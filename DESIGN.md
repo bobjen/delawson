@@ -1,7 +1,7 @@
 # DeLawson — Design
 
 Status: **draft, pre-implementation.** Nothing here is built. Sections marked
-⚠️ are unresolved; they are collected again in §12.
+⚠️ are unresolved; they are collected again in §14.
 
 Language: Rust.
 
@@ -14,26 +14,31 @@ Language: Rust.
   construction, not as an optimization.
 - **Tiny objects are equally expected.** Different users behave differently;
   the same system must hold a 30-record object and a 2^64-record object
-  without the small case paying for the large one. See §9.
+  without the small case paying for the large one (§10).
 - **No per-record index anywhere.** An index with 2^64 entries is not
   storable, so record location must be computed from aggregate counts (or key
   ranges) plus a bounded scan.
-- Durability by replication while data is being written, by erasure coding
-  once it is immutable.
+- **Compression and encryption are automatic**, not opt-in (§6).
+- Durability by replication while writing, by erasure coding once immutable.
 - Sequential read throughput approaching the aggregate sequential bandwidth of
   the disks holding the object.
+- **Billing is by physical bytes stored** (§11), which makes the compressed,
+  replicated footprint a first-class, customer-visible quantity rather than an
+  implementation detail.
 
 ## 2. Non-goals
 
 - Not a SQL database. No query language, no joins, no planner.
 - No cross-object transactions.
 - No general secondary indexes.
+- No deduplication — per-extent encryption keys make cross-extent identity
+  invisible, and billing by physical bytes removes the incentive.
 
 ---
 
 ## 3. Two object flavors
 
-The flavor is fixed at creation and determines how records are addressed.
+Fixed at creation; determines how records are addressed.
 
 | | **Unkeyed** | **Keyed** |
 |---|---|---|
@@ -41,24 +46,23 @@ The flavor is fixed at creation and determines how records are addressed.
 | Insert | **only at the end of the object** | anywhere, by key |
 | Update | yes, count-preserving | yes |
 | Delete | tombstone, count-preserving | tombstone |
-| Positional access | yes, `O(log)` | no — see §7.4 |
+| Positional access | yes, `O(log)` | no (§8.4) |
 
 The asymmetry follows from one fact: **record counts are stable under update
 and tombstoned delete, but not under insert.** An update replaces a record and
-a tombstone leaves the record present-but-dead, so in both cases every
-cumulative count in the object is unchanged. An insert in the middle
-renumbers every record after it, invalidating every cumulative count above the
-insertion point.
+a tombstone leaves it present-but-dead, so every cumulative count in the
+object is unchanged. An insert in the middle renumbers everything after it,
+invalidating every cumulative count above the insertion point.
 
 Therefore:
 
-- **Unkeyed objects forbid mid-object insert.** Appends land at the end of the
-  object, where they touch no existing cumulative count. Record numbers are
-  then permanently stable, and the count-based addressing of §7.1 works.
+- **Unkeyed objects forbid mid-object insert.** Appends land at the end, where
+  they touch no existing cumulative count. Record numbers are permanently
+  stable and the count-based addressing of §8.1 works.
 - **Keyed objects abandon counts as addresses.** Insert-in-the-middle is the
-  point of them, so record count is unusably unstable and keys are the address
-  instead. Counts are still maintained, but only as statistics — for `count`,
-  for load balancing, for placement — never for lookup.
+  point of them, so counts are unusably unstable and keys are the address.
+  Counts are still maintained, but only as statistics — for `count`, for load
+  balancing, for placement — never for lookup.
 
 ---
 
@@ -66,13 +70,13 @@ Therefore:
 
 ```
 Object
-  ├─ metadata (flavor, framing, device class, totals; inline records if tiny — §9)
-  └─ streams[]     unkeyed: (stream_id, cumulative records before, cumulative bytes before)
-       │           keyed:   (stream_id, first_key)
+  ├─ metadata (flavor, framing, device class, totals; inline records if tiny — §10)
+  └─ streams[]     unkeyed: (stream_id, cumulative records, cumulative logical + physical bytes)
+       │           keyed:   (stream_id, first_key, cumulative bytes)
        Stream                        unit of capacity striping
-         └─ extents[]  unkeyed: (extent_id, cumulative records before, cumulative bytes before)
-              │        keyed:   (extent_id, first_key)
-              Extent                 unit of replication, sealing, and erasure coding
+         └─ extents[]  unkeyed: (extent_id, cumulative records, cumulative logical + physical bytes)
+              │        keyed:   (extent_id, first_key, cumulative bytes)
+              Extent                 unit of replication, sealing, compression, encryption, EC
                 ├─ base              sealed, immutable
                 ├─ log               unsealed, lazily created — updates, tombstones, keyed inserts
                 └─ instances[]        replicas, or EC fragments after sealing
@@ -80,116 +84,175 @@ Object
                      Instance        one contiguous block of bytes on one disk
 ```
 
-Each level answers exactly one question, by binary search over an ordered
-array — of cumulative counts for unkeyed objects, of first keys for keyed ones:
+Each level answers one question by binary search over an ordered array — of
+cumulative counts for unkeyed objects, of first keys for keyed ones:
 
 | Level | Question | Key |
 |---|---|---|
 | Object | which stream? | cumulative records / first key |
 | Stream | which extent? | cumulative records / first key |
-| Extent | roughly where inside? | sparse offset index (§7.3) |
+| Extent | roughly where inside? | sparse index (§8.3) |
 | Instance | which disks hold those bytes? | replica / fragment list |
+
+Both logical and physical cumulative byte totals are carried, because logical
+drives addressing and physical drives billing (§11) and placement.
 
 ### 4.1 Streams
 
-A stream exists **purely for capacity striping**. It carries no semantic
-distinction — there is no "index stream" or "log stream". An object small
-enough to fit in one stream uses exactly one stream; streams are added as it
-grows.
+A stream exists **purely for capacity striping** — no semantic distinction, no
+"index stream" or "log stream". An object small enough for one stream uses one
+stream; streams are added as it grows.
 
-A stream is the granularity at which an object is spread across the cluster,
-and the granularity at which extent metadata is partitioned. **Streams of 1 PB
-and larger are expected** — §11 shows why they have to be that big.
+A stream is the granularity at which an object spreads across the cluster and
+at which extent metadata is partitioned. **Streams of 1 PB and larger are
+expected.** §13 shows that this expectation and the 32 MB physical extent limit
+of §5 are in tension.
+
+⚠️ Is a stream's size budget denominated in logical or physical bytes? With
+automatic compression the two differ by the compression ratio, so "1 PB
+stream" is ambiguous. §13 does the arithmetic in physical bytes.
 
 ### 4.2 Extents: base plus log
 
-An extent is the unit of replication and of immutability. Logically it is a
-**pair**:
+An extent is the unit of replication and immutability. Logically a **pair**:
 
-- a **base**: sealed, immutable, sorted (keyed) or in record order (unkeyed);
+- a **base**: sealed, immutable, in key order (keyed) or record order (unkeyed);
 - a **log**: unsealed and appendable, holding updates, tombstones, and — for
   keyed extents — inserts falling in this extent's key range.
 
-Reads merge base and log, newest version winning. **Compaction** periodically
-folds the log into a fresh base and drops the old pair (§8).
+Reads merge base and log, newest version winning. **Compaction** folds the log
+into a fresh base and drops the old pair (§9).
 
-**The log is created lazily.** An extent that has only ever been appended to
-has no log at all, and costs nothing for it. This matters more than it looks:
-a 1 PB stream holds ~250,000 extents (§11), and if each eagerly carried an
-open, fully-replicated log, the cluster's open-extent count — the expensive,
-un-erasure-coded, in-memory-state-bearing kind — would exceed its sealed
-extent count. For append-mostly objects almost no logs exist.
+**The log is created lazily.** An extent only ever appended to has no log and
+costs nothing for one. This matters more than it looks: with 32 MB extents a
+1 PB stream holds ~3 × 10^7 extents (§13), and if each eagerly carried an open,
+fully-replicated log, the cluster's open-extent count — the expensive,
+un-erasure-coded, in-memory-state-bearing kind — would dwarf its sealed extent
+count. For append-mostly objects almost no logs exist.
 
-⚠️ Even lazily, an update-heavy 1 PB stream can accumulate ~250,000 open logs.
-Whether that is acceptable, or whether logs need to be shared across
-neighbouring extents once their count crosses a threshold, is open.
-
-Sealing:
-
-- At most one extent per stream is open for **append** at a time (this is the
-  object's tail, distinct from logs).
-- When it reaches its size limit it is **sealed**: byte length, record count,
-  and content fixed forever.
-- Sealing is what makes everything else cheap. A sealed base's cumulative
-  counts never change, its sparse index never changes, and its bytes can be
-  erasure-coded, checksummed, and cached once.
-- Extents may be sealed **short**. Nothing requires a full extent, which makes
-  sealing available as a response to failure (§10).
+⚠️ Even lazily, an update-heavy 1 PB stream can accumulate ~3 × 10^7 open logs.
+The smaller extents get, the worse this is. Options: share a log across
+neighbouring extents past a threshold, or bound open logs per stream and force
+compaction when the bound is hit.
 
 ### 4.3 Instances
 
-- While an extent is open, each instance is a **full replica** on a distinct
-  machine and distinct failure domain. Writes go to all replicas.
-- After sealing, the extent is re-encoded to **erasure-coded fragments**;
-  instances become fragments, reconstructible from any *k* of *n*. Replicas
-  are dropped once encoding is durable and verified.
+- While open, each instance is a **full replica** on a distinct machine and
+  failure domain. Writes go to all replicas. Default 4 instances.
+- After sealing, the extent is re-encoded to **erasure-coded fragments**,
+  reconstructible from any *k* of *n*. Replicas drop once encoding is durable
+  and verified.
 
-Cheap durability for the overwhelming majority of data (sealed, cold, EC) and
-simple synchronous replication for the small hot tail.
+Because EC operates on the already-compressed, already-encrypted bytes (§6),
+re-encoding needs no key access and no recompression.
 
-⚠️ EC changes the read unit: what was one 1 MB sequential read against a
-replica becomes *k* fragment reads across *k* machines, partly defeating the
-device tuning of §7.3. Either align the fragment stripe with the index
-granularity, or retain one full replica alongside the fragments for locality.
+Sealing and EC are also a **billing event**: 4 replicas of a 32 MB body is
+128 MB billed; a 6+3 encoding of the same body is ~48 MB. See §11.
+
+⚠️ EC changes the read unit: what was one sequential read against a replica
+becomes *k* fragment reads across *k* machines, partly defeating the device
+tuning of §8.3. Either align the fragment stripe with the index granularity, or
+retain one full replica alongside the fragments for locality.
 
 ---
 
-## 5. Size limits
+## 5. Size limits and sealing
 
-| Bound | Value | Why |
+An extent seals when it hits **either** limit, whichever comes first:
+
+| Limit | Value | Why |
 |---|---|---|
-| Extent, logical | ≤ **4 GB** | An intra-extent logical offset fits in 32 bits. |
-| Extent, physical | limit configurable in **8 MB – 4 GB** | The 8 MB floor keeps seek cost small relative to scan cost. |
-| Records per object | ≤ 2^64 | Stated requirement. |
-| Stream | ≥ ~1 PB in practice | Forced by metadata sizing, §11. |
+| Logical | **4 GB** | An intra-extent logical offset fits in 32 bits. |
+| Physical | **32 MB compressed** (initial guess) | Bounds compaction cost, repair granularity, and open-extent memory. |
 
-The 8 MB floor: an HDD seek plus rotation is ~10 ms, and 8 MB at ~150 MB/s is
-~53 ms of scanning, so the seek is under 20% overhead. Below 8 MB the drive
-spends more time finding extents than reading them. Above 4 GB the 32-bit
-logical offset breaks.
+Also bounding the physical limit: it must stay **above ~8 MB** so that an HDD
+seek is small relative to scanning the extent. A seek plus rotation is ~10 ms;
+32 MB at ~150 MB/s is ~213 ms, so the seek is under 5% overhead. At 8 MB it is
+~19%. Below that the drive spends more time finding extents than reading them.
 
-⚠️ Logical ≤ 4 GB and physical ∈ [8 MB, 4 GB] are separate bounds, so the two
-can differ. What exactly drives the difference — superseded versions and
-tombstones still occupying logical space, compression, or EC expansion — is
-not settled, and it determines whether logical offsets are dense.
+**Consequence: extent size is data-dependent.** Which limit binds depends
+entirely on compressibility:
+
+| Data | Compression ratio | Binds first | Logical span | Physical |
+|---|---|---|---|---|
+| Incompressible (already-compressed media) | ~1× | physical | ~32 MB | 32 MB |
+| Typical text / structured records | ~3–4× | physical | ~100–130 MB | 32 MB |
+| Highly redundant (logs, sparse columns) | ~30× | physical | ~1 GB | 32 MB |
+| Pathologically redundant | ≥128× | **logical** | 4 GB | ≤32 MB |
+
+So in practice **the physical limit binds almost always**, and the 4 GB logical
+cap is reached only past a 128:1 ratio. The logical cap is best understood not
+as a normal sealing trigger but as the guarantee that keeps intra-extent
+logical offsets 32 bits wide.
+
+This also means a single object can hold wildly heterogeneous extents — a 32 MB
+span next to a 1 GB span — so nothing may assume uniform extent size. All
+navigation is by cumulative totals (§4), which is indifferent to this.
 
 ---
 
-## 6. Writing
+## 6. The storage pipeline
 
-### 6.1 Append blocks
+Every extent body goes through the same pipeline. Order matters and is forced:
+
+```
+records → framing → compression → encryption → replication → (seal) → erasure coding
+```
+
+- **Compress before encrypt.** Ciphertext is incompressible, so the reverse
+  order would give no compression at all — and compression ratio is what the
+  customer is billed on (§11).
+- **Encrypt before erasure-code.** EC is linear over whatever bytes it is
+  given, so encoding the ciphertext lets repair and re-encoding proceed with no
+  access to keys — a background repair job never needs to decrypt.
+
+### 6.1 Block alignment
+
+Whole-extent compression and whole-extent encryption would both destroy random
+access: you cannot decompress or decrypt from the middle. So both operate on
+**blocks**, and the block boundary is the same boundary the sparse index points
+at (§8.3). One granule is one compression unit and one encryption unit:
+
+- read the 32 MB physical extent's index, find the granule containing the target,
+- read exactly that granule, decrypt it, decompress it, scan it by framing.
+
+This makes granule size a three-way decision — index density, compression
+ratio (larger blocks compress better), and read amplification (larger blocks
+waste more per point read) — rather than the purely device-driven choice §8.3
+describes.
+
+⚠️ The device-tuned granularities of §8.3 (1 MB HDD, 20 KB SSD) were chosen for
+seek amortization alone. 20 KB is small enough to hurt compression ratio
+noticeably, and ratio is billable. The SSD granularity may need to rise, or
+compression blocks may need to span several index granules with the index
+recording which block a granule lives in.
+
+### 6.2 Encryption details
+
+- Block-granular mode with a per-block IV/tweak derived from
+  `(extent_id, block_index)` so blocks are independently decryptable and
+  identical plaintext in two places does not produce identical ciphertext.
+- Keys are per-extent. Sealed extents are immutable, so their keys never need
+  rotation in place; **rotation happens by rewriting during compaction**, which
+  is a rewrite anyway.
+- ⚠️ Key custody, the key hierarchy, and whether customers may supply their own
+  keys are entirely undesigned.
+
+---
+
+## 7. Writing
+
+### 7.1 Append blocks
 
 The unit of write is an **append block** of 0..n records, applied to the target
-extent atomically: either all its records become visible or none do. Block
-size is the client's choice within a limit.
+extent atomically: all its records become visible or none do.
 
 An append returns the record number of the first record in the block (unkeyed)
 and the extent it landed in.
 
-### 6.2 Record framing
+### 7.2 Record framing
 
-Record boundaries within a block are found by the object's framing, fixed at
-creation:
+Fixed at object creation:
 
 | Framing | Boundary |
 |---|---|
@@ -200,10 +263,10 @@ creation:
 
 `LengthPrefixed` is the only framing permitting arbitrary binary content; the
 terminator framings require the terminator not appear inside a record, and
-exist so that existing line- and NUL-delimited data can be stored and scanned
+exist so existing line- and NUL-delimited data can be stored and scanned
 without a rewrite.
 
-### 6.3 The three mutations
+### 7.3 The three mutations
 
 | | Unkeyed | Keyed |
 |---|---|---|
@@ -211,197 +274,281 @@ without a rewrite.
 | **Update** | `(local record number, new bytes)` appended to that extent's log | `(key, new bytes)` appended to the log |
 | **Delete** | tombstone for the local record number, appended to the log | tombstone for the key, appended to the log |
 
-Update and delete never touch the base, never change any cumulative count, and
-never require an extent to be reopened. Insert is the only operation that
+Update and delete never touch the base, never change any cumulative record
+count, and never reopen a sealed extent. Insert is the only operation that
 moves counts, which is why unkeyed inserts are confined to the object's end.
 
 ---
 
-## 7. Reading
+## 8. Reading
 
-### 7.1 Unkeyed: locating record *N*
+### 8.1 Unkeyed: locating record *N*
 
 1. Binary search the object's stream list on cumulative records → stream *S*
    and a stream-local record number.
 2. Binary search *S*'s extent list on cumulative records → extent *E* and an
    extent-local record number.
-3. If *E* has a log, check it for a newer version or tombstone of that local
-   record number. If found, done.
-4. Otherwise binary search *E*'s base sparse index → nearest preceding
-   checkpoint `(local record number, byte offset)`.
-5. Read one device granule from that offset off any instance, parse forward by
+3. If *E* has a log, check it for a newer version or tombstone. If found, done.
+4. Otherwise binary search *E*'s sparse index → nearest preceding checkpoint.
+5. Read that granule from any instance, decrypt, decompress, parse forward by
    framing, stop at the target.
 
-Two binary searches, one small log probe, one index search, one read. Costs
-are logarithmic in stream and extent count; the forward scan is bounded by the
-index granularity — never by the size of the object.
+Two binary searches, one small log probe, one index search, one granule read.
+Logarithmic in stream and extent count; the scan is bounded by granule size,
+never by object size.
 
-### 7.2 Keyed: locating key *K*
+### 8.2 Keyed: locating key *K*
 
-Identical in shape, with `first_key` comparisons replacing cumulative counts,
-and the extent's sparse index mapping `key → byte offset`. The log probe is
-not optional here: for keyed extents the log holds inserts, so a key absent
-from the base may still exist.
+Identical in shape, with `first_key` comparisons replacing cumulative counts
+and the sparse index mapping `key → offset`. The log probe is not optional
+here: keyed logs hold inserts, so a key absent from the base may still exist.
 
-### 7.3 Sparse index granularity
+### 8.3 The sparse index
 
-One checkpoint approximately every:
+One checkpoint approximately every **1 MB** for HDD-backed extents and **20 KB**
+for SSD-backed extents, tuned to the device's efficient read size: on an HDD the
+seek dominates and there is no point indexing finer than what you would read
+anyway; on an SSD there is no seek to amortize, so finer granularity pays.
 
-- **1 MB** for HDD-backed extents
-- **20 KB** for SSD-backed extents
+**Checkpoints must record physical offsets**, i.e. positions in the compressed,
+encrypted body — that is what a reader actually seeks to. A checkpoint is
+therefore `(local record number or key, physical offset)`, and optionally the
+logical offset too if callers need logical byte positions.
 
-Granularity is set to the device's efficient read size. On an HDD the seek
-dominates, a 1 MB read is nearly free relative to finding it, and there is no
-point indexing finer than what you would read anyway. On an SSD there is no
-seek to amortize, so much finer granularity pays for itself.
-
-Cost, for a 4 GB extent and 8-byte checkpoints (32-bit local record number
-plus 32-bit offset):
+Cost, at a 32 MB physical extent and 8-byte checkpoints:
 
 | Device | Granularity | Checkpoints | Index size | Overhead |
 |---|---|---|---|---|
-| HDD | 1 MB | ~4,100 | ~33 KB | 0.0008% |
-| SSD | 20 KB | ~210,000 | ~1.7 MB | 0.04% |
+| HDD | 1 MB | 32 | 256 B | 0.0008% |
+| SSD | 20 KB | ~1,600 | ~13 KB | 0.04% |
 
-Both are small enough to hold in memory for open extents and cache
-aggressively for sealed ones. Device class is a property of the extent, not
-the object, so an object may migrate between tiers extent by extent.
+Note how small these became once extents shrank from 4 GB to 32 MB physical.
+That is not free — see §13, where the same information reappears, multiplied,
+in the stream's extent list.
 
-### 7.4 Scans
+Device class is a property of the extent, so an object may migrate between
+tiers extent by extent.
+
+### 8.4 Scans
 
 A full scan ignores the index: walk the stream list in order, the extent list
-in order, and read each extent at full device bandwidth, merging its log.
-Because streams sit on disjoint machine sets, scans of a large object
-parallelize across the cluster naturally.
+in order, read each extent at full device bandwidth, merging its log. Because
+streams sit on disjoint machine sets, scans of a large object parallelize
+across the cluster naturally.
 
-Keyed objects support ordered scans and range scans by key, but **not**
-positional access — "the 10,000,000th record" is not answerable, because
-counts are statistics rather than addresses (§3).
+Keyed objects support ordered and range scans by key but **not** positional
+access — "the 10,000,000th record" is unanswerable, because counts are
+statistics rather than addresses (§3).
 
 ---
 
-## 8. Compaction
+## 9. Compaction
 
-Compaction reads a base plus its log, writes a fresh base with updates
-applied, tombstones dropped, and (for keyed extents) inserts merged in key
-order, then atomically swaps the pair in the stream's extent list.
+Compaction reads a base plus its log and writes a fresh base with updates
+applied, tombstones dropped, and (keyed) inserts merged in key order, then
+atomically swaps the pair in the stream's extent list.
 
-Consequences:
-
-- **Extent membership of a stream changes over time.** Extent *position*
-  within a stream is therefore unstable; extent *identity* must be a stable
-  unique id that outlives position.
-- **Keyed compaction can split.** If the merged result exceeds the extent
-  limit, it becomes two extents covering two key subranges, spliced into the
-  stream's extent list. This makes keyed objects B-tree-shaped — one log level
-  per base, splitting on overflow — rather than LSM-shaped with many levels.
-- **Unkeyed compaction never splits or renumbers.** Updates and tombstones
+- **Extent membership of a stream changes over time.** Extent *position* within
+  a stream is therefore unstable; extent *identity* must be a stable unique id
+  that outlives position.
+- **Keyed compaction can split.** If the merged result exceeds either limit of
+  §5 it becomes two extents covering two key subranges, spliced into the extent
+  list. This makes keyed objects B-tree-shaped — one log level per base,
+  splitting on overflow — rather than LSM-shaped with many levels.
+- **Unkeyed compaction never splits or renumbers.** Update and tombstone
   preserve count, so the new base covers exactly the record-number range the
-  old one did. Cumulative counts above it are untouched. Unkeyed compaction is
-  purely local.
-- Compaction rewrites, so it is also the moment to re-encode EC, change device
-  class, or re-checksum.
+  old one did and cumulative counts above it are untouched. Purely local.
+- Compaction is a rewrite, so it is also where EC re-encoding, device-class
+  changes, recompression, and **encryption key rotation** happen.
+- Compaction is a **billing event**: it is what reclaims the physical bytes
+  held by superseded versions and tombstones (§11).
 
-⚠️ Compaction policy — what triggers it, how much write amplification is
-budgeted, and how splits are throttled — is not designed yet.
+⚠️ Compaction policy — triggers, write-amplification budget, split throttling —
+is not designed. Billing makes it sharper than usual: the schedule directly
+determines a customer's bill.
 
 ---
 
-## 9. Small objects
+## 10. Small objects
 
-Three regimes, chosen by size:
+Three regimes by size:
 
 | Regime | When | Storage |
 |---|---|---|
 | **Inline** | very small | records live inside the object's metadata record — no stream, no extent, no instance |
-| **Packed** | smaller than half a max-sized extent (< 2 GB logical) | the object shares one extent with other objects; the extent holds a directory of the objects in it |
-| **Dedicated** | ≥ 2 GB logical | the object's own extents, as §4 |
+| **Packed** | smaller than half a max-sized extent | shares one extent with other objects; the extent carries a directory of the objects in it |
+| **Dedicated** | above that | its own extents, as §4 |
 
-The half-extent threshold for packing is what guarantees a packed object never
-straddles an extent boundary: at 2 GB of a 4 GB extent, at least two objects
-fit and any packable object fits whole.
+The half-extent threshold guarantees a packed object never straddles an extent
+boundary: at most half of a maximum extent, at least two objects fit and any
+packable object fits whole.
 
-⚠️ Packing raises the questions the uniform design avoids: deleting one packed
-object leaves garbage until the shared extent is compacted; erasure coding is
-per-extent, so packed objects share an EC fate; and the extent's directory is a
-fourth kind of index. The inline threshold is also unset.
+⚠️ "Half a max-sized extent" is now ambiguous, because §5 gives two maxima.
+Half of 4 GB logical and half of 32 MB physical are very different thresholds,
+and since the physical limit almost always binds, the packing threshold is
+presumably ~16 MB physical. Needs confirming.
+
+⚠️ Packing collides with billing and compression in a way the uniform design
+avoids. A packed extent is compressed as a unit, so per-object physical size is
+**not additive** — two objects that share substrings compress better together
+than apart, and there is no principled way to attribute the saving. Either
+compress each packed object independently (losing ratio, and ratio is billable)
+or attribute physical bytes proportionally to logical size (approximate, and
+customers can notice). Deleting one packed object also leaves garbage until the
+shared extent is compacted, and packed objects share an EC fate.
 
 ---
 
-## 10. Metadata, consistency, and membership
+## 11. Billing and metering
 
-Deliberately thinner than the rest — least determined so far.
+**Customers are billed by physical bytes stored, summed over instances.** So a
+32 MB compressed body held as 4 replicas bills as 128 MB; the same body as a
+6+3 erasure code bills as ~48 MB.
+
+This makes several internal choices customer-visible:
+
+- **Compression works for the customer, not just the fleet.** Ratio directly
+  divides the bill, which is why compression must precede encryption (§6) and
+  why shrinking compression blocks for index density is not a free trade (§6.1).
+- **Sealing and EC cut the bill ~2.7×** (4 replicas → 6+3). So the latency
+  between sealing and successful encoding is money. That needs an explicit
+  target, and a decision about who absorbs the cost of the gap.
+- **Compaction reclaims billable bytes.** Superseded versions and tombstones
+  occupy physical space until compacted, so the compaction schedule sets part
+  of the bill.
+- **Metering must be per-object, over time** — physical bytes × instances ×
+  duration — which means an accounting subsystem that survives failures and
+  double-counts nothing during replica repair, re-encoding, and compaction
+  (where old and new bases briefly coexist).
+
+⚠️ Open policy questions, all customer-facing:
+
+1. Do customers pay for **uncompacted garbage** they created by overwriting,
+   when DeLawson chooses the compaction schedule?
+2. Do they pay for the **transient double footprint** during compaction and
+   re-encoding?
+3. Do they pay for **metadata**? A stream's extent list can reach hundreds of
+   MB (§13) and is itself replicated.
+4. How are **packed objects** attributed (§10)?
+5. Is the billed figure **compressed size** (which the customer cannot directly
+   control) reported back to them, and at what granularity?
+
+---
+
+## 12. Metadata, consistency, and membership
+
+Thinner than the rest — least determined so far.
 
 - **Durability** on write comes from replicating an append block to all open
-  instances before acknowledging. Sealing is the commit point that fixes an
-  extent's content.
+  instances before acknowledging. Sealing is the commit point fixing content.
 - **Metadata** (object → streams, stream → extents, extent → instances) is
-  itself replicated state that must stay consistent under failure. This wants
-  a small consensus-replicated metadata service per stream or per object, not
-  one global one — §11 constrains which.
-- **Replica failure on an open extent**: seal the extent short and open a new
-  one. This removes replica repair from the write path entirely.
-- **Repair** of sealed extents is background fragment reconstruction, never
-  blocking a write.
+  replicated state that must stay consistent under failure. This wants a small
+  consensus-replicated metadata service per stream or per object, not one
+  global one — §13 constrains which.
+- **Replica failure on an open extent**: seal short and open a new one. This
+  removes replica repair from the write path entirely. Sealing short is cheap
+  precisely because §5 makes extent size variable anyway.
+- **Repair** of sealed extents is background fragment reconstruction over
+  ciphertext, never blocking a write, never needing keys.
 
 ⚠️ Open: metadata service per stream, per object, or sharded globally.
 
 ---
 
-## 11. Does the metadata fit? (sizing)
+## 13. Does the metadata fit? (sizing)
 
-The check that decides whether three levels suffice or a fourth is needed.
+This is the check that decides whether three levels suffice, and it is where
+the 32 MB physical limit does real damage.
 
-Take the stated ceiling: 2^64 ≈ 1.845 × 10^19 records. At an average 100 bytes
-per record that is ~1.8 ZB — physically unreachable, but addressing must still
-work, so use it as the bound.
+Take the stated ceiling: 2^64 ≈ 1.845 × 10^19 records, at an average 100 logical
+bytes each — 1.845 ZB logical. At a 4× compression ratio that is **T ≈ 461 EB
+physical**. Physically unreachable, but addressing must still work, so use it.
 
-At 4 GB per extent an extent holds ~4 × 10^7 such records, so a full object
-implies ~4.6 × 10^11 extents. Extent metadata at ~64 bytes per entry is ~30 TB
-in total. **No single machine holds the extent list** — and it does not have
-to, because it is partitioned by stream. That is what streams are for. But it
-pins stream size:
+### 13.1 The trade
 
-| Extents/stream | Stream capacity | Extent list (64 B) | Streams in a full object | Stream list (32 B) |
-|---|---|---|---|---|
-| 250 | 1 TB | 16 KB | 1.8 × 10^9 | ~59 GB — too big |
-| 2.5 × 10^5 | 1 PB | 16 MB | 1.8 × 10^6 | ~59 MB — fits |
-| 2.5 × 10^6 | 10 PB | 160 MB | 1.8 × 10^5 | ~5.9 MB — comfortable |
+Let *P* be the physical extent size and *S* the physical stream size, with
+64-byte extent-list entries and 32-byte stream-list entries:
 
-So streams want to be **1 PB or larger**, which is what is expected anyway. At
-that size each stream's extent list is 16–160 MB, held by that stream's
-metadata replicas, and the object's stream list is a few MB to tens of MB —
-holdable on one machine and cacheable at clients.
+- a stream's extent list is `64 · S / P`
+- the object's stream list is `32 · T / S`
 
-**Three levels are enough, but only because streams are enormous.** If streams
-ever needed to be small — for placement flexibility, say — the object's stream
-list would stop fitting on one machine and would need paging or striping of
-its own: a fourth level in disguise. Stream sizing is load-bearing, not a
-tuning knob.
+Shrinking *P* shrinks the per-extent sparse index (§8.3) but multiplies the
+number of extents, so the addressing information does not disappear — it moves
+up into the stream's extent list. Setting the two lists equal gives the balance
+point:
+
+  **S\* = √(T·P / 2)**, at which each level holds **64 · √(T / 2P)** bytes.
+
+Metadata per level therefore scales as **1/√P**: making extents 128× smaller
+makes each index level ~11× larger.
+
+| Physical extent *P* | Optimal stream *S\** | Metadata per level |
+|---|---|---|
+| 32 MB | ~86 TB | ~172 MB |
+| 256 MB | ~243 TB | ~61 MB |
+| 1 GB | ~500 TB | ~30 MB |
+| 4 GB | ~1 PB | ~15 MB |
+
+### 13.2 The tension
+
+Two stated intentions do not sit together:
+
+- **Streams of 1 PB and larger** (§4.1)
+- **32 MB physical extents** (§5)
+
+At 1 PB per stream and 32 MB extents, a stream holds ~3.1 × 10^7 extents and its
+extent list is **~2 GB** — too large to hold comfortably in a consensus-replicated
+metadata service, and paying for it means paging the extent list, which is a
+fourth level in disguise.
+
+The table shows the two intentions are consistent only around **P ≈ 4 GB**,
+where the optimal stream size lands almost exactly on 1 PB and both index
+levels sit at a comfortable ~15 MB. That is very likely where the 1 PB
+expectation came from.
+
+So one of three things has to give:
+
+1. **Raise the physical limit** toward 256 MB–1 GB, accepting costlier
+   compaction and coarser repair, and bringing metadata to 30–60 MB per level.
+2. **Shrink streams** to ~86 TB, accepting ~172 MB per level and ~5 × 10^6
+   streams per full object, and dropping the 1 PB expectation.
+3. **Add a level** — page or stripe the extent list — and keep both 32 MB
+   extents and 1 PB streams.
+
+Bob called 32 MB an initial guess, so (1) is the natural first move; but note
+that the 8 MB seek-amortization floor argues from below and this argues from
+above, which together bracket the physical limit rather than pinning it.
+
+**Three levels are enough only for large extents and large streams.** The
+32 MB guess breaks that, mildly at 86 TB streams and badly at 1 PB streams.
 
 ---
 
-## 12. Open questions
+## 14. Open questions
 
-1. **Log count under update-heavy load** (§4.2). Lazy log creation fixes the
-   append-mostly case; a 1 PB stream under heavy update can still reach
-   ~250,000 open logs. Share logs across neighbouring extents past a
-   threshold, or accept it?
-2. **Logical vs physical extent size** (§5). What drives the gap, and are
-   logical offsets dense?
-3. **EC vs read locality** (§4.3). Align the fragment stripe to the index
-   granularity, or keep a full replica for locality?
-4. **Compaction policy** (§8): triggers, write-amplification budget, split
-   throttling.
-5. **Packed extents** (§9): deletion garbage, shared EC fate, the directory
-   format, and the inline threshold.
-6. **Metadata service topology** (§10): per-stream, per-object, or sharded
-   global.
-7. Is `count` on an object expected to be exact and cheap? Cumulative counts
-   make it cheap and — because update and tombstoned delete preserve count —
-   exact for unkeyed objects. For keyed objects it is a maintained statistic.
-8. `Nul` and `\0` framing were both listed originally and are folded together
-   here (§6.2). Confirm no distinction was meant.
-9. Does a tombstoned unkeyed record number stay readable as "deleted" forever,
-   or can compaction eventually reclaim the number? Reclaiming it would
-   renumber, so presumably never — worth stating deliberately.
+1. **Physical extent size vs stream size vs level count** (§13) — the sharpest
+   open question, since 32 MB extents and 1 PB streams are not jointly
+   affordable at three levels.
+2. **Compression block size vs index granularity** (§6.1). A 20 KB SSD granule
+   hurts compression ratio, and ratio is billable.
+3. **Log count under update-heavy load** (§4.2) — worse the smaller extents get.
+4. **Are stream size budgets logical or physical?** (§4.1)
+5. **The packing threshold** (§10) — half of *which* maximum? Presumably ~16 MB
+   physical.
+6. **Packed-object billing attribution** (§10, §11) — per-object physical size
+   is not additive under shared-extent compression.
+7. **Billing policy** (§11): garbage, transient double footprint, metadata,
+   reporting granularity.
+8. **Key custody and hierarchy** (§6.2); customer-supplied keys?
+9. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+   keep a full replica?
+10. **Compaction policy** (§9) — now partly a pricing decision.
+11. **Metadata service topology** (§12).
+12. Is `count` expected exact and cheap? Cumulative counts make it cheap, and
+    because update and tombstoned delete preserve count, exact for unkeyed
+    objects. For keyed objects it is a maintained statistic.
+13. `Nul` and `\0` framing were both listed originally and are folded together
+    (§7.2). Confirm no distinction was meant.
+14. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+    Reclaiming it would renumber, so presumably never — worth stating
+    deliberately.

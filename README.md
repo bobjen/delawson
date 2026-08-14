@@ -2,7 +2,10 @@
 
 A distributed store for very large objects, written in Rust.
 
-Named after George DeLawson Lowry.
+Named after George DeLawson Lowry (b. 17 January 1880, Hagersville, Ontario;
+d. 1919, Buffalo, New York) — Bob's great-grandfather, a piano teacher who
+played jazz in the style of Gershwin. He went by **Laws**, short for DeLawson.
+See [his page](https://burtleburtle.net/gene/glowry18800117.html).
 
 ## Status
 
