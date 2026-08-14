@@ -40,6 +40,10 @@ SN  Stream Node      extents per stream, instances per extent
 EN  Extent Node      the bytes on disk
 ```
 
+The DN tier is self-hosted: directory and object metadata live in DeLawson
+keyed objects, reached through a small bootstrap root that is the only state
+stored outside the object hierarchy.
+
 ## Two object flavors
 
 - **Sequential** — variable-length records, appended only at the end,

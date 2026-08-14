@@ -103,18 +103,19 @@ Object
                      Instance        one contiguous block of bytes on one disk
 ```
 
-Each level answers one question by binary search over an ordered array — of
-cumulative counts for unkeyed objects, of first keys for keyed ones:
+Each level answers one question, searching on cumulative counts for unkeyed
+objects and on first keys for keyed ones:
 
-| Level | Question | Key |
+| Level | Question | Search key |
 |---|---|---|
 | Object | which stream? | starting record number / first key |
 | Stream | which extent? | starting record number / first key |
 | Extent | roughly where inside? | sparse index (§9.3) |
 | Instance | which disks hold those bytes? | replica / fragment list |
 
-Both logical and physical cumulative byte totals are carried: logical drives
-addressing, physical drives billing (§12) and placement.
+The list in the diagram is the *stored* form; the *served* form is a B-tree
+(§4.4). Which of the totals a level carries may be kept exact, and which only
+lazily, follows a single rule — §4.5.
 
 ### 4.1 Streams
 
@@ -168,9 +169,65 @@ becomes *k* fragment reads across *k* ENs, partly defeating the device tuning of
 §9.3. Either align the fragment stripe with the index granularity, or retain one
 full replica alongside the fragments for locality.
 
----
+### 4.4 Stored as lists, served as B-trees
 
-## 5. The physical decomposition: three node types
+The persistent form and the serving form differ:
+
+| | Stored | Served |
+|---|---|---|
+| Stream | list of extents | B-tree in memory |
+| Object | list of streams | B-tree in memory |
+
+A list is the right thing to *write*: appends are cheap, the format is compact
+(§14.1 depends on ~100 B per entry), and it is trivially scannable for the
+rebuild-from-ENs path of §5.2. A B-tree is the right thing to *serve*: lookup is
+a descent rather than a scan, and — decisively — **insert and split in the
+middle are cheap**, which is what keyed objects need (§10) and what a flat
+sorted array cannot give.
+
+So an SN loads a stream's extent list from disk into a B-tree on assignment, and
+serves from the tree; the list on disk is the durable record, brought up to date
+from the tree.
+
+⚠️ The relationship between the two forms under failure is not designed: whether
+the tree is checkpointed back to a list periodically, journalled per mutation, or
+simply rebuilt by scanning. This is the same question as SN durability (§5.2)
+seen from the other side.
+
+### 4.5 Which summaries may be kept exact
+
+Every level carries totals — record counts, logical bytes, physical bytes — and
+they cannot all be maintained the same way. One rule decides it:
+
+> **A summary that only ever grows at the tail may be updated synchronously all
+> the way to the root. A summary of something that can change anywhere in the
+> tree either should not exist, or is updated only lazily.**
+
+A tail-only update touches just the rightmost spine of the B-tree — O(depth)
+nodes, all of them already hot. A change in the middle would dirty an arbitrary
+interior path and, worse, invalidate every prefix sum after it.
+
+Applying the rule:
+
+| Summary | Changes where? | Treatment |
+|---|---|---|
+| Unkeyed record count | tail only — appends only at the end (§3), and update and tombstone preserve count | **synchronous, exact, to the root** |
+| Unkeyed logical/physical bytes | anywhere — a log append in a middle extent grows it | **lazy** |
+| Keyed record count | anywhere — inserts land mid-tree | **lazy, or absent** |
+| Keyed byte totals | anywhere | **lazy** |
+| Extent instance list | anywhere — repair, re-encoding | not a summary; maintained directly |
+
+Two consequences worth stating outright:
+
+- **The addressing summary is the one that gets to be exact.** Unkeyed lookup
+  needs cumulative *record counts*, which are precisely the tail-only quantity;
+  it never needs cumulative bytes. That is not luck, it is why the count-based
+  scheme of §3 works at all: the only summary on the critical path is the only
+  one that can be maintained synchronously.
+- **Byte totals — hence billing — are lazy.** See §12.
+
+Lazy summaries are brought forward by the background loops of §13.1, not by the
+write path.
 
 The logical levels of §4 do not all live in the same place. Splitting them is a
 reliability requirement, not an optimization (§1.1).
@@ -204,18 +261,15 @@ opposite of the SN arrangement below, and the difference is not incidental: SN
 state is bounded per stream by construction, while DN state grows with the
 object *count*, which nothing bounds.
 
-⚠️ DN state is a large, sorted, key-addressed collection that must be paged from
-disk and cached — which is exactly the keyed object of §3. Whether DeLawson
-stores its own directory and object metadata in DeLawson keyed objects (with
-some small bootstrap root outside), or in a separate purpose-built store, is
-open and consequential. Self-hosting is attractive and is roughly what Colossus
-does with BigTable; it also creates a bootstrap ordering problem and a risk of
-circular failure.
+DN state is a large, sorted, key-addressed collection that must be paged from
+disk and cached — which is exactly the keyed object of §3. **It is therefore
+stored in DeLawson keyed objects, with a bootstrap root outside.** See §5.5.
 
-⚠️ The directory hierarchy brings semantics not yet designed: path resolution,
-rename (cheap pointer move, or expensive?), listing a directory with a billion
-entries, permissions, and quotas. Billing (§12) also attaches naturally to
-directories and accounts rather than to bare objects.
+⚠️ The directory hierarchy brings semantics only partly designed: path
+resolution and rename are addressed by the key choice in §5.5.4, but listing a
+directory with a billion entries, permissions, and quotas are not. Billing
+(§12) also attaches naturally to directories and accounts rather than to bare
+objects.
 
 ### 5.2 SNs — Stream Nodes
 
@@ -265,6 +319,121 @@ At different levels, for different reasons:
 The first is about correlated loss; the second is about arithmetic. Conflating
 them would be a mistake — a placement policy good for one is not automatically
 good for the other.
+
+### 5.5 The DN tier is self-hosted
+
+**Decided: DN metadata lives in DeLawson keyed objects, with a bootstrap root
+outside DeLawson.** Building a separate store for it would duplicate
+compaction, replication, erasure coding, compression, and encryption — for a
+workload the keyed object already is.
+
+#### 5.5.1 The resolution chain has fixed depth
+
+Self-hosting invites infinite regress: an object's metadata is in an object,
+whose metadata is in an object. It must terminate at a fixed, small depth.
+
+| Level | What | Where its own locator lives |
+|---|---|---|
+| 0 | **Bootstrap root** — tiny, strongly consistent, *outside* DeLawson | replicated by its own means |
+| 1 | **Partition map** — a keyed object: key range → metadata object | level 0 |
+| 2 | **Metadata objects** — keyed objects: object key → object metadata | level 1 |
+| 3 | **User objects** | level 2 |
+
+Three hops, not recursion. This is the same shape, and for the same reason, as
+BigTable's Chubby file → root tablet → METADATA tablets → user tablets.
+
+The bootstrap root must contain exactly what a DN would otherwise supply for
+level 1: the partition map's object id, its stream list (stream ids plus SN
+locations), its totals, and its key identifier. The partition map is small — a
+million partitions at ~136 B is ~136 MB, comfortably one stream — so **the root
+is a few kilobytes and changes almost never.** That is what makes it cheap to
+keep strongly consistent by other means.
+
+Level 2 is partitioned rather than one global object mainly to bound contention
+and blast radius; a single keyed object could hold the whole namespace as far as
+capacity goes (§14.3).
+
+#### 5.5.2 Damping the write recursion
+
+The hazard: a user write updates metadata, which is a write to a DeLawson
+object, which updates *its* metadata, which cascades. A cascade to the root on
+every append would be fatal.
+
+Two dampers exist already, and one problem needs a decision.
+
+- **Extent churn does not propagate at all.** An object's extent list lives on
+  its SN, not in DN metadata (§5.2). So a metadata object sealing, splitting, or
+  compacting extents never touches the level above it. This is the main damper,
+  and it is free — a consequence of putting extent lists on SNs rather than in
+  object metadata.
+- **Stream growth barely propagates.** Level 1 needs updating only when a level-2
+  metadata object gains a *stream* — every ~64 PiB (§14.1). Effectively never.
+- **The cascade terminates after one level**, by the rule of §4.5. Writing a
+  user object's new record count into DN metadata is an *update* to an existing
+  level-2 record. An update is count-preserving (§3), so the level-2 metadata
+  object's own record count — the only summary maintained synchronously — does
+  not change at all. What does change is its byte totals, and those are lazy by
+  §4.5. So the propagation stops: one level up, and no further. The feared
+  cascade to the root cannot happen.
+
+- ⚠️ **Write amplification into the metadata tier is a separate problem**, and
+  it survives. Even without a cascade, updating DN metadata on every user append
+  is one metadata write per data write. The remedy is the same as §4.5's
+  treatment of byte totals: keep the authoritative live count on the SN, which
+  already maintains it exactly and synchronously for addressing, and let the DN
+  copy be a lazily-refreshed cache. Then a steady stream of appends touches no
+  DN at all.
+
+  Recommended, not decided — but note the recommendation now rests on write
+  amplification alone, not on any risk of unbounded recursion.
+
+Nothing else in DN metadata is volatile: the stream list is append-only, because
+a stream's starting record number never changes once assigned (§3).
+
+#### 5.5.3 Circular failure
+
+Self-hosting means a DeLawson outage can prevent recovering DeLawson. Three
+requirements follow:
+
+- The **bootstrap root must be durable and available independently** of
+  DeLawson — it cannot be stored in the thing it bootstraps.
+- **Metadata extents must be identifiable on ENs.** §5.2 already wants
+  self-describing instance headers so SN state can be rebuilt by scanning ENs;
+  those headers should also carry a flag marking metadata extents, so a
+  disaster-recovery scan can rebuild the metadata tier **first**, before anything
+  that depends on it.
+- **Metadata objects want their own placement policy**: more redundancy, maximal
+  spread, and possibly replicas retained rather than erasure-coded (§4.3), since
+  metadata reads are frequent, small, and latency-critical in a way bulk data is
+  not.
+
+⚠️ The key hierarchy has the same circularity: metadata objects are encrypted
+(§7), so their keys must be obtainable without reading metadata. The root must
+anchor the key hierarchy, not just the object hierarchy.
+
+#### 5.5.4 What the metadata key should be
+
+| Key | Listing a directory | Renaming a directory | Path resolution |
+|---|---|---|---|
+| Full path | prefix scan | rewrites every descendant key | one lookup |
+| `(parent dir id, name)` | prefix scan on parent id | one entry changes | one lookup per component |
+
+**Recommended: `(parent directory id, name)`.** Renaming a directory with a
+billion descendants must not be a billion-record rewrite, and prefix scans still
+make listing cheap because keyed objects are sorted. The cost is a lookup per
+path component, bounded by path depth and highly cacheable.
+
+⚠️ Not decided.
+
+#### 5.5.5 Two dividends
+
+- **Metadata gets compression, erasure coding, and repair for free.** Object
+  metadata is highly repetitive — sibling paths, adjacent timestamps, identical
+  flavor and framing — so it should compress several-fold, and it is
+  erasure-coded once sealed. This materially shrinks the "metadata can exceed
+  data" problem of §14.2: true in logical bytes, much less true in physical ones.
+- **Billing metadata becomes measurable** rather than estimated, because it is
+  physical bytes in real objects (§12).
 
 ---
 
@@ -395,16 +564,16 @@ counts, which is why unkeyed inserts are confined to the object's end.
 
 ### 9.1 Unkeyed: locating record *N*
 
-1. **DN**: resolve the path, read the object metadata, binary search the stream
-   list on starting record number → stream *S* and a stream-local record number.
-2. **SN** holding *S*: binary search the extent list → extent *E* and an
+1. **DN**: resolve the path, read the object metadata, descend the stream B-tree
+   (§4.4) on starting record number → stream *S* and a stream-local record number.
+2. **SN** holding *S*: descend the extent B-tree → extent *E* and an
    extent-local record number; read *E*'s instance list.
 3. If *E* has a log, check it for a newer version or tombstone. If found, done.
 4. Otherwise binary search *E*'s sparse index → nearest preceding checkpoint.
 5. **EN**: read that granule from any instance, decrypt, decompress, parse
    forward by framing, stop at the target.
 
-Two binary searches, one small log probe, one index search, one granule read —
+Two B-tree descents, one small log probe, one index search, one granule read —
 but spread over three node types, so a cold point read costs **three round
 trips**. Sealed extents are immutable, which makes almost everything above
 cacheable at the client: the object's stream list changes only when the object
@@ -484,15 +653,28 @@ determines a customer's bill.
 
 Three regimes by size, which map cleanly onto the node types of §5:
 
-| Regime | When | Storage | Nodes used |
+| Regime | When | Storage | Streams and extents of its own |
 |---|---|---|---|
-| **Inline** | very small | records live inside the object's metadata record | **DN only** |
-| **Packed** | below half a max-sized extent | shares one extent with other objects; the extent carries a directory of its occupants | DN + SN + EN |
-| **Dedicated** | above that | its own streams and extents | DN + SNs + ENs |
+| **Inline** | very small | records live inside the object's metadata record | none |
+| **Packed** | below half a max-sized extent | shares one extent with other objects; the extent carries a directory of its occupants | shares |
+| **Dedicated** | above that | its own streams and extents | yes |
 
-That an inline object touches no SN and no EN at all is the main reason the
-three-tier split does not penalize the small case: a 30-record object is one DN
-record, with no stream, no extent, and no instance anywhere.
+**Self-hosting (§5.5) changes what "inline" means.** Since DN metadata is itself
+stored in DeLawson keyed objects, an inline object's records end up as bytes in a
+*metadata* extent on ENs. There is no "DN only" regime — nothing is stored
+outside the object hierarchy except the bootstrap root.
+
+The small-object win is real but differently explained: an inline object has no
+stream, extent, or instance **of its own**, and instead rides along in metadata
+extents shared with thousands of other objects' metadata. So inline is really a
+special case of packing, obtained for free — and with better locality than
+explicit packing, because an object's metadata and its records land in the same
+place.
+
+⚠️ This blurs the boundary between the inline and packed regimes. If inline
+already packs via the metadata object, what does the explicit packed regime add
+beyond a larger size bound? Possibly nothing, in which case two regimes suffice:
+inline-in-metadata, and dedicated. Worth resolving before either is built.
 
 The half-extent threshold guarantees a packed object never straddles an extent
 boundary: at most half of a maximum extent, at least two objects fit and any
@@ -533,8 +715,18 @@ This makes several internal choices customer-visible:
 - **Metering must be per-object over time** — physical bytes × instances ×
   duration — surviving failures and double-counting nothing during repair,
   re-encoding, and compaction, where old and new bases briefly coexist.
-- **DN metadata is not free.** If metadata can exceed data (§5.1), then whether
-  it is billed is not a rounding decision.
+- **The billed quantity is a lazy summary.** By §4.5, physical byte totals change
+  anywhere in the tree and so are maintained lazily by the background loops of
+  §13.1 — the exact, synchronous summary is the unkeyed record count, which
+  nobody is billed for. Billing therefore reads an eventually-consistent figure.
+  This is tolerable for metering integrated over a month, but it means a
+  customer's *instantaneous* usage query is either stale or must be answered by
+  summing live extent totals on the SNs on demand. Which of those is the
+  contract needs deciding.
+- **DN metadata is not free, and is now measurable.** If metadata can exceed
+  data in logical bytes (§14.2), whether it is billed is not a rounding
+  decision. Self-hosting (§5.5) makes it a real physical-byte figure rather than
+  an estimate — and compresses it several-fold on the way.
 
 ⚠️ Open policy questions, all customer-facing:
 
@@ -567,6 +759,39 @@ This makes several internal choices customer-visible:
 
 ⚠️ Membership, leader election, and how a stream is reassigned from a dead SN to
 a live one are undesigned.
+
+### 13.1 Background loops
+
+Everything the write path is not allowed to do synchronously has to happen
+somewhere. That somewhere is a set of **background garbage-collection loops**,
+and by now the design has accumulated a substantial list of work for them:
+
+| Work | Deferred from | Why it cannot be synchronous |
+|---|---|---|
+| Bringing lazy summaries forward | §4.5 | Byte totals change anywhere in the tree |
+| Compaction: fold logs into bases | §10 | Rewrites an extent; also reclaims garbage |
+| Erasure coding after sealing | §4.3 | Encoding a sealed extent takes time and bandwidth |
+| Dropping replicas once EC is verified | §4.3 | Must not race the encode |
+| Fragment reconstruction after EN loss | §13 | Must never block a write |
+| Scrubbing and checksum verification | §1.1 | Catches decay before it accumulates |
+| Reclaiming garbage in packed extents | §11 | A deleted packed object leaves a hole |
+| Encryption key rotation | §7.2 | Happens by rewriting during compaction |
+| Refreshing the DN's cached counters | §5.5.2 | Otherwise one metadata write per data write |
+| Rebuilding SN state from ENs | §5.2 | Disaster recovery, inherently slow |
+
+Two observations. First, most of these are *the same operation* — compaction
+rewrites an extent, and while rewriting it can re-encode, re-key, re-compress,
+change device class, and reclaim garbage in one pass. Scheduling them jointly
+rather than as independent loops is likely to matter.
+
+Second, the loops are how the design pays for the §4.5 rule. Deferring
+mid-tree summary maintenance is only sound if something eventually does it, and
+the lag is directly visible in billing (§12) and in any `count` on a keyed
+object.
+
+⚠️ Loop scheduling, prioritisation, and rate limiting are undesigned, and they
+compete with foreground traffic for exactly the resources — EN disk bandwidth
+and SN memory — that the foreground path needs.
 
 ---
 
@@ -630,12 +855,22 @@ The DN's problem is the opposite one. Object metadata runs to something like:
 
 For a 30-byte object that is **4.5× more metadata than data**. For a 200-byte
 object it is still ~68%. Multiply by an unbounded object count and the DN tier
-can exceed the EN tier in total size — which is why DN state is disk-backed and
-cached, not resident (§5.1).
+can exceed the EN tier in *logical* size — which is why DN state is disk-backed
+and cached, not resident (§5.1).
 
-The asymmetry is worth stating plainly: **SN state is bounded per stream by
-construction; DN state is bounded by nothing.** Only the DN tier has to be a
-paging, caching store.
+In *physical* bytes it is much less alarming, because self-hosting (§5.5) puts
+that metadata through the same pipeline as everything else. Object metadata is
+unusually compressible — sibling names share prefixes, timestamps cluster,
+flavor and framing repeat across every object in a directory — so at a
+conservative 4× and 6+3 erasure coding, ~136 logical bytes becomes ~34 physical
+bytes and ~51 billed. Compare a bare 4-replica copy of the same field set at
+544 bytes: **self-hosting makes the metadata tier roughly an order of magnitude
+cheaper than storing it uncompressed and replicated.**
+
+The asymmetry is still worth stating plainly: **SN state is bounded per stream
+by construction; DN state is bounded by nothing.** Only the DN tier has to be a
+paging, caching store — and, since §5.5, only the DN tier is stored in DeLawson
+itself.
 
 ### 14.3 What actually binds
 
@@ -675,43 +910,66 @@ That trade is real; it just lands well inside budget.
 
 Roughly in order of how much else depends on them.
 
-1. **Does DeLawson store DN metadata in DeLawson?** (§5.1) Self-hosting keyed
-   objects is attractive and creates a bootstrap and circular-failure problem.
-   Decides the shape of the whole DN tier.
-2. **SN state durability and reassignment** (§5.2, §13). Self-describing extents
-   make the extent list rebuildable from ENs; is that enough, or is a journal or
-   consensus group needed? How does a stream move to a live SN?
-3. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+1. **The bootstrap root**: what exactly it holds, and how it is made durable and
+   strongly consistent *outside* DeLawson (§5.5.1, §5.5.3). It must anchor the
+   key hierarchy as well as the object hierarchy.
+2. **SN state durability and reassignment** (§5.2, §4.4, §13). The stored list
+   and the served B-tree must be reconciled under failure: checkpoint, journal,
+   or rebuild by scanning ENs? How does a stream move to a live SN?
+3. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+   away, so this is now a write-amplification question only: keep the
+   authoritative count on the SN and let the DN cache it lazily, or accept one
+   metadata write per data write.
+4. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
    bounds the logs, and each costs EN replicas and network.
-4. **Directory semantics** (§5.1): path resolution, rename cost, listing huge
-   directories, permissions, quotas.
-5. **The extent metadata entry: measure it** (§14.1), and decide whether a keyed
-   extent's `first_key` fits or forces a bounded prefix.
-6. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
-   hurts compression ratio, and ratio is billable.
-7. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
-   its own pass.
-8. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
-   physical.
-9. **Packed-object billing attribution** (§11, §12) — per-object physical size is
-   not additive under shared-extent compression.
-10. **Billing policy** (§12): garbage, transient double footprint, metadata,
-    reporting granularity.
-11. **Key custody and hierarchy** (§7.2); customer-supplied keys?
-12. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+5. **Background loop scheduling** (§13.1): prioritisation and rate limiting
+   against foreground traffic, and whether the rewrite-shaped work — compaction,
+   re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
+6. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+   away, so this is now a write-amplification question only: keep the
+   authoritative count on the SN and let the DN cache it lazily, or accept one
+   metadata write per data write.
+7. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+   path, so directory rename stays O(1).
+8. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+   inline objects pack automatically inside metadata extents, which may leave the
+   explicit packed regime with nothing to add.
+9. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+   replicas retained rather than erasure-coded?
+10. **Remaining directory semantics** (§5.1): listing huge directories,
+    permissions, quotas.
+11. **The extent metadata entry: measure it** (§14.1), and decide whether a keyed
+    extent's `first_key` fits or forces a bounded prefix.
+12. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
+    hurts compression ratio, and ratio is billable.
+13. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+    its own pass.
+14. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+    physical.
+15. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+    not additive under shared-extent compression.
+16. **Billing policy** (§12): garbage, transient double footprint, metadata,
+    instantaneous-usage contract, reporting granularity.
+17. **Key custody and hierarchy** (§7.2); customer-supplied keys?
+18. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-13. **Compaction policy** (§10) — now partly a pricing decision.
-14. **Membership and leader election** (§13).
-15. Is `count` expected exact and cheap? Cumulative counts make it cheap, and
-    because update and tombstoned delete preserve count, exact for unkeyed
-    objects. For keyed objects it is a maintained statistic.
-16. `Nul` and `\0` framing were both listed originally and are folded together
+19. **Compaction policy** (§10) — now partly a pricing decision.
+20. **Membership and leader election** (§13).
+21. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-17. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+22. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
-**Closed** since earlier drafts: the unkeyed overwrite/addressing contradiction
-(§3); logical vs physical extent size, which is compression (§6); the metadata
-topology, now three explicit node types (§5); and the supposed 32 MB-vs-large-
-streams tension, based on a wrong constraint (§14.4).
+**Closed** since earlier drafts:
+
+- the unkeyed overwrite/addressing contradiction (§3);
+- logical vs physical extent size, which is compression (§6);
+- the metadata topology, now three explicit node types (§5);
+- whether the DN tier is self-hosted — it is, with a bootstrap root (§5.5);
+- whether summary maintenance can run away under self-hosting — it cannot, by
+  the tail-only rule (§4.5, §5.5.2);
+- whether `count` is exact and cheap — exact and synchronous for unkeyed
+  objects, lazy for keyed ones, again by §4.5;
+- the supposed 32 MB-vs-large-streams tension, based on a wrong constraint
+  (§14.4).
