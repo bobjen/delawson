@@ -104,13 +104,10 @@ A stream exists **purely for capacity striping** — no semantic distinction, no
 stream; streams are added as it grows.
 
 A stream is the granularity at which an object spreads across the cluster and
-at which extent metadata is partitioned. **Streams of 1 PB and larger are
-expected.** §13 shows that this expectation and the 32 MB physical extent limit
-of §5 are in tension.
-
-⚠️ Is a stream's size budget denominated in logical or physical bytes? With
-automatic compression the two differ by the compression ratio, so "1 PB
-stream" is ambiguous. §13 does the arithmetic in physical bytes.
+at which extent metadata is partitioned. **A stream's ceiling is set by keeping
+its whole extent list resident in one machine's RAM**: at ~100 B per extent
+entry, 256 GB of RAM holds ~2^31 extents, and 2^31 extents of 2^25 bytes each
+is **2^56 bytes = 64 PiB per stream**. See §13.
 
 ### 4.2 Extents: base plus log
 
@@ -124,16 +121,18 @@ Reads merge base and log, newest version winning. **Compaction** folds the log
 into a fresh base and drops the old pair (§9).
 
 **The log is created lazily.** An extent only ever appended to has no log and
-costs nothing for one. This matters more than it looks: with 32 MB extents a
-1 PB stream holds ~3 × 10^7 extents (§13), and if each eagerly carried an open,
+costs nothing for one. This matters more than it looks: a full stream holds
+~2^31 extents (§13), and if each eagerly carried an open,
 fully-replicated log, the cluster's open-extent count — the expensive,
 un-erasure-coded, in-memory-state-bearing kind — would dwarf its sealed extent
 count. For append-mostly objects almost no logs exist.
 
-⚠️ Even lazily, an update-heavy 1 PB stream can accumulate ~3 × 10^7 open logs.
-The smaller extents get, the worse this is. Options: share a log across
-neighbouring extents past a threshold, or bound open logs per stream and force
-compaction when the bound is hit.
+⚠️ Even lazily, an update-heavy full stream could want ~2^31 open logs — two
+billion replicated, un-erasure-coded extents in one stream. Lazy creation makes
+the append-only case free but does nothing for the update-heavy case, so open
+logs per stream need a hard bound, with forced compaction when it is hit.
+Unlike the extent list, open logs cost replicas and network, not just RAM, so
+their bound is far below 2^31.
 
 ### 4.3 Instances
 
@@ -442,108 +441,150 @@ Thinner than the rest — least determined so far.
 - **Durability** on write comes from replicating an append block to all open
   instances before acknowledging. Sealing is the commit point fixing content.
 - **Metadata** (object → streams, stream → extents, extent → instances) is
-  replicated state that must stay consistent under failure. This wants a small
-  consensus-replicated metadata service per stream or per object, not one
-  global one — §13 constrains which.
+  replicated state that must stay consistent under failure. §13.5 settles the
+  topology: because a stream's extent list is RAM-resident on one machine,
+  there is **one metadata server per stream**.
 - **Replica failure on an open extent**: seal short and open a new one. This
   removes replica repair from the write path entirely. Sealing short is cheap
   precisely because §5 makes extent size variable anyway.
 - **Repair** of sealed extents is background fragment reconstruction over
   ciphertext, never blocking a write, never needing keys.
 
-⚠️ Open: metadata service per stream, per object, or sharded globally.
+⚠️ Open: how a stream's extent list survives losing its machine — rebuilt by
+scanning extents, journalled, or consensus-replicated across a group.
 
 ---
 
 ## 13. Does the metadata fit? (sizing)
 
-This is the check that decides whether three levels suffice, and it is where
-the 32 MB physical limit does real damage.
+The check that decides whether three levels suffice. They do, comfortably —
+and the binding constraint turns out to be the width of the record number, not
+storage capacity at any level.
 
-Take the stated ceiling: 2^64 ≈ 1.845 × 10^19 records, at an average 100 logical
-bytes each — 1.845 ZB logical. At a 4× compression ratio that is **T ≈ 461 EB
-physical**. Physically unreachable, but addressing must still work, so use it.
+The governing rule: **a stream's extent list is RAM-resident on one machine.**
+That is what bounds a stream, and everything else follows from it.
 
-### 13.1 The trade
+### 13.1 One stream
 
-Let *P* be the physical extent size and *S* the physical stream size, with
-64-byte extent-list entries and 32-byte stream-list entries:
+Assume the worst case for capacity, `compressed = physical` (ratio 1×), so an
+extent's logical span equals its 2^25-byte (32 MB) physical size.
 
-- a stream's extent list is `64 · S / P`
-- the object's stream list is `32 · T / S`
+| Quantity | Value |
+|---|---|
+| Extent metadata entry | ~100 B — **a guess, to be measured** |
+| Extents in 256 GB of RAM | ~2^31 (≈214 GB) |
+| Extent logical span | 2^25 B |
+| **Stream ceiling** | 2^31 × 2^25 = **2^56 B = 64 PiB** |
 
-Shrinking *P* shrinks the per-extent sparse index (§8.3) but multiplies the
-number of extents, so the addressing information does not disappear — it moves
-up into the stream's extent list. Setting the two lists equal gives the balance
-point:
+Compression only helps: at 4× the same 2^31 extents span 256 PiB logical.
 
-  **S\* = √(T·P / 2)**, at which each level holds **64 · √(T / 2P)** bytes.
+**Sensitivity to the 100 B guess.** The stream ceiling scales inversely with
+the entry size, so the number to measure moves the answer — but not the
+conclusion:
 
-Metadata per level therefore scales as **1/√P**: making extents 128× smaller
-makes each index level ~11× larger.
+| Entry size | Extents in 256 GB | Stream ceiling | Streams for 2^64 records |
+|---|---|---|---|
+| 50 B | 2^32 | 128 PiB | ~12,800 |
+| 100 B | 2^31 | 64 PiB | ~25,600 |
+| 200 B | 2^30 | 32 PiB | ~51,200 |
+| 400 B | 2^29 | 16 PiB | ~102,400 |
 
-| Physical extent *P* | Optimal stream *S\** | Metadata per level |
-|---|---|---|
-| 32 MB | ~86 TB | ~172 MB |
-| 256 MB | ~243 TB | ~61 MB |
-| 1 GB | ~500 TB | ~30 MB |
-| 4 GB | ~1 PB | ~15 MB |
+Even at 400 B per entry the object's stream list is ~40 MB. The margin in §13.3
+is large enough that measuring 100 B as 2× or 4× off changes nothing
+structural — it only shifts how many streams a maximal object needs.
 
-### 13.2 The tension
+### 13.2 The three levels, at full scale
 
-Two stated intentions do not sit together:
+| Level | Entries | Entry | Total | Where it lives |
+|---|---|---|---|---|
+| Extent sparse index | ~32 (1 MB granule) | 8 B | ~256 B | with the extent |
+| Stream's extent list | 2^31 | 100 B | ~214 GB | one machine's RAM |
+| Object's stream list | ~25,000 | 100 B | ~2.5 MB | trivially anywhere |
 
-- **Streams of 1 PB and larger** (§4.1)
-- **32 MB physical extents** (§5)
+The object's stream list is the striking number. To hold 2^64 records at 100
+bytes each — 1.845 ZB — an object needs 1.845 ZB / 64 PiB ≈ **25,600 streams**,
+a 2.5 MB list. Three orders of magnitude below anything difficult.
 
-At 1 PB per stream and 32 MB extents, a stream holds ~3.1 × 10^7 extents and its
-extent list is **~2 GB** — too large to hold comfortably in a consensus-replicated
-metadata service, and paying for it means paging the extent list, which is a
-fourth level in disguise.
+So the shape is lopsided by design: an enormous per-stream list on a dedicated
+machine, and a tiny per-object list pointing at a few thousand of those
+machines. "The object needs a list of huge streams" is exactly right.
 
-The table shows the two intentions are consistent only around **P ≈ 4 GB**,
-where the optimal stream size lands almost exactly on 1 PB and both index
-levels sit at a comfortable ~15 MB. That is very likely where the 1 PB
-expectation came from.
+### 13.3 What actually binds
 
-So one of three things has to give:
+Two independent ceilings:
 
-1. **Raise the physical limit** toward 256 MB–1 GB, accepting costlier
-   compaction and coarser repair, and bringing metadata to 30–60 MB per level.
-2. **Shrink streams** to ~86 TB, accepting ~172 MB per level and ~5 × 10^6
-   streams per full object, and dropping the 1 PB expectation.
-3. **Add a level** — page or stripe the extent list — and keep both 32 MB
-   extents and 1 PB streams.
+- **Record number**: 2^64 records, from the 8-byte record number.
+- **Capacity**: if the object's stream list is also allowed ~2^31 entries, then
+  2^31 streams × 2^56 B = **2^87 bytes**.
 
-Bob called 32 MB an initial guess, so (1) is the natural first move; but note
-that the 8 MB seek-amortization floor argues from below and this argues from
-above, which together bracket the physical limit rather than pinning it.
+These meet at an average record size of 2^87 / 2^64 = 2^23 = **8 MB**. Below 8 MB
+average, the record number runs out first; above it, byte capacity does.
 
-**Three levels are enough only for large extents and large streams.** The
-32 MB guess breaks that, mildly at 86 TB streams and badly at 1 PB streams.
+Since records are expected to average nearer 100 bytes than 8 MB, **the 8-byte
+record number is the binding constraint by a factor of ~10^5** — the object
+exhausts its record numbers long before any list approaches its maximum size.
+The three-level structure is not close to strained; the address space is.
+
+### 13.4 Correction to an earlier version of this section
+
+An earlier draft argued that 32 MB extents and large streams were in tension,
+concluding the physical extent limit had to rise toward 4 GB. That was wrong,
+and wrong in an instructive way: it assumed a stream's extent list had to stay
+in the tens of megabytes, sized for cheap consensus replication. The real
+constraint is one machine's RAM, roughly 10^4 times larger, which dissolves the
+problem. The 32 MB physical limit stands, and the tension does not exist.
+
+What survives from that analysis is only the observation that shrinking extents
+moves addressing information up from the extent's sparse index into the
+stream's extent list. That trade is real; it just lands well inside budget.
+
+### 13.5 Consequences
+
+- **The metadata topology is decided by this section**, not chosen freely: one
+  RAM-resident extent list per stream means **one metadata server (or
+  replicated group) per stream**. §12's open question is answered.
+- **Losing a stream's metadata machine is losing 64 PiB of addressing.** The
+  extent list must be durable and recoverable independently of the RAM copy —
+  reconstructible by scanning extents, or journalled, or both.
+- ⚠️ **The ~100 B entry is tight, and may not fit keyed extents.** For an
+  unkeyed extent the entry must hold an extent id, the starting record number,
+  cumulative logical and physical bytes, flags, and the instance or fragment
+  locations — roughly 4 × 16 B for four instances plus ~40 B of the rest, so
+  ~100 B with little slack. A keyed extent additionally needs a `first_key`,
+  which is variable-length and user-supplied. Either the entry grows (and the
+  stream ceiling falls proportionally), or the list stores a bounded key prefix
+  and resolves ambiguity by reading the extent.
+- ⚠️ 2^31 extents per stream also means up to 2^31 potential logs (§4.2). RAM
+  bounds the extent list; nothing yet bounds the open logs.
 
 ---
 
 ## 14. Open questions
 
-1. **Physical extent size vs stream size vs level count** (§13) — the sharpest
-   open question, since 32 MB extents and 1 PB streams are not jointly
-   affordable at three levels.
-2. **Compression block size vs index granularity** (§6.1). A 20 KB SSD granule
+Roughly in order of how much else depends on them.
+
+1. **Bounding open logs per stream** (§4.2). RAM bounds the extent list at
+   ~2^31; nothing yet bounds the logs, and each one costs replicas and network.
+   The only unresolved scaling question left in the structure.
+2. **Durability of a stream's extent list** (§12, §13.5) — losing that machine
+   loses 64 PiB of addressing. Rebuild by scanning, journal, or replicate?
+3. **The extent metadata entry: measure it** (§13.1). 100 B is a guess. Also
+   whether a keyed extent's variable-length `first_key` fits, or forces a
+   bounded prefix (§13.5).
+4. **Compression block size vs index granularity** (§6.1). A 20 KB SSD granule
    hurts compression ratio, and ratio is billable.
-3. **Log count under update-heavy load** (§4.2) — worse the smaller extents get.
-4. **Are stream size budgets logical or physical?** (§4.1)
-5. **The packing threshold** (§10) — half of *which* maximum? Presumably ~16 MB
+5. **Keyed objects** generally — the split-on-overflow B-tree shape of §9 needs
+   its own pass.
+6. **The packing threshold** (§10) — half of *which* maximum? Presumably ~16 MB
    physical.
-6. **Packed-object billing attribution** (§10, §11) — per-object physical size
+7. **Packed-object billing attribution** (§10, §11) — per-object physical size
    is not additive under shared-extent compression.
-7. **Billing policy** (§11): garbage, transient double footprint, metadata,
+8. **Billing policy** (§11): garbage, transient double footprint, metadata,
    reporting granularity.
-8. **Key custody and hierarchy** (§6.2); customer-supplied keys?
-9. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
-   keep a full replica?
-10. **Compaction policy** (§9) — now partly a pricing decision.
-11. **Metadata service topology** (§12).
+9. **Key custody and hierarchy** (§6.2); customer-supplied keys?
+10. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+    keep a full replica?
+11. **Compaction policy** (§9) — now partly a pricing decision.
 12. Is `count` expected exact and cheap? Cumulative counts make it cheap, and
     because update and tombstoned delete preserve count, exact for unkeyed
     objects. For keyed objects it is a maintained statistic.
@@ -552,3 +593,8 @@ above, which together bracket the physical limit rather than pinning it.
 14. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
+
+**Closed** since earlier drafts: the unkeyed overwrite/addressing contradiction
+(§3); logical vs physical extent size, which is compression (§5); metadata
+service topology, forced by §13.5; and the supposed 32 MB-vs-large-streams
+tension, which was based on a wrong constraint (§13.4).
