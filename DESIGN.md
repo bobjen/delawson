@@ -186,13 +186,20 @@ middle are cheap**, which is what keyed objects need (§10) and what a flat
 sorted array cannot give.
 
 So an SN loads a stream's extent list from disk into a B-tree on assignment, and
-serves from the tree; the list on disk is the durable record, brought up to date
-from the tree.
+serves from the tree.
 
-⚠️ The relationship between the two forms under failure is not designed: whether
-the tree is checkpointed back to a list periodically, journalled per mutation, or
-simply rebuilt by scanning. This is the same question as SN durability (§5.2)
-seen from the other side.
+Because SNs and DNs are Raft rings (§5), the two forms fall into the standard
+consensus arrangement, and the relationship between them is not a new problem:
+
+| Form | Raft role |
+|---|---|
+| Stored list on disk | **snapshot** |
+| Raft log | **journal** of mutations since the snapshot |
+| In-memory B-tree | **state machine** |
+
+Recovery is snapshot-then-replay, snapshotting truncates the log, and a new ring
+member catches up by shipping the list and replaying. Scanning ENs to rebuild
+(§5.2) sits behind all of this as a last resort.
 
 ### 4.5 Which summaries may be kept exact
 
@@ -232,17 +239,25 @@ write path.
 The logical levels of §4 do not all live in the same place. Splitting them is a
 reliability requirement, not an optimization (§1.1).
 
-| Node | Holds | Why separate |
-|---|---|---|
-| **DN** — Directory Node | The directory hierarchy and user object metadata, including each object's stream list, and inline records for tiny objects | User metadata can exceed the data itself; it is a distinct workload with a distinct size |
-| **SN** — Stream Node | Per stream: the extent list. Per extent: the instance list | Must not sit with the bytes it maps |
-| **EN** — Extent Node | Extent instances: contiguous blocks of bytes on disk | The bytes themselves; the only tier that scales with raw capacity |
+| Node | Holds | Replication | Why separate |
+|---|---|---|---|
+| **DN** — Directory Node | The directory hierarchy and user object metadata, including each object's stream list, and inline records for tiny objects | **Raft ring** | User metadata can exceed the data itself; a distinct workload with a distinct size |
+| **SN** — Stream Node | Per stream: the extent list. Per extent: the instance list | **Raft ring** | Must not sit with the bytes it maps |
+| **EN** — Extent Node | Extent instances: contiguous blocks of bytes on disk | none — instance placement *is* its redundancy | The bytes themselves; the only tier that scales with raw capacity |
 
 ```
 client ──▶ DN            resolve path → object metadata → which stream?
        ──▶ SN            which extent? → which instances?
        ──▶ EN            the bytes
 ```
+
+The asymmetry in the replication column is the heart of the design. **Metadata is
+made reliable by consensus; bulk data is made reliable by placement.** Consensus
+is the right tool for small mutable state that must be exactly right, and the
+wrong tool for petabytes — so DNs and SNs are Raft rings, while an extent's
+redundancy comes from having several independently-placed instances (§4.3) and,
+once sealed, erasure coding. Both mechanisms nonetheless need members placed in
+independently-failing domains, which is why §5.6 serves both.
 
 ### 5.1 DNs — Directory Nodes
 
@@ -285,18 +300,27 @@ What must *not* be co-located is either of them with the instances themselves.
 That separation is the reliability requirement of §1.1: an EN failure destroys
 bytes, and the map to the surviving copies has to outlive it.
 
-A stream's ceiling is what one SN can hold (§14). A maximal object therefore
-spreads its streams over many SNs — necessarily, since no single machine can
-hold them all.
+A stream's ceiling is what one SN ring member can hold (§14.1). A maximal object
+therefore spreads its streams over many SNs — necessarily, since no single
+machine can hold them all.
 
-⚠️ **Losing an SN makes its streams unaddressable even though every EN is
-healthy.** SN state must therefore be durable independently of the serving copy.
-The natural mechanism: make every extent instance **self-describing** — each
-carries a header with its extent id, stream id, starting record number, and
-byte totals — so an SN's extent list is reconstructible by scanning ENs. That
-turns SN state into a cache of a truth that lives redundantly on the ENs, at
-the cost of a slow rebuild. Whether that is sufficient, or whether SN state also
-needs a journal or a consensus group, is open.
+**An SN is a Raft ring, not a machine.** Losing one member costs nothing but
+capacity headroom; the extent list survives in the remaining members, and leader
+election is Raft's problem rather than DeLawson's. Ring members are placed in
+independently-failing domains by §5.6, for the same reason extent instances are.
+
+Note what this means for §14.1: each member holds the *whole* extent list, so the
+stream ceiling is set by one member's RAM, and the ring multiplies cost rather
+than capacity.
+
+**Self-describing extents remain worth having as a backstop.** Each instance
+should carry a header with its extent id, stream id, starting record number, and
+byte totals, so that an extent list is reconstructible by scanning ENs. With a
+Raft ring this is no longer the primary durability mechanism — it is the recovery
+path for losing a whole ring at once, which is exactly the correlated failure
+§5.6 exists to make unlikely but cannot make impossible. It also gives an
+independent check on the ring's state, which matters most for the metadata tier
+(§5.5.3).
 
 ### 5.3 ENs — Extent Nodes
 
@@ -307,18 +331,19 @@ capacity, and the only tier that erasure coding and repair touch.
 Because ENs hold ciphertext (§7), repair, re-encoding, and scrubbing all run
 without key access.
 
-### 5.4 Two independent spreading requirements
-
-At different levels, for different reasons:
+### 5.4 Three spreading requirements, of two kinds
 
 | Requirement | Level | Reason |
 |---|---|---|
 | Instances of one extent on ENs in distinct failure domains | extent → instances | Reliability and availability (§1.1) |
+| Members of one Raft ring in distinct failure domains | SN and DN rings | A ring whose members fail together is not a ring |
 | Streams of one object on distinct SNs | object → streams | Capacity: no machine holds them all |
 
-The first is about correlated loss; the second is about arithmetic. Conflating
-them would be a mistake — a placement policy good for one is not automatically
-good for the other.
+The first two are the same problem — place *n* things so they fail
+independently — and are solved by one mechanism, §5.6. The third is arithmetic,
+not reliability, and conflating it with the others would be a mistake: a
+placement policy good for correlated-loss avoidance is not automatically good
+for spreading capacity.
 
 ### 5.5 The DN tier is self-hosted
 
@@ -434,6 +459,74 @@ path component, bounded by path depth and highly cacheable.
   data" problem of §14.2: true in logical bytes, much less true in physical ones.
 - **Billing metadata becomes measurable** rather than estimated, because it is
   physical bytes in real objects (§12).
+
+### 5.6 Failure domains and placement
+
+Reliability (§1.1) requires instances that fail independently. A Raft ring wants
+the same thing for a different reason: a ring whose members fail together is not
+a ring. **Extent-instance placement and ring-member placement are therefore one
+problem**, and one mechanism should serve both.
+
+#### 5.6.1 Slack
+
+To place *n* independent things, use a failure-domain type that has at least
+**slack × n** domains. Slack is configurable; the default is **4/3**.
+
+| *n* | Domains required |
+|---|---|
+| 3 instances | 4 |
+| 4 instances | 6 |
+| 5-member ring | 7 |
+| 7-member ring | 10 |
+
+With exactly *n* domains there is no freedom at all: one domain down — planned
+or not — and there is nowhere to put a replacement, so the group stays degraded
+until that domain comes back. Slack buys somewhere to re-place, which is what
+turns repair from *waiting* into *work*.
+
+#### 5.6.2 Nested, not orthogonal
+
+Domain types must be **nested** — each a refinement of the one above, forming a
+single hierarchy. Cross-cutting, orthogonal domain types are **a bug**.
+
+The cost of getting this wrong, using 3 instances with 4 power domains and 4
+software-deployment domains:
+
+| | Where instance 3 may go | Fraction of cluster |
+|---|---|---|
+| **Orthogonal** (a 4×4 grid) | must differ from both predecessors in power *and* software: 2 powers × 2 softwares = 4 of 16 cells | **1/4** |
+| **Nested** (software within power) | satisfying the coarse constraint satisfies the fine one automatically: 2 of 4 power domains | **1/2** |
+
+The general shape: with *d* orthogonal types of *k* domains each, the *i*-th
+instance may be placed in `((k−i+1)/k)^d` of the cluster; nested, it is
+`(k−i+1)/k` **regardless of d**. For the case above the sequence is
+1, 0.75, 0.5 nested against 1, 0.5625, 0.25 orthogonal.
+
+**Orthogonality costs an exponent.** That is not merely inelegant: shrinking the
+candidate set slows repair, worsens balance, and can make placement impossible
+in a cluster that is already partly degraded — exactly when placement matters
+most. Nesting keeps the constraint linear no matter how many domain types are
+added, which means new domain types (a new firmware tier, a new network fabric)
+can be introduced without compounding cost.
+
+#### 5.6.3 What nesting costs
+
+**Planned disruptions must be serialized.** Software deployments and large
+planned outages cannot run at the same time.
+
+⚠️ The placement arithmetic above is verified; this operational constraint is
+asserted from experience and its precise argument should be written out before
+anyone relies on it. The mechanism appears to be that nesting collapses every
+domain type onto one hierarchy, so "at most one domain intentionally down"
+becomes a single global budget shared by every kind of planned work, rather than
+one budget per orthogonal dimension.
+
+#### 5.6.4 A concession that is a known defect
+
+⚠️ Orthogonal software-deployment domains may be supported anyway, because that
+is how clusters are built today. This is a compatibility concession and a known
+defect, not a design choice, and it should be labelled as such wherever it is
+configurable — it costs the exponent in §5.6.2.
 
 ---
 
@@ -751,14 +844,21 @@ This makes several internal choices customer-visible:
   precisely because §6 makes extent size variable anyway.
 - **EN failure on a sealed extent**: background fragment reconstruction over
   ciphertext, never blocking a write, never needing keys.
-- **SN failure**: the streams it served are unaddressable until recovered, even
-  with every EN healthy — see §5.2. This is the most serious single-node failure
-  in the design.
-- **DN failure**: objects under it are unreachable; the directory hierarchy needs
-  its own replication story, which depends on the self-hosting question in §5.1.
+- **SN or DN member failure**: absorbed by the Raft ring (§5). Leader election and
+  log catch-up are Raft's; the loss costs headroom, not availability, provided
+  members were placed per §5.6.
+- **Loss of a whole SN ring**: the streams it served are unaddressable even with
+  every EN healthy. This is now the worst failure in the design, and §5.6 exists
+  precisely to make it improbable — a ring is only as independent as its
+  placement. The recovery path is scanning ENs for self-describing extents (§5.2).
+- **Loss of a whole DN ring**: worse, because of self-hosting (§5.5.3) — recovery
+  must start from the bootstrap root and rebuild the metadata tier first.
 
-⚠️ Membership, leader election, and how a stream is reassigned from a dead SN to
-a live one are undesigned.
+⚠️ How a stream is reassigned from a failed ring to a fresh one, and how cluster
+membership and domain topology are themselves distributed, are undesigned. Note
+the topology is not static: §5.6 depends on knowing the domain hierarchy, so that
+hierarchy is itself critical configuration that has to live somewhere reliable —
+plausibly the bootstrap root (§5.5.1).
 
 ### 13.1 Background loops
 
@@ -777,7 +877,9 @@ and by now the design has accumulated a substantial list of work for them:
 | Reclaiming garbage in packed extents | §11 | A deleted packed object leaves a hole |
 | Encryption key rotation | §7.2 | Happens by rewriting during compaction |
 | Refreshing the DN's cached counters | §5.5.2 | Otherwise one metadata write per data write |
-| Rebuilding SN state from ENs | §5.2 | Disaster recovery, inherently slow |
+| Re-placing instances and ring members | §5.6 | Restoring domain independence after a loss |
+| Raft snapshotting | §4.4 | Truncating the log must not block mutations |
+| Rebuilding a ring's state from ENs | §5.2 | Disaster recovery, inherently slow |
 
 Two observations. First, most of these are *the same operation* — compaction
 rewrites an extent, and while rewriting it can re-encode, re-key, re-compress,
@@ -913,51 +1015,57 @@ Roughly in order of how much else depends on them.
 1. **The bootstrap root**: what exactly it holds, and how it is made durable and
    strongly consistent *outside* DeLawson (§5.5.1, §5.5.3). It must anchor the
    key hierarchy as well as the object hierarchy.
-2. **SN state durability and reassignment** (§5.2, §4.4, §13). The stored list
-   and the served B-tree must be reconciled under failure: checkpoint, journal,
-   or rebuild by scanning ENs? How does a stream move to a live SN?
-3. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+2. **Ring reassignment and cluster topology** (§13). How a stream moves from a
+   failed ring to a fresh one, and where the failure-domain hierarchy that §5.6
+   depends on is stored — plausibly the bootstrap root, since placement decisions
+   cannot be made without it.
+3. **Why nesting forces serialized planned disruptions** (§5.6.3) — the
+   arithmetic is verified but this operational constraint is asserted, and it
+   determines how the cluster is actually operated.
+4. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+   DN ring, and does the 4/3 default hold for both?
+5. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
    away, so this is now a write-amplification question only: keep the
    authoritative count on the SN and let the DN cache it lazily, or accept one
    metadata write per data write.
-4. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+6. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
    bounds the logs, and each costs EN replicas and network.
-5. **Background loop scheduling** (§13.1): prioritisation and rate limiting
+7. **Background loop scheduling** (§13.1): prioritisation and rate limiting
    against foreground traffic, and whether the rewrite-shaped work — compaction,
    re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-6. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+8. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
    away, so this is now a write-amplification question only: keep the
    authoritative count on the SN and let the DN cache it lazily, or accept one
    metadata write per data write.
-7. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+9. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
    path, so directory rename stays O(1).
-8. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
-   inline objects pack automatically inside metadata extents, which may leave the
-   explicit packed regime with nothing to add.
-9. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
-   replicas retained rather than erasure-coded?
-10. **Remaining directory semantics** (§5.1): listing huge directories,
+10. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+    inline objects pack automatically inside metadata extents, which may leave the
+    explicit packed regime with nothing to add.
+11. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+    replicas retained rather than erasure-coded?
+12. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-11. **The extent metadata entry: measure it** (§14.1), and decide whether a keyed
+13. **The extent metadata entry: measure it** (§14.1), and decide whether a keyed
     extent's `first_key` fits or forces a bounded prefix.
-12. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
+14. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
     hurts compression ratio, and ratio is billable.
-13. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+15. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-14. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+16. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-15. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+17. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-16. **Billing policy** (§12): garbage, transient double footprint, metadata,
+18. **Billing policy** (§12): garbage, transient double footprint, metadata,
     instantaneous-usage contract, reporting granularity.
-17. **Key custody and hierarchy** (§7.2); customer-supplied keys?
-18. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+19. **Key custody and hierarchy** (§7.2); customer-supplied keys?
+20. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-19. **Compaction policy** (§10) — now partly a pricing decision.
-20. **Membership and leader election** (§13).
-21. `Nul` and `\0` framing were both listed originally and are folded together
+21. **Compaction policy** (§10) — now partly a pricing decision.
+22. **Membership and leader election** (§13).
+23. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-22. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+24. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
