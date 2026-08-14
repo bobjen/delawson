@@ -31,6 +31,15 @@ Nothing in the system holds a per-record index. Locating record *N* is three
 binary searches over cumulative counts, then one device-sized read and a short
 forward scan. That is what makes 2^64 records addressable.
 
+Those levels are split across three node types, because the map to an extent
+must not die with the extent:
+
+```
+DN  Directory Node   directory hierarchy, object metadata, inline tiny objects
+SN  Stream Node      extents per stream, instances per extent
+EN  Extent Node      the bytes on disk
+```
+
 ## Two object flavors
 
 - **Sequential** — variable-length records, appended only at the end,
