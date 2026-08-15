@@ -326,7 +326,61 @@ This is why the §4 diagram puts the cumulative counts on the *entries* rather t
 the objects they point at. That was arbitrary-looking before sharing existed; it is
 forced now.
 
-#### 4.6.3 Reference width brackets the record size from below
+#### 4.6.3 Identity: ownership is part of the name
+
+Each level is **owned** by the tier above the bytes, and the owner is part of the
+identifier rather than a field beside it:
+
+| Thing | Owner | Full identifier |
+|---|---|---|
+| Stream | a DN | `(DnId, StreamId)` |
+| Extent | an SN | `(SnId, ExtentId, creation second)` |
+
+Extents are not guids. A full extent id is 12 bytes against a guid's 16, and **inside
+the owning SN the `SnId` is implicit, so it costs 8** — exactly the extent-id field
+already in the record (§5.10.4).
+
+When an extent is shared across DNs, that happens **through two different streams**;
+sharing is always mediated by the stream level, so an extent never has two owners.
+
+**Why the creation timestamp.** It makes an `ExtentId` reusable without ambiguity. A
+stale reference carrying an old second cannot match a new extent that reused the
+number, which is the §5.10.4 naming-lifecycle problem solved by incarnation rather
+than by refcounting — and solved with a clock instead of a persisted counter, so it
+survives restarts for free and is legible when debugging.
+
+Two safety requirements come with it:
+
+- ⚠️ **An `ExtentId` must not be reused within the same second.** Cycle time is no
+  help here — at any plausible creation rate the 2^32 id space takes days to years to
+  wrap — so the hazard is purely an allocator handing the same number out twice in one
+  second. That argues for a FIFO or least-recently-used free list rather than
+  lowest-free allocation.
+- ⚠️ **The issued second must never go backward**, or an NTP correction could
+  manufacture a collision. The SN should keep the last second it issued in its Raft
+  state and refuse to regress.
+
+A 4-byte second counter spans ~136 years from its epoch, which outlasts the hardware.
+
+##### Two questions this settles
+
+- **Who may authorize deleting a stream** (§13.1.5). The `DnId` *is* part of the
+  stream's name, so a stream has exactly one owning DN by construction, not by
+  convention. That is the safe form recommended there, obtained for free.
+- **Key derivation is now stable against reassignment** (§7.3.3). Extent keys derive
+  from the daily SN-master key of the SN that *created* the extent, and both the `SnId`
+  and the day are immutable parts of the extent's name. Moving a stream to another ring
+  cannot orphan its keys. Note the consequence: whoever decrypts must derive from the
+  extent's own `SnId`, not from the SN currently serving the stream.
+- The creation second also **subsumes the separate day index** §7.3.3 budgeted, since
+  the day is the second divided by 86,400. One field, two jobs.
+
+⚠️ Streams have no creation timestamp in this scheme, so `(DnId, StreamId)` is exposed
+to exactly the stale-reference hazard the extent timestamp prevents. Stream churn is
+far lower, so the pressure is milder — but the hazard is the same shape, and the
+asymmetry looks unintentional. Worth confirming.
+
+#### 4.6.4 Reference width brackets the record size from below
 
 The 4-byte extent reference caps a machine at 2^32 extents, and the extent budget of
 §14.1 is 171 GB, so:
@@ -981,14 +1035,16 @@ once per table rather than once per reference.
 
 | Field | Bytes |
 |---|---|
-| extent id | 8 |
+| extent id — `ExtentId` (4) + creation second (4), `SnId` implicit (§4.6.3) | 8 |
 | starting record number | 8 |
 | cumulative logical bytes | 8 |
 | cumulative physical bytes | 8 |
-| day index (§7.3.3) | 2 |
 | key generation and flags | 2 |
 | 4 × instance reference (2 B local EN index + 1 B disk + 3 B slot) | 24 |
-| **Total** | **60 B** |
+| **Total** | **58 B** |
+
+The day index §7.3.3 needs for key derivation is not a separate field: the creation
+second already carries it.
 
 The same argument applies to any reference whose fan-out is bounded: DN and FE
 references from an SN are likewise ≤20,000, so they too are 2-byte local indices.
@@ -1193,20 +1249,21 @@ Consequences worth being explicit about:
 
 #### 7.3.3 What the extent entry must record
 
-Deriving an extent's key needs the *correct* daily SN-master key, so the extent
-must say which one. A **day index** is enough and is cheap: 2 bytes covers 179
-years, 3 bytes covers far more than the hardware will last.
+Deriving an extent's key needs the *correct* daily SN-master key — the right day, and
+the right SN. **The extent's own identifier supplies both, at no extra cost.** A full
+extent id is `(SnId, ExtentId, creation second)` (§4.6.3), so:
 
-⚠️ It must also identify the SN scope — and that has a trap. If derivation keys on
-*which ring currently serves the stream*, then reassigning a stream to a different
-ring (§13) orphans every key for its existing extents. **Derivation must use a
-stable identifier**, the stream id rather than the current assignment, or
-reassignment must carry the old scope forward explicitly.
+- the **day** is the creation second divided by 86,400 — no separate day-index field;
+- the **SN scope** is the `SnId` of the SN that *created* the extent.
 
-⚠️ These bytes land in the ~100 B extent entry that §14.1 already calls tight, and
-§14.1 shows the stream list grows as the *square* of that entry size. A day index
-is a few bytes and cheap; it is worth counting deliberately rather than discovering
-later.
+Both are immutable parts of the extent's name, which closes a trap an earlier draft
+flagged: if derivation had keyed on *which ring currently serves the stream*, then
+reassigning a stream (§13) would orphan every key for its existing extents. Naming the
+creating SN makes derivation stable against reassignment by construction.
+
+⚠️ The consequence is that **whoever decrypts must derive from the extent's own `SnId`,
+not from the SN serving it.** After a reassignment those differ, and a cache keyed on
+the serving SN would fetch the wrong master key.
 
 #### 7.3.4 What this hierarchy does not give
 
@@ -1748,7 +1805,7 @@ figures** — 100 B and 200 B — even though the fields itemized so far reach o
 (§5.10.4), because flags, timestamps and fields nobody has identified yet will consume
 the headroom. Budget and spend deliberately; do not re-baseline on each increment.
 
-| Extent record | Extents per SN | One-stream ceiling | Share of the 4-byte reference (§4.6.3) |
+| Extent record | Extents per SN | One-stream ceiling | Share of the 4-byte reference (§4.6.4) |
 |---|---|---|---|
 | 40 B | 4.3 × 10^9 | 128 PiB | 99% — the floor |
 | 60 B — itemized so far | 2.8 × 10^9 | 85 PiB | 66% |
@@ -1974,10 +2031,9 @@ Roughly in order of how much else depends on them.
 11. **How widely an SN's streams spread across DNs** (§13.1.2). It swings the DN→SN
     digest from 0.4 MB to 85 MB per pair, and it is not determined by anything decided
     so far.
-12. **Who may authorize deleting a stream** (§13.1.5). One DN's silence is not proof
-    that nobody references a shared stream, and a wrong deletion destroys live data.
-    An owning DN per stream is the recommendation; it constrains how stream sharing
-    works (§4.6.1).
+12. **Should streams carry a creation timestamp too?** (§4.6.3) Extents do, which
+    makes their ids safely reusable; `(DnId, StreamId)` has no such protection against
+    stale references. Lower churn makes it milder, not absent.
 13. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
@@ -2055,4 +2111,8 @@ Roughly in order of how much else depends on them.
 - whether `count` is exact and cheap — exact and synchronous for unkeyed
   objects, lazy for keyed ones, again by §4.5;
 - the supposed 32 MB-vs-large-streams tension, based on a wrong constraint
-  (§14.4).
+  (§14.4);
+- who may authorize deleting a stream — the `DnId` is part of the stream's name, so
+  there is exactly one owning DN by construction (§4.6.3);
+- whether key derivation survives stream reassignment — it does, because the extent
+  names its creating SN and its creation day (§4.6.3, §7.3.3).
