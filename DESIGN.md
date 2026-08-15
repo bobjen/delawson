@@ -40,6 +40,10 @@ that will accept any of them. Reliability wants instances whose permanent-loss
 events are independent, plus background repair and scrubbing to catch decay
 before it accumulates.
 
+Availability is also promised **per record, not per object** — a large object spans too many
+rings to be wholly reachable at one instant, while any single record is unaffected by how big
+its object is (§5.11.2).
+
 Both push the same way on one point, and it is the origin of the machine types in
 §5: **instances of an extent must sit in places that fail independently, and
 the metadata describing an extent must not sit with the extent's own data.** A
@@ -1384,6 +1388,82 @@ now want deciding together.
 
 ---
 
+### 5.11 Fullness is handled by redirecting writes, never by moving data
+
+Every tier fills up eventually, and the design's answer is the same at each: **stop writing
+there and let the existing contents age out.** Nothing is relocated to make room.
+
+| Tier fills | Response | Movement required |
+|---|---|---|
+| **EN** | Its weight in the free-space table falls to zero, so placement stops choosing it (§5.6.3) | **none — automatic** |
+| **SN** | The DN directs *new streams* for that range to a different SN | **none** |
+| **DN range** | Split the range, or rebalance | **yes — but metadata only** |
+
+The EN case needs no mechanism at all: free-space weighting already stops writing to a full
+disk, because a disk with no free bytes has no weight. Fullness handling and load balancing
+are the same code.
+
+The SN case needs one fact tracked — **the DN knows how full its SNs are** — and then
+redirection is a placement decision for new streams. Existing streams on the full SN may
+still grow, but growth of existing streams is minor next to the creation of new ones, so the
+redirect is effective almost immediately. Eventually those streams age out and the SN
+recovers capacity without anything being copied.
+
+Only the DN range case forces movement. And note where it lands: **movement is required
+exactly where it is cheapest.**
+
+| | Volume | Medium | Movement needed? |
+|---|---|---|---|
+| EN | bulk data, PB per machine | disk | never |
+| SN | metadata, 256 GB per machine | **RAM** — ~5,000× disk (§12.2) | never |
+| DN | metadata | disk | **yes** |
+
+The requirement to move is *inversely* correlated with the cost of moving. Splitting a DN
+range is a metadata operation on disk-resident state, and it reuses the split machinery keyed
+objects already need (§10). Had the SN tier been the one requiring rebalancing, it would have
+meant relocating RAM-resident state — the most expensive bytes in the system.
+
+#### 5.11.1 Default locality, and why
+
+**User ranges map to a DN, and the DN maps them to an SN**, so by default **objects in the
+same directory land on the same SN.** That is deliberate: it minimizes the number of rings a
+directory depends on.
+
+A directory whose objects sit on one DN and one SN is unavailable only if one of *two* rings
+is down. Spread the same objects across a hundred SNs and it is unavailable if any of a
+hundred and one is:
+
+| Rings depended on | *p* = 10^-5 per ring | *p* = 10^-6 |
+|---|---|---|
+| 2 (default locality) | 2 × 10^-5 | 2 × 10^-6 |
+| 101 (spread over 100 SNs) | 1 × 10^-3 | 1 × 10^-4 |
+
+Fifty times worse, for no benefit — the capacity is the same either way. Spreading is
+something to do when *forced* by size, not by default.
+
+#### 5.11.2 Whole-object availability degrades with size; per-record does not
+
+The corollary is uncomfortable and worth stating plainly. A large object is forced to span
+many SNs (§14.1), so its dependency set grows with it:
+
+| Operation | Rings touched | Depends on object size? |
+|---|---|---|
+| Read one record | 1 DN + 1 SN + its ENs | **no** |
+| Read the whole object | every SN it spans | **yes, linearly** |
+
+At any plausible ring availability, **a maximal object of ~4 × 10^6 streams is never wholly
+available at one instant** — with *p* = 10^-6 the expected number of unavailable streams is
+still ~4. Per-record availability, meanwhile, is unaffected by object size.
+
+So the availability contract has to be **per record, not per object**, and whole-object
+operations — scans, migrations, verification sweeps — must be **resumable rather than
+atomic**, tolerating parts being briefly unreachable and returning to them. That is a
+requirement on the API and on §13.2's loops, not a defect: for objects this large there is no
+alternative, and §9.4's scan design already walks streams in order rather than needing them
+simultaneously.
+
+---
+
 ## 6. Size limits and sealing
 
 An extent seals when it hits **either** limit, whichever comes first:
@@ -2204,6 +2284,8 @@ unique allocation which exhausts all disks simultaneously. Imbalance never build
 there is nothing to go back and fix. The self-balancing of §5.6.4 is balance by *steering
 writes*, not by relocating bytes.
 
+§5.11 generalizes this to every tier, including what happens when one actually fills.
+
 That absence is a large simplification: no rebalancer to schedule, to rate-limit against
 foreground traffic, or to reason about interacting with repair and compaction.
 
@@ -2728,80 +2810,85 @@ Roughly in order of how much else depends on them.
     references it, where rewriting an extent is something compaction does anyway. So the
     wrap obligation is cheap for extents and expensive for streams — an argument for
     giving streams a *wider* timestamp rather than an equal one.
-13. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
+13. **How a DN range splits** (§5.11). The only place fullness forces movement. It should
+    reuse the keyed-object split of §10, but the interaction with in-flight writes to the
+    range is undesigned.
+14. **What ring unavailability *p* actually is** (§5.11.1). The locality argument and the
+    per-record availability contract both turn on it, and nothing has measured or targeted it.
+15. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
     and domain constraints interact: a markedly emptier domain attracts weighted picks and
     then rejects them, which is worst right after adding capacity. Bounded, but worth
     measuring.
-14. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
+16. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
     safe, but who chooses the primary, and how a new one is appointed when it fails, is
     undesigned.
-15. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
+17. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
     must be chosen together; a Raft log index is a natural per-ring counter, but what an
     SCN is scoped to is unsettled while objects span many rings.
-16. **Expected object count** (§14.5). DN cost scales with object count rather than
+18. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-17. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
+19. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-18. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+20. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-19. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+21. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-20. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+22. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-21. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+23. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-22. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+24. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-23. **Background loop scheduling** (§13.2): prioritisation and rate limiting
+25. **Background loop scheduling** (§13.2): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-24. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+26. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-25. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+27. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-26. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+28. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-27. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+29. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-28. **Remaining directory semantics** (§5.1): listing huge directories,
+30. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-29. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+31. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-30. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+32. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-31. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
+33. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
     hurts compression ratio, and ratio is billable.
-32. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+34. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-33. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+35. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-34. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+36. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-35. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
+37. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
     attribution, instantaneous-usage contract, reporting granularity. Slack itself is
     settled at 2× (§4.7).
-36. **Key custody within KS** (§7.3): how the daily master keys are themselves
+38. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-37. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+39. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-38. **Compaction policy** (§10) — now partly a pricing decision.
-39. **Membership and leader election** (§13).
-40. `Nul` and `\0` framing were both listed originally and are folded together
+40. **Compaction policy** (§10) — now partly a pricing decision.
+41. **Membership and leader election** (§13).
+42. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-41. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+43. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
