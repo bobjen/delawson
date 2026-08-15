@@ -37,7 +37,7 @@ it was computed or assumed.
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-73 things *not* decided.
+75 things *not* decided.
 
 **Priorities and framing**
 
@@ -83,7 +83,9 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Four is really a decision to **relax the repair window**, not a reliability necessity | §4.3.1.1 |
 | **Storage overhead = 1/(1 − survivable disaster fraction)**, achieved by MDS codes | §4.3.3 |
 | Working assumption **Reed-Solomon, MDS, m = 4**; overhead chosen from disaster tolerance | §4.3.2 |
-| Local codes trade minimum distance for locality, and are **patent-blocked until 2034** | §4.3.2.1 |
+| Local codes trade minimum distance for locality, and are **patent-blocked until 2034** — **turbo codes** are the unencumbered fallback with similar statistics | §4.3.2.1 |
+| The two EC tiers are one **10×6 LRC** (1.333×) and its **data-duplicated variant** (2.333×) | §12.7.2.1 |
+| The second instance buys **removal of repair from the read path**, not durability — minutes to readable instead of days | §12.7.2.1a |
 | Erasure coding does not address **software bugs, admin error, or running out of space** | §4.3.4 |
 | Utilization ≤ **1 − 1/D** is a *durability* requirement — a full cluster cannot repair | §4.3.4 |
 | Repair must exceed the failure rate or loss is **certain**, not unlikely | §4.3.4.1 |
@@ -857,11 +859,21 @@ licensing therefore depends on the network budget, and the two are substitutes.
 
 ⚠️ **It is patented, and the patent does not expire until 2034.** Bob is a co-inventor, which
 makes this easier to walk into rather than harder: the technique is familiar, the paper is
-public, and neither of those makes it usable. Until 2034 the options are to license it, to find
-an unencumbered construction, or to accept plain Reed-Solomon and pay the repair traffic. This
-is a question for counsel, not for this document — but it must be settled before any code is
-chosen, because the choice is baked into every sealed extent and the §4.6.3 timestamp deadline
-means those live a very long time.
+public, and neither of those makes it usable. This is a question for counsel, not for this
+document — but it must be settled before any code is chosen, because the choice is baked into
+every sealed extent and the §4.6.3 timestamp deadline means those live a very long time.
+
+**There is an unencumbered fallback with similar statistics: turbo codes.** A little worse than
+the LRC, but comparable in the properties that matter here, and not patent-encumbered. That
+changes the character of the patent problem considerably — the alternative to licensing is not
+plain Reed-Solomon and its 8× repair amplification, but something close to what was wanted. So
+the licensing question is a matter of recovering a modest margin rather than a design blocker,
+and §12.7.2.1's LRC figures should be read as roughly achievable either way.
+
+⚠️ Note this reframes §4.3.2.1's comparison. The candidate is not "MDS Reed-Solomon versus a patented
+local code" but "an LRC, or turbo codes if the patent bites" — and §12.7.2.1a shows the local structure buys
+something the earlier analysis missed: with data extents duplicated, repair leaves the read path entirely,
+which is what makes availability recover in minutes rather than days.
 
 **Working assumption: Reed-Solomon, MDS, with the overhead chosen from disaster tolerance** — §4.3.3
 makes overhead and survivable disaster fraction the same decision, and §4.3.3.1 makes it the dominant
@@ -3614,23 +3626,60 @@ TB-month** — the 2.62× factor that section derives, arrived at independently 
 
 #### 12.7.2.1 What the two EC tiers actually are
 
-Those overheads pin the codes, and both come out at *m* = 4 — the value §4.3.2 already wanted:
+An earlier draft guessed these were Reed-Solomon 3+4 and 12+4. They are not — they are **one LRC and a
+two-instance variant of it**, which behaves quite differently.
 
-| | Code | Read needs | Tolerates | Read fails past a disaster of |
-|---|---|---|---|---|
-| 2.333× | **3+4** | 3 of 7 = **43%** | 4 losses | >57% of its domains |
-| 1.333× | **12+4** | 12 of 16 = **75%** | 4 losses | >25% of its domains |
+**The 1.333× code is an LRC shaped as a 10 × 6 matrix:**
 
-So "always reliable" is exact: both tolerate four losses, so both meet the steady-state durability target.
-The availability difference is also real — 1.333× needs three-quarters of its fragments present, 2.333×
-only two-fifths — which at *p* = 10^-3 per fragment is 4.3 × 10^-12 against 2.1 × 10^-14, a 200×
-difference in read availability.
+| | Count | Placement |
+|---|---|---|
+| Data extents | **45** | rows 1–5 × columns 1–9 |
+| Global parities | **5** | column 10, rows 1–5 |
+| Local parities | **10** | row 6, one per column |
+| **Total** | **60** | overhead 60/45 = **1.333×** |
 
-⚠️ But the two labels understate the gap, because they capture availability and not **disaster
-tolerance**. By §4.3.3 the survivable disaster fraction is *m*/*n*: **57% for 2.333× and 25% for 1.333×.**
-The cheap tier is not merely "usually available" — it is also materially less durable against large
-correlated events, which is the loss mode that §1.1.1 says dominates. A customer-facing tier list should
-say so.
+Each column is a local group of six, so a single loss is repaired by reading the other five: **5 reads +
+1 write = ~6 operations per recovery.**
+
+**The 2.333× code is the same thing with the data extents duplicated:** 2 × 45 + 5 + 10 = **105**, overhead
+2.333×. Repair gets much cheaper, because a lost data extent is now a copy rather than a reconstruction —
+1 read + 1 write. Averaged over the 90 data instances and 15 parities that is **~2.4 operations per
+recovery**, against 6.
+
+#### 12.7.2.1a Why one takes days and the other minutes
+
+The operational gap after losing a tenth of the cluster is not 2.5× — it is about three orders of magnitude:
+
+| | Time until affected data is readable again |
+|---|---|
+| 1.333× | **days** |
+| 2.333× | **minutes** |
+
+Repair traffic does not explain that, and the reason it does not is the interesting part. **The
+two-instance variant does not need to repair before it can serve reads.** The surviving instance of each
+data extent is immediately readable, so restoring availability is a matter of re-pointing reads; the
+reconstruction that restores *durability* then proceeds in the background with nobody waiting on it.
+
+The 1.333× code has no such luxury. A lost data extent has no surviving copy, so it must be reconstructed
+from its column *before the first read of it can be answered* — which puts the whole multi-day repair on
+the critical path for availability.
+
+So this is §1.1's separation of availability from reliability turning up as **two recovery timescales**:
+
+| | Availability restored | Durability restored |
+|---|---|---|
+| 1.333× | days — coupled to repair | days |
+| 2.333× | **minutes — decoupled** | days, in the background |
+
+Which is a better justification for the extra 1× of overhead than "more copies." **What the second instance
+buys is not durability but the removal of repair from the read path.** That is also the honest content of
+"always available" versus "usually available" — much sharper than a fragment-count comparison.
+
+⚠️ Two caveats. The LRC's *guaranteed* disaster tolerance is bounded by the Gopalan Singleton-like bound —
+*d* ≤ *n* − *k* − ⌈*k*/*r*⌉ + 2 = 8, so at most 7 arbitrary erasures, **11.7% of fragments** against the 25%
+an MDS code of the same overhead would give (§4.3.3). The 10%-outage case is therefore *just* inside the
+guarantee, which is tighter than it looks. And "minutes" assumes hot data — the re-pointing is cheap, but a
+tenth of the cluster's worth of metadata still has to be updated to reflect the new instance locations.
 
 #### 12.7.2.2 Sanity check against the market
 
@@ -4439,121 +4488,127 @@ Roughly in order of how much else depends on them.
 30. **Name the durability tiers honestly** (§12.7.2.1). "Usually available, always reliable" hides that
     1.333× also survives only a 25% disaster against 2.333×'s 57% — and large correlated events are the
     dominant loss mode. A customer-facing tier list should state disaster tolerance, not just availability.
-31. **What FE-layer retention means** (§8.4.1c). DN, SN and EN retention is a deferred decrement; FE
+31. **Turbo codes as the unencumbered path** (§4.3.2.1). "A little worse but similar statistics" needs
+    quantifying — repair amplification, distance, and decode cost — before the licensing question can be
+    priced. It is the difference between the patent being a blocker and being a margin.
+32. **The 1.333× guarantee is tight against the 10% outage case** (§12.7.2.1a). The LRC tolerates at most
+    11.7% of fragments by the Singleton-like bound, and the worked scenario is a 10% loss. Worth confirming
+    that maximal recoverability covers the realistic patterns, since the margin is thin.
+33. **What FE-layer retention means** (§8.4.1c). DN, SN and EN retention is a deferred decrement; FE
     holds no durable state, so its window presumably means declining to issue the hard delete until its
     timer expires. Worth stating, since a layer that gets this wrong silently leaves the protection.
-32. **Retention window versus the repair reserve** (§8.4.3). Window × churn consumes the 1 − 1/D
+34. **Retention window versus the repair reserve** (§8.4.3). Window × churn consumes the 1 − 1/D
     headroom that durability depends on, so windows must be admission-controlled rather than freely
     chosen. A 30-day window at 100%/yr churn already exceeds a 5% reserve.
-33. **Measure the space-efficiency chain** (§12.7). Every factor is a guess and they multiply: the
+35. **Measure the space-efficiency chain** (§12.7). Every factor is a guess and they multiply: the
     difference between 58% and 55% billable is a 5% swing in revenue per disk bought. The
     undeletable-garbage term is the one most under the design's control, via compaction policy.
-34. **Expiry-aware placement** (§8.5.1). Grouping objects by declared expiry so extents die whole is
+36. **Expiry-aware placement** (§8.5.1). Grouping objects by declared expiry so extents die whole is
     the strongest lever on the efficiency chain, worth ~30× the entire extent-size range. Needs a
     placement policy, an API field, and a decision on how hard to discourage "never".
-35. **A lifetime dimension in the price list** (§8.5.3). Short-lived data skips erasure coding and so
+37. **A lifetime dimension in the price list** (§8.5.3). Short-lived data skips erasure coding and so
     costs 2.7× more per byte-day. Correct, but it means price cannot be one figure per byte.
-36. **A guaranteed repair-bandwidth floor** (§4.3.4.1). Repair below the failure arrival rate makes
+38. **A guaranteed repair-bandwidth floor** (§4.3.4.1). Repair below the failure arrival rate makes
     loss certain rather than unlikely. The floor is ~7.6 GB/s per 100,000 disks — cheap, but it has to
     be reserved rather than left to compete with foreground traffic.
-37. **Treat utilization as a durability limit** (§4.3.4). A full cluster cannot repair, so 1 − 1/D is
+39. **Treat utilization as a durability limit** (§4.3.4). A full cluster cannot repair, so 1 − 1/D is
     not a capacity guideline. Needs enforcement, and an answer for what happens when a tenant's growth
     would cross it.
-38. **Defence against logical corruption** (§4.3.4). Erasure coding faithfully preserves corrupted
+40. **Defence against logical corruption** (§4.3.4). Erasure coding faithfully preserves corrupted
     data. Scrubbing catches bit rot, not a bug that wrote the wrong bytes correctly.
-39. **What disaster size to design for** (§4.3.3). Overhead = 1/(1−s) makes this the single largest
+41. **What disaster size to design for** (§4.3.3). Overhead = 1/(1−s) makes this the single largest
     cost-versus-reliability decision in the system: 33% survivability at 1.50×, 50% at 2.00×. It
     should be settled before the erasure code is chosen.
-40. **Do real disasters respect the domain hierarchy?** (§4.3.3) The guarantee depends entirely on it.
+42. **Do real disasters respect the domain hierarchy?** (§4.3.3) The guarantee depends entirely on it.
     A cross-cutting failure mode returns loss to the binomial regime, where a 5% event loses hundreds
     of terabytes outright instead of ~3 extents.
-41. **Measure the disaster frequency exponent α** (§4.3.3.1). Every expected-loss figure depends on it,
+43. **Measure the disaster frequency exponent α** (§4.3.3.1). Every expected-loss figure depends on it,
     5×- and 10×-per-halving differ by ~6×, and for α > m the integral diverges and needs a floor.
-42. **A second cluster** (§4.3.3.1). Expected loss is of order the whole-cluster disaster rate for every
+44. **A second cluster** (§4.3.3.1). Expected loss is of order the whole-cluster disaster rate for every
     in-cluster code, so geo-replication is the only answer to the top of the distribution — and nothing
     in this document addresses it.
-43. **Is durability a per-customer billable tier?** (§4.3.3.3) Write-off fractions span 1/1000 to
+45. **Is durability a per-customer billable tier?** (§4.3.3.3) Write-off fractions span 1/1000 to
     999/1000, a 250× spread in effective loss rate on identical storage. Overhead = 1/(1−s) makes the
     knob natural and §12 bills it for free, but nothing offers it.
-44. **Do local codes actually lose on disasters, or only in the worst case?** (§4.3.2.1) Guaranteed
+46. **Do local codes actually lose on disasters, or only in the worst case?** (§4.3.2.1) Guaranteed
     tolerance is 7.5% against MDS's 33%, but maximal recoverability plus a good domain-to-local-group
     mapping may recover most real patterns — worth analysing before writing off the construction or the
     patent question.
-45. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
+47. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
     and domain constraints interact: a markedly emptier domain attracts weighted picks and
     then rejects them, which is worst right after adding capacity. Bounded, but worth
     measuring.
-46. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
+48. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
     safe, but who chooses the primary, and how a new one is appointed when it fails, is
     undesigned.
-47. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
+49. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
     must be chosen together; a Raft log index is a natural per-ring counter, but what an
     SCN is scoped to is unsettled while objects span many rings.
-48. **Expected object count** (§14.5). DN cost scales with object count rather than
+50. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-49. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
+51. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-50. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+52. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-51. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+53. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-52. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+54. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-53. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+55. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-54. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+56. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-55. **Background loop scheduling** (§13.3): prioritisation and rate limiting
+57. **Background loop scheduling** (§13.3): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-56. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+58. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-57. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+59. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-58. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+60. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-59. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+61. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-60. **Remaining directory semantics** (§5.1): listing huge directories,
+62. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-61. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+63. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-62. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+64. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-63. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
+65. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
     both sides: coarse granules compress better and bill less, fine granules cut read
     amplification, which is a 50× throughput factor for point reads.
-64. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+66. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-65. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+67. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-66. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+68. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-67. **Billing policy** (§12.8): garbage, transient double footprint, shared-extent
+69. **Billing policy** (§12.8): garbage, transient double footprint, shared-extent
     attribution, instantaneous-usage contract, reporting granularity. Slack itself is
     settled at 2× (§4.7).
-68. **Key custody within KS** (§7.3): how the daily master keys are themselves
+70. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-69. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+71. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-70. **Compaction policy** (§10) — now partly a pricing decision.
-71. **Membership and leader election** (§13).
-72. `Nul` and `\0` framing were both listed originally and are folded together
+72. **Compaction policy** (§10) — now partly a pricing decision.
+73. **Membership and leader election** (§13).
+74. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-73. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+75. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
