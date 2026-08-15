@@ -37,7 +37,7 @@ it was computed or assumed.
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-83 things *not* decided.
+85 things *not* decided.
 
 **Priorities and framing**
 
@@ -61,7 +61,7 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Two flavors: **unkeyed** (64-bit record number, append only at the end) and **keyed** (sorted key, insert anywhere) | §3 |
 | The asymmetry follows from counts being stable under update and tombstone but not insert | §3 |
 | **Records are a store-layer primitive** — framing, record numbers, keys. The largest divergence from Cosmos | §1.4.5.1 |
-| Framing fixed at creation: `LengthPrefixed`, `Nul`, `Lf`, `CrLf` | §8.2 |
+| Five framings — `FixedLength`, `Nul`, `Lf`, `CrLf`, `LengthPrefixed` — declared at creation, **translatable on read and re-writable by coalescing**, so framing is not a durable property of the data | §8.2 |
 | **Declared expiry**, defaulting to "never" but discouraged — the main lever on garbage | §8.5 |
 
 **Structure**
@@ -3027,19 +3027,70 @@ summaries §4.5 keeps lazy, and the sync loops of §13.1 reconcile the rest.
 
 ### 8.2 Record framing
 
-Fixed at object creation:
+An object declares a framing at creation, and **appends are stored in the format the writer gave
+them**, by default:
 
-| Framing | Boundary |
-|---|---|
-| `LengthPrefixed` | varint or fixed-width length precedes each record |
-| `Nul` | records terminated by `0x00` |
-| `Lf` | records terminated by `\n` |
-| `CrLf` | records terminated by `\r\n` |
+| Framing | Boundary | Overhead per record |
+|---|---|---|
+| `FixedLength` | every record the same declared width | **0 B** |
+| `Nul` | terminated by `0x00` | 1 B |
+| `Lf` | terminated by `\n` | 1 B |
+| `CrLf` | terminated by `\r\n` | 2 B |
+| `LengthPrefixed` | a fixed-width length precedes each record | 4 B |
 
-`LengthPrefixed` is the only framing permitting arbitrary binary content; the
-terminator framings require the terminator not appear inside a record, and exist
-so existing line- and NUL-delimited data can be stored and scanned without a
-rewrite.
+`LengthPrefixed` and `FixedLength` are the framings permitting arbitrary binary content; the
+terminator framings require that the terminator not appear inside a record, and exist so that
+existing line- and NUL-delimited data can be stored and scanned without a rewrite.
+
+**Boundary bytes count towards the logical length.** A 100-byte record in `CrLf` is 102 logical
+bytes, and §4's cumulative logical byte totals include the framing.
+
+#### 8.2.1 Framing is a representation, not a property of the data
+
+A reader may **ask for a different framing than the writer used**, and DeLawson translates. The
+translation is arithmetic rather than a scan, because the overhead per record is a constant for a
+given format:
+
+> logical_B = logical_A − *N*·overhead_A + *N*·overhead_B
+
+and *N*, the record count over the span, is exactly what §4's cumulative counts already carry. So
+converting a logical length between framings is **O(1)** — another use for an index built for
+addressing.
+
+Most users write and read in the same format, so this is the exception rather than the rule. But
+it also means **coalescing may change the stored framing** (§10), and therefore:
+
+> **Framing is not a durable property of the data.** The records are the data; the framing is how
+> they happen to be laid out at the moment.
+
+The motive for re-framing during coalescing is to match the *dominant read* format and take the
+translation off the read path. Saving space is a weaker motive than it looks: at 100-byte records
+`LengthPrefixed` costs 3.85% of logical bytes and `CrLf` 1.96%, but framing bytes are about as
+predictable as data gets — an identical terminator every hundred bytes — so compression removes
+most of that before it reaches the physical bytes anyone is billed for (§12.3).
+
+#### 8.2.2 Zero-length appends break the single-writer offset check
+
+⚠️ `FixedLength` with a declared width of **zero** is degenerate in a way that collides with
+§8.1.1a-3: every record occupies 0 logical bytes, so an append of any size advances the logical
+offset by nothing, and **two appends share an offset**. The single-writer check then cannot tell a
+retry from a new append, which is precisely what it exists to do.
+
+**Current answer: disallow single-writer zero-length appends with fixed-length rows.** A guess, per
+§0, and narrow enough to be safe.
+
+The general form of the invariant is worth stating, since it is what the check actually needs:
+
+> **Every single-writer append must advance the logical offset strictly.**
+
+Which also catches the other case — an append of *zero records*, permitted by §8.1 — since that
+advances the offset by nothing in any framing.
+
+⚠️ **Record numbers would not have this problem.** *n* records advance the count by *n* whatever
+their width, so only a zero-*record* append fails to advance them — and §8.1 already returns the
+first record number as the append's locator. Using the **record number rather than the logical byte
+offset** as the expected-position token would make the fixed-width-zero case work rather than
+needing to be forbidden. Offered as an observation, not a decision.
 
 ### 8.3 The three mutations
 
@@ -4887,135 +4938,140 @@ Roughly in order of how much else depends on them.
     truncation in another guise, and unspecified.
 35. **Bound and timeout on the out-of-order cache** (§8.1.1a-4). Together they set how far ahead a single
     writer may pipeline, and a gap that never fills must not pin cached data indefinitely.
-36. **Waste from a large append at a nearly-full extent** (§8.1.1c). The 32 MB logical bound (§8.1.1a-2)
+36. **Offset or record number as the single-writer position token?** (§8.2.2) The logical byte offset
+    fails for zero-width fixed-length rows, which currently has to be forbidden; the record number would
+    not, and §8.1 already returns it as the append's locator. Cheap to change now, awkward later.
+37. **When coalescing should re-frame** (§8.2.1). Matching the dominant read format takes translation off
+    the read path, but nothing tracks what the dominant read format is.
+38. **Waste from a large append at a nearly-full extent** (§8.1.1c). The 32 MB logical bound (§8.1.1a-2)
     caps it, but a 32 MB append arriving at an extent with 1 MB left still seals that extent 31 MB short.
     Lands in §12.7's garbage term rather than in silent padding.
-37. **Does shared AI memory need latency this design deprioritizes?** (§1.0.2) Near-real-time is
+39. **Does shared AI memory need latency this design deprioritizes?** (§1.0.2) Near-real-time is
     comfortable; millisecond index lookups are not what §1.4 optimizes for. If the motivating use case
     wants them, that is a conflict to resolve rather than assume away.
-38. **A time-based sealing trigger** (§9.7.1). It would bound the durability-timestamp table, which a
+40. **A time-based sealing trigger** (§9.7.1). It would bound the durability-timestamp table, which a
     slowly-written extent grows to 0.8% of its size, and open extents are expensive anyway — but hourly
     sealing of a slow stream makes nine times as many extents, and extent metadata is priced. A three-way
     trade, undecided.
-39. **Time-range queries on keyed objects** (§9.7.2). Record number is not monotonic in time there, so the
+41. **Time-range queries on keyed objects** (§9.7.2). Record number is not monotonic in time there, so the
     query is a scan over candidate extents rather than a binary search, and its cost is unworked.
-40. **Governance and licence** (§1.0). An open-source data store needs a licence choice, a contribution
+42. **Governance and licence** (§1.0). An open-source data store needs a licence choice, a contribution
     model, and a position on whether a hosted service competes with its own users. None decided.
-41. **What FE-layer retention means** (§8.4.1c). DN, SN and EN retention is a deferred decrement; FE
+43. **What FE-layer retention means** (§8.4.1c). DN, SN and EN retention is a deferred decrement; FE
     holds no durable state, so its window presumably means declining to issue the hard delete until its
     timer expires. Worth stating, since a layer that gets this wrong silently leaves the protection.
-42. **Retention window versus the repair reserve** (§8.4.3). Window × churn consumes the 1 − 1/D
+44. **Retention window versus the repair reserve** (§8.4.3). Window × churn consumes the 1 − 1/D
     headroom that durability depends on, so windows must be admission-controlled rather than freely
     chosen. A 30-day window at 100%/yr churn already exceeds a 5% reserve.
-43. **Measure the space-efficiency chain** (§12.7). Every factor is a guess and they multiply: the
+45. **Measure the space-efficiency chain** (§12.7). Every factor is a guess and they multiply: the
     difference between 58% and 55% billable is a 5% swing in revenue per disk bought. The
     undeletable-garbage term is the one most under the design's control, via compaction policy.
-44. **Expiry-aware placement** (§8.5.1). Grouping objects by declared expiry so extents die whole is
+46. **Expiry-aware placement** (§8.5.1). Grouping objects by declared expiry so extents die whole is
     the strongest lever on the efficiency chain, worth ~30× the entire extent-size range. Needs a
     placement policy, an API field, and a decision on how hard to discourage "never".
-45. **A lifetime dimension in the price list** (§8.5.3). Short-lived data skips erasure coding and so
+47. **A lifetime dimension in the price list** (§8.5.3). Short-lived data skips erasure coding and so
     costs 2.7× more per byte-day. Correct, but it means price cannot be one figure per byte.
-46. **A guaranteed repair-bandwidth floor** (§4.3.4.1). Repair below the failure arrival rate makes
+48. **A guaranteed repair-bandwidth floor** (§4.3.4.1). Repair below the failure arrival rate makes
     loss certain rather than unlikely. The floor is ~7.6 GB/s per 100,000 disks — cheap, but it has to
     be reserved rather than left to compete with foreground traffic.
-47. **Treat utilization as a durability limit** (§4.3.4). A full cluster cannot repair, so 1 − 1/D is
+49. **Treat utilization as a durability limit** (§4.3.4). A full cluster cannot repair, so 1 − 1/D is
     not a capacity guideline. Needs enforcement, and an answer for what happens when a tenant's growth
     would cross it.
-48. **Defence against logical corruption** (§4.3.4). Erasure coding faithfully preserves corrupted
+50. **Defence against logical corruption** (§4.3.4). Erasure coding faithfully preserves corrupted
     data. Scrubbing catches bit rot, not a bug that wrote the wrong bytes correctly.
-49. **What disaster size to design for** (§4.3.3). Overhead = 1/(1−s) makes this the single largest
+51. **What disaster size to design for** (§4.3.3). Overhead = 1/(1−s) makes this the single largest
     cost-versus-reliability decision in the system: 33% survivability at 1.50×, 50% at 2.00×. It
     should be settled before the erasure code is chosen.
-50. **Do real disasters respect the domain hierarchy?** (§4.3.3) The guarantee depends entirely on it.
+52. **Do real disasters respect the domain hierarchy?** (§4.3.3) The guarantee depends entirely on it.
     A cross-cutting failure mode returns loss to the binomial regime, where a 5% event loses hundreds
     of terabytes outright instead of ~3 extents.
-51. **Measure the disaster frequency exponent α** (§4.3.3.1). Every expected-loss figure depends on it,
+53. **Measure the disaster frequency exponent α** (§4.3.3.1). Every expected-loss figure depends on it,
     5×- and 10×-per-halving differ by ~6×, and for α > m the integral diverges and needs a floor.
-52. **A second cluster** (§4.3.3.1). Expected loss is of order the whole-cluster disaster rate for every
+54. **A second cluster** (§4.3.3.1). Expected loss is of order the whole-cluster disaster rate for every
     in-cluster code, so geo-replication is the only answer to the top of the distribution — and nothing
     in this document addresses it.
-53. **Is durability a per-customer billable tier?** (§4.3.3.3) Write-off fractions span 1/1000 to
+55. **Is durability a per-customer billable tier?** (§4.3.3.3) Write-off fractions span 1/1000 to
     999/1000, a 250× spread in effective loss rate on identical storage. Overhead = 1/(1−s) makes the
     knob natural and §12 bills it for free, but nothing offers it.
-54. **Do local codes actually lose on disasters, or only in the worst case?** (§4.3.2.1) Guaranteed
+56. **Do local codes actually lose on disasters, or only in the worst case?** (§4.3.2.1) Guaranteed
     tolerance is 7.5% against MDS's 33%, but maximal recoverability plus a good domain-to-local-group
     mapping may recover most real patterns — worth analysing before writing off the construction or the
     patent question.
-55. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
+57. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
     and domain constraints interact: a markedly emptier domain attracts weighted picks and
     then rejects them, which is worst right after adding capacity. Bounded, but worth
     measuring.
-56. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
+58. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
     safe, but who chooses the primary, and how a new one is appointed when it fails, is
     undesigned.
-57. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
+59. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
     must be chosen together; a Raft log index is a natural per-ring counter, but what an
     SCN is scoped to is unsettled while objects span many rings.
-58. **Expected object count** (§14.5). DN cost scales with object count rather than
+60. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-59. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
+61. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-60. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+62. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-61. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+63. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-62. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+64. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-63. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+65. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-64. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+66. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-65. **Background loop scheduling** (§13.3): prioritisation and rate limiting
+67. **Background loop scheduling** (§13.3): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-66. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+68. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-67. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+69. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-68. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+70. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-69. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+71. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-70. **Remaining directory semantics** (§5.1): listing huge directories,
+72. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-71. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+73. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-72. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+74. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-73. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
+75. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
     both sides: coarse granules compress better and bill less, fine granules cut read
     amplification, which is a 50× throughput factor for point reads.
-74. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+76. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-75. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+77. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-76. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+78. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-77. **Billing policy** (§12.8): garbage, transient double footprint, shared-extent
+79. **Billing policy** (§12.8): garbage, transient double footprint, shared-extent
     attribution, instantaneous-usage contract, reporting granularity. Slack itself is
     settled at 2× (§4.7).
-78. **Key custody within KS** (§7.3): how the daily master keys are themselves
+80. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-79. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+81. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-80. **Compaction policy** (§10) — now partly a pricing decision.
-81. **Membership and leader election** (§13).
-82. `Nul` and `\0` framing were both listed originally and are folded together
+82. **Compaction policy** (§10) — now partly a pricing decision.
+83. **Membership and leader election** (§13).
+84. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-83. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+85. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
