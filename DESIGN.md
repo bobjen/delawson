@@ -129,6 +129,8 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **Erasure coding forces byte-identical instances**, so an instance must **truncate above the durable watermark** on handover | §8.1.1a |
 | The primary assigns a **logical** offset in a tiny serialized window; compress, encrypt and write happen outside it | §8.1.1a-2 |
 | **Single-writer** appends supply their expected offset and are **exactly-once**; **multi-writer** appends are **at-least-once** | §8.1.1a-3 |
+| Logical offsets are **dense** — no padding, no holes — which is what makes the single-writer check, the reorder cache, and cumulative byte totals work | §8.1.1a-6 |
+| An append block is a **byte range**, not a set of records; fragments are single-writer only | §8.1 |
 | Append blocks bounded at **32 MB logical**, so one always fits a fresh extent | §8.1.1a-2 |
 | No chunk padding: an append that will not fit **seals the extent short** | §8.1.1c |
 | The quorum forces **broadcast, not a daisy chain** | §8.1.2 |
@@ -2792,11 +2794,21 @@ undecided and determines where plaintext exists.
 
 ### 8.1 Append blocks
 
-The unit of write is an **append block** of 0..n records, applied to the target
-extent atomically: all its records become visible or none do.
+The unit of write is an **append block**: a byte range applied to the target extent atomically — the whole
+range becomes visible or none of it does.
 
-An append returns the record number of the first record in the block (unkeyed)
-and the extent it landed in.
+⚠️ Note "byte range", not "set of records". A block may contain **record fragments** at either end, since with
+a single writer a record may span appends (§8.2.2). So a record becomes complete only when every append
+carrying part of it is durable, and atomicity is a property of the byte range rather than of the records inside
+it. An earlier draft said "0..n records, all its records become visible or none do", which is true only when
+appends happen to be record-aligned.
+
+**Fragments are a single-writer affair.** Two writers interleaving appends into one extent would split each
+other's records, so **multi-writer appends must be record-aligned** (§8.1.1a-3); only a single writer, which
+controls the whole byte stream, can safely leave a record half-written.
+
+An append returns its **logical offset in the extent** as a locator, plus the record number of the first
+complete record it contains (unkeyed) and the extent it landed in.
 
 #### 8.1.1 Accepted, applied, durable
 
@@ -2938,6 +2950,76 @@ single writer keep many appends in flight rather than waiting for each to be pla
 ⚠️ The cache needs a **bound** and a **timeout**: memory is finite, and a gap left by an append that never
 arrives must not pin cached data indefinitely. Both are undesigned, and together they set how far ahead a
 single writer may pipeline.
+
+#### 8.1.1a-5 Prior art for assigning the offset at the primary
+
+The mechanism is well-trodden, and one system has essentially the same two modes.
+
+**Azure append blobs are the closest analogue.** The service appends at the end and returns
+`x-ms-blob-append-offset`, "the offset at which the block was committed, in bytes" — the primary assigning the
+position and reporting it back. And the conditional header `x-ms-blob-condition-appendpos` supplies an expected
+byte offset, succeeding "only if the current offset matches that specified by the client" and otherwise failing
+412. Microsoft's stated purpose is DeLawson's exactly:
+
+> "Clients that use a single writer can use this header to determine whether an `Append Block` operation
+> succeeded, despite a network failure."
+
+Their multi-writer advice matches §8.1.1a-3 too — conditional headers work but hurt throughput, so "for the
+highest concurrent append throughput, applications should handle redundant appends and delayed appends in the
+application layer", by adding "epochs or sequence numbers in the data". Which is also GFS's advice (§8.1.1a).
+**Two independent designs reached the same split: conditional append for one writer, at-least-once plus
+application dedup for many.**
+
+Where DeLawson differs: Azure caps an append blob at **50,000 appends** and ~4.75 TiB. DeLawson has no
+append-count ceiling because extents seal and roll (§6) — the cap is a consequence of Azure's blob being one
+addressable unit rather than a list of extents.
+
+| System | Who assigns the offset | Client may specify it? |
+|---|---|---|
+| **Azure append blob** | the service, returned in the response | **yes** — `appendpos`, 412 on mismatch |
+| **GFS `record append`** | the primary chunkserver, "at an offset of GFS's choosing" | no |
+| **Kafka** | the partition leader, base offset in the produce response | no — idempotency via producer id and sequence |
+| **HDFS** | nobody — a single lease-holding writer knows the length already | n/a |
+| **Ceph RADOS** | the primary OSD serializes object ops (append is one) | compare-and-set primitives exist |
+| **Oracle `ROWID`** | the system, on insert, and returned to the client | no |
+
+⚠️ The Ceph row is from recollection rather than a checked source; it should be verified before being relied on.
+
+#### 8.1.1a-6 Density is load-bearing, and most of these lack it
+
+Oracle's `ROWID` is a system-determined locator handed back to the client, which is the same shape — but **it
+has holes.** Row numbers skip deleted rows, blocks are not packed full, and the space is sparse throughout.
+GFS's offsets have holes too, from the padding of §8.1.1c.
+
+**DeLawson's logical offsets are dense**, and three separate mechanisms depend on it:
+
+| Mechanism | Why density is required |
+|---|---|
+| The single-writer check (§8.1.1a-3) | the writer must **predict** the next offset — impossible if the system may skip |
+| The out-of-order cache (§8.1.1a-4) | it assumes gaps are *temporary*, from reordering. A permanent hole would never fill and the cache would never drain |
+| Cumulative logical byte totals (§4) | logical offsets must be additive to be searchable |
+
+This reframes §8.1.1c. Sealing an extent short rather than padding it looked like a space nicety; it is
+actually what **keeps offsets dense**, and therefore what makes the compare-and-append protocol possible at
+all. GFS could pad because its clients never predicted an offset; DeLawson's do.
+
+⚠️ **But sealing short still breaks predictability across an extent boundary**, and the design has not said
+which token the writer compares:
+
+| Token | Predictable by the writer? |
+|---|---|
+| Offset **within the extent** — as described in §8.1.1a-2 | no: the writer cannot know when the extent rolls |
+| Offset **within the object**, dense across extents | **yes**, always computable from what it has sent |
+| The pair *(extent, offset)* | yes, at the cost of one failed round trip per roll — the failure tells it the new extent |
+
+The pair is workable, since a roll happens only every 32 MB or so and one wasted round trip per roll is
+negligible. But an object-wide offset needs no failure at all, and the choice should be deliberate rather than
+implied.
+
+Worth noting a fourth shape: **sequencer-based shared logs** such as Corfu hand out positions from a tiny,
+fast, serialized token service and let clients write the data directly to storage. That is §8.1.1a-2's
+separation of the serialized window from the data path taken to its conclusion — the sequencer *is* nothing but
+the critical section. If per-extent offset assignment ever became a bottleneck, that is the shape to borrow.
 
 #### 8.1.1b What others do, and what DeLawson still needs
 
@@ -3086,11 +3168,14 @@ The general form of the invariant is worth stating, since it is what the check a
 Which also catches the other case — an append of *zero records*, permitted by §8.1 — since that
 advances the offset by nothing in any framing.
 
-⚠️ **Record numbers would not have this problem.** *n* records advance the count by *n* whatever
-their width, so only a zero-*record* append fails to advance them — and §8.1 already returns the
-first record number as the append's locator. Using the **record number rather than the logical byte
-offset** as the expected-position token would make the fixed-width-zero case work rather than
-needing to be forbidden. Offered as an observation, not a decision.
+**An earlier draft suggested using the record number instead, and that does not work.** Appends may contain
+**record fragments** — with a single writer it is reasonable for a record to span appends — so an append
+boundary need not fall on a record boundary. A record number therefore does not identify an append: two
+appends can both begin inside record 5, and distinguishing them needs *(record number, offset within the
+record)*, a two-part token strictly worse than the single logical byte offset.
+
+So **the logical byte offset is the right token precisely because it is record-agnostic**, and the
+zero-width-fixed-length case is a genuine corner that simply needs forbidding rather than designing around.
 
 ### 8.3 The three mutations
 
@@ -4938,9 +5023,10 @@ Roughly in order of how much else depends on them.
     truncation in another guise, and unspecified.
 35. **Bound and timeout on the out-of-order cache** (§8.1.1a-4). Together they set how far ahead a single
     writer may pipeline, and a gap that never fills must not pin cached data indefinitely.
-36. **Offset or record number as the single-writer position token?** (§8.2.2) The logical byte offset
-    fails for zero-width fixed-length rows, which currently has to be forbidden; the record number would
-    not, and §8.1 already returns it as the append's locator. Cheap to change now, awkward later.
+36. **Which offset the single-writer compares** (§8.1.1a-6): within the extent, within the object, or the
+    pair. Only an object-wide offset is predictable across an extent roll; the pair works at one wasted round
+    trip per roll. Settle it before the client interface exists. (The record number is *not* a candidate —
+    record fragments mean append boundaries need not fall on record boundaries, §8.2.2.)
 37. **When coalescing should re-frame** (§8.2.1). Matching the dominant read format takes translation off
     the read path, but nothing tracks what the dominant read format is.
 38. **Waste from a large append at a nearly-full extent** (§8.1.1c). The 32 MB logical bound (§8.1.1a-2)
