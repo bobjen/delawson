@@ -1858,29 +1858,58 @@ that behaviour was unreasonable; it was the cheapest way to use the product as p
 
 ### 12.2 Why "bill for bytes" is not enough
 
-The arithmetic of that failure mode is stark. Metadata lives in RAM on SNs, and RAM costs
-roughly **200× per byte what disk does** (illustratively, $3/GB DRAM against $15/TB HDD):
+The arithmetic of that failure mode is stark, because **RAM costs roughly 5,000× per byte
+what disk does** — and the gap is nothing like the ~200× a naive comparison of purchase
+prices suggests. Building it up per GB over a five-year life:
 
-| | Cost |
+| | DRAM | HDD |
+|---|---|---|
+| Capital | $3.00 | $0.010 |
+| Power | $1.53 | $0.0013 |
+| **Server amortization** | **$23.44** | $0.0020 |
+| Redundancy | ×3 materialized ring members (§5.7) | ×1.5 erasure code |
+| **Total** | **~$84** | **~$0.020** |
+| | | **ratio ~4,200×** |
+
+Purchase price is the *smallest* of the three terms. What dominates is server
+amortization — a machine's worth of CPU, board and chassis spread over 256 GB of RAM,
+against the same machine spread over 3 PB of disk — and then the ring triples it. So ~5,000×
+is the right order, and the figure the billing model must use.
+
+At that ratio:
+
+| | |
 |---|---|
-| A minimal stream: one 200 B stream record + one 100 B extent record | 300 B of SN RAM |
-| The same money spent on disk instead | ~60 KB |
-| So the break-even user payload, at 4 instances | **~15 KB** |
+| A minimal stream: 200 B stream record + 100 B extent reference | 300 B of SN RAM |
+| Disk-equivalent cost | **1.5 MB** |
+| Break-even user payload, at 4 instances | **~375 KB** |
 
-**A stream holding less than ~15 KB is underbilled if only bytes are charged**, and the
-underbilling grows without bound as the payload shrinks:
+**A stream holding less than ~375 KB costs more in metadata than in data**, and the
+underbilling grows without bound as the payload shrinks. The average stream of §14.1.1 holds
+128 MB, comfortably 341× above break-even — but the abuse case is not marginal. A user who
+fills one SN's stream budget with 1 KB streams consumes 128 GB of SN RAM, worth **640 TB of
+disk**, while billing for 1.7 TB. **Underbilled 375×.** The workload cheapest for the user is
+ruinous for the operator, so it is the workload the pricing selects for.
 
-| Stream payload | Metadata share of its true cost |
-|---|---|
-| 1 KB | **94%** |
-| 100 KB | 13% |
-| 32 MB (a full extent) | ~0% |
+#### 12.2.1 DN metadata is far less dangerous, and that is why lumping matters
 
-And the worst case is not marginal. A user who fills one SN's stream budget — 4.27 × 10^8
-streams (§14.1) — with 1 KB streams stores 427 GB, bills for 1.7 TB of replicated disk at
-roughly $26, and consumes a machine holding $768 of DRAM. **Underbilled ~30×, and an entire
-SN is gone.** The workload that is cheapest for the user is the one that is ruinous for the
-operator, so it is the workload the pricing selects for.
+The severity is entirely about *which medium* holds the metadata. DN metadata lives on disk
+(§5.1), so its ratio against user data is ~1 rather than ~5,000:
+
+| Metadata | Medium | Cost of one record | Break-even payload |
+|---|---|---|---|
+| Stream, on an SN | **RAM** | 300 B × 5,000 | **~375 KB** |
+| Object, on a DN | disk (300 B, 4× compressed, 1.5× EC) | ~112 B | **~112 B** |
+
+**The stream case is ~3,300× more dangerous than the object case.** Which is the real
+justification for lumping (§11): gathering tiny objects into common streams moves their
+metadata cost out of the RAM-backed stream tier and into the disk-backed DN tier. It is not
+merely a way to keep stream counts down — it is a change of medium, and therefore of cost by
+three and a half orders of magnitude.
+
+It also says something about where to worry. A trillion tiny objects is a manageable DN
+problem. A trillion tiny *streams* is an unmanageable SN problem, and the difference between
+those two sentences is the whole reason §11 exists.
 
 ### 12.3 Physical, not logical, is the same rule
 
