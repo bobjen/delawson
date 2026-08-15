@@ -838,6 +838,78 @@ Two consequences:
   billing-by-physical-bytes charges for it automatically with no new mechanism. A rare case where the
   cost model, the reliability model and the price list already agree.
 
+#### 4.3.4 What erasure coding does not address
+
+Bob has a song about this ("Erasure Coding", lyrics his, music Suno's), and it is a better summary of
+the loss landscape than the preceding four subsections:
+
+> *There is no clever coding or cost / That can guarantee no data loss …*
+> *But there is no need to invoke vicious thugs / The biggest losses are from software bugs*
+> *And fat-fingered admins who erase / There is no cure when you run out of space*
+
+Three loss modes there that §4.3.1–§4.3.3 say nothing about, and all three are worse than the ones
+they do cover.
+
+**Software bugs.** §13.2's failed rollout is one shape of this and already dominates disk failure by
+three orders of magnitude. It is not the only shape: a bug that corrupts on write, or deletes the
+wrong extent, is not a disaster the domain hierarchy protects against, because it hits *logically*
+rather than physically. Erasure coding is no defence at all — every fragment is dutifully consistent
+with the corrupted data.
+
+**Administrative error.** ⚠️ **The design currently has no protection whatsoever.** A delete is a
+delete: §8.3 tombstones it, §13.1.7's sync loop propagates it, and the background loops reclaim the
+space. Every mechanism cooperates efficiently in destroying the data. There is no soft-delete window,
+no undelete, and no protection against an *authorized* deletion being wrong — which is the case that
+actually happens. This is a real gap and probably the most serious one in this document, because it is
+both common and completely unmitigated.
+
+**Running out of space.** ⚠️ Worse than it sounds, and the song is precise: *there is no cure*. Repair
+must **write** the reconstructed fragment somewhere, so a full cluster **cannot repair at all** — its
+redundancy only decays, monotonically, until the data goes. So §13.2's utilization ceiling of
+1 − 1/*D* is not a capacity guideline but a **durability requirement**, and running out of space is a
+data-loss mode rather than an availability inconvenience.
+
+#### 4.3.4.1 The stability condition
+
+> *Erasure Coding stops random leaks / It's more like draining a bathtub, so to speak*
+> *If fixes are faster than failures, data's preserved / Otherwise loss is certain and well deserved*
+
+This is a condition the probability arithmetic of §4.3.1 quietly assumes and never states. Repair is
+a queue: if its service rate falls below the failure arrival rate, the backlog grows without bound,
+redundancy decays monotonically, and **loss becomes certain rather than unlikely** — no code helps,
+because the code is not the thing failing.
+
+For 100,000 disks at 1.5% AFR, 30 PB is lost per year, so repair must sustain **7.6 GB/s of reads** at
+8× amplification. That is 0.03% of a 25 TB/s fleet — trivially affordable, but it is a **floor rather
+than a target**, and it must be *guaranteed* rather than best-effort. §13.2.1's question of how much
+bandwidth repair may take has an answer at the bottom end: never less than this, whatever else is
+happening.
+
+The in-flight backlog also needs somewhere to live — 41 TB at a 12-hour window, 198 TB at 58 hours —
+which is small next to the 1/*D* reserve above, so the space rule is set by domain loss rather than by
+ordinary repair.
+
+#### 4.3.4.2 Two conclusions the song reaches first
+
+> *Erasure Coding stops hardware leaks / But not admins or management freaks*
+> *So: backup in several unrelated places / Immortality any 1 of n embraces*
+
+**Independent clouds, not just independent domains.** §4.3.3.1 arrives at the same place by
+arithmetic — expected loss is of order the whole-cluster disaster rate for every in-cluster code — but
+the song's reason is better, because "management freaks" and administrative error are not in any
+failure model. A second cluster under the same management protects against asteroids and not against
+mistakes; a second *provider* protects against both.
+
+> *Frequently no matter what you do / You find your worst opponent is you*
+> *The safest place your data could have gotten / Is the one that you've forgotten*
+
+Which is the design principle behind the gap above: the mechanisms most worth having are the ones that
+resist the operator, and forgetting is the only such mechanism the system currently has.
+
+> *Immortal data's impossible, tough, / But perhaps the end of time is good enough*
+
+§1.3 sets the longevity goal at a cluster that may run indefinitely. This is the honest version of it.
+
 ### 4.4 Stored as lists, served as B-trees
 
 The persistent form and the serving form differ:
@@ -3804,99 +3876,110 @@ Roughly in order of how much else depends on them.
     utilization ceiling of 1 - 1/D (§5.11).
 25. **How much fleet bandwidth repair may take** (§13.2.1). Recovery at full tilt stops all
     customer work; at 10% it takes five days. The split is a business decision nobody has made.
-26. **What disaster size to design for** (§4.3.3). Overhead = 1/(1−s) makes this the single largest
+26. **Protection against administrative error** (§4.3.4). The most serious gap in this document:
+    a wrong-but-authorized delete is executed faithfully by every mechanism, with no soft-delete
+    window and no undelete. Common, unmitigated, and unaddressed by any amount of erasure coding.
+27. **A guaranteed repair-bandwidth floor** (§4.3.4.1). Repair below the failure arrival rate makes
+    loss certain rather than unlikely. The floor is ~7.6 GB/s per 100,000 disks — cheap, but it has to
+    be reserved rather than left to compete with foreground traffic.
+28. **Treat utilization as a durability limit** (§4.3.4). A full cluster cannot repair, so 1 − 1/D is
+    not a capacity guideline. Needs enforcement, and an answer for what happens when a tenant's growth
+    would cross it.
+29. **Defence against logical corruption** (§4.3.4). Erasure coding faithfully preserves corrupted
+    data. Scrubbing catches bit rot, not a bug that wrote the wrong bytes correctly.
+30. **What disaster size to design for** (§4.3.3). Overhead = 1/(1−s) makes this the single largest
     cost-versus-reliability decision in the system: 33% survivability at 1.50×, 50% at 2.00×. It
     should be settled before the erasure code is chosen.
-27. **Do real disasters respect the domain hierarchy?** (§4.3.3) The guarantee depends entirely on it.
+31. **Do real disasters respect the domain hierarchy?** (§4.3.3) The guarantee depends entirely on it.
     A cross-cutting failure mode returns loss to the binomial regime, where a 5% event loses hundreds
     of terabytes outright instead of ~3 extents.
-28. **Measure the disaster frequency exponent α** (§4.3.3.1). Every expected-loss figure depends on it,
+32. **Measure the disaster frequency exponent α** (§4.3.3.1). Every expected-loss figure depends on it,
     5×- and 10×-per-halving differ by ~6×, and for α > m the integral diverges and needs a floor.
-29. **A second cluster** (§4.3.3.1). Expected loss is of order the whole-cluster disaster rate for every
+33. **A second cluster** (§4.3.3.1). Expected loss is of order the whole-cluster disaster rate for every
     in-cluster code, so geo-replication is the only answer to the top of the distribution — and nothing
     in this document addresses it.
-30. **Is durability a per-customer billable tier?** (§4.3.3.3) Write-off fractions span 1/1000 to
+34. **Is durability a per-customer billable tier?** (§4.3.3.3) Write-off fractions span 1/1000 to
     999/1000, a 250× spread in effective loss rate on identical storage. Overhead = 1/(1−s) makes the
     knob natural and §12 bills it for free, but nothing offers it.
-31. **Do local codes actually lose on disasters, or only in the worst case?** (§4.3.2.1) Guaranteed
+35. **Do local codes actually lose on disasters, or only in the worst case?** (§4.3.2.1) Guaranteed
     tolerance is 7.5% against MDS's 33%, but maximal recoverability plus a good domain-to-local-group
     mapping may recover most real patterns — worth analysing before writing off the construction or the
     patent question.
-32. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
+36. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
     and domain constraints interact: a markedly emptier domain attracts weighted picks and
     then rejects them, which is worst right after adding capacity. Bounded, but worth
     measuring.
-33. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
+37. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
     safe, but who chooses the primary, and how a new one is appointed when it fails, is
     undesigned.
-34. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
+38. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
     must be chosen together; a Raft log index is a natural per-ring counter, but what an
     SCN is scoped to is unsettled while objects span many rings.
-35. **Expected object count** (§14.5). DN cost scales with object count rather than
+39. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-36. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
+40. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-37. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+41. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-38. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+42. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-39. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+43. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-40. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+44. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-41. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+45. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-42. **Background loop scheduling** (§13.3): prioritisation and rate limiting
+46. **Background loop scheduling** (§13.3): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-43. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+47. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-44. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+48. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-45. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+49. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-46. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+50. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-47. **Remaining directory semantics** (§5.1): listing huge directories,
+51. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-48. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+52. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-49. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+53. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-50. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
+54. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
     both sides: coarse granules compress better and bill less, fine granules cut read
     amplification, which is a 50× throughput factor for point reads.
-51. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+55. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-52. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+56. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-53. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+57. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-54. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
+58. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
     attribution, instantaneous-usage contract, reporting granularity. Slack itself is
     settled at 2× (§4.7).
-55. **Key custody within KS** (§7.3): how the daily master keys are themselves
+59. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-56. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+60. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-57. **Compaction policy** (§10) — now partly a pricing decision.
-58. **Membership and leader election** (§13).
-59. `Nul` and `\0` framing were both listed originally and are folded together
+61. **Compaction policy** (§10) — now partly a pricing decision.
+62. **Membership and leader election** (§13).
+63. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-60. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+64. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
