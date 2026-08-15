@@ -1957,7 +1957,7 @@ is commercially viable — customers accept it — rather than as a pattern to c
 | Resource | Cost driver | Must be billed as |
 |---|---|---|
 | EN disk | physical bytes × instances × time | **bytes stored** |
-| SN RAM | stream records + extent records | **stream count and extent count** |
+| SN RAM | stream records + extent **references** (§12.6.2) | **stream count and extent-reference count** |
 | DN storage | object records (§14.2) | **object count** |
 | Network and CPU | appends, reads, syncs | **operations** |
 
@@ -1997,7 +1997,62 @@ on one workload is fatal, because that is the one users will find — and §12.3
   month; it means a customer's *instantaneous* usage query is either stale or must be
   answered by summing live extent totals on the SNs on demand.
 
-### 12.6 Open policy questions
+### 12.6 A complex model, presented simply
+
+Closing every arbitrage means many billed dimensions (§12.4), and many dimensions mean a
+bill nobody wants to read. Those are separable problems: **the model is complex, the
+presentation need not be.**
+
+A bill is a **sum of charges**. A summary shows **the top few charges plus "everything
+else"**, and collapses the tail only when that tail is below **1% of the total**. Precisely:
+
+> Sort the charges descending and show the **smallest prefix whose complement sums to under
+> 1%**.
+
+The "sums to" matters. Collapsing every *individual* item under 1% would let twenty
+half-percent charges vanish into a tenth of the bill — the threshold has to apply to the
+remainder as a whole, not item by item.
+
+#### 12.6.1 It adapts to the workload, which makes it diagnostic
+
+The point is that the same rule produces a one-line bill for ordinary use and an itemized
+one for strange use, without anybody choosing which. Extent references are the example:
+usually negligible, dominant if you do something weird.
+
+Take 1 PB of erasure-coded data, illustratively:
+
+| | Stored bytes | Extent references | Summary |
+|---|---|---|---|
+| Normal workload | 99.96% | 0.04% | **1 line item** + everything else at 0.04% |
+| Same data, cloned 1000× | 71.6% | **28.4%** | **2 line items** |
+
+The clone adds no bytes at all — every extent is shared (§4.6.1) — but multiplies extent
+references a thousandfold, and references are what consume SN memory. So the cost appears
+from nowhere as far as stored volume is concerned, and the bill surfaces it automatically
+the moment it matters.
+
+That is a **diagnostic** property, not merely a cosmetic one. A customer who accidentally
+builds a pathological workload learns it from their own bill, in the line item that names
+the mechanism, rather than from a support conversation weeks later. And a dimension that is
+invisible in the common case cannot be quietly forgotten by whoever implements the meter,
+because the summary rule will expose it as soon as some customer finds it.
+
+#### 12.6.2 The cost driver is extent *references*, not extents
+
+Worth making explicit, since it is what the example turns on. An extent shared by *n*
+streams has **one** extent record but ***n*** entries in ***n*** extent lists, and it is the
+list entries that occupy SN memory. So:
+
+> SN memory ∝ stream records + **extent references**
+
+§14.1 counts "extent records" and is right only because §4.7 assumes one reference per
+extent. Under heavy sharing the two diverge without limit, and it is references that must be
+metered and that bound a stream. The §15.1 self-concatenation test is the extreme case —
+2^31 references to a single 32 MB extent — which is a useful consistency check: **the
+workload that stresses the system hardest is also the one the billing model charges most
+heavily for.** If those two ever disagreed, one of them would be wrong.
+
+### 12.7 Open policy questions
 
 1. Do customers pay for **uncompacted garbage** they created by overwriting, when DeLawson
    chooses the compaction schedule?
@@ -2363,7 +2418,11 @@ and 2/3 for extent records at 100 B** — and taking the worst case for capacity
 | | Budget | Record | Capacity |
 |---|---|---|---|
 | Stream records | 85 GB | 200 B | **4.3 × 10^8 streams** |
-| Extent records | 171 GB | 100 B | **1.7 × 10^9 extents** |
+| Extent references | 171 GB | 100 B | **1.7 × 10^9 references** |
+
+(References, not extents: a shared extent has one record but an entry in each referring
+stream's list, and the entries are what occupy memory — §12.6.2. The two are equal only
+under §4.7's assumption of one reference per extent.)
 
 A stream is bounded above by the whole extent budget: one stream monopolizing a
 machine reaches 1.7 × 10^9 × 32 MB = **51 PiB**. Any lower cap is policy, not a
