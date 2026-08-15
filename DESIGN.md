@@ -19,9 +19,9 @@ Language: Rust.
   storable, so record location must be computed from aggregate counts (or key
   ranges) plus a bounded scan.
 - **Compression and encryption are automatic**, not opt-in (§7).
-- **Billing is by physical bytes stored** (§12), which makes the compressed,
-  replicated footprint a customer-visible quantity, not an implementation
-  detail.
+- **Billing tracks actual cost across every scarce resource** (§12) — bytes, but also
+  stream, extent and object counts. Not a pricing detail: getting it wrong is what sank
+  the one previous attempt to make this class of system user-visible.
 - Sequential read throughput approaching the aggregate sequential bandwidth of
   the disks holding the object.
 
@@ -62,8 +62,9 @@ work below and because the numbers it implies are sensitive to it (§5.3.1):
 - It bounds the **metadata tiers** to a small fraction of the fleet, which §14.5
   checks and finds comfortable.
 
-Billing by physical bytes (§12) is the revenue side of the same coin: if cost is
-dominated by bytes on disk, the price should be too.
+⚠️ This is a prediction about a *healthy* workload, not an invariant, and it is emphatically
+not a licence to bill only for bytes on disk — see §12.2, where doing so is what sank the
+one previous attempt to make this class of system user-visible.
 
 ### 1.3 Longevity
 
@@ -1839,46 +1840,109 @@ share an EC fate.
 
 ## 12. Billing and metering
 
-**Customers are billed by physical bytes stored, summed over instances.** A
-32 MB compressed body held as 4 replicas bills as 128 MB; the same body as a 6+3
-erasure code bills as ~48 MB.
+### 12.1 The governing principle
 
-This makes several internal choices customer-visible:
+> **Billing must be proportional to actual cost, within some slack.** Bill too little and
+> the service goes broke; bill too much and a competitor undercuts it.
 
-- **Compression works for the customer, not just the fleet.** Ratio divides the
-  bill, which is why compression must precede encryption (§7) and why shrinking
-  compression blocks for index density is not a free trade (§7.1).
-- **Sealing and EC cut the bill ~2.7×** (4 replicas → 6+3), so the latency
-  between sealing and successful encoding is money. That needs an explicit
-  target and a decision about who absorbs the cost of the gap.
-- **Compaction reclaims billable bytes**, so the compaction schedule sets part
-  of the bill.
-- **Metering must be per-object over time** — physical bytes × instances ×
-  duration — surviving failures and double-counting nothing during repair,
-  re-encoding, and compaction, where old and new bases briefly coexist.
-- **The billed quantity is a lazy summary.** By §4.5, physical byte totals change
-  anywhere in the tree and so are maintained lazily by the background loops of
-  §13.2 — the exact, synchronous summary is the unkeyed record count, which
-  nobody is billed for. Billing therefore reads an eventually-consistent figure.
-  This is tolerable for metering integrated over a month, but it means a
-  customer's *instantaneous* usage query is either stale or must be answered by
-  summing live extent totals on the SNs on demand. Which of those is the
-  contract needs deciding.
-- **DN metadata is not free, and is now measurable.** If metadata can exceed
-  data in logical bytes (§14.2), whether it is billed is not a rounding
-  decision. Self-hosting (§5.5) makes it a real physical-byte figure rather than
-  an estimate — and compresses it several-fold on the way.
+Both bounds are real, which makes billing accuracy a two-sided constraint rather than a
+revenue-maximizing exercise. It also makes it a *design* constraint: the price list has to
+be derivable from the cost structure, so any resource the design makes scarce must be
+something the design can meter.
 
-⚠️ Open policy questions, all customer-facing:
+**This has a precedent worth taking seriously.** Cosmos was made user-visible once, as
+**ADLS Gen1**. It did not bill for user metadata — and users responded exactly as the
+incentive invited, piling into enormous numbers of extremely tiny streams. Nothing about
+that behaviour was unreasonable; it was the cheapest way to use the product as priced.
 
-1. Do customers pay for **uncompacted garbage** they created by overwriting,
-   when DeLawson chooses the compaction schedule?
-2. Do they pay for the **transient double footprint** during compaction and
-   re-encoding?
-3. Do they pay for **metadata** — DN records, and SN extent lists?
+### 12.2 Why "bill for bytes" is not enough
+
+The arithmetic of that failure mode is stark. Metadata lives in RAM on SNs, and RAM costs
+roughly **200× per byte what disk does** (illustratively, $3/GB DRAM against $15/TB HDD):
+
+| | Cost |
+|---|---|
+| A minimal stream: one 200 B stream record + one 100 B extent record | 300 B of SN RAM |
+| The same money spent on disk instead | ~60 KB |
+| So the break-even user payload, at 4 instances | **~15 KB** |
+
+**A stream holding less than ~15 KB is underbilled if only bytes are charged**, and the
+underbilling grows without bound as the payload shrinks:
+
+| Stream payload | Metadata share of its true cost |
+|---|---|
+| 1 KB | **94%** |
+| 100 KB | 13% |
+| 32 MB (a full extent) | ~0% |
+
+And the worst case is not marginal. A user who fills one SN's stream budget — 4.27 × 10^8
+streams (§14.1) — with 1 KB streams stores 427 GB, bills for 1.7 TB of replicated disk at
+roughly $26, and consumes a machine holding $768 of DRAM. **Underbilled ~30×, and an entire
+SN is gone.** The workload that is cheapest for the user is the one that is ruinous for the
+operator, so it is the workload the pricing selects for.
+
+### 12.3 The rule that follows
+
+> **Every scarce resource must be a billed dimension, or users will arbitrage the free
+> one.**
+
+| Resource | Cost driver | Must be billed as |
+|---|---|---|
+| EN disk | physical bytes × instances × time | **bytes stored** |
+| SN RAM | stream records + extent records | **stream count and extent count** |
+| DN storage | object records (§14.2) | **object count** |
+| Network and CPU | appends, reads, syncs | **operations** |
+
+⚠️ **§1.2's "95% of cost is disk" must not be read as licence to bill only for disk.** That
+figure is an *outcome* of a healthy workload, not an invariant. Bill only for bytes and the
+workload shifts until metadata dominates cost — at which point 95% is simply false. The
+cost model is a prediction conditional on the billing being right, not a justification for
+simplifying it.
+
+The slack in §12.1 is what makes this tractable: dimensions need not be exact, only close
+enough that no arbitrage is worth chasing. Being within a factor of ~2 across every
+workload is fine. Being 30× out on one workload is fatal, because that is the one users
+will find.
+
+### 12.4 What the design already makes visible
+
+- **Compression works for the customer, not just the fleet.** Ratio divides the bill, which
+  is why compression must precede encryption (§7) and why shrinking compression blocks for
+  index density is not a free trade (§7.1).
+- **Sealing and EC cut the bill ~2.7×** (4 replicas → 6+3), so the latency between sealing
+  and successful encoding is money. That needs an explicit target and a decision about who
+  absorbs the cost of the gap.
+- **Compaction reclaims billable bytes**, so the compaction schedule sets part of the bill —
+  as does the DN→SN sync cadence, since each missed delete leaks an orphan stream pinning
+  ~1.74 PB (§13.1.8).
+- **Lumping tiny objects into common streams** (§11) is what makes the small-object case
+  billable at all: without it every tiny object would carry a full stream's metadata cost,
+  which is precisely the ADLS Gen1 failure reappearing from the object side rather than the
+  stream side.
+- **Metering must be per-object over time** — bytes × instances × duration, plus the counts
+  above — surviving failures and double-counting nothing during repair, re-encoding, and
+  compaction, where old and new bases briefly coexist.
+- **The billed quantity is a lazy summary.** By §4.5, physical byte totals change anywhere
+  in the tree and so are maintained lazily by the background loops of §13.2 — the exact,
+  synchronous summary is the unkeyed record count, which nobody is billed for. Billing
+  therefore reads an eventually-consistent figure. Tolerable for metering integrated over a
+  month; it means a customer's *instantaneous* usage query is either stale or must be
+  answered by summing live extent totals on the SNs on demand.
+
+### 12.5 Open policy questions
+
+1. Do customers pay for **uncompacted garbage** they created by overwriting, when DeLawson
+   chooses the compaction schedule?
+2. Do they pay for the **transient double footprint** during compaction and re-encoding?
+3. How are **shared streams and extents** attributed between a clone and its original
+   (§4.6.1)? Charging both double-bills; charging neither loses revenue.
 4. How are **packed objects** attributed (§11)?
-5. Is the billed figure — compressed size, which the customer cannot directly
-   control — reported back to them, and at what granularity?
+5. Is the billed figure — compressed size, which the customer cannot directly control —
+   reported back to them, and at what granularity?
+6. What **slack** is acceptable? §12.3 asserts a factor of ~2 without deriving it.
+
+Note question 3 in the old list — whether metadata is billed — is no longer open. It must
+be (§12.3).
 
 ---
 
@@ -2569,8 +2633,9 @@ Roughly in order of how much else depends on them.
     physical.
 34. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-35. **Billing policy** (§12): garbage, transient double footprint, metadata,
-    instantaneous-usage contract, reporting granularity.
+35. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
+    attribution, instantaneous-usage contract, reporting granularity — and what slack is
+    acceptable, which §12.3 asserts at ~2× without deriving.
 36. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
 37. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
