@@ -34,6 +34,115 @@ it was computed or assumed.
 | Extent physical cap | 32 MB | §6 — bracketed from both sides, exact value a guess |
 | Record sizes | 100 / 200 / 300 B | §4.7 |
 
+### 0.1 Decided
+
+The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
+72 things *not* decided.
+
+**Priorities and framing**
+
+| | |
+|---|---|
+| Availability and reliability are **separate goals** with different remedies | §1.1 |
+| **Data loss happens during disasters**, not steady state — a failed rollout beats a millennium of disk attrition | §1.1.1, §13.2 |
+| Availability is promised **per record**, and is **time-bounded** — a timeout is part of it | §1.1, §5.11.2, §9.5 |
+| **Throughput over latency**; job latency is the *maximum* over requests, so hedge at p99.9+ | §1.4, §9.5 |
+| **~95% of hardware cost is disk**; that is cost composition and says nothing about space efficiency | §1.2, §12.7 |
+| **User code only on Compute; keys never where user code runs** | §1.5 |
+| A cluster may run **indefinitely** and lie dormant for eons — no absolute epochs, no work per elapsed time | §1.3 |
+
+**Object model**
+
+| | |
+|---|---|
+| Two flavors: **unkeyed** (64-bit record number, append only at the end) and **keyed** (sorted key, insert anywhere) | §3 |
+| The asymmetry follows from counts being stable under update and tombstone but not insert | §3 |
+| **Records are a store-layer primitive** — framing, record numbers, keys. The largest divergence from Cosmos | §1.4.5.1 |
+| Framing fixed at creation: `LengthPrefixed`, `Nul`, `Lf`, `CrLf` | §8.2 |
+| **Declared expiry**, defaulting to "never" but discouraged — the main lever on garbage | §8.5 |
+
+**Structure**
+
+| | |
+|---|---|
+| Four levels: object → streams → extents → instances | §4 |
+| **Stored as lists, served as B-trees** — snapshot, Raft log, state machine | §4.4 |
+| **Tail-only summaries may be synchronous; mid-tree summaries are lazy.** Why count-based addressing works at all | §4.5 |
+| References are **node-local**: 4 B object→stream, 4 B stream→extent, 6 B extent→instance. No cluster-wide names in the data plane | §4.6 |
+| Identity carries ownership: stream = `(DnId, StreamId)`, extent = `(SnId, ExtentId, creation second)` | §4.6.3 |
+| Timestamps are **8-byte seconds compared by signed difference**, reinterpretable indefinitely | §4.6.3 |
+| Position-dependent facts live in the **referrer**, not the target — forced by sharing | §4.6.2 |
+| Extent = sealed **base** plus lazily-created **log**; compaction folds them | §4.2 |
+| Extents seal on **either** limit: 4 GB logical or 32 MB physical | §6 |
+
+**Durability**
+
+| | |
+|---|---|
+| **4 instances while open, erasure-coded once sealed** | §4.3 |
+| Four is really a decision to **relax the repair window**, not a reliability necessity | §4.3.1.1 |
+| **Storage overhead = 1/(1 − survivable disaster fraction)**, achieved by MDS codes | §4.3.3 |
+| Working assumption **Reed-Solomon, MDS, m = 4**; overhead chosen from disaster tolerance | §4.3.2 |
+| Local codes trade minimum distance for locality, and are **patent-blocked until 2034** | §4.3.2.1 |
+| Erasure coding does not address **software bugs, admin error, or running out of space** | §4.3.4 |
+| Utilization ≤ **1 − 1/D** is a *durability* requirement — a full cluster cannot repair | §4.3.4 |
+| Repair must exceed the failure rate or loss is **certain**, not unlikely | §4.3.4.1 |
+
+**Machines**
+
+| | |
+|---|---|
+| **DN**, **SN**, **EN**, plus **FE**, **KS**, Compute, and the `delawson` client | §5, §5.9 |
+| **Metadata is made reliable by consensus; bulk data by placement** | §5 |
+| The **DN tier is self-hosted** in DeLawson keyed objects; the bootstrap root lives in **DN0's Raft state** | §5.5, §5.5.1 |
+| Rings have 2n+1 voters but only **3 materialized members** — 3× RAM, not 7× | §5.7 |
+| **Many rings per machine**; rings are a concurrency unit, not a capacity unit | §5.8 |
+| **32-bit node ids**, bounded fan-out ~20,000, local indices in the data plane | §5.10 |
+| SNs place on a **disk**, not an EN | §5.3.1 |
+| Failure domains are **nested, never orthogonal**; slack 4/3 | §5.6 |
+| Placement is **free-space-weighted random with rejection** — provably optimal, and self-balancing at any scale | §5.6.3, §5.6.4 |
+| **No rebalancing.** Fullness is handled by redirecting writes; only DN range splits move anything | §5.11, §13.1.2 |
+| **Default locality**: a directory's objects land on one SN | §5.11.1 |
+| The intra-cluster network is **flat**, so there is no affinity mechanism | §5.12.3 |
+| The **SN is not in the write path** | §8.1.3 |
+
+**Pipeline and keys**
+
+| | |
+|---|---|
+| frame → **compress → encrypt** → replicate → seal → erasure-code. Both orderings are forced | §7 |
+| Compression and encryption are **block-granular** at the index granule; the index points at **physical** offsets | §7.1, §9.3 |
+| Keys: **daily master keys in KS only**, daily SN-master keys cached on ENs, extent keys derived. ~1 MB per century | §7.3 |
+| KS is unlocked by **operator secrets plus hardware** — the only step needing people | §7.3.2 |
+
+**Writing, reading, syncing**
+
+| | |
+|---|---|
+| Append blocks are atomic; **accepted / applied / durable**, with 3-of-4 a quorum | §8.1.1 |
+| The quorum forces **broadcast, not a daisy chain** | §8.1.2 |
+| **Soft delete** is a deferred decrement: 3-day window, timers in parallel across layers, opt-out per directory | §8.4 |
+| Metadata must not **predecease** its data — which makes the heroics window for user deletes zero | §8.4.1d |
+| Three sync loops: disk state **~1 min**, instance state **~1 hr**, DN→SN **days to months** | §13.1 |
+| Sync is driven **from above**, one message per pair, with bucket counts negotiated **upward only** | §13.1 |
+| Exactly two sync loops, because **only cross-tier references can drift** | §13.1.7 |
+| Hot small objects need **caching plus a broadcast tree**, not more replicas | §9.6 |
+
+**Billing**
+
+| | |
+|---|---|
+| Billing tracks **actual cost within 2× slack**, on every scarce resource | §12.1, §12.4 |
+| **Physical, not logical** bytes — forced by the same slack rule | §12.3 |
+| A complex model with a **simple presentation**: top charges plus "everything else" while under 1% | §12.6 |
+| Only **~58% of purchased disk** is billable; price lands near **2.6× raw disk cost** per byte | §12.7 |
+
+**Testing**
+
+| | |
+|---|---|
+| **Self-concatenation** tests metadata scale — 2^31 extent references on 32 MB of real data | §15 |
+
 ---
 
 ## 1. Goals
