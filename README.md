@@ -7,6 +7,13 @@ d. 1919, Buffalo, New York) — Bob's great-grandfather, a piano teacher who
 played jazz in the style of Gershwin. He went by **Laws**, short for DeLawson.
 See [his page](https://burtleburtle.net/gene/glowry18800117.html).
 
+**Intended to be open source**, so a storage cluster can run inside a compute cluster and avoid
+ingress and egress charges — which for read-heavy analytics run to tens of times the cost of the
+storage itself. One motivating use case is shared AI memory: because unkeyed objects only ever
+append at the end and keyed objects are addressed by sorted key, **external indexes stay
+permanently valid** without rebuilding, and every append records the second it became durable, so
+time-range queries work indefinitely.
+
 ## Status
 
 **Design phase. No implementation yet.**
