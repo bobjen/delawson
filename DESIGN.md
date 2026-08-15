@@ -5028,10 +5028,11 @@ Roughly in order of how much else depends on them.
     truncation in another guise, and unspecified.
 35. **Bound and timeout on the out-of-order cache** (§8.1.1a-4). Together they set how far ahead a single
     writer may pipeline, and a gap that never fills must not pin cached data indefinitely.
-36. **Which offset the single-writer compares** (§8.1.1a-6): within the extent, within the object, or the
-    pair. Only an object-wide offset is predictable across an extent roll; the pair works at one wasted round
-    trip per roll. Settle it before the client interface exists. (The record number is *not* a candidate —
-    record fragments mean append boundaries need not fall on record boundaries, §8.2.2.)
+36. **Stable offsets versus parallel append throughput** (§8.1.1a-8). One unsealed extent is what makes the
+    object logical offset well defined, and it caps a single object's append rate near one disk's bandwidth,
+    ~200 MB/s. §1.0's shared-memory case wants many writers on one object *and* stable references, and those
+    conflict: shard across objects and lose the single ordered sequence, or allow several open extents and
+    lose the object-wide offset. Settle before the API is fixed.
 37. **When coalescing should re-frame** (§8.2.1). Matching the dominant read format takes translation off
     the read path, but nothing tracks what the dominant read format is.
 38. **Waste from a large append at a nearly-full extent** (§8.1.1c). The 32 MB logical bound (§8.1.1a-2)
