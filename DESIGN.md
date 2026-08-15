@@ -5,6 +5,35 @@ Status: **draft, pre-implementation.** Nothing here is built. Sections marked
 
 Language: Rust.
 
+## 0. How to read this document
+
+**Nullius in verba.** No number in here stands on anyone's authority, Bob's included. Every design
+and every figure is either justified from first principles in place, or labelled as a guess to be
+confirmed. Where the two conflict, the arithmetic wins and the label gets updated.
+
+| Label | Means |
+|---|---|
+| **Derived** | the arithmetic is shown where the claim is made |
+| **Cited** | from a public source, with a link |
+| **Guess** | a round number pending measurement; the numeric ones are collected in §4.7 |
+| **Asserted** | stated from experience without derivation — usable, but flagged so it can be revisited |
+| ⚠️ | unresolved; collected again in §16 |
+
+The distinction matters because this document is long and will be read by people who cannot
+re-derive it from scratch. An unlabelled number is a liability: in a year nobody can tell whether
+it was computed or assumed.
+
+**Inputs currently asserted rather than derived**, in rough order of how much rests on them:
+
+| Input | Value | Where |
+|---|---|---|
+| Instance gone-and-not-yet-replaced | 10^-4 | §4.3.1 — **challenged in §4.3.1.1** |
+| Reliability target | 10^-14 per window | §4.3.1 — given fleet meaning in §4.3.1.1 |
+| Instance unavailable | 10^-3 | §4.3.1 |
+| Placement slack | 4/3 | §5.6.1 — rationale given, the specific ratio is not derived |
+| Extent physical cap | 32 MB | §6 — bracketed from both sides, exact value a guess |
+| Record sizes | 100 / 200 / 300 B | §4.7 |
+
 ---
 
 ## 1. Goals
@@ -532,8 +561,50 @@ margin nobody asked for.
 ⚠️ **The model is corroborated; the number is not.** Cosmos states the same failure model in the same
 terms — replicas in separate failure domains, a lost replica replaced, data loss when all are lost
 inside the replication window (§1.4.5.2). But its empirical finding was that **three replicas
-sufficed** at exabyte scale for a decade. Four here is more conservative than measured practice;
-the defence is that replication is transient, so the fourth copy costs little (§4.3).
+sufficed** at exabyte scale for a decade. §4.3.1.1 works out why, and the answer is not that Cosmos
+was lucky.
+
+#### 4.3.1.1 What the target means, and which input to doubt
+
+A probability "per average window" is not a quantity anyone can sanity-check. Converting it to a
+fleet loss rate makes it checkable. A window opens when *one* instance is lost, so loss requires
+the remaining *n*−1 inside that window:
+
+> losses/year ≈ (extents) × *n* × AFR × *p_gone*^(*n*−1)
+
+At 1 EB in 32 MB extents — 3.0 × 10^10 extents — and 1.5% AFR:
+
+| Repair window *W* | Implied *p_gone* | 3 replicas | 4 replicas |
+|---|---|---|---|
+| 1 h | 1.7 × 10^-6 | 1 loss per **255 yr** | 1 per 10^8 yr |
+| 4 h | 6.8 × 10^-6 | 1 per **16 yr** | 1 per 1.7 × 10^6 yr |
+| 12 h | 2.1 × 10^-5 | 1 per **2 yr** | 1 per 65,000 yr |
+| **58 h** | **10^-4** | **13 losses per year** | 1 per **572 yr** |
+
+Two things fall out, and the second is the important one.
+
+**First, the 10^-14 target does have a sensible fleet meaning**: at 4 replicas and a 58-hour window
+it is roughly one lost extent per 572 years per exabyte. That is a defensible number, so the target
+survives being questioned.
+
+⚠️ **Second, *p_gone* = 10^-4 is the input to doubt.** It implies a **58-hour repair window**, which
+is lax — and a tighter one is cheap. Rebuilding a failed 20 TB disk inside an hour needs ~44 GB/s of
+reads at 8× erasure-coding amplification, which is **0.18% of a 25 TB/s fleet**:
+
+| *W* | Read bandwidth to hit it | Fraction of a 25 TB/s fleet |
+|---|---|---|
+| 1 h | 44 GB/s | 0.18% |
+| 4 h | 11 GB/s | 0.04% |
+| 58 h | 0.8 GB/s | 0.003% |
+
+So **at a 1–4 hour window, three replicas already meet the target**, which is almost certainly why
+Cosmos observed three sufficing. The fourth replica is not buying reliability that three plus prompt
+repair could not; it is buying permission to repair slowly.
+
+Which is still a reasonable trade — replication is transient (§4.3), so a fourth copy of open
+extents costs little, while a tight repair window is a standing operational commitment. But the
+honest statement is that **four instances is a choice to relax the repair window, not a
+reliability necessity**, and the number to revisit is *p_gone*, not *n*.
 
 **That exponent is entirely a claim about independence.** (10^-4)^4 assumes the four
 failures are uncorrelated, which is exactly what the placement rules of §5.6 exist to
@@ -3493,10 +3564,10 @@ Roughly in order of how much else depends on them.
     unnecessary only while intra-cluster network is flat, which costs ~6% of an EN and is tight
     against a strict 5% overhead target. If a cluster ever spans an unflattenable boundary,
     topology and affinity both return.
-23. **Is four instances over-engineered?** (§4.3.1) Cosmos observed three sufficing at exabyte
-    scale for a decade. Either the 10^-4 gone-not-replaced assumption or the 10^-14 target is
-    pessimistic; the fourth copy is cheap because replication is transient, but it is worth
-    knowing which.
+23. **Pick the repair window, then the replica count** (§4.3.1.1). *p_gone* = 10^-4 implies a
+    58-hour window; a 1–4 hour window costs 0.04–0.18% of fleet read bandwidth and makes three
+    replicas sufficient. So four instances is a decision to repair slowly, not a reliability
+    necessity — and the window is the number to set deliberately.
 24. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
     and domain constraints interact: a markedly emptier domain attracts weighted picks and
     then rejects them, which is worst right after adding capacity. Bounded, but worth
