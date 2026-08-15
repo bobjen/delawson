@@ -96,7 +96,71 @@ That rules out a family of designs that are otherwise natural:
   may be unrecognizably newer than the code that wrote it. Format evolution across such
   spans is a requirement, not a maintenance concern.
 
-### 1.4 One security invariant
+### 1.4 Throughput over latency
+
+**DeLawson optimizes for throughput, and treats latency as a secondary good.** Good latency
+is worth having when it is cheap; it does not win arguments against throughput.
+
+The primary customer runs **big jobs composed of enormous numbers of small parallel
+requests**. Such a user cares about when the *job* finishes and is indifferent to how long any
+one of its zillions of requests took. Users who care about individual request latency exist
+and are welcome, but they are not who this is built for.
+
+The arithmetic behind the priority is Little's Law. Sustained throughput needs only
+`throughput × latency ÷ request size` requests in flight:
+
+| Sustained | Requests in flight at 17 ms, 32 MB | 1 PB job elapsed |
+|---|---|---|
+| 100 GB/s | 51 | 10,000 s |
+| 1 TB/s | 507 | 1,000 s |
+| 10 TB/s | 5,066 | 100 s |
+
+A few hundred outstanding requests sustain a terabyte a second, so **concurrency is cheap and
+per-request latency is hidden almost entirely.** Doubling latency while doubling concurrency
+is a wash; halving throughput is not.
+
+#### 1.4.1 But job latency is the *maximum* over requests
+
+The priority does not make tail latency irrelevant — it changes which part of the tail
+matters. A scan must read everything, so it waits for its slowest request, and with tens of
+millions of requests the extreme tail becomes a certainty:
+
+> A 1 PB scan issues ~3 × 10^7 requests. If one request in 10^6 stalls for a TCP timeout,
+> ~30 of them do, and the job pays ~40 seconds.
+
+So per-request tails matter *through the maximum*, not because any user is watching an
+individual request. That is the real justification for the hedging of §9.5, and it also says
+where to set it: hedging costs throughput in proportion to how often it fires, while the
+benefit is a fixed saving, so the break-even depends on job length.
+
+| Hedge at | Throughput cost | Wins for jobs shorter than |
+|---|---|---|
+| p95 | 5% | 13 minutes |
+| p99 | 1% | 1.1 hours |
+| **p99.9** | **0.1%** | **11 hours** |
+| p99.99 | 0.01% | 111 hours |
+
+**Hedge at a high percentile.** p95 would be the natural choice for a latency-first system and
+is wrong here — it only pays for jobs under a quarter of an hour. p99.9 or beyond removes the
+40-second stalls while costing a tenth of a percent.
+
+#### 1.4.2 Read amplification becomes a first-order concern
+
+Throughput-first does *not* simply favour coarser everything, which was my first instinct and
+is wrong. Wasted bytes are wasted throughput, so read amplification is a throughput cost:
+
+| Granule | Amplification for a 100 B record | Bytes moved by 10^9 point reads |
+|---|---|---|
+| 20 KB | 200× | 20 TB |
+| 1 MB | 10,000× | 1,000 TB |
+
+Granule size is therefore a **50× throughput factor** for point-read workloads, while being
+nearly irrelevant to sequential scans, which read everything regardless. So §9.3's fine SSD
+granularity is throughput-motivated, not latency-motivated — and the tension with compression
+ratio in §7.1 is now a throughput-versus-cost trade on both sides rather than a
+latency-versus-cost one. Sharpened, not settled.
+
+### 1.5 One security invariant
 
 **User code runs only on Compute machines, and decryption keys are never on a
 machine that runs user code** (§5.9.1). Stated here because it constrains the
@@ -1664,7 +1728,7 @@ the serving SN would fetch the wrong master key.
 ⚠️ **There is no cryptographic tenant isolation.** Keys are scoped by day and SN,
 not by customer, so two tenants' extents on one SN for one day derive from the same
 SN-master key. Isolation rests on FE authorization (§5.9) and on keys never
-reaching user code (§1.4) — not on separate key material. That is a coherent
+reaching user code (§1.5) — not on separate key material. That is a coherent
 position, but it forecloses customer-supplied keys and weakens any "we cannot read
 your data" claim, so it interacts directly with §5.9.2.
 
@@ -1879,6 +1943,10 @@ are exactly the options needed:
 And it is nearly free, because only the slow tail is ever duplicated. Hedging at the p99 of
 read latency duplicates 1% of reads; at p99.9, 0.1%. The extra load is a knob with a
 well-understood cost, unlike the 40-second stall it replaces.
+
+**Set it high — p99.9 or beyond.** §1.4.1 works out why: under a throughput-first priority the
+cost of hedging is proportional while the benefit is a fixed saving, so p95 only pays for jobs
+under a quarter of an hour, while p99.9 pays for anything under eleven.
 
 Two places this generalizes:
 
@@ -2878,9 +2946,9 @@ Roughly in order of how much else depends on them.
     range is undesigned.
 14. **What ring unavailability *p* actually is** (§5.11.1). The locality argument and the
     per-record availability contract both turn on it, and nothing has measured or targeted it.
-15. **Hedge delays per tier** (§9.5). EN granule reads, metadata lookups and
-    client-to-FE requests differ in normal latency by orders of magnitude, so one global
-    value will be wrong everywhere. Also: may a ring's hot backup serve hedged metadata
+15. **Hedge delays per tier** (§9.5). The *percentile* is settled at p99.9+ (§1.4.1), but the
+    absolute delays differ by orders of magnitude between an EN granule read, a metadata
+    lookup and a client-to-FE request. Also: may a ring's hot backup serve hedged metadata
     reads, and what staleness does that admit?
 16. **The give-up budget for seal-short** (§9.5, §13). It must sit far below a 40-second TCP
     retry or one dead EN stalls a writer for a timeout.
@@ -2938,8 +3006,9 @@ Roughly in order of how much else depends on them.
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
 34. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-35. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
-    hurts compression ratio, and ratio is billable.
+35. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
+    both sides: coarse granules compress better and bill less, fine granules cut read
+    amplification, which is a 50× throughput factor for point reads.
 36. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
 37. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
@@ -2969,6 +3038,7 @@ Roughly in order of how much else depends on them.
 - whether the DN tier is self-hosted — it is, with a bootstrap root (§5.5);
 - whether summary maintenance can run away under self-hosting — it cannot, by
   the tail-only rule (§4.5, §5.5.2);
+- the hedging percentile — p99.9 or beyond, from the throughput priority (§1.4.1);
 - whether `count` is exact and cheap — exact and synchronous for unkeyed
   objects, lazy for keyed ones, again by §4.5;
 - the supposed 32 MB-vs-large-streams tension, based on a wrong constraint
