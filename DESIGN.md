@@ -321,13 +321,68 @@ states outright that their on-disk representation "Is Only Visible to Scope."
 
 That is why DeLawson carries machinery Cosmos's store layer did not: framing options, keyed
 objects, a record-granular index. It buys something specific in return — **a record is
-addressable without a query engine.** §1's goal of 2^64 addressable records is a statement about
+addressable without a query engine.**
+
+**Cosmos's own measurements argue for the change.** The VLDB paper (§1.4.5.2) reports that ad-hoc
+jobs "typically spent 90% of their CPU in massively parallel extractors", most of it parsing
+tab-separated values and sorting results. Moving record structure into the store aims squarely at
+that number — though only at part of it:
+
+| Extractor work | Removed by DeLawson? |
+|---|---|
+| Finding record boundaries | **yes** — framing is a store property (§8.2) |
+| Re-sorting into key order | **yes** — keyed objects are already sorted (§3) |
+| Parsing fields into typed columns | **no** — still a compute-tier job |
+
+Two of three, then. Taking the third would mean column and schema awareness in the store, which is
+what Structured Streams were and what this design has deliberately not taken on. §1's goal of 2^64 addressable records is a statement about
 the store, not about a language on top of it, and none of §4's structure works if the store only
 sees bytes.
 
 ⚠️ It also means DeLawson takes on a job Cosmos deliberately left to SCOPE, and the cost of that
 is spread across §3, §4, §8.2 and §9.3 rather than sitting in one place. Worth being honest that
 this is the single largest bet in the design relative to its ancestor.
+
+#### 1.4.5.2 Cosmos, a decade later
+
+A second public paper covers 2002–2021: [The Cosmos Big Data Platform at
+Microsoft](https://www.microsoft.com/en-us/research/publication/the-cosmos-big-data-platform-at-microsoft-over-a-decade-of-progress-and-a-decade-to-look-forward/),
+Power, Patel, Jindal, Leeka, **Jenkins**, Rys et al., VLDB 2021. Growth over that decade: **12×
+servers, 188× logical data, 108× batch jobs**, at exabyte scale, with machine utilization
+"exceeding 70% in most cases and 90% in many cases."
+
+It also records specifics that bear directly on decisions made here.
+
+**CSM was a Paxos ring of seven replicas, all holding metadata in RAM.** The paper describes
+metadata kept "in a Paxos-protected ring with seven replicas that keep all metadata in RAM." That
+is precisely the arrangement §5.7 rejects: 7× RAM to tolerate 3 failures, when only **three
+members need the state materialized** and the rest can be log-only. §5.7's 3× is a direct
+improvement on a documented predecessor rather than a hypothetical saving — and RAM is the
+resource §12.2 shows costs ~5,000× disk, so the factor matters.
+
+**Extents were 100 MB, "soon 250MB", compressed and stored in triplicate in different failure
+domains.** The 2011 talk's 2 GB was a later figure, so the trajectory ran 100 MB → 250 MB → 2 GB.
+DeLawson's 32 MB *physical* cap is smaller than any of them, with the growth absorbed by a
+separate 4 GB *logical* cap (§6) — a split Cosmos did not have.
+
+**The reliability model is the same one, stated the same way.** Each replica in a separate failure
+domain so that "correlated hardware failures, such as power failures, do not cause the loss of
+every extent replica"; a lost replica is replaced; and "data loss occurs when all replicas are
+lost within the time window it takes" to do that replication. That is §4.3.1 and §5.6 exactly,
+including the window framing — arrived at here independently and confirmed there empirically.
+
+⚠️ **But their empirical answer was three replicas, not four.** The paper reports that data loss
+"occur[s] with two replicas, but not with three replicas" — a decade of exabyte-scale operation
+saying three suffices. §4.3.1 derives four from a 10^-14 target and a 10^-4 gone-not-replaced
+assumption; production experience suggests one or both is pessimistic. The counter-argument is
+that replication is transient in DeLawson — only open extents are replicated, everything sealed is
+erasure-coded — so the fourth copy is cheap insurance rather than a third of the storage bill.
+Worth knowing that the conservative choice is conservative *against measured practice*, not just
+against a spreadsheet.
+
+Two negative results are recorded too, which are worth more than they look: **2×2 replication**
+(two copies in each of two clusters) "proved insufficient for availability during outages," and
+plain two-replica extents "lost a trickle of data constantly."
 
 ### 1.5 One security invariant
 
@@ -474,7 +529,13 @@ instances the loss probability per window is (10^-4)^*n*:
 So four is not a round number — three misses by two orders of magnitude and five buys
 margin nobody asked for.
 
-⚠️ **That exponent is entirely a claim about independence.** (10^-4)^4 assumes the four
+⚠️ **The model is corroborated; the number is not.** Cosmos states the same failure model in the same
+terms — replicas in separate failure domains, a lost replica replaced, data loss when all are lost
+inside the replication window (§1.4.5.2). But its empirical finding was that **three replicas
+sufficed** at exabyte scale for a decade. Four here is more conservative than measured practice;
+the defence is that replication is transient, so the fourth copy costs little (§4.3).
+
+**That exponent is entirely a claim about independence.** (10^-4)^4 assumes the four
 failures are uncorrelated, which is exactly what the placement rules of §5.6 exist to
 deliver. A correlated failure mode — one bad firmware revision, one power domain, two
 instances on one machine's disks — collapses the exponent toward 10^-4 and the design
@@ -1422,6 +1483,10 @@ Raft tolerates *n* failures with 2n+1 members. Materializing the served B-tree
 (§4.4) on all of them would cost **7× RAM at n=3** — and RAM is the resource that
 bounds a stream (§14.1), so that is 7× the most expensive thing in the system.
 
+That is not hypothetical: Cosmos's CSM did exactly this, keeping metadata "in a Paxos-protected
+ring with seven replicas that keep all metadata in RAM" (§1.4.5.2). What follows is a direct
+improvement on a documented predecessor.
+
 It is also unnecessary. **Consensus needs 2n+1 voters; only three members need
 the state materialized.**
 
@@ -1838,8 +1903,10 @@ lands in the same neighbourhood.
 #### 5.12.2 L-shaped jobs, and what "compact" should mean
 
 Jobs are often **L-shaped**: a huge parallel read that discards most of its input through
-filtering and aggregation, then a long churn on what remains. The question is whether the
-remainder wants to be *compact*.
+filtering and aggregation, then a long churn on what remains. Not a guess — the VLDB paper
+describes it directly: extract vertices "discard most of the data, aggregate most of the rest, and
+then later vertices spend a long time churning that remaining data" (§1.4.5.2). The question is
+whether the remainder wants to be *compact*.
 
 It does — but **"compact" means RAM-resident in aggregate, not co-located on few machines.** The
 gap that matters is not network topology, it is memory versus network, and that gap survives any
@@ -1871,6 +1938,15 @@ and reductions — and DeLawson is not in the loop.
 ⚠️ Which suggests the useful thing for DeLawson to offer Compute is not locality-aware placement
 but a way to know, and to report, whether a job's remainder will fit. That is a scheduling input
 nobody has designed.
+
+**One kind of locality this reasoning does not cover: co-partitioning for joins.** Cosmos built
+placement affinity for exactly that — affinitized extents mapped to the same racks, so a vertex
+"joining two affinitized streams could join them by their affinitized keys without reading
+cross-rack data", kept in sync by an Affinity Service (§1.4.5.2). That is about avoiding a
+*shuffle*, not about re-reading a working set, so the RAM-versus-network argument above says
+nothing about it. DeLawson gets directory-level affinity free from §5.11.1's default locality, but
+has no notion of two objects being co-partitioned by key. A real gap — and Cosmos found it worth a
+whole service.
 
 ---
 
@@ -3383,81 +3459,88 @@ Roughly in order of how much else depends on them.
 21. **Telling a job whether its remainder fits** (§5.12.2). Phase 2 is a memory workload or a
     storage workload depending on the filtering ratio, differing by the iteration count. That
     looks like the most useful thing DeLawson could tell a scheduler, and nothing computes it.
-22. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
+22. **Co-partitioning affinity** (§5.12.2). Cosmos built an Affinity Service so joins on
+    affinitized keys read no cross-rack data. DeLawson has directory-level locality and no
+    key-level co-partitioning, and the RAM-versus-network argument does not cover shuffles.
+23. **Is four instances over-engineered?** (§4.3.1) Cosmos observed three sufficing at exabyte
+    scale for a decade. Either the 10^-4 gone-not-replaced assumption or the 10^-14 target is
+    pessimistic; the fourth copy is cheap because replication is transient, but it is worth
+    knowing which.
+24. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
     and domain constraints interact: a markedly emptier domain attracts weighted picks and
     then rejects them, which is worst right after adding capacity. Bounded, but worth
     measuring.
-23. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
+25. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
     safe, but who chooses the primary, and how a new one is appointed when it fails, is
     undesigned.
-24. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
+26. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
     must be chosen together; a Raft log index is a natural per-ring counter, but what an
     SCN is scoped to is unsettled while objects span many rings.
-25. **Expected object count** (§14.5). DN cost scales with object count rather than
+27. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-26. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
+28. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-27. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+29. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-28. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+30. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-29. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+31. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-30. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+32. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-31. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+33. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-32. **Background loop scheduling** (§13.2): prioritisation and rate limiting
+34. **Background loop scheduling** (§13.2): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-33. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+35. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-34. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+36. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-35. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+37. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-36. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+38. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-37. **Remaining directory semantics** (§5.1): listing huge directories,
+39. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-38. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+40. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-39. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+41. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-40. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
+42. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
     both sides: coarse granules compress better and bill less, fine granules cut read
     amplification, which is a 50× throughput factor for point reads.
-41. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+43. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-42. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+44. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-43. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+45. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-44. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
+46. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
     attribution, instantaneous-usage contract, reporting granularity. Slack itself is
     settled at 2× (§4.7).
-45. **Key custody within KS** (§7.3): how the daily master keys are themselves
+47. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-46. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+48. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-47. **Compaction policy** (§10) — now partly a pricing decision.
-48. **Membership and leader election** (§13).
-49. `Nul` and `\0` framing were both listed originally and are folded together
+49. **Compaction policy** (§10) — now partly a pricing decision.
+50. **Membership and leader election** (§13).
+51. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-50. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+52. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
