@@ -1502,47 +1502,64 @@ SN ring (§5.7), not by a disk. So there is nothing for a fast loop to catch. An
 reference to an instance, by contrast, depends on a specific spinning disk that can
 die between one second and the next.
 
-#### 13.1.1 The sync is one message per SN/EN pair
+#### 13.1.1 One message per pair, driven from above
 
-**Sync is per SN/EN pair, not per disk.** One message covers the whole pair and is
-*internally* structured by disk. That keeps the message count proportional to the
-fan-out (§5.10) rather than to fan-out × disks, which at 150 disks per EN is a
-150-fold difference in protocol chatter for no gain.
+**Sync is per pair — SN/EN, DN/SN — not per disk or per object.** One message covers
+the whole pair and is *internally* structured by the substructure below it. That keeps
+the message count proportional to the fan-out (§5.10) rather than to fan-out × disks,
+which at 150 disks per EN is a 150-fold difference in chatter for no gain.
 
-**The SN drives it.** The EN answers; it does not initiate. That follows from the SN
-being the one that knows what *should* be there.
+**The upper tier drives.** The SN asks the EN; the DN asks the SN. The tier holding the
+metadata is the one that knows what ought to exist.
 
-#### 13.1.2 Cold sync needs bucketing, negotiated
+#### 13.1.2 Cold sync bucketing, negotiated
 
-A cold sync enumerates everything, and everything is large. An SN drives ~2.3 × 10^9
-instances (§5.10.1) spread over its fan-out; at a 3 PB EN with *G*=16 that is ~5.6
-million instances per pair, or **~112 MB at 20 B each** — far past any sane message
-size. So a cold sync is split, in three escalating steps:
+A cold sync enumerates everything, and everything is large, so it is split in three
+escalating steps. **Both sync pairs use the same mechanism**, with the middle step
+instantiated on whatever natural substructure that pair has:
 
-| Step | Split by | When |
-|---|---|---|
-| 1 | nothing — one message | small pairs |
-| 2 | **sets of disks** | the pair's digest exceeds the message limit |
-| 3 | **hash within a disk** | a *single disk's* share still exceeds it |
+| Step | Split by | SN → EN | DN → SN |
+|---|---|---|---|
+| 1 | nothing — one message | small pairs | small pairs |
+| 2 | the natural substructure | **sets of disks** | **sets of objects** |
+| 3 | hash within one unit of it | **hash within a disk** | **hash within an object** |
 
-Step 3 is not hypothetical but is not common either. One 20 TB disk holds ~596,000
-extents, so a digest of an entire disk is ~12 MB; a pair only reaches step 3 when the
-SN owns a large fraction of one disk, which means a low sharing factor *G* or unusually
-large disks. At *G*=16 the per-disk share is ~37,000 instances, or 0.75 MB, and step 2
-suffices.
+The parallel is exact: a disk groups an EN's instances the way an object groups a DN's
+streams, and in both cases step 3 exists for the case where a single unit of that
+grouping is itself too large.
+
+Both need step 3 in practice:
+
+- **SN → EN.** An SN drives ~2.3 × 10^9 instances (§5.10.1); at a 3 PB EN with *G*=16
+  that is ~5.6 million per pair, **~112 MB** at 20 B each. One whole 20 TB disk digests
+  to ~12 MB, so a pair reaches step 3 only when the SN owns a large fraction of one
+  disk — a low sharing factor or unusually large disks. At *G*=16 the per-disk share is
+  ~0.75 MB and step 2 suffices.
+- **DN → SN.** An SN holds ~4.3 × 10^8 stream records (§14.1). How much lands in one
+  pair depends entirely on how widely an SN's streams are spread across DNs:
+
+  | DNs per SN | Streams per pair | Digest |
+  |---|---|---|
+  | 20,000 | 21,000 | 0.43 MB — one message |
+  | 1,000 | 427,000 | 8.5 MB — step 2 |
+  | 100 | 4.3 × 10^6 | 85 MB — step 2, well split |
+
+  And step 3 is unavoidable at the top end regardless: **a maximal object has ~4.1 × 10^6
+  streams, ~82 MB**, so one object alone exceeds any sane message and must be split by
+  hash.
 
 **Bucket count is negotiated, and only upward:**
 
-- The **SN estimates** the bucket count from the instances it knows about — it has the
-  count already, so the estimate is free and usually right.
-- The **EN may raise it in its first response** if that estimate is too low, and the SN
-  retries with the larger count.
+- The **upper tier estimates** the bucket count from what it knows — it has the count
+  already, so the estimate is free and usually right.
+- The **lower tier may raise it in its first response** if that estimate is too low, and
+  the upper tier retries with the larger count.
 
-The asymmetry is the interesting part, and it is not arbitrary. The EN may legitimately
-know about *more* instances than the SN does — that is a large part of what the sync is
-for (§13.1.3) — so only the EN can discover that the SN's estimate was short. Allowing
-only increases makes the negotiation monotonic and terminating: at worst one extra
-round trip, with no possibility of two parties oscillating between sizes.
+The asymmetry is the interesting part, and it is not arbitrary. The lower tier may
+legitimately hold *more* than the upper tier knows about — orphans, which are a large
+part of what the sync is for (§13.1.3) — so only it can discover the estimate was short.
+Allowing increases only makes the negotiation monotonic and terminating: at worst one
+extra round trip, with no possibility of two parties oscillating between sizes.
 
 #### 13.1.3 Divergence runs in both directions
 
@@ -1551,13 +1568,23 @@ Worth being explicit, because it shapes what the sync is for:
 | Divergence | Meaning | Action |
 |---|---|---|
 | SN expects an instance the EN lacks | lost to disk failure or corruption | repair — re-replicate or reconstruct (§13) |
-| EN holds an instance the SN never mentions | **orphan** — a failed delete, an abandoned write, or state the SN lost and rebuilt | reclaim the space |
+| EN holds an instance the SN never mentions | **orphan instance** — a failed delete, an abandoned write, or state the SN lost and rebuilt | reclaim the space |
+| DN references a stream the SN lacks | lost stream — data loss, not merely unavailability | escalate; nothing routine fixes this |
+| SN holds a stream no DN references | **orphan stream** — a failed object delete, or an abandoned create | decrement and reclaim (§4.6.1) |
 
-Orphans are why the EN can hold more than the SN expects, and why it must be able to
-raise the bucket count. They also cost money: an orphan is physical bytes on a disk, and
-§12 bills by physical bytes, so unreclaimed orphans are either overcharging a customer
-or unbilled cost absorbed by the operator. Neither is acceptable indefinitely, which
-gives the sweep a business reason to complete and not merely a hygienic one.
+Orphans are why the lower tier can hold more than the upper tier knows about, and why
+only it can raise the bucket count. They also cost money: an orphan is physical bytes on
+a disk, and §12 bills by physical bytes, so unreclaimed orphans either overcharge a
+customer or become unbilled cost absorbed by the operator. Neither is acceptable
+indefinitely, which gives the sweep a business reason to complete and not merely a
+hygienic one.
+
+⚠️ The asymmetry between the two "upper tier expects something missing" rows deserves
+attention. A missing instance is routine — that is what replication is for. A missing
+*stream* is data loss, because the SN ring was the authority for it (§5.7) and no other
+copy exists. So the DN→SN sync is the loop most likely to discover something
+unrecoverable, which is an argument for it being an alarm rather than a repair
+mechanism, despite being the slowest of the three.
 
 #### 13.1.4 Warm sync, and why cadence is affordable
 
@@ -1900,71 +1927,74 @@ Roughly in order of how much else depends on them.
 9. **Digest-based instance confirmation** (§13.1.4). A per-disk hash tree would make
    steady-state cost proportional to divergence rather than instance count, and
    divergence is normally zero.
-10. **The maximum sync message size** (§13.1.2), which decides whether cold sync ever
-    needs step 3, hash-within-disk, at all.
-11. **Expected object count** (§14.5). DN cost scales with object count rather than
+10. **The maximum sync message size** (§13.1.2), which sets how much bucketing either
+    sync pair needs.
+11. **How widely an SN's streams spread across DNs** (§13.1.2). It swings the DN→SN
+    digest from 0.4 MB to 85 MB per pair, and it is not determined by anything decided
+    so far.
+12. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-12. **Why nesting forces serialized planned disruptions** (§5.6.3) — the
+13. **Why nesting forces serialized planned disruptions** (§5.6.3) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-13. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+14. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-14. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+15. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-15. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+16. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-16. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+17. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-17. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+18. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-18. **Background loop scheduling** (§13.2): prioritisation and rate limiting
+19. **Background loop scheduling** (§13.2): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-19. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+20. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-20. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+21. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-21. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+22. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-22. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+23. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-23. **Remaining directory semantics** (§5.1): listing huge directories,
+24. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-24. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+25. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-25. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+26. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-26. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
+27. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
     hurts compression ratio, and ratio is billable.
-27. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+28. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-28. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+29. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-29. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+30. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-30. **Billing policy** (§12): garbage, transient double footprint, metadata,
+31. **Billing policy** (§12): garbage, transient double footprint, metadata,
     instantaneous-usage contract, reporting granularity.
-31. **Key custody within KS** (§7.3): how the daily master keys are themselves
+32. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-32. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+33. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-33. **Compaction policy** (§10) — now partly a pricing decision.
-34. **Membership and leader election** (§13).
-35. `Nul` and `\0` framing were both listed originally and are folded together
+34. **Compaction policy** (§10) — now partly a pricing decision.
+35. **Membership and leader election** (§13).
+36. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-36. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+37. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
