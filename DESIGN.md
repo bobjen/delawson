@@ -913,17 +913,19 @@ rings map a fixed quantity of instance bytes, and each visible EN devotes roughl
 `capacity/G` of itself to any one SN, so `F/G = instance bytes per SN ÷ EN
 capacity`.
 
-The instance bytes per SN machine come straight from §14.1: 256 GB of RAM at ~100 B
-per entry across three materialized roles is 8.5 × 10^8 extents, which at 32 MB and
-4 instances is **~115 PB of instance bytes**. Note this is **independent of P** —
-more rings per machine means proportionally smaller streams, so the total extent
-count a machine maps is set by its RAM, not by how that RAM is divided.
+The instance bytes per SN machine come from §14.1. A machine's extent budget of
+171 GB at ~100 B holds **1.7 × 10^9 extent records**, but it is *primary* for only
+about a third of the rings it materializes (§5.7) — the other roles do not talk to
+ENs — so it drives ~5.7 × 10^8 extents, which at 32 MB and 4 instances is
+**~76 PB of EN capacity to reach**. Note this is **independent of P**: more rings per
+machine means proportionally smaller streams, so the extent count a machine holds is
+set by its RAM, not by how that RAM is divided.
 
-| EN capacity | *F/G* | *F* at *G*=1 | *G*=4 | *G*=16 | *G*=64 |
-|---|---|---|---|---|---|
-| 100 TB | 1145 | 1,145 | 4,581 | 18,325 | 73,301 |
-| 1 PB | 115 | 115 | 458 | 1,833 | 7,330 |
-| 10 PB | 11 | 11 | 46 | 183 | 733 |
+| EN capacity | *F/G* | *F* at *G*=4 | *G*=16 | *G*=64 |
+|---|---|---|---|---|
+| 100 TB | 764 | 3,054 | 12,217 | 48,867 |
+| 1 PB | 76 | 306 | 1,222 | 4,887 |
+| 3 PB | 25 | 102 | 407 | 1,629 |
 
 *G* is the free choice, and it is the one that matters: **sharing is what gives
 repair and balance somewhere to go.** With *G*=1 each EN answers to a single SN,
@@ -938,8 +940,8 @@ decision, not two.
 
 Helpfully, **the cost target pushes the same way.** §5.3.1 derives tens to hundreds
 of disks per EN from the requirement that server hardware be ≤5% of cost; at 150
-disks of 20 TB that is a 3 PB EN, where *G*=16 costs only ~613 connections and *G*=64
-still only ~2,450. Two independent arguments — reliability wanting sharing, economics
+disks of 20 TB that is a 3 PB EN, where *G*=16 costs only ~407 connections and *G*=64
+still only ~1,600. Two independent arguments — reliability wanting sharing, economics
 wanting few servers per byte — converge on large ENs.
 
 #### 5.10.2 Neighborhoods must be domain-diverse
@@ -1487,8 +1489,12 @@ by orders of magnitude, and the principle behind that is worth stating:
 | Loop | Cadence | Why that cadence |
 |---|---|---|
 | SN → EN, disk liveness | **~1 minute** | The fastest twitch. Disks fail without warning, and until the SN knows, it is placing on and reading from something that is gone. |
-| SN → EN, instance confirmation | slow sweep | Confirms each instance really exists. Divergence here comes from real hardware loss and silent corruption, so it must happen — but not urgently, since liveness already caught the loud failures. |
+| SN → EN, warm instance sync | frequent | Only what changed, so small at any fleet size (§13.1.4). |
+| SN → EN, cold instance sync | slow sweep | Full enumeration, to catch what the warm path missed. Divergence comes from real hardware loss and silent corruption, so it must happen — but not urgently, since liveness already caught the loud failures. |
 | DN → SN | **quite slow** | No hardware failure can cause a DN's view of a stream to go wrong. Only software bugs and lost messages can, so this is a correctness audit rather than a failure detector. |
+
+All of them are **driven by the upper tier** — the SN asks the EN, the DN asks the SN.
+The tier holding the metadata is the one that knows what ought to exist.
 
 The DN→SN case is the instructive one. A DN's reference to a stream does not depend on
 any hardware that can independently fail — the stream's existence is guaranteed by its
@@ -1496,30 +1502,87 @@ SN ring (§5.7), not by a disk. So there is nothing for a fast loop to catch. An
 reference to an instance, by contrast, depends on a specific spinning disk that can
 die between one second and the next.
 
-#### 13.1.1 The confirmation sweep must be a bulk digest
+#### 13.1.1 The sync is one message per SN/EN pair
 
-The cadence hides a volume problem. An SN machine maps 1.7 × 10^9 extents at 4
-instances each — **6.8 × 10^9 instances**:
+**Sync is per SN/EN pair, not per disk.** One message covers the whole pair and is
+*internally* structured by disk. That keeps the message count proportional to the
+fan-out (§5.10) rather than to fan-out × disks, which at 150 disks per EN is a
+150-fold difference in protocol chatter for no gain.
 
-| Full sweep every | Per-instance rate | As a 20 B/instance digest |
+**The SN drives it.** The EN answers; it does not initiate. That follows from the SN
+being the one that knows what *should* be there.
+
+#### 13.1.2 Cold sync needs bucketing, negotiated
+
+A cold sync enumerates everything, and everything is large. An SN drives ~2.3 × 10^9
+instances (§5.10.1) spread over its fan-out; at a 3 PB EN with *G*=16 that is ~5.6
+million instances per pair, or **~112 MB at 20 B each** — far past any sane message
+size. So a cold sync is split, in three escalating steps:
+
+| Step | Split by | When |
 |---|---|---|
-| hour | 1.9 × 10^6 /s | 38 MB/s |
-| day | 79,000 /s | 1.6 MB/s |
-| week | 11,000 /s | 0.23 MB/s |
+| 1 | nothing — one message | small pairs |
+| 2 | **sets of disks** | the pair's digest exceeds the message limit |
+| 3 | **hash within a disk** | a *single disk's* share still exceeds it |
 
-79,000 RPCs per second per SN is not viable; 1.6 MB/s of bulk digest is nothing. So
-**instance confirmation must be an aggregate exchange, per disk, not a per-instance
-protocol.** A full sweep moves ~137 GB regardless of cadence, which is what the
-cadence is really trading against.
+Step 3 is not hypothetical but is not common either. One 20 TB disk holds ~596,000
+extents, so a digest of an entire disk is ~12 MB; a pair only reaches step 3 when the
+SN owns a large fraction of one disk, which means a low sharing factor *G* or unusually
+large disks. At *G*=16 the per-disk share is ~37,000 instances, or 0.75 MB, and step 2
+suffices.
 
-⚠️ Better still, compare a hash tree per disk and descend only where the digests
+**Bucket count is negotiated, and only upward:**
+
+- The **SN estimates** the bucket count from the instances it knows about — it has the
+  count already, so the estimate is free and usually right.
+- The **EN may raise it in its first response** if that estimate is too low, and the SN
+  retries with the larger count.
+
+The asymmetry is the interesting part, and it is not arbitrary. The EN may legitimately
+know about *more* instances than the SN does — that is a large part of what the sync is
+for (§13.1.3) — so only the EN can discover that the SN's estimate was short. Allowing
+only increases makes the negotiation monotonic and terminating: at worst one extra
+round trip, with no possibility of two parties oscillating between sizes.
+
+#### 13.1.3 Divergence runs in both directions
+
+Worth being explicit, because it shapes what the sync is for:
+
+| Divergence | Meaning | Action |
+|---|---|---|
+| SN expects an instance the EN lacks | lost to disk failure or corruption | repair — re-replicate or reconstruct (§13) |
+| EN holds an instance the SN never mentions | **orphan** — a failed delete, an abandoned write, or state the SN lost and rebuilt | reclaim the space |
+
+Orphans are why the EN can hold more than the SN expects, and why it must be able to
+raise the bucket count. They also cost money: an orphan is physical bytes on a disk, and
+§12 bills by physical bytes, so unreclaimed orphans are either overcharging a customer
+or unbilled cost absorbed by the operator. Neither is acceptable indefinitely, which
+gives the sweep a business reason to complete and not merely a hygienic one.
+
+#### 13.1.4 Warm sync, and why cadence is affordable
+
+Cold sync is the full enumeration above. **Warm sync covers only what changed**, so it
+is small regardless of fleet size and can run far more often. The cold sweep exists to
+catch what the warm path missed — silent corruption, dropped messages, state lost in a
+ring failure — and its cadence is a bandwidth decision:
+
+| Full cold sweep every | Digest bandwidth per SN |
+|---|---|
+| hour | ~13 MB/s |
+| day | ~0.5 MB/s |
+| week | ~0.08 MB/s |
+
+Even hourly is affordable in bulk terms. What makes it affordable is that it is a
+digest exchange rather than a per-instance protocol: the same sweep as individual RPCs
+would be tens of thousands per second.
+
+⚠️ Better still, compare a **hash tree per disk** and descend only where the digests
 differ, making steady-state cost proportional to *divergence* rather than to instance
-count. Given that divergence is normally zero, that is the difference between 137 GB
-per sweep and almost nothing. Undesigned, but this is where it belongs.
+count. Divergence is normally zero, so that is the difference between a full sweep and
+almost nothing. Undesigned; this is where it belongs.
 
-The liveness loop has no such problem: one probe per EN per minute across a
-20,000-wide fan-out is ~333 probes/second, and it can be a push from the EN rather
-than a poll.
+The liveness loop has no such problem: one message per EN per minute across the fan-out
+is a few hundred messages a second, and each is a small per-disk status vector.
 
 ### 13.2 Background loops
 
@@ -1721,15 +1784,15 @@ list. That trade is real; it just lands well inside budget.
 are the part of that most likely to surprise, so it is worth a check.
 
 Take an EN of 150 disks with a server costing 8 disk-equivalents (§5.3.1): 158
-disk-equivalents, holding 3 PB. One SN machine maps 115 PB of instance bytes (§5.10.1),
-so it serves ~38 such ENs — call it 1.5 server-costs for the extra RAM, or 12
+disk-equivalents, holding 3 PB. One SN machine drives ~76 PB of EN capacity (§5.10.1),
+so it accounts for ~25 such ENs — call it 1.5 server-costs for the extra RAM, or 12
 disk-equivalents.
 
 | | Disk-equivalents |
 |---|---|
-| 38 ENs | 6,004 |
+| 25 ENs | 3,950 |
 | 1 SN machine | 12 |
-| **SN tier share** | **0.2%** |
+| **SN tier share** | **0.3%** |
 
 Comfortable, with two orders of magnitude of headroom against the 5% budget. The
 reason is structural: an SN's memory maps a fixed *count* of extents, and each extent
@@ -1834,72 +1897,74 @@ Roughly in order of how much else depends on them.
 8. **The DN-side stream-list entry has no budget** (§14.1.2). Sizings currently use
    the 200 B stream record as a loose upper bound; a real figure would shrink every
    stream-list number severalfold.
-9. **Digest-based instance confirmation** (§13.1.1). A full sweep moves ~137 GB per
-   SN; a per-disk hash tree would make steady-state cost proportional to divergence,
-   which is normally zero.
-10. **Expected object count** (§14.5). DN cost scales with object count rather than
+9. **Digest-based instance confirmation** (§13.1.4). A per-disk hash tree would make
+   steady-state cost proportional to divergence rather than instance count, and
+   divergence is normally zero.
+10. **The maximum sync message size** (§13.1.2), which decides whether cold sync ever
+    needs step 3, hash-within-disk, at all.
+11. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-11. **Why nesting forces serialized planned disruptions** (§5.6.3) — the
+12. **Why nesting forces serialized planned disruptions** (§5.6.3) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-12. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+13. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-13. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+14. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-14. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+15. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-15. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+16. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-16. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+17. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-17. **Background loop scheduling** (§13.2): prioritisation and rate limiting
+18. **Background loop scheduling** (§13.2): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-18. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+19. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-19. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+20. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-20. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+21. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-21. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+22. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-22. **Remaining directory semantics** (§5.1): listing huge directories,
+23. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-23. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+24. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-24. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+25. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-25. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
+26. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
     hurts compression ratio, and ratio is billable.
-26. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+27. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-27. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+28. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-28. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+29. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-29. **Billing policy** (§12): garbage, transient double footprint, metadata,
+30. **Billing policy** (§12): garbage, transient double footprint, metadata,
     instantaneous-usage contract, reporting granularity.
-30. **Key custody within KS** (§7.3): how the daily master keys are themselves
+31. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-31. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+32. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-32. **Compaction policy** (§10) — now partly a pricing decision.
-33. **Membership and leader election** (§13).
-34. `Nul` and `\0` framing were both listed originally and are folded together
+33. **Compaction policy** (§10) — now partly a pricing decision.
+34. **Membership and leader election** (§13).
+35. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-35. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+36. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
