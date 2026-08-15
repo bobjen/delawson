@@ -40,6 +40,11 @@ SN  Stream Node      extents per stream, instances per extent
 EN  Extent Node      the bytes on disk
 ```
 
+Around those sit `FE` (Front End: authorization and coordination), `KS` (Key
+Store: the daily master keys), the `delawson` client, and eventually Compute
+machines. User code runs only on Compute, and decryption keys never go where
+user code runs.
+
 The DN tier is self-hosted: directory and object metadata live in DeLawson
 keyed objects, reached through a small bootstrap root that is the only state
 stored outside the object hierarchy.

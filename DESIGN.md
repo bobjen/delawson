@@ -40,10 +40,16 @@ that will accept any of them. Reliability wants instances whose permanent-loss
 events are independent, plus background repair and scrubbing to catch decay
 before it accumulates.
 
-Both push the same way on one point, and it is the origin of the node types in
+Both push the same way on one point, and it is the origin of the machine types in
 §5: **instances of an extent must sit in places that fail independently, and
 the metadata describing an extent must not sit with the extent's own data.** A
 failure that destroys the bytes must not also destroy the map to them.
+
+### 1.2 One security invariant
+
+**User code runs only on Compute machines, and decryption keys are never on a
+machine that runs user code** (§5.9.1). Stated here because it constrains the
+machine layout rather than following from it.
 
 ## 2. Non-goals
 
@@ -236,8 +242,13 @@ Two consequences worth stating outright:
 Lazy summaries are brought forward by the background loops of §13.1, not by the
 write path.
 
+---
+
+## 5. The physical decomposition: machine types
+
 The logical levels of §4 do not all live in the same place. Splitting them is a
-reliability requirement, not an optimization (§1.1).
+reliability requirement, not an optimization (§1.1). Three machine types carry
+the storage hierarchy itself; §5.9 adds the four that surround it.
 
 | Node | Holds | Replication | Why separate |
 |---|---|---|---|
@@ -304,14 +315,15 @@ A stream's ceiling is what one SN ring member can hold (§14.1). A maximal objec
 therefore spreads its streams over many SNs — necessarily, since no single
 machine can hold them all.
 
-**An SN is a Raft ring, not a machine.** Losing one member costs nothing but
-capacity headroom; the extent list survives in the remaining members, and leader
-election is Raft's problem rather than DeLawson's. Ring members are placed in
-independently-failing domains by §5.6, for the same reason extent instances are.
+**An SN is a Raft ring, not a machine** — and only three of its members hold the
+extent list in RAM at all (§5.7). Losing one member costs capacity headroom, not
+availability; ring members are placed in independently-failing domains by §5.6,
+for the same reason extent instances are.
 
-Note what this means for §14.1: each member holds the *whole* extent list, so the
-stream ceiling is set by one member's RAM, and the ring multiplies cost rather
-than capacity.
+Note what this means for §14.1: a materialized member holds the *whole* extent
+list, so the stream ceiling is set by the share of one machine's RAM that this
+ring gets — and since a machine hosts many rings (§5.8), that share is a small
+fraction, not the whole.
 
 **Self-describing extents remain worth having as a backstop.** Each instance
 should carry a header with its extent id, stream id, starting record number, and
@@ -528,6 +540,180 @@ is how clusters are built today. This is a compatibility concession and a known
 defect, not a design choice, and it should be labelled as such wherever it is
 configurable — it costs the exponent in §5.6.2.
 
+### 5.7 Ring composition: consensus membership is not RAM membership
+
+Raft tolerates *n* failures with 2n+1 members. Materializing the served B-tree
+(§4.4) on all of them would cost **7× RAM at n=3** — and RAM is the resource that
+bounds a stream (§14.1), so that is 7× the most expensive thing in the system.
+
+It is also unnecessary. **Consensus needs 2n+1 voters; only three members need
+the state materialized.**
+
+| Role | Count | Cost | Job |
+|---|---|---|---|
+| Primary | 1 | CPU + RAM | serves reads and writes; holds the B-tree |
+| Hot backup | 1 | RAM | always up to date; the designated next primary |
+| Checkpoint writer | 1 | RAM | takes write locks to write checkpoints, without stalling the primary |
+| Log-only members | 2n+1 − 3 | disk | store the Raft log and vote; materialize nothing |
+
+At n=3 that is **3× RAM instead of 7×**, with four cheap log-only members
+supplying the remaining durability and votes.
+
+The third materialized member exists because writing a checkpoint — the on-disk
+list form of §4.4 — needs a consistent view of the tree, which means taking write
+locks. Doing that on the primary or on the always-current hot backup would stall
+serving, so it gets a member of its own.
+
+⚠️ **That third member is removable.** Given transactions and a consistent read
+that can be held for ~10 minutes, the single hot backup could write its checkpoint
+from a snapshot without taking write locks, bringing the cost to **2× RAM**. The
+ten minutes is roughly checkpoint size over write bandwidth: at ~500 MB/s it is a
+checkpoint of ~3 × 10^11 bytes, about one machine's full memory. Note that §5.8
+shrinks checkpoints by orders of magnitude, which makes this optimization easier
+rather than harder.
+
+#### 5.7.1 Primary switchover has three quality tiers
+
+| Case | Client uncertainty | Requires |
+|---|---|---|
+| Scheduled: known next primary, known time | **milliseconds** | switchover planned in advance |
+| Known next primary, unplanned time | one wrong guess, then correct | a designated successor |
+| Ordinary Raft election | wait for the winner to catch up | nothing |
+
+The third case is the expensive one, and the role split above is why: **a log-only
+member elected primary must materialize the whole B-tree from checkpoint plus log
+before it can do anything.** So elections must prefer materialized members
+strongly — and the hot backup is exactly that, a designated successor that is
+already current. The cheap tiers are not optimizations bolted on; they are the
+normal path, and ordinary election is the fallback.
+
+### 5.8 Many rings per machine
+
+A metadata machine should hold members of **many** rings in different roles:
+primary for some, hot backup for others, checkpoint writer for a few, log-only for
+many more. Two reasons:
+
+- **Cost amortization.** Expensive roles (CPU for primaries, RAM for materialized
+  backups) and the cheap one (a log on disk) mix on every machine, so no machine
+  is all-expensive and none sits idle.
+- **Core utilization.** Write-lock work within a ring is serialized, so one ring
+  keeps about one core busy. To use *C* cores a machine needs on the order of *C*
+  rings in a primary role. **Ring count per machine is set by core count.**
+
+#### 5.8.1 This shrinks streams by a large factor
+
+Easy to miss, and it corrects §14.1. If a machine is primary for *P* rings then,
+by symmetry across the cluster, it is also hot backup for ~*P* and checkpoint
+writer for ~*P* — so it materializes ~3*P* B-trees in *R* bytes of RAM. RAM per
+ring is **R/3P, not R**, and the stream ceiling falls by the same factor.
+
+At 256 GB per machine, 100 B per extent entry, and 32 MB extents:
+
+| Primary rings/machine | Materialized | RAM/ring | Extents/stream | Stream ceiling | Streams per maximal object | Stream list | Materialize time |
+|---|---|---|---|---|---|---|---|
+| 1 | 3 | 85 GB | 8.5 × 10^8 | 25 PiB | 64,000 | 6 MB | 171 s |
+| 16 | 48 | 5.3 GB | 5.3 × 10^7 | 1.6 PiB | 1.0 × 10^6 | 103 MB | 11 s |
+| 64 | 192 | 1.3 GB | 1.3 × 10^7 | 0.4 PiB | 4.1 × 10^6 | 412 MB | 2.7 s |
+| 256 | 768 | 333 MB | 3.3 × 10^6 | 0.1 PiB | 1.7 × 10^7 | 1.6 GB | 0.7 s |
+
+(Materialize time assumes 500 MB/s — it is how long an elected log-only member
+takes to become useful.)
+
+At a plausible 64 cores, streams are **~400 TB rather than 64 PiB**, and there are
+~4 × 10^6 of them in a maximal object rather than ~25,000.
+
+#### 5.8.2 Consequences
+
+Two of them are gifts:
+
+- **Failover becomes fast.** Materializing a 1.3 GB B-tree takes ~3 seconds;
+  materializing 214 GB takes ~7 minutes. The same arithmetic that shrinks rings
+  shrinks the worst-case election, so §5.7.1's expensive tier stops being
+  frightening.
+- **Checkpoints become cheap**, which is precisely what the 2×-RAM optimization in
+  §5.7 needs. Holding a consistent read for seconds is a far easier promise than
+  holding one for ten minutes.
+
+One needs watching:
+
+- **The object's stream list grows proportionally** — ~412 MB at 64 rings per
+  machine, and 1.6 GB at 256. That is affordable only because the stream list lives
+  in a DN keyed object, which is disk-backed and paged (§14.2). It is no longer
+  the trivially small structure §14.2 described, and at the high end it is itself
+  a multi-extent object.
+
+⚠️ So *P* is a real design parameter, not a tuning knob: it trades core
+utilization and failover speed against stream-list size. It wants choosing
+deliberately, and it interacts with the extent-entry size that §14.1 still needs
+measured.
+
+### 5.9 The rest of the fleet
+
+Four more machine types surround the storage hierarchy.
+
+Naming convention: **the three storage-hierarchy tiers end in `-N`** — DN, SN, EN
+— **and the surrounding services do not**, so FE and KS read as outside the
+hierarchy at a glance. Names stay plain and descriptive rather than clever, so
+that a wide range of people can work on the code comfortably.
+
+| Type | What it is | Holds keys? | Runs user code? |
+|---|---|---|---|
+| **KS** — Key Store | A Raft ring holding the daily master keys (§7.3); ~1 MB per century, unlocked by humans and hardware | **yes — and only here** | no |
+| **FE** — Front End | Checks user authorization; coordinates clients talking to the other machines | yes, transiently | no |
+| **Compute** | Runs user code. Eventually, not initially | **never** | **yes** |
+| **`delawson`** — client | Library and CLI, talks to FE over the internet | see §5.9.2 | it *is* user code |
+
+KS is a Raft ring for the same reason SNs and DNs are (§5): keys are small mutable
+state that must be exactly right, which is what consensus is for and what bulk
+replication is not. Unusually among the rings, KS's state is *tiny* — about a
+megabyte per century (§7.3) — so its ring exists purely for reliability and
+availability, never for capacity.
+
+#### 5.9.1 The security boundary
+
+> **User code may only run on Compute machines, and decryption keys may never be
+> on a machine that runs user code.**
+
+The boundary is drawn at *keys*, not at *bytes*, and that is the right place:
+plaintext is one object's worth of exposure, while a key is every extent under it.
+The blast radius differs by orders of magnitude, so the two deserve different
+containment.
+
+What falls out of the invariant:
+
+- **ENs hold keys, but narrowly scoped ones.** They cache daily SN-master keys
+  (§7.3.1), so an EN compromise is not limited to ciphertext — but it is bounded on
+  two axes, to the days and the SNs whose keys that EN happens to hold, and it
+  never yields a master key. Repair, re-encoding, and scrubbing still need no keys
+  at all (§7), so those background loops stay outside the crypto path.
+- **Compute machines receive plaintext, never keys.** User code may read what it is
+  authorized to read; it may not hold the capability to decrypt anything else.
+- **SNs and DNs need keys for their own state, not for user data.** Their
+  checkpoints and logs are on disk and so are encrypted, and DN state is itself
+  DeLawson keyed objects (§5.5) — but neither needs a user object's data key.
+
+⚠️ **Compute-near-data and decrypt-at-FE pull against each other.** If only a
+trusted tier may decrypt, and Compute may not, then every byte Compute reads
+traverses a decryption tier — which is exactly the bandwidth funnel that
+compute-near-storage exists to avoid. Enforcing the boundary by process or enclave
+isolation *on* the Compute machine would fix the bandwidth problem, but the
+invariant as stated is machine-level and excludes it. Either the invariant relaxes
+to a hardware-isolation boundary, or the decryption tier's bandwidth has to scale
+with Compute's input rate. This needs deciding before Compute is built, not after.
+
+#### 5.9.2 Where decryption happens
+
+⚠️ Genuinely open, and consequential:
+
+| Decrypt at | Consequence |
+|---|---|
+| **FE** | FE sees plaintext for everything passing through it; keys never leave the datacenter; FE bandwidth must carry all bulk data |
+| **Client** | End-to-end encryption — the operator cannot read customer data — but keys leave the datacenter and the client must be trusted to hold them |
+
+The stated invariant forbids keys on Compute but says nothing about the client, so
+both remain open. They are very different products: the second is a much stronger
+privacy claim and a much harder key-management problem.
+
 ---
 
 ## 6. Size limits and sealing
@@ -605,11 +791,116 @@ compression blocks may need to span several index granules.
 - Block-granular mode with a per-block IV/tweak derived from
   `(extent_id, block_index)`, so blocks are independently decryptable and
   identical plaintext in two places does not yield identical ciphertext.
-- Keys are per-extent. Sealed extents are immutable, so keys never need rotation
-  in place; **rotation happens by rewriting during compaction** (§10), which is
-  a rewrite anyway.
-- ⚠️ Key custody, the key hierarchy, and whether customers may supply their own
-  keys are undesigned.
+- Keys are per-extent, but **derived, not stored** — see §7.3.
+- Sealed extents are immutable, so keys never need rotation in place; **rotation
+  happens by rewriting during compaction** (§10), which is a rewrite anyway.
+
+### 7.3 The key hierarchy: daily, derived, and scoped by SN
+
+Per-extent keys are right, but *storing* them is arithmetically impossible. At 32
+bytes each:
+
+| Keys for | Count | Stored size |
+|---|---|---|
+| Extents in a 1 EB physical cluster | 3.0 × 10^10 | **954 GB** |
+| Extents in one maximal object | 5.5 × 10^13 | **1.75 PB** |
+| Objects, if a trillion tiny ones exist | 10^12 | **32 TB** |
+
+None of those can live in a consensus ring. So the hierarchy stores almost nothing
+and derives the rest:
+
+```
+daily master key         randomly generated, one per day
+                         lives ONLY in KS; on KS disk, encrypted at rest
+  → daily SN-master key  = derive(daily master key, SN)
+                         cached on ENs
+    → extent key         = derive(the correct daily SN-master key, extent)
+      → block IV         = f(extent id, block index)        (§7.2)
+```
+
+Master keys are **random, not derived** — there is no key above them, which is
+what makes the layer below unrecoverable without KS.
+
+**The authoritative key store is kilobytes.** One random key per day:
+
+| Retention | Keys | Size |
+|---|---|---|
+| 1 year | 365 | 12 KB |
+| 10 years | 3,650 | 117 KB |
+| 100 years | 36,500 | **1.2 MB** |
+
+A century of master keys is about a megabyte, and — unlike the tenant-keyed scheme
+this replaces — the figure does not depend on how many customers or objects exist.
+Old daily keys must be kept as long as any extent encrypted under them survives,
+which this makes free.
+
+#### 7.3.1 Two-dimensional scoping bounds the blast radius
+
+**ENs cache daily SN-master keys.** This corrects §5.9.1: ENs are not keyless, and
+an EN compromise is not limited to ciphertext.
+
+But the exposure is bounded on two axes at once:
+
+| Axis | Bounded by | Effect of a compromise |
+|---|---|---|
+| Time | daily rotation | only the days whose keys are cached |
+| Space | per-SN derivation | only extents of the SNs whose keys are cached |
+
+And critically, **the master keys never leave KS**, so no number of compromised ENs
+ever yields the ability to derive a key for a different SN or a different day.
+Deriving downward is easy and deriving upward is impossible, which is what makes
+caching the middle layer acceptable.
+
+#### 7.3.2 KS is unlocked by humans and hardware
+
+Master keys are written to KS disks encrypted, under an **unlocking key derived
+from a combination of operator-entered secrets and hardware devices**. That is the
+true root of trust — and it is deliberately not something a machine can produce
+alone.
+
+Consequences worth being explicit about:
+
+- **Cold start requires human action.** If every KS machine restarts at once, the
+  master keys on disk cannot be decrypted until operators supply their secrets and
+  the hardware devices are present. There is no fully automatic recovery from a
+  total KS outage, by design. This is a security choice being paid for in
+  availability, and it should be an owned decision rather than a discovered one.
+- **There are two independent roots.** §5.5.1's bootstrap root anchors the *object*
+  hierarchy; the KS unlocking key anchors the *key* hierarchy. A cold start needs
+  both, and neither can be stored inside what it unlocks.
+
+#### 7.3.3 What the extent entry must record
+
+Deriving an extent's key needs the *correct* daily SN-master key, so the extent
+must say which one. A **day index** is enough and is cheap: 2 bytes covers 179
+years, 3 bytes covers far more than the hardware will last.
+
+⚠️ It must also identify the SN scope — and that has a trap. If derivation keys on
+*which ring currently serves the stream*, then reassigning a stream to a different
+ring (§13) orphans every key for its existing extents. **Derivation must use a
+stable identifier**, the stream id rather than the current assignment, or
+reassignment must carry the old scope forward explicitly.
+
+⚠️ These bytes land in the ~100 B extent entry that §14.1 already calls tight, and
+§14.1 shows the stream list grows as the *square* of that entry size. A day index
+is a few bytes and cheap; it is worth counting deliberately rather than discovering
+later.
+
+#### 7.3.4 What this hierarchy does not give
+
+⚠️ **There is no cryptographic tenant isolation.** Keys are scoped by day and SN,
+not by customer, so two tenants' extents on one SN for one day derive from the same
+SN-master key. Isolation rests on FE authorization (§5.9) and on keys never
+reaching user code (§1.2) — not on separate key material. That is a coherent
+position, but it forecloses customer-supplied keys and weakens any "we cannot read
+your data" claim, so it interacts directly with §5.9.2.
+
+⚠️ **Where each pipeline stage runs is now a security question, not just a
+performance one.** §7 fixes the *order* — compress, then encrypt, then encode — but
+ENs caching keys implies the ENs are doing encryption or decryption, which in turn
+implies plaintext crosses the network to reach them. If instead FE or the client
+encrypted, ENs would need no keys at all. Which machine performs which stage is
+undecided and determines where plaintext exists.
 
 ---
 
@@ -657,6 +948,8 @@ counts, which is why unkeyed inserts are confined to the object's end.
 
 ### 9.1 Unkeyed: locating record *N*
 
+0. **FE**: the `delawson` client sends the request; FE authorizes it against the
+   object's ACL and coordinates the hops below (§5.9).
 1. **DN**: resolve the path, read the object metadata, descend the stream B-tree
    (§4.4) on starting record number → stream *S* and a stream-local record number.
 2. **SN** holding *S*: descend the extent B-tree → extent *E* and an
@@ -667,8 +960,8 @@ counts, which is why unkeyed inserts are confined to the object's end.
    forward by framing, stop at the target.
 
 Two B-tree descents, one small log probe, one index search, one granule read —
-but spread over three node types, so a cold point read costs **three round
-trips**. Sealed extents are immutable, which makes almost everything above
+but spread over four machine types, so a cold point read costs **four round
+trips** including the authorization hop. Sealed extents are immutable, which makes almost everything above
 cacheable at the client: the object's stream list changes only when the object
 grows, and an extent's instance list changes only on repair or re-encoding. A
 warm client goes straight to the EN.
@@ -844,9 +1137,12 @@ This makes several internal choices customer-visible:
   precisely because §6 makes extent size variable anyway.
 - **EN failure on a sealed extent**: background fragment reconstruction over
   ciphertext, never blocking a write, never needing keys.
-- **SN or DN member failure**: absorbed by the Raft ring (§5). Leader election and
-  log catch-up are Raft's; the loss costs headroom, not availability, provided
-  members were placed per §5.6.
+- **SN or DN member failure**: absorbed by the ring (§5.7), but the cost depends on
+  *which* member. Losing a log-only member costs a vote. Losing the primary
+  triggers switchover, cheap if scheduled or if the hot backup takes over (§5.7.1).
+  Losing the hot backup is the one that quietly matters — it removes the cheap
+  switchover path until a replacement is materialized, so restoring it should be
+  prompt rather than lazy.
 - **Loss of a whole SN ring**: the streams it served are unaddressable even with
   every EN healthy. This is now the worst failure in the design, and §5.6 exists
   precisely to make it improbable — a ring is only as independent as its
@@ -902,33 +1198,46 @@ and SN memory — that the foreground path needs.
 Three tiers, three different answers, and the binding constraint turns out to be
 the width of the record number rather than storage at any level.
 
-### 14.1 SN: bounded per stream, RAM-resident
+### 14.1 SN: bounded per stream by a *share* of RAM
 
 An SN serves a stream's extent list from RAM, and that is what bounds a stream.
 Assume the worst case for capacity, `compressed = physical` (ratio 1×), so an
 extent's logical span equals its 2^25-byte (32 MB) physical size.
+
+The naive calculation gives a machine's whole memory to one stream:
 
 | Quantity | Value |
 |---|---|
 | Extent metadata entry | ~100 B — **a guess, to be measured** |
 | Extents in 256 GB of RAM | ~2^31 (≈214 GB) |
 | Extent logical span | 2^25 B |
-| **Stream ceiling** | 2^31 × 2^25 = **2^56 B = 64 PiB** |
+| Ceiling if one stream owned a machine | 2^31 × 2^25 = 2^56 B = 64 PiB |
 
-Compression only helps: at 4× the same 2^31 extents span 256 PiB logical.
+**But a stream never owns a machine.** §5.8 requires many rings per machine — on
+the order of one per core, to use the cores at all — and each machine materializes
+roughly three B-trees per primary ring it hosts. So the real budget is `R/3P`, and
+at 64 primary rings per machine the ceiling is **~0.4 PiB, not 64 PiB**. The table
+in §5.8.1 is the authoritative version; the 64 PiB figure above is only the
+degenerate *P*=1 case.
 
-Since one full stream fills one SN's memory, **streams and SNs are effectively
-one-to-one at full size**, and smaller streams share an SN.
+Compression relaxes this: at a 4× ratio the same extent count spans 4× the logical
+bytes.
 
-**Sensitivity to the 100 B guess.** The stream ceiling scales inversely with
-entry size, so measuring it moves the answer but not the conclusion:
+**Sensitivity to the 100 B guess.** The ceiling scales inversely with entry size,
+so measuring it moves the answer but not the conclusion. Shown at *P*=64:
 
-| Entry size | Extents in 256 GB | Stream ceiling | Streams for 2^64 records | Stream list |
+| Entry size | Extents/stream | Stream ceiling | Streams per maximal object | Stream list |
 |---|---|---|---|---|
-| 50 B | 2^32 | 128 PiB | ~12,800 | ~1.3 MB |
-| 100 B | 2^31 | 64 PiB | ~25,600 | ~2.5 MB |
-| 200 B | 2^30 | 32 PiB | ~51,200 | ~5 MB |
-| 400 B | 2^29 | 16 PiB | ~102,400 | ~10 MB |
+| 50 B | 2.7 × 10^7 | ~0.8 PiB | ~2.1 × 10^6 | ~103 MB |
+| 100 B | 1.3 × 10^7 | ~0.4 PiB | ~4.1 × 10^6 | ~412 MB |
+| 200 B | 6.7 × 10^6 | ~0.2 PiB | ~8.2 × 10^6 | ~1.6 GB |
+| 400 B | 3.3 × 10^6 | ~0.1 PiB | ~1.6 × 10^7 | ~6.6 GB |
+
+Note the stream list grows as the *square* of the entry size across this table —
+once from more streams, once from fatter entries — so measuring the entry size
+matters considerably more than it did when streams were 64 PiB. At 400 B and
+*P*=256 the stream list reaches ~26 GB, which is still a paged DN object but no
+longer casually affordable.
 
 ⚠️ The ~100 B entry is tight. For an unkeyed extent it must hold an extent id,
 the starting record number, cumulative logical and physical bytes, flags, and
@@ -1015,57 +1324,72 @@ Roughly in order of how much else depends on them.
 1. **The bootstrap root**: what exactly it holds, and how it is made durable and
    strongly consistent *outside* DeLawson (§5.5.1, §5.5.3). It must anchor the
    key hierarchy as well as the object hierarchy.
-2. **Ring reassignment and cluster topology** (§13). How a stream moves from a
+2. **Where decryption happens — FE or client** (§5.9.2). Two different products:
+   operator-readable, or end-to-end encrypted with keys leaving the datacenter.
+3. **Compute-near-data vs the key boundary** (§5.9.1). As stated the invariant is
+   machine-level, which funnels all of Compute's input through a decryption tier.
+   Relax it to hardware isolation, or size the tier's bandwidth accordingly —
+   decide before Compute is built.
+4. **Ring reassignment and cluster topology** (§13). How a stream moves from a
    failed ring to a fresh one, and where the failure-domain hierarchy that §5.6
    depends on is stored — plausibly the bootstrap root, since placement decisions
    cannot be made without it.
-3. **Why nesting forces serialized planned disruptions** (§5.6.3) — the
+5. **Why nesting forces serialized planned disruptions** (§5.6.3) — the
    arithmetic is verified but this operational constraint is asserted, and it
    determines how the cluster is actually operated.
-4. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+6. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+   core utilization and failover speed against stream-list size, and it multiplies
+   with the unmeasured extent-entry size — the stream list grows as the *square*
+   of that entry size across the plausible range.
+7. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+   ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
+   makes the required read duration much shorter than ten minutes, so this looks
+   more attainable than when first raised.
+8. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
    DN ring, and does the 4/3 default hold for both?
-5. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+9. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
    away, so this is now a write-amplification question only: keep the
    authoritative count on the SN and let the DN cache it lazily, or accept one
    metadata write per data write.
-6. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
-   bounds the logs, and each costs EN replicas and network.
-7. **Background loop scheduling** (§13.1): prioritisation and rate limiting
-   against foreground traffic, and whether the rewrite-shaped work — compaction,
-   re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-8. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
-   away, so this is now a write-amplification question only: keep the
-   authoritative count on the SN and let the DN cache it lazily, or accept one
-   metadata write per data write.
-9. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
-   path, so directory rename stays O(1).
-10. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+10. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+    bounds the logs, and each costs EN replicas and network.
+11. **Background loop scheduling** (§13.1): prioritisation and rate limiting
+    against foreground traffic, and whether the rewrite-shaped work — compaction,
+    re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
+12. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+    away, so this is now a write-amplification question only: keep the
+    authoritative count on the SN and let the DN cache it lazily, or accept one
+    metadata write per data write.
+13. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+    path, so directory rename stays O(1).
+14. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-11. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+15. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-12. **Remaining directory semantics** (§5.1): listing huge directories,
+16. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-13. **The extent metadata entry: measure it** (§14.1), and decide whether a keyed
+17. **The extent metadata entry: measure it** (§14.1), and decide whether a keyed
     extent's `first_key` fits or forces a bounded prefix.
-14. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
+18. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
     hurts compression ratio, and ratio is billable.
-15. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+19. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-16. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+20. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-17. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+21. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-18. **Billing policy** (§12): garbage, transient double footprint, metadata,
+22. **Billing policy** (§12): garbage, transient double footprint, metadata,
     instantaneous-usage contract, reporting granularity.
-19. **Key custody and hierarchy** (§7.2); customer-supplied keys?
-20. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+23. **Key custody within KS** (§7.3): how the daily master keys are themselves
+    protected beyond the unlocking key, and whether customers may supply their own.
+24. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-21. **Compaction policy** (§10) — now partly a pricing decision.
-22. **Membership and leader election** (§13).
-23. `Nul` and `\0` framing were both listed originally and are folded together
+25. **Compaction policy** (§10) — now partly a pricing decision.
+26. **Membership and leader election** (§13).
+27. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-24. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+28. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
