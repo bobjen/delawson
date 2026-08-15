@@ -886,7 +886,7 @@ numbers and Linux's `time_after()`, and it changes the constraint qualitatively:
 That is the reconciliation between wanting 8 bytes and wanting a cluster that may run
 essentially forever: the window stops being a doomsday and becomes a **rolling maximum
 extent age** of ~292 billion years, 21× the age of the universe, which the age-driven
-rewrite sweep (§13.2) satisfies trivially.
+rewrite sweep (§13.3) satisfies trivially.
 
 **The interpretation flips back and forth indefinitely.** Each flip is not a one-time
 extension that eventually runs out; it is a periodic reinterpretation of the same 8
@@ -1933,7 +1933,7 @@ still ~4. Per-record availability, meanwhile, is unaffected by object size.
 So the availability contract has to be **per record, not per object**, and whole-object
 operations — scans, migrations, verification sweeps — must be **resumable rather than
 atomic**, tolerating parts being briefly unreachable and returning to them. That is a
-requirement on the API and on §13.2's loops, not a defect: for objects this large there is no
+requirement on the API and on §13.3's loops, not a defect: for objects this large there is no
 alternative, and §9.4's scan design already walks streams in order rather than needing them
 simultaneously.
 
@@ -3676,7 +3676,7 @@ Roughly in order of how much else depends on them.
     metadata write per data write.
 35. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-36. **Background loop scheduling** (§13.2): prioritisation and rate limiting
+36. **Background loop scheduling** (§13.3): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
 37. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
