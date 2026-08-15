@@ -619,6 +619,7 @@ each increment produces numbers obsolete by the next revision.
 | Placement slack | 4/3 | §5.6.1 |
 | Fan-out per machine | ~20,000 | §5.10 |
 | Compression ratio, when assumed | 4× | §12, §14.2 |
+| Billing slack — how far a billed dimension may sit from true cost | **2×** | §12.1, §12.3 |
 
 The SN RAM split deserves its own warning: **it will vary wildly between tenants and
 in production**, because it encodes an assumed mix of object sizes (§14.1.1). It has
@@ -1881,7 +1882,36 @@ roughly $26, and consumes a machine holding $768 of DRAM. **Underbilled ~30×, a
 SN is gone.** The workload that is cheapest for the user is the one that is ruinous for the
 operator, so it is the workload the pricing selects for.
 
-### 12.3 The rule that follows
+### 12.3 Physical, not logical, is the same rule
+
+Billing by physical rather than logical bytes is not a separate decision — it is §12.1
+applied to compressibility. **The slack is 2× by default**, and the gap between logical and
+physical is the compression ratio, which §6 puts anywhere from 1× to 128×:
+
+| Data | Ratio | Error if billed logically |
+|---|---|---|
+| Incompressible media | 1× | inside slack |
+| Typical text and records | 3.5× | 1.8× outside |
+| Logs, sparse columns | 30× | 15× outside |
+| Pathological | 128× | 64× outside |
+
+The extremes are 128× apart, so **no single logical price can sit within 2× of cost for
+everyone.** Set it for compressible data and incompressible customers are massively
+underbilled; set it for incompressible data and compressible ones leave for a competitor.
+Physical billing is forced, not preferred.
+
+The same test catches something else. A byte of extent body costs 4× as much held as four
+replicas as it does at 1.5× under a 6+3 erasure code — a **2.67× ratio, which exceeds the
+2× slack.** So billing cannot apply a flat per-byte rate across durability states: whether
+an extent is still replicated or already encoded has to be metered per extent, which is why
+§12.5 treats the seal-to-encode latency as a real quantity rather than an implementation
+detail.
+
+⚠️ Bob believes **Colossus already offers optional physical billing**, which would be
+corroborating prior art rather than a novel move. Unverified, and it does not change the
+derivation above.
+
+### 12.4 The rule that follows
 
 > **Every scarce resource must be a billed dimension, or users will arbitrage the free
 > one.**
@@ -1900,11 +1930,11 @@ cost model is a prediction conditional on the billing being right, not a justifi
 simplifying it.
 
 The slack in §12.1 is what makes this tractable: dimensions need not be exact, only close
-enough that no arbitrage is worth chasing. Being within a factor of ~2 across every
-workload is fine. Being 30× out on one workload is fatal, because that is the one users
-will find.
+enough that no arbitrage is worth chasing. **The default slack is 2×** (§4.7). Being 30× out
+on one workload is fatal, because that is the one users will find — and §12.3 shows the same
+2× test is what forces physical billing and per-extent durability metering.
 
-### 12.4 What the design already makes visible
+### 12.5 What the design already makes visible
 
 - **Compression works for the customer, not just the fleet.** Ratio divides the bill, which
   is why compression must precede encryption (§7) and why shrinking compression blocks for
@@ -1929,7 +1959,7 @@ will find.
   month; it means a customer's *instantaneous* usage query is either stale or must be
   answered by summing live extent totals on the SNs on demand.
 
-### 12.5 Open policy questions
+### 12.6 Open policy questions
 
 1. Do customers pay for **uncompacted garbage** they created by overwriting, when DeLawson
    chooses the compaction schedule?
@@ -1939,7 +1969,8 @@ will find.
 4. How are **packed objects** attributed (§11)?
 5. Is the billed figure — compressed size, which the customer cannot directly control —
    reported back to them, and at what granularity?
-6. What **slack** is acceptable? §12.3 asserts a factor of ~2 without deriving it.
+6. Whether **2× slack** (§4.7) is right for every dimension, or whether some — network,
+   operations — can tolerate more.
 
 Note question 3 in the old list — whether metadata is billed — is no longer open. It must
 be (§12.3).
@@ -2634,8 +2665,8 @@ Roughly in order of how much else depends on them.
 34. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
 35. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
-    attribution, instantaneous-usage contract, reporting granularity — and what slack is
-    acceptable, which §12.3 asserts at ~2× without deriving.
+    attribution, instantaneous-usage contract, reporting granularity. Slack itself is
+    settled at 2× (§4.7).
 36. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
 37. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
