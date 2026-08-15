@@ -45,7 +45,27 @@ Both push the same way on one point, and it is the origin of the machine types i
 the metadata describing an extent must not sit with the extent's own data.** A
 failure that destroys the bytes must not also destroy the map to them.
 
-### 1.2 One security invariant
+### 1.2 The cost target
+
+**Ignoring Compute, ~95% of DeLawson's cost should be disk, electricity, and rent.**
+Everything else — server hardware, the metadata tiers, the software — fits in the
+remaining ~5%.
+
+This is a **working assumption with room to move**, not a hard requirement: overhead
+can be larger if it has to be. But it is worth stating as a goal, because it does real
+work below and because the numbers it implies are sensitive to it (§5.3.1):
+
+- It forces **tens to hundreds of disks per EN** (§5.3.1), because that is the only
+  way a server's own cost becomes negligible against the storage attached to it.
+- It keeps **ENs computationally cheap**, which constrains where the storage pipeline
+  runs (§7.1).
+- It bounds the **metadata tiers** to a small fraction of the fleet, which §14.5
+  checks and finds comfortable.
+
+Billing by physical bytes (§12) is the revenue side of the same coin: if cost is
+dominated by bytes on disk, the price should be too.
+
+### 1.3 One security invariant
 
 **User code runs only on Compute machines, and decryption keys are never on a
 machine that runs user code** (§5.9.1). Stated here because it constrains the
@@ -239,7 +259,7 @@ Two consequences worth stating outright:
   one that can be maintained synchronously.
 - **Byte totals — hence billing — are lazy.** See §12.
 
-Lazy summaries are brought forward by the background loops of §13.1, not by the
+Lazy summaries are brought forward by the background loops of §13.2, not by the
 write path.
 
 ### 4.6 References and reference counts
@@ -251,7 +271,7 @@ reference-counted targets**, and they behave symmetrically:
 |---|---|---|---|
 | object → stream | a DN | **4 B** | streams a DN references |
 | stream → extent | an SN | **4 B** | 1.7 × 10^9 extents per SN (§14.1) |
-| extent → instance | an SN, within its fan-out | 2 B | ~20,000 ENs (§5.10.4) |
+| extent → instance | an SN, within its fan-out | 6 B | a **disk** within an EN, plus a slot (§5.3.1) |
 | global node id | cluster-wide, control plane | 4 B | 2^32 nodes (§5.10) |
 
 Nothing in the data plane carries a cluster-wide name. Every reference is an index
@@ -274,7 +294,7 @@ What it buys:
 
 What it costs:
 
-- **Deletion becomes decrement**, with the background loops (§13.1) reclaiming at
+- **Deletion becomes decrement**, with the background loops (§13.2) reclaiming at
   zero. Dropping an object frees nothing by itself.
 - ⚠️ **Compaction of a shared extent cannot rewrite in place**, because the other
   referrers did not ask for it. It needs copy-on-write: compaction produces a private
@@ -459,6 +479,66 @@ capacity, and the only tier that erasure coding and repair touch.
 Because ENs hold ciphertext (§7), repair, re-encoding, and scrubbing all run
 without key access.
 
+#### 5.3.1 SNs place on disks, not on ENs
+
+**An SN chooses a disk, not a machine.** It tracks which instances sit on each disk
+of each EN it can reach, so an instance reference names `(EN, disk, slot)` rather
+than `(EN, offset)`.
+
+That costs nothing, because the disk byte is paid for by the locator shrinking. A
+slot index within one disk needs 3 bytes where a byte offset within a whole EN
+needed 4:
+
+| Component | Width | Covers |
+|---|---|---|
+| local EN index | 2 B | ~20,000 ENs in the fan-out set (§5.10) |
+| disk index | 1 B | 256 disks — a 1 PB EN of 20 TB disks has 50 |
+| slot index | 3 B | 16.7 × 10^6 slots — a 100 TB disk holds 3.0 × 10^6 extents |
+| **Instance reference** | **6 B** | unchanged from the previous per-EN encoding |
+
+**The cost target sets the disk count.** Per §1.2, server hardware must be ≤5% of an
+EN's total cost. With *S* the server cost and *D* a disk's lifetime cost — the drive
+plus its share of electricity and rent — that requires:
+
+> *S* / (*S* + *nD*) ≤ 0.05, i.e. **n ≥ 19·(S/D)**
+
+| *S/D* — server cost in disk-equivalents | Disks required | Within a 1-byte index? |
+|---|---|---|
+| 3 | 57 | yes |
+| 6 | 114 | yes |
+| 8 | 152 | yes |
+| 13 | 247 | barely |
+| 20 | 380 | **no** |
+
+So "tens or hundreds" is right, and which end depends entirely on how a bare storage
+server prices against a disk. A cheap server against expensive disks lands in the
+tens; anything like a conventional server needs well over a hundred.
+
+**How hard this bites depends on the overhead target**, which §1.2 holds loosely. For
+an overhead fraction *f*, the requirement is *n* ≥ ((1−*f*)/*f*)·(*S/D*), and a 1-byte
+disk index caps *n* at 256:
+
+| Overhead *f* | Disks needed | Largest *S/D* a 1-byte index allows |
+|---|---|---|
+| 5% | 19 × (*S/D*) | 13.5 |
+| 10% | 9 × (*S/D*) | 28.4 |
+| 15% | 5.7 × (*S/D*) | 45.2 |
+
+So this does couple a metadata format decision to the business model — but softly.
+At a strict 5% a bare server may cost at most ~13 disk-equivalents before 1 byte of
+disk index stops sufficing; letting overhead drift to 10% doubles that headroom to
+~28, which is comfortably beyond any plausible server-to-disk ratio. **The 1-byte
+index is safe unless both the 5% target is held strictly and servers are expensive
+relative to disks.** Worth watching rather than worrying about.
+
+Why bother tracking disks at all: **a disk is the innermost failure domain.** One
+disk dying should cost the instances on that disk and nothing else. Without
+per-disk tracking, a single failed disk is indistinguishable from a failed EN, and
+repair would rebuild the machine's whole complement instead of one disk's worth.
+Per-disk placement also stops two instances of one extent landing on two disks of
+the same machine, which would satisfy a naive "different disk" rule while sharing a
+power supply, a controller, and a kernel.
+
 ### 5.4 Three spreading requirements, of two kinds
 
 | Requirement | Level | Reason |
@@ -498,7 +578,7 @@ BigTable's Chubby file → root tablet → METADATA tablets → user tablets.
 The bootstrap root must contain exactly what a DN would otherwise supply for
 level 1: the partition map's object id, its stream list (stream ids plus SN
 locations), its totals, and its key identifier. The partition map is small — a
-million partitions at ~136 B is ~136 MB, comfortably one stream — so **the root
+million partitions at ~300 B is ~300 MB, comfortably one stream — so **the root
 is a few kilobytes and changes almost never.** That is what makes it cheap to
 keep strongly consistent by other means.
 
@@ -856,6 +936,12 @@ needs 18,000 connections and is out of reach; at 1 PB per EN the same sharing co
 ~1,800 connections and is comfortable. Fan-out policy and EN sizing are one
 decision, not two.
 
+Helpfully, **the cost target pushes the same way.** §5.3.1 derives tens to hundreds
+of disks per EN from the requirement that server hardware be ≤5% of cost; at 150
+disks of 20 TB that is a 3 PB EN, where *G*=16 costs only ~613 connections and *G*=64
+still only ~2,450. Two independent arguments — reliability wanting sharing, economics
+wanting few servers per byte — converge on large ENs.
+
 #### 5.10.2 Neighborhoods must be domain-diverse
 
 §5.6 requires instances in slack × *n* independent failure domains. Those domains
@@ -899,7 +985,7 @@ once per table rather than once per reference.
 | cumulative physical bytes | 8 |
 | day index (§7.3.3) | 2 |
 | key generation and flags | 2 |
-| 4 × instance reference (2 B local EN index + 4 B locator) | 24 |
+| 4 × instance reference (2 B local EN index + 1 B disk + 3 B slot) | 24 |
 | **Total** | **60 B** |
 
 The same argument applies to any reference whose fan-out is bounded: DN and FE
@@ -1011,6 +1097,15 @@ seek amortization alone. 20 KB is small enough to hurt compression ratio
 noticeably, and ratio is billable. The SSD granularity may need to rise, or
 compression blocks may need to span several index granules.
 
+**The cost target constrains where these stages run.** §1.2 requires ENs to be
+computationally cheap — a server carrying 150 disks cannot also carry the CPU to
+compress at line rate, since that CPU would blow the 5% budget it is supposed to fit
+inside. **So compression should not run on ENs.** Encryption is a weaker case, since
+AES-NI is cheap enough to plausibly survive the budget, which matters because §7.3.1
+has ENs caching keys and therefore doing crypto. That asymmetry — compression
+elsewhere, encryption possibly on the EN — is a constraint on §5.9.2's open question,
+not an answer to it.
+
 ### 7.2 Encryption details
 
 - Block-granular mode with a per-block IV/tweak derived from
@@ -1116,7 +1211,7 @@ later.
 ⚠️ **There is no cryptographic tenant isolation.** Keys are scoped by day and SN,
 not by customer, so two tenants' extents on one SN for one day derive from the same
 SN-master key. Isolation rests on FE authorization (§5.9) and on keys never
-reaching user code (§1.2) — not on separate key material. That is a coherent
+reaching user code (§1.3) — not on separate key material. That is a coherent
 position, but it forecloses customer-supplied keys and weakens any "we cannot read
 your data" claim, so it interacts directly with §5.9.2.
 
@@ -1328,7 +1423,7 @@ This makes several internal choices customer-visible:
   re-encoding, and compaction, where old and new bases briefly coexist.
 - **The billed quantity is a lazy summary.** By §4.5, physical byte totals change
   anywhere in the tree and so are maintained lazily by the background loops of
-  §13.1 — the exact, synchronous summary is the unkeyed record count, which
+  §13.2 — the exact, synchronous summary is the unkeyed record count, which
   nobody is billed for. Billing therefore reads an eventually-consistent figure.
   This is tolerable for metering integrated over a month, but it means a
   customer's *instantaneous* usage query is either stale or must be answered by
@@ -1381,7 +1476,52 @@ the topology is not static: §5.6 depends on knowing the domain hierarchy, so th
 hierarchy is itself critical configuration that has to live somewhere reliable —
 plausibly the bootstrap root (§5.5.1).
 
-### 13.1 Background loops
+### 13.1 Sync loops
+
+Reality diverges from metadata, and three loops reconcile it. Their cadences differ
+by orders of magnitude, and the principle behind that is worth stating:
+
+> **Sync frequency follows the rate at which reality can diverge, not the importance
+> of the data.**
+
+| Loop | Cadence | Why that cadence |
+|---|---|---|
+| SN → EN, disk liveness | **~1 minute** | The fastest twitch. Disks fail without warning, and until the SN knows, it is placing on and reading from something that is gone. |
+| SN → EN, instance confirmation | slow sweep | Confirms each instance really exists. Divergence here comes from real hardware loss and silent corruption, so it must happen — but not urgently, since liveness already caught the loud failures. |
+| DN → SN | **quite slow** | No hardware failure can cause a DN's view of a stream to go wrong. Only software bugs and lost messages can, so this is a correctness audit rather than a failure detector. |
+
+The DN→SN case is the instructive one. A DN's reference to a stream does not depend on
+any hardware that can independently fail — the stream's existence is guaranteed by its
+SN ring (§5.7), not by a disk. So there is nothing for a fast loop to catch. An SN's
+reference to an instance, by contrast, depends on a specific spinning disk that can
+die between one second and the next.
+
+#### 13.1.1 The confirmation sweep must be a bulk digest
+
+The cadence hides a volume problem. An SN machine maps 1.7 × 10^9 extents at 4
+instances each — **6.8 × 10^9 instances**:
+
+| Full sweep every | Per-instance rate | As a 20 B/instance digest |
+|---|---|---|
+| hour | 1.9 × 10^6 /s | 38 MB/s |
+| day | 79,000 /s | 1.6 MB/s |
+| week | 11,000 /s | 0.23 MB/s |
+
+79,000 RPCs per second per SN is not viable; 1.6 MB/s of bulk digest is nothing. So
+**instance confirmation must be an aggregate exchange, per disk, not a per-instance
+protocol.** A full sweep moves ~137 GB regardless of cadence, which is what the
+cadence is really trading against.
+
+⚠️ Better still, compare a hash tree per disk and descend only where the digests
+differ, making steady-state cost proportional to *divergence* rather than to instance
+count. Given that divergence is normally zero, that is the difference between 137 GB
+per sweep and almost nothing. Undesigned, but this is where it belongs.
+
+The liveness loop has no such problem: one probe per EN per minute across a
+20,000-wide fan-out is ~333 probes/second, and it can be a push from the EN rather
+than a poll.
+
+### 13.2 Background loops
 
 Everything the write path is not allowed to do synchronously has to happen
 somewhere. That somewhere is a set of **background garbage-collection loops**,
@@ -1575,6 +1715,35 @@ list. That trade is real; it just lands well inside budget.
 
 ---
 
+### 14.5 Do the metadata tiers fit in the cost budget?
+
+§1.2 wants everything but disk, electricity and rent inside ~5%. The metadata tiers
+are the part of that most likely to surprise, so it is worth a check.
+
+Take an EN of 150 disks with a server costing 8 disk-equivalents (§5.3.1): 158
+disk-equivalents, holding 3 PB. One SN machine maps 115 PB of instance bytes (§5.10.1),
+so it serves ~38 such ENs — call it 1.5 server-costs for the extra RAM, or 12
+disk-equivalents.
+
+| | Disk-equivalents |
+|---|---|
+| 38 ENs | 6,004 |
+| 1 SN machine | 12 |
+| **SN tier share** | **0.2%** |
+
+Comfortable, with two orders of magnitude of headroom against the 5% budget. The
+reason is structural: an SN's memory maps a fixed *count* of extents, and each extent
+stands for 32 MB of disk, so the metadata tier scales with the storage it describes
+divided by 32 million.
+
+⚠️ The DN tier does not follow that logic. DN cost scales with **object count**, which
+nothing bounds (§14.2), so a tenant with a trillion tiny objects buys DN capacity
+rather than disk. The 0.2% above is the SN side only, and the DN side cannot be
+computed until object-count expectations are pinned. This is the same asymmetry as
+§14.2 and §14.4, arriving in the cost model.
+
+---
+
 ## 15. Testing at scale
 
 The sizing claims of §14 are about metadata volume — B-trees of 10^9 entries,
@@ -1665,66 +1834,72 @@ Roughly in order of how much else depends on them.
 8. **The DN-side stream-list entry has no budget** (§14.1.2). Sizings currently use
    the 200 B stream record as a loose upper bound; a real figure would shrink every
    stream-list number severalfold.
-9. **Why nesting forces serialized planned disruptions** (§5.6.3) — the
-   arithmetic is verified but this operational constraint is asserted, and it
-   determines how the cluster is actually operated.
-10. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+9. **Digest-based instance confirmation** (§13.1.1). A full sweep moves ~137 GB per
+   SN; a per-disk hash tree would make steady-state cost proportional to divergence,
+   which is normally zero.
+10. **Expected object count** (§14.5). DN cost scales with object count rather than
+    bytes, so the DN tier's share of the cost budget cannot be computed until this is
+    pinned — it is the one part of §1.2 still unquantified.
+11. **Why nesting forces serialized planned disruptions** (§5.6.3) — the
+    arithmetic is verified but this operational constraint is asserted, and it
+    determines how the cluster is actually operated.
+12. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-11. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+13. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-12. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+14. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-13. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+15. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-14. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+16. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-15. **Background loop scheduling** (§13.1): prioritisation and rate limiting
+17. **Background loop scheduling** (§13.2): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-16. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+18. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-17. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+19. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-18. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+20. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-19. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+21. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-20. **Remaining directory semantics** (§5.1): listing huge directories,
+22. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-21. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+23. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-22. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+24. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-23. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
+25. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
     hurts compression ratio, and ratio is billable.
-24. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+26. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-25. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+27. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-26. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+28. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-27. **Billing policy** (§12): garbage, transient double footprint, metadata,
+29. **Billing policy** (§12): garbage, transient double footprint, metadata,
     instantaneous-usage contract, reporting granularity.
-28. **Key custody within KS** (§7.3): how the daily master keys are themselves
+30. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-29. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+31. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-30. **Compaction policy** (§10) — now partly a pricing decision.
-31. **Membership and leader election** (§13).
-32. `Nul` and `\0` framing were both listed originally and are folded together
+32. **Compaction policy** (§10) — now partly a pricing decision.
+33. **Membership and leader election** (§13).
+34. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-33. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+35. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
