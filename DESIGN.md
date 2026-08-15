@@ -547,7 +547,7 @@ spans many rings, so what an SCN is scoped to is not yet settled.
 
 ##### Two questions this settles
 
-- **Who may authorize deleting a stream** (§13.1.5). The `DnId` *is* part of the
+- **Who may authorize deleting a stream** (§13.1.7). The `DnId` *is* part of the
   stream's name, so a stream has exactly one owning DN by construction, not by
   convention. That is the safe form recommended there, obtained for free.
 - **Key derivation is now stable against reassignment** (§7.3.3). Extent keys derive
@@ -1899,29 +1899,78 @@ plausibly the bootstrap root (§5.5.1).
 
 ### 13.1 Sync loops
 
-Reality diverges from metadata, and three loops reconcile it. Their cadences differ
-by orders of magnitude, and the principle behind that is worth stating:
+Reality diverges from metadata, and three loops reconcile it. Their cadences differ by
+five orders of magnitude, and the principle behind that is worth stating:
 
-> **Sync frequency follows the rate at which reality can diverge, not the importance
-> of the data.**
+> **Sync frequency follows the rate at which reality can diverge, not the importance of
+> the data.**
 
-| Loop | Cadence | Why that cadence |
+| Loop | Cadence | Volume per sweep | Why that cadence |
+|---|---|---|---|
+| SN → EN, **disk state** | **~1 minute** | ~1 MB (16 KB/s) | Disks go up and down constantly, and placement needs fresh free-space figures (§13.1.1) |
+| SN → EN, **instance state** | **~1 hour** | ~46 GB (13 MB/s) | Individual instances vanishing or corrupting is far rarer than a disk cycling |
+| DN → SN | **a day to a month** | ~8.5 GB (99 KB/s daily) | No hardware failure can make a DN's view of a stream wrong; the limit is DN paging (§13.1.2) |
+
+All are **driven by the upper tier** — the SN asks the EN, the DN asks the SN. The tier
+holding the metadata is the one that knows what ought to exist.
+
+#### 13.1.1 Why the fast loop carries disks, not instances
+
+The two SN→EN loops differ by the size of what they enumerate, and the gap is enormous:
+an SN reaching 407 ENs sees ~61,000 disks but drives ~2.3 × 10^9 instances — **37,000
+instances per disk.**
+
+| Per-minute sweep of | Volume | Rate |
 |---|---|---|
-| SN → EN, disk liveness | **~1 minute** | The fastest twitch. Disks fail without warning, and until the SN knows, it is placing on and reading from something that is gone. |
-| SN → EN, warm instance sync | frequent | Only what changed, so small at any fleet size (§13.1.6). |
-| SN → EN, cold instance sync | slow sweep | Full enumeration, to catch what the warm path missed. Divergence comes from real hardware loss and silent corruption, so it must happen — but not urgently, since liveness already caught the loud failures. |
-| DN → SN | **quite slow** | No hardware failure can cause a DN's view of a stream to go wrong. Only software bugs and lost messages can, so this is a correctness audit rather than a failure detector. |
+| all disks | ~1 MB | **16 KB/s** — trivial |
+| all instances | ~46 GB | **760 MB/s** — out of the question |
 
-All of them are **driven by the upper tier** — the SN asks the EN, the DN asks the SN.
-The tier holding the metadata is the one that knows what ought to exist.
+So the once-a-minute message carries **disk-level state only**: up or down, and free
+bytes. Instance enumeration moves to the hourly loop, where the same 46 GB is 13 MB/s.
 
-The DN→SN case is the instructive one. A DN's reference to a stream does not depend on
-any hardware that can independently fail — the stream's existence is guaranteed by its
-SN ring (§5.7), not by a disk. So there is nothing for a fast loop to catch. An SN's
-reference to an instance, by contrast, depends on a specific spinning disk that can
-die between one second and the next.
+**What the fast twitch is actually for is rebalancing.** The free-space table of §5.6.3
+is what placement weights against, so it must be fresh, and a dead disk must leave the
+table before the SN places on it. Correctness of the *data* is not the fast loop's job —
+that is the hourly instance loop. This matches the failure rates: a disk cycling up and
+down is routine, while an instance disappearing or silently corrupting is not.
 
-#### 13.1.1 One message per pair, driven from above
+The cadence also has to match **the SN's own scan of its extents**, ideally once a
+minute and once every five minutes at worst, since a stale free-space table is useless if
+nothing consults it. That scan is memory-bandwidth bound, not I/O bound:
+
+| Scanned | In 1 minute | In 5 minutes |
+|---|---|---|
+| the SN's primary share, 5.7 × 10^8 records | 0.95 GB/s | 0.19 GB/s |
+| all roles, 1.7 × 10^9 records | 2.85 GB/s | 0.57 GB/s |
+
+Comfortable on a modern machine — but only because records are compact and laid out for
+sequential access (§4.4). At 100 B per record a full scan walks 57–171 GB of memory;
+pointer-chasing through a structure that size would not finish in a minute. **The scan
+cadence is what makes the record-size budget and the list-shaped layout load-bearing**,
+not merely tidy.
+
+#### 13.1.2 Why DN → SN can be so much slower
+
+Network is never the constraint here: the whole sweep is 8.5 GB, which is 99 KB/s daily
+and 3.3 KB/s monthly. The cost is **DN-side paging**, because a DN must read its object
+metadata to enumerate which streams it references, and that metadata is disk-backed
+(§5.1):
+
+| Objects per DN | Daily sweep | Monthly sweep |
+|---|---|---|
+| 10^9 | 3.5 MB/s | 0.12 MB/s |
+| 10^12 | **3.5 GB/s — too much** | 115 MB/s |
+
+So the cadence is set by how many objects a DN holds, which §14.5 already lists as
+unpinned. That is the honest reason the answer is "a day or a week or a month" rather
+than a number: at a billion objects per DN, daily is easy; at a trillion, only monthly is.
+
+⚠️ The tension to keep in view is §13.1.7: this loop's job is confirming deletes, and
+each missed one leaks an orphan stream pinning ~1.74 PB. A monthly cadence means a
+month of accumulated leakage, so the cadence trades DN paging bandwidth directly against
+stranded capacity.
+
+#### 13.1.3 One message per pair, driven from above
 
 **Sync is per pair — SN/EN, DN/SN — not per disk or per object.** One message covers
 the whole pair and is *internally* structured by the substructure below it. That keeps
@@ -1931,7 +1980,7 @@ which at 150 disks per EN is a 150-fold difference in chatter for no gain.
 **The upper tier drives.** The SN asks the EN; the DN asks the SN. The tier holding the
 metadata is the one that knows what ought to exist.
 
-#### 13.1.2 Cold sync bucketing, negotiated
+#### 13.1.4 Cold sync bucketing, negotiated
 
 A cold sync enumerates everything, and everything is large, so it is split in three
 escalating steps. **Both sync pairs use the same mechanism**, with the middle step
@@ -1976,11 +2025,11 @@ Both need step 3 in practice:
 
 The asymmetry is the interesting part, and it is not arbitrary. The lower tier may
 legitimately hold *more* than the upper tier knows about — orphans, which are a large
-part of what the sync is for (§13.1.5) — so only it can discover the estimate was short.
+part of what the sync is for (§13.1.7) — so only it can discover the estimate was short.
 Allowing increases only makes the negotiation monotonic and terminating: at worst one
 extra round trip, with no possibility of two parties oscillating between sizes.
 
-#### 13.1.3 What each sync is actually for
+#### 13.1.5 What each sync is actually for
 
 The two loops have different centres of gravity, and it is worth being precise because
 an earlier draft of this section had the DN→SN emphasis backwards.
@@ -2003,7 +2052,7 @@ record at the §14.1 stream size holds down ~1.3 × 10^7 extents, four instances
 That is the whole justification for the loop existing, and it is why "quite slow" must
 still mean "reliably completes".
 
-#### 13.1.4 Why there are exactly two sync loops
+#### 13.1.6 Why there are exactly two sync loops
 
 Because **only cross-tier references can drift.** Within one tier a Raft ring makes
 updates atomic, so its internal references are consistent by construction; across a
@@ -2020,11 +2069,11 @@ in the middle. It also reframes reference counts — **a refcount is a cache of 
 held by the referrer**, and where the referrer is in another tier, the cache can be
 wrong. The sync is what reconciles it.
 
-#### 13.1.5 Divergence runs in both directions
+#### 13.1.7 Divergence runs in both directions
 
 | Divergence | Meaning | Action |
 |---|---|---|
-| SN holds a stream no DN references | **orphan stream** — a failed delete or abandoned create | reclaim; this is the common case (§13.1.3) |
+| SN holds a stream no DN references | **orphan stream** — a failed delete or abandoned create | reclaim; this is the common case (§13.1.5) |
 | EN holds an instance the SN never mentions | **orphan instance** — a failed delete, an abandoned write, or state a ring lost and rebuilt | reclaim the space |
 | SN expects an instance the EN lacks | lost to disk failure or corruption | repair — re-replicate or reconstruct |
 | DN references a stream the SN lacks | **data loss**, not mere unavailability — the ring was the sole authority | escalate; nothing routine fixes this |
@@ -2047,7 +2096,7 @@ unrecoverable — it destroys live customer data — so the safe forms are:
 (1) is much the simpler, and it is the recommendation, but it constrains how stream
 sharing works and needs settling alongside §4.6.1.
 
-#### 13.1.6 Warm sync, and why cadence is affordable
+#### 13.1.8 Warm sync and cold sweeps
 
 Cold sync is the full enumeration above. **Warm sync covers only what changed**, so it
 is small regardless of fleet size and can run far more often. The cold sweep exists to
@@ -2091,6 +2140,7 @@ and by now the design has accumulated a substantial list of work for them:
 | **Age-driven rewrite of over-age extents** | §4.6.3 | Compulsory: no live extent may be older than the ~292-billion-year comparison window, or its identity and key selection become ambiguous |
 | Refreshing the DN's cached counters | §5.5.2 | Otherwise one metadata write per data write |
 | Re-placing instances and ring members | §5.6 | Restoring domain independence after a loss |
+| The SN's own once-a-minute extent scan | §13.1.1 | Finds extents wanting repair, sealing, encoding or re-placement; memory-bandwidth bound |
 | Raft snapshotting | §4.4 | Truncating the log must not block mutations |
 | Rebuilding a ring's state from ENs | §5.2 | Disaster recovery, inherently slow |
 
@@ -2386,12 +2436,12 @@ Roughly in order of how much else depends on them.
 8. **The DN-side stream-list entry has no budget** (§14.1.2). Sizings currently use
    the 200 B stream record as a loose upper bound; a real figure would shrink every
    stream-list number severalfold.
-9. **Digest-based instance confirmation** (§13.1.6). A per-disk hash tree would make
+9. **Digest-based instance confirmation** (§13.1.8). A per-disk hash tree would make
    steady-state cost proportional to divergence rather than instance count, and
    divergence is normally zero.
-10. **The maximum sync message size** (§13.1.2), which sets how much bucketing either
+10. **The maximum sync message size** (§13.1.4), which sets how much bucketing either
     sync pair needs.
-11. **How widely an SN's streams spread across DNs** (§13.1.2). It swings the DN→SN
+11. **How widely an SN's streams spread across DNs** (§13.1.4). It swings the DN→SN
     digest from 0.4 MB to 85 MB per pair, and it is not determined by anything decided
     so far.
 12. **Should streams carry a creation timestamp too?** (§4.6.3) Bob's expectation is
