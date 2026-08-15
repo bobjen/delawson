@@ -198,13 +198,50 @@ bound is far below the extent count.
 ### 4.3 Instances
 
 - While open, each instance is a **full replica** on a distinct EN in a distinct
-  failure domain. Writes go to all replicas. Default 4 instances.
+  failure domain, and on a distinct **disk** (§5.3.1). Writes go to all replicas.
+  **4 instances**, for the reason below.
 - After sealing, the extent is re-encoded to **erasure-coded fragments**,
   reconstructible from any *k* of *n*. Replicas drop once encoding is durable
   and verified.
 
 Because EC operates on already-compressed, already-encrypted bytes (§7),
 re-encoding needs no key access and no recompression.
+
+#### 4.3.1 Why four instances and not three
+
+Two operating assumptions, per instance:
+
+| State | Fraction of the time |
+|---|---|
+| unavailable | 1/1,000 |
+| gone, and not yet replaced | 1/10,000 |
+
+The target is **at least 10^-14 reliability per average window between an instance being
+lost and being replaced.** Data is lost when every instance is gone at once, so with *n*
+instances the loss probability per window is (10^-4)^*n*:
+
+| *n* | Loss per window | |
+|---|---|---|
+| 3 | 10^-12 | **fails the target by 100×** |
+| **4** | **10^-16** | meets it with 100× margin |
+| 5 | 10^-20 | overshoots; pays 25% more disk for it |
+
+So four is not a round number — three misses by two orders of magnitude and five buys
+margin nobody asked for.
+
+⚠️ **That exponent is entirely a claim about independence.** (10^-4)^4 assumes the four
+failures are uncorrelated, which is exactly what the placement rules of §5.6 exist to
+deliver. A correlated failure mode — one bad firmware revision, one power domain, two
+instances on one machine's disks — collapses the exponent toward 10^-4 and the design
+misses its target by ten orders of magnitude. The reliability figure is therefore a
+statement about placement discipline, not about disks.
+
+**Availability, separately.** A read needs one instance of four, so it is unavailable
+(10^-3)^4 = **10^-12** of the time. A write needs three of four applied (§8.1), which is
+unavailable ~**6 × 10^-6** of the time — about 190 seconds per year per extent, and six
+orders of magnitude worse than reads. That asymmetry is affordable only because a write
+that cannot reach a quorum does not block: the extent is sealed short and a new one opened
+(§13), which §6 already makes cheap by allowing extents to seal at any size.
 
 Sealing and EC are also a **billing event**: 4 replicas of a 32 MB body bills as
 128 MB; a 6+3 encoding of the same body bills as ~48 MB (§12).
@@ -917,7 +954,56 @@ most. Nesting keeps the constraint linear no matter how many domain types are
 added, which means new domain types (a new firmware tier, a new network fabric)
 can be introduced without compounding cost.
 
-#### 5.6.3 What nesting costs
+#### 5.6.3 Choosing a disk: weighted random, then reject
+
+Domain independence says where an instance may *not* go. It does not say which of the
+survivors to pick, and picking badly fills disks unevenly — which wastes capacity, since
+a full disk is unusable even while its neighbours are half empty.
+
+**So placement is proportional to free space.** The mechanism reuses the sync loop that
+already exists:
+
+1. The once-a-minute disk-liveness sync (§13.1) also reports **fullness per disk**.
+2. A once-a-minute summary builds a **cumulative table of free bytes** over all disks the
+   SN can currently reach.
+3. To place an instance, pick a **uniformly random byte** in the total free space and
+   **binary search** the table for the disk containing it.
+4. If the placement rules already exclude that disk's domain, **retry**.
+
+The cost is negligible. An SN reaching 407 ENs of 150 disks tracks ~61,000 disks — a
+477 KB table, rebuilt each minute, and 16 comparisons per placement. At *G*=64 it is
+~244,000 disks, 1.9 MB, and 18 comparisons.
+
+Retries are few, because the rules only exclude domains already used. With the six domains
+slack requires for four instances (§5.6.1):
+
+| Placing instance | Fraction allowed | Expected picks |
+|---|---|---|
+| 1st | 1.00 | 1.0 |
+| 2nd | 0.83 | 1.2 |
+| 3rd | 0.67 | 1.5 |
+| 4th | 0.50 | 2.0 |
+
+**Rejection sampling is exactly right here, not an approximation.** Sampling from a
+free-space-weighted distribution and discarding disallowed draws yields precisely the
+free-space-weighted distribution *conditioned on* the allowed set — which is the
+distribution wanted. No correction term is needed.
+
+Two further properties worth noting:
+
+- **It self-corrects.** A newly added, empty disk has a large share of free bytes and so
+  attracts writes until it matches its neighbours; a nearly full one is chosen almost
+  never. Fill levels converge without any explicit rebalancing.
+- **It is indifferent to the rule set**, so the same machinery serves erasure coding,
+  whose placement rules differ from 4-instance replication (§4.3) — only the rejection
+  predicate changes.
+
+⚠️ Weighting and constraints do interact: if one domain is markedly emptier than the rest,
+weighted picks concentrate there and are rejected more often. The retry count stays
+bounded but rises, and the effect is worst exactly when the cluster is lopsided — after
+adding a rack, say. Worth measuring rather than assuming.
+
+#### 5.6.4 What nesting costs
 
 **Planned disruptions must be serialized.** Software deployments and large
 planned outages cannot run at the same time.
@@ -929,7 +1015,7 @@ domain type onto one hierarchy, so "at most one domain intentionally down"
 becomes a single global budget shared by every kind of planned work, rather than
 one budget per orthogonal dimension.
 
-#### 5.6.4 A concession that is a known defect
+#### 5.6.5 A concession that is a known defect
 
 ⚠️ Orthogonal software-deployment domains may be supported anyway, because that
 is how clusters are built today. This is a compatibility concession and a known
@@ -1448,6 +1534,73 @@ extent atomically: all its records become visible or none do.
 
 An append returns the record number of the first record in the block (unkeyed)
 and the extent it landed in.
+
+#### 8.1.1 Accepted, applied, durable
+
+An extent has a **primary EN** among the ENs holding its instances, and that primary runs
+the append protocol. Three states, and the distinctions matter:
+
+| State | Means | Scope |
+|---|---|---|
+| **accepted** | a machine has received the append | one machine |
+| **applied** | it *and every append before it* are on disk on that machine | one machine |
+| **durable** | the primary EN knows **3 of 4** instances have applied it | the extent |
+
+**Applied is a prefix property, not a per-append flag.** An append is applied only once
+all its predecessors are also on disk, so each instance's state collapses to a single
+watermark and durability is the watermark reached by at least three of the four. That is
+what makes the bookkeeping cheap enough for a tier that must stay CPU-poor (§1.2): the
+primary tracks four numbers per open extent, not a set of outstanding appends.
+
+**Three of four is a quorum, and that is load-bearing.** Any two 3-subsets of a 4-set
+overlap in at least two members, so a new primary that polls any three instances is
+guaranteed to see every durable append. Primary handover needs no separate reconciliation
+protocol — the intersection does it. Had durability been 2 of 4, two disjoint pairs could
+each hold a "durable" append the other had never seen.
+
+#### 8.1.2 The quorum forces broadcast, not a daisy chain
+
+The primary must send each append to all three secondaries **in parallel**. Chain
+replication — primary → S1 → S2 → S3 — would defeat the quorum entirely.
+
+The reason is that a quorum only buys straggler tolerance if the writes are *issued*
+concurrently. Under broadcast, durability arrives when the second-fastest of three
+secondaries applies, so one slow node costs nothing. Under a chain, reaching three of four
+means passing *through* the first two secondaries in sequence, so every straggler is on the
+critical path and a stall at S1 blocks S2 and S3 as well:
+
+| | Mean latency to durable (iid apply times, mean 1) |
+|---|---|
+| Broadcast — 2nd fastest of 3 | 1/3 + 1/2 = **0.83** |
+| Chain — first two in sequence | 1 + 1 = **2.00** |
+
+The tail matters more than the mean. With 1% of nodes running 10× slow, a chain is hit by a
+straggler 2.0% of the time, while broadcast needs *two* of three to be slow and is hit
+0.03% of the time — a **67× rarer** slow tail. Given that 3-of-4 exists precisely to avoid
+waiting for the slowest instance, pairing it with a topology that serializes them would be
+self-defeating.
+
+What broadcast costs is egress *distribution*, not egress total. For a 4 MB append block
+both put 12 MB on the wire; the chain spreads it one hop per node while broadcast puts all
+12 MB on the primary's uplink. Fleet-wide that evens out, because every EN is primary for
+some extents and secondary for others — so the concentration bounds per-extent burst
+throughput rather than aggregate capacity.
+
+#### 8.1.3 The SN is not in the write path
+
+Worth stating explicitly, because it is easy to assume otherwise: **the SN places
+instances and records where they are, then gets out of the way.** The append protocol runs
+between the client or FE and the primary EN, and the SN is not consulted per write.
+
+Two things depend on this:
+
+- **The SN's memory budget survives.** §14.1 has one SN mapping ~76 PB of EN capacity from
+  256 GB of RAM, which is only possible because it never touches a byte of it.
+- **The cost target survives.** §1.2 needs writes to be handled by the tier that already
+  owns the disks, not by an extra hop through a metadata machine.
+
+The SN does learn of the outcome, but lazily: extent size and byte totals are the mid-tree
+summaries §4.5 keeps lazy, and the sync loops of §13.1 reconcile the rest.
 
 ### 8.2 Record framing
 
@@ -2196,72 +2349,79 @@ Roughly in order of how much else depends on them.
     references it, where rewriting an extent is something compaction does anyway. So the
     wrap obligation is cheap for extents and expensive for streams — an argument for
     giving streams a *wider* timestamp rather than an equal one.
-13. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
+13. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
+    and domain constraints interact: a markedly emptier domain attracts weighted picks and
+    then rejects them, which is worst right after adding capacity. Bounded, but worth
+    measuring.
+14. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
+    safe, but who chooses the primary, and how a new one is appointed when it fails, is
+    undesigned.
+15. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
     must be chosen together; a Raft log index is a natural per-ring counter, but what an
     SCN is scoped to is unsettled while objects span many rings.
-14. **Expected object count** (§14.5). DN cost scales with object count rather than
+16. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-15. **Why nesting forces serialized planned disruptions** (§5.6.3) — the
+17. **Why nesting forces serialized planned disruptions** (§5.6.4) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-16. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+18. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-17. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+19. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-18. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+20. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-19. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+21. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-20. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+22. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-21. **Background loop scheduling** (§13.2): prioritisation and rate limiting
+23. **Background loop scheduling** (§13.2): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-22. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+24. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-23. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+25. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-24. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+26. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-25. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+27. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-26. **Remaining directory semantics** (§5.1): listing huge directories,
+28. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-27. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+29. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-28. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+30. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-29. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
+31. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
     hurts compression ratio, and ratio is billable.
-30. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+32. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-31. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+33. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-32. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+34. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-33. **Billing policy** (§12): garbage, transient double footprint, metadata,
+35. **Billing policy** (§12): garbage, transient double footprint, metadata,
     instantaneous-usage contract, reporting granularity.
-34. **Key custody within KS** (§7.3): how the daily master keys are themselves
+36. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-35. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+37. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-36. **Compaction policy** (§10) — now partly a pricing decision.
-37. **Membership and leader election** (§13).
-38. `Nul` and `\0` framing were both listed originally and are folded together
+38. **Compaction policy** (§10) — now partly a pricing decision.
+39. **Membership and leader election** (§13).
+40. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-39. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+41. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
