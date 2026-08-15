@@ -360,7 +360,41 @@ Two safety requirements come with it:
   manufacture a collision. The SN should keep the last second it issued in its Raft
   state and refuse to regress.
 
-A 4-byte second counter spans ~136 years from its epoch, which outlasts the hardware.
+##### The timestamp is a deadline, not just a disambiguator
+
+The daily SN-master key that encrypted an extent is **selected by its creation
+timestamp** (§7.3), so the timestamp is load-bearing for decryption as well as for
+identity. Which gives a hard obligation:
+
+> **Every extent must be replaced or deleted before its creation timestamp wraps.**
+
+After a wrap, an old and a new extent can share the same `(SnId, ExtentId, second)` —
+ambiguous identity *and* ambiguous key selection. A 4-byte second counter spans **~136
+years**, so that is the deadline. Comfortably beyond any hardware, but not beyond the
+life of a storage service, and the design is meant to hold data indefinitely.
+
+So this creates a **compulsory** background obligation, not an optimization: an
+age-driven rewrite sweep that guarantees no extent outlives the window. The cost is
+trivial — clearing 1 EB inside 136 years is ~233 MB/s across the entire fleet — and the
+mechanism already exists, since compaction rewrites extents and rotates keys anyway
+(§10). The risk is purely that it gets forgotten, so §13.2 lists it explicitly.
+
+⚠️ **Granularity trades directly against the window**, and the two safety rules pull
+opposite ways — finer ticks make id reuse safer and the deadline sooner:
+
+| Tick | 4-byte window | Reuse rule | Creation rate it permits |
+|---|---|---|---|
+| **1 second** | **136 years** | not within 1 s | 4.3 × 10^9 /s |
+| 1 minute | 8,166 years | not within 1 min | 7.2 × 10^7 /s |
+| 1 hour | 489,957 years | not within 1 hr | 1.2 × 10^6 /s |
+| 1 day | 11.8 million years | not within 1 day | 49,710 /s |
+
+Even the day row permits ~50,000 extent creations per second per SN, which would turn
+over an SN's entire 1.7 × 10^9 extents in under ten hours — implausibly fast. So a
+coarser tick would buy an effectively unlimited window at no realistic cost in reuse
+safety, and a 5-byte second counter would buy 34,841 years for one byte. One second is
+the current choice and gives the best forensics; the alternatives are recorded because
+a 136-year deadline is the kind of thing that is much cheaper to widen now than later.
 
 ##### Two questions this settles
 
@@ -1726,6 +1760,7 @@ and by now the design has accumulated a substantial list of work for them:
 | Scrubbing and checksum verification | §1.1 | Catches decay before it accumulates |
 | Reclaiming garbage in packed extents | §11 | A deleted packed object leaves a hole |
 | Encryption key rotation | §7.2 | Happens by rewriting during compaction |
+| **Age-driven rewrite before timestamp wrap** | §4.6.3 | Compulsory: an extent outliving its 136-year window becomes ambiguous in both identity and key selection |
 | Refreshing the DN's cached counters | §5.5.2 | Otherwise one metadata write per data write |
 | Re-placing instances and ring members | §5.6 | Restoring domain independence after a loss |
 | Raft snapshotting | §4.4 | Truncating the log must not block mutations |
@@ -2031,9 +2066,14 @@ Roughly in order of how much else depends on them.
 11. **How widely an SN's streams spread across DNs** (§13.1.2). It swings the DN→SN
     digest from 0.4 MB to 85 MB per pair, and it is not determined by anything decided
     so far.
-12. **Should streams carry a creation timestamp too?** (§4.6.3) Extents do, which
-    makes their ids safely reusable; `(DnId, StreamId)` has no such protection against
-    stale references. Lower churn makes it milder, not absent.
+12. **Should streams carry a creation timestamp too?** (§4.6.3) Bob's expectation is
+    yes, not yet thought through. Two asymmetries make it a different problem from the
+    extent case rather than the same one: a stream is not itself encrypted, so a stream
+    timestamp would be for id-reuse safety only and would not select a key; but
+    "rewriting" a stream to escape a wrap means re-identifying it in every object that
+    references it, where rewriting an extent is something compaction does anyway. So the
+    wrap obligation is cheap for extents and expensive for streams — an argument for
+    giving streams a *wider* timestamp rather than an equal one.
 13. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
