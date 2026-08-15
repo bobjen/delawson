@@ -991,9 +991,14 @@ distribution wanted. No correction term is needed.
 
 Two further properties worth noting:
 
-- **It self-corrects.** A newly added, empty disk has a large share of free bytes and so
-  attracts writes until it matches its neighbours; a nearly full one is chosen almost
-  never. Fill levels converge without any explicit rebalancing.
+- **It is provably optimal, not a heuristic.** Maximizing the time until the *first*
+  disk fills means equalizing every disk's time-to-full: with free space *f_i* and write
+  rate *r_i*, equal *f_i*/*r_i* under Σ*r_i* = *R* gives *r_i* = *R*·*f_i*/Σ*f_i* — exactly
+  proportional to free space, and uniquely so.
+- **What converges is exhaustion, not fullness.** Since d*f_i*/d*t* ∝ −*f_i*, free space
+  decays exponentially and *ratios are preserved*: a newly added disk stays proportionally
+  emptier rather than catching up. All disks approach exhaustion together, which is the
+  property worth having — no disk is full while its neighbours have room.
 - **It is indifferent to the rule set**, so the same machinery serves erasure coding,
   whose placement rules differ from 4-instance replication (§4.3) — only the rejection
   predicate changes.
@@ -1003,7 +1008,49 @@ weighted picks concentrate there and are rejected more often. The retry count st
 bounded but rises, and the effect is worst exactly when the cluster is lopsided — after
 adding a rack, say. Worth measuring rather than assuming.
 
-#### 5.6.4 What nesting costs
+#### 5.6.4 The cluster balances itself, at any size
+
+Something falls out of §5.6.3 that is worth stating on its own, because it is the property
+that makes the scheme viable at scale: **SNs never coordinate with each other, and the
+cluster balances globally anyway.**
+
+Each SN sees a random ~20,000 of the ENs — random, but stratified so its view is spread
+evenly across the finest tracked failure domain. It weights placement by the free space it
+observes, and that is the whole algorithm. No SN knows another exists.
+
+**The ENs are the communication medium.** When one SN fills the ENs it can see, their free
+space falls, so their weight falls in the tables of every *other* SN that shares them.
+Those SNs shift elsewhere, which raises pressure on their remaining ENs, which lowers those
+weights for a third set of SNs. The adjustment propagates through the overlap graph without
+a single message between SNs — the fullness measurement *is* the signal.
+
+**Why it lands on the global optimum.** Because each SN's fan-out is an unbiased sample of
+the cluster, its local free-space distribution is an unbiased sample of the global one. An
+SN allocating proportionally to its local sample therefore allocates proportionally to
+global free space in expectation, and the sum over all SNs is the globally optimal
+allocation of §5.6.3 — reached by purely local decisions. This is why the stratification
+matters: it is what keeps the sample unbiased across domains, and a clustered or correlated
+view would bias the aggregate.
+
+**The algorithm is scale-free.** Per-SN cost is a 477 KB table and 16 comparisons per
+placement, and *neither changes when the cluster grows* — an SN's work depends on its
+fan-out, not on the fleet. Adding ENs or SNs requires no re-partitioning, no rehashing, and
+no global recomputation.
+
+> **The 2^32 node limit is a consequence of identifier width, not of the algorithm.** The
+> algorithm itself works arbitrarily large.
+
+And raising that limit is cheap, thanks to the local-reference design of §4.6: global node
+ids appear only in the control plane and in the per-SN fan-out tables (78 KB each), never in
+the 10^9-entry extent lists, which use 2-byte neighbourhood-local indices. Widening the
+global id touches small structures only. **The data plane is already size-agnostic.**
+
+Feedback delay is not a concern. The table is a minute stale at worst, and one SN writing
+at 5 GB/s spread over 61,000 disks moves each by ~4.9 MB per minute — 0.000025% of a 20 TB
+disk. Weighting is also proportional rather than threshold-based, so there is no edge to
+oscillate around.
+
+#### 5.6.5 What nesting costs
 
 **Planned disruptions must be serialized.** Software deployments and large
 planned outages cannot run at the same time.
@@ -1015,7 +1062,7 @@ domain type onto one hierarchy, so "at most one domain intentionally down"
 becomes a single global budget shared by every kind of planned work, rather than
 one budget per orthogonal dimension.
 
-#### 5.6.5 A concession that is a known defect
+#### 5.6.6 A concession that is a known defect
 
 ⚠️ Orthogonal software-deployment domains may be supported anyway, because that
 is how clusters are built today. This is a compatibility concession and a known
@@ -1234,7 +1281,7 @@ disks of 20 TB that is a 3 PB EN, where *G*=16 costs only ~407 connections and *
 still only ~1,600. Two independent arguments — reliability wanting sharing, economics
 wanting few servers per byte — converge on large ENs.
 
-#### 5.10.2 Neighborhoods must be domain-diverse
+#### 5.10.2 Neighborhoods must be domain-diverse, and randomly chosen
 
 §5.6 requires instances in slack × *n* independent failure domains. Those domains
 must now exist **within the F ENs an SN can see**, not merely somewhere in the
@@ -1247,6 +1294,12 @@ likewise a neighborhood property, not a cluster property — repair re-places wi
 the neighborhood, so it is the neighborhood that must retain spare domains after a
 loss. This is a materially stronger requirement than the cluster-wide version, and
 it is the one that actually has to hold.
+
+Beyond diversity, the set should be a **random** selection, stratified to spread evenly
+across the finest tracked failure domain. Randomness is what makes each SN's view an
+unbiased sample of the cluster, which is what makes the self-balancing of §5.6.4 land on
+the global optimum. A clustered or systematically-assigned neighborhood would satisfy
+domain diversity and still bias placement.
 
 #### 5.10.3 Reassignment needs mutable fan-out
 
@@ -2362,7 +2415,7 @@ Roughly in order of how much else depends on them.
 16. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-17. **Why nesting forces serialized planned disruptions** (§5.6.4) — the
+17. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
 18. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
