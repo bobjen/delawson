@@ -37,7 +37,7 @@ it was computed or assumed.
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-80 things *not* decided.
+82 things *not* decided.
 
 **Priorities and framing**
 
@@ -126,6 +126,8 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | | |
 |---|---|
 | Append blocks are atomic; **accepted / applied / durable**, with 3-of-4 a quorum | §8.1.1 |
+| **Erasure coding forces exactly-once, byte-identical appends** — GFS's at-least-once model is unavailable | §8.1.1a |
+| No chunk padding: an append that will not fit **seals the extent short** | §8.1.1c |
 | The quorum forces **broadcast, not a daisy chain** | §8.1.2 |
 | **Soft delete** is a deferred decrement: 3-day window, timers in parallel across layers, opt-out per directory | §8.4 |
 | Metadata must not **predecease** its data — which makes the heroics window for user deletes zero | §8.4.1d |
@@ -2816,6 +2818,81 @@ guaranteed to see every durable append. Primary handover needs no separate recon
 protocol — the intersection does it. Had durability been 2 of 4, two disjoint pairs could
 each hold a "durable" append the other had never seen.
 
+#### 8.1.1a Parallel appends: what GFS does, and why it cannot be copied
+
+Multiple clients appending to one object is the case worth studying, because §1.0's motivating use case —
+many writers recording shared experiences — is exactly it.
+
+**GFS's answer is `record append`.** It "allows multiple clients to append data to the same file concurrently
+while guaranteeing the atomicity of each individual client's append", and the mechanics are close to
+DeLawson's: the client pushes data to all replicas of the last chunk, the primary assigns the offset, and the
+secondaries are told where it went. Serialization at a primary, as in §8.1.1.
+
+But the semantics are much weaker, deliberately:
+
+| GFS property | Consequence |
+|---|---|
+| The offset is "of GFS's choosing" | the client learns where its record landed; it cannot specify |
+| **"append-at-least-once semantics"** | a failed append is retried, so **duplicates** occur |
+| A record that will not fit pads the chunk | **gaps**, and records never span chunks |
+| Records limited to **¼ of chunk size** | bounds worst-case fragmentation from that padding |
+| **"GFS does not guarantee that all replicas are bytewise identical"** | replicas may differ; regions are "defined interspersed with inconsistent" |
+
+Readers cope by application convention — records carry checksums so padding can be skipped, and unique IDs so
+duplicates can be dropped.
+
+**DeLawson cannot adopt this, and erasure coding is the reason.** GFS reads a whole replica, so divergent
+replicas are survivable: each read is self-consistent even if two reads differ. Erasure coding is not so
+forgiving. Reconstruction combines fragments computed from *different machines*, so if those machines held
+different byte sequences the reconstruction yields garbage — and §7.2's per-block IVs derived from
+`(extent_id, block_index)` mean even the ciphertext must match exactly.
+
+> **Erasure coding forces byte-identical instances and therefore exactly-once append. Replication does not.**
+
+The second reason is §1.0's stable-index property. An index entry of (object, record *N*) is only permanently
+valid if record numbers are unique and never shift. At-least-once appends would give the same logical record
+two numbers, and padding would leave gaps — which does not break correctness so much as destroy the one
+property that made DeLawson attractive for indexed data in the first place.
+
+#### 8.1.1b What others do, and what DeLawson still needs
+
+| System | Approach to concurrent append |
+|---|---|
+| **GFS** | serialize at the primary, at-least-once, duplicates and padding pushed to the application |
+| **HDFS** | **single writer** per file, lease-held — avoids the problem rather than solving it |
+| **Apache BookKeeper** | single writer per ledger, with fencing on failover |
+| **Kafka** | partition leader assigns offsets; an idempotent producer (producer id + sequence number) gives exactly-once |
+| **Azure append blobs** | concurrent appends with an append-position conditional header for optimistic concurrency |
+| **Ceph RADOS** | append ops serialized by the primary OSD |
+| **S3** | historically no append at all — whole-object PUT |
+
+The pattern: either restrict to one writer, or serialize at a primary and then choose between at-least-once
+(cheap, GFS) and exactly-once (needs an idempotency token, Kafka).
+
+**DeLawson is structurally in the Kafka position but has not specified the token.** §8.1.1 gives a primary EN,
+a total order per extent, and a prefix watermark; §8.1.2's 3-of-4 intersection lets a new primary learn the
+durable point. What is missing is the retry case: if an append is applied by two instances and the primary
+then dies, a client retry could append it a second time, and nothing in the design prevents that.
+
+⚠️ **So an append needs a client-supplied idempotency token** — a producer identifier plus a sequence number,
+in Kafka's shape — that the primary keeps far enough back to recognize a duplicate retry. Undesigned, and it
+is a prerequisite for exactly-once rather than an optimization: without it the erasure-coding requirement
+above is violated on the first primary failure.
+
+#### 8.1.1c One thing DeLawson gets for free: no padding
+
+GFS pads a chunk when a record will not fit and caps records at a quarter of the chunk to bound the resulting
+fragmentation. **DeLawson needs neither**, because extents may be sealed at any size (§6) — an append block
+that will not fit simply seals the extent short and starts a new one, which is the same mechanism §13 already
+uses when an EN fails mid-write.
+
+That is a direct payoff from variable-size extents. GFS's chunks were fixed at 64 MB, so the only way to keep
+a record whole was to waste the tail; DeLawson's are bounded but not fixed, so the tail is simply shorter.
+
+⚠️ A bound on append-block size is probably still wanted, for the same reason GFS had one: a very large block
+arriving at a nearly-full extent wastes the remainder. The difference is that the waste is bounded by the
+block size rather than by the chunk size, and it lands in §12.7's garbage term rather than in silent padding.
+
 #### 8.1.2 The quorum forces broadcast, not a daisy chain
 
 The primary must send each append to all three secondaries **in parallel**. Chain
@@ -4717,132 +4794,139 @@ Roughly in order of how much else depends on them.
 33. **Why the price undercuts B2 threefold** (§12.7.2.2). Either disk density and cost discipline are a
     real advantage, or the efficiency chain is optimistic. B2 runs a lower-overhead code, so it is not the
     coding. Worth resolving before the number is quoted to anyone.
-34. **Does shared AI memory need latency this design deprioritizes?** (§1.0.2) Near-real-time is
+34. **An append idempotency token** (§8.1.1b). Exactly-once append is *required* — erasure coding cannot
+    tolerate divergent instances — and nothing currently prevents a retry after primary failure from
+    duplicating an append. A producer id plus sequence number in Kafka's shape is the obvious answer.
+    A prerequisite, not an optimization.
+35. **A maximum append-block size** (§8.1.1c). GFS capped records at a quarter of a chunk to bound padding
+    waste; DeLawson seals short instead, so the waste is bounded by block size, but a very large block
+    arriving at a nearly-full extent still wastes the remainder.
+36. **Does shared AI memory need latency this design deprioritizes?** (§1.0.2) Near-real-time is
     comfortable; millisecond index lookups are not what §1.4 optimizes for. If the motivating use case
     wants them, that is a conflict to resolve rather than assume away.
-35. **A time-based sealing trigger** (§9.7.1). It would bound the durability-timestamp table, which a
+37. **A time-based sealing trigger** (§9.7.1). It would bound the durability-timestamp table, which a
     slowly-written extent grows to 0.8% of its size, and open extents are expensive anyway — but hourly
     sealing of a slow stream makes nine times as many extents, and extent metadata is priced. A three-way
     trade, undecided.
-36. **Time-range queries on keyed objects** (§9.7.2). Record number is not monotonic in time there, so the
+38. **Time-range queries on keyed objects** (§9.7.2). Record number is not monotonic in time there, so the
     query is a scan over candidate extents rather than a binary search, and its cost is unworked.
-37. **Governance and licence** (§1.0). An open-source data store needs a licence choice, a contribution
+39. **Governance and licence** (§1.0). An open-source data store needs a licence choice, a contribution
     model, and a position on whether a hosted service competes with its own users. None decided.
-38. **What FE-layer retention means** (§8.4.1c). DN, SN and EN retention is a deferred decrement; FE
+40. **What FE-layer retention means** (§8.4.1c). DN, SN and EN retention is a deferred decrement; FE
     holds no durable state, so its window presumably means declining to issue the hard delete until its
     timer expires. Worth stating, since a layer that gets this wrong silently leaves the protection.
-39. **Retention window versus the repair reserve** (§8.4.3). Window × churn consumes the 1 − 1/D
+41. **Retention window versus the repair reserve** (§8.4.3). Window × churn consumes the 1 − 1/D
     headroom that durability depends on, so windows must be admission-controlled rather than freely
     chosen. A 30-day window at 100%/yr churn already exceeds a 5% reserve.
-40. **Measure the space-efficiency chain** (§12.7). Every factor is a guess and they multiply: the
+42. **Measure the space-efficiency chain** (§12.7). Every factor is a guess and they multiply: the
     difference between 58% and 55% billable is a 5% swing in revenue per disk bought. The
     undeletable-garbage term is the one most under the design's control, via compaction policy.
-41. **Expiry-aware placement** (§8.5.1). Grouping objects by declared expiry so extents die whole is
+43. **Expiry-aware placement** (§8.5.1). Grouping objects by declared expiry so extents die whole is
     the strongest lever on the efficiency chain, worth ~30× the entire extent-size range. Needs a
     placement policy, an API field, and a decision on how hard to discourage "never".
-42. **A lifetime dimension in the price list** (§8.5.3). Short-lived data skips erasure coding and so
+44. **A lifetime dimension in the price list** (§8.5.3). Short-lived data skips erasure coding and so
     costs 2.7× more per byte-day. Correct, but it means price cannot be one figure per byte.
-43. **A guaranteed repair-bandwidth floor** (§4.3.4.1). Repair below the failure arrival rate makes
+45. **A guaranteed repair-bandwidth floor** (§4.3.4.1). Repair below the failure arrival rate makes
     loss certain rather than unlikely. The floor is ~7.6 GB/s per 100,000 disks — cheap, but it has to
     be reserved rather than left to compete with foreground traffic.
-44. **Treat utilization as a durability limit** (§4.3.4). A full cluster cannot repair, so 1 − 1/D is
+46. **Treat utilization as a durability limit** (§4.3.4). A full cluster cannot repair, so 1 − 1/D is
     not a capacity guideline. Needs enforcement, and an answer for what happens when a tenant's growth
     would cross it.
-45. **Defence against logical corruption** (§4.3.4). Erasure coding faithfully preserves corrupted
+47. **Defence against logical corruption** (§4.3.4). Erasure coding faithfully preserves corrupted
     data. Scrubbing catches bit rot, not a bug that wrote the wrong bytes correctly.
-46. **What disaster size to design for** (§4.3.3). Overhead = 1/(1−s) makes this the single largest
+48. **What disaster size to design for** (§4.3.3). Overhead = 1/(1−s) makes this the single largest
     cost-versus-reliability decision in the system: 33% survivability at 1.50×, 50% at 2.00×. It
     should be settled before the erasure code is chosen.
-47. **Do real disasters respect the domain hierarchy?** (§4.3.3) The guarantee depends entirely on it.
+49. **Do real disasters respect the domain hierarchy?** (§4.3.3) The guarantee depends entirely on it.
     A cross-cutting failure mode returns loss to the binomial regime, where a 5% event loses hundreds
     of terabytes outright instead of ~3 extents.
-48. **Measure the disaster frequency exponent α** (§4.3.3.1). Every expected-loss figure depends on it,
+50. **Measure the disaster frequency exponent α** (§4.3.3.1). Every expected-loss figure depends on it,
     5×- and 10×-per-halving differ by ~6×, and for α > m the integral diverges and needs a floor.
-49. **A second cluster** (§4.3.3.1). Expected loss is of order the whole-cluster disaster rate for every
+51. **A second cluster** (§4.3.3.1). Expected loss is of order the whole-cluster disaster rate for every
     in-cluster code, so geo-replication is the only answer to the top of the distribution — and nothing
     in this document addresses it.
-50. **Is durability a per-customer billable tier?** (§4.3.3.3) Write-off fractions span 1/1000 to
+52. **Is durability a per-customer billable tier?** (§4.3.3.3) Write-off fractions span 1/1000 to
     999/1000, a 250× spread in effective loss rate on identical storage. Overhead = 1/(1−s) makes the
     knob natural and §12 bills it for free, but nothing offers it.
-51. **Do local codes actually lose on disasters, or only in the worst case?** (§4.3.2.1) Guaranteed
+53. **Do local codes actually lose on disasters, or only in the worst case?** (§4.3.2.1) Guaranteed
     tolerance is 7.5% against MDS's 33%, but maximal recoverability plus a good domain-to-local-group
     mapping may recover most real patterns — worth analysing before writing off the construction or the
     patent question.
-52. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
+54. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
     and domain constraints interact: a markedly emptier domain attracts weighted picks and
     then rejects them, which is worst right after adding capacity. Bounded, but worth
     measuring.
-53. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
+55. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
     safe, but who chooses the primary, and how a new one is appointed when it fails, is
     undesigned.
-54. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
+56. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
     must be chosen together; a Raft log index is a natural per-ring counter, but what an
     SCN is scoped to is unsettled while objects span many rings.
-55. **Expected object count** (§14.5). DN cost scales with object count rather than
+57. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-56. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
+58. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-57. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+59. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-58. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+60. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-59. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+61. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-60. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+62. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-61. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+63. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-62. **Background loop scheduling** (§13.3): prioritisation and rate limiting
+64. **Background loop scheduling** (§13.3): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-63. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+65. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-64. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+66. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-65. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+67. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-66. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+68. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-67. **Remaining directory semantics** (§5.1): listing huge directories,
+69. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-68. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+70. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-69. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+71. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-70. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
+72. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
     both sides: coarse granules compress better and bill less, fine granules cut read
     amplification, which is a 50× throughput factor for point reads.
-71. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+73. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-72. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+74. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-73. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+75. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-74. **Billing policy** (§12.8): garbage, transient double footprint, shared-extent
+76. **Billing policy** (§12.8): garbage, transient double footprint, shared-extent
     attribution, instantaneous-usage contract, reporting granularity. Slack itself is
     settled at 2× (§4.7).
-75. **Key custody within KS** (§7.3): how the daily master keys are themselves
+77. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-76. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+78. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-77. **Compaction policy** (§10) — now partly a pricing decision.
-78. **Membership and leader election** (§13).
-79. `Nul` and `\0` framing were both listed originally and are folded together
+79. **Compaction policy** (§10) — now partly a pricing decision.
+80. **Membership and leader election** (§13).
+81. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-80. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+82. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
