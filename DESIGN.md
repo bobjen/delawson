@@ -128,7 +128,7 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Append blocks are atomic; **accepted / applied / durable**, with 3-of-4 a quorum | §8.1.1 |
 | **Erasure coding forces byte-identical instances**, so an instance must **truncate above the durable watermark** on handover | §8.1.1a |
 | The primary assigns a **logical** offset in a tiny serialized window; compress, encrypt and write happen outside it | §8.1.1a-2 |
-| **Single-writer** appends supply their expected offset and are **exactly-once**; **multi-writer** appends are **at-least-once** | §8.1.1a-3 |
+| **Single-writer** appends supply their expected offset and are **exactly-once**; **multi-writer** appends are **at-least-once**. Prior art: **Azure append blobs**, same two modes, same rationale | §8.1.1a-3, §8.1.1a-5 |
 | Logical offsets are **dense** — no padding, no holes — which is what makes the single-writer check, the reorder cache, and cumulative byte totals work | §8.1.1a-6 |
 | An append block is a **byte range**, not a set of records; fragments are single-writer only | §8.1 |
 | Append blocks bounded at **32 MB logical**, so one always fits a fresh extent | §8.1.1a-2 |
@@ -2924,7 +2924,9 @@ then compares:
 | Expected offset beyond the current end | held in an out-of-order cache (below) |
 
 That third row is the idempotency mechanism, and it needs no producer identifier or sequence number: **the
-offset plus the content is the token.** A retry re-sends the same bytes at the same place and is absorbed;
+offset plus the content is the token.** This is not a new idea — it is
+[Azure's `Append Block` conditional append](https://learn.microsoft.com/en-us/rest/api/storageservices/append-block),
+for the same stated reason (§8.1.1a-5). A retry re-sends the same bytes at the same place and is absorbed;
 a genuine conflict is detected rather than silently ordered.
 
 So the two modes differ in exactly the way GFS's does not offer:
@@ -2951,15 +2953,16 @@ single writer keep many appends in flight rather than waiting for each to be pla
 arrives must not pin cached data indefinitely. Both are undesigned, and together they set how far ahead a
 single writer may pipeline.
 
-#### 8.1.1a-5 Prior art for assigning the offset at the primary
+#### 8.1.1a-5 Prior art: Azure append blobs
 
-The mechanism is well-trodden, and one system has essentially the same two modes.
+**The two-mode append of §8.1.1a-2 and §8.1.1a-3 is not novel. The prior art is Azure append blobs**, whose
+[`Append Block` operation](https://learn.microsoft.com/en-us/rest/api/storageservices/append-block) has both
+modes and gives the same reason for them.
 
-**Azure append blobs are the closest analogue.** The service appends at the end and returns
-`x-ms-blob-append-offset`, "the offset at which the block was committed, in bytes" — the primary assigning the
-position and reporting it back. And the conditional header `x-ms-blob-condition-appendpos` supplies an expected
-byte offset, succeeding "only if the current offset matches that specified by the client" and otherwise failing
-412. Microsoft's stated purpose is DeLawson's exactly:
+The service appends at the end and returns `x-ms-blob-append-offset`, "the offset at which the block was
+committed, in bytes" — the primary assigning the position and reporting it back. The conditional header
+`x-ms-blob-condition-appendpos` supplies an expected byte offset, succeeding "only if the current offset matches
+that specified by the client" and otherwise failing 412. Microsoft's stated purpose is DeLawson's exactly:
 
 > "Clients that use a single writer can use this header to determine whether an `Append Block` operation
 > succeeded, despite a network failure."
