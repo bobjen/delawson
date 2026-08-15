@@ -83,7 +83,7 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Four is really a decision to **relax the repair window**, not a reliability necessity | §4.3.1.1 |
 | **Storage overhead = 1/(1 − survivable disaster fraction)**, achieved by MDS codes | §4.3.3 |
 | Working assumption **Reed-Solomon, MDS, m = 4**; overhead chosen from disaster tolerance | §4.3.2 |
-| Local codes trade minimum distance for locality, and are **patent-blocked until 2034** — **turbo codes** are the unencumbered fallback with similar statistics | §4.3.2.1 |
+| Local codes trade minimum distance for locality, and are **patent-blocked until 2034** — **turbo codes** are the unencumbered fallback, at 1.5× and 2.5× instead of 1.333× and 2.333×, so the patent is worth **~$0.24/TB-month** | §4.3.2.1 |
 | The two EC tiers are one **10×6 LRC** (1.333×) and its **data-duplicated variant** (2.333×) | §12.7.2.1 |
 | The second instance buys **removal of repair from the read path**, not durability — minutes to readable instead of days | §12.7.2.1a |
 | Erasure coding does not address **software bugs, admin error, or running out of space** | §4.3.4 |
@@ -863,12 +863,34 @@ public, and neither of those makes it usable. This is a question for counsel, no
 document — but it must be settled before any code is chosen, because the choice is baked into
 every sealed extent and the §4.6.3 timestamp deadline means those live a very long time.
 
-**There is an unencumbered fallback with similar statistics: turbo codes.** A little worse than
-the LRC, but comparable in the properties that matter here, and not patent-encumbered. That
-changes the character of the patent problem considerably — the alternative to licensing is not
-plain Reed-Solomon and its 8× repair amplification, but something close to what was wanted. So
-the licensing question is a matter of recovering a modest margin rather than a design blocker,
-and §12.7.2.1's LRC figures should be read as roughly achievable either way.
+**There is an unencumbered fallback with similar statistics: turbo codes.** A little worse than the LRC,
+but comparable in the properties that matter here, and not patent-encumbered. That changes the character of
+the patent problem entirely — the alternative to licensing is not plain Reed-Solomon and its 8× repair
+amplification, but something close to what was wanted.
+
+**And the cost of not licensing can be priced.** Turbo codes raise the two overheads from 1.333× and 2.333×
+to **1.5× and 2.5×** — the same absolute increment of 0.167× in both cases, so at §12.7.2's $1.42 per
+physical TB-month the patent is worth a flat
+
+> **~$0.24 per TB-month of avoided storage overhead**
+
+which is +12.5% on the cheap tier and +7.1% on the dearer one. That makes licensing a straightforward
+arithmetic question rather than a design one:
+
+| Stored | Value of the patent |
+|---|---|
+| 100 PB | $284,000/year |
+| 1 EB | **$2.84M/year** |
+| 10 EB | $28.4M/year |
+
+License it if it costs less than that; otherwise use turbo codes. Either way the design is unblocked, and
+the unencumbered path still prices at $2.13 and $3.55 per TB-month — **2.8× and 1.7× under the cheapest
+immediate-read incumbent** (§12.7.2.2).
+
+⚠️ What is *not* quantified is the disaster-tolerance comparison. The MDS bound at 1.5× is 33% and at 2.5×
+is 60%, but turbo codes will fall short of those as LRCs do (§4.3.2.1), and by how much is unknown. Since
+§1.1.1 makes disasters the dominant loss mode, that gap could matter more than the $0.24 — it should be
+measured before the choice is made on price alone.
 
 ⚠️ Note this reframes §4.3.2.1's comparison. The candidate is not "MDS Reed-Solomon versus a patented
 local code" but "an LRC, or turbo codes if the patent bites" — and §12.7.2.1a shows the local structure buys
@@ -4509,9 +4531,10 @@ Roughly in order of how much else depends on them.
 30. **Name the durability tiers honestly** (§12.7.2.1). "Usually available, always reliable" hides that
     1.333× also survives only a 25% disaster against 2.333×'s 57% — and large correlated events are the
     dominant loss mode. A customer-facing tier list should state disaster tolerance, not just availability.
-31. **Turbo codes as the unencumbered path** (§4.3.2.1). "A little worse but similar statistics" needs
-    quantifying — repair amplification, distance, and decode cost — before the licensing question can be
-    priced. It is the difference between the patent being a blocker and being a margin.
+31. **Turbo codes' disaster tolerance** (§4.3.2.1). The storage cost of not licensing is now priced at
+    ~$0.24/TB-month, but the *reliability* cost is not. Turbo codes will fall short of the MDS bound as
+    LRCs do, and since disasters dominate loss that gap could outweigh the money. Measure before deciding
+    on price.
 32. **The 1.333× guarantee is tight against the 10% outage case** (§12.7.2.1a). The LRC tolerates at most
     11.7% of fragments by the Singleton-like bound, and the worked scenario is a 10% loss. Worth confirming
     that maximal recoverability covers the realistic patterns, since the margin is thin.
