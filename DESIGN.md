@@ -37,7 +37,7 @@ it was computed or assumed.
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-75 things *not* decided.
+76 things *not* decided.
 
 **Priorities and framing**
 
@@ -138,7 +138,7 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **Physical, not logical** bytes — forced by the same slack rule | §12.3 |
 | A complex model with a **simple presentation**: top charges plus "everything else" while under 1% | §12.6 |
 | Only **~58% of purchased disk** is billable; price lands near **2.6× raw disk cost** per byte | §12.7 |
-| Worked prices: **$1.89 / $3.31 / $5.68 per TB-month** for 1.333× EC, 2.333× EC, 4-instance | §12.7.2 |
+| Worked prices: **$1.89 / $3.31 / $5.68 per TB-month** for 1.333× EC, 2.333× EC, 4-instance — **warm** storage, read immediately at HDD speed | §12.7.2 |
 
 **Testing**
 
@@ -3683,28 +3683,49 @@ tenth of the cluster's worth of metadata still has to be updated to reflect the 
 
 #### 12.7.2.2 Sanity check against the market
 
-| | $/TB-month |
+⚠️ An earlier draft compared these tiers to Glacier Deep Archive and GCS Coldline. **That comparison is
+unfair to DeLawson**, because those tiers buy their price with retrieval latency, retrieval fees, and
+minimum storage durations. **This is warm data, not cold data:**
+
+| | Read behaviour |
 |---|---|
-| Glacier Deep Archive | 1.00 |
-| GCS Archive | 1.20 |
-| **DeLawson EC 1.333×** | **1.89** |
-| DeLawson EC 2.333× | **3.31** |
-| Glacier Flexible | 3.60 |
-| GCS Coldline | 4.00 |
-| **DeLawson 4-instance** | **5.68** |
-| Backblaze B2, Wasabi | ~6.00 |
-| S3 Standard-IA | 12.50 |
-| S3 Standard | 23.00 |
+| **EC 1.333×** | usually **100% readable immediately at HDD speed** — the exception being while recovering from a major outage (§12.7.2.1a) |
+| **EC 2.333×** | **almost always** 100% readable immediately at HDD speed |
 
-The three tiers land between deep archive and the flat-rate providers, and roughly an order of magnitude
-under hot object storage. That is the right neighbourhood for an HDD-backed, throughput-oriented store: it
-is not competing with S3 Standard's request rates and multi-AZ semantics, and it should not be priced as if
-it were.
+So the right comparison set is providers that also serve reads immediately:
 
-⚠️ Two caveats on the comparison. Those competitors charge separately for requests and egress, which this
-figure does not include — §12.4 requires operations to be billed, and that revenue is additional. And they
-are *list* prices; real large-customer pricing is lower, so the margin above cost is thinner than the table
-suggests.
+| | $/TB-month | |
+|---|---|---|
+| **DeLawson EC 1.333×** | **1.89** | usually immediate, HDD speed |
+| **DeLawson EC 2.333×** | **3.31** | almost always immediate, HDD speed |
+| **DeLawson 4-instance** | **5.68** | immediate |
+| Backblaze B2 | 6.00 | immediate; egress free to 3× storage |
+| Wasabi | 6.99 | immediate; no egress fee, 90-day minimum |
+| S3 Standard-IA | 12.50 | immediate; retrieval fee, 30-day minimum |
+| Cloudflare R2 | 15.00 | immediate; no egress fee |
+| GCS Standard | 20.00 | immediate |
+| S3 Standard | 23.00 | immediate; no minimum, no retrieval fee |
+
+Against the cheapest immediate-read incumbent, B2 at $6:
+
+| | vs B2 | vs S3 Standard |
+|---|---|---|
+| EC 1.333× | **3.2× cheaper** | 12.2× |
+| EC 2.333× | **1.8× cheaper** | 6.9× |
+| 4-instance | 1.06× — parity | 4.0× |
+
+⚠️ **Treat that as a question, not a boast.** Undercutting the cheapest incumbent threefold is either a real
+advantage or a sign the cost model is optimistic, and since every factor in §12.7's efficiency chain is a
+guess, the second deserves weight. Two specifics: B2 reportedly runs a wider Reed-Solomon code with *lower*
+storage overhead than 1.333×, so the advantage cannot be coming from the code — it would have to come from
+disk density (§5.3.1's 150 disks per server) and cost discipline. And these are list prices; negotiated
+large-customer pricing is lower, so the real gap is smaller than the table.
+
+**If SSD latency and throughput are wanted, that is a different product at a different price.** Device class
+is already a per-extent property (§9.3), so the design accommodates it without change. On media capital
+alone — $46/TB for these HDDs against roughly $60/TB for QLC or $120/TB for enterprise NVMe — the same tiers
+would land near $2.50–$7.40 or $4.90–$14.80 per TB-month, before accounting for the very different power,
+density and endurance profiles. **HDD is the default because §1.4 wants throughput per dollar, not latency.**
 
 ### 12.8 Open policy questions
 
@@ -4494,121 +4515,124 @@ Roughly in order of how much else depends on them.
 32. **The 1.333× guarantee is tight against the 10% outage case** (§12.7.2.1a). The LRC tolerates at most
     11.7% of fragments by the Singleton-like bound, and the worked scenario is a 10% loss. Worth confirming
     that maximal recoverability covers the realistic patterns, since the margin is thin.
-33. **What FE-layer retention means** (§8.4.1c). DN, SN and EN retention is a deferred decrement; FE
+33. **Why the price undercuts B2 threefold** (§12.7.2.2). Either disk density and cost discipline are a
+    real advantage, or the efficiency chain is optimistic. B2 runs a lower-overhead code, so it is not the
+    coding. Worth resolving before the number is quoted to anyone.
+34. **What FE-layer retention means** (§8.4.1c). DN, SN and EN retention is a deferred decrement; FE
     holds no durable state, so its window presumably means declining to issue the hard delete until its
     timer expires. Worth stating, since a layer that gets this wrong silently leaves the protection.
-34. **Retention window versus the repair reserve** (§8.4.3). Window × churn consumes the 1 − 1/D
+35. **Retention window versus the repair reserve** (§8.4.3). Window × churn consumes the 1 − 1/D
     headroom that durability depends on, so windows must be admission-controlled rather than freely
     chosen. A 30-day window at 100%/yr churn already exceeds a 5% reserve.
-35. **Measure the space-efficiency chain** (§12.7). Every factor is a guess and they multiply: the
+36. **Measure the space-efficiency chain** (§12.7). Every factor is a guess and they multiply: the
     difference between 58% and 55% billable is a 5% swing in revenue per disk bought. The
     undeletable-garbage term is the one most under the design's control, via compaction policy.
-36. **Expiry-aware placement** (§8.5.1). Grouping objects by declared expiry so extents die whole is
+37. **Expiry-aware placement** (§8.5.1). Grouping objects by declared expiry so extents die whole is
     the strongest lever on the efficiency chain, worth ~30× the entire extent-size range. Needs a
     placement policy, an API field, and a decision on how hard to discourage "never".
-37. **A lifetime dimension in the price list** (§8.5.3). Short-lived data skips erasure coding and so
+38. **A lifetime dimension in the price list** (§8.5.3). Short-lived data skips erasure coding and so
     costs 2.7× more per byte-day. Correct, but it means price cannot be one figure per byte.
-38. **A guaranteed repair-bandwidth floor** (§4.3.4.1). Repair below the failure arrival rate makes
+39. **A guaranteed repair-bandwidth floor** (§4.3.4.1). Repair below the failure arrival rate makes
     loss certain rather than unlikely. The floor is ~7.6 GB/s per 100,000 disks — cheap, but it has to
     be reserved rather than left to compete with foreground traffic.
-39. **Treat utilization as a durability limit** (§4.3.4). A full cluster cannot repair, so 1 − 1/D is
+40. **Treat utilization as a durability limit** (§4.3.4). A full cluster cannot repair, so 1 − 1/D is
     not a capacity guideline. Needs enforcement, and an answer for what happens when a tenant's growth
     would cross it.
-40. **Defence against logical corruption** (§4.3.4). Erasure coding faithfully preserves corrupted
+41. **Defence against logical corruption** (§4.3.4). Erasure coding faithfully preserves corrupted
     data. Scrubbing catches bit rot, not a bug that wrote the wrong bytes correctly.
-41. **What disaster size to design for** (§4.3.3). Overhead = 1/(1−s) makes this the single largest
+42. **What disaster size to design for** (§4.3.3). Overhead = 1/(1−s) makes this the single largest
     cost-versus-reliability decision in the system: 33% survivability at 1.50×, 50% at 2.00×. It
     should be settled before the erasure code is chosen.
-42. **Do real disasters respect the domain hierarchy?** (§4.3.3) The guarantee depends entirely on it.
+43. **Do real disasters respect the domain hierarchy?** (§4.3.3) The guarantee depends entirely on it.
     A cross-cutting failure mode returns loss to the binomial regime, where a 5% event loses hundreds
     of terabytes outright instead of ~3 extents.
-43. **Measure the disaster frequency exponent α** (§4.3.3.1). Every expected-loss figure depends on it,
+44. **Measure the disaster frequency exponent α** (§4.3.3.1). Every expected-loss figure depends on it,
     5×- and 10×-per-halving differ by ~6×, and for α > m the integral diverges and needs a floor.
-44. **A second cluster** (§4.3.3.1). Expected loss is of order the whole-cluster disaster rate for every
+45. **A second cluster** (§4.3.3.1). Expected loss is of order the whole-cluster disaster rate for every
     in-cluster code, so geo-replication is the only answer to the top of the distribution — and nothing
     in this document addresses it.
-45. **Is durability a per-customer billable tier?** (§4.3.3.3) Write-off fractions span 1/1000 to
+46. **Is durability a per-customer billable tier?** (§4.3.3.3) Write-off fractions span 1/1000 to
     999/1000, a 250× spread in effective loss rate on identical storage. Overhead = 1/(1−s) makes the
     knob natural and §12 bills it for free, but nothing offers it.
-46. **Do local codes actually lose on disasters, or only in the worst case?** (§4.3.2.1) Guaranteed
+47. **Do local codes actually lose on disasters, or only in the worst case?** (§4.3.2.1) Guaranteed
     tolerance is 7.5% against MDS's 33%, but maximal recoverability plus a good domain-to-local-group
     mapping may recover most real patterns — worth analysing before writing off the construction or the
     patent question.
-47. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
+48. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
     and domain constraints interact: a markedly emptier domain attracts weighted picks and
     then rejects them, which is worst right after adding capacity. Bounded, but worth
     measuring.
-48. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
+49. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
     safe, but who chooses the primary, and how a new one is appointed when it fails, is
     undesigned.
-49. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
+50. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
     must be chosen together; a Raft log index is a natural per-ring counter, but what an
     SCN is scoped to is unsettled while objects span many rings.
-50. **Expected object count** (§14.5). DN cost scales with object count rather than
+51. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-51. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
+52. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-52. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+53. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-53. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+54. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-54. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+55. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-55. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+56. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-56. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+57. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-57. **Background loop scheduling** (§13.3): prioritisation and rate limiting
+58. **Background loop scheduling** (§13.3): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-58. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+59. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-59. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+60. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-60. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+61. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-61. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+62. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-62. **Remaining directory semantics** (§5.1): listing huge directories,
+63. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-63. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+64. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-64. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+65. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-65. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
+66. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
     both sides: coarse granules compress better and bill less, fine granules cut read
     amplification, which is a 50× throughput factor for point reads.
-66. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+67. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-67. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+68. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-68. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+69. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-69. **Billing policy** (§12.8): garbage, transient double footprint, shared-extent
+70. **Billing policy** (§12.8): garbage, transient double footprint, shared-extent
     attribution, instantaneous-usage contract, reporting granularity. Slack itself is
     settled at 2× (§4.7).
-70. **Key custody within KS** (§7.3): how the daily master keys are themselves
+71. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-71. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+72. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-72. **Compaction policy** (§10) — now partly a pricing decision.
-73. **Membership and leader election** (§13).
-74. `Nul` and `\0` framing were both listed originally and are folded together
+73. **Compaction policy** (§10) — now partly a pricing decision.
+74. **Membership and leader election** (§13).
+75. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-75. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+76. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
