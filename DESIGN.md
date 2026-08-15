@@ -415,12 +415,67 @@ that cannot reach a quorum does not block: the extent is sealed short and a new 
 (§13), which §6 already makes cheap by allowing extents to seal at any size.
 
 Sealing and EC are also a **billing event**: 4 replicas of a 32 MB body bills as
-128 MB; a 6+3 encoding of the same body bills as ~48 MB (§12).
+128 MB; an 8+4 encoding of the same body bills as ~48 MB (§12).
 
 ⚠️ EC changes the read unit: what was one sequential read against a replica
 becomes *k* fragment reads across *k* ENs, partly defeating the device tuning of
 §9.3. Either align the fragment stripe with the index granularity, or retain one
 full replica alongside the fragments for locality.
+
+#### 4.3.2 Erasure-code parameters, and a patent problem
+
+The §4.3.1 target applies to sealed data, which is erasure-coded rather than replicated, so the
+code's parameters need the same arithmetic. A *k*+*m* code tolerates *m* losses and is lost at
+*m*+1, so the loss probability is a binomial tail rather than a simple power — and **durability
+depends on *m* alone, not on the storage ratio.**
+
+That much is easy. The hard part is that plain Reed-Solomon **forces a choice between storage
+overhead and repair traffic**, because reconstructing one lost fragment requires reading *k*:
+
+| Code | Overhead | Repair amplification | Loss per window |
+|---|---|---|---|
+| 6+3 | 1.50× | 6× | 1.26 × 10^-14 — **fails 10^-14** |
+| 8+4 | 1.50× | 8× | 7.9 × 10^-18 |
+| 12+4 | 1.33× | 12× | 4.4 × 10^-17 |
+| 20+4 | 1.20× | 20× | 4.2 × 10^-16 |
+
+Note 6+3 fails the target, and earlier drafts of this document used it as the example. Beyond
+that, every row buys cheaper storage with dearer repair. **Repair traffic is a throughput cost,
+and §1.4 makes throughput the priority**, so this is not a free trade: across 2 EB at 1.5% AFR,
+~30 PB is lost per year, and repair reads 240 PB/yr at 8+4 or 600 PB/yr at 20+4 — 7.6 GB/s
+against 19 GB/s of continuous background traffic.
+
+#### 4.3.2.1 Local codes dissolve the trade, and are encumbered
+
+Codes with **locality** break the coupling: some parities cover only a small group of *r* data
+symbols, so a single failure — the overwhelmingly common case — is repaired by reading *r*
+fragments rather than *k*. Additional *h* "heavy" parities over all symbols preserve tolerance
+to multiple simultaneous losses. **Repair amplification becomes *r*, independent of *k***, so
+large *k* (cheap storage) and small *r* (cheap repair) stop being in tension.
+
+*Maximally recoverable* codes are the strongest form: every erasure pattern that is
+information-theoretically recoverable actually is. See ["Explicit Maximally Recoverable Codes
+with Locality"](https://arxiv.org/html/1307.4150v2) — Gopalan, Huang, Jenkins and Yekhanin,
+2013. Its Example 16 gives a [80,60,7] maximally recoverable local (60,4,4) code:
+
+| | Overhead | Repair amplification | Loss per window | Fleet repair traffic |
+|---|---|---|---|---|
+| RS 8+4 | 1.50× | 8× | 7.9 × 10^-18 | 7.6 GB/s |
+| **MR (60,4,4)** | **1.33×** | **4×** | ≤3.2 × 10^-19 | **3.8 GB/s** |
+
+Better on every axis at once — cheaper storage, half the repair traffic, better durability.
+
+⚠️ **It is patented, and the patent does not expire until 2034.** Bob is a co-inventor, which
+makes this easier to walk into rather than harder: the technique is familiar, the paper is
+public, and neither of those makes it usable. Until 2034 the options are to license it, to find
+an unencumbered construction, or to accept plain Reed-Solomon and pay the repair traffic. This
+is a question for counsel, not for this document — but it must be settled before any code is
+chosen, because the choice is baked into every sealed extent and the §4.6.3 timestamp deadline
+means those live a very long time.
+
+**Working assumption: Reed-Solomon with *m* = 4**, and *k* chosen against the repair-traffic
+budget rather than the storage ratio alone. 8+4 is used as the example because it matches the
+1.50× overhead assumed elsewhere in this document, so no downstream figure changes.
 
 ### 4.4 Stored as lists, served as B-trees
 
@@ -2337,7 +2392,7 @@ underbilled; set it for incompressible data and compressible ones leave for a co
 Physical billing is forced, not preferred.
 
 The same test catches something else. A byte of extent body costs 4× as much held as four
-replicas as it does at 1.5× under a 6+3 erasure code — a **2.67× ratio, which exceeds the
+replicas as it does at 1.5× under an 8+4 erasure code — a **2.67× ratio, which exceeds the
 2× slack.** So billing cannot apply a flat per-byte rate across durability states: whether
 an extent is still replicated or already encoded has to be metered per extent, which is why
 §12.5 treats the seal-to-encode latency as a real quantity rather than an implementation
@@ -2413,7 +2468,7 @@ on one workload is fatal, because that is the one users will find — and §12.3
 - **Compression works for the customer, not just the fleet.** Ratio divides the bill, which
   is why compression must precede encryption (§7) and why shrinking compression blocks for
   index density is not a free trade (§7.1).
-- **Sealing and EC cut the bill ~2.7×** (4 replicas → 6+3), so the latency between sealing
+- **Sealing and EC cut the bill ~2.7×** (4 replicas → 8+4), so the latency between sealing
   and successful encoding is money. That needs an explicit target and a decision about who
   absorbs the cost of the gap.
 - **Compaction reclaims billable bytes**, so the compaction schedule sets part of the bill —
@@ -2962,7 +3017,7 @@ expects those in enormous numbers — so the DN tier can exceed the EN tier in
 In *physical* bytes it is far less alarming, because self-hosting (§5.5) runs that
 metadata through the same pipeline as everything else. Object metadata is unusually
 compressible — sibling names share prefixes, timestamps cluster, flavor and framing
-repeat across every object in a directory — so at a conservative 4× and 6+3 erasure
+repeat across every object in a directory — so at a conservative 4× and 8+4 erasure
 coding, 300 logical bytes becomes ~75 physical and ~113 billed. Against a bare
 4-replica copy at 1,200 bytes, **self-hosting makes the metadata tier roughly an
 order of magnitude cheaper than storing it uncompressed and replicated.**
