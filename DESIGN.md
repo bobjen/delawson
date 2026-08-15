@@ -810,19 +810,15 @@ offset, 3 bytes addresses 2^24 slots, which at 32 MB per extent covers a 512 TiB
 — bringing the entry to **56 B**. Worth confirming against the EN sizing that §5.10.1
 already ties to fan-out.
 
-What it is worth, at *P*=64:
-
-| Entry | Extents/stream | Stream ceiling | Streams per maximal object | Stream list |
-|---|---|---|---|---|
-| 100 B (original guess) | 1.3 × 10^7 | 0.40 PiB | 4.1 × 10^6 | 412 MB |
-| 68 B (global 32-bit ids) | 2.0 × 10^7 | 0.58 PiB | 2.8 × 10^6 | 191 MB |
-| **60 B (2-byte local index)** | 2.2 × 10^7 | 0.66 PiB | 2.5 × 10^6 | **148 MB** |
-| 56 B (also a 3-byte slot) | 2.4 × 10^7 | 0.71 PiB | 2.3 × 10^6 | 129 MB |
-
 Two compounding effects, because §14.1 shows the stream list grows as the *square*
-of entry size: 8 bytes saved per entry is 10 GB of RAM freed on every SN machine,
-*and* 22% off the largest metadata structure in the system. Larger streams also mean
-fewer of them, which shortens every stream-list descent.
+of entry size: the 8 bytes saved by local indices frees ~10 GB of RAM on every SN
+machine, *and* takes ~22% off the largest metadata structure in the system. Larger
+streams also mean fewer of them, which shortens every stream-list descent.
+
+The itemized total is not a new baseline. **§14.1 keeps 100 B as the budget**,
+because flags, timestamps and fields not yet identified will consume the headroom;
+what the local-index encoding buys is room to add them, not a smaller number to
+quote.
 
 ⚠️ **The cost is a naming-lifecycle problem.** A local index is only meaningful
 relative to a table, so:
@@ -1351,37 +1347,34 @@ degenerate *P*=1 case.
 Compression relaxes this: at a 4× ratio the same extent count spans 4× the logical
 bytes.
 
-**Sensitivity to the entry size.** The ceiling scales inversely with it, so measuring
-it moves the answer but not the conclusion. Shown at *P*=64, with 60 B as the
-current estimate (§5.10.4):
+**Sensitivity to the entry size.** The ceiling scales inversely with it. **100 B
+stays the planning figure** — not because that is what the fields itemized so far
+add up to (§5.10.4 reaches about 60 B), but because flags, timestamps, and fields
+nobody has thought of yet will accumulate. Budget 100 B and spend it deliberately;
+do not re-baseline the sizing on each increment.
+
+Shown at *P*=64:
 
 | Entry size | Extents/stream | Stream ceiling | Streams per maximal object | Stream list |
 |---|---|---|---|---|
-| 56 B | 2.4 × 10^7 | ~0.71 PiB | ~2.3 × 10^6 | ~129 MB |
-| **60 B** (current estimate) | 2.2 × 10^7 | ~0.66 PiB | ~2.5 × 10^6 | **~148 MB** |
-| 100 B (original guess) | 1.3 × 10^7 | ~0.40 PiB | ~4.1 × 10^6 | ~412 MB |
-| 200 B (if a long `first_key` is inlined) | 6.7 × 10^6 | ~0.20 PiB | ~8.2 × 10^6 | ~1.6 GB |
+| 60 B — itemized so far | 2.2 × 10^7 | ~0.66 PiB | ~2.5 × 10^6 | ~148 MB |
+| **100 B — the budget** | 1.3 × 10^7 | ~0.40 PiB | ~4.1 × 10^6 | **~412 MB** |
+| 200 B — if a long `first_key` is inlined | 6.7 × 10^6 | ~0.20 PiB | ~8.2 × 10^6 | ~1.6 GB |
 
 The stream list grows as the *square* of the entry size — once from more streams,
-once from fatter entries — so this is a number worth defending, not merely
-measuring. The 200 B row is the warning: inlining a generous keyed `first_key`
-would cost an order of magnitude on the largest metadata structure in the system,
-which is the argument for a bounded key prefix instead.
+once from fatter entries — so the budget is worth defending. The 200 B row is the
+warning: inlining a generous keyed `first_key` would cost an order of magnitude on
+the largest metadata structure in the system, which is the argument for a bounded
+key prefix instead.
 
-**The 100 B guess was pessimistic.** §5.10.4 itemizes an unkeyed entry at **60 B**,
-including the day index the key hierarchy needs (§7.3.3), and possibly 56 B. Two
-corrections got it there: instance references are 8 B rather than the 16 B first
-assumed, and then only 6 B once bounded fan-out lets an EN be named by a 2-byte
-neighborhood-local index instead of its global 32-bit id.
+**There is headroom in the budget, and it will get spent.** §5.10.4 itemizes the
+fields identified so far at ~60 B, leaving ~40 B before the budget binds. Expect
+flags, timestamps, checksums and similar to consume it as the design fills in.
 
-At 60 B rather than 100 B, streams reach 0.66 PiB instead of 0.40 PiB and the stream
-list falls from 412 MB to 148 MB.
-
-⚠️ A keyed extent additionally needs a variable-length, user-supplied `first_key`.
-That is now the only field in the entry whose size is unknown, and there is ~40 B of
-headroom under the original 100 B budget for it — enough for a short key, not for an
-arbitrary one. Either the entry grows and the stream ceiling falls proportionally, or
-the list stores a bounded key prefix and disambiguates by reading the extent.
+⚠️ A keyed extent additionally needs a variable-length, user-supplied `first_key`,
+competing for that same headroom — enough for a short key, not an arbitrary one.
+Either the entry grows and the stream ceiling falls proportionally, or the list
+stores a bounded key prefix and disambiguates by reading the extent.
 
 ### 14.2 DN: unbounded in object count, disk-backed
 
