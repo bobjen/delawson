@@ -1892,7 +1892,8 @@ anything else:
 
 **Bounding a cluster geographically and by network bandwidth is therefore not a convenience, it
 is forced.** Buy more EN disk bandwidth than the fabric can deliver to compute and the disks sit
-idle.
+idle. The corollary is that the fabric must be flat within that bound — §5.12.3 costs it out and
+finds it affordable, which is what lets topology be ignored thereafter.
 
 The same balance appears inside one machine, and it is a **third independent bound on disks per
 EN**: 150 disks at 200 MB/s is 30 GB/s, while 2 × 100 GbE is 25 GB/s. Disks outrun the NIC by
@@ -1939,14 +1940,43 @@ and reductions — and DeLawson is not in the loop.
 but a way to know, and to report, whether a job's remainder will fit. That is a scheduling input
 nobody has designed.
 
-**One kind of locality this reasoning does not cover: co-partitioning for joins.** Cosmos built
-placement affinity for exactly that — affinitized extents mapped to the same racks, so a vertex
-"joining two affinitized streams could join them by their affinitized keys without reading
-cross-rack data", kept in sync by an Affinity Service (§1.4.5.2). That is about avoiding a
-*shuffle*, not about re-reading a working set, so the RAM-versus-network argument above says
-nothing about it. DeLawson gets directory-level affinity free from §5.11.1's default locality, but
-has no notion of two objects being co-partitioned by key. A real gap — and Cosmos found it worth a
-whole service.
+#### 5.12.3 No affinity, because the network is flat
+
+Cosmos built placement affinity for joins — affinitized extents mapped to the same racks, so a
+vertex "joining two affinitized streams could join them by their affinitized keys without reading
+cross-rack data", kept in sync by an Affinity Service (§1.4.5.2). DeLawson has nothing equivalent,
+and deliberately so.
+
+**Affinity is a mechanism for avoiding network. If the network is flat, it buys nothing.** Cosmos's
+affinity was worth a service because its topology had a cross-rack penalty worth dodging. DeLawson
+assumes instead that **intra-cluster network is flat** — full bisection, no topology to exploit —
+which makes co-partitioning an optimization with nothing to optimize.
+
+That assumption has to be paid for, and it is affordable because network is not close to the
+dominant cost. For one EN over five years:
+
+| | Cost |
+|---|---|
+| 150 disks at ~$250 each (capital, power, space) | ~$37,500 |
+| Full-bisection 100 GbE per server — NIC, leaf port, spine share, optics | ~$2,500 |
+| Network as a fraction of total EN cost | **~6%** |
+
+So the strategy is: **make the network sufficiently beefy, then ignore it.** Against a strict 5%
+overhead target that is tight — network alone would consume the whole non-disk budget — and at the
+10% §1.2 allows for, it is comfortable. Either way it is single-digit percent of a cluster whose
+cost is disk, which is what makes "ignore the topology" a sound engineering position rather than
+wishful thinking.
+
+⚠️ It is an **assumption, and worth recording as one.** If a cluster ever spans a boundary the
+fabric cannot flatten — separate buildings, an oversubscribed uplink, a metro link — then topology
+becomes visible again and affinity comes back with it. §1.2's geographic bound is what keeps that
+from happening, so the two are the same decision seen from different ends.
+
+This also completes a chain worth reading in one place:
+
+> §1.5 forbids user code where keys are → so all reads cross the network (§5.12.1) → so the
+> network must be flat and beefy → so cluster size is bounded by what can be affordably
+> flattened (§1.2) → and given a flat network, affinity and co-partitioning buy nothing.
 
 ---
 
@@ -3459,9 +3489,10 @@ Roughly in order of how much else depends on them.
 21. **Telling a job whether its remainder fits** (§5.12.2). Phase 2 is a memory workload or a
     storage workload depending on the filtering ratio, differing by the iteration count. That
     looks like the most useful thing DeLawson could tell a scheduler, and nothing computes it.
-22. **Co-partitioning affinity** (§5.12.2). Cosmos built an Affinity Service so joins on
-    affinitized keys read no cross-rack data. DeLawson has directory-level locality and no
-    key-level co-partitioning, and the RAM-versus-network argument does not cover shuffles.
+22. **Does the flat-network assumption hold at the intended scale?** (§5.12.3) Affinity is
+    unnecessary only while intra-cluster network is flat, which costs ~6% of an EN and is tight
+    against a strict 5% overhead target. If a cluster ever spans an unflattenable boundary,
+    topology and affinity both return.
 23. **Is four instances over-engineered?** (§4.3.1) Cosmos observed three sufficing at exabyte
     scale for a decade. Either the 10^-4 gone-not-replaced assumption or the 10^-14 target is
     pessimistic; the fourth copy is cheap because replication is transient, but it is worth
@@ -3555,6 +3586,8 @@ Roughly in order of how much else depends on them.
 - whether summary maintenance can run away under self-hosting — it cannot, by
   the tail-only rule (§4.5, §5.5.2);
 - the hedging percentile — p99.9 or beyond, from the throughput priority (§1.4.1);
+- whether DeLawson needs co-partitioning affinity — it does not, because the intra-cluster
+  network is flat and affinity only avoids network (§5.12.3);
 - whether `count` is exact and cheap — exact and synchronous for unkeyed
   objects, lazy for keyed ones, again by §4.5;
 - the supposed 32 MB-vs-large-streams tension, based on a wrong constraint
