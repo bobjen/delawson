@@ -3887,15 +3887,46 @@ most of that before it reaches the physical bytes anyone is billed for (§12.3).
 offset by nothing, and **two appends share an offset**. The single-writer check then cannot tell a
 retry from a new append, which is precisely what it exists to do.
 
-**Current answer: disallow single-writer zero-length appends with fixed-length rows.** A guess, per
-§0, and narrow enough to be safe.
+**Resolved: the append offset is always determined in a canonical length-stuffed space** (Asserted,
+Bob, 2026-08-15), independent of how the append is actually formatted.
 
-The general form of the invariant is worth stating, since it is what the check actually needs:
+> The offset assigned at accept is computed as if the append were **length-stuffed**, where every
+> row's length field occupies **4 bytes** of logical space. The append's real format is a separate
+> field in the append header.
+
+**This makes no assumption whatever about row content.** A zero-width fixed-length row still consumes
+4 logical bytes, so `FixedLength(0)` stops being degenerate and no framing mode needs forbidding.
+
+The invariant the check actually needs is still worth stating:
 
 > **Every single-writer append must advance the logical offset strictly.**
 
-Which also catches the other case — an append of *zero records*, permitted by §8.1 — since that
-advances the offset by nothing in any framing.
+but the only way left to violate it is an append containing **zero records**, permitted by §8.1. That
+is a property of the individual request rather than of the object's declared framing, so it is
+detectable at accept and cheap to reject — a far narrower restriction than disallowing a framing mode.
+
+**The larger payoff is that logical offsets become invariant under re-framing**, which removes a
+contradiction between §8.2.1 and §8.1.1a-7 that would otherwise have been latent. §8.2.1 permits
+coalescing to change the stored framing; §8.1.1a-7 defines the object offset as the sum of sealed
+extent *logical* lengths. If logical length were measured in the stored framing, re-framing an extent
+during compaction would silently shift every offset above it — destroying exactly the density and
+stability §8.1.1a-6 says three mechanisms depend on. A canonical space decouples the two: **framing is
+a representation, and now so is the physical byte position; only the canonical offset is a name.**
+
+**What it costs, and what it does not.**
+
+- **4 bytes per row of canonical space**, whatever the stored framing. At 100-byte records that is 4%
+  inflation of the logical space; at 8-byte records, 50%.
+- **Nothing in billing**, because §12.3 bills physical bytes and the canonical space never reaches a
+  disk.
+- **Something in sealing**: §6's 4 GB *logical* cap is consumed in canonical bytes, so an extent of
+  very small records seals at fewer physical bytes than a naive reading suggests. Worth stating
+  explicitly, since the two limits of §6 are meant to bracket a known range.
+- **No new work on the append path.** The primary must parse the append per its declared framing to
+  compute canonical lengths — but it already has to parse it to maintain the cumulative record counts
+  of §4, and §8.2.1 shows converting a logical length between framings is O(1) given the record count.
+- **A 4-byte length field caps a row at 4 GB**, which coincides with §6's logical extent cap. Those two
+  agreeing is a consistency check, not a coincidence to be relied on.
 
 **An earlier draft suggested using the record number instead, and that does not work.** Appends may contain
 **record fragments** — with a single writer it is reasonable for a record to span appends — so an append
@@ -4565,6 +4596,27 @@ everything eventually. That is easy to get right and easy to forget.
 
 ---
 
+#### 9.7.3 Interval summaries, for when the extent list is not monotone
+
+§9.7.1's binary search depends on durability seconds increasing down the extent list. §8.6.2 shows that any form of
+parallel ingest breaks that monotonicity — several unsealed tails interleave in time, and so do concurrently
+written partitions that are later concatenated. So the search has to be replaced, not merely tuned.
+
+**Keep `(min durable second, max durable second)` per extent, per stream, and per object**, and answer a range
+query by pruning on interval overlap instead of by binary search.
+
+**The reason this is legal under §4.5 is better than "it is cheap".** An interval **only ever widens**, so a stale
+or conservative value costs a wasted read and never a wrong answer. Fail-safe summaries can be maintained lazily by
+§13.3's loops with no correctness argument about ordering — which is exactly the property §4.5's rule exists to
+select for.
+
+It is also not novel: this is what Parquet column statistics and Iceberg manifest pruning do. And it **degrades
+gracefully in the right direction** — if writes happen to be sequential, the intervals are disjoint and pruning is
+exactly as good as the binary search it replaced.
+
+Per-object intervals are what make §8.6.3's directory-level time-range query cheap, since fan-out then only reaches
+objects whose interval overlaps the requested range.
+
 ## 10. Compaction
 
 Compaction reads a base plus its log and writes a fresh base with updates
@@ -4589,6 +4641,54 @@ atomically swaps the pair in the SN's extent list.
 ⚠️ Compaction policy — triggers, write-amplification budget, split throttling —
 is not designed. Billing makes it sharper than usual: the schedule directly
 determines a customer's bill.
+
+### 10.1 Rewrites must retain their inputs for the hint window
+
+§8.1.1a-10's middle tier — `(extent identity, row number in extent)` — is invalidated by exactly one operation, and
+compaction is it:
+
+| Operation | Invalidates a hint? |
+|---|---|
+| Replication/repair (§13.1's fast loop) | No — new *instances*, same extent identity |
+| EC on seal | No — physical layout changes, logical row number does not |
+| Tail truncation above the durable watermark | No — pre-seal |
+| **Coalescing / base-plus-log compaction** | **Yes** |
+| Hard delete | Yes, and correctly so — the record is gone |
+
+The goal is exact ordering, for a bounded window after write, without a key lookup — the SCN-granularity tier that
+§4.6.3 contrasts with second-granularity timestamps. Current guess: **10 minutes** (Guess).
+
+**Three things make that nearly free.**
+
+**Test the seal second, not the creation second.** An extent open for an hour has its last write at seal time, so the
+predicate is `now - seal_second >= 600`. No new field: the seal second is the maximum of the per-extent durability
+timestamps §9.7 already stores, and unsealed extents cannot be compaction inputs anyway.
+
+**Constrain reclamation, not compaction frequency.** A flat rule would forbid a hot keyed object from compacting its
+log every 30 seconds for read amplification. But compaction may write its new base whenever it likes provided the
+*inputs stay resolvable* for the window after their seal. So the requirement is a **minimum retention on superseded
+extents** — the deferred-decrement shape §8.4.1 already uses for soft delete, with a different timer — and
+compaction frequency stays purely a read-amplification decision.
+
+**The cost is disk, not SN RAM.** Bounded by the window times the compaction output rate, held on the tier that
+§12.2 prices at 1/5000th of RAM.
+
+**What the window does not promise.** It promises *not rewritten*, not *not deleted*. A hint into hard-deleted data
+must fail, and with §8.4's soft-delete opt-out it can fail in well under 10 minutes. That is correct behaviour.
+
+**And it does not deliver cluster-wide SCNs.** An SCN is a total order; `(extent, row)` is an address. Within one
+stream it *is* a total order — extent position in the stream, then row within extent — but across the N frontier
+streams of §8.6.6 there is no order at all. So the honest guarantee is two-tier:
+
+- **per-stream, exact ordering, for the window** — via `(extent, row)`, no key lookup, no ambiguity;
+- **globally, second granularity, forever** — via durability timestamps (§9.7).
+
+That is what a Kafka partition offers, so it is defensible to advertise, but it is not "SCNs for 10 minutes" and
+must not be described that way.
+
+⚠️ 10 minutes is a guess, and the real number should be derived from what it budgets: **how far a tail-following
+consumer may lag behind its writer before it must fall back to a key lookup.** Framed as a follower-lag budget it
+becomes measurable; framed as a round number it stays a guess forever.
 
 ---
 
@@ -5069,7 +5169,60 @@ alone — $46/TB for these HDDs against roughly $60/TB for QLC or $120/TB for en
 would land near $2.50–$7.40 or $4.90–$14.80 per TB-month, before accounting for the very different power,
 density and endurance profiles. **HDD is the default because §1.4 wants throughput per dollar, not latency.**
 
-### 12.8 Open policy questions
+### 12.8 Billing runs offline, over snapshots
+
+**Billing is a job over the snapshotted metadata of §13.5. It does not read DN, SN, or EN metadata
+directly** (Asserted, Bob, 2026-08-15).
+
+The decisive reason is **reproducibility**: a disputed invoice must recompute to the same number, which
+requires an immutable, retained input. Walking live metadata gives a bill with no well-defined instant,
+non-reproducible by construction. It would also put a full-fleet aggregation over ~6x10^10 extents on the
+serving path once a day.
+
+#### 12.8.1 Retain outputs for years, inputs for weeks
+
+Billing retention is set by the dispute and audit window, which is far longer than §13.5's few weeks — but
+weekly samples cannot reproduce a *daily* charge, and extending daily snapshot retention to cover an audit
+period would be expensive. The bill and its per-object intermediate aggregates are orders of magnitude
+smaller than the metadata they came from, so: **keep computed charges and intermediates for years, raw
+snapshots for weeks**, and answer old disputes from the retained aggregates rather than by recomputation.
+
+That also decides what the intermediates must contain — otherwise discovered during the first dispute.
+
+#### 12.8.2 Daily sampling is not integration, and soft delete is what closes the gap
+
+Metering storage from a daily snapshot would make an object created and deleted between two snapshots
+**free**, and timed create/delete cycles are then unbounded abuse — exactly the failure mode §12.1 exists
+to prevent.
+
+**§8.4.1b's three-day soft-delete window is longer than the one-day snapshot interval**, so anything that
+lived and died between snapshots is still present as soft-deleted in the next one, carrying a creation
+second (§4.6.3) and a deletion timestamp. Byte-seconds are therefore **exactly computable, not sampled**.
+Soft delete, built for disaster heroics, is what makes daily billing exact.
+
+**Except for the opt-out.** §8.4's per-object opt-out hard-deletes immediately, and such an object can slip
+entirely between snapshots. So **opting out of soft delete must not opt out of a minimal billing
+tombstone** — id, physical size, creation second, deletion second, durability class, media class — retained
+until the next snapshot. A few dozen bytes. Without it, the opt-out added for users with one-day data is
+also a free-storage exploit.
+
+#### 12.8.3 Billing is offline and exact; quota is online and approximate
+
+These will be conflated. A spend cap or capacity quota cannot run off a snapshot, since a tenant can blow
+through it within a day, so enforcement needs a live, cheap, deliberately inexact mechanism — documented as
+**not** the billing path. Both are needed and neither substitutes for the other.
+
+#### 12.8.4 The job runs on Compute, and DN inlines tiny objects
+
+⚠️ That combination is a §1.5 problem. §11 inlines small object bodies in DN metadata, so a DN metadata
+snapshot puts **plaintext user data** into a file that Compute jobs read — and Compute is where user code
+runs. Billing needs only the *length* of those bodies.
+
+So the snapshot must either exclude inline bodies or keep them encrypted under a key Compute does not hold.
+Worth catching before implementation, because "snapshot the DN metadata" is the obvious approach and it
+quietly moves user data across the one boundary the design says must never be crossed.
+
+### 12.9 Open policy questions
 
 1. Do customers pay for **uncompacted garbage** they created by overwriting, when DeLawson
    chooses the compaction schedule?
@@ -5392,6 +5545,71 @@ almost nothing. Undesigned; this is where it belongs.
 The liveness loop has no such problem: one message per EN per minute across the fan-out
 is a few hundred messages a second, and each is a small per-disk status vector.
 
+#### 13.1.10 Two verification tiers, riding the two sync loops
+
+§5.6.9 makes the steady-state cost of placement *verification* rather than search. That verification has to fit
+inside the sync loops, and whether it does is entirely a question of cadence.
+
+**A full pass is expensive.** Per SN at 2^31 extents there are ~36 M EC groups, each needing ~60 instance lookups;
+at 60 x 100 B = 6 KB per group that is ~215 GB touched per pass, or ~20 s at 10 GB/s sequential — and 200 s+ if
+the accesses are scattered rather than group-ordered. **Derived.**
+
+| Cadence | Full-pass cost |
+|---|---|
+| 1 minute | 33-330% of a core — infeasible |
+| **1 hour** | **0.5-5% of a core — free** |
+
+So the two tiers map onto the two loops of §13.1.7, and neither needs a new mechanism:
+
+| Loop | Cadence | Scope of verification |
+|---|---|---|
+| **SN/EN liveness** (per-disk status vector) | ~1 minute | only EC groups with a member on a disk whose state changed |
+| **SN/EN instance sync** (per-instance enumeration) | ~1 hour | **everything, unconditionally** |
+
+**The fast loop's job is unavailable disks.** That is what the frequent loop is really for (Asserted, Bob,
+2026-08-15); it catches domain-topology changes — a disk rehomed to another rack, two racks merged into one power
+domain, an EN reassigned — only incidentally, and those would not justify a one-minute cadence on their own. But
+they are real, and they are why a placement that nothing has touched can develop a collision: they are the reason
+the slow tier must be unconditional rather than incremental.
+
+**The slow tier is nearly free because it rides a walk that is happening anyway.** The hourly per-instance sync
+already enumerates every instance, so verification adds table operations to an existing traversal, and because that
+sync covers every EN once per hour, "verify everything" falls out of dirty-marking as each EN reports in — no
+separate scan, and the work spreads across the hour instead of arriving as a burst.
+
+**This gives SN-local EC grouping (§4.3.2.3) a second justification.** It was already about keeping §13.4's
+priority sort local; it also keeps the verifier local, since a group's members are all extents the same SN owns. If
+groups spanned SNs, neither loop could verify a group from one partner's report.
+
+##### 13.1.10.1 Finding the affected extents when the EN cannot tell you
+
+The fast tier needs "which extents have an instance on the disk that just changed", and there are three candidate
+answers. Two of them are wrong.
+
+**A reverse index on SN is too expensive.** At ~625,000 extents per disk (20 TB / 32 MB) and ~3,400 disks per SN,
+an `(EN, disk)` to extent index is ~8.5 GB of SN RAM — the tier §12.2 prices at 5,000x disk, competing with the
+extent metadata that already owns 2/3 of it (§14.1).
+
+**Asking the EN does not work in the case that matters.** The EN does hold the disk-to-extent mapping on its own
+cheap storage, and for a single failed disk on a *live* EN it can simply report the list. But **if the disk is down
+because the EN is dead, the EN cannot respond** — and an EN death takes every one of its disks down at once, which
+is the largest repair event there is. An answer that only works while the reporter is healthy is not an answer.
+
+**So: ask the EN when it is alive, and scan when it is not.** SN's extent metadata names the EN in every instance
+reference (§5.3.1), so the work list is recoverable by enumeration — and enumeration is a pass SN already knows how
+to do, because it is the same walk as the hourly full verification above. **An unreachable EN triggers an
+out-of-band run of that pass.**
+
+- Cost: the same 20-200 s as a full pass.
+- Against a repair budget measured in hours (§4.3.1.1), that is comfortable.
+- **Bucket by EN, so one pass serves every currently-dead EN.** A failed rollout kills 5% of the fleet at once
+  (§13.2); it should cost one scan, not one scan per EN.
+- No reverse index is needed at all — not in RAM, not on disk.
+
+**This puts a real latency requirement on the full pass**, and not merely an amortized one: it is also the
+critical path for the largest repair event. 200 s is fine; 2,000 s would not be. That is the number §5.6.10's
+measurement should report first.
+
 ### 13.2 Recovering from a failed rollout
 
 A worked case, because it turns out to be the dominant data-loss mode rather than a footnote.
@@ -5501,6 +5719,133 @@ compete with foreground traffic for exactly the resources — EN disk bandwidth
 and SN memory — that the foreground path needs.
 
 ---
+
+### 13.4 Repair scheduling: sort by amortized cost, not by risk
+
+§4.3.3.2d shows repair cost per rebuilt cell spikes at `g = 1` — one global repair needed — and falls monotonically
+above it. That shapes the scheduler.
+
+**Always fix a whole EC group.** The 45 reads are being paid anyway, so write as many rebuilt instances as
+possible from them (Asserted, Bob, 2026-08-15). This is why more at-risk repairs have *lower* amortized cost: 6.4
+reads per cell at m = 7 against 5.0 for a purely local repair, a 1.29x penalty for repairing the group that is one
+loss from unrecoverable.
+
+**The priority order inverts the obvious one:**
+
+1. groups needing **0 global repairs** — local, cheap, high volume;
+2. groups needing **2 or more** global repairs, **descending** by count — both more at risk and cheaper per cell;
+3. groups needing **exactly 1** global repair — last.
+
+**And the deferred class is drained by evolution rather than by scheduling.** Ignored `g = 1` groups accumulate
+further losses and thereby become higher-priority *and cheaper*, while the `g = 0` groups get fixed quickly and so
+never evolve into `g = 1` in the first place. The policy shapes the population: it drains the cheap end and lets
+the middle drift into the cheap-per-cell high end, so the 22.5-reads-per-cell peak is rarely paid.
+
+**It is safe by construction, which is not obvious.** The single deprioritized class, `g = 1`, is also the *least*
+at-risk of the classes needing global work — it needs six more losses to reach `d = 8`. The only way it worsens is
+to escalate to `g >= 2`, which places it in the descending-priority region. Escalation *is* the promotion
+mechanism, so the deferred population cannot drift into a blind spot and no deadline override is required.
+
+**Efficiency improves with disaster severity**, which is backwards from most schedulers and worth stating so nobody
+"fixes" it. Severity is what converts `g = 1` groups into `g = 4` groups, and that conversion is the source of the
+amortization. The bad case is a slow trickle, where `g = 1` groups sit at peak cost and never escalate — and in a
+slow trickle there is spare network and nobody cares. It is efficient precisely in the regime where efficiency
+binds.
+
+**Turbo codes have the same pattern** with different constants (§4.3.3.2d), so the policy is not code-specific.
+
+#### 13.4.1 The greedy order and the throughput-optimal order disagree
+
+Strictly by marginal risk reduction per byte read, a `g = 1` group is ~1/f times more likely to lose data than a
+`g = 0` one, so at f = 1% greedy risk-per-byte ranks it ~22x above the local repairs and would fix it **first** —
+the naive ordering. **Derived.** The ordering above wins only through lookahead over the population's evolution.
+
+This is a case where the myopic optimum is the wrong answer, so the reasoning belongs next to the code. A priority
+function read without the dynamics looks like a bug, and will be "optimized" back to the greedy order.
+
+#### 13.4.2 The fast loop needs no re-replication timeout
+
+The obvious implementation carries a constant — wait N minutes before re-replicating a down disk — to avoid
+churning on reboots, which take every disk on an EN down at once. It is unnecessary. **Unavailability duration is
+just another input to the same priority function**: one missing instance with the disk down two minutes ranks below
+one missing with the disk down two hours.
+
+Then transient failures resolve by **never reaching the front of the queue**, which is the same drain-by-evolution
+dynamic as above, running in the opposite direction. Three dividends:
+
+- one continuously re-sorted queue instead of a fast loop with a timeout plus a disaster scheduler;
+- §13.1's one-minute cadence sets *detection* latency, and the queue sets repair latency;
+- an EN reboot generates no repair work at all, rather than work that must be cancelled — and there is no constant
+  to tune wrong.
+
+### 13.5 Metadata snapshots, and the jobs that run over them
+
+**System metadata is snapshotted daily and kept for a few weeks, with once-a-week samples kept longer** (Asserted,
+Bob, 2026-08-15). Compute jobs run over the snapshots. This is the substrate for several things that must not run
+against live DN/SN/EN state.
+
+#### 13.5.1 EC grouping is computed offline
+
+§4.3.2.3 requires group members to share a media class, an EC scheme, and a physical length; grouping them by
+likely co-deletion additionally requires knowing which objects sit in which directory, **which only DN knows**. So
+a job reads the snapshot, computes groupings, and tells SN which of its extents to group.
+
+**SN must know sealed physical size.** ⚠️ This was previously unclear; it is not optional, for three independent
+reasons. Something must decide and durably record the 32 MB physical seal (§6); §12.3 bills physical bytes, so
+DN's per-object charge aggregates from SN's per-extent sizes; and grouping needs it. 32 MB needs 25 bits, so it is
+4 bytes inside §4.7's ~100 B budget. The primary EN computes it — it compresses before broadcasting (§8.1.4.1) —
+and reports it at seal, which cannot wait for the hourly instance sync because seal is a durable metadata
+transition.
+
+**The grouping key**, in decreasing order of confidence:
+
+| Term | Why |
+|---|---|
+| media class, EC scheme | hard requirements (§7.4.2, §4.3.2.3) |
+| **physical size bin** | the immediately measurable win — drives `sum(max - size)` padding waste toward zero |
+| **declared expiry bucket** | §8.5.1 is an *explicit statement* of when data dies, so a group ages out in a narrow window and reclamation is nearly free |
+| directory | the fallback co-deletion proxy, for data with no declared expiry |
+
+Expiry beats directory because directory is only a proxy for co-deletion and expiry is a declaration of it.
+
+#### 13.5.2 The job is advisory; SN validates
+
+SN checks every proposed group against its own invariants — same media class, same EC scheme, compatible sizes, and
+per-recovery-set independence with slack (§4.3.3.2e) — and rejects violations.
+
+That keeps the trust boundary right under §1.5, since the job runs on Compute, where user code lives and no keys
+are held. And it means a buggy or hostile optimizer costs **efficiency, never durability** — the same principle as
+§5.6.10's refusal to let a transient condition weaken independence permanently.
+
+#### 13.5.3 Snapshots are on the intervention path, not the recovery path
+
+They will look exactly like a backup, and someone will eventually write a recovery procedure that depends on
+yesterday's snapshot. **Normal recovery is §5.5.1's Raft state and three acyclic durability layers.**
+
+What snapshots are genuinely load-bearing for is the human-intervention window: §8.4.1b requires an operator to
+decide "stop hard deleting" within three days, and a daily snapshot is precisely what tells them what existed
+before the bug ran. So they are load-bearing for heroics and must not be load-bearing for correctness. That is a
+constraint worth stating rather than leaving to inference.
+
+#### 13.5.4 Sizing, and why they should be deltas
+
+At 1,000 ENs x 62.5 M extents x 100 B, one full snapshot is ~6.25 TB. Daily for three weeks plus weekly for five
+years is ~1.6 PB against a ~2 EB fleet — **0.08%**: acceptable, but not noise. **Derived.**
+
+Successive snapshots are nearly identical, and DN metadata already lives in keyed DeLawson objects (§5.5), so a
+snapshot is a consistent read of a keyed object and **deltas are the natural form**, cutting that by one to two
+orders of magnitude. Either way it is system overhead that belongs in §12.7's 58% chain explicitly, rather than
+appearing later as unexplained shrinkage.
+
+#### 13.5.5 One artifact, several consumers, so the schema is a contract
+
+Billing (§12.8), EC grouping, capacity forecasting, and the realized-independence audit of §5.6.8 all read the same
+snapshot. So the schema must be **self-describing and versioned**, and old snapshots must stay readable by newer job
+code. Cheap now; expensive in year three.
+
+The independence audit is worth calling out because nothing else can do it: placement is fixed at write time and
+never revisited (§5.6.7), so a cluster that has been quietly placing badly for a year looks identical to a healthy
+one — until the disaster it was supposed to survive (§1.1.1).
 
 ## 14. Does the metadata fit? (sizing)
 
@@ -5991,7 +6336,7 @@ Roughly in order of how much else depends on them.
     physical.
 78. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-79. **Billing policy** (§12.8): garbage, transient double footprint, shared-extent
+79. **Billing policy** (§12.9): garbage, transient double footprint, shared-extent
     attribution, instantaneous-usage contract, reporting granularity. Slack itself is
     settled at 2× (§4.7).
 80. **Key custody within KS** (§7.3): how the daily master keys are themselves
