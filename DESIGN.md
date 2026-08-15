@@ -30,14 +30,17 @@ it was computed or assumed.
 | Instance gone-and-not-yet-replaced | 10^-4 | §4.3.1 — **challenged in §4.3.1.1** |
 | Reliability target | 10^-14 per window | §4.3.1 — given fleet meaning in §4.3.1.1 |
 | Instance unavailable | 10^-3 | §4.3.1 |
-| Placement slack | 4/3 | §5.6.1 — rationale given, the specific ratio is not derived |
+| Placement slack | 4/3 | §5.6.1a — **now derived** from solver cost: `s/(s-1)` = 4 draws |
+| Hint window | 10 minutes | §10.1 — should be a follower-lag budget |
+| SSD seek/scan break-even | 40 KB | §7.1.1 — spans 4 KB-320 KB; the widest uncertainty here |
+| EC group size for `(12+3)x(5+1)` | 90 or 108 cells | §4.3.3.2e — the 4/3 rule needs 108 to give 144 |
 | Extent physical cap | 32 MB | §6 — bracketed from both sides, exact value a guess |
 | Record sizes | 100 / 200 / 300 B | §4.7 |
 
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-85 things *not* decided.
+95 things *not* decided.
 
 **Priorities and framing**
 
@@ -93,6 +96,19 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Erasure coding does not address **software bugs, admin error, or running out of space** | §4.3.4 |
 | Utilization ≤ **1 − 1/D** is a *durability* requirement — a full cluster cannot repair | §4.3.4 |
 | Repair must exceed the failure rate or loss is **certain**, not unlikely | §4.3.4.1 |
+| **EC groups whole extents; it never splits them into fragments** — so reads never touch EC at all | §4.3.2.3 |
+| Group members must be **byte-identical and of equal physical length**; SN owns the group | §4.3.2.3 |
+| 1.333× and 2.333× are **one code with a different data-instance count**; the difference is availability, not durability | §4.3.2.4 |
+| Repair bandwidth is a **network** number, not a device number — so the codec choice is **media-neutral** | §4.3.2.2a |
+| All three candidate codes have **minimum distance 8**; the LRC wins on cell count and maximal recoverability | §4.3.3.2b |
+| Product codes can be counted in **closed form** — no Monte Carlo needed for half the comparison | §4.3.3.2c |
+| Equal-lossiness `f*` is a property of **(code, scheduler)** jointly, so the simulation needs the scheduler in it | §4.3.3.2c |
+| Repair amplification is **not monotonic** in loss; it peaks at the first forced global solve | §4.3.3.2d |
+| Domain requirements are `ceil(4k/3)` **per recovery set, at every nesting level** | §4.3.3.2e |
+| Domain counts say where a code **reaches designed reliability**, not a minimum cluster size | §4.3.3.2e |
+| Repair sorts by **amortized cost**, deprioritizing the single expensive class and letting it evolve | §13.4 |
+| The greedy risk-per-byte order is the **wrong** order; the argument is over the population, not the group | §13.4.1 |
+| The fast loop needs **no re-replication timeout** — duration is a priority input | §13.4.2 |
 
 **Machines**
 
@@ -111,6 +127,17 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **Default locality**: a directory's objects land on one SN | §5.11.1 |
 | The intra-cluster network is **flat**, so there is no affinity mechanism | §5.12.3 |
 | The **SN is not in the write path** | §8.1.3 |
+| **Minimum viable cluster is one machine**; an unenforceable placement rule is simply **not enforced** | §5.6.7 |
+| Placement is decided at write time and **never revisited**, so oscillation causes no churn | §5.6.7 |
+| Achieved durability is therefore a **per-group** property, computed from placements, not from config | §5.6.8 |
+| Independence **self-heals through compaction**, not through a rebalancer | §5.6.8 |
+| Placement is a solver whose answer is **persisted in the instance list order** — steady state is verification | §5.6.9 |
+| Therefore the instance list must **never be sorted or reordered** | §5.6.9 |
+| Slack exists to make the **solve cheap** (`s/(s−1)` draws → 4 at 4/3) and to allow routing around bad domains | §5.6.1a |
+| Raising the slack threshold **turns rules off** in mid-size clusters, so tune upward from the smallest | §5.6.1a |
+| A **solver timeout** must defer and retry, never drop a rule | §5.6.10 |
+| Verification is **incremental at 1 minute, unconditional at 1 hour**, riding the two sync loops | §13.1.10 |
+| A dead EN cannot report its own disks, so the work list comes from a **scan**, bucketed by EN | §13.1.10.1 |
 
 **Pipeline and keys**
 
@@ -120,6 +147,11 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Compression and encryption are **block-granular** at the index granule; the index points at **physical** offsets | §7.1, §9.3 |
 | Keys: **daily master keys in KS only**, daily SN-master keys cached on ENs, extent keys derived. ~1 MB per century | §7.3 |
 | KS is unlocked by **operator secrets plus hardware** — the only step needing people | §7.3.2 |
+| Index granularity is `latency × bandwidth / 2` — **1 MB HDD, 20 KB SSD**, in *physical* bytes | §7.1.1 |
+| Compression improves **HDD** read bandwidth and degrades **NVMe** read bandwidth; it is mandatory regardless | §7.1.2 |
+| **An extent has exactly one media class**, because compression block size is durable and EC needs identical bytes | §7.4.2 |
+| So a fast-read copy is a **tier or cache, never an instance**; migration is compaction with a new target | §7.4.2 |
+| Every device-dependent constant lives in **one media-class table** in config | §7.4.1 |
 
 **Writing, reading, syncing**
 
@@ -142,6 +174,21 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Sync is driven **from above**, one message per pair, with bucket counts negotiated **upward only** | §13.1 |
 | Exactly two sync loops, because **only cross-tier references can drift** | §13.1.7 |
 | Hot small objects need **caching plus a broadcast tree**, not more replicas | §9.6 |
+| Appends stage in per-EN, single-copy **common extents**; four independent ENs are the durability | §8.1.4 |
+| The receipt names the **final** extent; compression happens **upstream of the four-way fan-out** | §8.1.4, §8.1.4.1 |
+| The durable watermark is set at **staging**, not at coalescing | §8.1.4.2 |
+| 3-of-4 durability plus local coalescing gives **interior holes**, exactly detectable from the offset map | §8.1.4.3 |
+| Staging is sized by **endurance, not capacity**; stage only small appends | §8.1.4.4 |
+| Prior art returns an offset only with **one** unsealed region (VSAM RBA); parallel writers always change the **name space** | §8.1.1a-9 |
+| Three reference tiers: **durable** (key / record number), **hint** (extent, row), and **none** (object offset) | §8.1.1a-10 |
+| Hints fail **detectably** because extent identity carries a creation second — Oracle's logical rowid pattern | §8.1.1a-10 |
+| Large objects are built by **parallel partitions, sealed, then concatenated** | §8.6.1 |
+| **Trilemma**: parallel bandwidth, dense stable offsets, monotone time index — pick two | §8.6.2 |
+| The recursion to DN **attenuates** by fan-out; the rule is **spray per writer, not per request** | §8.6.4 |
+| An object has a **sealed prefix** with dense numbering and a **growing frontier** addressed per stream | §8.6.6 |
+| Non-monotone extent lists are pruned by **min/max durable-second intervals**, which fail safe by widening | §9.7.3 |
+| Rewrites retain their inputs for the **hint window** (guess: 10 minutes) — retention, not compaction frequency | §10.1 |
+| Append offsets are assigned in a **canonical length-stuffed space**, so they survive re-framing | §8.2.2 |
 
 **Billing**
 
@@ -150,6 +197,14 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Billing tracks **actual cost within 2× slack**, on every scarce resource | §12.1, §12.4 |
 | **Physical, not logical** bytes — forced by the same slack rule | §12.3 |
 | A complex model with a **simple presentation**: top charges plus "everything else" while under 1% | §12.6 |
+| **Billing is a job over snapshots**, never over live DN/SN/EN metadata — reproducibility demands it | §12.8 |
+| Retain **outputs for years, inputs for weeks** | §12.8.1 |
+| Soft delete's 3-day window is what makes **daily sampling exact**; the opt-out therefore needs a billing tombstone | §12.8.2 |
+| Billing is **offline and exact**; quota is **online and approximate** | §12.8.3 |
+| Metadata is snapshotted **daily, kept weeks, sampled weekly** for longer; jobs are **advisory** and SN validates | §13.5 |
+| Snapshots are on the **intervention** path, not the recovery path | §13.5.3 |
+| SN **must** know sealed physical size — seal, billing, and EC grouping each require it | §13.5.1 |
+| Grouping keys on media, scheme, **size bin**, then **declared expiry**, then directory | §13.5.1 |
 | Only **~58% of purchased disk** is billable; price lands near **2.6× raw disk cost** per byte | §12.7 |
 | Worked prices: **$1.89 / $3.31 / $5.68 per TB-month** for 1.333× EC, 2.333× EC, 4-instance — **warm** storage, read immediately at HDD speed | §12.7.2 |
 
@@ -158,6 +213,8 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | | |
 |---|---|
 | **Self-concatenation** tests metadata scale — 2^31 extent references on 32 MB of real data | §15 |
+| Hardest placement shapes are enumerable — a permanent suite asserting **latency percentiles, not success** | §5.6.10 |
+| Budget: ~22 group placements/s per SN, so a group solve must clear **~10 ms** | §5.6.10 |
 
 ---
 
@@ -3028,9 +3085,13 @@ ratio (larger blocks compress better), and read amplification (larger blocks
 waste more per point read) — not the purely device-driven choice §9.3 describes.
 
 ⚠️ The device-tuned granularities of §9.3 (1 MB HDD, 20 KB SSD) were chosen for
-seek amortization alone. 20 KB is small enough to hurt compression ratio
-noticeably, and ratio is billable. The SSD granularity may need to rise, or
-compression blocks may need to span several index granules.
+seek amortization alone — §7.1.1 derives them. 20 KB is small enough to hurt
+compression ratio noticeably, and ratio is billable. The SSD granularity may need
+to rise, or compression blocks may need to span several index granules.
+
+Because block size is device-dependent and larger blocks compress better, **the
+compression block size is a durable property of the extent** — which is what makes
+media class durable too, and forbids mixed-media extents (§7.4.2).
 
 **The cost target constrains where these stages run.** §1.2 requires ENs to be
 computationally cheap — a server carrying 150 disks cannot also carry the CPU to
@@ -4382,9 +4443,10 @@ exist.
 ### 9.3 The sparse index
 
 One checkpoint approximately every **1 MB** for HDD-backed extents and **20 KB**
-for SSD-backed extents, tuned to the device's efficient read size: on an HDD the
-seek dominates and there is no point indexing finer than what you would read
-anyway; on an SSD there is no seek to amortize, so finer granularity pays.
+for SSD-backed extents — half the point at which seek cost equals scan cost, which
+§7.1.1 derives as `latency x bandwidth`. On an HDD the seek dominates and there is
+no point indexing finer than what you would read anyway; on an SSD there is much
+less seek to amortize, so finer granularity pays.
 
 **Checkpoints record physical offsets** — positions in the compressed, encrypted
 body, which is what a reader actually seeks to. A checkpoint is
@@ -4398,8 +4460,8 @@ Cost, at a 32 MB physical extent and 8-byte checkpoints:
 | HDD | 1 MB | 32 | ~256 B | 0.0008% |
 | SSD | 20 KB | ~1,600 | ~13 KB | 0.04% |
 
-Device class is a property of the extent, so an object may migrate between tiers
-extent by extent.
+Device class is a property of the extent — necessarily so, per §7.4.2 — so an object
+migrates between tiers extent by extent, as a rewrite (§10).
 
 ### 9.4 Scans
 
@@ -6212,11 +6274,11 @@ Roughly in order of how much else depends on them.
     truncation in another guise, and unspecified.
 35. **Bound and timeout on the out-of-order cache** (§8.1.1a-4). Together they set how far ahead a single
     writer may pipeline, and a gap that never fills must not pin cached data indefinitely.
-36. **Stable offsets versus parallel append throughput** (§8.1.1a-8). One unsealed extent is what makes the
-    object logical offset well defined, and it caps a single object's append rate near one disk's bandwidth,
-    ~200 MB/s. §1.0's shared-memory case wants many writers on one object *and* stable references, and those
-    conflict: shard across objects and lose the single ordered sequence, or allow several open extents and
-    lose the object-wide offset. Settle before the API is fixed.
+36. **Which corner of the ingest trilemma the shared-memory case takes** (§8.6.2). Parallel bandwidth,
+    dense stable object offsets, and a timestamp-monotone extent list are not simultaneously available.
+    §8.6.6 proposes the sealed-prefix-plus-growing-frontier shape as the default, but §1.0's case has not
+    been made to choose, and the choice is visible in the API. Related: whether the frontier's stream count
+    is user-visible, since an object's total record count is unknown while it is open.
 37. **When coalescing should re-frame** (§8.2.1). Matching the dominant read format takes translation off
     the read path, but nothing tracks what the dominant read format is.
 38. **Waste from a large append at a nearly-full extent** (§8.1.1c). The 32 MB logical bound (§8.1.1a-2)
@@ -6341,7 +6403,7 @@ Roughly in order of how much else depends on them.
     settled at 2× (§4.7).
 80. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-81. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+81. ~~**EC vs read locality**~~ — moot: EC groups whole extents (§4.3.2.3). Formerly: align the fragment stripe to the granule, or
     keep a full replica?
 82. **Compaction policy** (§10) — now partly a pricing decision.
 83. **Membership and leader election** (§13).
@@ -6350,6 +6412,32 @@ Roughly in order of how much else depends on them.
 85. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
+
+86. **Whether the stripe of a `(12+3)x(5+1)` turbo code is 90 cells or 108** (§4.3.3.2e). The 4/3 rule
+    reproduces 8 and 20 exactly but needs 108 to reach 144; 15 x 6 is 90, which wants 120. It decides
+    where the code reaches designed reliability.
+87. **Whether ENs need keys at all** (§8.1.4.1). Compressing and encrypting upstream of the four-way
+    fan-out means ENs could store opaque bytes, which is a strictly stronger §1.5 posture than §7.3.1's
+    cached SN-master keys. Decide rather than inherit.
+88. **Whether power is a nested failure domain** (§5.6.2, §8.1.4.4). DRAM staging on an all-SSD EN is
+    sound only if four independent ENs cannot lose power together. Without it, the all-SSD staging tier has
+    no home.
+89. **Whether 4-instance collapses at the EN level or the disk level on one machine** (§5.6.8). Four
+    instances on four disks of one machine protect against the commonest failure there is; collapsing to one
+    gives that up. The difference is 4x in space.
+90. **The hint window's real value** (§10.1). 10 minutes is a guess; it should be derived from how far a
+    tail-following consumer may lag before falling back to a key lookup.
+91. **The SSD seek/scan break-even** (§7.1.1). It spans 4 KB to 320 KB across defensible assumptions —
+    the widest uncertainty in the document, and it sets index density, compression block size, and the
+    staging bypass threshold.
+92. **How inline tiny object bodies are kept out of Compute-readable snapshots** (§12.8.4). Exclude them,
+    or encrypt them under a key Compute lacks. §11 inlines them and §12.8 reads the snapshot on Compute.
+93. **Padding versus size-binning for EC groups** (§4.3.2.3, §13.5.1). Whether an unfilled cell is padded
+    to a fixed EC unit or matched by size offline, and what the residual waste is in §12.7's chain.
+94. **What retires a snapshot schema version** (§13.5.5). Several jobs read one artifact, and old
+    snapshots must stay readable by newer code; nothing says for how long.
+95. **Whether the append-rate ceiling should be surfaced** (§8.1.1a-8). A single unkeyed object appends at
+    ~200 MB/s. That is discoverable by benchmark and surprising if undocumented.
 
 **Closed** since earlier drafts:
 
@@ -6371,4 +6459,39 @@ Roughly in order of how much else depends on them.
 - who may authorize deleting a stream — the `DnId` is part of the stream's name, so
   there is exactly one owning DN by construction (§4.6.3);
 - whether key derivation survives stream reassignment — it does, because the extent
-  names its creating SN and its creation day (§4.6.3, §7.3.3).
+  names its creating SN and its creation day (§4.6.3, §7.3.3);
+- which offset an append may report — it follows from the object flavour, and
+  compare-and-append is therefore unkeyed-only (§8.1.1a-7);
+- whether to defer the object offset until sealing — no; no system does it, and the
+  reasons are structural, not merely conventional (§8.1.1a-9);
+- how zero-width fixed-length rows break the single-writer check — they no longer do,
+  because offsets are assigned in a canonical length-stuffed space (§8.2.2);
+- whether logical offsets survive re-framing during coalescing — they do, for the same
+  reason (§8.2.2, §8.2.1);
+- whether EC splits extents into fragments — it does not, so reads never touch EC
+  (§4.3.2.3);
+- whether an all-SSD fleet changes the codec choice — it does not, because repair
+  bandwidth is network-bound either way (§4.3.2.2a);
+- whether mixed-media extents are supported — they are not, because compression block
+  size is a durable property and EC needs byte-identical instances (§7.4.2);
+- what the minimum viable cluster is — one machine, because an unenforceable placement
+  rule is simply not enforced (§5.6.7);
+- whether toggling a placement rule across its threshold causes churn — it cannot,
+  because placement is never revisited (§5.6.7);
+- whether placement needs a general solver on the common path — no; the solution is
+  persisted in the instance list order and the steady state is verification (§5.6.9);
+- what the 4/3 slack is for — cheap solving and routing around bad domains, not a
+  durability reserve (§5.6.1a);
+- whether EC verification fits a one-minute loop — only incrementally; the unconditional
+  pass rides the hourly instance sync (§13.1.10);
+- how the repair work list is found when an EN is dead and cannot report — by a scan
+  bucketed by EN, needing no reverse index (§13.1.10.1);
+- whether the fast loop needs a re-replication timeout — it does not, since
+  unavailability duration is a priority input (§13.4.2);
+- whether billing may read live metadata — it may not; reproducibility requires an
+  immutable retained input (§12.8);
+- whether daily snapshots make storage billing a sampling exploit — they do not, because
+  soft delete outlasts the interval, provided the opt-out still leaves a tombstone
+  (§12.8.2);
+- whether SN knows an extent's sealed physical size — it must, for three independent
+  reasons (§13.5.1).
