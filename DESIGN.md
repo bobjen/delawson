@@ -85,6 +85,7 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Working assumption **Reed-Solomon, MDS, m = 4**; overhead chosen from disaster tolerance | §4.3.2 |
 | Local codes trade minimum distance for locality, and are **patent-blocked until 2034** — **turbo codes** are the unencumbered fallback, at 1.5× and 2.5× instead of 1.333× and 2.333×, so the patent is worth **~$0.24/TB-month** | §4.3.2.1 |
 | The two EC tiers are one **10×6 LRC** (1.333×) and its **data-duplicated variant** (2.333×) | §12.7.2.1 |
+| Codes are judged by **equivalence to 3× or 4× replication** — what customers already accept — under independent loss and under domain-loss-plus-independent-loss | §4.3.3.2a |
 | The second instance buys **removal of repair from the read path**, not durability — minutes to readable instead of days | §12.7.2.1a |
 | Erasure coding does not address **software bugs, admin error, or running out of space** | §4.3.4 |
 | Utilization ≤ **1 − 1/D** is a *durability* requirement — a full cluster cannot repair | §4.3.4 |
@@ -982,6 +983,55 @@ This is far more informative than a durability probability. It says **8+4 beats 
 disasters below 4% of the cluster** — and §13.2's failed rollout is 5%, already past it. 8+2 is worse
 than triplication at every size despite costing 1.25×, so cheap parity is a false economy. 8+8, at
 two-thirds the cost of triplication, is better than it for everything below 30%.
+
+#### 4.3.3.2a How to evaluate a candidate code — the procedure, not yet the answer
+
+**Not done here.** This records the method so the numbers can be produced when a code is actually chosen;
+they are all calculable.
+
+**The reference points are what customers already accept.** Almost all are happy with 3× replication and
+essentially all would be happy with 4×. So the useful statement about any code is not an abstract
+probability but **"equivalent to 3× or 4× replication at what loss rate?"** — and 3× fails at *p*³ while 4×
+fails at *p*⁴, which makes the comparison a single equation.
+
+Note this is the same equal-lossiness idea as §4.3.3.2 with a different independent variable: that section
+crosses schemes against *disaster size s*, this one against *per-instance loss probability p*. They are
+complementary — correlated loss and independent loss — and the second failure model below combines them.
+
+**Two failure models to evaluate under:**
+
+| | Model |
+|---|---|
+| 1 | Instant random loss of each instance with probability *p* |
+| 2 | **One failure domain lost**, plus instant random loss of each surviving instance with probability *p* |
+
+Model 2 is the one that matters, because §1.1.1 makes correlated loss the dominant mode and §13.2 shows a
+domain-scale event is the realistic starting condition rather than a rare extreme.
+
+**Method A — Monte Carlo.** Simulate both models across the code's matrix and find the *p* at which the
+code's loss probability equals *p*³ or *p*⁴.
+
+**Method B — back-of-the-envelope.** Count minimal uncorrectable patterns and equate. For the 10 × 6 LRC,
+an uncorrectable pattern needs two rows and eight extents within them, giving
+
+> C(10,2) × C(12,8) × *p*⁸ = *p*⁴  →  22,275·*p*⁴ = 1  →  ***p* ≈ 8.2%**
+
+So that code matches 4× replication at a per-instance loss probability around 8%: below that it is better
+than four copies, above it worse. The shape generalizes — (ways to choose the structural units) × (ways to
+choose extents within them) × *p*^(losses needed) set equal to the reference — and it is cheap enough to do
+for every candidate before committing to any.
+
+**The turbo-code candidate to evaluate is a (5+1) × (12+3) matrix:**
+
+| | |
+|---|---|
+| Grid | 6 rows × 15 columns = 90 cells |
+| Data | 5 × 12 = **60** |
+| Parity | 30 — each row a (12+3) code tolerating 3, each column a (5+1) tolerating 1, plus a 1 × 3 parity-of-parity corner |
+| Overhead | 90/60 = **1.500×**, matching §4.3.2.1's turbo figure |
+
+⚠️ Running these is what settles the open questions about turbo-code disaster tolerance and about whether the
+LRC's thin guarantee (§12.7.2.1a) matters in practice. Both are arithmetic, not research.
 
 #### 4.3.3.3 "Lost" is a customer's judgement, not ours
 
@@ -4531,10 +4581,11 @@ Roughly in order of how much else depends on them.
 30. **Name the durability tiers honestly** (§12.7.2.1). "Usually available, always reliable" hides that
     1.333× also survives only a 25% disaster against 2.333×'s 57% — and large correlated events are the
     dominant loss mode. A customer-facing tier list should state disaster tolerance, not just availability.
-31. **Turbo codes' disaster tolerance** (§4.3.2.1). The storage cost of not licensing is now priced at
-    ~$0.24/TB-month, but the *reliability* cost is not. Turbo codes will fall short of the MDS bound as
-    LRCs do, and since disasters dominate loss that gap could outweigh the money. Measure before deciding
-    on price.
+31. **Turbo codes' disaster tolerance** (§4.3.2.1, §4.3.3.2a). The storage cost of not licensing is priced
+    at ~$0.24/TB-month; the *reliability* cost is not. §4.3.3.2a gives the procedure — two failure models,
+    Monte Carlo or pattern-counting, expressed as "equivalent to 3× or 4× replication at what loss rate" —
+    and the candidate to evaluate is a (5+1)×(12+3) matrix. Arithmetic, not research, and it should be done
+    before the choice is made on price.
 32. **The 1.333× guarantee is tight against the 10% outage case** (§12.7.2.1a). The LRC tolerates at most
     11.7% of fragments by the Singleton-like bound, and the worked scenario is a 10% loss. Worth confirming
     that maximal recoverability covers the realistic patterns, since the margin is thin.
