@@ -160,6 +160,51 @@ granularity is throughput-motivated, not latency-motivated — and the tension w
 ratio in §7.1 is now a throughput-versus-cost trade on both sides rather than a
 latency-versus-cost one. Sharpened, not settled.
 
+#### 1.4.3 Prior art: GFS targeted the same customers
+
+The [Google File System](https://research.google/pubs/the-google-file-system/) (SOSP 2003)
+aimed at this same workload, and its assumptions section states the priority almost verbatim:
+**"bandwidth is more critical than latency."** It also assumed *"component failures are the
+norm rather than the exception"*, that *"appending is the dominant write operation"*, and that
+overwrites are rare.
+
+That is worth knowing for two reasons. It establishes the customer segment as real and
+durable rather than a preference of this design; and where DeLawson agrees with GFS it is
+converging on a tested answer, while where it differs the difference should be deliberate.
+
+Agreeing:
+
+| | GFS | DeLawson |
+|---|---|---|
+| Priority | bandwidth over latency | §1.4 |
+| Failure model | failures are the norm | §1.1 |
+| Write pattern | append-dominant, overwrite rare | §3, §4.2 |
+| Chunk / extent size | 64 MB | 32 MB physical (§6) |
+| Metadata in memory | master's RAM bounds capacity | SN's RAM bounds a stream (§14.1) |
+
+The chunk size agreement is the more interesting one: two designs twenty years apart picked
+tens of megabytes for the same reasons — amortize the seek, bound the metadata.
+
+Differing, and why:
+
+| | GFS | DeLawson |
+|---|---|---|
+| Metadata scale | **single master** | many DN and SN rings, bounded fan-out, 2^32 nodes (§5.10) |
+| Durability | 3 replicas | 4 replicas derived from a 10^-14 target, then erasure coding (§4.3.1) |
+| Consistency | relaxed | 3-of-4 quorum, applied-as-prefix, SCN consistent read (§8.1.1) |
+| Namespace | flat pathname lookup table, no per-directory structure | `(parent dir id, name)`, so directory rename is O(1) (§5.5.4) |
+| Billing | none — an internal system | a first-class design constraint (§12) |
+
+The single-master limit is the one Google itself went on to fix with Colossus, and it is the
+same limit §14.1 reasons about — metadata in memory bounds what one machine can address. GFS
+accepted one such machine; DeLawson has many, which is what the fan-out and identifier work of
+§5.10 buys.
+
+The last row is the one that most shapes this document. GFS and Cosmos were both internal
+systems where metadata cost was *absorbed* rather than charged. §12.1 records what happened
+when a system of this shape was exposed to paying users without billing for metadata, and it is
+why billing here is derived from the cost structure rather than bolted on.
+
 ### 1.5 One security invariant
 
 **User code runs only on Compute machines, and decryption keys are never on a
