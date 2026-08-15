@@ -1907,9 +1907,47 @@ an extent is still replicated or already encoded has to be metered per extent, w
 §12.5 treats the seal-to-encode latency as a real quantity rather than an implementation
 detail.
 
-⚠️ Bob believes **Colossus already offers optional physical billing**, which would be
-corroborating prior art rather than a novel move. Unverified, and it does not change the
-derivation above.
+#### 12.3.1 Prior art: BigQuery offers both models
+
+**BigQuery** — not Colossus, though BigQuery is built on it — offers exactly this choice:
+["two storage billing models: logical (uncompressed) and physical
+(compressed)"](https://docs.cloud.google.com/bigquery/docs/storage_overview). The details
+are more instructive than the mere existence:
+
+| | BigQuery's arrangement |
+|---|---|
+| Granularity | per **dataset** |
+| Default | **logical** |
+| Switching | 14-day cooldown between changes, 24 hours to take effect |
+| Time travel and fail-safe | **included** under logical, **charged separately** under physical |
+
+Offering a choice looks at first like adverse selection — every customer picks whichever is
+cheaper, so the provider collects the *minimum* of the two. But it is better than that.
+Let *R* be the physical price per byte divided by the logical price per byte. A customer with
+compression ratio *c* prefers physical when *c* > *R*, so revenue per physical byte tracks
+min(*c*, *R*):
+
+| *R* | Billing error across all compression ratios | |
+|---|---|---|
+| 1.5 | 1.5× | inside 2× slack |
+| 2 | 2× | inside 2× slack |
+| 4 | 4× | outside |
+
+So **the price ratio caps the error.** Two models with *R* ≈ 2 sit inside the 2× slack,
+where pure logical billing was unbounded — the choice converts an open-ended error into a
+bounded one. That is a real mechanism, not a giveaway. (I have not verified BigQuery's
+actual *R*; the page above defers pricing elsewhere.)
+
+The catch is that the bound holds **only for customers who optimize.** A customer left on
+the logical default with 30×-compressible data is overcharged ~15× against an *R*=2 physical
+rate. So the scheme is really a non-compliant default plus an escape hatch, and its accuracy
+is conditional on customer attention. The 14-day cooldown and the differing time-travel
+treatment are what stop the escape hatch from being gamed continuously.
+
+**DeLawson's position: physical only.** Error 1× for everyone, no customer decision, no dual
+accounting, no cooldown rules, and nothing that depends on whether a customer read the
+pricing page. The dual model is worth knowing about as a demonstration that physical billing
+is commercially viable — customers accept it — rather than as a pattern to copy.
 
 ### 12.4 The rule that follows
 
