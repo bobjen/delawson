@@ -69,6 +69,22 @@ that will accept any of them. Reliability wants instances whose permanent-loss
 events are independent, plus background repair and scrubbing to catch decay
 before it accumulates.
 
+#### 1.1.1 Data loss happens during disasters, not during steady state
+
+**Asserted** (Bob, from experience): disasters come in all sizes, with larger ones rarer. Wait long
+enough and something takes out 100% of a cluster; wait roughly a fifth as long for 50%, and so on.
+Taking that shape literally gives a frequency falling as a power of size — halving the size
+multiplying the rate by ~5 means **λ(s) ∝ s^-2.32**.
+
+The consequence dominates everything else in this section: **steady-state disk failure is not where
+data is lost.** §13.2 works a case — a failed rollout destroying 5% of a cluster costs ~3.2 extents,
+against ~1 extent per 572 years per exabyte from ordinary disk failure. A single bad day beats a
+millennium of attrition, and disasters are not rare enough to ignore.
+
+So the reliability question is not "what is the per-window loss probability" but **"how large a
+disaster survives, and how often is one that large?"** §4.3.3 works that out; it turns out to have an
+exact and rather simple answer.
+
 Two refinements to what "available" means:
 
 - **It is promised per record, not per object.** A large object spans too many rings to be
@@ -684,6 +700,57 @@ means those live a very long time.
 **Working assumption: Reed-Solomon with *m* = 4**, and *k* chosen against the repair-traffic
 budget rather than the storage ratio alone. 8+4 is used as the example because it matches the
 1.50× overhead assumed elsewhere in this document, so no downstream figure changes.
+
+#### 4.3.3 What size of disaster survives, and what it costs
+
+**Derived.** Given §5.6's placement — every fragment of an extent in a *distinct* failure domain —
+a disaster confined to *m* domains destroys at most *m* fragments of any extent. So an *k*+*m* code
+**survives any disaster confined to *m* or fewer domains, with certainty.** Not a probability: a
+guarantee, provided the disaster respects the domain hierarchy.
+
+The largest fraction of a cluster that can be confined to *m* of the *k*+*m* domains holding an
+extent's fragments is *m*/(*k*+*m*) — the **parity fraction**. And that gives an exact relation:
+
+> **storage overhead = 1 / (1 − survivable fraction)**
+
+| Code | Overhead | Survives a disaster of |
+|---|---|---|
+| 8+2 | 1.25× | 20% of the cluster |
+| 10+4 | 1.40× | 29% |
+| **8+4** | **1.50×** | **33%** |
+| 8+8 | 2.00× | 50% |
+| 4+12 | 4.00× | 75% |
+
+Storage overhead *is* disaster tolerance, in a one-line correspondence. Surviving half a cluster
+costs 2× — mirroring, essentially — and no in-cluster code survives 100%, which is what a second
+cluster is for.
+
+#### 4.3.3.1 Expected loss is set by the smallest disaster that beats parity
+
+Loss as a function of disaster size is nearly a step: below the threshold, §13.2's slow degraded-window
+attrition; above it, immediate loss of a large fraction of everything. Since frequency falls steeply
+with size, the integral `∫ λ(s)·Loss(s) ds` is **dominated by disasters just above the threshold** —
+the smallest ones that still hurt, because they are the most frequent.
+
+Which makes the design lever obvious, and it is not the one §4.3.1 was reaching for:
+
+| Survivable fraction | Overhead | Relative rate of a threshold-exceeding disaster |
+|---|---|---|
+| 10% | 1.11× | 16.4× |
+| 20% | 1.25× | 3.3× |
+| **33%** | **1.50×** | **1.0×** (reference) |
+| 50% | 2.00× | 0.39× |
+
+Each **doubling of the survivable fraction cuts the loss rate ~5×** — the same factor as the
+frequency law, unsurprisingly. Compare §4.3.1.1, where tightening the repair window from 58 hours to
+1 hour bought a factor of ~1,000 against *steady-state* loss that was already negligible. **Parity
+buys reliability where reliability is actually lost; repair speed buys it where it is not.**
+
+⚠️ This rests entirely on disasters respecting the domain hierarchy. A disaster that cuts across
+domains — the orthogonality bug of §5.6.2, or simply a failure mode nobody modelled as a domain —
+destroys the guarantee and returns the problem to the binomial regime, where a 5% event can lose
+hundreds of terabytes outright. **§5.6.2's insistence on nesting is what makes this section true**,
+and it is worth rereading in that light.
 
 ### 4.4 Stored as lists, served as B-trees
 
@@ -3254,9 +3321,16 @@ as *D*^-4.**
 | 100 | 1% | 0.4 d | 12% | ~0.002 |
 | 200 | 0.5% | 0.2 d | 6% | ~0.0001 |
 
-Doubling the domain count cuts expected loss **sixteenfold**, which makes this the cheapest
-reliability lever in the design. **Deploy in ~1% increments, not 5%.** Nothing about the storage
-design has to change; it is a rollout policy.
+Doubling the domain count cuts expected loss **sixteenfold**. **Deploy in ~1% increments, not 5%.**
+Nothing about the storage design has to change; it is a rollout policy.
+
+⚠️ **Failure domains and deployment increments are different things, and the table above conflates
+them.** A *failure domain* (§5.6) is a unit of correlated failure that fragments must be spread
+across, and §4.3.3 wants those coarse — few enough that a real disaster is confined to *m* of them.
+A *deployment increment* is how much software is pushed at once, and this section wants those fine.
+They are independent: deploy in 1% increments *within* one failure domain, and both goals hold at
+once. The right reading of the table is that the *increment* should be ~1%, not that there should be
+100 failure domains.
 
 #### 13.2.4 Three things this connects to
 
