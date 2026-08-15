@@ -65,7 +65,26 @@ work below and because the numbers it implies are sensitive to it (§5.3.1):
 Billing by physical bytes (§12) is the revenue side of the same coin: if cost is
 dominated by bytes on disk, the price should be too.
 
-### 1.3 One security invariant
+### 1.3 Longevity
+
+**A cluster may run indefinitely, and may be dormant for geological spans and then be
+brought back up.** Nothing in any persistent format may assume otherwise.
+
+That rules out a family of designs that are otherwise natural:
+
+- **No absolute end date.** Fixed-epoch counters that wrap into ambiguity are out;
+  §4.6.3 compares timestamps modularly instead, so the interpretation can flip
+  indefinitely and only extent *age* is bounded.
+- **No work proportional to elapsed time.** Anything that marches forward one unit at a
+  time must be lazy instead. Generating one key per elapsed day through a billion-year
+  dormancy would mean 3.7 × 10^11 keys and 12 TB in a ring meant to hold a megabyte, so
+  the key store is indexed by *active* days only (§7.3).
+- **No assumption that the reader and the writer are contemporaries.** Persistent
+  structures must be self-describing and versioned, because the code reading a record
+  may be unrecognizably newer than the code that wrote it. Format evolution across such
+  spans is a requirement, not a maintenance concern.
+
+### 1.4 One security invariant
 
 **User code runs only on Compute machines, and decryption keys are never on a
 machine that runs user code** (§5.9.1). Stated here because it constrains the
@@ -360,41 +379,134 @@ Two safety requirements come with it:
   manufacture a collision. The SN should keep the last second it issued in its Raft
   state and refuse to regress.
 
-##### The timestamp is a deadline, not just a disambiguator
+##### The timestamp is 8 bytes of seconds, compared modularly
 
 The daily SN-master key that encrypted an extent is **selected by its creation
 timestamp** (§7.3), so the timestamp is load-bearing for decryption as well as for
-identity. Which gives a hard obligation:
+identity. That makes its width a longevity decision, not a formatting one.
 
-> **Every extent must be replaced or deleted before its creation timestamp wraps.**
+**8 bytes of seconds.** Inside the owning SN the id field is then `ExtentId` (4) plus
+second (8) = **12 B**; the full form is 16 B, the same as a guid but structured and
+meaningful.
 
-After a wrap, an old and a new extent can share the same `(SnId, ExtentId, second)` —
-ambiguous identity *and* ambiguous key selection. A 4-byte second counter spans **~136
-years**, so that is the deadline. Comfortably beyond any hardware, but not beyond the
-life of a storage service, and the design is meant to hold data indefinitely.
+Read as an unsigned counter from a fixed epoch, 8 bytes spans 585 billion years — 42×
+the age of the universe — and then wraps, which would be an absolute doomsday: every
+extent in the system becomes ambiguous at the same instant, and no amount of rewriting
+beforehand helps the ones written just before it.
 
-So this creates a **compulsory** background obligation, not an optimization: an
-age-driven rewrite sweep that guarantees no extent outlives the window. The cost is
-trivial — clearing 1 EB inside 136 years is ~233 MB/s across the entire fleet — and the
-mechanism already exists, since compaction rewrites extents and rotates keys anyway
-(§10). The risk is purely that it gets forgotten, so §13.2 lists it explicitly.
+**So timestamps are compared by signed difference, not by magnitude.** The same bits are
+interpreted as signed or unsigned according to era — equivalently, ordering is decided
+by `(a − b)` taken as a signed 64-bit value. This is the technique behind TCP sequence
+numbers and Linux's `time_after()`, and it changes the constraint qualitatively:
 
-⚠️ **Granularity trades directly against the window**, and the two safety rules pull
-opposite ways — finer ticks make id reuse safer and the deadline sooner:
+| | Absolute unsigned epoch | Signed-difference comparison |
+|---|---|---|
+| Cluster lifetime | 585 billion years, then dead | **unbounded** |
+| The real constraint | replace everything before the epoch wraps | **no live extent older than ~292 billion years** (2^63 s) |
+| Failure mode | everything breaks at once, unfixably | a single over-age extent, fixed by rewriting it |
 
-| Tick | 4-byte window | Reuse rule | Creation rate it permits |
+That is the reconciliation between wanting 8 bytes and wanting a cluster that may run
+essentially forever: the window stops being a doomsday and becomes a **rolling maximum
+extent age** of ~292 billion years, 21× the age of the universe, which the age-driven
+rewrite sweep (§13.2) satisfies trivially.
+
+**The interpretation flips back and forth indefinitely.** Each flip is not a one-time
+extension that eventually runs out; it is a periodic reinterpretation of the same 8
+bytes, repeatable without limit. The only standing obligation is that live extents stay
+inside one window — a bound on extent *age*, never on cluster age.
+
+Two rules follow, and both are the kind that lie dormant for eons and then fail:
+
+- ⚠️ **Never compare raw timestamps by magnitude.** Any `a < b` on the unsigned value is
+  a latent bug. Only signed differences are meaningful.
+- ⚠️ **Modular comparison is not a total order**, so a timestamp cannot be used naively
+  as a sort key or B-tree key — it is only consistent among values within one window.
+  Extents are keyed by `(SnId, ExtentId)` with the timestamp as a disambiguator rather
+  than a sort key, so this is currently safe; it would stop being safe the moment
+  something wanted to index by creation time.
+
+Two safety rules from before still apply: an `ExtentId` must not be reused within one
+second, which argues for FIFO or LRU rather than lowest-free allocation; and the issued
+second must never go backward, so the SN keeps the last one it issued in its Raft state
+and refuses to regress.
+
+##### The same discipline applies to SCNs
+
+Transaction sequence numbers (§5.7) have the identical problem on a **much shorter
+wall-clock window**, because an SCN advances per transaction rather than per second. The
+signed half-window, in years:
+
+| Transactions/s | 6-byte | 8-byte | 10-byte |
 |---|---|---|---|
-| **1 second** | **136 years** | not within 1 s | 4.3 × 10^9 /s |
-| 1 minute | 8,166 years | not within 1 min | 7.2 × 10^7 /s |
-| 1 hour | 489,957 years | not within 1 hr | 1.2 × 10^6 /s |
-| 1 day | 11.8 million years | not within 1 day | 49,710 /s |
+| 10^3 | 4,500 | 2.9 × 10^8 | 1.9 × 10^13 |
+| 10^6 | **4.5** | 2.9 × 10^5 | 1.9 × 10^10 |
+| 10^9 | **0.0045** | 292 | 1.9 × 10^7 |
 
-Even the day row permits ~50,000 extent creations per second per SN, which would turn
-over an SN's entire 1.7 × 10^9 extents in under ten hours — implausibly fast. So a
-coarser tick would buy an effectively unlimited window at no realistic cost in reuse
-safety, and a 5-byte second counter would buy 34,841 years for one byte. One second is
-the current choice and gives the best forensics; the alternatives are recorded because
-a 136-year deadline is the kind of thing that is much cheaper to widen now than later.
+At a million transactions per second, 6 bytes is 4.5 years and 8 bytes is 290,000 —
+where the same widths measured in seconds were geological. So width matters far more
+here, and the comparison discipline is not optional.
+
+What rescues it is that **the live SCN range is deliberately tiny**: SCNs are expected
+to be valid for only ~10 minutes. Only open consistent reads and retained versions need
+to be comparable, so capping validity caps the range, and the window bounds *version
+age* rather than cluster age — exactly as with extents.
+
+**SCNs are never persisted in cold data.** They live only in the short-lived replicated
+extents — the open base and its log — and are **dropped when those are coalesced into a
+sealed, erasure-coded extent** (§10). So an SCN's lifetime is bounded by how long an
+extent stays hot, which is short by construction rather than by policy. This is the
+strongest of the three reasons for the cap: the others bound the SCN range by choosing
+to, while this one makes a long-lived SCN impossible to write down.
+
+It also removes a per-record cost from the tier that holds essentially all the bytes. An
+8-byte SCN beside a 100-byte record would be ~8% of logical volume — on the order of 80
+PB across an exabyte — before compression; delta-encoding monotonic counters would claw
+much of that back, but not storing them is exactly zero and depends on nothing.
+
+⚠️ The API consequence is worth stating plainly: **consistent read has a horizon.** A
+snapshot can be held for minutes, but there is no querying an object "as of last
+Tuesday", because once coalesced there is one version and no SCN to select by. Any
+time-travel feature would need a different mechanism entirely.
+
+That cap is a large part of *why* the 10-minute figure exists. Headroom of a 6-byte SCN:
+
+| SCN validity | at 10^6 tx/s | at 10^9 tx/s |
+|---|---|---|
+| **10 minutes** | 234,562× | **235×** |
+| 1 hour | 39,094× | 39× |
+| 1 day | 1,629× | **2× — exhausted** |
+
+At a day of validity and a billion transactions a second, 6 bytes is gone. At ten
+minutes it holds comfortably even there. **So the 10-minute cap is what makes a narrow
+SCN viable at high transaction rates**, and the width and the cap have to be chosen
+together.
+
+Note the 10 minutes is **bracketed from both sides**, which is what makes it look like a
+real design point rather than a round number: §5.7 needs a consistent read to last *long
+enough* to write a checkpoint, while the SCN range and the coalescing lifetime both need
+it *short enough*. The same shape as the extent record bracketed by reference width from
+below and fleet size from above (§4.6.4), and the physical extent limit bracketed by seek
+amortization and metadata volume (§6).
+
+##### The hot tier absorbs the complexity
+
+SCNs are the fourth thing to land on one side of the same line, which is worth naming as
+a through-line rather than a coincidence:
+
+| | Hot: open, replicated, mutable | Cold: sealed, erasure-coded, immutable |
+|---|---|---|
+| Durability | 4 replicas | *k*-of-*n* fragments |
+| Structure | base **plus log** | base only |
+| Versioning | **SCNs** | none |
+| Mutability | appendable | fixed forever |
+
+Every expensive or intricate mechanism lives in the small hot tier; the tier holding
+essentially all the bytes stays simple, cheap, and immutable. Coalescing is the
+transition, and it is where each of these is given up at once.
+
+⚠️ SCN width and scope are undesigned. A Raft log index is a natural per-ring SCN and
+needs no separate counter, but §2 rules out cross-object transactions while an object
+spans many rings, so what an SCN is scoped to is not yet settled.
 
 ##### Two questions this settles
 
@@ -856,6 +968,10 @@ checkpoint of ~3 × 10^11 bytes, about one machine's full memory. Note that §5.
 shrinks checkpoints by orders of magnitude, which makes this optimization easier
 rather than harder.
 
+The same ten minutes is also an *upper* bound from a different direction — it keeps
+the live SCN range small enough for a narrow sequence number (§4.6.3) — so the figure
+is squeezed from both sides rather than chosen.
+
 #### 5.7.1 Primary switchover has three quality tiers
 
 | Case | Client uncertainty | Requires |
@@ -1069,13 +1185,13 @@ once per table rather than once per reference.
 
 | Field | Bytes |
 |---|---|
-| extent id — `ExtentId` (4) + creation second (4), `SnId` implicit (§4.6.3) | 8 |
+| extent id — `ExtentId` (4) + creation second (8), `SnId` implicit (§4.6.3) | 12 |
 | starting record number | 8 |
 | cumulative logical bytes | 8 |
 | cumulative physical bytes | 8 |
 | key generation and flags | 2 |
 | 4 × instance reference (2 B local EN index + 1 B disk + 3 B slot) | 24 |
-| **Total** | **58 B** |
+| **Total** | **62 B** |
 
 The day index §7.3.3 needs for key derivation is not a separate field: the creation
 second already carries it.
@@ -1235,7 +1351,7 @@ what makes the layer below unrecoverable without KS.
 
 **The authoritative key store is kilobytes.** One random key per day:
 
-| Retention | Keys | Size |
+| Active days | Keys | Size |
 |---|---|---|
 | 1 year | 365 | 12 KB |
 | 10 years | 3,650 | 117 KB |
@@ -1245,6 +1361,12 @@ A century of master keys is about a megabyte, and — unlike the tenant-keyed sc
 this replaces — the figure does not depend on how many customers or objects exist.
 Old daily keys must be kept as long as any extent encrypted under them survives,
 which this makes free.
+
+⚠️ **Keys are generated lazily, and the store is indexed by *active* day, not elapsed
+day.** §1.3 allows a cluster to lie dormant for geological spans; marching one key
+forward per elapsed day through a billion-year dormancy would mean 3.7 × 10^11 keys and
+12 TB in a ring sized for a megabyte. A day with no extent creations needs no key, so
+the store must be sparse and populated on demand.
 
 #### 7.3.1 Two-dimensional scoping bounds the blast radius
 
@@ -1304,7 +1426,7 @@ the serving SN would fetch the wrong master key.
 ⚠️ **There is no cryptographic tenant isolation.** Keys are scoped by day and SN,
 not by customer, so two tenants' extents on one SN for one day derive from the same
 SN-master key. Isolation rests on FE authorization (§5.9) and on keys never
-reaching user code (§1.3) — not on separate key material. That is a coherent
+reaching user code (§1.4) — not on separate key material. That is a coherent
 position, but it forecloses customer-supplied keys and weakens any "we cannot read
 your data" claim, so it interacts directly with §5.9.2.
 
@@ -1760,7 +1882,7 @@ and by now the design has accumulated a substantial list of work for them:
 | Scrubbing and checksum verification | §1.1 | Catches decay before it accumulates |
 | Reclaiming garbage in packed extents | §11 | A deleted packed object leaves a hole |
 | Encryption key rotation | §7.2 | Happens by rewriting during compaction |
-| **Age-driven rewrite before timestamp wrap** | §4.6.3 | Compulsory: an extent outliving its 136-year window becomes ambiguous in both identity and key selection |
+| **Age-driven rewrite of over-age extents** | §4.6.3 | Compulsory: no live extent may be older than the ~292-billion-year comparison window, or its identity and key selection become ambiguous |
 | Refreshing the DN's cached counters | §5.5.2 | Otherwise one metadata write per data write |
 | Re-placing instances and ring members | §5.6 | Restoring domain independence after a loss |
 | Raft snapshotting | §4.4 | Truncating the log must not block mutations |
@@ -2074,69 +2196,72 @@ Roughly in order of how much else depends on them.
     references it, where rewriting an extent is something compaction does anyway. So the
     wrap obligation is cheap for extents and expensive for streams — an argument for
     giving streams a *wider* timestamp rather than an equal one.
-13. **Expected object count** (§14.5). DN cost scales with object count rather than
+13. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
+    must be chosen together; a Raft log index is a natural per-ring counter, but what an
+    SCN is scoped to is unsettled while objects span many rings.
+14. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-14. **Why nesting forces serialized planned disruptions** (§5.6.3) — the
+15. **Why nesting forces serialized planned disruptions** (§5.6.3) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-15. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+16. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-16. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+17. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-17. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+18. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-18. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+19. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-19. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+20. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-20. **Background loop scheduling** (§13.2): prioritisation and rate limiting
+21. **Background loop scheduling** (§13.2): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-21. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+22. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-22. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+23. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-23. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+24. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-24. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+25. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-25. **Remaining directory semantics** (§5.1): listing huge directories,
+26. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-26. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+27. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-27. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+28. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-28. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
+29. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
     hurts compression ratio, and ratio is billable.
-29. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+30. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-30. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+31. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-31. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+32. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-32. **Billing policy** (§12): garbage, transient double footprint, metadata,
+33. **Billing policy** (§12): garbage, transient double footprint, metadata,
     instantaneous-usage contract, reporting granularity.
-33. **Key custody within KS** (§7.3): how the daily master keys are themselves
+34. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-34. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+35. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-35. **Compaction policy** (§10) — now partly a pricing decision.
-36. **Membership and leader election** (§13).
-37. `Nul` and `\0` framing were both listed originally and are folded together
+36. **Compaction policy** (§10) — now partly a pricing decision.
+37. **Membership and leader election** (§13).
+38. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-38. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+39. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
