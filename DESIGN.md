@@ -40,9 +40,16 @@ that will accept any of them. Reliability wants instances whose permanent-loss
 events are independent, plus background repair and scrubbing to catch decay
 before it accumulates.
 
-Availability is also promised **per record, not per object** — a large object spans too many
-rings to be wholly reachable at one instant, while any single record is unaffected by how big
-its object is (§5.11.2).
+Two refinements to what "available" means:
+
+- **It is promised per record, not per object.** A large object spans too many rings to be
+  wholly reachable at one instant, while any single record is unaffected by how big its
+  object is (§5.11.2).
+- **It is time-bounded, not instantaneous.** Deciding something is unavailable means waiting
+  for a timeout, and TCP's is ~20 seconds — ~40 with a retry, which is ~2,400× a normal
+  read. A request that eventually succeeds after 40 seconds satisfies a naive availability
+  definition and is useless in practice, so availability must be stated with a latency budget
+  attached (§9.5).
 
 Both push the same way on one point, and it is the origin of the machine types in
 §5: **instances of an extent must sit in places that fail independently, and
@@ -242,7 +249,9 @@ misses its target by ten orders of magnitude. The reliability figure is therefor
 statement about placement discipline, not about disks.
 
 **Availability, separately.** A read needs one instance of four, so it is unavailable
-(10^-3)^4 = **10^-12** of the time. A write needs three of four applied (§8.1), which is
+(10^-3)^4 = **10^-12** of the time — *provided the four are tried promptly rather than
+serially* (§9.5). Four copies give durability unconditionally, but they only give
+availability if the read path can reach past a dead one faster than a TCP timeout. A write needs three of four applied (§8.1), which is
 unavailable ~**6 × 10^-6** of the time — about 190 seconds per year per extent, and six
 orders of magnitude worse than reads. That asymmetry is affordable only because a write
 that cannot reach a quorum does not block: the extent is sealed short and a new one opened
@@ -1839,6 +1848,58 @@ statistics rather than addresses (§3).
 
 ---
 
+### 9.5 Timeouts, and using the options
+
+**Redundancy is an availability benefit only if it can be used before a timeout expires.**
+That is not automatic, and getting it wrong turns four copies into a durability feature with
+no latency benefit at all.
+
+The scales are brutally mismatched:
+
+| | Duration |
+|---|---|
+| Typical EN granule read (HDD seek + 1 MB) | ~17 ms |
+| TCP timeout | ~20 s |
+| TCP timeout with one retry | ~40 s — **~2,400× a normal read** |
+
+So a reader that tries one instance, waits for TCP to give up, retries, and only then tries
+another has a worst case of tens of seconds per instance. Four instances tried serially is
+worse than one.
+
+**The remedy is hedging: issue to a second instance after a short delay rather than after a
+failure.** §4.3's four instances (and, after sealing, *n* fragments of which any *k* suffice)
+are exactly the options needed:
+
+| Hedge after | Worst-case read | Improvement over serial retry |
+|---|---|---|
+| 25 ms | ~42 ms | ~960× |
+| 50 ms | ~67 ms | ~600× |
+| 100 ms | ~117 ms | ~343× |
+
+And it is nearly free, because only the slow tail is ever duplicated. Hedging at the p99 of
+read latency duplicates 1% of reads; at p99.9, 0.1%. The extra load is a knob with a
+well-understood cost, unlike the 40-second stall it replaces.
+
+Two places this generalizes:
+
+- **Metadata reads have fewer options.** A record read touches one DN ring and one SN ring
+  (§5.11.1), and unlike the EN layer there is no second ring to ask. The options inside a
+  ring are its members: the hot backup is current by construction (§5.7), so it can serve a
+  hedged metadata read. That trades a little staleness for a large latency bound — and
+  because sealed extents are immutable, most metadata answers cannot go stale in a way that
+  matters.
+- **The write path already hedges structurally.** Broadcast plus a 3-of-4 quorum (§8.1.2)
+  means a straggler or a dead instance costs nothing: the quorum arrives from the fast three.
+  What still needs a timeout budget is the decision to give up and seal the extent short
+  (§13), and that budget must sit far below 40 seconds or a single dead EN stalls a writer
+  for a TCP timeout.
+
+⚠️ Hedge delays are undesigned. They differ per tier — an EN granule read, a metadata
+lookup, and a client-to-FE request over the internet have different normal latencies by
+orders of magnitude — so a single global value will be wrong everywhere.
+
+---
+
 ## 10. Compaction
 
 Compaction reads a base plus its log and writes a fresh base with updates
@@ -2253,8 +2314,10 @@ How much window there is to spend depends on disk failure rates, since the assum
 | 5% | 20 yr | 17.5 hours | 0.10% |
 | 10% | 10 yr | 8.8 hours | 0.19% |
 
-So detection is nearly free against a budget measured in hours, and what actually consumes
-the window is moving the data: re-replicating a failed 20 TB disk needs 1.4 GB/s aggregate
+So detection is nearly free against a budget measured in hours. It is not *instant*, though:
+with a 20-second timeout, a dead disk is known 20 seconds after the fact at best, and ~80
+seconds at worst if a probe is missed first — 0.25% of even the tightest repair budget. What
+actually consumes the window is moving the data: re-replicating a failed 20 TB disk needs 1.4 GB/s aggregate
 to finish in 4 hours, or 0.23 GB/s in a day — spread across the fan-out, either is
 comfortable.
 
@@ -2815,80 +2878,86 @@ Roughly in order of how much else depends on them.
     range is undesigned.
 14. **What ring unavailability *p* actually is** (§5.11.1). The locality argument and the
     per-record availability contract both turn on it, and nothing has measured or targeted it.
-15. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
+15. **Hedge delays per tier** (§9.5). EN granule reads, metadata lookups and
+    client-to-FE requests differ in normal latency by orders of magnitude, so one global
+    value will be wrong everywhere. Also: may a ring's hot backup serve hedged metadata
+    reads, and what staleness does that admit?
+16. **The give-up budget for seal-short** (§9.5, §13). It must sit far below a 40-second TCP
+    retry or one dead EN stalls a writer for a timeout.
+17. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
     and domain constraints interact: a markedly emptier domain attracts weighted picks and
     then rejects them, which is worst right after adding capacity. Bounded, but worth
     measuring.
-16. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
+18. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
     safe, but who chooses the primary, and how a new one is appointed when it fails, is
     undesigned.
-17. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
+19. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
     must be chosen together; a Raft log index is a natural per-ring counter, but what an
     SCN is scoped to is unsettled while objects span many rings.
-18. **Expected object count** (§14.5). DN cost scales with object count rather than
+20. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-19. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
+21. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-20. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+22. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-21. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+23. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-22. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+24. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-23. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+25. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-24. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+26. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-25. **Background loop scheduling** (§13.2): prioritisation and rate limiting
+27. **Background loop scheduling** (§13.2): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-26. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+28. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-27. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+29. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-28. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+30. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-29. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+31. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-30. **Remaining directory semantics** (§5.1): listing huge directories,
+32. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-31. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+33. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-32. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+34. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-33. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
+35. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
     hurts compression ratio, and ratio is billable.
-34. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+36. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-35. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+37. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-36. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+38. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-37. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
+39. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
     attribution, instantaneous-usage contract, reporting granularity. Slack itself is
     settled at 2× (§4.7).
-38. **Key custody within KS** (§7.3): how the daily master keys are themselves
+40. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-39. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+41. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-40. **Compaction policy** (§10) — now partly a pricing decision.
-41. **Membership and leader election** (§13).
-42. `Nul` and `\0` framing were both listed originally and are folded together
+42. **Compaction policy** (§10) — now partly a pricing decision.
+43. **Membership and leader election** (§13).
+44. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-43. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+45. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
