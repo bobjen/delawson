@@ -687,7 +687,32 @@ with Locality"](https://arxiv.org/html/1307.4150v2) — Gopalan, Huang, Jenkins 
 | RS 8+4 | 1.50× | 8× | 7.9 × 10^-18 | 7.6 GB/s |
 | **MR (60,4,4)** | **1.33×** | **4×** | ≤3.2 × 10^-19 | **3.8 GB/s** |
 
-Better on every axis at once — cheaper storage, half the repair traffic, better durability.
+Better on three axes — cheaper storage, half the repair traffic, better steady-state durability.
+
+⚠️ **But worse on the axis that turns out to matter.** An earlier draft of this section claimed
+"better on every axis at once", which was wrong. Guaranteed disaster tolerance is (*d*−1)/*n*
+(§4.3.3), and local codes **trade minimum distance for locality** — that is the fundamental tension,
+not an artefact of this particular construction:
+
+| | *n* | *d* | Overhead | Guaranteed survivable | MDS bound at that overhead |
+|---|---|---|---|---|---|
+| RS 8+4 | 12 | 5 | 1.50× | **33.3%** | 33.3% — achieved |
+| MR (60,4,4) | 80 | 7 | 1.33× | **7.5%** | 25% — far short |
+
+By the frequency law of §1.1.1 that is a **~32× higher loss rate** in the worst case. Since §4.3.3
+shows disasters dominate loss, the local code is better precisely where reliability was already
+adequate and worse precisely where it is lost.
+
+To be fair to it: *maximally recoverable* means it recovers **every** pattern its structure permits,
+so it does far better than 7.5% on disasters whose losses spread across local groups. If each local
+group's fragments sit in distinct domains, a single-domain disaster costs one fragment per group and
+every one is repaired locally — the ideal case. The real comparison therefore depends on the disaster
+size distribution and on how domains map onto local groups, and deserves proper analysis rather than a
+verdict either way.
+
+⚠️ **This substantially reduces the cost of the patent.** The unencumbered MDS code is the better
+choice for the dominant loss mode; what the patent blocks is a repair-traffic optimization in a regime
+that §4.3.3.1 shows was never the constraint. Worth knowing before spending anything on licensing.
 
 ⚠️ **It is patented, and the patent does not expire until 2034.** Bob is a co-inventor, which
 makes this easier to walk into rather than harder: the technique is familiar, the paper is
@@ -697,9 +722,15 @@ is a question for counsel, not for this document — but it must be settled befo
 chosen, because the choice is baked into every sealed extent and the §4.6.3 timestamp deadline
 means those live a very long time.
 
-**Working assumption: Reed-Solomon with *m* = 4**, and *k* chosen against the repair-traffic
-budget rather than the storage ratio alone. 8+4 is used as the example because it matches the
-1.50× overhead assumed elsewhere in this document, so no downstream figure changes.
+**Working assumption: Reed-Solomon, MDS, with the overhead chosen from disaster tolerance** — §4.3.3
+makes overhead and survivable disaster fraction the same decision, and §4.3.3.1 makes it the dominant
+reliability lever. *m* = 4 also satisfies steady-state durability, so 8+4 at 1.50× meets both; it is
+used as the example throughout because it matches the overhead assumed elsewhere, so no downstream
+figure changes.
+
+Note the ordering this implies: **pick the disaster size to survive, which fixes the overhead, which
+fixes *m*/*n*.** Repair traffic is then whatever *k* makes it, and is a throughput cost rather than a
+reliability one.
 
 #### 4.3.3 What size of disaster survives, and what it costs
 
@@ -708,10 +739,14 @@ a disaster confined to *m* domains destroys at most *m* fragments of any extent.
 **survives any disaster confined to *m* or fewer domains, with certainty.** Not a probability: a
 guarantee, provided the disaster respects the domain hierarchy.
 
-The largest fraction of a cluster that can be confined to *m* of the *k*+*m* domains holding an
-extent's fragments is *m*/(*k*+*m*) — the **parity fraction**. And that gives an exact relation:
+In general a code tolerates *d*−1 arbitrary erasures, so its guaranteed survivable fraction is
+(*d*−1)/*n*. Reed-Solomon is **MDS** — *d* = *n*−*k*+1 — which makes that exactly the parity fraction
+*m*/(*k*+*m*), and gives a clean relation:
 
-> **storage overhead = 1 / (1 − survivable fraction)**
+> **storage overhead = 1 / (1 − survivable fraction)**, for an MDS code
+
+This is a **bound**, not an identity: MDS codes achieve it and nothing beats it. A non-MDS code of the
+same overhead survives strictly less (§4.3.2.1 is the cautionary case).
 
 | Code | Overhead | Survives a disaster of |
 |---|---|---|
