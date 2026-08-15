@@ -130,6 +130,8 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | The primary assigns a **logical** offset in a tiny serialized window; compress, encrypt and write happen outside it | §8.1.1a-2 |
 | **Single-writer** appends supply their expected offset and are **exactly-once**; **multi-writer** appends are **at-least-once**. Prior art: **Azure append blobs**, same two modes, same rationale | §8.1.1a-3, §8.1.1a-5 |
 | Logical offsets are **dense** — no padding, no holes — which is what makes the single-writer check, the reorder cache, and cumulative byte totals work | §8.1.1a-6 |
+| **Unkeyed** objects have one unsealed extent, so the **object** logical offset is reportable; **keyed** objects have several, so only an extent-relative offset exists and it does not survive coalescing | §8.1.1a-7 |
+| So compare-and-append is unkeyed-only; keyed objects get idempotency **from the key** | §8.1.1a-7 |
 | An append block is a **byte range**, not a set of records; fragments are single-writer only | §8.1 |
 | Append blocks bounded at **32 MB logical**, so one always fits a fresh extent | §8.1.1a-2 |
 | No chunk padding: an append that will not fit **seals the extent short** | §8.1.1c |
