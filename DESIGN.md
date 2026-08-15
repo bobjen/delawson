@@ -1062,6 +1062,11 @@ So "tens or hundreds" is right, and which end depends entirely on how a bare sto
 server prices against a disk. A cheap server against expensive disks lands in the
 tens; anything like a conventional server needs well over a hundred.
 
+A **third bound** comes from the NIC: 150 disks at 200 MB/s is 30 GB/s against 25 GB/s for
+2 × 100 GbE, so past ~125 disks a sequential scan is network-limited rather than disk-limited
+(§5.12.1). All three bounds — cost from below, disk index from above, NIC from above — land in the
+same neighbourhood, which is mild corroboration that a hundred-and-something is the right answer.
+
 **How hard this bites depends on the overhead target**, which §1.2 holds loosely. For
 an overhead fraction *f*, the requirement is *n* ≥ ((1−*f*)/*f*)·(*S/D*), and a 1-byte
 disk index caps *n* at 256:
@@ -1789,6 +1794,83 @@ atomic**, tolerating parts being briefly unreachable and returning to them. That
 requirement on the API and on §13.2's loops, not a defect: for objects this large there is no
 alternative, and §9.4's scan design already walks streams in order rather than needing them
 simultaneously.
+
+---
+
+### 5.12 Compute: undesigned, but the network already binds
+
+Compute is largely undesigned, and **Virtual Clusters (§1.4.5) are unlikely to be the route** —
+Cosmos's model of guaranteed capacity per group plus free use of idle capacity is one answer, not
+the only one. What follows is what can already be said without designing it.
+
+**The bounded fan-out pattern probably applies.** §5.10's answer to "*n* machines cannot all talk
+to *m* machines" is not specific to SN↔EN, and Compute has the same shape: a vertex needs a
+handful of ENs and a handful of peers, not all of them. Expect the same three ingredients —
+random stratified neighbourhoods, local indices rather than global ids, and rejection against
+placement rules.
+
+#### 5.12.1 The security invariant makes the network carry everything
+
+Cosmos and Dryad placed **computation close to its data** — the talk is explicit that the
+execution engine is "responsible for the placement of the computation close to the data it
+reads." **DeLawson cannot do that**, because §1.5 forbids user code on any machine holding
+decryption keys, and ENs hold them (§7.3.1).
+
+So every byte a job reads crosses the network, always. That is a real cost this design pays and
+its ancestor did not, and it is why cluster size is bounded by network bandwidth rather than by
+anything else:
+
+| | Aggregate delivery | Compute uplinks needed to absorb it |
+|---|---|---|
+| 100 ENs | 2.5 TB/s | 200 × 100 GbE |
+| 1,000 ENs | 25 TB/s | 2,000 × 100 GbE |
+
+**Bounding a cluster geographically and by network bandwidth is therefore not a convenience, it
+is forced.** Buy more EN disk bandwidth than the fabric can deliver to compute and the disks sit
+idle.
+
+The same balance appears inside one machine, and it is a **third independent bound on disks per
+EN**: 150 disks at 200 MB/s is 30 GB/s, while 2 × 100 GbE is 25 GB/s. Disks outrun the NIC by
+1.2×, so sequential scanning is NIC-limited at that disk count. §5.3.1 bounded disks per EN from
+below by the cost target and from above by the 1-byte disk index; the NIC bounds it too, and
+lands in the same neighbourhood.
+
+#### 5.12.2 L-shaped jobs, and what "compact" should mean
+
+Jobs are often **L-shaped**: a huge parallel read that discards most of its input through
+filtering and aggregation, then a long churn on what remains. The question is whether the
+remainder wants to be *compact*.
+
+It does — but **"compact" means RAM-resident in aggregate, not co-located on few machines.** The
+gap that matters is not network topology, it is memory versus network, and that gap survives any
+fabric:
+
+| | Bandwidth |
+|---|---|
+| Local RAM | ~100 GB/s |
+| 100 GbE NIC | ~12.5 GB/s |
+| Local NVMe | ~7 GB/s |
+
+RAM is ~8× a 100 GbE link, so **no amount of bisection bandwidth makes fetching a working set as
+fast as already having it.** Which resolves the worry: the goal is not to squeeze phase 2's data
+onto a few nearby machines — that would sacrifice the CPU parallelism phase 2 needs — but to have
+it *resident* across whatever nodes are churning on it.
+
+The number that decides everything is the filtering ratio:
+
+| Remainder | Against 1,000 nodes × 256 GB = 256 TB | Phase 2 becomes |
+|---|---|---|
+| 1 TB | 0.4% of RAM, 1 GB per node | a **memory** workload; storage is out of the loop |
+| 500 TB | does not fit | a **storage** workload — 100 iterations is 50 PB of re-reads |
+
+So the design implication is not about placement at all: **phase 2 is cheap when the remainder
+fits in aggregate compute RAM and expensive when it does not**, by a factor of the iteration
+count. If it does fit, the network carries only whatever the algorithm itself needs — shuffles
+and reductions — and DeLawson is not in the loop.
+
+⚠️ Which suggests the useful thing for DeLawson to offer Compute is not locality-aware placement
+but a way to know, and to report, whether a job's remainder will fit. That is a scheduling input
+nobody has designed.
 
 ---
 
@@ -3296,84 +3378,86 @@ Roughly in order of how much else depends on them.
     plaintext location, while an FE cache of whole objects removes a hop but does.
 19. **The broadcast tool for Compute** (§9.6.2): tree fan-out, how a job's vertex set is
     discovered, and what happens when a forwarding vertex dies mid-distribution.
-20. **Compute allocation** (§1.4.5). Cosmos had Virtual Clusters — guaranteed capacity per
-    group, free use of idle capacity. DeLawson has Compute machines and no allocation model at
-    all, and §12 means whatever model appears has to be billable.
-21. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
+20. **Compute allocation** (§5.12). Not Virtual Clusters, but nothing yet in their place, and
+    §12 means whatever appears has to be billable.
+21. **Telling a job whether its remainder fits** (§5.12.2). Phase 2 is a memory workload or a
+    storage workload depending on the filtering ratio, differing by the iteration count. That
+    looks like the most useful thing DeLawson could tell a scheduler, and nothing computes it.
+22. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
     and domain constraints interact: a markedly emptier domain attracts weighted picks and
     then rejects them, which is worst right after adding capacity. Bounded, but worth
     measuring.
-22. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
+23. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
     safe, but who chooses the primary, and how a new one is appointed when it fails, is
     undesigned.
-23. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
+24. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
     must be chosen together; a Raft log index is a natural per-ring counter, but what an
     SCN is scoped to is unsettled while objects span many rings.
-24. **Expected object count** (§14.5). DN cost scales with object count rather than
+25. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-25. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
+26. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-26. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+27. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-27. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+28. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-28. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+29. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-29. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+30. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-30. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+31. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-31. **Background loop scheduling** (§13.2): prioritisation and rate limiting
+32. **Background loop scheduling** (§13.2): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-32. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+33. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-33. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+34. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-34. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+35. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-35. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+36. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-36. **Remaining directory semantics** (§5.1): listing huge directories,
+37. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-37. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+38. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-38. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+39. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-39. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
+40. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
     both sides: coarse granules compress better and bill less, fine granules cut read
     amplification, which is a 50× throughput factor for point reads.
-40. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+41. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-41. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+42. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-42. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+43. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-43. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
+44. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
     attribution, instantaneous-usage contract, reporting granularity. Slack itself is
     settled at 2× (§4.7).
-44. **Key custody within KS** (§7.3): how the daily master keys are themselves
+45. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-45. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+46. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-46. **Compaction policy** (§10) — now partly a pricing decision.
-47. **Membership and leader election** (§13).
-48. `Nul` and `\0` framing were both listed originally and are folded together
+47. **Compaction policy** (§10) — now partly a pricing decision.
+48. **Membership and leader election** (§13).
+49. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-49. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+50. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
