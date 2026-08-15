@@ -106,6 +106,11 @@ requests**. Such a user cares about when the *job* finishes and is indifferent t
 one of its zillions of requests took. Users who care about individual request latency exist
 and are welcome, but they are not who this is built for.
 
+That customer generates three distinct access patterns, and they want different things:
+sequential scans (§9.4), scattered point reads (§9.1), and **one small object read by every
+vertex of a job at once** (§9.6). The third is the one that breaks if treated as either of the
+others.
+
 The arithmetic behind the priority is Little's Law. Sustained throughput needs only
 `throughput × latency ÷ request size` requests in flight:
 
@@ -243,9 +248,10 @@ would be the natural one, which is still not *relocation*. Worth resolving befor
 absence of a rebalancer as a simplification.
 
 Finally, the public description **does not address the bootstrap recursion** — BigTable runs on
-Colossus while storing Colossus's metadata. §5.5.1's fixed-depth chain and bootstrap root are
-therefore derived here rather than borrowed, and remain the part of self-hosting with the least
-external precedent to check against.
+Colossus while storing Colossus's metadata. §5.5.1's answer is derived here rather than
+borrowed: the rings' Raft state is already a durable store that is *not* DeLawson, so the
+bootstrap root lives in DN0's Raft persistent data and needs no separate component. It remains
+the part of self-hosting with the least external precedent to check against.
 
 ### 1.5 One security invariant
 
@@ -978,20 +984,51 @@ whose metadata is in an object. It must terminate at a fixed, small depth.
 
 | Level | What | Where its own locator lives |
 |---|---|---|
-| 0 | **Bootstrap root** — tiny, strongly consistent, *outside* DeLawson | replicated by its own means |
+| 0 | **Bootstrap root** — in **DN0's Raft persistent state** | the ring's own consensus storage, not DeLawson |
 | 1 | **Partition map** — a keyed object: key range → metadata object | level 0 |
 | 2 | **Metadata objects** — keyed objects: object key → object metadata | level 1 |
 | 3 | **User objects** | level 2 |
 
-Three hops, not recursion. This is the same shape, and for the same reason, as
-BigTable's Chubby file → root tablet → METADATA tablets → user tablets.
+Three hops, not recursion. Same shape, and for the same reason, as BigTable's Chubby file →
+root tablet → METADATA tablets → user tablets.
 
-The bootstrap root must contain exactly what a DN would otherwise supply for
-level 1: the partition map's object id, its stream list (stream ids plus SN
-locations), its totals, and its key identifier. The partition map is small — a
-million partitions at ~300 B is ~300 MB, comfortably one stream — so **the root
-is a few kilobytes and changes almost never.** That is what makes it cheap to
-keep strongly consistent by other means.
+**The root needs no new component.** Every ring is a Raft ring (§5.7), and **ring state is made
+persistent by Raft — a log and snapshots on local disks — not by DeLawson.** So a
+non-self-hosted durable store already exists in the system, and the bootstrap root is simply
+distinguished content in the Raft state of a distinguished DN ring, **DN0**. Nothing has to be
+invented, deployed, or operated separately.
+
+Its content is what a DN would otherwise supply for level 1: the partition map's object id, its
+stream list (stream ids plus SN locations), its totals, and its key identifier. The partition
+map is small — a million partitions at ~300 B is ~300 MB, comfortably one stream — so **the root
+is a few kilobytes and changes almost never**, which is trivial for a Raft snapshot to carry.
+
+This is what dissolves the recursion, and it is the piece Colossus's public description leaves
+unexplained (§1.4.4). The layering is three deep and acyclic:
+
+| Layer | Made durable by |
+|---|---|
+| DN metadata, user objects | DeLawson objects |
+| Object locators — the bootstrap root | **DN0's Raft state** |
+| Raft state | local disks, replicated across ring members |
+
+#### 5.5.1.1 Cold start has a definite order
+
+Because ring state is itself encrypted at rest (§5.9.1), the sequence matters, and it is
+acyclic only because KS is keyed differently from everything else:
+
+| Step | What comes up | Unlocked by |
+|---|---|---|
+| 1 | **KS ring** | operator secrets plus hardware devices (§7.3.2) — the only step needing humans |
+| 2 | **DN0 ring** | keys from KS; decrypts its Raft state |
+| 3 | The **bootstrap root**, read from DN0's Raft state | — |
+| 4 | Partition map → metadata objects → user objects | keys from KS |
+| 5 | **SN rings**, loading extent B-trees from their snapshots | keys from KS |
+| 6 | **ENs**, reporting disks (§13.1) | no keys needed to serve ciphertext |
+
+KS's own state is encrypted under the human-and-hardware unlocking key rather than under a
+DeLawson key, which is precisely what breaks the circle. Everything else can then be keyed from
+KS without any structure needing to read itself.
 
 Level 2 is partitioned rather than one global object mainly to bound contention
 and blast radius; a single keyed object could hold the whole namespace as far as
@@ -1788,9 +1825,11 @@ Consequences worth being explicit about:
   the hardware devices are present. There is no fully automatic recovery from a
   total KS outage, by design. This is a security choice being paid for in
   availability, and it should be an owned decision rather than a discovered one.
-- **There are two independent roots.** §5.5.1's bootstrap root anchors the *object*
-  hierarchy; the KS unlocking key anchors the *key* hierarchy. A cold start needs
-  both, and neither can be stored inside what it unlocks.
+- **There are two independent roots, and only one needs people.** §5.5.1's bootstrap root
+  anchors the *object* hierarchy and lives in DN0's Raft state, so it needs no ceremony; the KS
+  unlocking key anchors the *key* hierarchy and does. Since ring state is itself encrypted,
+  KS must come up first — §5.5.1.1 gives the full cold-start order, which is acyclic precisely
+  because KS is keyed by humans rather than by KS.
 
 #### 7.3.3 What the extent entry must record
 
@@ -2052,6 +2091,78 @@ Two places this generalizes:
 ⚠️ Hedge delays are undesigned. They differ per tier — an EN granule read, a metadata
 lookup, and a client-to-FE request over the internet have different normal latencies by
 orders of magnitude — so a single global value will be wrong everywhere.
+
+---
+
+### 9.6 Hot small objects: caching and broadcast
+
+A third access pattern, distinct from the sequential scans of §9.4 and the point reads of §9.1:
+**one small object read by an enormous number of consumers at once.** The motivating case is
+Compute — a big job ships tiny executables and config files to every one of its zillion
+vertices.
+
+Read amplification here is the job's vertex count, and that is not survivable by ordinary means:
+
+| Vertices | Total read for a 50 MB executable | Served from 4 instances on 4 disks |
+|---|---|---|
+| 10,000 | 0.5 TB | 625 s |
+| 100,000 | 5 TB | 1.7 h |
+| 1,000,000 | 50 TB | **17.4 h** |
+
+A job whose vertices should start in seconds cannot spend seventeen hours distributing its own
+binary. And replication does not rescue it: sustaining this from disk would need hundreds of
+thousands of disks for one 50 MB file.
+
+Two mechanisms are needed, and they address different parts of it.
+
+#### 9.6.1 A cache, at FE or EN
+
+Caching removes the *disk* from the path. A machine serving from RAM at ~10 GB/s does the work
+of fifty disks, so ~83 caching machines could distribute 50 TB in a minute — viable where 400,000
+disks is not.
+
+Where it lives is a real trade:
+
+| | Caches | For | Against |
+|---|---|---|---|
+| **EN** | ciphertext granules | already has the bytes; a few GB of RAM is nothing against 3 PB of disk; **adds no new plaintext location** | still costs a network hop per consumer |
+| **FE** | whole small objects | already on the path for authorization; removes the EN hop entirely | FE holds **plaintext** (§5.9.2), so it is a new place plaintext sits |
+
+⚠️ Undecided. The security asymmetry is worth weighing: an EN cache of ciphertext creates no
+new exposure, while an FE plaintext cache does.
+
+#### 9.6.2 Broadcast, which is the actual fix
+
+Caching reduces the cost per consumer; it does not change the fact that the total is *N* × *S*
+flowing out of a small number of machines. **Broadcast changes who provides the bandwidth.**
+
+Distributing through a tree among the job's own vertices — each receiving vertex forwarding to
+*f* others — moves the bottleneck from a handful of EN disks to the compute fabric's own NICs:
+
+| Fan-out | Depth at 10^6 vertices | Source sends | Elapsed at 10 Gbps |
+|---|---|---|---|
+| 4 | 9 | 200 MB | ~1.4 s |
+| **10** | **5** | **500 MB** | **~2 s** |
+| 32 | 4 | 1.6 GB | ~5.1 s |
+
+**17.4 hours becomes ~2 seconds** — a ~26,000× improvement — and the source reads the object
+*once*. The total bytes moved are unchanged; what changes is that they move across links which
+scale with the job, rather than across the four disks that happen to hold the extent.
+
+So DeLawson needs a **broadcast tool for Compute**, not merely a faster read path.
+
+Three things fall out:
+
+- **It does not violate the key boundary.** Vertices forward *plaintext* to other vertices of the
+  same job, all of which are already authorized for it (§1.5). No keys move, so peer distribution
+  is compatible with the invariant — worth stating, since it superficially looks like a breach.
+- **Billing stays honest by itself.** Reads are a billed dimension (§12.4), and a broadcast job
+  performs one read rather than a million. That is not a discount — it is what the job actually
+  costs, since the fan-out consumed compute-fabric bandwidth rather than storage. The incentive
+  and the cost point the same way.
+- **This is not the hot-spot problem of §1.4.4.** Read hot spots are unpredictable and gradual,
+  and their remedy is more instances. This is predictable, job-scoped, and all at once, and its
+  remedy is a tree. Conflating them would produce the wrong mechanism for both.
 
 ---
 
@@ -3050,81 +3161,85 @@ Roughly in order of how much else depends on them.
     is blind to read load. Colossus runs a balancing custodian, which suggests this is real.
     Adding instances to hot extents would fix it without relocating anything, but nothing is
     designed.
-18. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
+18. **Where the hot-object cache lives** (§9.6.1) — an EN cache of ciphertext adds no new
+    plaintext location, while an FE cache of whole objects removes a hop but does.
+19. **The broadcast tool for Compute** (§9.6.2): tree fan-out, how a job's vertex set is
+    discovered, and what happens when a forwarding vertex dies mid-distribution.
+20. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
     and domain constraints interact: a markedly emptier domain attracts weighted picks and
     then rejects them, which is worst right after adding capacity. Bounded, but worth
     measuring.
-19. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
+21. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
     safe, but who chooses the primary, and how a new one is appointed when it fails, is
     undesigned.
-20. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
+22. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
     must be chosen together; a Raft log index is a natural per-ring counter, but what an
     SCN is scoped to is unsettled while objects span many rings.
-21. **Expected object count** (§14.5). DN cost scales with object count rather than
+23. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-22. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
+24. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-23. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+25. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-24. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+26. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-25. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+27. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-26. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+28. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-27. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+29. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-28. **Background loop scheduling** (§13.2): prioritisation and rate limiting
+30. **Background loop scheduling** (§13.2): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-29. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+31. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-30. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+32. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-31. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+33. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-32. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+34. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-33. **Remaining directory semantics** (§5.1): listing huge directories,
+35. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-34. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+36. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-35. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+37. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-36. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
+38. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
     both sides: coarse granules compress better and bill less, fine granules cut read
     amplification, which is a 50× throughput factor for point reads.
-37. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+39. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-38. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+40. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-39. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+41. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-40. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
+42. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
     attribution, instantaneous-usage contract, reporting granularity. Slack itself is
     settled at 2× (§4.7).
-41. **Key custody within KS** (§7.3): how the daily master keys are themselves
+43. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-42. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+44. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-43. **Compaction policy** (§10) — now partly a pricing decision.
-44. **Membership and leader election** (§13).
-45. `Nul` and `\0` framing were both listed originally and are folded together
+45. **Compaction policy** (§10) — now partly a pricing decision.
+46. **Membership and leader election** (§13).
+47. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-46. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+48. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
@@ -3134,6 +3249,8 @@ Roughly in order of how much else depends on them.
 - logical vs physical extent size, which is compression (§6);
 - the metadata topology, now three explicit node types (§5);
 - whether the DN tier is self-hosted — it is, with a bootstrap root (§5.5);
+- where the bootstrap root lives — DN0's Raft persistent state, since ring state is made
+  durable by Raft rather than by DeLawson (§5.5.1);
 - whether summary maintenance can run away under self-hosting — it cannot, by
   the tail-only rule (§4.5, §5.5.2);
 - the hedging percentile — p99.9 or beyond, from the throughput priority (§1.4.1);
