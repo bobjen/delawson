@@ -988,6 +988,91 @@ Note the ordering this implies: **pick the disaster size to survive, which fixes
 fixes *m*/*n*.** Repair traffic is then whatever *k* makes it, and is a throughput cost rather than a
 reliability one.
 
+#### 4.3.2.2a Repair bandwidth is a network number, which makes the codec choice media-neutral
+
+The budget §4.3.2.2 spends is **network**, not device. Per EN at ~100 drives:
+
+| | Device aggregate | NIC (100 GbE) | Repair bound |
+|---|---|---|---|
+| HDD | 100 x 200 MB/s = 20 GB/s | 12.5 GB/s | **12.5 GB/s** |
+| SSD | 100 x 4 GB/s = 400 GB/s | 12.5 GB/s | **12.5 GB/s** |
+
+**Derived.** The network already binds in an HDD fleet, by 1.6x. It binds in an all-SSD fleet by 32x. So a
+media transition moves repair bandwidth by approximately nothing, and every repair-window figure in §4.3.3
+is denominated in network bytes.
+
+Two consequences.
+
+**The codec decision has no hardware-driven expiry.** Both the constraint (network volume) and the saving a
+local code buys (fewer bytes read to rederive) are denominated in the same unit, and neither depends on the
+device. So the patent question of §4.3.2.1 — and its ~$0.24/TB-month price — is unchanged by the HDD-to-SSD
+transition that §7.4 says is coming. It expires in 2034 and not before.
+
+**Locality is worth more, not less, when the network binds.** The point of a local code is reading 6 nearby
+blocks instead of 45 far ones, and that saving is priced in exactly the scarce resource. An earlier draft of
+this section argued the reverse from a 20x device-bandwidth improvement that does not exist.
+
+⚠️ In a *correlated* disaster the binding number is not any one NIC but the fleet's aggregate cross-section,
+so a spine oversubscription ratio multiplies every repair window in §4.3.3 directly. §5.12.3 assumes a flat
+intra-cluster network to argue affinity is unnecessary; **durability depends on that same assumption**, which
+is a heavier load than it was introduced to carry.
+
+#### 4.3.2.3 Erasure coding groups whole extents; it never splits them
+
+An erasure-coded stripe is a **grid of whole extents**. A cell is one extent, not a fragment of one, and
+parity is computed across cells. Nothing is ever split into shards and reassembled.
+
+**Asserted** (Bob, 2026-08-15), and it is the single most consequential structural fact about EC here. Four
+things follow.
+
+**Reads never touch EC.** Data cells are stored whole and independently readable, so the read path is
+identical for replicated and erasure-coded data. Erasure coding is purely a *repair-time* concern. That
+removes reconstruction from §1.4.2's read-amplification budget entirely, and it is why §9.3's sparse index and
+§9.1's three binary searches need no EC-aware variant.
+
+**Instances must be byte-identical in stored form.** Parity is computed over the stored bytes of whole
+extents, so the four instances of a cell must agree bit for bit — see §8.1.4, where this forces compression
+and encryption to happen *upstream* of the fan-out to four ENs.
+
+**Group members need equal physical length.** Extents seal on either the 32 MB physical bound or the 4 GB
+logical bound (§6), so a logical-limit seal comes out short and arbitrary. Either pad every cell to a fixed
+EC unit — pure waste, landing in §12.7's space-efficiency chain — or bin by size when forming groups. §13.5's
+daily job does the latter, and that is its most immediately measurable win.
+
+**A group spans unrelated objects, so deleting one member frees nothing.** Recomputing parity means reading
+the whole group, so hard-deleting a cell inside a live group is deferred and batched. This is precisely
+§12.7's "undeletable garbage" term, and it gives §8.4.1's deferred-decrement machinery a second consumer.
+
+**SN owns the group** (Asserted, Bob). Group formation is therefore constrained to extents belonging to
+streams on one SN. That is not an arbitrary restriction: it is what lets the repair priority sort of §13.4 and
+the verification loops of §13.1.10 both run locally, with no cross-SN accumulator.
+
+#### 4.3.2.4 The two variants are one code with a different data-instance count
+
+The 1.333x and 2.333x figures of §12.7.2.1 are the same 10x6 grid, differing only in how many instances each
+*data* cell gets. Parities always get one.
+
+| Variant | Cells stored | Overhead |
+|---|---|---|
+| 1.333x | 45 data x 1 + 15 parity | 60 / 45 = **1.333x** |
+| 2.333x | 45 data x 2 + 15 parity | 105 / 45 = **2.333x** |
+
+**Derived**, and it reproduces both of Bob's figures exactly, which is the check that the reading is right.
+
+Duplicating data cells buys a three-tier repair hierarchy:
+
+| Loss | Repair path | Extents read |
+|---|---|---|
+| 1 of 2 data instances | copy the sibling | **1** |
+| both data instances | local group | 5 |
+| local group insufficient | global solve | 45 |
+
+**And it explains the labels in §12.7.2.1.** "Always available" does not mean more durable — the code is the
+same. It means a read can never be forced to do EC work: there is always a live copy. At 1.333x a lost cell
+must be rederived before it can be served, hence "usually available, always reliable". The availability
+difference between the two tiers is entirely about whether §4.3.2.3's promise — EC stays off the read path —
+can ever be broken.
+
 #### 4.3.3 What size of disaster survives, and what it costs
 
 **Derived.** Given §5.6's placement — every fragment of an extent in a *distinct* failure domain —
@@ -1112,6 +1197,147 @@ for every candidate before committing to any.
 
 ⚠️ Running these is what settles the open questions about turbo-code disaster tolerance and about whether the
 LRC's thin guarantee (§12.7.2.1a) matters in practice. Both are arithmetic, not research.
+
+#### 4.3.3.2b All three candidate codes have minimum distance 8
+
+Before any simulation, the distances are computable and they are equal.
+
+| Code | Overhead | Cells | Formula | d |
+|---|---|---|---|---|
+| 10x6 LRC (45 data, 5 global, 10 local) | 1.333x | 60 | `n - k - ceil(k/r) + 2` = 60 - 45 - 9 + 2 | **8** |
+| `(12+3)x(5+1)` turbo | 1.5x | 90 | product: `d1 x d2` = 4 x 2 | **8** |
+| `(27+3)x(5+1)` turbo | 1.333x | 180 | product: 4 x 2 | **8** |
+
+**Derived.** Every one of them survives any 7 losses and no more, guaranteed. So the differences between them
+lie entirely in (a) how many cells there are to fail and (b) behaviour *beyond* d.
+
+That settles the tempting middle option. `(27+3)x(5+1)` reaches 1.333x overhead with an unencumbered code —
+the same overhead as the patented LRC — but it does so with **180 cells at the same distance 8**, twice as many
+chances to accumulate the eight failures that kill a stripe. Bob's guess that it would be less reliable is
+right, and §4.3.3.2c prices it.
+
+It also isolates what the patent actually buys. At equal distance, the LRC has the fewest cells *and* is
+**maximally recoverable** — its uncorrectable set is the information-theoretic minimum given the locality
+structure, which no product code matches at any overhead.
+
+#### 4.3.3.2c Product codes can be evaluated in closed form, with no Monte Carlo
+
+§4.3.3.2a asks for pattern counting. For product codes that count is a combinatorial identity, so half the
+comparison is free.
+
+A product-code erasure pattern is uncorrectable by iterative row/column decoding exactly when it contains a
+full rectangle of `d2` rows by `d1` columns in which every involved row and column exceeds its parity budget.
+The minimum-weight uncorrectable patterns *are* those rectangles, so for an `(m1+r1) x (m2+r2)` code the count
+of weight-`(r1+1)(r2+1)` failures is `C(m2+r2, r2+1) * C(m1+r1, r1+1)`.
+
+| Code | Overhead | Min-weight uncorrectable patterns | Tolerable random loss vs 4-instance |
+|---|---|---|---|
+| `(12+3)x(5+1)` | 1.5x | C(6,2)·C(15,4) = 15 · 1,365 = **20,475** | **~23%** |
+| `(27+3)x(5+1)` | 1.333x | C(6,2)·C(30,4) = 15 · 27,405 = **411,075** | **~13.5%** |
+
+The equal-lossiness point of §4.3.3.2 solves as `f* = (k / N_8)^(1/4)`, setting per-data-cell loss equal to
+4-instance data's `f^4`:
+
+- `(12+3)x(5+1)`: `(60 / 20475)^(1/4)` = **0.233**
+- `(27+3)x(5+1)`: `(135 / 411075)^(1/4)` = **0.135**
+
+**Derived.** So buying 1.5x down to 1.333x with a turbo code costs **1.7x in tolerable loss fraction, or ~8.9x
+more data lost at any given f.** That is the quantitative form of §4.3.3.2b's conclusion, and it is arithmetic
+rather than simulation.
+
+**Three caveats, all of which matter.**
+
+1. It assumes uniform independent loss. §1.1.1 says the regime that actually destroys data is *correlated*, so
+   this is the wrong model for the case we care most about — it is a code-comparison yardstick, not a
+   prediction.
+2. It assumes minimum-weight domination, which holds near break-even and fails badly above it.
+3. Those `f*` values sit in a regime where **everything has already lost fractions of a percent**. Reading
+   "13.5%" as "we tolerate 13.5% loss" would be badly wrong; at f = 0.135 four-instance data is losing
+   `0.135^4` = 0.03% of itself, which by §4.3.3.3 may already be a total loss to the customer.
+
+**And the yardstick is not a property of the code alone.** §13.4's repair scheduler changes how much data is
+lost at a given f, so `f*` is a property of **(code, scheduler)** jointly. The pattern counting above stands
+on its own and bounds the code; the equal-lossiness comparison between LRC and turbo cannot be done without
+the scheduler in the loop, driven by a loss *process* over time rather than a single random loss fraction. Any
+scoping of that work as "simulate the code" is scoped wrong.
+
+#### 4.3.3.2d Repair cost per rebuilt cell, and where the peak is
+
+For the 10x6 LRC, a row is 5 data + 1 local parity, so:
+
+- **one** loss in a row is **0 global repairs** — the local parity solves it, 5 reads;
+- **two** losses is **1 global repair** — solve one cell against the global parities, which drops the row to
+  one loss and lets the local parity finish;
+
+and in general the number of global repairs a group needs is
+
+```
+g = sum over rows of max(0, losses_in_row - 1)
+```
+
+A global pass costs ~45 reads regardless of `g`, because solving even one unknown against a global parity
+touches all 45 data cells. So the cost per rebuilt cell is:
+
+| Losses `m` | `g` | Reads | **Reads per fixed cell** |
+|---|---|---|---|
+| 1 | 0 | 5 | **5.0** |
+| 2 | 1 | 45 | **22.5** — the peak |
+| 3 | 2 | 45 | 15.0 |
+| 4 | 3 | 45 | 11.3 |
+| 5 | 4 | 45 | 9.0 |
+| 6 | 5 | 45 | 7.5 |
+| 7 | 5 | 45 | **6.4** |
+
+**Derived.** Two readings of this table drive §13.4.
+
+**Repair amplification is not monotonic in loss fraction.** It is 5 at tiny loss (everything is a local
+repair), spikes to 22.5 at the first forced global solve, then *falls* as more losses per group amortize the
+same 45 reads. A measurement taken at "small failure" and at "big disaster" straddles the worst case and
+reports that all is well.
+
+**The most at-risk repairable group is nearly the cheapest.** 6.4 reads per cell at m=7 against 5.0 for a
+local repair — a 1.29x penalty for repairing the thing that is one loss from unrecoverable. Risk-ordered
+repair is therefore almost free at the top end, and the only expensive class is `g = 1`.
+
+Turbo codes have the same shape with different constants: a column repair reads 5, a row repair reads 12, and
+a pattern needing the full iterative solve reads up to 60 — worse than the LRC's 45, and an iterative
+convergence rather than a one-shot solve. Combined with §4.3.3.2b and §4.3.3.2c, the patented code is better
+on overhead, on the tail, and on domain floor (§4.3.3.2e) — and **identical in the common case**, where both
+read 5. "We cannot use the LRC" costs 12.5% more space and a nastier worst case, not a slower steady state.
+
+#### 4.3.3.2e What a code costs in failure domains
+
+§5.6.1's 4/3 slack applies **per recovery set, at every nesting level at once**. For the
+`(12+3)x(5+1)` turbo code (Asserted, Bob, 2026-08-15):
+
+| Recovery set | Members | x 4/3 | Domains needed |
+|---|---|---|---|
+| `(5+1)` row | 6 | 8 | **8** |
+| `(12+3)` column | 15 | 20 | **20** |
+| full stripe | 108 | 144 | **144** |
+
+**Derived** that the rule is exactly `ceil(4k/3)` — the three figures reproduce as 8, 20 and 144. ⚠️ The third
+only works if the stripe is 108 cells; `(12+3)x(5+1)` is 15 x 6 = **90**, which wants 120. Either the grid is
+`(15+3)x(5+1)` = 18 x 6 = 108, or 144 should read 120. This needs settling because it is the figure that
+decides where a code reaches its designed reliability.
+
+Note what the slack is and is not. It inflates the **domain count requirement** without touching the 1.5x
+space overhead — see §5.6.1, where the same ratio is derived from solver cost.
+
+| Scheme | Overhead | Domains for designed reliability |
+|---|---|---|
+| 4 instances | 4x | **6** |
+| 10x6 LRC | 1.333x | **80** |
+| `(12+3)x(5+1)` turbo | 1.5x | **120-144** |
+
+**These are not minimum cluster sizes.** §5.6.7 is explicit that an unenforceable rule is simply not enforced,
+so every code works on one machine. The table says where a code **achieves its designed reliability** — below
+80 domains a 10x6 LRC still functions and still returns data, it just does not deliver 1.333x-code durability.
+
+**Which argues for a ladder rather than a code.** Adopters of an open-source store start small (§1.0.1), so
+the durability scheme must be a recorded per-group property like media class (§7.4), with promotion between
+rungs done as compaction-with-a-different-target (§10) — machinery that already exists. §4.3.3.2a's evaluation
+procedure should then be run **per rung**, not once.
 
 #### 4.3.3.3 "Lost" is a customer's judgement, not ours
 
@@ -1937,6 +2163,38 @@ or not — and there is nowhere to put a replacement, so the group stays degrade
 until that domain comes back. Slack buys somewhere to re-place, which is what
 turns repair from *waiting* into *work*.
 
+#### 5.6.1a What slack is actually for, and why the ratio is 4/3
+
+The paragraph above gives the wrong rationale. **Slack is for making the solve cheap and for preventing
+hardware hotspots** (Asserted, Bob, 2026-08-15) — not for reserving somewhere to re-place.
+
+**The solve cost has a closed form.** Placing the *last* of *k* members into *n* = *s·k* domains, a random
+draw hits an unused domain with probability `(n-k)/n = (s-1)/s`, so the expected number of draws is
+`s/(s-1)`:
+
+| Slack *s* | Expected draws for the hardest member |
+|---|---|
+| 1 | infinite — a perfect matching, and one domain down makes it infeasible |
+| 5/4 | 5 |
+| **4/3** | **4** |
+| 3/2 | 3 |
+
+**Derived**, and it is what makes 4/3 principled rather than round: it buys a four-draw expected solve for the
+hardest member of a recovery set. At zero slack §5.6.3 is not sampling at all — it is a matching problem with
+essentially one solution up to permutation, which goes infeasible the moment a domain is unavailable.
+
+**And it is what gives free-space weighting any power.** With no slack there is no choice to make, so §5.6.3's
+weighting is decorative and a full, slow, or degraded domain still gets its share. Slack is the ability to
+route *around* a bad domain while still satisfying the rule. That is a balance-and-availability argument, not
+a durability-reserve one.
+
+**The ratio has a counter-pressure, which sets the search direction.** Slack cannot be turned up for free,
+because domains cannot be manufactured: "4/3 slack" means *do not enforce a rule unless the cluster has 4/3x
+the domains the recovery set needs* (§5.6.7). Raising the threshold makes solving cheaper and simultaneously
+**turns rules off in mid-size clusters**, weakening independence exactly where it is already thinnest. So the
+correct tuning procedure is to start at the smallest slack that solves acceptably and raise only until the
+time budget of §5.6.10 is met — never higher. That is the opposite of how a knob like this is usually tuned.
+
 #### 5.6.2 Nested, not orthogonal
 
 Domain types must be **nested** — each a refinement of the one above, forming a
@@ -2076,6 +2334,124 @@ one budget per orthogonal dimension.
 is how clusters are built today. This is a compatibility concession and a known
 defect, not a design choice, and it should be labelled as such wherever it is
 configurable — it costs the exponent in §5.6.2.
+
+#### 5.6.7 An unenforceable rule is not enforced, and the minimum cluster is one machine
+
+**The minimum viable cluster size is 1 machine** (Asserted, Bob, 2026-08-15). If a placement rule cannot find
+a domain type with enough domains, **the rule is not enforced.** It does not fail, and it does not block the
+write.
+
+- In the degenerate single-machine case, 4-instance reduces to 1-instance and EC's two copies per data extent
+  reduce to one.
+- As the cluster grows and more domain types acquire enough domains, 4-instance placement and the rules of
+  §4.3.3.2e start making use of them, with no migration required.
+- Because domains are **nested** (§5.6.2), a rule whose natural domain type is too small degrades to the
+  finest nested type that does have enough domains. Orthogonal domains could not express that fallback, which
+  is one more instance of §5.6.2's "orthogonal is a bug".
+- **All placement rules are enforced independently.** Each is a separate filter, applied or skipped on its own.
+
+**This is the adoption path, not a concession.** §1.0's purpose is an open-source store, and people evaluate
+those on one machine before deploying them. A cluster that refused to write until it had 80 failure domains
+would never be evaluated at all. An earlier draft of this section argued that placement should fail loudly
+rather than degrade; that is wrong for placement rules, and right only for the distinct case in §5.6.10.
+
+**Oscillation causes no churn**, for two reasons that both hold:
+
+1. A placement spread over 80 domains still satisfies the rule vacuously at 79, and still satisfies it on the
+   way back to 80. The predicate is monotone in the right direction.
+2. More fundamentally, **placement is decided at write time and never revisited** for rule reasons — which is
+   the same fact §13.1.2 states as "there is no rebalancing". Nothing moves, so oscillation cannot move it.
+
+#### 5.6.8 Therefore achieved durability is a per-group property, not a cluster property
+
+Because placement is fixed at write time and never revisited, a five-year-old cluster holds extents placed
+under many different sets of enforceable rules. **"How durable is my data" cannot be read off the
+configuration** — it has to be computed from actual placements.
+
+That is what §13.5's daily job should audit: the *realized* independence of each EC group, not a prediction of
+feasibility. It is also the input §4.3.3.2c's simulation actually needs, since a real fleet is a mixture of
+independence levels rather than a single one.
+
+**And independence self-heals opportunistically, without a rebalancer.** Extents written during a dip below a
+threshold keep their weaker placement, but compaction, media migration (§7.4) and code promotion (§4.3.3.2e)
+rewrite extents anyway, and a rewrite places under whatever rules are enforceable *then*. The fleet drifts
+toward better independence as a side effect of work it already does. Nobody should later add a rebalancer to
+accomplish this.
+
+⚠️ On a single machine with ~100 disks, **disk is a domain type with plenty of domains**, and §5.3.1 already
+places on disks rather than ENs with a 1-byte disk field for exactly that reason. So four instances on four
+disks of one machine is expressible and protects against the most common failure there is. Collapsing to
+1-instance whenever the *EN-level* rule is unenforceable gives that up. The reading taken here is that the
+collapse happens when the **finest** type is also exhausted — one disk, or few enough that the rule fails at
+disk level too. If the intent is to collapse at the EN level regardless, the reasoning needs recording,
+because the difference is 4x in space.
+
+#### 5.6.9 Placement is a solver whose answer is persisted, so the steady state is verification
+
+Placement *is* a constraint solve (Asserted, Bob, 2026-08-15) — the earlier claim in this section that it is
+merely a sequence of independent filters is wrong. What keeps it cheap is that **the solution is persisted in
+the order of the instance list**, so the recurring cost is verification rather than search:
+
+- **Solve once**, when the extent is created or when it converts from 4-instance to EC.
+- **Verify** thereafter: rebuild the rules and check they are obeyed, with no attempt to re-derive an ordering.
+- **Repair is an incremental single-slot solve** against an already-valid assignment — one filtered
+  weighted-random draw per §5.6.3, not a stripe-wide search.
+
+**The rules are little hash tables**, indexed by `ExtentId & (tablesize - 1)`, and verification looks for
+collisions. `ExtentId` is dense and system-assigned, so it is already well distributed and no real hash
+function is needed. Table sizes follow §4.3.3.2e's thresholds — 8, 32, 256 — so they are stack-allocated,
+cache-resident, and verification is O(members) per rule with no sorting and no set allocation.
+
+**Collision-freedom comes from the stored assignment, not from the hashing**, and the arithmetic shows it must:
+six members into an 8-slot table are all distinct with probability `8·7·6·5·4·3 / 8^6` = **0.077**, so a random
+slot would collide 92% of the time. **Derived.** The mask is how the table is *indexed* cheaply; the ordering
+is what makes it collision-free.
+
+**Two invariants this creates.**
+
+**The instance list's order is semantic.** The per-extent list of 6-byte references (§5.3.1) carries the
+solution in its positions, and position also gives the EC cell role of §4.3.2.3 for free. So the list must
+never be sorted, deduplicated, or reordered for lookup speed. That is exactly the kind of locally-harmless
+optimization someone applies to a small unsorted array, so it belongs as an assertion next to the type.
+
+**Collision-freedom and slack are different checks.** Verifying no collisions says the current assignment is
+valid. It says nothing about whether the next repair will *find* a free slot, which is a count of available
+domains, not a collision test. Both are cheap; conflating them produces a fleet that verifies clean right up to
+the moment it cannot place a replacement.
+
+#### 5.6.10 Both cadences are guesses gated on measurement, and the two gates are separate
+
+4/3 and the one-minute loop of §13.1 are guesses. The real test is to implement and time it, with **the cadence
+gated on verification speed and the slack gated on solve speed** (Asserted, Bob, 2026-08-15). The two are
+independent: verification is O(members) regardless of slack, and the solve does not care how often verification
+runs.
+
+**The most frequent hard solve is the 4-instance-to-EC conversion**, which places a whole group plus its
+parities. Its rate is derivable: at 1 TB/s cluster ingest and 32 MB physical extents, ~30,000 extents seal per
+second, forming ~670 EC groups/s, or roughly **22 group placements per second per SN** at ~30 SNs. To hold that
+under a quarter of a core, a full group solve must come in under **~10 ms**. **Derived**, and loose enough that
+a reasonable rejection-sampling implementation should clear it by a wide margin — which is itself worth
+confirming, because failing it by 10x would mean something structural rather than something tunable.
+
+The requirement is that placement be **solvable nearly always for all cluster shapes, and very fast on
+average.** For any code there are a handful of hardest shapes, where several placement rules are tight against
+the slack at once. Those are enumerable, so they should be a permanent regression suite: domain counts sitting
+exactly at each threshold of §4.3.3.2e, several rules tight simultaneously, skewed free space, one domain full,
+one domain down.
+
+**The suite's assertions must be on latency percentiles, not on success.** The failure mode being guarded
+against is not a wrong answer; it is a solve that takes ten seconds under a shape nobody tested. A suite that
+asserts only "placement succeeded" passes straight through it.
+
+**And a solver timeout must not be handled like insufficient domains.** These need opposite treatment:
+
+| Condition | Nature | Correct response |
+|---|---|---|
+| Not enough domains | permanent, a property of the cluster | drop the rule (§5.6.7) |
+| Solver out of time | transient, a property of load | **defer and retry** |
+
+If they share a code path, a load spike permanently degrades the independence of everything written during it,
+and per §1.1.1 that is discovered during the disaster.
 
 ### 5.7 Ring composition: consensus membership is not RAM membership
 
@@ -2665,6 +3041,81 @@ has ENs caching keys and therefore doing crypto. That asymmetry — compression
 elsewhere, encryption possibly on the EN — is a constraint on §5.9.2's open question,
 not an answer to it.
 
+#### 7.1.1 Where the granularities come from: seek cost equals scan cost
+
+The device figures §9.3 uses are not arbitrary. The break-even byte count is
+
+```
+B = access_latency x sequential_bandwidth
+```
+
+— the point at which the time to seek equals the time to scan the bytes you skipped.
+
+| Device | Latency | Bandwidth | Break-even | Index interval | Min read |
+|---|---|---|---|---|---|
+| HDD | ~10 ms (seek + rotation) | ~200 MB/s | **2 MB** | 1 MB | 1 MB |
+| NVMe SSD | ~10 us | ~4 GB/s | **40 KB** | 20 KB | 20 KB |
+
+**Derived**, reproducing Bob's 2 MB and 40 KB.
+
+**The interval is half the break-even, and "half" has a reason.** Once scan time falls below seek time, halving
+the index interval again cuts total read cost by at most a third while doubling index size. At half break-even
+the seek is 2/3 of the read and further densification buys almost nothing. The same number falls out from the
+opposite direction: if a seek is being paid at all, read at least half break-even so it is amortized. Two
+independent arguments landing on one number is why this is a design point rather than a taste.
+
+**The HDD figure is robust; the SSD figure is not.** HDD spans 1-3 MB across plausible drives (5-13 ms,
+200-250 MB/s) — +/-50%, safe to build on. SSD spans **4 KB to 320 KB**, an 80x range: 10 us is Optane-class or
+a very good NVMe at queue depth 1, NAND NVMe is 80-100 us (giving 320 KB), and at high queue depth a modern
+drive reaches full bandwidth at 4 K random, pushing break-even down to the page size. Since §1.4 has DeLawson
+issuing zillions of tiny requests in parallel, **queues will be deep**, which argues the effective figure is
+well below 40 KB. ⚠️ This is the number to measure earliest; it is the only one in this section that spans two
+orders of magnitude across defensible assumptions.
+
+**Intervals must be measured in physical bytes, not logical.** The trade is about bytes crossing the device,
+and compression ratios span 1x to 128x (§12.3), so a logical-interval index would give wildly different
+physical scans per object. §9.3 already stores physical offsets; this is the reason.
+
+**The index sizing then works out with a symmetry worth noticing.**
+
+- **HDD, 1 MB interval, 32 MB extent** — 32 entries, ~384 B per extent. That is ~4x the ~100 B SN extent budget
+  of §4.7, so it cannot live on SN; it lives in the extent, EN-side. Per EN at 2 PB / 32 MB = 62.5 M extents
+  that is ~24 GB, which is affordable to **cache in EN RAM** — and worth caching, because a cold read that
+  fetches the index first costs two seeks and doubles the expensive thing.
+- **SSD, 20 KB interval** — ~1,600 entries, ~19 KB per extent: 0.06% space overhead, far too much to cache
+  broadly. So it stays on the device and is fetched on demand, which is fine precisely because SSD seeks are
+  cheap.
+
+The device with the expensive seek gets the small cacheable index; the device with the cheap seek gets the large
+index it can afford to fetch. Both fall out of the same ratio, so this is not a coincidence to be maintained by
+hand.
+
+#### 7.1.2 Compression improves HDD read bandwidth and degrades SSD read bandwidth
+
+Compression helps *bandwidth* only when the decompressor is faster than the device it is feeding. Reading `B`
+logical bytes at ratio `r` with decompression speed `D` takes `B/(r·BW) + B/D`, which beats `B/BW` exactly when
+
+```
+D > BW · r/(r-1)          (at r = 2: D > 2·BW)
+```
+
+| Device | Bandwidth | Threshold *D* at r = 2 | LZ4, ~4 GB/s/core |
+|---|---|---|---|
+| HDD | 200 MB/s | 400 MB/s | **wins**, ~10x over |
+| SATA SSD | 550 MB/s | 1.1 GB/s | **wins** |
+| NVMe | 4 GB/s | 8 GB/s | **loses** |
+
+**Derived**, and it confirms Bob's statement that no codec is fast enough to improve SSD read performance —
+zstd at ~1-2 GB/s loses even on SATA. The general rule, which is what should be recorded rather than the
+verdict, is that **compression helps when device bandwidth is below about half the decompressor's speed**. Over
+a build measured in years the device side moves and the codec side does not.
+
+**This does not make compression optional.** DeLawson compresses regardless, for capacity and for §12.3's
+physical billing. What the arithmetic says is that on an SSD, compression is simultaneously a capacity win and a
+bandwidth loss — and that is **not a conflict the system has to adjudicate**, because physical billing already
+makes it the user's economic choice: declining compression costs them more physical bytes and buys them
+bandwidth. One more case where billing proportional to cost removes a policy decision instead of adding one.
+
 ### 7.2 Encryption details
 
 - Block-granular mode with a per-block IV/tweak derived from
@@ -2791,6 +3242,66 @@ encrypted, ENs would need no keys at all. Which machine performs which stage is
 undecided and determines where plaintext exists.
 
 ---
+
+### 7.4 Media classes, and why an extent has exactly one
+
+**There will be an HDD-to-SSD transition, and the fleet will be mixed for a decade.** §12.7.2's drive lives ten
+years, so anything purchased now is in service into the mid-2030s. If SSD manufacturing overbuilds and its price
+falls to HDD's, there is no motive to buy HDD and it goes away (Asserted, Bob, 2026-08-15) — but gradually. So
+**media class is a permanent configuration axis, not a migration event.**
+
+#### 7.4.1 Every device-dependent constant belongs in one table
+
+The constants of §7.1.1, §7.1.2 and §9.3 are **per media class**, not global: index interval in physical bytes,
+minimum read size, compression block size, the staging bypass threshold of §8.1.4, whether compression is a
+read-bandwidth win, and repair bandwidth. Those belong in a single device-class table in the config, populated
+by measurement — not as five constants scattered through the code. That is cheap now and unpleasant in year
+three, and it is a decision for the config schema being built first.
+
+#### 7.4.2 An extent has exactly one media class, and so do all four of its instances
+
+**Mixed-media extents are not supported** (Asserted, Bob, 2026-08-15). The derivation:
+
+1. Minimum read size is per-media — 1 MB HDD, 20 KB SSD (§7.1.1).
+2. Compression block size must be at least the minimum read, and larger blocks compress better (§7.1), so the
+   optimal block differs by ~50x between media.
+3. EC operates on stored bytes, so instances must be byte-identical in stored form (§4.3.2.3). Different block
+   sizes make that impossible, and re-deriving parity from decompressed content would need keys on the parity
+   path and full decompression.
+4. Therefore compression block size is a **durable property of the extent** — unlike record framing, which
+   §8.2.1 explicitly says is *not* — and so is media class.
+5. Therefore all four instances are same-media.
+
+Encryption reinforces the same conclusion: block boundaries and IV structure would also have to match (§7.2).
+
+**Five consequences, all mild, which is a sign this is the natural constraint.**
+
+- **A fast-read copy is a tier or a cache, never an instance.** §9.5's hedging stays within one media class.
+  Cross-media speedup must be a separate object or an explicit cache, which is honest about its cost instead of
+  hiding it. ⚠️ An earlier draft proposed one SSD instance plus three HDD instances per extent; that is
+  unavailable, and the reasoning above is why.
+- **Media migration is compaction with a different target.** Rewriting an extent at a new block size is what §10
+  already does, so migration is a policy input to an existing loop rather than new machinery — and it inherits
+  the retention rule of §10.1 automatically, since it is a rewrite.
+- **Placement filters by class before selecting.** §5.6.3's free-space-weighted choice with rejection sampling
+  runs *within* a class.
+- **A media class cannot be piloted.** The 4/3 slack and the independence rules must be satisfiable inside the
+  class alone (§5.6.1a, §4.3.3.2e), so introducing SSD means introducing a placement-viable footprint of it, not
+  a few drives per rack.
+- **The same logical object costs different physical bytes on different media**, because block size changes the
+  ratio. Under §12.3's physical billing that is automatically correct rather than a special case, but it does
+  mean media must be a **visible, priced attribute** — a user cannot be surprised by their bill changing after a
+  migration they did not request.
+
+#### 7.4.3 What the transition does not change
+
+- **Repair bandwidth**, which is a network number either way (§4.3.2.2a) — so the codec choice, and the patent
+  question, are media-neutral.
+- **Compression as a requirement**, since capacity dominates cost whichever device holds it (§12.3).
+- **Extent size**, which is governed by SN RAM (§14.1) rather than by the device.
+
+The exposure is entirely in the constants, which is the good case — provided they are constants in a table and
+not constants in the code.
 
 ## 8. Writing
 
@@ -3026,6 +3537,140 @@ fast, serialized token service and let clients write the data directly to storag
 separation of the serialized window from the data path taken to its conclusion — the sequencer *is* nothing but
 the critical section. If per-extent offset assignment ever became a bottleneck, that is the shape to borrow.
 
+#### 8.1.1a-7 Which offset is reportable depends on the object flavour
+
+| | Unsealed extents | Reportable offset |
+|---|---|---|
+| **Unkeyed** (append at end) | exactly one — the tail of the last stream | **object logical offset** |
+| **Keyed** (insert in middle) | several at once | **extent-relative only** |
+
+For an unkeyed object,
+
+> object logical offset = sum of sealed extent logical lengths + offset within the tail extent
+
+is **well defined, dense, stable, and writer-predictable**. There is exactly one place appends can land, so the
+prior sum is fixed.
+
+**Keyed objects insert in the middle and therefore have several unsealed extents at once**, so no such sum
+exists. Only the **extent-relative** offset is available, and §10's coalescing can rewrite an extent into other
+extents and take its offsets with it.
+
+**So compare-and-append is an unkeyed-object mechanism.** Keyed objects do not need it: an insert names a key,
+so re-inserting the same key with the same value is naturally idempotent and with a different value is an
+update. **The key is the position**, and idempotency comes from key comparison rather than from an offset token.
+
+One addition worth stating plainly, because it applies to both flavours: **offsets are never a durable
+reference.** Only record numbers and keys are (§4.6.3, §8.1.1a-10).
+
+#### 8.1.1a-8 The cost: one open extent bounds the per-object append rate
+
+Having exactly one unsealed extent is *what makes* the object offset well defined, and it serializes appends
+through one extent whose instances sit on one disk each.
+
+| | |
+|---|---|
+| Per-object append rate | **~200 MB/s** — one disk's write bandwidth |
+| Against a 1,000-EN fleet's read capability | ~125,000x lower |
+| Aggregate, 10,000 objects appending | 2 TB/s — unaffected |
+
+**Derived.** The ceiling is per-object, not fleet-wide, which is fine for most workloads and awkward for exactly
+the one §1.0 names: many writers recording shared experiences into one object, wanting both a single ordered
+sequence and stable references. §8.6 works that conflict through and finds it is a trilemma rather than a
+choice.
+
+#### 8.1.1a-9 Prior art for the receipt: VSAM returns it, POSIX does not
+
+Two questions were asked separately and have opposite answers.
+
+**Is there a standard append interface that returns the offset?** Yes, and it is old. **VSAM ESDS**: a `PUT` to
+an entry-sequenced data set appends at the end and **returns the record's RBA to the application, and that RBA
+is constant thereafter**, usable as a direct-access address (Cited: [IBM, relative byte
+addresses](https://www.ibm.com/docs/en/epfz/6.1.0?topic=sets-relative-byte-addresses-rba); [IBM CICS: KSDS,
+ESDS, RRDS](https://www.ibm.com/docs/en/cics-ts/5.5.0?topic=control-vsam-data-sets-ksds-esds-rrds)). That is
+compare-and-append's receipt, from the 1970s. The SQL analogue is Oracle's `INSERT ... RETURNING ROWID` and the
+identity-retrieval family: the system picks the address, the response reports it, the address is durable.
+
+**POSIX is the opposite.** `write(2)` under `O_APPEND` atomically positions at end-of-file, but returns the byte
+*count*, never the position; obtaining the position needs a separate racy `lseek`/`fstat`, and NFS cannot even
+provide the atomic append underneath it (Cited: [POSIX
+`write`](https://pubs.opengroup.org/onlinepubs/9699919799/functions/write.html); [appending from multiple
+processes](https://nullprogram.com/blog/2016/08/03/)).
+
+**Are there systems with several unsealed tails, where the object offset becomes known only later?** None found.
+Every system that permits parallel unsealed regions **removes the global offset from the write response rather
+than deferring it**, in one of two shapes:
+
+| Shape | Systems | Position name space |
+|---|---|---|
+| **Compound id** | Pulsar / BookKeeper | `MessageId` = (ledgerId, entryId); one ledger open at a time |
+| | Kafka | offsets are per-*partition*; a topic has no offset at all |
+| | Iceberg positional deletes | `(file_path, pos)` — row position within a data file, never table-wide (Cited: [Iceberg spec](https://iceberg.apache.org/spec/)) |
+| **Two-phase** | S3 / Azure / GCS multipart upload | `UploadPart` returns an ETag against a part *number*; byte layout is defined by `CompleteMultipartUpload` |
+| | BigQuery Storage Write API | pending streams have **per-stream offsets starting at 0**; table order is defined atomically by `BatchCommitWriteStreams` (Cited: [batch load](https://docs.cloud.google.com/bigquery/docs/write-api-batch), [intro](https://docs.cloud.google.com/bigquery/docs/write-api)) |
+
+And everything that *does* return an offset synchronously has exactly one unsealed region: GFS `RecordAppend`,
+Azure append blob `AppendBlock` (§8.1.1a-5), Kafka's single active segment per partition, Corfu's sequencer
+(which assigns *before* the write).
+
+**So the eventually-known-offset interface is unattested** (Guess, from absence — absence is not proof, but the
+consistency is a signal: everyone who needed the parallelism paid for it by changing the name space, not by
+deferring the answer). Three reasons it is worse than it looks, all Derived:
+
+1. **Order must be fixed at extent *creation*, not seal**, or the sum of prior lengths never converges. So
+   extent slots would be allocated eagerly and filled lazily, committing extent count before the bytes exist.
+2. **Resolution is head-of-line blocked.** One stuck unsealed extent leaves every append after it unresolvable,
+   indefinitely. Offset availability becomes coupled to the slowest concurrent writer rather than to your own
+   durability — a promise with no time bound, which §1.1 argues is the worst kind here.
+3. **Two answers over time for one append** is a cache-invalidation problem pushed into every client and every
+   external index, which is precisely what §1.0 promises not to have.
+
+**Conclusion.** The append response carries the address the system can guarantee forever — the compound
+`(stream, record number)` for unkeyed data, the key for keyed — and never a position in a name space that has
+not been decided yet. §8.6 shows the eventually-known object offset is still real, but as a consequence of
+*sealing* rather than a promise made at append time.
+
+#### 8.1.1a-10 Three tiers of reference lifetime
+
+| Tier | Reference | Known | Lifetime |
+|---|---|---|---|
+| **Durable** | `(object, key)` keyed; `(stream, record number)` unkeyed | immediately | forever |
+| **Hint** | `(extent identity, row number in extent)` | immediately | **until that extent is rewritten** |
+| **None** | object offset, or object row number for keyed data | never | — |
+
+Row number within an extent **is** stable and can be returned immediately; what makes it a hint rather than a
+name is that §10 may rewrite the extent (Asserted, Bob, 2026-08-15).
+
+**What makes the middle tier safe rather than dangerous is already in §4.6.3**: extent identity is
+`(SnId, ExtentId, creation second)`, so a rewritten extent has a **different identity**. A stale hint therefore
+fails **detectably** — a clean "that extent is gone" rather than a silent read of whatever now occupies the slot.
+If extent ids were reused, the same hint would be a corruption vector. The creation second, introduced to
+disambiguate reuse after deletion, is what licenses returning extent-relative row numbers at all.
+
+**Oracle solved exactly this, for exactly this reason.** A secondary index on an index-organized table cannot use
+a physical rowid "because of the inherent movability of rows in a B\*-tree index", so it stores a **logical rowid
+= primary key + a physical guess** at the block address. On lookup the guess is tried; if the block is not what
+was expected it falls back to the primary-key search, and the logical rowid stays valid regardless. Oracle even
+meters the decay: `PCT_DIRECT_ACCESS` in `DBA_INDEXES` is the percentage of guesses still valid, and partition
+maintenance is called out as invalidating them wholesale. (Cited: [Oracle: speeding up index access with
+IOTs](https://docs.oracle.com/cd/A97630_01/appdev.920/a96590/adg07iot.htm); [Oracle 26c: indexes and
+IOTs](https://docs.oracle.com/en/database/oracle/oracle-database/26/cncpt/indexes-and-index-organized-tables.html);
+[Foote, the logical rowid guess component](https://richardfoote.wordpress.com/2012/04/26/iot-secondary-indexes-the-logical-rowid-guess-component-part-i-lucky/).)
+
+That is the pattern for DeLawson keyed objects verbatim: an external index stores the key and *may* cache
+`(extent, row)` as a hint; on miss it re-resolves by key. Keyed objects therefore need no new mechanism — the key
+lookup is the recovery path that has to exist anyway.
+
+**Hint lifetime is a compaction-policy number.** With base-plus-log (§4.2), a hint into the base dies at every
+compaction and a hint into the log dies when the log merges, so expected validity is about the compaction
+interval. That makes compaction frequency a **three-way** trade rather than two-way: write amplification, read
+amplification, and hint hit rate. It argues for exposing a `PCT_DIRECT_ACCESS` analogue per object, since an
+index whose guesses have all gone stale is silently paying double lookups — and §12.1 says a cost that real
+should be visible.
+
+**Hints are a keyed-object optimization specifically.** For unkeyed objects the durable reference is already a
+direct address and the fallback is exact and cheap (§9.1's three binary searches), so they barely need hints.
+Keyed is where positions move.
+
 #### 8.1.1b What others do, and what DeLawson still needs
 
 | System | Approach to concurrent append |
@@ -3111,6 +3756,85 @@ Two things depend on this:
 
 The SN does learn of the outcome, but lazily: extent size and byte totals are the mid-tree
 summaries §4.5 keeps lazy, and the sync loops of §13.1 reconcile the rest.
+
+#### 8.1.4 EN-internal staging: common extents
+
+Appends do not land directly in their final extent. Each EN has its own **common extents**, likely on SSD, which
+absorb arriving appends; the EN tracks the offsets those appends will occupy in their **final** extents, and
+coalesces into the final extents immediately. **The `(extent, offset)` returned by an append names the final
+extent, never a common extent** (Asserted, Bob, 2026-08-15).
+
+**Common extents are single-copy and purely EN-internal.** Each of the four ENs stages independently, and *that*
+is the durability: four staging copies on four ENs chosen for failure independence (§5.6) have identical exposure
+to the four final instances. So the SSD needs no RAID and no replication of its own, and an EN that loses its
+staging device is repaired by the ordinary instance-repair path (§13.1) — no new failure mode, no new mechanism.
+
+**What it buys.** Small appends destined for many different final extents would otherwise be small random writes
+to HDD, at ~100 IOPS. Batching them into one sequential staging write and then one batched sequential write to
+the final extent converts random IOPS into sequential bandwidth. Since §1.2 puts 95% of cost in disk, HDD IOPS is
+exactly the scarce resource worth spending a cheap device to protect.
+
+**Address assignment is decoupled from data placement.** The final extent and the offset within it are chosen by
+the primary when the append arrives (§8.1.1a-2), so the address is known before the bytes reach their final home.
+The EN-local index from `(final extent, offset range)` to staging location is bounded by *un-coalesced* appends
+only, so it is small, and it is the read path's authority: a read of a recently-appended offset consults it before
+touching the final device. That is what makes §8.1.1a-10's hint valid immediately on write rather than a
+forward-dated promise.
+
+##### 8.1.4.1 Compression and encryption must happen upstream of the four-way fan-out
+
+§4.3.2.3 requires byte-identical instances. If each EN compressed its own copy the bytes would differ —
+compressors are not bit-reproducible across versions or settings — and EC would break. So the primary (or FE)
+compresses and encrypts **once** and broadcasts opaque bytes. **Derived**, and it is better than the alternative
+on three counts:
+
+- 4x less compression CPU, which matters because §7.1 has already ruled compression off the EN;
+- no bit-reproducibility requirement on the codec, so codecs may be upgraded;
+- the primary knows the compressed size and can therefore assign the **physical** offset and detect the 32 MB
+  physical seal bound at the same moment it assigns the logical offset (§6).
+
+It does put compression inside the append's critical path, which §1.4 says is an acceptable trade. ⚠️ It also
+raises whether ENs need keys at all, which cuts against §7.3.1 caching SN-master keys on ENs — "ENs never hold
+keys" is a strictly stronger §1.5 posture and should be decided rather than inherited.
+
+##### 8.1.4.2 The durable watermark is set at staging, not at coalescing
+
+*Durable* (§8.1.1) is reached when 3 of 4 ENs have the append in staging or final storage. So the
+second-granularity durability timestamp of §9.7 and the retention window of §10.1 both key off **staging** time,
+and coalescing latency is invisible to both. The alternative — timestamping at coalesce — would make time-range
+query boundaries depend on background-loop scheduling, which is not a property anyone should have to reason
+about.
+
+##### 8.1.4.3 3-of-4 durability plus local coalescing produces interior holes, not short tails
+
+Each EN coalesces on its own schedule, deterministically given the same appends at the same offsets. But
+durability is 3-of-4, so the fourth EN may legitimately have missed an append — and because offsets are
+primary-assigned, that append is a **hole in the middle** of its final extent, not a truncated tail. §8.1.1a
+frames pre-EC reconciliation as truncation above the durable watermark; it is actually **hole-filling and
+truncation**.
+
+The saving grace is that primary-assigned offsets make hole detection **exact and cheap**: a gap in the offset map
+is a gap, with no byte comparison. So before seal, the primary confirms all four instances cover the offset range
+contiguously and any EN with gaps fetches them from a peer. **That is a required pre-EC step** and should be named
+as one rather than discovered.
+
+##### 8.1.4.4 Sizing is set by endurance, not capacity
+
+Every ingested byte passes through the staging device once, so DWPD binds rather than GB. Using §12.7.2's
+20 TB/$923 drive and ~100 drives per EN (2 PB raw, ~$92k), filling that over a year is ~63 MB/s sustained, or
+5.5 TB/day — at 3 DWPD, ~1.8 TB of SSD, **under 0.1% of the EN's disk cost**. Even a 16x burstier assumption
+stays inside §1.2's 5% budget. **Derived.** The sizing rule is therefore "endurance at sustained fill rate", not
+"capacity for N seconds of buffer", and the two give very different answers.
+
+**So stage only small appends.** An append near the 32 MB physical bound gains nothing — it is already a
+sequential write — so writing those through directly cuts staging wear to the small-append fraction, which is the
+only fraction that needed the IOPS conversion. The threshold is a per-media-class constant (§7.4.1).
+
+⚠️ On an all-SSD EN, staging on SSD writes every byte to the expensive device twice. The staging tier should then
+become **DRAM**, whose durability rests on exactly the argument above — four independent ENs, single copy each —
+but which is sound only if the four ENs cannot lose power together. That requires **power to be one of the nested
+failure domains** of §5.6.2, which is currently implicit. With it, DRAM staging is licensed by an argument already
+in the design; without it, DRAM staging is unsound.
 
 ### 8.2 Record framing
 
@@ -3479,6 +4203,121 @@ Three consequences:
   means the price list needs a durability-and-lifetime dimension rather than one figure per byte.
 
 ---
+
+### 8.6 Parallel ingest into one object
+
+§8.1.1a-8 leaves a conflict: one unsealed extent is what makes the object offset well defined, and it caps a
+single object at one disk's write bandwidth. §1.0's motivating case wants both. This section resolves it, and the
+resolution is that **the three properties people want are a trilemma, not a menu.**
+
+#### 8.6.1 Concatenation of sealed streams is the mechanism
+
+The way to build a large single-writer object is to **write many partitions in parallel, each single-writer, seal
+them, then concatenate them into one object** (Asserted, Bob, 2026-08-15).
+
+This is strictly better than the deferred-offset interface §8.1.1a-9 rejects, and for a reason worth stating:
+**concatenating sealed streams computes the offsets you would have deferred, synchronously, at a moment you
+choose.** All inputs have known logical lengths, so the splice is metadata-only and the resulting object offsets
+are dense, stable and final immediately — no head-of-line blocking, no two-answers-over-time, no promise without a
+time bound. It also reuses machinery §15.1 already assumes exists, since self-concatenation is how large test
+objects are built.
+
+Two costs, both bounded:
+
+- **References taken before the concatenation are invalidated by it** — partition *k*'s records shift by the sum of
+  prior record counts. But **stream-relative** record numbers survive, because concatenation splices streams
+  unchanged. That is §8.1.1a-9's compound id arriving on its own, and it matches §4.6.3, where `(DnId, StreamId)`
+  is already the durable name.
+- **N partitions contribute N short tail extents.** That is §10's existing job.
+
+#### 8.6.2 The trilemma
+
+Multiple unsealed tails do **not** rescue the time-range property, which is the thing that makes them look
+attractive. §9.7's binary search works because durability seconds increase monotonically down a single-tail extent
+list; concurrent tails interleave in time, so the list stops being sorted and the search degrades to a scan.
+Multiple unsealed tails do not remove the fan-out — they hide it inside one object.
+
+And parallel concatenation has the same defect: partitions written *simultaneously* have overlapping timestamp
+ranges, so the concatenated extent list is not monotone either. Concatenation preserves monotonicity only when the
+partitions are time-**disjoint** — hourly segments written in sequence, which is segmentation rather than
+parallelism.
+
+| Want | Mechanism | Loses |
+|---|---|---|
+| parallel bandwidth + dense stable offsets | parallel partitions, then concatenate | timestamp-monotone extent list |
+| parallel bandwidth + monotone time index | N objects, one tail each | single-object dense offsets |
+| dense offsets + monotone time index | one writer, one tail | parallelism (~200 MB/s) |
+
+**Derived.** All three in one object is not available, and this is independent of any interface choice. It is the
+sharp form of open question 36.
+
+#### 8.6.3 Fan-out on read is the right thing to pay for
+
+The objection to N objects is that a `[X, Y)` reader touches many of them. That costs less than it appears under
+§1.4's own stance: 1,000 binary searches issued in parallel cost **one round trip of latency**, not 1,000, because
+§1.4.1 makes job latency the maximum. What they really cost is 1,000x the metadata *request rate* — which §12 says
+must be billed, and is therefore a priced resource rather than a hidden one.
+
+What the client should not have to do is know the 1,000 object names. So **time-range becomes a directory-level
+operation**, pruned by the interval summaries of §9.7.3 before any fan-out happens.
+
+#### 8.6.4 The recursion up to DN attenuates rather than repeating
+
+If ingress exceeds one SN, it must be sprayed across streams on multiple SNs. The worry is that recording those
+streams overwhelms DN the same way. It does not, because update rate divides by the fan-out at each level:
+
+| Level | Unit added | Rate at 1 TB/s ingress |
+|---|---|---|
+| EN | bytes | 1 TB/s |
+| SN | extent (<=4 GB logical / 32 MB physical) | ~30,000/s |
+| DN | stream (>=1 PB) | ~1 per 1,000 s |
+
+A stream holds ~262,144 extents at the 4 GB logical cap, so **SN-to-DN update rate is ~10^5-10^6 : 1**. And DN's
+per-stream cost is a 4-byte reference plus a cumulative count — ~12 B, not the 200 B the *SN* pays (§4.7). A
+10,000-stream frontier is ~120 KB in the DN object. **Derived.** The 200 B/stream figure is what makes tiny
+streams a billing catastrophe on SN (§12.2); it is not what DN pays.
+
+**So DN is overwhelmed only if the streams are fragments**, which gives the design rule:
+
+> **Spray per writer, not per request.** A writer picks its stream once and stays on it.
+
+Then DN traffic is one entry per writer, ever. Round-robin per append makes DN's update rate equal the request
+rate and kills it. That stickiness is already forced by single-writer compare-and-append (§8.1.1a-3), so it is not
+a new constraint. And per §12.1 the enforcement should be **price, not quota**: bill stream count and DN entry
+count and fragment-spraying becomes the expensive way to write — §12.2's lesson applied prospectively instead of
+retroactively.
+
+#### 8.6.5 What genuinely recurses is the summary, not the load
+
+A DN object's stream list carries the **cumulative record count per stream**. The moment two streams are growing at
+once, that is a mid-tree summary in §4.5's sense — it changes below the tail, not at it — and §4.5 already forbids
+maintaining it eagerly.
+
+So record numbers are unavailable over the growing region for a **summary-rule** reason, which is a cleaner and
+more durable argument than a load argument because it does not depend on any of the numbers above.
+
+#### 8.6.6 The shape that follows: a sealed prefix and a growing frontier
+
+Given §8.6.5, the two options collapse toward each other — "N separate objects" is "one object" with the fan-out
+list held in a directory instead of inside an object. Both fan out on read, but the stream list is one object,
+RAM-resident, ~12 B/entry, already on the read path, where a directory needs an enumeration plus N object metadata
+lookups. So a single object wins, with two explicit regions:
+
+| | Sealed prefix | Growing frontier |
+|---|---|---|
+| Streams | sealed, lengths final | N, one SN each, sticky writer |
+| Addressing | dense object record number, binary searchable | `(stream, record number)` only |
+| Time range | monotone per stream, binary search | min/max durable-second interval, prune by overlap |
+| Cumulative counts | materialized | must not exist (§4.5) |
+
+Streams convert from frontier to prefix as they seal, and the cumulative counts are materialized lazily at that
+point by §13.3's background loops. So the eventually-known offset is real, but it is a consequence of **sealing**
+and never a promise made in an append response — which is where §8.1.1a-9's prior art pointed.
+
+⚠️ An object's *total* record count is unknown while the frontier is open, so the 2^64 record numbering of §3 is
+dense only over the prefix. A reader asking "how many records" gets "at least K, plus N open streams". That is
+honest rather than broken, but it is a user-visible consequence that should be decided deliberately rather than
+discovered.
 
 ## 9. Reading
 
