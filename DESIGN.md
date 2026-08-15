@@ -1,7 +1,7 @@
 # DeLawson — Design
 
 Status: **draft, pre-implementation.** Nothing here is built. Sections marked
-⚠️ are unresolved; they are collected again in §15.
+⚠️ are unresolved; they are collected again in §16.
 
 Language: Rust.
 
@@ -150,11 +150,41 @@ open-extent count — the expensive, un-erasure-coded, in-memory-state-bearing
 kind — would dwarf its sealed extent count. For append-mostly objects almost no
 logs exist.
 
-⚠️ Even lazily, an update-heavy full stream could want ~2^31 open logs. Lazy
+⚠️ Even lazily, an update-heavy full stream could want a log per extent. Lazy
 creation makes the append-only case free and does nothing for the update-heavy
 case, so open logs per stream need a hard bound with forced compaction when it
 is hit. Open logs cost EN replicas and network, not just SN memory, so their
-bound is far below 2^31.
+bound is far below the extent count.
+
+#### 4.2.1 Extents are reference-counted
+
+**An extent may be referenced by more than one stream.** The working assumption is
+**one reference per extent** (§4.6) — sharing is supported but expected to be rare —
+so the sizing arguments treat extents as privately owned.
+
+Where sharing arises, it is valuable rather than incidental:
+
+- **Cheap clone and snapshot.** Copying a stream's extent list and incrementing
+  refcounts duplicates an object in time proportional to its *metadata*, not its
+  data. For a 0.4 PiB stream that is the difference between milliseconds and days.
+- **Packed extents** (§11), where one extent holds several small objects, are
+  naturally multiply-referenced.
+
+What sharing costs:
+
+- **Deletion becomes decrement.** Dropping a stream cannot free its extents; the
+  background loops (§13.1) reclaim at zero.
+- ⚠️ **Compaction of a shared extent cannot rewrite in place**, because the other
+  referrers did not ask for it. It needs copy-on-write — compaction produces a
+  private extent for the referrer that triggered it and leaves the shared one alone
+  — which means a clone's first write is more expensive than its steady state.
+- ⚠️ **Key derivation must fix on the creating stream** (§7.3.3). A shared extent
+  belongs to several streams, so "the stream id" is ambiguous unless it means the
+  one that created it, recorded once and never reinterpreted.
+- ⚠️ **Billing attribution is a policy question** (§12). If a clone shares every
+  extent with its original, charging both for the full physical footprint
+  double-bills, and charging neither loses revenue. Charging the creator makes a
+  clone free and the original hostage to it.
 
 ### 4.3 Instances
 
@@ -241,6 +271,36 @@ Two consequences worth stating outright:
 
 Lazy summaries are brought forward by the background loops of §13.1, not by the
 write path.
+
+### 4.6 Working budgets
+
+Every number below is **a guess, to be replaced by measurement**. They are collected
+here so the sizing arguments have one source, and so that refining one of them is a
+single edit rather than an archaeology exercise.
+
+Treat them as **budgets to spend against, not totals to re-derive.** The itemized
+content of a record will drift upward as flags, timestamps and checksums accumulate;
+that is what the headroom is for, and re-baselining every downstream calculation on
+each increment produces numbers obsolete by the next revision.
+
+| Budget | Value | Where it is used |
+|---|---|---|
+| Extent metadata record | **100 B** | §14.1 — itemized at ~60 B so far (§5.10.4) |
+| Stream metadata record | **200 B** | §14.1 |
+| User object metadata record | **300 B** | §14.2 |
+| References per extent | **1** | §4.2.1 — more than one is supported but expected to be rare |
+| Extent physical size | 32 MB compressed | §6 |
+| Extent logical size | ≤ 4 GB | §6 |
+| Instances per open extent | 4 | §4.3 |
+| SN / DN machine RAM | 256 GB | §14.1 |
+| SN RAM split | **1/3 streams, 2/3 extents** | §14.1 — varies wildly by tenant |
+| Placement slack | 4/3 | §5.6.1 |
+| Fan-out per machine | ~20,000 | §5.10 |
+| Compression ratio, when assumed | 4× | §12, §14.2 |
+
+The SN RAM split deserves its own warning: **it will vary wildly between tenants and
+in production**, because it encodes an assumed mix of object sizes (§14.1.1). It has
+to be a soft allocation that rebalances, not a partition fixed at build time.
 
 ---
 
@@ -600,47 +660,32 @@ many more. Two reasons:
   keeps about one core busy. To use *C* cores a machine needs on the order of *C*
   rings in a primary role. **Ring count per machine is set by core count.**
 
-#### 5.8.1 This shrinks streams by a large factor
+#### 5.8.1 Rings are a concurrency unit, not a capacity unit
 
-Easy to miss, and it corrects §14.1. If a machine is primary for *P* rings then,
-by symmetry across the cluster, it is also hot backup for ~*P* and checkpoint
-writer for ~*P* — so it materializes ~3*P* B-trees in *R* bytes of RAM. RAM per
-ring is **R/3P, not R**, and the stream ceiling falls by the same factor.
+**A ring serves many streams.** *P* is chosen for cores and cost amortization, and
+has nothing to do with how much a stream may hold — the two are independent, and an
+earlier draft of this section wrongly tied them together by assuming one stream per
+ring (§14.4).
 
-At 256 GB per machine, 100 B per extent entry, and 32 MB extents:
+What *P* does bound is **failover cost**, because an elected log-only member must
+materialize everything its ring serves before it can act. At 500 MB/s, a ring
+holding a 1/*P* share of a machine's 171 GB extent budget takes:
 
-| Primary rings/machine | Materialized | RAM/ring | Extents/stream | Stream ceiling | Streams per maximal object | Stream list | Materialize time |
-|---|---|---|---|---|---|---|---|
-| 1 | 3 | 85 GB | 8.5 × 10^8 | 25 PiB | 64,000 | 6 MB | 171 s |
-| 16 | 48 | 5.3 GB | 5.3 × 10^7 | 1.6 PiB | 1.0 × 10^6 | 103 MB | 11 s |
-| 64 | 192 | 1.3 GB | 1.3 × 10^7 | 0.4 PiB | 4.1 × 10^6 | 412 MB | 2.7 s |
-| 256 | 768 | 333 MB | 3.3 × 10^6 | 0.1 PiB | 1.7 × 10^7 | 1.6 GB | 0.7 s |
+| Primary rings/machine | Ring's share of the extent budget | Materialize time |
+|---|---|---|
+| 1 | 171 GB | ~5.7 min |
+| 16 | 10.7 GB | ~21 s |
+| 64 | 2.7 GB | ~5.3 s |
+| 256 | 667 MB | ~1.3 s |
 
-(Materialize time assumes 500 MB/s — it is how long an elected log-only member
-takes to become useful.)
+So many rings per machine is what makes §5.7.1's expensive tier — an ordinary
+election won by an unmaterialized member — tolerable rather than frightening. It
+also makes checkpoints cheap, which is exactly what the 2×-RAM optimization in §5.7
+needs: holding a consistent read for seconds is a far easier promise than holding
+one for ten minutes.
 
-At a plausible 64 cores, streams are **~400 TB rather than 64 PiB**, and there are
-~4 × 10^6 of them in a maximal object rather than ~25,000.
-
-#### 5.8.2 Consequences
-
-Two of them are gifts:
-
-- **Failover becomes fast.** Materializing a 1.3 GB B-tree takes ~3 seconds;
-  materializing 214 GB takes ~7 minutes. The same arithmetic that shrinks rings
-  shrinks the worst-case election, so §5.7.1's expensive tier stops being
-  frightening.
-- **Checkpoints become cheap**, which is precisely what the 2×-RAM optimization in
-  §5.7 needs. Holding a consistent read for seconds is a far easier promise than
-  holding one for ten minutes.
-
-One needs watching:
-
-- **The object's stream list grows proportionally** — ~412 MB at 64 rings per
-  machine, and 1.6 GB at 256. That is affordable only because the stream list lives
-  in a DN keyed object, which is disk-backed and paged (§14.2). It is no longer
-  the trivially small structure §14.2 described, and at the high end it is itself
-  a multi-extent object.
+Stream size, separately, is bounded by the machine's whole extent budget — see
+§14.1.
 
 ⚠️ So *P* is a real design parameter, not a tuning knob: it trades core
 utilization and failover speed against stream-list size. It wants choosing
@@ -1322,90 +1367,106 @@ and SN memory — that the foreground path needs.
 Three tiers, three different answers, and the binding constraint turns out to be
 the width of the record number rather than storage at any level.
 
-### 14.1 SN: bounded per stream by a *share* of RAM
+### 14.1 SN: a machine's RAM, split between streams and extents
 
-An SN serves a stream's extent list from RAM, and that is what bounds a stream.
-Assume the worst case for capacity, `compressed = physical` (ratio 1×), so an
-extent's logical span equals its 2^25-byte (32 MB) physical size.
+An SN serves stream and extent records from RAM, and that is what bounds both. Using
+the budgets of §4.6 — 256 GB per machine, split **1/3 for stream records at 200 B
+and 2/3 for extent records at 100 B** — and taking the worst case for capacity,
+`compressed = physical`, so an extent's logical span equals its 32 MB physical size:
 
-The naive calculation gives a machine's whole memory to one stream:
+| | Budget | Record | Capacity |
+|---|---|---|---|
+| Stream records | 85 GB | 200 B | **4.3 × 10^8 streams** |
+| Extent records | 171 GB | 100 B | **1.7 × 10^9 extents** |
 
-| Quantity | Value |
-|---|---|
-| Extent metadata entry | ~100 B — **a guess, to be measured** |
-| Extents in 256 GB of RAM | ~2^31 (≈214 GB) |
-| Extent logical span | 2^25 B |
-| Ceiling if one stream owned a machine | 2^31 × 2^25 = 2^56 B = 64 PiB |
+A stream is bounded above by the whole extent budget: one stream monopolizing a
+machine reaches 1.7 × 10^9 × 32 MB = **51 PiB**. Any lower cap is policy, not a
+constraint. Note this is a property of the *machine*, not of the ring — §5.8.1
+corrects an earlier draft that tied stream size to rings per machine.
 
-**But a stream never owns a machine.** §5.8 requires many rings per machine — on
-the order of one per core, to use the cores at all — and each machine materializes
-roughly three B-trees per primary ring it hosts. So the real budget is `R/3P`, and
-at 64 primary rings per machine the ceiling is **~0.4 PiB, not 64 PiB**. The table
-in §5.8.1 is the authoritative version; the 64 PiB figure above is only the
-degenerate *P*=1 case.
+Compression relaxes it further: at a 4× ratio the same extent count spans 4× the
+logical bytes.
 
-Compression relaxes this: at a 4× ratio the same extent count spans 4× the logical
-bytes.
+#### 14.1.1 The split encodes an assumed workload mix
 
-**Sensitivity to the entry size.** The ceiling scales inversely with it. **100 B
-stays the planning figure** — not because that is what the fields itemized so far
-add up to (§5.10.4 reaches about 60 B), but because flags, timestamps, and fields
-nobody has thought of yet will accumulate. Budget 100 B and spend it deliberately;
-do not re-baseline the sizing on each increment.
+The two rows above imply an average of just **4 extents per stream** — 128 MB of
+logical data per stream. That is not a claim about how a large object is striped; it
+is a claim about the *population*, and it is consistent with §1's expectation of
+enormous numbers of tiny objects, each holding one stream with a handful of extents.
 
-Shown at *P*=64:
+The average and the maximum differ by nine orders of magnitude, and both are real:
 
-| Entry size | Extents/stream | Stream ceiling | Streams per maximal object | Stream list |
+| Stream size | Extents | What has this shape |
+|---|---|---|
+| 128 MB | 4 | the average, dominated by tiny objects |
+| 0.4 PiB | 1.3 × 10^7 | a stream of a large object |
+| 51 PiB | 1.7 × 10^9 | one stream owning a machine's whole extent budget |
+
+**So the split cannot be a static partition.** A tenant with a billion tiny objects
+would exhaust the stream budget while the extent budget sat idle; a tenant with one
+enormous object would do the reverse. Bob's own caveat is that the ratio varies
+wildly by tenant even in production, so it has to be a soft allocation over one pool,
+rebalanced as the mix shifts.
+
+⚠️ Soft allocation raises a question a fixed split does not: what happens when a
+machine's mix shifts far enough that it can no longer hold what it has been assigned?
+Streams must migrate, which is §16's reassignment problem arriving from a new
+direction — driven by workload drift rather than failure.
+
+#### 14.1.2 Sensitivity
+
+The ceiling scales inversely with record size. **The §4.6 budgets stay the planning
+figures** — 100 B and 200 B — even though the fields itemized so far reach only ~60 B
+(§5.10.4), because flags, timestamps and fields nobody has identified yet will consume
+the headroom. Budget and spend deliberately; do not re-baseline on each increment.
+
+| Extent record | Extents/machine | One-stream ceiling | Streams for a maximal object at 0.4 PiB each | Stream list at 200 B |
 |---|---|---|---|---|
-| 60 B — itemized so far | 2.2 × 10^7 | ~0.66 PiB | ~2.5 × 10^6 | ~148 MB |
-| **100 B — the budget** | 1.3 × 10^7 | ~0.40 PiB | ~4.1 × 10^6 | **~412 MB** |
-| 200 B — if a long `first_key` is inlined | 6.7 × 10^6 | ~0.20 PiB | ~8.2 × 10^6 | ~1.6 GB |
+| 60 B — itemized so far | 2.8 × 10^9 | 85 PiB | 4.1 × 10^6 | 820 MB |
+| **100 B — the budget** | 1.7 × 10^9 | 51 PiB | 4.1 × 10^6 | 820 MB |
+| 200 B — a long `first_key` inlined | 8.5 × 10^8 | 26 PiB | 4.1 × 10^6 | 820 MB |
 
-The stream list grows as the *square* of the entry size — once from more streams,
-once from fatter entries — so the budget is worth defending. The 200 B row is the
-warning: inlining a generous keyed `first_key` would cost an order of magnitude on
-the largest metadata structure in the system, which is the argument for a bounded
-key prefix instead.
+The stream-list column is flat because it depends on the *stream* record and the
+chosen stream size, not on the extent record. What the extent record controls is how
+many machines a given object needs: at 200 B rather than 100 B, every stream costs
+twice the SN memory, so the fleet doubles for the same data.
 
-**There is headroom in the budget, and it will get spent.** §5.10.4 itemizes the
-fields identified so far at ~60 B, leaving ~40 B before the budget binds. Expect
-flags, timestamps, checksums and similar to consume it as the design fills in.
-
-⚠️ A keyed extent additionally needs a variable-length, user-supplied `first_key`,
-competing for that same headroom — enough for a short key, not an arbitrary one.
-Either the entry grows and the stream ceiling falls proportionally, or the list
-stores a bounded key prefix and disambiguates by reading the extent.
+⚠️ Inlining a generous keyed `first_key` is therefore a fleet-sizing decision, not a
+metadata-format detail. That is the argument for a bounded key prefix with
+disambiguation-by-read.
 
 ### 14.2 DN: unbounded in object count, disk-backed
 
-To hold 2^64 records at 100 bytes each — 1.845 ZB — an object needs
-1.845 ZB / 64 PiB ≈ **25,600 streams**, a stream list of a few MB. Trivial.
+The SN's problem is bounding a single stream. The DN's is the opposite: nothing
+bounds the number of objects.
 
-The DN's problem is the opposite one. Object metadata runs to something like:
+At the §4.6 budget of **300 B per user object**:
 
-| Field | Bytes |
+| Objects | Logical | At 4× compression |
+|---|---|---|
+| 10^9 | 300 GB | 75 GB |
+| 10^12 | **300 TB** | **75 TB** |
+
+The ratio that matters is against the object's own data. **Metadata equals data at a
+payload of 300 B**, so:
+
+| Object payload | Metadata as a multiple of data |
 |---|---|
-| object id, parent directory id | 32 |
-| name | ~32 |
-| timestamps | 24 |
-| flavor, framing, device class, flags | 8 |
-| record count, logical and physical byte totals | 24 |
-| ACL reference, stream list pointer | 16 |
-| **Total before any records** | **~136 B** |
+| 30 B | **10×** |
+| 300 B | 1× |
+| 3 KB | 0.1× |
 
-For a 30-byte object that is **4.5× more metadata than data**. For a 200-byte
-object it is still ~68%. Multiply by an unbounded object count and the DN tier
-can exceed the EN tier in *logical* size — which is why DN state is disk-backed
-and cached, not resident (§5.1).
+Below a few hundred bytes an object costs more to describe than to store, and §1
+expects those in enormous numbers — so the DN tier can exceed the EN tier in
+*logical* size. That is why DN state is disk-backed and cached, not resident (§5.1).
 
-In *physical* bytes it is much less alarming, because self-hosting (§5.5) puts
-that metadata through the same pipeline as everything else. Object metadata is
-unusually compressible — sibling names share prefixes, timestamps cluster,
-flavor and framing repeat across every object in a directory — so at a
-conservative 4× and 6+3 erasure coding, ~136 logical bytes becomes ~34 physical
-bytes and ~51 billed. Compare a bare 4-replica copy of the same field set at
-544 bytes: **self-hosting makes the metadata tier roughly an order of magnitude
-cheaper than storing it uncompressed and replicated.**
+In *physical* bytes it is far less alarming, because self-hosting (§5.5) runs that
+metadata through the same pipeline as everything else. Object metadata is unusually
+compressible — sibling names share prefixes, timestamps cluster, flavor and framing
+repeat across every object in a directory — so at a conservative 4× and 6+3 erasure
+coding, 300 logical bytes becomes ~75 physical and ~113 billed. Against a bare
+4-replica copy at 1,200 bytes, **self-hosting makes the metadata tier roughly an
+order of magnitude cheaper than storing it uncompressed and replicated.**
 
 The asymmetry is still worth stating plainly: **SN state is bounded per stream
 by construction; DN state is bounded by nothing.** Only the DN tier has to be a
@@ -1417,8 +1478,8 @@ itself.
 Two independent ceilings on one object:
 
 - **Record number**: 2^64 records, from the 8-byte record number.
-- **Capacity**: if an object's stream list is allowed ~2^31 entries, then
-  2^31 streams × 2^56 B = **2^87 bytes**.
+- **Capacity**: if an object's stream list is allowed ~2^31 entries at the §14.1
+  one-stream ceiling of 51 PiB, then 2^31 × 2^56 B ≈ **2^87 bytes**.
 
 These meet at an average record size of 2^87 / 2^64 = 2^23 = **8 MB**. Below
 8 MB average the record number runs out first; above it, byte capacity does.
@@ -1440,13 +1501,74 @@ A second draft then over-generalized RAM-residency to *all* metadata. §14.2 is
 the correction: it holds for SNs and fails for DNs, because object count is
 unbounded while extents per stream is not.
 
-What survives is only the observation that shrinking extents moves addressing
-information up from the extent's sparse index into the stream's extent list.
-That trade is real; it just lands well inside budget.
+A third draft tied stream size to *P*, the rings per machine, by assuming one stream
+per ring. Rings serve many streams; *P* is a concurrency and failover parameter and
+has nothing to do with stream capacity, which is bounded by the machine's extent
+budget (§5.8.1, §14.1).
+
+What survives from all of this is the observation that shrinking extents moves
+addressing information up from the extent's sparse index into the stream's extent
+list. That trade is real; it just lands well inside budget.
 
 ---
 
-## 15. Open questions
+## 15. Testing at scale
+
+The sizing claims of §14 are about metadata volume — B-trees of 10^9 entries,
+checkpoints of hundreds of GB, failover that must materialize them. Provisioning
+exabytes of disk to test any of that would be absurd. It is also unnecessary.
+
+### 15.1 Self-concatenation
+
+Because extents are reference-counted (§4.2.1), **an unkeyed stream can be
+concatenated to itself.** Each concatenation appends its own extent list to its end,
+which doubles both the number of extent references in the list and the reference
+count on every original extent. The bytes on disk do not change at all.
+
+So *n* operations produce 2^n references over constant physical data:
+
+| Doublings | Extent references | Logical size | Physical data |
+|---|---|---|---|
+| 10 | 1,024 | 32 GB | 32 MB |
+| 20 | 1.0 × 10^6 | 32 TB | 32 MB |
+| 31 | 2.1 × 10^9 | **64 PiB** | **32 MB** |
+
+Thirty-one doublings from a single extent reaches a stream larger than §14.1's
+ceiling, on 32 MB of real data. It works because unkeyed appends land at the end and
+never disturb existing cumulative counts (§3), so records *N*..2*N*−1 legitimately
+repeat records 0..*N*−1 and every addressing invariant still holds.
+
+### 15.2 What it exercises, and what it does not
+
+Genuinely tested:
+
+- B-tree descent, split, and memory footprint at 10^9 entries
+- The Raft snapshot/log/state-machine cycle (§4.4) on a full-sized checkpoint
+- Materialize time and failover (§5.8.1) — the numbers there become measurable
+- Reference counting under extreme fan-in, and every path that must handle it
+- **Copy-on-write compaction** (§4.2.1), because *everything* is shared, so no
+  compaction may ever rewrite in place. A bug there is impossible to miss.
+
+Not tested — worth being explicit, since the technique is tempting to over-trust:
+
+- Fan-out breadth and placement diversity (§5.10): all references point at the same
+  few ENs, so neighborhoods, domain spreading, and repair remain untested
+- Disk capacity and bandwidth behaviour under real load
+- Compaction across *distinct* data, and compression-ratio variety
+
+It is a metadata-scale test, not a data-scale test. Both are needed; this one is
+nearly free.
+
+⚠️ **It also pins the reference-count width.** Reaching 2^31 references means
+refcounts need 32 bits, against a working assumption of one reference per extent
+(§4.6). Either the field is 4 bytes — competing for the extent record budget
+§14.1 already watches — or it saturates, or the test is capped below 2^31. Worth
+deciding deliberately, since a test method that cannot reach the design's stated
+ceiling is much less useful.
+
+---
+
+## 16. Open questions
 
 Roughly in order of how much else depends on them.
 
@@ -1467,66 +1589,74 @@ Roughly in order of how much else depends on them.
 5. **Fan-out policy and EN sizing together** (§5.10.1). G, the sharing factor, is
    what gives repair and balance room to move, and EN capacity is what makes G
    affordable. One decision, not two.
-6. **Why nesting forces serialized planned disruptions** (§5.6.3) — the
+6. **Soft allocation of SN memory between streams and extents** (§14.1.1). The 1/3
+   : 2/3 split encodes a workload mix that varies wildly by tenant, so it must
+   rebalance — and when a machine's mix drifts past what it was assigned, streams
+   have to migrate, which is reassignment arriving from workload drift rather than
+   failure.
+7. **Shared-extent consequences** (§4.2.1): copy-on-write compaction, billing
+   attribution between a clone and its original, and the reference-count width that
+   §15.1's test method pressures toward 32 bits.
+8. **Why nesting forces serialized planned disruptions** (§5.6.3) — the
    arithmetic is verified but this operational constraint is asserted, and it
    determines how the cluster is actually operated.
-7. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+9. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
    core utilization and failover speed against stream-list size, and it multiplies
    with the unmeasured extent-entry size — the stream list grows as the *square*
    of that entry size across the plausible range.
-8. **Transactions and long consistent reads** (§5.7). Getting them would drop the
-   ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
-   makes the required read duration much shorter than ten minutes, so this looks
-   more attainable than when first raised.
-9. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
-   DN ring, and does the 4/3 default hold for both?
-10. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+10. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+    ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
+    makes the required read duration much shorter than ten minutes, so this looks
+    more attainable than when first raised.
+11. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+    DN ring, and does the 4/3 default hold for both?
+12. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-11. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+13. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-12. **Background loop scheduling** (§13.1): prioritisation and rate limiting
+14. **Background loop scheduling** (§13.1): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-13. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+15. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-14. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+16. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-15. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+17. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-16. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+18. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-17. **Remaining directory semantics** (§5.1): listing huge directories,
+19. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-18. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+20. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-19. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+21. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-20. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
+22. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
     hurts compression ratio, and ratio is billable.
-21. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+23. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-22. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+24. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-23. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+25. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-24. **Billing policy** (§12): garbage, transient double footprint, metadata,
+26. **Billing policy** (§12): garbage, transient double footprint, metadata,
     instantaneous-usage contract, reporting granularity.
-25. **Key custody within KS** (§7.3): how the daily master keys are themselves
+27. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-26. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+28. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-27. **Compaction policy** (§10) — now partly a pricing decision.
-28. **Membership and leader election** (§13).
-29. `Nul` and `\0` framing were both listed originally and are folded together
+29. **Compaction policy** (§10) — now partly a pricing decision.
+30. **Membership and leader election** (§13).
+31. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-30. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+32. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
