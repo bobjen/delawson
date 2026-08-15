@@ -72,9 +72,10 @@ before it accumulates.
 #### 1.1.1 Data loss happens during disasters, not during steady state
 
 **Asserted** (Bob, from experience): disasters come in all sizes, with larger ones rarer. Wait long
-enough and something takes out 100% of a cluster; wait roughly a fifth as long for 50%, and so on.
-Taking that shape literally gives a frequency falling as a power of size — halving the size
-multiplying the rate by ~5 means **λ(s) ∝ s^-2.32**.
+enough and something takes out 100% of a cluster; wait less long for 50%, and so on — **some power law,
+R(≥s) ∝ s^-α, with α unmeasured.** Halving the size might multiply the rate by 5 (α ≈ 2.32) or by 10
+(α ≈ 3.32); §4.3.3.1 shows that choice moves expected loss by ~6×, so it wants measuring rather than
+assuming.
 
 The consequence dominates everything else in this section: **steady-state disk failure is not where
 data is lost.** §13.2 works a case — a failed rollout destroying 5% of a cluster costs ~3.2 extents,
@@ -3803,81 +3804,99 @@ Roughly in order of how much else depends on them.
     utilization ceiling of 1 - 1/D (§5.11).
 25. **How much fleet bandwidth repair may take** (§13.2.1). Recovery at full tilt stops all
     customer work; at 10% it takes five days. The split is a business decision nobody has made.
-26. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
+26. **What disaster size to design for** (§4.3.3). Overhead = 1/(1−s) makes this the single largest
+    cost-versus-reliability decision in the system: 33% survivability at 1.50×, 50% at 2.00×. It
+    should be settled before the erasure code is chosen.
+27. **Do real disasters respect the domain hierarchy?** (§4.3.3) The guarantee depends entirely on it.
+    A cross-cutting failure mode returns loss to the binomial regime, where a 5% event loses hundreds
+    of terabytes outright instead of ~3 extents.
+28. **Measure the disaster frequency exponent α** (§4.3.3.1). Every expected-loss figure depends on it,
+    5×- and 10×-per-halving differ by ~6×, and for α > m the integral diverges and needs a floor.
+29. **A second cluster** (§4.3.3.1). Expected loss is of order the whole-cluster disaster rate for every
+    in-cluster code, so geo-replication is the only answer to the top of the distribution — and nothing
+    in this document addresses it.
+30. **Is durability a per-customer billable tier?** (§4.3.3.3) Write-off fractions span 1/1000 to
+    999/1000, a 250× spread in effective loss rate on identical storage. Overhead = 1/(1−s) makes the
+    knob natural and §12 bills it for free, but nothing offers it.
+31. **Do local codes actually lose on disasters, or only in the worst case?** (§4.3.2.1) Guaranteed
+    tolerance is 7.5% against MDS's 33%, but maximal recoverability plus a good domain-to-local-group
+    mapping may recover most real patterns — worth analysing before writing off the construction or the
+    patent question.
+32. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
     and domain constraints interact: a markedly emptier domain attracts weighted picks and
     then rejects them, which is worst right after adding capacity. Bounded, but worth
     measuring.
-27. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
+33. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
     safe, but who chooses the primary, and how a new one is appointed when it fails, is
     undesigned.
-28. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
+34. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
     must be chosen together; a Raft log index is a natural per-ring counter, but what an
     SCN is scoped to is unsettled while objects span many rings.
-29. **Expected object count** (§14.5). DN cost scales with object count rather than
+35. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-30. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
+36. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-31. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+37. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-32. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+38. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-33. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+39. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-34. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+40. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-35. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+41. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-36. **Background loop scheduling** (§13.3): prioritisation and rate limiting
+42. **Background loop scheduling** (§13.3): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-37. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+43. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-38. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+44. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-39. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+45. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-40. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+46. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-41. **Remaining directory semantics** (§5.1): listing huge directories,
+47. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-42. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+48. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-43. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+49. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-44. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
+50. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
     both sides: coarse granules compress better and bill less, fine granules cut read
     amplification, which is a 50× throughput factor for point reads.
-45. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+51. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-46. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+52. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-47. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+53. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-48. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
+54. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
     attribution, instantaneous-usage contract, reporting granularity. Slack itself is
     settled at 2× (§4.7).
-49. **Key custody within KS** (§7.3): how the daily master keys are themselves
+55. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-50. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+56. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-51. **Compaction policy** (§10) — now partly a pricing decision.
-52. **Membership and leader election** (§13).
-53. `Nul` and `\0` framing were both listed originally and are folded together
+57. **Compaction policy** (§10) — now partly a pricing decision.
+58. **Membership and leader election** (§13).
+59. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-54. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+60. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
