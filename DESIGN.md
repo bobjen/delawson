@@ -555,7 +555,7 @@ states outright that their on-disk representation "Is Only Visible to Scope."
 
 **DeLawson pulls that boundary down.** Records are a storage primitive here:
 
-- record framing is a property of the object, chosen at creation (§8.2);
+- record framing is declared per object and translatable on read (§8.2);
 - records are addressed by 64-bit record number or by sorted key (§3);
 - the sparse index maps record numbers, not byte offsets (§9.3);
 - and the whole addressing scheme rests on cumulative *record* counts (§4).
