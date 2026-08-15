@@ -714,6 +714,95 @@ The stated invariant forbids keys on Compute but says nothing about the client, 
 both remain open. They are very different products: the second is a much stronger
 privacy claim and a much harder key-management problem.
 
+### 5.10 Node identifiers and bounded fan-out
+
+**DN, SN, and EN identifiers are 32 bits**, so the design scales to 2^32 of each.
+
+That immediately rules out a full mesh. There are only 65,536 ports per IP and a
+usable ephemeral range of ~28,000, so a machine can hold on the order of 10^3–10^4
+connections. Against 4.3 × 10^9 nodes, **a machine can see roughly one part in
+400,000 of the cluster.** Connectivity is therefore deliberately partial:
+
+> Each SN ring talks to only some ENs; each EN talks to only some SNs.
+
+#### 5.10.1 How much fan-out is needed
+
+Let *F* be the ENs an SN can see and *G* the SNs an EN can see. An SN machine's
+rings map a fixed quantity of instance bytes, and each visible EN devotes roughly
+`capacity/G` of itself to any one SN, so `F/G = instance bytes per SN ÷ EN
+capacity`.
+
+The instance bytes per SN machine come straight from §14.1: 256 GB of RAM at ~100 B
+per entry across three materialized roles is 8.5 × 10^8 extents, which at 32 MB and
+4 instances is **~115 PB of instance bytes**. Note this is **independent of P** —
+more rings per machine means proportionally smaller streams, so the total extent
+count a machine maps is set by its RAM, not by how that RAM is divided.
+
+| EN capacity | *F/G* | *F* at *G*=1 | *G*=4 | *G*=16 | *G*=64 |
+|---|---|---|---|---|---|
+| 100 TB | 1145 | 1,145 | 4,581 | 18,325 | 73,301 |
+| 1 PB | 115 | 115 | 458 | 1,833 | 7,330 |
+| 10 PB | 11 | 11 | 46 | 183 | 733 |
+
+*G* is the free choice, and it is the one that matters: **sharing is what gives
+repair and balance somewhere to go.** With *G*=1 each EN answers to a single SN,
+which is a static partition — cheap in connections, but a dead EN can only be
+replaced from a pool of one SN's making, and a reassigned stream finds no ENs it
+may talk to.
+
+The table's real lesson: **EN capacity buys sharing.** At 100 TB per EN, *G*=16
+needs 18,000 connections and is out of reach; at 1 PB per EN the same sharing costs
+~1,800 connections and is comfortable. Fan-out policy and EN sizing are one
+decision, not two.
+
+#### 5.10.2 Neighborhoods must be domain-diverse
+
+§5.6 requires instances in slack × *n* independent failure domains. Those domains
+must now exist **within the F ENs an SN can see**, not merely somewhere in the
+cluster. A neighborhood of 2,000 ENs that all share a power domain satisfies the
+connection budget and violates the reliability requirement.
+
+So fan-out sets are not arbitrary subsets: **each neighborhood must span at least
+slack × n domains at every level of the nesting hierarchy** (§5.6.2). Slack is
+likewise a neighborhood property, not a cluster property — repair re-places within
+the neighborhood, so it is the neighborhood that must retain spare domains after a
+loss. This is a materially stronger requirement than the cluster-wide version, and
+it is the one that actually has to hold.
+
+#### 5.10.3 Reassignment needs mutable fan-out
+
+⚠️ If a stream moves from one SN ring to another (§13), the new ring must be able
+to reach the ENs already holding that stream's extents. Otherwise the move requires
+copying every byte. So either reassignment is confined to rings with compatible
+neighborhoods, or **fan-out sets must be mutable** — which means connection churn
+during recovery, exactly when the system is already busy.
+
+This is the same shape as the key-derivation trap in §7.3.3: a mutable assignment
+being used where a stable identity is needed. Both want deciding together.
+
+#### 5.10.4 A dividend: 32-bit ids shrink the extent entry
+
+32-bit node ids are a metadata-density decision as much as an addressing one.
+§14.1's ~100 B entry looked tight when an instance reference was assumed to be
+~16 B; with a 4-byte EN id plus a 4-byte intra-EN locator it is 8 B, and the whole
+entry fits with room to spare:
+
+| Field | Bytes |
+|---|---|
+| extent id | 8 |
+| starting record number | 8 |
+| cumulative logical bytes | 8 |
+| cumulative physical bytes | 8 |
+| day index (§7.3.3) | 2 |
+| key generation and flags | 2 |
+| 4 × instance reference (4 B EN id + 4 B locator) | 32 |
+| **Total** | **68 B** |
+
+That matters more than it looks: §14.1 shows the object's stream list grows as the
+*square* of the entry size, so 68 B rather than 136 B is a 4× saving on the largest
+metadata structure in the system. It also leaves headroom for the keyed extents'
+`first_key`, which §14.1 flagged as the field that might not fit at all.
+
 ---
 
 ## 6. Size limits and sealing
@@ -1239,13 +1328,15 @@ matters considerably more than it did when streams were 64 PiB. At 400 B and
 *P*=256 the stream list reaches ~26 GB, which is still a paged DN object but no
 longer casually affordable.
 
-⚠️ The ~100 B entry is tight. For an unkeyed extent it must hold an extent id,
-the starting record number, cumulative logical and physical bytes, flags, and
-the instance or fragment locations — roughly 4 × 16 B for four instances plus
-~40 B of the rest. A keyed extent additionally needs a variable-length,
-user-supplied `first_key`, which may not fit at all: either the entry grows and
-the stream ceiling falls proportionally, or the list stores a bounded key prefix
-and disambiguates by reading the extent.
+**The ~100 B entry now looks affordable**, thanks to 32-bit node ids: §5.10.4
+itemizes an unkeyed entry at **68 B**, including the day index the key hierarchy
+needs (§7.3.3). The earlier worry assumed 16 B instance references; 8 B is enough.
+
+⚠️ A keyed extent additionally needs a variable-length, user-supplied `first_key`.
+The 32 B of headroom under the 100 B budget covers a short key and no more, so
+either the entry grows and the stream ceiling falls proportionally, or the list
+stores a bounded key prefix and disambiguates by reading the extent. This is now
+the only field in the entry whose size is not known.
 
 ### 14.2 DN: unbounded in object count, disk-backed
 
@@ -1330,66 +1421,70 @@ Roughly in order of how much else depends on them.
    machine-level, which funnels all of Compute's input through a decryption tier.
    Relax it to hardware isolation, or size the tier's bandwidth accordingly —
    decide before Compute is built.
-4. **Ring reassignment and cluster topology** (§13). How a stream moves from a
-   failed ring to a fresh one, and where the failure-domain hierarchy that §5.6
-   depends on is stored — plausibly the bootstrap root, since placement decisions
-   cannot be made without it.
-5. **Why nesting forces serialized planned disruptions** (§5.6.3) — the
+4. **Ring reassignment, fan-out mutability, and cluster topology** (§13, §5.10.3).
+   How a stream moves from a failed ring to a fresh one that may not be able to
+   reach its ENs; whether fan-out sets are mutable; and where the failure-domain
+   hierarchy that §5.6 depends on is stored — plausibly the bootstrap root, since
+   placement decisions cannot be made without it.
+5. **Fan-out policy and EN sizing together** (§5.10.1). G, the sharing factor, is
+   what gives repair and balance room to move, and EN capacity is what makes G
+   affordable. One decision, not two.
+6. **Why nesting forces serialized planned disruptions** (§5.6.3) — the
    arithmetic is verified but this operational constraint is asserted, and it
    determines how the cluster is actually operated.
-6. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+7. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
    core utilization and failover speed against stream-list size, and it multiplies
    with the unmeasured extent-entry size — the stream list grows as the *square*
    of that entry size across the plausible range.
-7. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+8. **Transactions and long consistent reads** (§5.7). Getting them would drop the
    ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
    makes the required read duration much shorter than ten minutes, so this looks
    more attainable than when first raised.
-8. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+9. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
    DN ring, and does the 4/3 default hold for both?
-9. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
-   away, so this is now a write-amplification question only: keep the
-   authoritative count on the SN and let the DN cache it lazily, or accept one
-   metadata write per data write.
-10. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
-    bounds the logs, and each costs EN replicas and network.
-11. **Background loop scheduling** (§13.1): prioritisation and rate limiting
-    against foreground traffic, and whether the rewrite-shaped work — compaction,
-    re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-12. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+10. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-13. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+11. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+    bounds the logs, and each costs EN replicas and network.
+12. **Background loop scheduling** (§13.1): prioritisation and rate limiting
+    against foreground traffic, and whether the rewrite-shaped work — compaction,
+    re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
+13. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+    away, so this is now a write-amplification question only: keep the
+    authoritative count on the SN and let the DN cache it lazily, or accept one
+    metadata write per data write.
+14. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-14. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+15. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-15. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+16. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-16. **Remaining directory semantics** (§5.1): listing huge directories,
+17. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-17. **The extent metadata entry: measure it** (§14.1), and decide whether a keyed
+18. **The extent metadata entry: measure it** (§14.1), and decide whether a keyed
     extent's `first_key` fits or forces a bounded prefix.
-18. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
+19. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
     hurts compression ratio, and ratio is billable.
-19. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+20. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-20. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+21. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-21. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+22. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-22. **Billing policy** (§12): garbage, transient double footprint, metadata,
+23. **Billing policy** (§12): garbage, transient double footprint, metadata,
     instantaneous-usage contract, reporting granularity.
-23. **Key custody within KS** (§7.3): how the daily master keys are themselves
+24. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-24. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+25. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-25. **Compaction policy** (§10) — now partly a pricing decision.
-26. **Membership and leader election** (§13).
-27. `Nul` and `\0` framing were both listed originally and are folded together
+26. **Compaction policy** (§10) — now partly a pricing decision.
+27. **Membership and leader election** (§13).
+28. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-28. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+29. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
