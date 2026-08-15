@@ -2701,6 +2701,42 @@ All timers therefore run concurrently and expire together, so the total is one w
 layer — 12 days becomes 3. The conjunction is what keeps it safe: the timer alone would allow premature
 deletion, and the hard delete alone would let a buggy layer force an immediate purge.
 
+#### 8.4.1d The heroics window for user deletes is zero
+
+The two-phase arrangement has a property worth naming, because it is exactly what §8.4.1a demands and it
+falls out rather than being engineered: **for a user delete there is no interval during which the data
+exists but the user cannot recover it themselves.**
+
+The reason is an ordering. The DN holds the user-facing metadata *and* drives the hard-delete GC, so it
+necessarily still has the soft-deleted record at the moment it issues the hard delete. Therefore:
+
+| Interval | Data on ENs | User can undelete | Heroics needed |
+|---|---|---|---|
+| Before the DN's timer expires | yes | **yes, via the normal API** | no |
+| After the hard-delete cascade | no | no — it is genuinely gone | impossible |
+
+There is no third row. Contrast the arrangement that would produce one: if the DN discarded its record
+first and the ENs retained afterwards, then in between the bytes would exist on disk with no metadata
+pointing at them — unrecoverable through the API, recoverable only by scanning ENs. That is precisely the
+staffing trap of §8.4.1a, and it is avoided by the invariant
+
+> **metadata must not predecease the data it describes.**
+
+Which the design satisfies for free, since the metadata holder is the one that initiates the deletion.
+
+**The bug case is different, and that is what the lower layers' timers are for.** A bug that destroys DN
+metadata directly, bypassing soft delete, *does* create a heroics window — metadata gone, EN data still
+present — and recovering from it means scanning ENs for self-describing extents (§5.2). So the two
+mechanisms divide cleanly by failure mode:
+
+| Mechanism | Serves | Failure mode |
+|---|---|---|
+| The DN's soft-deleted record | **users**, directly | someone deleted the wrong thing |
+| The lower layers' independent timers | **maintainers**, by heroics | a bug deleted metadata it should not have |
+
+Same window length, no overlap wasting space, and no gap creating the trap. Each layer's retention is doing
+a different job.
+
 #### 8.4.2 The window must resist the operator
 
 > *Frequently no matter what you do / You find your worst opponent is you* — §4.3.4.2
