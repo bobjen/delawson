@@ -780,12 +780,15 @@ during recovery, exactly when the system is already busy.
 This is the same shape as the key-derivation trap in §7.3.3: a mutable assignment
 being used where a stable identity is needed. Both want deciding together.
 
-#### 5.10.4 A dividend: 32-bit ids shrink the extent entry
+#### 5.10.4 Bounded fan-out means 2-byte references, not 4-byte
 
-32-bit node ids are a metadata-density decision as much as an addressing one.
-§14.1's ~100 B entry looked tight when an instance reference was assumed to be
-~16 B; with a 4-byte EN id plus a 4-byte intra-EN locator it is 8 B, and the whole
-entry fits with room to spare:
+The 32-bit identifiers are for **cluster-wide naming** — topology, configuration,
+the control plane. They need not appear in per-extent metadata at all.
+
+Because an SN can reach at most ~20,000 ENs, and 2 bytes addresses 65,536, an
+instance's EN can be named by a **neighborhood-local index**. The global 32-bit id
+appears exactly once, in the SN's fan-out table: 20,000 entries × 4 B = **78 KB**,
+once per table rather than once per reference.
 
 | Field | Bytes |
 |---|---|
@@ -795,13 +798,49 @@ entry fits with room to spare:
 | cumulative physical bytes | 8 |
 | day index (§7.3.3) | 2 |
 | key generation and flags | 2 |
-| 4 × instance reference (4 B EN id + 4 B locator) | 32 |
-| **Total** | **68 B** |
+| 4 × instance reference (2 B local EN index + 4 B locator) | 24 |
+| **Total** | **60 B** |
 
-That matters more than it looks: §14.1 shows the object's stream list grows as the
-*square* of the entry size, so 68 B rather than 136 B is a 4× saving on the largest
-metadata structure in the system. It also leaves headroom for the keyed extents'
-`first_key`, which §14.1 flagged as the field that might not fit at all.
+The same argument applies to any reference whose fan-out is bounded: DN and FE
+references from an SN are likewise ≤20,000, so they too are 2-byte local indices.
+**Global ids are control-plane; local indices are data-plane.**
+
+The intra-EN locator can likely shrink too. If it is a slot index rather than a byte
+offset, 3 bytes addresses 2^24 slots, which at 32 MB per extent covers a 512 TiB EN
+— bringing the entry to **56 B**. Worth confirming against the EN sizing that §5.10.1
+already ties to fan-out.
+
+What it is worth, at *P*=64:
+
+| Entry | Extents/stream | Stream ceiling | Streams per maximal object | Stream list |
+|---|---|---|---|---|
+| 100 B (original guess) | 1.3 × 10^7 | 0.40 PiB | 4.1 × 10^6 | 412 MB |
+| 68 B (global 32-bit ids) | 2.0 × 10^7 | 0.58 PiB | 2.8 × 10^6 | 191 MB |
+| **60 B (2-byte local index)** | 2.2 × 10^7 | 0.66 PiB | 2.5 × 10^6 | **148 MB** |
+| 56 B (also a 3-byte slot) | 2.4 × 10^7 | 0.71 PiB | 2.3 × 10^6 | 129 MB |
+
+Two compounding effects, because §14.1 shows the stream list grows as the *square*
+of entry size: 8 bytes saved per entry is 10 GB of RAM freed on every SN machine,
+*and* 22% off the largest metadata structure in the system. Larger streams also mean
+fewer of them, which shortens every stream-list descent.
+
+⚠️ **The cost is a naming-lifecycle problem.** A local index is only meaningful
+relative to a table, so:
+
+- The fan-out table is critical state and must live in the ring's Raft state
+  (§4.4), snapshotted and logged like everything else.
+- **A local index must not be reused while any extent entry still references it.**
+  Retiring an EN and admitting a replacement into the same slot would silently
+  re-point every extent that named it. That needs reference counting, or a
+  generation number in the slot, or append-only slot allocation with compaction.
+- §5.10.3's mutable fan-out becomes harder: reassigning a stream to another ring
+  means its entries' local indices refer to the wrong table. The cheap fix is to
+  make the table **travel with the stream** — 78 KB is nothing next to the extent
+  list — which argues for the index namespace being per-stream rather than per-ring.
+
+⚠️ Per-stream or per-ring index namespace is undecided, and it is the same
+stable-identity-versus-mutable-assignment question as §5.10.3 and §7.3.3. All three
+now want deciding together.
 
 ---
 
@@ -1312,31 +1351,37 @@ degenerate *P*=1 case.
 Compression relaxes this: at a 4× ratio the same extent count spans 4× the logical
 bytes.
 
-**Sensitivity to the 100 B guess.** The ceiling scales inversely with entry size,
-so measuring it moves the answer but not the conclusion. Shown at *P*=64:
+**Sensitivity to the entry size.** The ceiling scales inversely with it, so measuring
+it moves the answer but not the conclusion. Shown at *P*=64, with 60 B as the
+current estimate (§5.10.4):
 
 | Entry size | Extents/stream | Stream ceiling | Streams per maximal object | Stream list |
 |---|---|---|---|---|
-| 50 B | 2.7 × 10^7 | ~0.8 PiB | ~2.1 × 10^6 | ~103 MB |
-| 100 B | 1.3 × 10^7 | ~0.4 PiB | ~4.1 × 10^6 | ~412 MB |
-| 200 B | 6.7 × 10^6 | ~0.2 PiB | ~8.2 × 10^6 | ~1.6 GB |
-| 400 B | 3.3 × 10^6 | ~0.1 PiB | ~1.6 × 10^7 | ~6.6 GB |
+| 56 B | 2.4 × 10^7 | ~0.71 PiB | ~2.3 × 10^6 | ~129 MB |
+| **60 B** (current estimate) | 2.2 × 10^7 | ~0.66 PiB | ~2.5 × 10^6 | **~148 MB** |
+| 100 B (original guess) | 1.3 × 10^7 | ~0.40 PiB | ~4.1 × 10^6 | ~412 MB |
+| 200 B (if a long `first_key` is inlined) | 6.7 × 10^6 | ~0.20 PiB | ~8.2 × 10^6 | ~1.6 GB |
 
-Note the stream list grows as the *square* of the entry size across this table —
-once from more streams, once from fatter entries — so measuring the entry size
-matters considerably more than it did when streams were 64 PiB. At 400 B and
-*P*=256 the stream list reaches ~26 GB, which is still a paged DN object but no
-longer casually affordable.
+The stream list grows as the *square* of the entry size — once from more streams,
+once from fatter entries — so this is a number worth defending, not merely
+measuring. The 200 B row is the warning: inlining a generous keyed `first_key`
+would cost an order of magnitude on the largest metadata structure in the system,
+which is the argument for a bounded key prefix instead.
 
-**The ~100 B entry now looks affordable**, thanks to 32-bit node ids: §5.10.4
-itemizes an unkeyed entry at **68 B**, including the day index the key hierarchy
-needs (§7.3.3). The earlier worry assumed 16 B instance references; 8 B is enough.
+**The 100 B guess was pessimistic.** §5.10.4 itemizes an unkeyed entry at **60 B**,
+including the day index the key hierarchy needs (§7.3.3), and possibly 56 B. Two
+corrections got it there: instance references are 8 B rather than the 16 B first
+assumed, and then only 6 B once bounded fan-out lets an EN be named by a 2-byte
+neighborhood-local index instead of its global 32-bit id.
+
+At 60 B rather than 100 B, streams reach 0.66 PiB instead of 0.40 PiB and the stream
+list falls from 412 MB to 148 MB.
 
 ⚠️ A keyed extent additionally needs a variable-length, user-supplied `first_key`.
-The 32 B of headroom under the 100 B budget covers a short key and no more, so
-either the entry grows and the stream ceiling falls proportionally, or the list
-stores a bounded key prefix and disambiguates by reading the extent. This is now
-the only field in the entry whose size is not known.
+That is now the only field in the entry whose size is unknown, and there is ~40 B of
+headroom under the original 100 B budget for it — enough for a short key, not for an
+arbitrary one. Either the entry grows and the stream ceiling falls proportionally, or
+the list stores a bounded key prefix and disambiguates by reading the extent.
 
 ### 14.2 DN: unbounded in object count, disk-backed
 
@@ -1464,27 +1509,31 @@ Roughly in order of how much else depends on them.
     replicas retained rather than erasure-coded?
 17. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-18. **The extent metadata entry: measure it** (§14.1), and decide whether a keyed
-    extent's `first_key` fits or forces a bounded prefix.
-19. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
+18. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+    whose size is unknown, and the stream list grows as the *square* of the entry —
+    so a bounded key prefix with disambiguation-by-read looks strongly preferable to
+    inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
+19. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+    how a slot is retired without silently re-pointing the extents that name it.
+20. **Compression block size vs index granularity** (§7.1). A 20 KB SSD granule
     hurts compression ratio, and ratio is billable.
-20. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+21. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-21. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+22. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-22. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+23. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-23. **Billing policy** (§12): garbage, transient double footprint, metadata,
+24. **Billing policy** (§12): garbage, transient double footprint, metadata,
     instantaneous-usage contract, reporting granularity.
-24. **Key custody within KS** (§7.3): how the daily master keys are themselves
+25. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-25. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+26. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-26. **Compaction policy** (§10) — now partly a pricing decision.
-27. **Membership and leader election** (§13).
-28. `Nul` and `\0` framing were both listed originally and are folded together
+27. **Compaction policy** (§10) — now partly a pricing decision.
+28. **Membership and leader election** (§13).
+29. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-29. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+30. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
