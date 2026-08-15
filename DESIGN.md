@@ -198,12 +198,54 @@ Differing, and why:
 The single-master limit is the one Google itself went on to fix with Colossus, and it is the
 same limit §14.1 reasons about — metadata in memory bounds what one machine can address. GFS
 accepted one such machine; DeLawson has many, which is what the fan-out and identifier work of
-§5.10 buys.
+§5.10 buys. §1.4.4 compares Colossus directly, since it is the closer relative.
 
 The last row is the one that most shapes this document. GFS and Cosmos were both internal
 systems where metadata cost was *absorbed* rather than charged. §12.1 records what happened
 when a system of this shape was exposed to paying users without billing for metadata, and it is
 why billing here is derived from the cost structure rather than bolted on.
+
+#### 1.4.4 Closer relative: Colossus
+
+Colossus is GFS's successor and the nearer comparison. Per [Google's own
+description](https://cloud.google.com/blog/products/storage-data-transfer/a-peek-behind-colossus-googles-file-system):
+
+> "Curators store file system metadata in Google's high-performance NoSQL database, BigTable.
+> The original motivation for building Colossus was to solve scaling limits we experienced with
+> Google File System (GFS) when trying to accommodate metadata related to Search. Storing file
+> metadata in BigTable allowed Colossus to scale up by over 100x over the largest GFS clusters."
+
+So yes — distributed metadata, in BigTable, and worth **over 100×** the largest GFS clusters.
+The component mapping is closer to DeLawson than is comfortable:
+
+| Colossus | DeLawson | Note |
+|---|---|---|
+| **Curators** — horizontally scalable metadata control plane | DN and SN rings (§5) | same fix for the same limit |
+| Metadata in **BigTable**, which itself runs on Colossus | DN metadata in DeLawson keyed objects (§5.5) | same self-hosting choice |
+| **D servers** — network-attached disks; data flows client↔D directly | ENs; the SN is not in the write path (§8.1.3) | same separation |
+| **Custodians** — background balancing, RAID reconstruction, efficiency | background loops (§13.2) | same shape |
+| **Client library** — the most complex component: software RAID, encoding schemes | undecided (§5.9.2) | see below |
+
+Two of these are informative rather than merely reassuring.
+
+**Colossus puts encoding in the client library**, and calls it the most complex component. That
+is a real data point for §5.9.2, which is still open on where the storage pipeline runs.
+DeLawson's cost target independently pushes the same way — §1.2 requires ENs to be
+CPU-cheap — so client-or-FE-side encoding is both the economical answer and the one a
+comparable system reached.
+
+⚠️ **Colossus has a disk-space-balancing custodian, and §13.1.2 claims DeLawson needs no
+rebalancing at all.** One of those is wrong, or they are solving different problems. The
+likeliest reconciliation: free-space-weighted placement balances *space* prospectively and says
+nothing about **read load**. A constantly-read extent makes its four disks hot regardless of how
+full they are, and DeLawson currently has no answer for that — adding instances to hot extents
+would be the natural one, which is still not *relocation*. Worth resolving before claiming the
+absence of a rebalancer as a simplification.
+
+Finally, the public description **does not address the bootstrap recursion** — BigTable runs on
+Colossus while storing Colossus's metadata. §5.5.1's fixed-depth chain and bootstrap root are
+therefore derived here rather than borrowed, and remain the part of self-hosting with the least
+external precedent to check against.
 
 ### 1.5 One security invariant
 
@@ -2465,6 +2507,13 @@ writes*, not by relocating bytes.
 That absence is a large simplification: no rebalancer to schedule, to rate-limit against
 foreground traffic, or to reason about interacting with repair and compaction.
 
+⚠️ **The claim covers space, not load.** Colossus has a disk-space-balancing custodian
+(§1.4.4), which suggests prospective placement is not the whole story. The gap is probably
+**read hot spots**: a constantly-read extent makes its instances' disks hot regardless of
+fullness, and free-space weighting is blind to that. The natural remedy is *adding* instances
+to hot extents rather than moving anything, which would preserve "no relocation" while
+admitting that "no rebalancing" was too strong.
+
 The cadence also has to match **the SN's own scan of its extents**, ideally once a
 minute and once every five minutes at worst, since a stale free-space table is useless if
 nothing consults it. That scan is memory-bandwidth bound, not I/O bound:
@@ -2997,81 +3046,85 @@ Roughly in order of how much else depends on them.
     reads, and what staleness does that admit?
 16. **The give-up budget for seal-short** (§9.5, §13). It must sit far below a 40-second TCP
     retry or one dead EN stalls a writer for a timeout.
-17. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
+17. **Read hot spots** (§13.1.2, §1.4.4). Free-space-weighted placement balances space and
+    is blind to read load. Colossus runs a balancing custodian, which suggests this is real.
+    Adding instances to hot extents would fix it without relocating anything, but nothing is
+    designed.
+18. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
     and domain constraints interact: a markedly emptier domain attracts weighted picks and
     then rejects them, which is worst right after adding capacity. Bounded, but worth
     measuring.
-18. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
+19. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
     safe, but who chooses the primary, and how a new one is appointed when it fails, is
     undesigned.
-19. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
+20. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
     must be chosen together; a Raft log index is a natural per-ring counter, but what an
     SCN is scoped to is unsettled while objects span many rings.
-20. **Expected object count** (§14.5). DN cost scales with object count rather than
+21. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-21. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
+22. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-22. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+23. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-23. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+24. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-24. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+25. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-25. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+26. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-26. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+27. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-27. **Background loop scheduling** (§13.2): prioritisation and rate limiting
+28. **Background loop scheduling** (§13.2): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-28. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+29. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-29. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+30. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-30. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+31. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-31. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+32. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-32. **Remaining directory semantics** (§5.1): listing huge directories,
+33. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-33. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+34. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-34. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+35. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-35. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
+36. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
     both sides: coarse granules compress better and bill less, fine granules cut read
     amplification, which is a 50× throughput factor for point reads.
-36. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+37. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-37. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+38. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-38. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+39. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-39. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
+40. **Billing policy** (§12.5): garbage, transient double footprint, shared-extent
     attribution, instantaneous-usage contract, reporting granularity. Slack itself is
     settled at 2× (§4.7).
-40. **Key custody within KS** (§7.3): how the daily master keys are themselves
+41. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-41. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
+42. **EC vs read locality** (§4.3): align the fragment stripe to the granule, or
     keep a full replica?
-42. **Compaction policy** (§10) — now partly a pricing decision.
-43. **Membership and leader election** (§13).
-44. `Nul` and `\0` framing were both listed originally and are folded together
+43. **Compaction policy** (§10) — now partly a pricing decision.
+44. **Membership and leader election** (§13).
+45. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-45. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+46. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
