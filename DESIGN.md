@@ -760,32 +760,82 @@ Storage overhead *is* disaster tolerance, in a one-line correspondence. Survivin
 costs 2× — mirroring, essentially — and no in-cluster code survives 100%, which is what a second
 cluster is for.
 
-#### 4.3.3.1 Expected loss is set by the smallest disaster that beats parity
+#### 4.3.3.1 Where expected loss actually comes from
 
-Loss as a function of disaster size is nearly a step: below the threshold, §13.2's slow degraded-window
-attrition; above it, immediate loss of a large fraction of everything. Since frequency falls steeply
-with size, the integral `∫ λ(s)·Loss(s) ds` is **dominated by disasters just above the threshold** —
-the smallest ones that still hurt, because they are the most frequent.
+An earlier draft of this subsection argued that loss is dominated by the *smallest* disaster
+exceeding parity, on the reasoning that those are the most frequent. **That was wrong**, and the
+error was treating loss as a step function. It is not: a disaster of size *s* destroys the fraction
+of extents that lose more than *m* of their *n* fragments, which for an MDS code is
 
-Which makes the design lever obvious, and it is not the one §4.3.1 was reaching for:
+> **L(s) = P(X > m)**, where X ~ Binomial(*n*, *s*)
 
-| Survivable fraction | Overhead | Relative rate of a threshold-exceeding disaster |
-|---|---|---|
-| 10% | 1.11× | 16.4× |
-| 20% | 1.25× | 3.3× |
-| **33%** | **1.50×** | **1.0×** (reference) |
-| 50% | 2.00× | 0.39× |
+— a smooth curve, not a cliff. With disaster rate R(≥s) ∝ s^-α, expected loss is
+∫ α·s^-(α+1)·L(s) ds, whose integrand goes as s^(m−α). For m > α that **increases** with s, so the
+large disasters dominate after all:
 
-Each **doubling of the survivable fraction cuts the loss rate ~5×** — the same factor as the
-frequency law, unsurprisingly. Compare §4.3.1.1, where tightening the repair window from 58 hours to
-1 hour bought a factor of ~1,000 against *steady-state* loss that was already negligible. **Parity
-buys reliability where reliability is actually lost; repair speed buys it where it is not.**
+| α (rate multiplier per halving) | Code | E[loss] ÷ R₁ | Median contributing *s* |
+|---|---|---|---|
+| 2.32 (5×) | RS 8+4 | 16.7 | **32%** |
+| 2.32 (5×) | RS 8+8 | 4.6 | 58% |
+| 2.32 (5×) | 3× replication | 3.4 | 36% |
+| 3.32 (10×) | RS 8+4 | 101 | 20% |
 
-⚠️ This rests entirely on disasters respecting the domain hierarchy. A disaster that cuts across
-domains — the orthogonality bug of §5.6.2, or simply a failure mode nobody modelled as a domain —
-destroys the guarantee and returns the problem to the binomial regime, where a 5% event can lose
-hundreds of terabytes outright. **§5.6.2's insistence on nesting is what makes this section true**,
-and it is worth rereading in that light.
+R₁ is the rate of whole-cluster disasters. **Expected annual loss is of order R₁ for every code** —
+which is the real conclusion: no in-cluster erasure code does anything about losing the whole
+cluster, so the top of the distribution can only be addressed by **a second cluster.** In-cluster
+parity buys the middle of the range.
+
+⚠️ **The exponent is not known.** "Halving the size multiplies the rate by 5" was a shape, not a
+measurement; 10× is equally plausible and changes E[loss] by 6×. Worse, **the integral diverges for
+α > m**: at 3× replication (m=2) and α=3.32 the small end dominates and the model needs a floor —
+the smallest real "disaster" being one disk. So **more parity both lowers loss and makes the
+estimate well-behaved**, and the exponent needs measuring before any of these numbers are trusted.
+
+#### 4.3.3.2 Comparing codes: the equal-lossiness point
+
+Absolute loss figures are hard to judge and depend on an unmeasured α. **A better comparison, and
+one independent of the frequency law: for what disaster size is a scheme exactly as lossy as
+triplication?** Below that size it is better, above it worse.
+
+| Scheme | Overhead | As lossy as 3× replication at | As lossy as 4× at |
+|---|---|---|---|
+| RS 8+2 | 1.25× | **never better** | never better |
+| **RS 8+4** | **1.50×** | **s = 4.0%** | s = 0.13% |
+| RS 8+8 | 2.00× | s = 30.5% | s = 20.5% |
+
+This is far more informative than a durability probability. It says **8+4 beats triplication only for
+disasters below 4% of the cluster** — and §13.2's failed rollout is 5%, already past it. 8+2 is worse
+than triplication at every size despite costing 1.25×, so cheap parity is a false economy. 8+8, at
+two-thirds the cost of triplication, is better than it for everything below 30%.
+
+#### 4.3.3.3 "Lost" is a customer's judgement, not ours
+
+**Asserted** (Bob): there is some fraction of loss at which a customer writes the remainder off as
+unsalvageable, and **it varies by customer from about 1/1000 to 999/1000.** The upper end is not
+hyperbole — people are still extracting text from the carbonized Herculaneum scrolls.
+
+So the right metric is not "probability of losing an extent" but **the rate of disasters losing more
+than the customer's write-off fraction *f***. That rate is R₁·s_f^-α where L(s_f) = *f*:
+
+| Write-off fraction *f* | RS 8+4: disaster size that reaches it | Rate ÷ R₁ | 3× replication rate ÷ R₁ |
+|---|---|---|---|
+| 0.1% | 7.2% | **447** | 209 |
+| 1% | 12.1% | 133 | 35 |
+| 10% | 21.9% | 34 | 5.9 |
+| 99.9% | 78.4% | **1.8** | 1.0 |
+
+**A 250-fold spread in effective loss rate across customers, on identical storage.** The intolerant
+customer and the Pompeii customer are not buying the same product, and no single durability number
+describes both.
+
+Two consequences:
+
+- **Durability is a per-customer parameter**, so the design should expose overhead as a choice rather
+  than fixing one code. §4.3.3 makes that a one-line correspondence — the customer picks a survivable
+  disaster fraction and pays 1/(1−s) for it.
+- **Which makes it billable**, and correctly so: higher durability *is* more physical bytes, so §12's
+  billing-by-physical-bytes charges for it automatically with no new mechanism. A rare case where the
+  cost model, the reliability model and the price list already agree.
 
 ### 4.4 Stored as lists, served as B-trees
 
