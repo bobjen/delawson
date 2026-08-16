@@ -254,6 +254,10 @@ pub struct KsConfig {
     /// KS will answer key requests. False on a test box — and `status` says so
     /// rather than staying quiet about it.
     pub require_unlock: bool,
+    /// Answer a ping on the connection's read loop rather than handing it to a
+    /// worker. Here to be turned off, since what it costs to hand one small
+    /// message to a scheduler is a number worth having.
+    pub inline_ping: bool,
 }
 
 impl KsConfig {

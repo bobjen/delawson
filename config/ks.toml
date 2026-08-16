@@ -6,3 +6,7 @@ lazy_day_keys = true
 # No operator secrets and no hardware devices on a test box, so KS comes up
 # already unlocked. Nothing but a test configuration may say false here.
 require_unlock = false
+
+# Answer a ping on the connection's read loop instead of a worker thread. A ping
+# is far too small to be worth a queue hop; turn it off to price one.
+inline_ping = true

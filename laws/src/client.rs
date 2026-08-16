@@ -10,6 +10,7 @@
 
 use common::wire::{Chan, Request, Response, Status, read_response, write_request};
 use common::{Context, Error, Result};
+use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
@@ -75,14 +76,14 @@ impl Conn {
         until: Instant,
         tally: &mut Tally,
     ) -> Result<()> {
-        // At most `depth` are outstanding and ids are handed out in order, so an
-        // id's send time lives at `id % depth`.
-        let mut sent = vec![Instant::now(); depth.max(1)];
+        // Keyed by id, not by a slot: answers may come back in any order, and a
+        // slow one can stay outstanding while ids run far past it.
+        let mut sent: HashMap<u32, Instant> = HashMap::with_capacity(depth * 2);
         let mut out = 0;
         loop {
             while out < depth && Instant::now() < until {
                 let id = self.send(request)?;
-                sent[id as usize % depth] = Instant::now();
+                sent.insert(id, Instant::now());
                 out += 1;
             }
             if out == 0 {
@@ -96,7 +97,10 @@ impl Conn {
             if response.status != Status::Ok {
                 return Err(Error::new(format!("answered {}", response.status)));
             }
-            tally.add(sent[response.id as usize % depth].elapsed());
+            match sent.remove(&response.id) {
+                Some(at) => tally.add(at.elapsed()),
+                None => return Err(Error::new(format!("unasked answer {}", response.id))),
+            }
             out -= 1;
         }
     }

@@ -8910,6 +8910,34 @@ wakeup; answering it on the connection's read loop stalls the next read for as l
 takes. Ping is cheap enough that inline plainly wins and is what the code does; anything that
 touches a disk plainly does not. The middle is unknown, so it is a per-operation knob.
 
+**Measured, 2026-08-16, by flipping that knob for ping** (`inline_ping` in KS's configuration),
+round trips per second:
+
+| Shape | Answered on the read loop | Handed to a worker | Cost |
+|---|---|---|---|
+| 1 connection, 1 in flight | 58,900 (17 µs) | 40,100 (25 µs) | +8 µs per round trip |
+| 1 connection, 64 in flight | 1,418,000 | 116,000 | **12x** |
+| 8 connections, 64 in flight | 5,279,000 | 234,000 | **23x** |
+| 16 connections, 256 in flight | 7,874,000 | 208,000 | **38x** |
+
+**Two different costs are in that table, and only the first is the queue hop.** At one request in
+flight there is nothing to coalesce, so the difference is the hop alone: **~8 µs**, and that is an
+upper bound, since this pool is one mutex-guarded queue shared by every worker rather than anything
+clever.
+
+The rest is worse and more interesting: **a worker cannot know whether more requests are already in
+hand, so it flushes its own answer, and the connection loses coalescing entirely.** That is why the
+pooled column is flat at ~200k no matter how many connections or how deep the pipeline — one syscall
+per message, which is exactly the rate the read loop gets at depth 1. Load stops helping.
+
+> **The dispatch decision is not "threads or an async runtime". It is whether the design still lets
+> answers pile up before they are sent.**
+
+Anything that hands each message to a scheduler and writes each answer when it completes pays this,
+whatever the scheduler is. So a machine type whose work genuinely must leave the read loop needs a
+flush policy of its own — batch the answers that are ready, rather than sending each — and that is
+tracked as work rather than assumed.
+
 ### 17.5 The first measurements: a ping to KS0
 
 Loopback TCP, this box (16 cores, client and server both on it), retail build, `bench-laws`, ping
@@ -8966,6 +8994,16 @@ and message compression. None of those are here yet. So the honest claim is narr
 path alone, stripped of everything that will later share it, costs about 0.8 µs of core per message
 and reaches millions per second.** Expect that number to get worse as the omitted work returns, and
 treat 8.4M as a ceiling on this box rather than a result to defend.
+
+**But logging and encryption were not the majority of the prototype's cost** (Asserted, Bob,
+2026-08-16), which leaves the 6x mostly unexplained by omitted work. Bob's own guess is the async
+runtime: that prototype was Rust on Linux **using tokio**, and this is not. §17.4's measurement is
+the part of that guess this box can test — dispatching each ping through a worker instead of
+answering it on the read loop caps throughput at ~200k, a 38x loss, because a scheduled handler
+flushes its own answer and the connection stops coalescing. That is the same shape a task-per-message
+runtime has by default. It is evidence for the hypothesis and not a verdict on tokio, whose scheduler
+is far better than the one measured here; what it does establish is that **per-message dispatch, not
+the work, is what a small request pays for.**
 
 Then message size, holding 64 in flight:
 

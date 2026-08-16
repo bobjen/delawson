@@ -43,10 +43,20 @@ impl Service for Ks {
         }
     }
 
+    fn inline(&self, op: Op) -> bool {
+        match op {
+            Op::Ping => self.config.inline_ping,
+            Op::Status | Op::Shutdown => true,
+            // A registry lookup takes a lock, so it goes to a worker.
+            _ => false,
+        }
+    }
+
     fn status(&self, _process: &Process) -> Vec<String> {
         vec![
             format!("lazy_day_keys {}", self.config.lazy_day_keys),
             format!("require_unlock {}", self.config.require_unlock),
+            format!("inline_ping {}", self.config.inline_ping),
             format!("unlocked {}", self.unlocked.load(Ordering::SeqCst)),
             format!("registered {}", self.peers.lock().expect("peers").len()),
             "master_keys 0".to_string(),
