@@ -93,7 +93,12 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **Georeplication is a ship requirement**, and the only answer to §4.3.3.1's dominant loss term | §13.4.5 |
 | It costs **1 at each end**, plus WAN — the first purpose the scalar ball bin cannot express | §13.4.5.1 |
 | Re-encrypt at the **destination**; instances need not be byte-identical across clusters | §13.4.5.2 |
-| Durability seconds must survive the trip; **`(path, record number)` is the portable name**, not the `DnId` | §13.4.5.3 |
+| Durability seconds must survive the trip; **`(path, record number)` is the portable name**, not the `DnId` | §4.6.3, §13.4.5.3 |
+| `DnId`/`SnId` are **internal and cluster-local**; the path is the user-visible durable name | §4.6.3 |
+| A hint `(extent, row)` is cluster-local by construction, and fails detectably across clusters | §4.6.3, §8.1.1a-10 |
+| The georep destination gets a **dedicated directory**, so replicas cannot collide with local objects | §13.4.5.4 |
+| So portability is relative to the replication root, and cross-cluster translation is **one prefix substitution** | §13.4.5.4 |
+| Failover is a **re-rooting**, which §5.5.4's `(parent dir id, name)` key makes one metadata change | §13.4.5.4, §5.5.4 |
 | **Priority is door height, not a sort**: round-robin plus thresholds, so no heap over 2^31 items | §13.4.3.3 |
 | Two doors per purpose: a **floor** admitted readily, then competition for the surplus | §13.4.3.1 |
 | **Every door is below 10% remaining** — 1% for high priority, 9% for low; the bin runs nearly empty by design | §13.4.3.5 |
@@ -2272,6 +2277,30 @@ Two safety requirements come with it:
   manufacture a collision. The SN should keep the last second it issued in its Raft
   state and refuse to regress.
 
+##### The portable name is the path, not the id
+
+**The identifiers above are internal and cluster-local. The durable user-visible name is the path**
+(Asserted, Bob, 2026-08-16). An earlier draft of this section read as though the id *were* the name, which is
+wrong in a way that only shows up at the worst moment.
+
+| | Name | Scope |
+|---|---|---|
+| Internal | `(DnId, StreamId)`, `(SnId, ExtentId, creation second)` | **one cluster** — two clusters collide |
+| **User-visible** | `(path, record number)` for unkeyed, `(path, key)` for keyed | **portable** |
+
+**§13.4.5's georeplication is what forces the distinction.** `DnId` and `SnId` are assigned per cluster, so a
+replica cannot carry them; but §1.0's central promise is that external indexes never need rebuilding, and a
+failover to the second cluster is precisely when a user cannot afford to rebuild every index they own. A path is
+a sequence of names and is cluster-independent, so it survives the trip where an id cannot.
+
+This costs nothing, because §5.5.4 already keys metadata by `(parent directory id, name)` rather than by the
+path — so the path was never a stored identifier in the first place. It is resolved component by component, and
+the components are portable even though the ids are not.
+
+**Consequence for §8.1.1a-10's reference tiers:** the durable tier's names must be written with a path, and the
+hint tier `(extent identity, row number)` is **cluster-local by construction** — a hint cannot survive
+georeplication, and per §8.1.1a-10 it fails detectably, which is the correct behaviour rather than a gap.
+
 ##### The timestamp is 8 bytes of seconds, compared modularly
 
 The daily SN-master key that encrypted an extent is **selected by its creation
@@ -2787,7 +2816,15 @@ billion descendants must not be a billion-record rewrite, and prefix scans still
 make listing cheap because keyed objects are sorted. The cost is a lookup per
 path component, bounded by path depth and highly cacheable.
 
-⚠️ Not decided.
+**§13.4.5.4 strengthens this from a recommendation to close to a requirement.** A
+georeplication failover promotes a replica by re-rooting its dedicated subtree —
+`/georep/A/x/y` becomes `/x/y` — which is one metadata change under this key and a
+rewrite of every descendant under a full-path key. That rename happens during a
+disaster, under time pressure, over the entire replicated dataset. It is the worst
+possible moment to discover the key choice was wrong.
+
+⚠️ Still not formally decided, but the case against full-path keys is now much
+harder to argue with.
 
 #### 5.5.5 Two dividends
 
@@ -7235,10 +7272,34 @@ arrival.
 record numbers and keys is that external indexes never need rebuilding — and a failover to the second cluster is
 precisely when a user cannot afford to rebuild every index they own.
 
-**The resolution is probably that the durable user-visible name is the path, not the `DnId`.** §5.1 gives objects
-a directory hierarchy, and a path is cluster-independent. So `(path, record number)` and `(path, key)` survive
-georeplication where `(DnId, ObjectId, record number)` does not. That deserves to be stated as the rule rather
-than left implicit, because §4.6.3 currently reads as though the id *is* the name.
+**Resolved: the durable user-visible name is the path**, and §4.6.3 now says so. `(path, record number)` and
+`(path, key)` survive georeplication where `(DnId, ObjectId, record number)` does not.
+
+#### 13.4.5.4 The destination gets a dedicated directory
+
+**A georeplication destination should have a dedicated directory, so replicated data cannot collide with
+anything local** (Asserted, Bob, 2026-08-16). Three things follow.
+
+**No collision, and multiple sources coexist.** Each source cluster lands under its own subtree, so the local
+namespace is untouched and a destination can hold replicas of several clusters at once without a naming
+authority between them.
+
+**Portability is relative to the replication root.** The prefix means the absolute path differs between
+clusters — `/x/y` on the source, `/georep/A/x/y` on the destination. So the portable name is precisely
+`(path relative to the replication root, record number)`, and translating between clusters is **one prefix
+substitution**. That is a world away from re-identifying every object: a client library or an index consumer can
+do it mechanically, and it is the same operation for every object rather than a per-object lookup.
+
+**Failover is a re-rooting, and §5.5.4 is what makes it cheap.** Promoting a replica means moving
+`/georep/A/x/y` to `/x/y`. Under §5.5.4's recommended `(parent directory id, name)` key that is **one metadata
+change**; under a full-path key it would rewrite every descendant record. §5.5.4 marks that choice as not
+decided and recommends it on renaming cost alone — **georeplication turns the recommendation into close to a
+requirement**, because the rename in question happens during a disaster, under time pressure, on the entire
+replicated dataset.
+
+⚠️ Presumably the subtree is **read-only** while the source is authoritative, and promotion is what makes it
+writable. That interacts with §8.1.1a-3's single-writer machinery — a promoted replica must not accept appends at
+offsets the old primary may also have used — and nothing here designs that.
 
 ### 13.5 Metadata snapshots, and the jobs that run over them
 
@@ -7936,10 +7997,10 @@ Roughly in order of how much else depends on them.
      bandwidth plus one local write, where repair consumes the intra-cluster cross-section. A scalar bin cannot
      express "plenty of WAN, no local write bandwidth". Arbitrate a vector, or admit against the scarcer
      resource with the other as a constraint.
-118. **How georeplicated data is identified** (§13.4.5.3). §4.6.3 makes `DnId` and `SnId` part of the name, and
-     those are cluster-local, so two clusters collide. Add a cluster component to identity, or re-identify on
-     arrival — and re-identifying breaks §1.0's index-stability promise at failover, which is when it matters
-     most. The likely answer is that the portable name is the **path**, which needs stating in §4.6.3.
+118. **Whether a promoted replica may accept writes safely** (§13.4.5.4). The replicated subtree is presumably
+     read-only while the source is authoritative, and promotion makes it writable — but §8.1.1a-3's
+     single-writer compare-and-append means a promoted replica must not accept appends at offsets the old
+     primary may also have used. Split-brain at the offset level, and undesigned.
 119. **What georeplication's unit and policy are** (§13.4.5). Per object, per directory, or per stream; which
      clusters pair with which; whether replication is symmetric; and how a reader chooses a replica. None of
      this is designed, and it is now a ship gate.
@@ -8022,6 +8083,10 @@ Roughly in order of how much else depends on them.
   read entirely, so read billing can stay flat (§9.8.1);
 - what a read does when a cell needs reconstruction — it does **not** reconstruct; it repairs
   the whole group if the timeout allows, else flags the group hot and fails (§9.8);
+- what the portable, user-visible durable name is — the **path**, since `DnId` and `SnId` are
+  cluster-local and cannot survive georeplication (§4.6.3, §13.4.5.3);
+- how a replica avoids colliding with the destination's local namespace — a **dedicated
+  directory** per source, making cross-cluster translation one prefix substitution (§13.4.5.4);
 - whether the throughput targets are per box or per cluster — **per box**, and both have
   already been reached on this box, so they are a floor rather than a stretch (§1.4.0);
 - whether the 200k/2M pair is two requirements or one — one, on messaging: the 10x gap
