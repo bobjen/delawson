@@ -51,7 +51,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-128 things *not* decided.
+130 things *not* decided.
 
 **Priorities and framing**
 
@@ -310,6 +310,11 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **Storage must not** be dynamically priced; a stored byte occupies a disk continuously | §12.1.1.3 |
 | Reservations are the **hedge against spot peaks**, which is what their premium buys | §12.1.1.3, §5.12.6 |
 | **Dither hard deletes** forward: the midnight expiry spike is self-inflicted and free to flatten | §8.5.1a |
+| **DN owns expiry**, and keeps a heap of what expires before the next GC pass, refilled by that pass | §8.5.1b |
+| The heap works only while **GC period ≪ mean object lifetime**; at parity it is the whole object set | §8.5.1b.1 |
+| Objects created after the sweep passed them must be **inserted into the live heap**, or they outlive their declaration | §8.5.1b.2 |
+| Three mechanisms now smooth the midnight spike; they must **compose, not compound** | §8.5.1b.2 |
+| Expiry is a **trigger**, not a mechanism — it enters §8.4.1's deferred decrement | §8.5.1b.2 |
 | Rule: **flatten what the design creates, price only what the world creates** | §8.5.1a |
 | **Physical, not logical** bytes — forced by the same slack rule | §12.3 |
 | A complex model with a **simple presentation**: top charges plus "everything else" while under 1% | §12.6 |
@@ -5432,6 +5437,80 @@ gone by a deadline is the entire point, must be exempt** — plausibly the same 
 so a spike that cannot be flattened must be priced around forever. **Flatten what the design creates; price only
 what the world creates.** This is the one large spike that is ours rather than the world's.
 
+#### 8.5.1b How DN finds what to expire, given that its metadata is on disk
+
+**DN is in charge of expiring user objects** (Asserted, Bob, 2026-08-16). That is the natural owner — DN holds the
+object metadata carrying the declared expiry — but it creates a problem the SN tier does not have.
+
+**DN metadata is mostly on disk** (§14.2), so the GC pass that would naively do the expiring is slow: **once a day
+or slower.** Expiring on that schedule would mean an object declared for 30 days lives 31, which is not prompt
+enough to be called honouring the declaration.
+
+**So DN keeps a heap prioritized by expiry date, holding the objects that will expire before the next GC pass, and
+the GC pass refills the next heap** (Asserted, Bob). The slow sweep supplies the fast structure; between sweeps
+DN pops from a small RAM-resident heap as times arrive. **That is what lets DN expire promptly despite keeping most
+object metadata on disk.**
+
+It is double-buffered by necessity: the sweep takes about as long as the window it is filling, so it fills the
+*next* window's heap while the current one is being drained.
+
+##### 8.5.1b.1 The heap only works if the GC period is far shorter than object lifetimes
+
+The heap holds one GC period's worth of expirations, so its size is
+
+> `heap entries ≈ objects × (GC period / mean object lifetime)`
+
+For a DN holding ~10^9 objects at ~16 B per entry — an expiry second plus an object reference — **Derived**:
+
+| Mean lifetime | GC period | Heap entries | Heap size |
+|---|---|---|---|
+| 30 days | daily | 3.3 × 10^7 | ~530 MB |
+| 7 days | daily | 1.4 × 10^8 | ~2.3 GB |
+| **1 day** | daily | **10^9 — every object** | ~16 GB |
+
+⚠️ **And short lifetimes are expected.** §8.4.1b notes that three days is already long for users who typically
+delete within a week, so the middle row is the realistic case and the bottom row is not far-fetched. As the ratio
+approaches 1 the heap degenerates into a copy of the whole object set and saves nothing.
+
+**Two ways out, and they are the classic index-versus-scan pair.**
+
+**Shorten the GC period for expiry alone.** The expiry sweep does not need to be the full metadata GC — it only
+needs the expiry column, so it can be a cheaper, more frequent pass. This keeps the write path untouched.
+
+**Or keep a secondary index keyed by expiry second.** §5.5 already stores DN metadata in DeLawson *keyed* objects,
+so a second keyed object sorted by expiry costs no new machinery — and then the "next expirations" are a prefix
+scan of a sorted structure rather than a heap that must be rebuilt. No sweep, and no sizing constraint at all.
+The price is maintenance on the write path: one keyed insert per object, and a delete-plus-insert whenever an
+expiry changes.
+
+⚠️ Undecided. The index is strictly better on read and strictly worse on write, and which dominates depends on the
+ratio above — the very number §8.5.1b.1 says is not yet known. Note that §8.5.1a's dithering helps the index case
+specifically, by spreading inserts that would otherwise all land on the same midnight key.
+
+##### 8.5.1b.2 One correctness hole, and three smoothers that must not compound
+
+⚠️ **An object created after the sweep passed its position can expire without being in any heap.** The sweep is a
+snapshot; anything created, or re-dated, afterwards is invisible to it. So **DN must insert directly into the live
+heap** when it creates an object whose expiry falls inside the current window. DN is the creator and knows the
+expiry, so this is cheap — but it is exactly the case a heap-refilled-by-sweep design forgets, and the symptom is
+data that outlives its declaration silently.
+
+**And there is now a rate limit on extent deletion** (Asserted, Bob), which spreads the resulting work downstream.
+So three separate mechanisms smooth the same midnight spike:
+
+| Mechanism | Where |
+|---|---|
+| Dithered hard-delete times | §8.5.1a |
+| The heap's pop schedule | above |
+| The rate limit on extent deletion | §8.4, here |
+
+⚠️ **They must compose rather than compound.** If dithering spreads work over six hours and the rate limiter also
+meters it over six hours, the effective delay is worse than either alone and the storage is billed for the whole of
+it. They should be understood as one policy with one budget, not three independent knobs that each seem harmless.
+
+Note that expiry needs no new teardown path: DN expiring an object enters §8.4.1's deferred decrement, which
+releases stream references, then extent references, then the bytes. Expiry is a *trigger*, not a mechanism.
+
 #### 8.5.2 Extent size is a weak lever by comparison
 
 **Guess** (Bob): doubling extent size increases garbage by ~3%. Taken literally that is
@@ -8528,6 +8607,14 @@ Roughly in order of how much else depends on them.
      utilization and predictable enough to plan against, or it gives customers no way to shift load and fails at
      its only job. A published forward curve, a posted current rate, or an auction — and the choice determines
      whether §12.6's simple presentation survives.
+
+129. **Heap versus an expiry-keyed index in DN** (§8.5.1b.1). The heap needs no write-path maintenance but
+     degenerates to the whole object set as the GC period approaches mean object lifetime — and §8.4.1b says
+     lifetimes of a week are typical. A secondary keyed object sorted by expiry second costs one insert per object
+     and removes both the sweep and the sizing constraint. Which wins depends on the ratio, which is unmeasured.
+130. **One budget for the three deletion smoothers** (§8.5.1b.2). Dithering, the heap's pop schedule and the
+     extent-deletion rate limit each spread the same work. Independently tuned they compound, delaying reclamation
+     and billing the customer for the delay. They need to be one policy with one budget.
 
 **Closed** since earlier drafts:
 
