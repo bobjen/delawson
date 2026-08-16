@@ -51,7 +51,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-126 things *not* decided.
+128 things *not* decided.
 
 **Priorities and framing**
 
@@ -305,6 +305,12 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | | |
 |---|---|
 | Billing tracks **actual cost within 2× slack**, on every scarce resource | §12.1, §12.4 |
+| For compute the slack binds on the **average** (~1.2× cost), not the instant — scarcity *is* cost | §12.1.1.2 |
+| **Peak-to-mean is invariant to cluster size**: demand spikes are common-mode, so the LLN never smooths them | §12.1.1.1 |
+| **Storage must not** be dynamically priced; a stored byte occupies a disk continuously | §12.1.1.3 |
+| Reservations are the **hedge against spot peaks**, which is what their premium buys | §12.1.1.3, §5.12.6 |
+| **Dither hard deletes** forward: the midnight expiry spike is self-inflicted and free to flatten | §8.5.1a |
+| Rule: **flatten what the design creates, price only what the world creates** | §8.5.1a |
 | **Physical, not logical** bytes — forced by the same slack rule | §12.3 |
 | A complex model with a **simple presentation**: top charges plus "everything else" while under 1% | §12.6 |
 | Shared extents: **charge per billed reference = extent cost / number of billed references** | §12.6.3 |
@@ -5401,6 +5407,31 @@ What a declared expiry buys:
 This is the strongest available lever on the §12.7 efficiency chain, and it costs nothing but an API
 field and the discipline to group by it.
 
+#### 8.5.1a Dither the hard delete, because the midnight spike is self-inflicted
+
+§12.1.1.1 lists a deletion spike at midnight GMT as a demand feature to be priced around. **Part of it is
+self-inflicted, and the design can flatten it instead.**
+
+Humans declare expiry at day boundaries — "keep this 30 days" means midnight, not 03:47 — so honouring declared
+times exactly piles the resulting hard-delete work onto one instant, worldwide, every day.
+
+**So dither the hard delete forward by a deterministic per-object offset**, for example a hash of the object id
+modulo a window of hours. Deterministic so it is reproducible and auditable; forward so it never deletes early.
+
+**This is free.** The storage is already paid for during the dither window — §12.8.2's byte-seconds are computed
+from actual reference lifetimes, so the customer is charged for exactly the time the data existed and not a moment
+more. Nothing is given away and nothing is over-billed.
+
+⚠️ **It requires expiry to mean "not before", not "not after".** §8.4.1b already delays reclamation by up to three
+days for soft delete, so DeLawson does not promise prompt destruction in the general case — which suggests "not
+before" is already the operative semantics. But it must not be assumed: **compliance-driven deletion, where being
+gone by a deadline is the entire point, must be exempt** — plausibly the same class that opts out of soft delete
+(§8.4).
+
+**The general lesson is worth more than the mechanism:** §12.1.1 shows peak-to-mean is invariant to cluster size,
+so a spike that cannot be flattened must be priced around forever. **Flatten what the design creates; price only
+what the world creates.** This is the one large spike that is ours rather than the world's.
+
 #### 8.5.2 Extent size is a weak lever by comparison
 
 **Guess** (Bob): doubling extent size increases garbage by ~3%. Taken literally that is
@@ -6101,6 +6132,74 @@ something the design can meter.
 **ADLS Gen1**. It did not bill for user metadata — and users responded exactly as the
 incentive invited, piling into enormous numbers of extremely tiny streams. Nothing about
 that behaviour was unreasonable; it was the cheapest way to use the product as priced.
+
+#### 12.1.1 Compute prices must vary, and the slack rule binds on the average
+
+**Compute pricing will break the 1x-2x rule in both directions — lower when capacity risks going unused, higher at
+peak demand — while still averaging about 1.2x cost** (Asserted, Bob, 2026-08-16).
+
+##### 12.1.1.1 The law of large numbers does not rescue this
+
+**Demand is not uniform, and no cluster is large enough to make it uniform.** That is the load-bearing claim, and it
+is worth stating formally because the intuition runs the other way. Write each customer's demand as
+
+```
+demand_i(t) = a_i · f(t) + noise_i(t)
+```
+
+Summing over *n* customers, the noise averages out — its relative variance falls as `1/sqrt(n)` — but the common
+term `f(t) · Σa_i` **scales with *n* exactly as the mean does.** So:
+
+> **Peak-to-mean is a property of the workload's time structure, not of the cluster's size. Growing the cluster
+> does not smooth demand.**
+
+**Derived.** The spikes are common-mode, not independent: a deletion spike at midnight GMT every day, weekends
+quieter than weekdays, end-of-year busier than the rest. Averaging only works on what is independent, and none of
+those are.
+
+##### 12.1.1.2 Varying prices are *more* faithful to §12.1, not less
+
+The rule says proportional to **actual cost**. Ask what actual cost is at a given instant:
+
+| State | Actual cost of serving one more compute-hour | Average cost is |
+|---|---|---|
+| Capacity idle | **marginal** — electricity, a small fraction of amortized | far too high |
+| Capacity scarce | **opportunity** — the work displaced | too low |
+
+So average cost is the right answer at neither extreme, and **a fixed price was always the approximation.**
+Selling idle capacity below average cost but above marginal cost is profitable rather than charitable — the
+alternative is zero revenue on hardware that costs the same either way, which §1.6 calls waste.
+
+At peak, the usual objection is that a competitor undercuts you. But the peak is common-mode, so **every provider
+is scarce simultaneously** and there is no trough elsewhere to undercut from. That is uncomfortable and it is the
+honest reading.
+
+**So restate the rule rather than abandon it:**
+
+> §12.1's slack binds on the **average** price paid over time, not on the instantaneous price. The accountable
+> figure is ~1.2x cost on average; the instantaneous price is free to track scarcity because scarcity *is* cost.
+
+##### 12.1.1.3 What must not vary, and what it costs
+
+**Storage must not be dynamically priced.** A stored byte occupies a disk continuously, so its cost has no
+time structure to track. Compute has one because a processor-second unused is gone. The design therefore has three
+billing shapes, and their differences are §12.1 applied faithfully rather than inconsistently:
+
+| Resource | Shape | Where |
+|---|---|---|
+| Storage | continuous, stable price | §12.3 |
+| Compute bank | accumulate at a rate, **charging stops at the ceiling** | §5.12.5.1 |
+| Compute at the margin | **time-varying with scarcity** | here |
+
+⚠️ **The cost is predictability, and this is the second source of it.** §16's question about sharing volatility is
+the first. §12.6 promises a simple presentation, and a bill that moves with the clock strains that — so the price
+must be **published and derived from observable utilization**, because an unpredictable price gives customers no
+way to shift load and therefore fails at the one job it was introduced to do.
+
+**And §5.12.6's reservations are the hedge, which retroactively explains their premium.** A scheduled compute-hour
+costs more than a normal one precisely because it is **insurance against peak spot prices** as well as a capacity
+guarantee. Customers with flexible work take the spot price; customers with predictable work buy certainty. The two
+products compose rather than compete.
 
 ### 12.2 Why "bill for bytes" is not enough
 
@@ -8420,6 +8519,15 @@ Roughly in order of how much else depends on them.
 126. **A cap on the reservable fraction of the cluster** (§5.12.6.2). At a peak instant best-effort work gets
      `cores − Σ scheduled(t)`, which may be zero, making the bank's accumulation rate briefly worthless. Bounding
      the reservable fraction fixes that and costs reservation revenue. Where the line goes is a product decision.
+
+127. **Whether declared expiry means "not before" or "not after"** (§8.5.1a). Dithering hard deletes to flatten
+     the midnight spike requires the former, and §8.4.1b's three-day soft-delete window suggests that is already
+     the operative semantics — but compliance-driven deletion needs the latter, and nothing says which class an
+     object is in. Plausibly the same distinction as the soft-delete opt-out.
+128. **How the compute spot price is computed and published** (§12.1.1.3). It must be derived from observable
+     utilization and predictable enough to plan against, or it gives customers no way to shift load and fails at
+     its only job. A published forward curve, a posted current rate, or an auction — and the choice determines
+     whether §12.6's simple presentation survives.
 
 **Closed** since earlier drafts:
 
