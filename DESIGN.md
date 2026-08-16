@@ -29,6 +29,12 @@ it was computed or assumed.
 
 **Inputs currently asserted rather than derived**, in rough order of how much rests on them:
 
+Four public sources by Bob set the motivation and the scale, and are cited where used:
+[the erasure-coding song](https://youtu.be/oak6U2yBy94) (§4.3.4.2),
+[how AI should work](https://burtleburtle.net/bob/future/ai.html) (§1.0, §1.0.3),
+[really big data centers](https://burtleburtle.net/bob/future/bigdata.html) and
+[the dense torus core](https://burtleburtle.net/bob/future/dense.html) (§1.0.4).
+
 | Input | Value | Where |
 |---|---|---|
 | Instance gone-and-not-yet-replaced | 10^-4 | §4.3.1 — **challenged in §4.3.1.1** |
@@ -63,6 +69,11 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **~95% of hardware cost is disk**; that is cost composition and says nothing about space efficiency | §1.2, §12.7 |
 | **Open source**, so storage can sit inside a compute cluster and egress fees — 48× the storage cost — vanish | §1.0 |
 | Stable record numbers and keys make **external indexes permanently valid**, which is what shared AI memory needs | §1.0, §3 |
+| The motivating case is public and specific: thousands of minds, 10,000 remember-test cycles/s each | §1.0.3 |
+| So it wants **~10^7 metadata QPS** — 5× the demonstrated target, ~1/4 of the hardware bound | §1.0.3 |
+| And it is the **one serial workload**: parallelism comes from the number of minds, not within one mind | §1.0.3 |
+| The scale ambition is ~10^57 bits; DeLawson addresses ~10^26, so it is **10^31 short** and directional | §1.0.4 |
+| Relative timestamps are why §1.3's rule survives a scale nobody designed for | §1.0.4, §4.6.3 |
 | Every append records its **durability second**, so time-range queries work indefinitely — distinct from the minutes-long SCN snapshot horizon | §9.7 |
 | **User code only on Compute; keys never where user code runs** | §1.5 |
 | The real boundary is **signed executables**, not absence of keys — which makes code signing load-bearing | §1.5 |
@@ -262,9 +273,10 @@ attached — the software itself, runnable by anyone, on their own hardware.
 
 Three things follow, and they are the reason the design looks as it does.
 
-**A motivating use case: shared AI memory.** That means indexes maintained over shared experiences in real
-or near-real time, and the awkward part of such a system is normally that indexes go stale — references
-shift as the underlying store reorganizes. DeLawson's object model happens to remove that problem:
+**A motivating use case: shared AI memory**, set out at length in Bob's [*How I expect AI to eventually
+work*](https://burtleburtle.net/bob/future/ai.html) (Cited). That means indexes maintained over shared
+experiences in real or near-real time, and the awkward part of such a system is normally that indexes go
+stale — references shift as the underlying store reorganizes. DeLawson's object model happens to remove that problem:
 
 | | Gives |
 |---|---|
@@ -338,6 +350,90 @@ system.
   the one previous attempt to make this class of system user-visible.
 - Sequential read throughput approaching the aggregate sequential bandwidth of
   the disks holding the object.
+
+#### 1.0.3 What the motivating case actually demands
+
+The AI page is specific enough to turn §1.0's motivation into requirements rather than a gesture. Its
+load-bearing claims (Cited):
+
+| Claim | Figure |
+|---|---|
+| Scale of sharing | *"thousands of souls reading and writing it simultaneously"* |
+| Why pool at all | *"If you equipped 1000 AIs with processors and hard drives, and gave them the option of pooling their hard drives, pooling the hard drives is a large obvious win"* |
+| Memory per mind | 1 TB to 100 TB |
+| Thinking speed | a *remember-test-remember-test* cycle: ~50/s on disk, **~10,000/s on SSD** |
+| Why not one store | speed of light forbids real-time access to a single central repository |
+
+**The pooling argument is §1.0's co-location argument reached from the other direction**, which is worth
+noticing: that page argues for shared storage from economies of scale among many minds, and §1.0 argues for
+it from egress fees. Same conclusion, independent premises.
+
+**Three requirements fall out. Derived.**
+
+**Storage is not the binding constraint.** 1,000 minds at 100 TB each is 100 PB, against ~2 EB for a
+1,000-EN fleet (§12.7.2). Comfortable by a factor of twenty.
+
+**Metadata QPS is the binding constraint.** 1,000 minds × 10,000 cycles/s is **10^7 memory operations per
+second** — five times §1.4.0's 2M batched target, and about a quarter of §1.6.2's ~40M/s hardware bound. So
+the motivating case sits *between* what has been demonstrated and what the machine can do, which is exactly
+the region §1.6 exists to make visible. It is also the strongest argument that §1.4.0's targets are a floor
+rather than an ambition.
+
+**And it introduces the one workload where §1.4's stance does not apply.** §1.4 prioritizes throughput
+because jobs are zillions of tiny *parallel* requests. But a remember-test cycle is **serial**: each step
+depends on the previous, so per-mind thinking speed is capped by round-trip latency at `1/latency` cycles per
+second — 10,000/s means a **100 µs budget per lookup**, end to end.
+
+That is not a contradiction, and the resolution should be stated rather than left to be rediscovered:
+
+> **Parallelism comes from the number of minds, not from within one mind.** Aggregate throughput scales with
+> soul count and is a §1.4 problem; per-mind thinking speed is a latency problem, and it is the only place in
+> this design where latency is not amortizable by batching.
+
+Which puts a floor under §9.5's hedging and §1.1's timeout discussion that no other workload here does: a
+100 µs budget leaves no room for a 20-second TCP timeout to be part of the answer, so the tail matters
+per-request and not merely per-job.
+
+#### 1.0.4 The scale ambition, and the honest size of the gap
+
+Bob's [*Really Big Data Centers*](https://burtleburtle.net/bob/future/bigdata.html) and
+[*Dense Torus Core*](https://burtleburtle.net/bob/future/dense.html) describe the scale DeLawson is *aimed*
+at — with his own caveat that it is "utterly wishful thinking that this particular code will go that far"
+(Cited).
+
+The dense core is a solar-mass rotating torus of 15 km hydrogen spheres at ~0.5 K, holding **1.2 × 10^57
+bits**, computing 6 × 10^63 operations/second, lasting ~34 trillion years, with light-speed latency of 1.2 s
+across a compact subset and 13 s across the whole.
+
+**Quantifying the gap is more useful than admiring it.** Three scales, and they are far apart:
+
+| | Nodes | Bits | Where |
+|---|---|---|---|
+| Ship gate | 100,000 | ~10^21 | §1.4.0, issue #26 |
+| Addressable by design | 2^32 = 4.3 × 10^9 | ~7 × 10^25 | §5.10 |
+| The ambition | — | 1.2 × 10^57 | this section |
+
+So DeLawson's addressing tops out about **10^31 short** of the dense core. **Derived.** It is not the design
+that goes there, and saying so plainly is more useful than a hedge — the target is directional.
+
+**But two parts of the design already come from the ambition, and that is why they look odd.**
+
+**§1.3's refusal of absolute epochs.** The dense core's 34-trillion-year lifespan exceeds what an 8-byte
+count of seconds can even express: 2^63 seconds is ~2.9 × 10^11 years, a hundred times short. §4.6.3's
+timestamps survive anyway **because they are compared by signed difference rather than against an epoch**, so
+the representation is reinterpretable indefinitely and only requires that two compared times be within ~1.5 ×
+10^11 years of each other. A rule adopted for tidiness turns out to be the only reason the scheme survives a
+scale nobody designed it for.
+
+**The 2^64 records per object of §3.** At the ambition's scale a single object genuinely could exceed any one
+machine, which is the premise §4's whole four-level decomposition rests on.
+
+**And both pages agree on the thing that bounds this design's scope.** The AI page says speed of light
+forbids one central repository; the dense core puts 1.2–13 seconds of light latency inside a *single*
+structure. Against §1.0.3's 100 µs thinking budget, a mind cannot think across such a structure at all. So
+**DeLawson is one memory store among many, not the global memory** — and moving memories between stores,
+which the AI page describes as needing back-and-forth verification and questioning, is asynchronous, distinct,
+and out of scope per §2.
 
 ### 1.1 Availability and reliability are separate goals
 
@@ -1778,6 +1874,9 @@ which is small next to the 1/*D* reserve above, so the space rule is set by doma
 ordinary repair.
 
 #### 4.3.4.2 Two conclusions the song reaches first
+
+The song is public, and performed: [*Erasure Coding*](https://youtu.be/oak6U2yBy94) (Cited).
+
 
 > *Erasure Coding stops hardware leaks / But not admins or management freaks*
 > *So: backup in several unrelated places / Immortality any 1 of n embraces*
