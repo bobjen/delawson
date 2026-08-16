@@ -51,7 +51,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-113 things *not* decided.
+116 things *not* decided.
 
 **Priorities and framing**
 
@@ -81,6 +81,11 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | The **user sets the read timeout**, making availability-versus-latency their choice | §9.8 |
 | Repair priority takes a third input: **read demand**, +1 global read applied after the swap | §13.4.0, §9.8 |
 | Repair admission is a budget on **outstanding** reads+writes, returned on completion — the bin is the feedback loop | §13.4.3 |
+| Bandwidth is a **whole-cluster** resource, so a **coordinator** hands out per-SN allocations | §13.4.4 |
+| `grant = min(max(min(work, minimum), proportional), maximum)` — a floor, a share, and a self-DOS cap | §13.4.4 |
+| Shared domains is why a coordinator is needed **and** why its per-SN ceiling rarely binds | §13.4.4.1 |
+| A **tree of coordinators rooted at SN0**; two levels covers any real cluster | §13.4.4.2 |
+| Recurring idiom: **a set of floors is a partition of a total** and must be validated as one | §13.4.4.3 |
 | **Priority is door height, not a sort**: round-robin plus thresholds, so no heap over 2^31 items | §13.4.3.3 |
 | Two doors per purpose: a **floor** admitted readily, then competition for the surplus | §13.4.3.1 |
 | **Every door is below 10% remaining** — 1% for high priority, 9% for low; the bin runs nearly empty by design | §13.4.3.5 |
@@ -6832,7 +6837,7 @@ they sound (Asserted, Bob, 2026-08-16).
 
 Each SN has an allocation of **outstanding repair bandwidth, measured in extent reads plus writes.** When a
 repair is scheduled its cost is **removed** from the available pool; when it completes, the cost is
-**returned**.
+**returned**. Where that allocation comes from is §13.4.4 — it is not a per-SN constant.
 
 | Repair | Reads | Writes | Cost |
 |---|---|---|---|
@@ -7010,6 +7015,87 @@ deadlines. Every other repair type is "sooner is better"; a decommission has a d
 leaves whether or not its data was copied off. Either it gets the lowest door unconditionally, or it needs a
 door that descends as its deadline approaches. Undecided, and it is the case where getting admission control
 wrong loses data rather than merely delaying repair.
+
+### 13.4.4 The allocation is handed out centrally, because bandwidth is a cluster resource
+
+**Repair bandwidth is a whole-cluster resource, determined by the network** (Asserted, Bob, 2026-08-16). §13.4.3
+treats an SN's allocation as given; this is where it comes from.
+
+**Why it cannot be partitioned per SN.** Every SN's ENs are spread across the same power domains, software
+deployment domains and racks — that is what §5.6 requires of placement. So all SNs draw on the same network
+cross-section and are in direct competition. There is no static division that is both fair and work-conserving.
+
+**A central coordinator.** SNs report how much work they have; the coordinator hands out bandwidth
+proportionally, with a floor and a ceiling:
+
+```
+grant = min( max( min(work_requested, minimum), proportional_share ), maximum )
+```
+
+Reading the inner part: if an SN wants less than its minimum it gets what it asked for; otherwise it gets its
+minimum, or its proportional share if that is larger. **So the minimum is a floor and the proportional share is
+the surplus** — the same shape as §13.4.3.1's two doors, one level up. That recurrence is worth noticing: the
+same floor-plus-compete idiom arbitrates purposes within an SN and SNs within a cluster, so the starvation and
+work-conservation reasoning of §13.4.3.6 transfers directly.
+
+**The maximum exists because an SN can DOS itself.** An SN granted a very large share could schedule enough
+repair to saturate its own ENs and ring, damaging the foreground work it is there to serve. The cap is
+self-protection, not fairness, and it is the one term that is *not* about sharing.
+
+#### 13.4.4.1 The maximum costs work-conservation, and the same premise pays for it
+
+⚠️ The cap breaks the property §13.4.3.6 establishes at the SN level. If damage concentrates on a few SNs, then
+`(SNs with work) × maximum` may be less than the cluster total, and bandwidth sits idle — which §1.6 forbids.
+
+**But the premise that forces central coordination is the same one that makes this rare. Derived.** Because every
+SN's ENs are spread over all domains, any domain-scoped disaster — a failed rollout (§13.2), a power event, a
+rack loss — damages **every SN roughly equally**, so every SN has work and the cap does not bind. Even a single
+EN's death spreads, since §5.10 gives an EN a fan-out of thousands of SNs. Concentration would require something
+SN-scoped, such as one ring's own failure.
+
+So the two facts are one fact: *shared domains* is why a coordinator is needed **and** why its ceiling is
+affordable. Worth stating, because the cap looks like a work-conservation bug in isolation.
+
+#### 13.4.4.2 A tree of coordinators, rooted at SN0
+
+For clusters with very many SN rings a single coordinator will not do, so it becomes a **tree — and SN0 is always
+the root** (Asserted, Bob).
+
+That reuses §5.5.1's convention rather than adding a mechanism: instance 0 of a machine type is the well-known
+anchor, as DN0 already is for the bootstrap root, so nothing new is needed to discover the coordinator.
+
+**The tree is shallow. Derived.** At §5.10's fan-out of ~20,000 children:
+
+| Levels | SNs coordinated |
+|---|---|
+| 1 | 20,000 |
+| 2 | 4 × 10^8 |
+| 3 | 8 × 10^12 — beyond the 2^32 node limit of §5.10 |
+
+So two levels covers any realistic cluster and three covers the design limit. Each level adds a round trip, but
+reporting is periodic rather than per-repair and grants change slowly (§13.4.3.4), so the depth costs nothing.
+
+#### 13.4.4.3 Two consequences to settle before it is built
+
+⚠️ **What an SN does when the coordinator is unreachable.** Falling back to the **minimum** is the safe answer:
+it guarantees forward progress on repair without risking oversubscription of a network nobody is arbitrating. But
+that only holds if
+
+> **Σ minimum over all SNs ≤ total cluster bandwidth.**
+
+Otherwise the minimums are nominal *and* a coordinator outage oversubscribes the network. That is the third time
+this document has met the same constraint — §13.4.3.4's sufficient amounts, §16 question 111, and now this — so
+it is an idiom with a recurring bug: **a set of floors is a partition of a total, and must be validated as one.**
+
+⚠️ **What "work to do" means, and how stale it is.** The natural unit is §13.4.3's outstanding reads plus writes,
+and an SN learns its backlog from the round-robin sweep of §13.4.3.3. So a report is only as fresh as the sweep
+period, and proportional shares are only as accurate as that. If sweeps take 20-200 s (§13.1.10) then grants lag
+by that much, which is fine for a slow-moving level and possibly not fine at the onset of a disaster — exactly
+when proportions change fastest.
+
+Note also that the cluster figure being arbitrated is a **network cross-section**, not a sum of NICs.
+§4.3.2.2a's warning applies: a spine oversubscription ratio divides the total that the coordinator has to give
+away.
 
 ### 13.5 Metadata snapshots, and the jobs that run over them
 
@@ -7691,6 +7777,17 @@ Roughly in order of how much else depends on them.
 113. **Whether the GC repair sweep and the verification sweep are one pass** (§13.4.3.3, §13.1.10). Both walk
      every extent and every EC group at ~20-200 s per SN. Two passes is twice the memory traffic for no
      benefit; fusing them couples loops with different natural cadences.
+
+114. **What an SN does when the repair coordinator is unreachable** (§13.4.4.3). Falling back to the minimum is
+     the safe answer, but only if the minimums sum within the cluster total — otherwise a coordinator outage
+     oversubscribes the network. Needs the fallback rule and a validator on the sum.
+115. **How stale a work report may be** (§13.4.4.3). Proportional shares are only as accurate as the sweep that
+     discovers an SN's backlog, which is 20-200 s (§13.1.10). Tolerable for a slowly-moving level; possibly not
+     at the onset of a disaster, which is when proportions change fastest and when getting them wrong costs the
+     most.
+116. **The values of the per-SN minimum and maximum** (§13.4.4). The minimum is bounded by the partition
+     constraint above; the maximum is set by how much repair an SN can schedule before damaging its own
+     foreground work, which is a measurement rather than a policy.
 
 **Closed** since earlier drafts:
 
