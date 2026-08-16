@@ -51,7 +51,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-121 things *not* decided.
+124 things *not* decided.
 
 **Priorities and framing**
 
@@ -87,7 +87,12 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | A **tree of coordinators rooted at SN0**; two levels covers any real cluster | §13.4.4.2 |
 | Recurring idiom: **a set of floors is a partition of a total** and must be validated as one | §13.4.4.3 |
 | Sum the minimums to **a half or a third** of the total | §13.4.4.4 |
-| **Pure proportional allocation is pessimal**: every SN finishes simultaneously, so nobody recovers early | §13.4.4.4 |
+| **Equal sharing is pessimal**: with work and capacity fixed, the last completion is invariant, the earlier ones are free | §13.4.4.4, §5.12.4 |
+| So compute **serializes at maximum parallelism** — 45% lower mean latency, 10× on staggered arrivals, same throughput | §5.12.4 |
+| But bounded by Amdahl: run the **fewest concurrent jobs that saturates**, not literally one | §5.12.4.1 |
+| Compute is paid from a **bank of compute-hours**; a job starts when the balance covers its expected cost | §5.12.5 |
+| Fourth instance of: **guaranteed allocations partition a total** — and an accumulating one needs a ceiling too | §5.12.5 |
+| For compute, **quota and billing merge**: the balance is the quota, the hours spent are the record | §5.12.5.1 |
 | The floor staggers completion, so **whole users recover early** — worth more than partial recovery (§4.3.3.3) | §13.4.4.4 |
 | Its cost is a **cap-limited tail**, which gives the per-SN maximum a second job | §13.4.4.4a |
 | **Georeplication is a ship requirement**, and the only answer to §4.3.3.1's dominant loss term | §13.4.5 |
@@ -3684,6 +3689,90 @@ This also completes a chain worth reading in one place:
 
 ---
 
+#### 5.12.4 Scheduling: maximum parallelism, because equal sharing is pessimal
+
+**Compute should strive for maximum parallelism once a job is started** (Asserted, Bob, 2026-08-16). The argument
+is the same one §13.4.4.4 makes about repair bandwidth, and seeing it twice in unrelated places is the reason to
+state it as a principle.
+
+Ten jobs, ten processors, ten minutes of compute each:
+
+| Policy | Each job finishes at | Mean latency | Last finishes at |
+|---|---|---|---|
+| **Fair**: one processor each | 10 min, all of them | **10 min** | 10 min |
+| **Serialize at full parallelism** | 1, 2, 3 … 10 min | **5.5 min** | 10 min |
+
+**Derived.** Same throughput, 45% lower mean latency, identical worst case. And with jobs arriving staggered at
+one-minute intervals, each finishes one minute after it arrives — **a 10x latency improvement at identical
+throughput.**
+
+> **When total work and total capacity are fixed, every allocation finishes the last job at the same time. Only
+> the distribution of earlier completions differs — and equal sharing is the pessimal choice.**
+
+That is the same statement as §13.4.4.4's, where pure proportional allocation makes every SN finish
+simultaneously so no user recovers early. Repair and compute are the same problem with different nouns.
+
+**Note this is not §1.4's throughput-versus-latency trade.** §1.4 declines to sacrifice throughput for latency.
+Here nothing is sacrificed: the latency distribution improves for free, so §1.4's priority does not forbid it and
+in fact has nothing to say about it.
+
+##### 5.12.4.1 Bounded by the job's own parallelism, so "one at a time" is not the rule
+
+⚠️ The table above assumes a job can use all ten processors. Amdahl bounds that: a job with serial fraction *s*
+cannot exceed a speedup of `1/s`, so a job that can only occupy two processors leaves eight idle if run alone —
+which §1.6 forbids.
+
+So the rule is not "one job at a time". It is:
+
+> **Run the fewest concurrent jobs that still saturates the resource.**
+
+That degrades to one at a time when a single job can saturate, and to many when jobs are narrow. It also means the
+scheduler needs each job's *parallelism profile*, not just its total cost — and nothing here says how that is
+obtained. Declared by the submitter, measured from history, or discovered by ramping.
+
+#### 5.12.5 Compute-hours in a bank account
+
+**Compute should hand out compute-hours; accounts accumulate them and may start a job when the balance covers its
+expected cost** (Asserted, Bob, 2026-08-16).
+
+That makes admission a **local balance check** rather than a global negotiation, which matters because §5.12.4
+wants jobs started promptly and at full width. And it is what makes maximum parallelism affordable: a job that
+will occupy the whole cluster for a minute must first have banked the equivalent, so bursts are pre-funded rather
+than arbitrated.
+
+**It is the design's third scheduling idiom**, and they are worth distinguishing:
+
+| Resource | Idiom | Where |
+|---|---|---|
+| Repair bandwidth within an SN | thresholds — doors on a bin | §13.4.3 |
+| Repair bandwidth across SNs | floor plus proportional surplus | §13.4.4 |
+| **Compute** | **token bucket — accumulate a rate, spend in lumps** | here |
+
+**And the same constraint appears for the fourth time.** §13.4.3.4's sufficient amounts, §13.4.4.3's minimums,
+§16's question about their partition — and now:
+
+> **Σ accumulation rates ≤ total capacity**, or the bank is insolvent in the long run and balances are promises
+> that cannot be kept.
+
+**Derived.** A balance cap is needed too, and for a different reason: rates summing correctly still permits every
+account to hoard for a month and burst simultaneously, which exceeds capacity instantly. Rates bound the long-run
+average; a cap bounds the burst. At this point the recurrence is established enough to state as a rule: **any set
+of guaranteed allocations is a partition of a total, and must be validated as one — and if the guarantee
+accumulates, it needs a ceiling as well as a rate.**
+
+##### 5.12.5.1 Two things the bank forces a decision about
+
+⚠️ **Overrun.** Admission tests the *expected* cost, and estimates are wrong. Killing a job at its estimate is
+harsh and makes estimation adversarial; allowing unbounded debt invites abuse. The middle option — let the job
+run, let the balance go negative, and refuse **new** starts until it recovers — preserves work already done and
+self-limits, but needs a bound on how negative.
+
+**Quota and billing merge here, unlike everywhere else.** §12.8.3 insists billing be offline and exact while quota
+is online and approximate. For compute the bank balance *is* the quota and compute-hours consumed *are* the
+billing record — one quantity doing both jobs. That works because compute is consumed in large lumps, where §12.8's
+per-request metering needed the split precisely because requests are tiny and numerous. Worth stating so nobody
+"fixes" the inconsistency.
+
 ## 6. Size limits and sealing
 
 An extent seals when it hits **either** limit, whichever comes first:
@@ -7256,6 +7345,10 @@ tie. Since §1.1 promises availability **per record** rather than per cluster, a
 the maximum over its requests, a user whose data all sits on small SNs goes from "recovered at the very end" to
 "recovered early" — and their max drops with it.
 
+**The same result appears in compute scheduling** (§5.12.4), which is the reason to trust it: with total work and
+capacity fixed, the last completion is invariant and only the earlier ones are free to arrange, so equal sharing
+is pessimal in both places.
+
 **And §4.3.3.3 explains why completing *some* users fully beats partially completing all of them.** A
 fully-recovered user is unambiguously fine; a 95%-recovered user may consider the remainder unsalvageable. So
 the staggered distribution is not merely nicer, it converts users from *possibly ruined* to *definitely fine*,
@@ -8150,6 +8243,16 @@ Roughly in order of how much else depends on them.
      sharing their extents and rises when that stranger deletes. Total revenue is invariant so this is not a
      correctness problem, but §12.6 promises a simple presentation, and it has to survive a customer asking why
      their bill moved when they changed nothing.
+
+122. **How a job's parallelism profile is obtained** (§5.12.4.1). "Fewest concurrent jobs that saturates" needs
+     to know how wide each job can run, not just its total cost. Declared by the submitter, measured from
+     history, or discovered by ramping — and a declared value is an adversarial input under §5.12.5's pricing.
+123. **Overrun policy for the compute bank** (§5.12.5.1). Admission tests an estimate. Killing at the estimate
+     makes estimation adversarial; unbounded debt invites abuse; letting the balance go negative and refusing new
+     starts needs a bound on how negative.
+124. **The compute-hour accumulation rates and balance cap** (§5.12.5). Rates must sum within capacity or the bank
+     is insolvent; a cap is separately needed because correct rates still allow every account to hoard and burst
+     together. Two numbers per account, one constraint across all of them.
 
 **Closed** since earlier drafts:
 
