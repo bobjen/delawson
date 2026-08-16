@@ -60,7 +60,8 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **AEGIS-128X2**, ~20 GB/s per core: encryption is 0.63 of a core at line rate where compression would be ~21 | §7.2.1 |
 | The **AEAD tag is the checksum**, so every block is self-verifying before EC uses it as a repair source | §7.2.1 |
 | Everything is encrypted **on the wire and on disk**; KS uses 256-bit | §7.2, §7.2.1 |
-| Targets: **200k QPS** small metadata requests, **2M+ batched** — the 10× gap is a messaging requirement | §1.4.0 |
+| Targets: **200k QPS** small metadata requests, **2M+ batched**, **per box** — both already reached, so a floor | §1.4.0 |
+| The 10× gap says **nine tenths of the unbatched cost is messaging**; the ping ceiling is >64M QPS | §1.4.0 |
 | A cluster may run **indefinitely** and lie dormant for eons — no absolute epochs, no work per elapsed time | §1.3 |
 
 **Object model**
@@ -444,22 +445,53 @@ Two figures, both shipping requirements (Asserted, Bob, 2026-08-15):
 | Small metadata info requests | **200,000+ QPS** |
 | The same, **batched** | **2,000,000+ QPS** |
 
-**The 10x gap between them is the whole design content of these numbers.** The work
-itself does not change; only the per-request message overhead is amortized. So the pair
-is really one requirement on messaging.
+**Both have already been reached on this box** (Asserted, Bob, 2026-08-15): a prior
+prototype of Bob's served 200k+ QPS of random object-info requests over **20 million tiny
+objects** with the metadata resident in main memory on SN and DN, and 2M+ QPS for the same
+workload **in batches of 1,000**. Per the clean-room rule in `CLAUDE.md`, that figure is
+used here as an *existence proof* and nothing else — no design, structure, or constant is
+taken from it.
 
-Working it out on a 16-core box: a small metadata lookup is §9.1's three binary searches
-over RAM-resident structures — call it 10-30 cache misses, ~1-3 us of CPU. Then
+So these are a **floor, not a stretch**, which changes how they should be treated: failing
+them is a regression rather than a missed target. It also pins the workload definition —
+random object info, tiny objects, ~20 M of them, metadata RAM-resident — and answers a
+question this section previously left open: the figures are **per box**, this box.
 
-- **200k QPS** needs ~0.5 core of lookup plus whatever the messaging costs. At ~10 us of
-  CPU per unbatched round trip that is ~2 cores. Comfortable.
-- **2M QPS** needs ~3-6 cores of lookup, leaving room for at most **~1 us of message
-  overhead per request** — and realistically under 0.5 us.
+**The 10x gap between them is the whole design content of these numbers.** The work itself
+does not change; only the per-request message overhead is amortized. So the pair is really
+one requirement on messaging.
 
-**Derived.** Which rules out a syscall per request and points at io_uring or shared
-memory, per the calibration table in §15. That is why the first implementation milestone
-is a ping benchmark rather than a feature: 2M QPS is not reachable by making the lookup
-faster, only by making the message nearly free.
+**The two figures together split the cost**, which is more useful than either alone. With
+`M` the per-message overhead and `W` the per-request work, a 1,000-deep batch amortizes `M`
+to nothing, so `(M + W) / W = 10` gives **`M = 9W`: nine tenths of the unbatched cost is
+messaging.**
+
+Bob's instruction budget makes that concrete. Taking **~64 G instructions/sec** for the box:
+
+| | Instructions per request | Note |
+|---|---|---|
+| Ping — the floor | **< 1,000** | so a pure ping ceiling is **> 64M QPS** |
+| Batched lookup at 2M QPS | ~32,000 | this is `W`, the real work |
+| Unbatched lookup at 200k QPS | ~320,000 | `M + W`, so `M` ≈ 288,000 |
+
+**Derived**, from Bob's 64 G figure and the two QPS numbers. Three things follow.
+
+**2M QPS is where an implementation landed, not a ceiling.** The architectural ceiling for
+a trivial request is >64M QPS, and the batched lookup sits **32x** above the ping floor in
+per-request work. How much of those 32,000 instructions is essential is an open and
+answerable question — a random lookup over 20 M objects should cost a handful of cache
+misses, and 32,000 instruction-slots is on the order of eighty. That gap is where headroom
+is, if headroom is wanted.
+
+**It is not memory-bound**, which is worth checking before assuming otherwise: 2M QPS at
+~5 random cache-line touches each is 10M misses/sec, well inside what 16 cores can keep
+outstanding, and ~640 MB/s of traffic against a box that does ~90 GB/s (§7.2.1).
+
+**And `M ≈ 288,000` instructions is the target to attack.** A syscall per request cannot
+reach a fraction of that, so the unbatched path points at io_uring or shared memory (§15's
+calibration table). That is why the first implementation milestone is a ping benchmark
+rather than a feature: the batched number is bounded by `W`, and the unbatched number is
+almost entirely `M`.
 
 Note also what these targets are *not*: they say nothing about bulk bandwidth, and they
 are about **metadata**. Bulk data is bounded by disks and the network, and is the subject
@@ -6640,13 +6672,16 @@ Roughly in order of how much else depends on them.
 94. **What is in the erasure-code catalog, and what each entry recommends itself for** (§4.3.2.5). Not
     "which code" — a list, with a few recommendations per use case, each justified by the fields §4.3.2.5
     enumerates. Turbo codes suffice for shipping, so this is not a release gate.
-95. **Whether the throughput targets are per box or per cluster** (§1.4.0). 200k and 2M QPS were stated
-    without a denominator. Per 16-core box they imply a sub-microsecond per-request message budget in the
-    batched path; per cluster they imply almost nothing.
-96. **Whether small metadata requests have a defined batch API** (§1.4.0). The 10x gap between the two
-    targets exists only if batching is expressible by callers, which makes it an API question rather than
-    an implementation one.
-
+95. **What the batch API for small metadata requests looks like** (§1.4.0). Batching is known to work —
+    batches of 1,000 are what produced the 2M QPS figure — so the question is not whether but how it is
+    expressed: how a caller groups requests that may target different objects, different DNs, and different
+    SNs; what partial failure means when 1,000 lookups share one message; and whether the batch is a client
+    convenience or a wire-level primitive. §9.5's hedging interacts, since a batch's latency is the maximum
+    over its members (§1.4.1) and one straggler delays a thousand answers.
+96. **How much of the ~32,000 instructions per batched lookup is essential** (§1.4.0). A random lookup over
+    20 M objects should cost a handful of cache misses; 32,000 instruction-slots is on the order of eighty.
+    The ping floor is under 1,000, so there is a 32x gap. Worth understanding before deciding whether more
+    than 2M QPS is available, since the target is already met.
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
@@ -6717,4 +6752,8 @@ Roughly in order of how much else depends on them.
 - whether staging may live in DRAM — no; durable means durable with the power off, which
   also removes the motive for power as an explicit failure domain (§8.1.4.4);
 - whether the erasure code is a single choice — it is a **catalog** with recommendations,
-  and turbo codes suffice for shipping, so the patent is not a release gate (§4.3.2.5).
+  and turbo codes suffice for shipping, so the patent is not a release gate (§4.3.2.5);
+- whether the throughput targets are per box or per cluster — **per box**, and both have
+  already been reached on this box, so they are a floor rather than a stretch (§1.4.0);
+- whether the 200k/2M pair is two requirements or one — one, on messaging: the 10x gap
+  says nine tenths of the unbatched cost is per-message overhead (§1.4.0).
