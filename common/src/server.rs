@@ -18,13 +18,16 @@
 //! flush gets the chance; a signal is the fallback.
 
 use crate::config::{ClusterConfig, ProcessConfig, ServiceEntry};
-use crate::wire::{Op, Request, Response, read_request, write_response};
+use crate::random::Rng;
+use crate::wire::{
+    Arg, MAX_FRAME_BYTES, Op, Request, Response, Status, read_request, write_response,
+};
 use crate::{Context, Error, Result};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const READY_FILE: &str = "ready";
@@ -231,11 +234,46 @@ fn reply(process: &Process, service: &impl Service, out: &Mutex<TcpStream>, requ
 
 fn answer(process: &Process, service: &impl Service, request: &Request) -> Response {
     match request.op {
-        Op::Ping => Response::text(format!("{} is alive", process.identity())),
+        Op::Ping => ping(process, request),
         Op::Status => Response::text(status(process, service)),
         Op::Shutdown => Response::ok(),
         _ => service.handle(process, request),
     }
+}
+
+/// A ping asks for a reply of a given size, so that message size is a knob and
+/// not a constant. Bare, it answers in words.
+fn ping(process: &Process, request: &Request) -> Response {
+    let size = match request.args.first() {
+        None => 0,
+        Some(Arg::Number(size)) => *size as usize,
+        Some(other) => {
+            return Response::error(Status::BadRequest, format!("ping takes a size, not {other}"));
+        }
+    };
+    if size == 0 {
+        return Response::text(format!("{} is alive", process.identity()));
+    }
+    match noise(size) {
+        Some(bytes) => Response { id: 0, status: Status::Ok, args: vec![Arg::Bytes(bytes)] },
+        None => Response::error(
+            Status::BadRequest,
+            format!("a {size}-byte reply is over the {MAX_FRAME_BYTES}-byte frame limit"),
+        ),
+    }
+}
+
+/// Random bytes for a reply body, cut from one block generated at first use.
+/// Generating them per reply would measure this generator instead of the
+/// message path, and zeros would let compression and the kernel cheat.
+fn noise(size: usize) -> Option<Vec<u8>> {
+    static BLOCK: OnceLock<Vec<u8>> = OnceLock::new();
+    let block = BLOCK.get_or_init(|| {
+        let mut block = vec![0u8; MAX_FRAME_BYTES];
+        Rng::new().fill(&mut block);
+        block
+    });
+    block.get(..size).map(|slice| slice.to_vec())
 }
 
 fn status(process: &Process, service: &impl Service) -> String {

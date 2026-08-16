@@ -52,6 +52,10 @@ enum Cmd {
         /// Connections, each on its own thread, all pinging at once.
         #[arg(long, default_value_t = 1)]
         conns: usize,
+        /// Bytes of random padding to ask for in the reply. Zero answers in
+        /// words; anything else makes message size the variable.
+        #[arg(long, default_value_t = 0)]
+        size: u64,
         /// Open a fresh connection for each round trip.
         #[arg(long)]
         reconnect: bool,
@@ -65,9 +69,9 @@ enum Cmd {
         /// Seconds of unmeasured pinging first.
         #[arg(long, default_value_t = 2)]
         warmup: u64,
-        /// Requests each client keeps outstanding at once.
-        #[arg(long, default_value_t = 1)]
-        depth: usize,
+        /// Bytes of random padding in each reply.
+        #[arg(long, default_value_t = 0)]
+        size: u64,
         /// Seconds to measure.
         #[arg(long, default_value_t = 10)]
         seconds: u64,
@@ -281,18 +285,19 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Ping { count, conns, reconnect } => {
-            let plan = Plan { count: *count, conns: *conns, reconnect: *reconnect, timeout };
+        Cmd::Ping { count, conns, size, reconnect } => {
+            let plan =
+                Plan { count: *count, conns: *conns, size: *size, reconnect: *reconnect, timeout };
             ping(&cluster, &cli, &plan)
         }
-        Cmd::Bench { clients, warmup, depth, seconds } => {
+        Cmd::Bench { clients, warmup, size, seconds } => {
             // Anything answers a ping, so an unnamed target is just the first
             // thing that comes up.
             let target = targets(&cluster, &cli)?[0];
             let plan = Bench {
                 clients: *clients,
                 warmup: *warmup,
-                depth: *depth,
+                size: *size,
                 seconds: *seconds,
                 timeout,
             };
@@ -328,13 +333,20 @@ fn run(cli: Cli) -> Result<()> {
 struct Plan {
     count: usize,
     conns: usize,
+    size: u64,
     reconnect: bool,
     timeout: Duration,
 }
 
+/// A ping, asking for `size` bytes of padding back.
+fn ping_request(size: u64) -> Request {
+    let request = Request::new(Op::Ping);
+    if size == 0 { request } else { request.number(size) }
+}
+
 /// The ping is a benchmark, not a feature: the work it asks for is a few hundred
-/// instructions, so what comes back is the per-message overhead, and that is the
-/// number that says how deep later batching has to be.
+/// instructions, so with a bare reply what comes back is per-message overhead,
+/// and with a padded one it is that plus what size costs.
 fn ping(cluster: &ClusterConfig, cli: &Cli, plan: &Plan) -> Result<()> {
     if plan.count == 0 || plan.conns == 0 {
         return Err(Error::new("--count 0 or --conns 0 measures nothing"));
@@ -344,9 +356,10 @@ fn ping(cluster: &ClusterConfig, cli: &Cli, plan: &Plan) -> Result<()> {
         let start = std::time::Instant::now();
         let threads: Vec<_> = (0..plan.conns)
             .map(|_| {
-                let (count, reconnect, timeout) = (plan.count, plan.reconnect, plan.timeout);
+                let (count, size) = (plan.count, plan.size);
+                let (reconnect, timeout) = (plan.reconnect, plan.timeout);
                 std::thread::spawn(move || -> Result<(Vec<Duration>, Response)> {
-                    let request = Request::new(Op::Ping);
+                    let request = ping_request(size);
                     let mut conn = Conn::open(addr, timeout)?;
                     let mut samples = Vec::with_capacity(count);
                     let mut last = conn.call(&request)?;
@@ -389,7 +402,7 @@ fn ping(cluster: &ClusterConfig, cli: &Cli, plan: &Plan) -> Result<()> {
 struct Bench {
     clients: usize,
     warmup: u64,
-    depth: usize,
+    size: u64,
     seconds: u64,
     timeout: Duration,
 }
@@ -397,8 +410,8 @@ struct Bench {
 /// Warm up, then measure. Throughput is the number to want first, and average
 /// latency is what says how much of it is per-message overhead.
 fn bench(target: &ServiceEntry, plan: &Bench) -> Result<()> {
-    if plan.clients == 0 || plan.depth == 0 || plan.seconds == 0 {
-        return Err(Error::new("--clients, --depth and --seconds must all be positive"));
+    if plan.clients == 0 || plan.seconds == 0 {
+        return Err(Error::new("--clients and --seconds must both be positive"));
     }
     let addr = target.address;
     let warm_end = std::time::Instant::now() + Duration::from_secs(plan.warmup);
@@ -406,13 +419,13 @@ fn bench(target: &ServiceEntry, plan: &Bench) -> Result<()> {
 
     let threads: Vec<_> = (0..plan.clients)
         .map(|_| {
-            let (depth, timeout) = (plan.depth, plan.timeout);
+            let (size, timeout) = (plan.size, plan.timeout);
             std::thread::spawn(move || -> Result<Tally> {
-                let request = Request::new(Op::Ping);
+                let request = ping_request(size);
                 let mut conn = Conn::open(addr, timeout)?;
-                conn.flood(&request, depth, warm_end, &mut Tally::new())?;
+                conn.press(&request, warm_end, &mut Tally::new())?;
                 let mut tally = Tally::new();
-                conn.flood(&request, depth, end, &mut tally)?;
+                conn.press(&request, end, &mut tally)?;
                 Ok(tally)
             })
         })
@@ -425,18 +438,25 @@ fn bench(target: &ServiceEntry, plan: &Bench) -> Result<()> {
     }
     let measured = std::time::Instant::now().saturating_duration_since(warm_end).as_secs_f64();
     let us = |d: Duration| d.as_secs_f64() * 1e6;
+    let rate = total.count as f64 / measured;
     println!(
-        "{} {} clients x {} outstanding, {measured:.1} s measured after {} s warm-up",
-        target.identity, plan.clients, plan.depth, plan.warmup
+        "{} {} clients, {} byte replies, {measured:.1} s measured after {} s warm-up",
+        target.identity, plan.clients, plan.size, plan.warmup
     );
     println!(
-        "{} {:.0} round trips per second, average {:.1} us, min {:.1} us, max {:.1} us",
+        "{} {rate:.0} round trips per second, average {:.1} us, min {:.1} us, max {:.1} us",
         target.identity,
-        total.count as f64 / measured,
         us(total.mean()),
         us(total.min),
         us(total.max)
     );
+    if plan.size > 0 {
+        println!(
+            "{} {:.0} MB per second of reply body",
+            target.identity,
+            rate * plan.size as f64 / 1e6
+        );
+    }
     Ok(())
 }
 

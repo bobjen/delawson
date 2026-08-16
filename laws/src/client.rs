@@ -2,7 +2,8 @@
 //!
 //! Calls are asynchronous: `send` and `recv` are separate, so a caller may keep
 //! many requests outstanding on one connection and match answers by id. `call`
-//! is the one-at-a-time convenience on top.
+//! is the one-at-a-time convenience on top, and it is what the measurements use:
+//! parallelism comes from more clients, not from pipelining one.
 
 use common::wire::{Request, Response, Status, read_response, write_request};
 use common::{Context, Error, Result};
@@ -53,39 +54,16 @@ impl Conn {
         Ok((response, start.elapsed()))
     }
 
-    /// Keep `depth` copies of one request outstanding until `until`, then drain,
-    /// tallying each round trip.
-    ///
-    /// Latency here includes queuing, which is the point: depth is the knob that
-    /// trades it for throughput.
-    pub fn flood(
-        &mut self,
-        request: &Request,
-        depth: usize,
-        until: Instant,
-        tally: &mut Tally,
-    ) -> Result<()> {
-        // At most `depth` are outstanding and ids are handed out in order, so an
-        // id's send time lives at `id % depth`.
-        let mut sent = vec![Instant::now(); depth.max(1)];
-        let mut out = 0;
-        loop {
-            if out < depth && Instant::now() < until {
-                let id = self.send(request)?;
-                sent[id as usize % depth] = Instant::now();
-                out += 1;
-                continue;
-            }
-            if out == 0 {
-                return Ok(());
-            }
-            let response = self.recv()?;
+    /// Round trip one request over and over until `until`, tallying each.
+    pub fn press(&mut self, request: &Request, until: Instant, tally: &mut Tally) -> Result<()> {
+        while Instant::now() < until {
+            let (response, elapsed) = self.timed(request)?;
             if response.status != Status::Ok {
                 return Err(Error::new(format!("answered {}", response.status)));
             }
-            tally.add(sent[response.id as usize % depth].elapsed());
-            out -= 1;
+            tally.add(elapsed);
         }
+        Ok(())
     }
 }
 

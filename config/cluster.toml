@@ -19,6 +19,10 @@ shutdown_grace_ms = 2000
 
 # The service directory. In production one machine holds one EN, or several SN
 # processes; here every entry is a process on this box.
+#
+# Addresses are hand-assigned only until KS becomes the registrar. Then KS's port
+# is the one fixed address, every other process binds an ephemeral port and
+# registers, and what stays here is identity, kind, domain and media class.
 [[service]]
 identity = "KS0"
 kind = "ks"

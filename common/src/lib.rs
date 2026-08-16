@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod placement;
+pub mod random;
 pub mod server;
 pub mod wire;
 

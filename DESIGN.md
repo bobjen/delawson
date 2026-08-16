@@ -8885,24 +8885,50 @@ touches a disk plainly does not. The middle is unknown, so it is a per-operation
 
 ### 17.5 The first measurement: a ping to KS0
 
-Loopback TCP, this box, retail build, `bench-laws`, ping answered on the read loop. The work
-requested is a few hundred instructions, so essentially all of this is message overhead.
+Loopback TCP, this box, retail build, `bench-laws`, ping answered on the connection's read loop,
+one round trip at a time per client. A ping asks for a reply of a stated size, filled with random
+bytes, so **message size is a knob rather than a constant** — zeros would let compression and a
+page-sharing kernel cheat, and a per-reply generator would measure the generator, so one random
+block is made at first use and replies are slices of it.
 
-| Clients | Outstanding each | Round trips/s | Average latency |
-|---|---|---|---|
-| 1 | 1 | 55,000 | 13 µs |
-| 8 | 1 | 230,000 | 25 µs |
-| 8 | 8 | 525,000 | 112 µs |
-| 16 | 1 | 400,000 | 15 µs |
-| 16 | 8 | 424,000 | 276 µs |
+A bare ping, which asks for a few hundred instructions of work and therefore measures almost pure
+per-message overhead:
 
-**Measured, 2026-08-16.** The single-client round trip of ~13–18 µs came in at the ~15 µs that
-issue #5 calibrated a Unix-domain socket at, rather than the ~40 µs it guessed for TCP loopback.
-It is the per-message overhead `M` that sets how deep later batching has to be. Two things to read from the rest of the table: throughput scales
-with clients until the box saturates near half a million round trips per second, and depth buys
-throughput only until then — past saturation it buys latency and nothing else. §1.4's targets are
-200k QPS unbatched and 2M+ batched, so the unbatched target is met by parallelism alone on one
-box, and the batched one is the open work.
+| Clients | Round trips/s | Average latency |
+|---|---|---|
+| 1 | 55,800 | 18 µs |
+| 8 | 231,000 | 34 µs |
+| 16 | 400,000 | 15 µs |
+
+Then holding the client count fixed and varying the reply body:
+
+| Reply bytes | 1 client: round trips/s | body MB/s | 8 clients: round trips/s | body MB/s |
+|---|---|---|---|---|
+| 0 | 55,800 | — | 231,000 | — |
+| 64 | 54,600 | 3 | | |
+| 1,024 | 54,200 | 56 | 223,000 | 228 |
+| 8,192 | 40,300 | 330 | | |
+| 65,536 | 9,900 | 650 | 37,400 | 2,449 |
+| 524,288 | 1,400 | 726 | 4,300 | 2,268 |
+
+**Measured, 2026-08-16.** Three things to take from it:
+
+- **`M`, the per-message overhead, is 15-18 µs.** That is the ~15 µs issue #5 calibrated for a
+  *Unix-domain socket*, not the ~40 µs it guessed for TCP loopback.
+- **Size is free up to about a kilobyte** and costs from there: a 1 KB reply is within 3% of a bare
+  one, 8 KB costs 28%, and past that the round-trip rate falls roughly as 1/size. So the cost model
+  changes from per-message to per-byte somewhere between 1 and 8 KB, which is the number to know
+  before choosing any batch or granule size.
+- **The bandwidth ceiling is ~730 MB/s for one client and ~2.4 GB/s for eight**, both far under
+  memory bandwidth, so it is the message path and not the copy that binds.
+
+§1.4's targets are 200k QPS unbatched and 2M+ batched, so the unbatched target is met by
+parallelism alone on one box, and the batched one is the open work.
+
+**A batched ping was considered and rejected** (Asserted, Bob, 2026-08-16): pipelining one client's
+pings measures nothing the client count does not, while a variable reply size measures something
+new. Asynchrony (§17.4) is still what the protocol provides; it is simply not what this benchmark
+varies.
 
 ### 17.6 The harness reports what it cannot enforce
 
@@ -8911,3 +8937,19 @@ skips a rule it cannot enforce — but `start-laws` prints the report anyway, an
 computes it on demand: per rule, how many distinct things it wants, the coarsest failure-domain
 level that has that many, and a loud line when no level does. A rule wanting one of something is
 reported as vacuous rather than as enforced.
+
+### 17.7 KS is also the registrar
+
+**Decided: KS holds the process registry, and its port is the one fixed address in a cluster**
+(Asserted, Bob, 2026-08-16). Every other process registers with KS on startup and is told where the
+processes it must talk to are, and on which port. That is why KS is the first daemon built rather
+than FE: it is what the others need in order to find anything, and it is already the one type that
+must come up first for keys.
+
+It also explains why cold start is acyclic. KS's own address cannot come from a registry, so it is
+configuration; nothing else needs to be.
+
+Until it exists, the cluster configuration carries a service directory of fixed addresses, which is
+what the harness uses today. Two things that changes when registration lands: ports become
+ephemeral rather than assigned by hand, and a process's address stops being checked-in
+configuration — leaving the checked-in part as identity, kind, failure domain, and media class.
