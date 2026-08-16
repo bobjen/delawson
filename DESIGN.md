@@ -6754,6 +6754,98 @@ dynamic as above, running in the opposite direction. Three dividends:
 - an EN reboot generates no repair work at all, rather than work that must be cancelled — and there is no constant
   to tune wrong.
 
+#### 13.4.3 Admission control: the ball bin
+
+§13.4 says how repairs are *ordered*. This says how they are *admitted*, and the two are less similar than
+they sound (Asserted, Bob, 2026-08-16).
+
+Each SN has an allocation of **outstanding repair bandwidth, measured in extent reads plus writes.** When a
+repair is scheduled its cost is **removed** from the available pool; when it completes, the cost is
+**returned**.
+
+| Repair | Reads | Writes | Cost |
+|---|---|---|---|
+| Copy one missing instance | 1 | 1 | **2** |
+| Replace 2 of 4 missing | 1 | 2 | 3 |
+| Replace 3 of 4 missing | 1 | 3 | 4 |
+| EC local group repair (§4.3.3.2d) | 5 | 1 | 6 |
+| EC global solve, `m` = 2 | 45 | 2 | **47** |
+| EC global solve, `m` = 7 | 45 | 7 | 52 |
+| Vacating an EN scheduled to go down | 1 | 1 | 2 per extent, x very many |
+
+**Derived** from §4.3.3.2d, and SN can estimate every one of these because it knows the instance state and the
+group's shape. The 26x spread between a copy and a global solve is the range the thresholds below have to
+discriminate over. At 32 MB physical per extent (§6), a budget of *N* outstanding is about *N* x 32 MB in
+flight, which is what makes the unit physically meaningful rather than notional.
+
+##### 13.4.3.1 The mechanism
+
+Think of a **bin of balls**, where the balls are unused bandwidth and the **level** is how much is free. Each
+purpose has a **door** at some height in the wall of the bin. If the level of balls is above a purpose's door,
+GC may spend bandwidth on that purpose. Lower door means higher priority.
+
+**There are two doors per purpose, plus a *sufficient* amount for that purpose:**
+
+| Condition | Door used | Effect |
+|---|---|---|
+| the purpose is using **less** than its sufficient bandwidth | the **lower** door | admitted readily |
+| the purpose is already using **at least** its sufficient bandwidth | the **higher** door | admitted only when there is plenty spare |
+
+So every purpose gets easy access up to a guaranteed floor and then competes for the surplus. That is a
+minimum guarantee plus best-effort above it, expressed as two numbers per purpose instead of as a scheduler.
+
+**GC sweeps every item round robin** — every extent, every EC group — and grants bandwidth to anything that
+needs repair and whose door the current level clears.
+
+##### 13.4.3.2 Why the "outstanding" framing is better than a rate limit
+
+**Because cost is returned on completion, the mechanism self-corrects under congestion.** A congested fleet
+completes repairs more slowly, so costs stay deducted for longer, so the level stays low and fewer new repairs
+are admitted. A rate limiter would keep injecting work at the configured rate and would need a feedback loop
+and a tuning constant to avoid it. Here there is neither: **the bin is the feedback loop.**
+
+It also means the budget is denominated in something real. Outstanding reads plus writes is what the network
+and the disks are actually spending, which is the §4.3.2.2a bottleneck, and it makes a copy and a global solve
+directly comparable without a conversion factor.
+
+##### 13.4.3.3 Ordering is thresholds, not a sort
+
+This is the part most likely to be implemented wrong. §13.4's priority ordering is **not** realized by keeping
+a sorted queue:
+
+- **Priority is door height.** A group's `g`, its unavailability duration (§13.4.2) and its hot flag (§13.4.0)
+  determine which door it must clear.
+- **Round robin gives everything a chance to try.** No heap, no re-sorting as state changes underneath — which
+  matters at 2^31 extents and ~36 M EC groups per SN, where maintaining a sorted structure would cost more than
+  the repairs.
+- **Order within a priority class is sweep order**, i.e. arbitrary, and that is fine.
+
+**The sweep period is therefore the repair latency floor** for anything discovered by the sweep. That argues
+for fusing this pass with §13.1.10's hourly verification pass, since both walk every item and one walk can do
+both. §9.8's hot flag is the out-of-band fast path that exists precisely because an hour is too long to wait
+when somebody is reading.
+
+##### 13.4.3.4 Starvation is accepted, and bounded by the sufficient amounts
+
+**Lower doors can starve upper doors**, because the ball level changes only slowly — a burst of high-priority
+work holds the level down long enough that low-priority purposes never get a turn. That is intended, not a
+defect: during a disaster, low-priority work *should* stop.
+
+What bounds it is the sufficient amounts, and that gives a design constraint worth checking:
+
+> **If the sum of all purposes' sufficient allocations does not exceed the total, no purpose can be starved
+> below its sufficient level.** If the sum exceeds the total, starvation below the floor becomes possible and
+> the guarantees are nominal.
+
+**Derived.** So the `sufficient` values are not independent knobs — they are a partition of the allocation, and
+they should be validated as one.
+
+⚠️ **Vacating a scheduled-down EN is the one purpose with a deadline**, and thresholds cannot express
+deadlines. Every other repair type is "sooner is better"; a decommission has a date, after which the machine
+leaves whether or not its data was copied off. Either it gets the lowest door unconditionally, or it needs a
+door that descends as its deadline approaches. Undecided, and it is the case where getting admission control
+wrong loses data rather than merely delaying repair.
+
 ### 13.5 Metadata snapshots, and the jobs that run over them
 
 **System metadata is snapshotted daily and kept for a few weeks, with once-a-week samples kept longer** (Asserted,
