@@ -24,7 +24,7 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -116,6 +116,15 @@ const FLUSH_MS: u64 = 200;
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
+/// The floor, kept apart from the rest of the configuration so that deciding
+/// whether to log is one relaxed load and a compare. A filtered line must cost
+/// nothing worth measuring, or it cannot be left in the hot path.
+static FLOOR: AtomicU8 = AtomicU8::new(Level::Info as u8);
+
+pub fn enabled(level: Level) -> bool {
+    level as u8 >= FLOOR.load(Ordering::Relaxed)
+}
+
 /// Start logging into `dir`. Until this is called — and in the client, which
 /// never calls it — lines go to standard error.
 pub fn open(dir: &Path, identity: &str, config: Logging) -> Result<()> {
@@ -129,6 +138,7 @@ pub fn open(dir: &Path, identity: &str, config: Logging) -> Result<()> {
     );
     let full = Rotating::new(dir, &name, config.size, config.full_files, header.clone())?;
     let info = Rotating::new(dir, &format!("{name}-info"), config.size, config.info_files, header)?;
+    FLOOR.store(config.level as u8, Ordering::Relaxed);
     let _ = LOGGER.set(Logger { config, full: Mutex::new(full), info: Mutex::new(info) });
 
     std::thread::spawn(|| {
@@ -144,6 +154,11 @@ pub fn level() -> Level {
     LOGGER.get().map(|logger| logger.config.level).unwrap_or(Level::Info)
 }
 
+/// Set the floor without opening files, for measuring what a filtered line costs.
+pub fn set_floor(level: Level) {
+    FLOOR.store(level as u8, Ordering::Relaxed);
+}
+
 thread_local! {
     static LINE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     /// The kernel's thread id, so a line can be matched with what perf, gdb and
@@ -155,9 +170,6 @@ static PID: OnceLock<u32> = OnceLock::new();
 
 /// Write one line. Called by the macros, which supply the site.
 pub fn write(site: &'static Site, level: Level, message: std::fmt::Arguments) {
-    if level < self::level() {
-        return;
-    }
     let stride = site.stride.load(Ordering::Relaxed);
     let seen = site.count.fetch_add(1, Ordering::Relaxed);
     if !site.listed.swap(true, Ordering::Relaxed) {
@@ -404,40 +416,60 @@ fn civil(days: i64) -> (i64, u32, u32) {
 #[macro_export]
 macro_rules! logd {
     ($($arg:tt)*) => {{
-        static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
-        $crate::log::write(&SITE, $crate::log::Level::Debug, format_args!($($arg)*));
+        // The floor is tested first, so a filtered line does not even evaluate
+        // its arguments.
+        if $crate::log::enabled($crate::log::Level::Debug) {
+            static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
+            $crate::log::write(&SITE, $crate::log::Level::Debug, format_args!($($arg)*));
+        }
     }};
 }
 
 #[macro_export]
 macro_rules! logi {
     ($($arg:tt)*) => {{
-        static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
-        $crate::log::write(&SITE, $crate::log::Level::Info, format_args!($($arg)*));
+        // The floor is tested first, so a filtered line does not even evaluate
+        // its arguments.
+        if $crate::log::enabled($crate::log::Level::Info) {
+            static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
+            $crate::log::write(&SITE, $crate::log::Level::Info, format_args!($($arg)*));
+        }
     }};
 }
 
 #[macro_export]
 macro_rules! logn {
     ($($arg:tt)*) => {{
-        static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
-        $crate::log::write(&SITE, $crate::log::Level::Notice, format_args!($($arg)*));
+        // The floor is tested first, so a filtered line does not even evaluate
+        // its arguments.
+        if $crate::log::enabled($crate::log::Level::Notice) {
+            static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
+            $crate::log::write(&SITE, $crate::log::Level::Notice, format_args!($($arg)*));
+        }
     }};
 }
 
 #[macro_export]
 macro_rules! logw {
     ($($arg:tt)*) => {{
-        static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
-        $crate::log::write(&SITE, $crate::log::Level::Warning, format_args!($($arg)*));
+        // The floor is tested first, so a filtered line does not even evaluate
+        // its arguments.
+        if $crate::log::enabled($crate::log::Level::Warning) {
+            static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
+            $crate::log::write(&SITE, $crate::log::Level::Warning, format_args!($($arg)*));
+        }
     }};
 }
 
 #[macro_export]
 macro_rules! loge {
     ($($arg:tt)*) => {{
-        static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
-        $crate::log::write(&SITE, $crate::log::Level::Error, format_args!($($arg)*));
+        // The floor is tested first, so a filtered line does not even evaluate
+        // its arguments.
+        if $crate::log::enabled($crate::log::Level::Error) {
+            static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
+            $crate::log::write(&SITE, $crate::log::Level::Error, format_args!($($arg)*));
+        }
     }};
 }
 
@@ -465,5 +497,28 @@ mod tests {
         let left: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
         assert_eq!(left.len(), 3, "should keep three files");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod cost {
+    use super::*;
+
+    /// What a line costs when the level filters it out. It has to be nothing
+    /// worth measuring, or a debug line cannot be left in a hot path.
+    #[test]
+    fn a_filtered_line_is_nearly_free() {
+        set_floor(Level::Notice);
+        let rounds = 10_000_000;
+        let mut sink = 0u64;
+        let start = std::time::Instant::now();
+        for n in 0..rounds {
+            sink = sink.wrapping_add(n);
+            crate::logd!("a line with a value {n} and another {sink}");
+        }
+        let each = start.elapsed().as_secs_f64() * 1e9 / rounds as f64;
+        println!("filtered: {each:.2} ns per line (sink {sink})");
+        set_floor(Level::Info);
+        assert!(each < 20.0, "{each} ns is too much for a line nobody writes");
     }
 }

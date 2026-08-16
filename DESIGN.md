@@ -9204,6 +9204,11 @@ the source it came from, and the message. **The identity, host and version are w
 every file** rather than on every line, so a rotated file still says what it is. **Kernel thread id
 rather than a name**, so a line matches what `perf`, `gdb` and `top` say.
 
+⚠️ **There is no request id on the line, and there should not be** (Asserted, Bob, 2026-08-16).
+Only code serving a request has one; a compaction, a sync loop or a repair does not, so a fixed
+field would be empty for most of what a storage system does. Where a line belongs to a request, the
+id goes in the message with the rest of that line's values.
+
 **Write the words first and the values last** — `appending to %s length %s`, not
 `%s: appending, len %s`. The histogram is keyed on file and line and shows the start of the message,
 so a line that begins with its variables is unreadable in aggregate.
@@ -9236,6 +9241,11 @@ One `info` line per ping, at 16 connections x 256 in flight:
   rotation, and immediately for anything at warning or above. That is worth **5x** over a write per
   line, and it is the same argument the message path makes: a syscall per small thing dominates the
   small thing.
+- **A line the level filters out costs 0.52 ns** — about two cycles, since the macro tests the floor
+  before it evaluates anything, so neither the arguments nor the formatting happen. At 16 x 256 the
+  ping runs at 13,235,000 with its debug line filtered out against 13,213,000 with no line at all,
+  which is to say the difference is not measurable. That is what makes it reasonable to leave debug
+  lines in a hot path.
 - ⚠️ **Even batched, a line per message costs 85% of throughput.** The line is about 105 bytes
   against a ping's 20, so logging one produces five times the bytes the work does — 507 MB of log in
   three seconds. There is no version of per-message logging that is cheap at millions of messages a
