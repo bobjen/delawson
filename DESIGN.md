@@ -51,7 +51,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-109 things *not* decided.
+113 things *not* decided.
 
 **Priorities and framing**
 
@@ -80,6 +80,11 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Because reconstructing for a read **does work the system does not persist** | §9.8, §1.6.4 |
 | The **user sets the read timeout**, making availability-versus-latency their choice | §9.8 |
 | Repair priority takes a third input: **read demand**, +1 global read applied after the swap | §13.4.0, §9.8 |
+| Repair admission is a budget on **outstanding** reads+writes, returned on completion — the bin is the feedback loop | §13.4.3 |
+| **Priority is door height, not a sort**: round-robin plus thresholds, so no heap over 2^31 items | §13.4.3.3 |
+| Two doors per purpose: a **floor** admitted readily, then competition for the surplus | §13.4.3.1 |
+| **Every door is below 10% remaining** — 1% for high priority, 9% for low; the bin runs nearly empty by design | §13.4.3.5 |
+| Low priority therefore runs **only at idle**, and resolution improves under congestion | §13.4.3.4, §13.4.3.5 |
 | So there is no expensive read to meter, and read billing can stay flat | §9.8.1 |
 | The scale ambition is ~10^57 bits; DeLawson addresses ~10^26, so it is **10^31 short** and directional | §1.0.4 |
 | Relative timestamps are why §1.3's rule survives a scale nobody designed for | §1.0.4, §4.6.3 |
@@ -6840,6 +6845,52 @@ What bounds it is the sufficient amounts, and that gives a design constraint wor
 **Derived.** So the `sufficient` values are not independent knobs — they are a partition of the allocation, and
 they should be validated as one.
 
+##### 13.4.3.5 Every door is near the bottom: below 10% remaining
+
+**All doors, high and low, sit below 10% bandwidth remaining** — high priority perhaps **1% remaining**, low
+priority perhaps **9%** (Asserted, Bob, 2026-08-16). So the bin is nearly empty almost all the time, and every
+distinction the mechanism makes happens inside the last tenth of the headroom.
+
+**That is deliberate, and it follows from §1.6.** Allocated repair bandwidth left unused is wasted hardware, so
+the target state is *nearly all of it committed*. The doors are not there to hold the level up; they are there
+to decide who gets the last sliver.
+
+⚠️ **Read "90% allocated" as 90% of the repair allocation, not 90% of the fleet.** The allocation is itself a cap
+on what repair may take from foreground work, so a nearly-empty bin says nothing about cluster utilization.
+These two get conflated and the mistake is alarming in the wrong direction.
+
+**It creates a resolution requirement, and this needs checking. Derived.** Doors 8 percentage points apart, with
+the lowest at 1%, cannot be distinguished unless the level resolves much finer than one repair. The largest
+single cost is ~52 (a global solve at `m` = 7), so for 1% to mean anything the allocation *A* must satisfy
+
+> *A* ≳ 100 × 52 = **~5,200 outstanding units**, i.e. ~166 GB of repair data in flight per SN at 32 MB each.
+
+Whether that is reachable depends on how long a repair holds its cost, by Little's law — outstanding = rate ×
+latency:
+
+| Repair completion latency | Outstanding at ~42.5 GB/s of repair | Doors distinguishable? |
+|---|---|---|
+| 0.16 s (one extent at full disk rate) | ~210 units | **no** — one global solve is 26% of *A* |
+| 5 s (repair queued behind foreground work) | ~6,600 units | yes |
+
+**Which is a second, less obvious dividend of the outstanding-work framing:** the mechanism's *resolution*
+improves under exactly the congestion it exists to manage, because slow completion raises the outstanding count.
+In a quiet fleet the level sits near the top, everything clears every door, and the door structure is
+irrelevant — which is correct, since there is nothing to arbitrate.
+
+⚠️ But it means **the allocation must be sized for the congested case**, not the quiet one. If *A* is a few
+hundred units, a single global solve vaults past every door at once and the two-door structure is decorative.
+That is a concrete thing to validate once repair exists.
+
+⚠️ **And §9.8's hot flag needs a reserved floor, not just a low door.** At 1% remaining, a low door is barely
+cleared by anything, so "immediately reprocessed by GC" is not delivered by door height alone. Hot repair should
+have its own *sufficient* allocation under §13.4.3.1, so that it is admitted through the lower door of its own
+purpose rather than competing for a sliver.
+
+**Starvation is therefore structural rather than incidental** (§13.4.3.4). With low priority at 9% remaining and
+the level designed to sit below 10%, low-priority work runs only when the fleet is genuinely quiet. That is the
+intended behaviour, but it is stronger than "can starve" — it is "does not run except at idle."
+
 ⚠️ **Vacating a scheduled-down EN is the one purpose with a deadline**, and thresholds cannot express
 deadlines. Every other repair type is "sooner is better"; a decommission has a date, after which the machine
 leaves whether or not its data was copied off. Either it gets the lowest door unconditionally, or it needs a
@@ -7512,7 +7563,21 @@ Roughly in order of how much else depends on them.
      weight; no accumulation keeps §13.4's ordering bounded. A decaying accumulation is the obvious
      compromise and is not obviously right.
 
-**Closed** since earlier drafts:
+110. **How a scheduled EN decommission gets a deadline out of a threshold system** (§13.4.3.4). Every other
+     repair purpose is "sooner is better"; vacating a machine that leaves on a date is not. Lowest door
+     unconditionally, or a door that descends as the deadline approaches. This is the one admission-control
+     mistake that loses data rather than delaying repair.
+111. **The sufficient-bandwidth allocations, as a partition** (§13.4.3.4). Not independent knobs: if they sum
+     above the total, the floors they appear to guarantee are nominal. Needs the list of purposes, their
+     values, and a validator on the sum. §9.8's hot repair should be one of them (§13.4.3.5).
+112. **The size of the repair allocation *A*** (§13.4.3.5). Doors at 1% and 9% remaining need *A* ≳ 100× the
+     largest single repair cost, or a global solve jumps every door at once. That is ~5,200 outstanding units,
+     ~166 GB in flight per SN, which is reachable only if repair operations complete slowly. Measure the
+     completion latency before setting *A*.
+113. **Whether the GC repair sweep and the verification sweep are one pass** (§13.4.3.3, §13.1.10). Both walk
+     every extent and every EC group at ~20-200 s per SN. Two passes is twice the memory traffic for no
+     benefit; fusing them couples loops with different natural cadences.
+
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
