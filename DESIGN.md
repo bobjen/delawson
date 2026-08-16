@@ -8961,6 +8961,21 @@ state it costs one relaxed load per answer:
 **Measured, 2026-08-16.** Adaptive lands on whichever fixed policy is the right one, within noise,
 and KS reports how many connections switched — 0 in the left pair, one per connection in the right.
 
+**Connections scale to the core count and then stop**, which is where this box's ceiling is. At 256
+in flight each, with ping answered on the read loop:
+
+| Connections | 4 | 8 | 16 | 24 | 32 | 48 | 64 |
+|---|---|---|---|---|---|---|---|
+| Round trips/s | 6,746,000 | 9,463,000 | **12,658,000** | 12,470,000 | 12,266,000 | 12,191,000 | 12,120,000 |
+| Average latency | 152 µs | 216 µs | 323 µs | 492 µs | 667 µs | 1,007 µs | 1,350 µs |
+
+**Measured, 2026-08-16.** 4 to 16 is close to linear; past 16 — this box has 16 cores — throughput is
+flat and latency grows in proportion to the connection count, which is a queue getting longer and
+nothing else. The server's own accounting agrees that nothing degrades: **0.58 µs of core per message
+at 16 connections and 0.60 µs at 32**, so the same work is being done, there is simply no more
+machine. KS took ~7 cores of the 16 and the client the rest, so ⚠️ **the knee at 16 is the box, not
+the design, and it cannot be attributed to either side until the client runs elsewhere.**
+
 ⚠️ **The switch is one-way, so one off-loop answer commits the connection for its lifetime.** A
 connection that does a single metadata lookup and then a million pings runs the rest at sender speed,
 which the table above prices at about 30% off direct. Switching back would mean quiescing the sender

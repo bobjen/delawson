@@ -67,7 +67,9 @@ for ready in "$run_dir"/*/ready; do
 done
 
 mkdir -p "$run_dir"
-echo "$flavor" > "$run_dir/flavor"
+# The build directory, not the word: stop-laws needs a path that exists.
+echo "$target" > "$run_dir/build"
+rm -f "$run_dir/flavor"
 
 # KS's address is fixed; every other process is handed a port from the base up.
 eval "$("$laws" --config "$cluster" bootstrap | sed 's/^/ks_/;s/ /=/')"

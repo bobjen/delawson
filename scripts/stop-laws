@@ -34,12 +34,11 @@ done
 
 [[ -d $run_dir ]] || { echo "stop-laws: no $run_dir, nothing to stop"; exit 0; }
 
-# Whichever client is built; either can talk to either flavor of daemon.
-laws=""
-for candidate in "$root/target/$(cat "$run_dir/flavor" 2>/dev/null || echo debug)/laws" \
-                 "$root/target/debug/laws" "$root/target/release/laws"; do
-    if [[ -x $candidate ]]; then laws=$candidate; break; fi
-done
+# The client from the same build as the running processes. Falling back to the
+# other build is a trap: it may predate a configuration change and then fail for
+# a reason that looks like the process ignoring us.
+laws=$root/target/$(cat "$run_dir/build" 2>/dev/null || echo debug)/laws
+[[ -x $laws ]] || laws=""
 
 # Reverse cold-start order: nothing should outlive what it depends on, and within
 # a kind the highest-numbered instance goes first, so KS0 - the registrar - is the
@@ -80,9 +79,20 @@ for dir in "${dirs[@]}"; do
     # Straight to the address in the run directory: a shutdown must not depend on
     # KS still being up to look the process up.
     listen=$(sed -n 's/^listen = "\(.*\)"/\1/p' "$dir/process.toml")
+    asked=no
+    if [[ -n $laws && -n $listen ]]; then
+        # Keep the reason. Escalating silently makes a client that could not even
+        # send the request look like a process that ignored it.
+        if why=$("$laws" --config "$dir/cluster.toml" --at "$listen" --to "$identity" \
+            shutdown 2>&1); then
+            asked=yes
+        else
+            echo "stop-laws: $identity would not take the request: $why" >&2
+        fi
+    fi
+
     how=""
-    if [[ -n $laws && -n $listen ]] && "$laws" --config "$dir/cluster.toml" --at "$listen" \
-        --to "$identity" shutdown > /dev/null 2>&1 && wait_gone "$pid" "$grace"; then
+    if [[ $asked == yes ]] && wait_gone "$pid" "$grace"; then
         how="on request"
     elif kill -TERM "$pid" 2>/dev/null && wait_gone "$pid" "$grace"; then
         how="on SIGTERM"
