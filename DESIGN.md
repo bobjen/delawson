@@ -51,7 +51,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-130 things *not* decided.
+128 things *not* decided.
 
 **Priorities and framing**
 
@@ -309,11 +309,11 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **Peak-to-mean is invariant to cluster size**: demand spikes are common-mode, so the LLN never smooths them | §12.1.1.1 |
 | **Storage must not** be dynamically priced; a stored byte occupies a disk continuously | §12.1.1.3 |
 | Reservations are the **hedge against spot peaks**, which is what their premium buys | §12.1.1.3, §5.12.6 |
-| **Dither hard deletes** forward: the midnight expiry spike is self-inflicted and free to flatten | §8.5.1a |
-| **DN owns expiry**, and keeps a heap of what expires before the next GC pass, refilled by that pass | §8.5.1b |
-| The heap works only while **GC period ≪ mean object lifetime**; at parity it is the whole object set | §8.5.1b.1 |
-| Objects created after the sweep passed them must be **inserted into the live heap**, or they outlive their declaration | §8.5.1b.2 |
-| Three mechanisms now smooth the midnight spike; they must **compose, not compound** | §8.5.1b.2 |
+| **No dithering of deletes**: the outstanding-delete limit already defers, and only when saturated | §8.5.1a |
+| Back-pressure beats pre-emption whenever the pressure can be **measured** — §13.4.3.6's shape again | §8.5.1a |
+| **DN owns expiry**, via a secondary keyed index on **expiry second** — a prefix scan, no sweep | §8.5.1b |
+| Costs ~5% more DN metadata and one insert per creation; **removes a correctness hole**, which decided it | §8.5.1b.0, §8.5.1b.2 |
+| So **one** mechanism smooths deletion load, not three | §8.5.1b.2 |
 | Expiry is a **trigger**, not a mechanism — it enters §8.4.1's deferred decrement | §8.5.1b.2 |
 | Rule: **flatten what the design creates, price only what the world creates** | §8.5.1a |
 | **Physical, not logical** bytes — forced by the same slack rule | §12.3 |
@@ -5412,30 +5412,37 @@ What a declared expiry buys:
 This is the strongest available lever on the §12.7 efficiency chain, and it costs nothing but an API
 field and the discipline to group by it.
 
-#### 8.5.1a Dither the hard delete, because the midnight spike is self-inflicted
+#### 8.5.1a The midnight spike needs no dithering, because the delete limit already defers
 
-§12.1.1.1 lists a deletion spike at midnight GMT as a demand feature to be priced around. **Part of it is
-self-inflicted, and the design can flatten it instead.**
+§12.1.1.1 lists a deletion spike at midnight GMT as a demand feature to be priced around, and part of it is
+self-inflicted: humans declare expiry at day boundaries — "keep this 30 days" means midnight, not 03:47 — so
+expirations pile onto one instant, worldwide, every day.
 
-Humans declare expiry at day boundaries — "keep this 30 days" means midnight, not 03:47 — so honouring declared
-times exactly piles the resulting hard-delete work onto one instant, worldwide, every day.
+**An earlier draft proposed dithering the hard-delete time forward by a deterministic per-object offset to spread
+that work. Rejected** (Bob, 2026-08-16): there is a limit on outstanding extent deletions, and **GC simply defers
+deletes when the limit is already hit.** No pre-emptive spreading is needed.
 
-**So dither the hard delete forward by a deterministic per-object offset**, for example a hash of the object id
-modulo a window of hours. Deterministic so it is reproducible and auditable; forward so it never deletes early.
+**And the rejection is right for a reason worth keeping**, because dithering is an appealing idea that will be
+proposed again. It is the difference between a static partition and a work-conserving threshold — §13.4.3.6's
+distinction, arriving in a second place:
 
-**This is free.** The storage is already paid for during the dither window — §12.8.2's byte-seconds are computed
-from actual reference lifetimes, so the customer is charged for exactly the time the data existed and not a moment
-more. Nothing is given away and nothing is over-billed.
+| | When the fleet is idle | When it is saturated |
+|---|---|---|
+| **Dithering** | delays anyway, and the customer is billed for the delay | delays |
+| **Outstanding-delete limit** | **no delay at all** | defers, exactly as much as needed |
 
-⚠️ **It requires expiry to mean "not before", not "not after".** §8.4.1b already delays reclamation by up to three
-days for soft delete, so DeLawson does not promise prompt destruction in the general case — which suggests "not
-before" is already the operative semantics. But it must not be assumed: **compliance-driven deletion, where being
-gone by a deadline is the entire point, must be exempt** — plausibly the same class that opts out of soft delete
-(§8.4).
+**Derived.** Dithering pays its cost unconditionally to buy smoothing that is only ever needed under contention; the
+limit is free when there is nothing to smooth. Back-pressure beats pre-emption whenever the pressure can be
+measured, and here it can.
 
-**The general lesson is worth more than the mechanism:** §12.1.1 shows peak-to-mean is invariant to cluster size,
-so a spike that cannot be flattened must be priced around forever. **Flatten what the design creates; price only
-what the world creates.** This is the one large spike that is ours rather than the world's.
+**Two dividends of not dithering.** The declared expiry is honoured as closely as capacity allows rather than
+deliberately missed, so the "not before" reading of expiry is not required for *this* purpose. And there is only
+**one** smoothing mechanism to reason about instead of three, so nothing can compound (an earlier draft flagged that
+hazard; it no longer exists).
+
+**The general rule survives the specific proposal's rejection**, and it is the part to remember: §12.1.1 shows
+peak-to-mean is invariant to cluster size, so a spike the design cannot flatten must be priced around forever.
+Flatten what the design creates — but prefer measuring the pressure to guessing at a spread.
 
 #### 8.5.1b How DN finds what to expire, given that its metadata is on disk
 
@@ -5446,17 +5453,25 @@ object metadata carrying the declared expiry — but it creates a problem the SN
 or slower.** Expiring on that schedule would mean an object declared for 30 days lives 31, which is not prompt
 enough to be called honouring the declaration.
 
-**So DN keeps a heap prioritized by expiry date, holding the objects that will expire before the next GC pass, and
-the GC pass refills the next heap** (Asserted, Bob). The slow sweep supplies the fast structure; between sweeps
-DN pops from a small RAM-resident heap as times arrive. **That is what lets DN expire promptly despite keeping most
-object metadata on disk.**
+**Decided: DN keeps a secondary index of objects keyed by expiry second** (Bob, 2026-08-16). §5.5 already stores DN
+metadata in DeLawson *keyed* objects, so this is one more keyed object and no new machinery. Finding what to expire
+is then a **prefix scan** of a sorted structure — everything with key ≤ now — rather than anything requiring a
+sweep.
 
-It is double-buffered by necessity: the sweep takes about as long as the window it is filling, so it fills the
-*next* window's heap while the current one is being drained.
+**The write cost is small. Derived:** one extra keyed insert per object creation, and a delete-plus-insert when an
+expiry changes. An index entry is an expiry second plus an object reference, ~16 B against the ~300 B of object
+metadata in §4.7 — about **5% more DN metadata**, which is inside the noise of a tier §12.2 already prices as the
+cheap one.
 
-##### 8.5.1b.1 The heap only works if the GC period is far shorter than object lifetimes
+##### 8.5.1b.0 The alternative, and why it lost
 
-The heap holds one GC period's worth of expirations, so its size is
+The natural alternative — and the first proposal — was a **heap prioritized by expiry date, holding objects that
+expire before the next GC pass, refilled by that pass**, double-buffered so the sweep fills the next window while
+the current one drains. It needs no write-path maintenance at all, which is its whole appeal. It lost on three
+counts:
+
+**1. It only works if the GC period is far shorter than object lifetimes.** The heap holds one GC period's worth of
+expirations, so its size is
 
 > `heap entries ≈ objects × (GC period / mean object lifetime)`
 
@@ -5472,41 +5487,31 @@ For a DN holding ~10^9 objects at ~16 B per entry — an expiry second plus an o
 delete within a week, so the middle row is the realistic case and the bottom row is not far-fetched. As the ratio
 approaches 1 the heap degenerates into a copy of the whole object set and saves nothing.
 
-**Two ways out, and they are the classic index-versus-scan pair.**
+**2. Its sizing depends on a number nobody knows.** Whether the heap is 530 MB or the entire object set turns on
+the lifetime distribution, so choosing it would mean betting on unmeasured customer behaviour. The index has no
+sizing constraint to get wrong.
 
-**Shorten the GC period for expiry alone.** The expiry sweep does not need to be the full metadata GC — it only
-needs the expiry column, so it can be a cheaper, more frequent pass. This keeps the write path untouched.
+**3. It has a correctness hole that the index does not**, and this was decisive. See §8.5.1b.2.
 
-**Or keep a secondary index keyed by expiry second.** §5.5 already stores DN metadata in DeLawson *keyed* objects,
-so a second keyed object sorted by expiry costs no new machinery — and then the "next expirations" are a prefix
-scan of a sorted structure rather than a heap that must be rebuilt. No sweep, and no sizing constraint at all.
-The price is maintenance on the write path: one keyed insert per object, and a delete-plus-insert whenever an
-expiry changes.
+An index is maintained on write, so it is never a snapshot and never stale. A heap refilled by a sweep is both.
 
-⚠️ Undecided. The index is strictly better on read and strictly worse on write, and which dominates depends on the
-ratio above — the very number §8.5.1b.1 says is not yet known. Note that §8.5.1a's dithering helps the index case
-specifically, by spreading inserts that would otherwise all land on the same midnight key.
+##### 8.5.1b.2 The hole the index closes
 
-##### 8.5.1b.2 One correctness hole, and three smoothers that must not compound
+**An object created after a sweep passed its position can expire without ever being in the heap.** A sweep is a
+snapshot; anything created — or re-dated — afterwards is invisible to it until the next pass. The symptom is data
+silently outliving its declaration, which is the one failure mode expiry exists to prevent.
 
-⚠️ **An object created after the sweep passed its position can expire without being in any heap.** The sweep is a
-snapshot; anything created, or re-dated, afterwards is invisible to it. So **DN must insert directly into the live
-heap** when it creates an object whose expiry falls inside the current window. DN is the creator and knows the
-expiry, so this is cheap — but it is exactly the case a heap-refilled-by-sweep design forgets, and the symptom is
-data that outlives its declaration silently.
+A heap design can patch this: DN is the creator, knows the expiry, and can insert directly into the live heap when
+the expiry falls inside the current window. But it is precisely the case such a design forgets, and it has to be
+got right in two places rather than one.
 
-**And there is now a rate limit on extent deletion** (Asserted, Bob), which spreads the resulting work downstream.
-So three separate mechanisms smooth the same midnight spike:
+**An index has no snapshot and therefore no hole.** Creation writes the index entry; a prefix scan for key ≤ now
+finds it. That is the strongest of the three reasons above, because the other two are about cost and this one is
+about correctness.
 
-| Mechanism | Where |
-|---|---|
-| Dithered hard-delete times | §8.5.1a |
-| The heap's pop schedule | above |
-| The rate limit on extent deletion | §8.4, here |
-
-⚠️ **They must compose rather than compound.** If dithering spreads work over six hours and the rate limiter also
-meters it over six hours, the effective delay is worse than either alone and the storage is billed for the whole of
-it. They should be understood as one policy with one budget, not three independent knobs that each seem harmless.
+**Deletion load is smoothed by one mechanism, not three.** §8.5.1a rejects dithering, and the index has no pop
+schedule to tune, so the outstanding-extent-deletion limit is the only thing spreading the work — which is what
+§8.5.1a argues is the right shape anyway.
 
 Note that expiry needs no new teardown path: DN expiring an object enters §8.4.1's deferred decrement, which
 releases stream references, then extent references, then the bytes. Expiry is a *trigger*, not a mechanism.
@@ -8599,22 +8604,15 @@ Roughly in order of how much else depends on them.
      `cores − Σ scheduled(t)`, which may be zero, making the bank's accumulation rate briefly worthless. Bounding
      the reservable fraction fixes that and costs reservation revenue. Where the line goes is a product decision.
 
-127. **Whether declared expiry means "not before" or "not after"** (§8.5.1a). Dithering hard deletes to flatten
-     the midnight spike requires the former, and §8.4.1b's three-day soft-delete window suggests that is already
-     the operative semantics — but compliance-driven deletion needs the latter, and nothing says which class an
-     object is in. Plausibly the same distinction as the soft-delete opt-out.
+127. **Whether any object class needs guaranteed-prompt destruction** (§8.4.1b, §8.5.1b). §8.4.1b delays
+     reclamation up to three days for soft delete and §8.5.1a's delete limit defers further under load, so
+     DeLawson promises "not before" and not "not after". Compliance-driven deletion wants the opposite, and
+     nothing says which class an object is in — plausibly the same distinction as the soft-delete opt-out. Note
+     the dithering that originally motivated this question was rejected; the question survives on its own.
 128. **How the compute spot price is computed and published** (§12.1.1.3). It must be derived from observable
      utilization and predictable enough to plan against, or it gives customers no way to shift load and fails at
      its only job. A published forward curve, a posted current rate, or an auction — and the choice determines
      whether §12.6's simple presentation survives.
-
-129. **Heap versus an expiry-keyed index in DN** (§8.5.1b.1). The heap needs no write-path maintenance but
-     degenerates to the whole object set as the GC period approaches mean object lifetime — and §8.4.1b says
-     lifetimes of a week are typical. A secondary keyed object sorted by expiry second costs one insert per object
-     and removes both the sweep and the sizing constraint. Which wins depends on the ratio, which is unmeasured.
-130. **One budget for the three deletion smoothers** (§8.5.1b.2). Dithering, the heap's pop schedule and the
-     extent-deletion rate limit each spread the same work. Independently tuned they compound, delaying reclamation
-     and billing the customer for the delay. They need to be one policy with one budget.
 
 **Closed** since earlier drafts:
 
@@ -8705,6 +8703,12 @@ Roughly in order of how much else depends on them.
   with each sharer paying its own reference's metadata cost in full (§12.6.3, §12.6.3.1);
 - whether cross-tenant sharing can be gamed to cut a bill — it cannot; total revenue is invariant
   under any regrouping of references (§12.6.3);
+- how DN finds what to expire, given metadata on disk — a **secondary keyed index on expiry
+  second**, scanned by prefix; the heap-refilled-by-sweep alternative lost on a correctness hole
+  (§8.5.1b, §8.5.1b.0);
+- whether hard deletes should be dithered to flatten the midnight spike — **no**; the
+  outstanding-delete limit defers under load and costs nothing when idle (§8.5.1a);
+- whether the several deletion smoothers might compound — moot, there is now only one (§8.5.1b.2);
 - whether the throughput targets are per box or per cluster — **per box**, and both have
   already been reached on this box, so they are a floor rather than a stretch (§1.4.0);
 - whether the 200k/2M pair is two requirements or one — one, on messaging: the 10x gap
