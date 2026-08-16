@@ -51,7 +51,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-106 things *not* decided.
+108 things *not* decided.
 
 **Priorities and framing**
 
@@ -74,6 +74,9 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | So it wants **~10^7 metadata QPS** — 5× the demonstrated target, ~1/4 of the hardware bound | §1.0.3 |
 | Latency bounds **depth** of reasoning; throughput bounds **breadth** — souls think in parallel, so §1.4 applies | §1.0.3 |
 | Aggregate demand plausibly **exceeds one cluster**, which is a second reason for multiple stores | §1.0.3 |
+| Depth is **per tier**, so the depth/breadth trade is really a **tiering** problem — DeLawson is one tier | §1.0.3.1 |
+| DeLawson spans **8 orders of magnitude** of read latency internally and exposes none of it | §1.0.3.1 |
+| A reconstruction read costs ~5 reads, so §12 should charge ~5× for it | §1.0.3.1, §4.3.3.2d |
 | The scale ambition is ~10^57 bits; DeLawson addresses ~10^26, so it is **10^31 short** and directional | §1.0.4 |
 | Relative timestamps are why §1.3's rule survives a scale nobody designed for | §1.0.4, §4.6.3 |
 | The intermediate scale is a **torus Dyson swarm** — 2^18 elements, so **inside** DeLawson's addressing | §1.0.5 |
@@ -410,6 +413,52 @@ With `k` concurrent lines the demand is 1,000 × `k` × 10,000/s, so even modest
 §1.6.2's ~40M/s bound for a single cluster. ⚠️ `k` is not given by the source and nothing here estimates it,
 but the direction matters: **the shared-memory workload's aggregate demand plausibly exceeds what one cluster
 can serve**, which is a second and quite independent reason the AI page insists on multiple stores.
+
+#### 1.0.3.1 Memory is a hierarchy, so depth is per-tier
+
+**There are different latencies at different levels** (Asserted, Bob, 2026-08-16), and the assistant writing
+this document is an instance of it. Its own tiers, by observable behaviour rather than by any claim about
+internals:
+
+| Tier | Latency | Depth reachable |
+|---|---|---|
+| What is already in context | effectively free | thousands of steps |
+| Reading a file in this repo | milliseconds | hundreds |
+| Fetching a web page | seconds | a handful |
+| Asking Bob | minutes to hours, and he may be asleep | one, maybe |
+
+So §1.0.3's depth bound is **per tier**, not global. A line of reasoning that stays inside the fast tier goes
+deep; one that must escalate goes shallow, and the escalation is what actually sets the pace.
+
+**That dissolves §1.0.5's depth-versus-breadth trade into a tiering problem.** A soul does not choose one
+minimum communication time — it has a fast small store *and* a slow large one, and spends the fast tier on
+depth while using the slow tier for reach. Which is exactly what the AI page means by multiple memory stores
+at different scales, and it means DeLawson is built to be **one tier in someone's hierarchy**, not the whole
+of anyone's memory.
+
+**DeLawson already has such a hierarchy internally, spanning eight orders of magnitude, and exposes none of
+it. Derived:**
+
+| Path | Added latency |
+|---|---|
+| Tiny object inlined in DN metadata, RAM-resident (§11) | network only |
+| §9.6's cache at FE or EN | network only |
+| Un-coalesced append, served from the EN staging index (§8.1.4) | network + SSD |
+| Sealed extent on SSD | + ~100 µs |
+| Sealed extent on HDD | + ~10 ms |
+| Erasure-coded extent needing reconstruction, 1.333× tier (§4.3.2.4) | + 5 reads and a solve; §12.7.2.1a's worst case is minutes |
+
+⚠️ **Nothing lets a caller ask which tier a read will come from**, and for a caller managing a depth budget
+that is exactly the actionable fact: "will this be 100 µs or 10 ms?" decides whether to follow a line of
+reasoning now or defer it. §9.5 gives timeouts and hedging, which handle the *consequences* of a slow read;
+they do not let a caller avoid one. §4.3.2.4's availability tiers are already latency tiers in disguise — the
+whole value of the second data instance is keeping reconstruction off the read path — so the design prices
+this distinction without exposing it.
+
+**And §12 should charge for it, which it currently does not.** A reconstruction read genuinely costs five
+reads (§4.3.3.2d), so by §12.1 it should cost about five times a normal read. Billing per request without
+regard to tier under-charges exactly the reads that are expensive, which is §12.2's failure mode in a new
+place.
 
 #### 1.0.4 The scale ambition, and the honest size of the gap
 
@@ -7268,6 +7317,15 @@ Roughly in order of how much else depends on them.
      disk, electricity and rent; in orbit, power is abundant and launch mass and heat radiation bind. §12.1's
      principle is unaffected, which is the point of it being a principle — but §12.7's whole chain to a price
      per byte would need rebuilding. Not near-term unless StarMind is.
+107. **Whether a read's latency tier is visible to the caller** (§1.0.3.1). DeLawson spans eight orders of
+     magnitude from an inlined tiny object to a reconstruction read, and a caller managing a depth budget
+     wants to know which it will get *before* issuing the read. §9.5's timeouts and hedging address the
+     consequences of a slow read, not the choice to avoid one. Candidates: an advertised tier per object, a
+     may-block flag on the request, or a fast-path-only mode that fails rather than waits.
+108. **Whether reads are billed by tier** (§1.0.3.1). A reconstruction read costs about five reads
+     (§4.3.3.2d) and a cached read costs almost nothing. §12.6.2 prices request rate without regard to tier,
+     which under-charges precisely the expensive reads — §12.2's failure mode relocated.
+
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
