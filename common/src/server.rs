@@ -42,13 +42,14 @@ use crate::wire::{
     self, Arg, BUF_BYTES, MAX_FRAME_BYTES, Op, Request, Response, Status, Wire, put_response,
 };
 use crate::{Context, Error, Result};
+use crate::{logd, logi, logn, logw};
 use std::cell::RefCell;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 pub const READY_FILE: &str = "ready";
 
@@ -81,7 +82,7 @@ pub trait Service: Send + Sync + 'static {
     /// Whether to answer this operation on the connection's read loop instead of
     /// handing it to a worker. Only for work too small to be worth a queue hop.
     fn inline(&self, op: Op) -> bool {
-        matches!(op, Op::Ping | Op::Status | Op::Shutdown)
+        matches!(op, Op::Ping | Op::Status | Op::Shutdown | Op::Histogram)
     }
 
     /// Lines appended to the common `status` reply.
@@ -117,6 +118,7 @@ impl Process {
         }
         std::fs::create_dir_all(&config.data_dir).context(config.data_dir.display())?;
         let run_dir = process_config.parent().unwrap_or(Path::new(".")).to_path_buf();
+        crate::log::open(&run_dir.join("logs"), &config.identity, cluster.logging.build()?)?;
         Ok(Process {
             config,
             cluster,
@@ -181,11 +183,6 @@ impl Process {
                 response.message().unwrap_or("no reason given")
             ))),
         }
-    }
-
-    pub fn log(&self, message: impl std::fmt::Display) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        eprintln!("{now} {} {message}", self.config.identity);
     }
 
     /// Ask the accept loop to stop. It is blocked in `accept`, so set the flag
@@ -255,12 +252,12 @@ pub fn serve(process: Arc<Process>, service: Arc<impl Service>) -> Result<()> {
         TcpListener::bind(process.address()).context(format!("binding {}", process.address()))?;
     let address = listener.local_addr()?;
     let pool = Arc::new(Pool::new(workers()));
-    process.log(format!("listening on {address} with {} workers", workers()));
+    logn!("listening on {address} with {} workers", workers());
 
     // KS cannot register with itself, and needs no one's permission to serve.
     if process.cluster.fixed_address(process.identity()).is_none() {
         process.register()?;
-        process.log(format!("registered with KS at {}", process.cluster.ks.address));
+        logn!("registered with KS at {}", process.cluster.ks.address);
     }
 
     // Ready last: a process is ready when it can be found, not merely when it is
@@ -278,7 +275,7 @@ pub fn serve(process: Arc<Process>, service: Arc<impl Service>) -> Result<()> {
         let stream = match connection {
             Ok(stream) => stream,
             Err(e) => {
-                process.log(format!("accept failed: {e}"));
+                logw!("accept failed: {e}");
                 continue;
             }
         };
@@ -287,14 +284,15 @@ pub fn serve(process: Arc<Process>, service: Arc<impl Service>) -> Result<()> {
         let pool = Arc::clone(&pool);
         std::thread::spawn(move || {
             if let Err(e) = read_loop(&process, &service, &pool, stream) {
-                process.log(format!("connection ended: {e}"));
+                logi!("connection ended: {e}");
             }
         });
     }
 
     let stopped = service.stop(&process);
     let _ = std::fs::remove_file(process.ready_file());
-    process.log("stopped");
+    logn!("stopped");
+    crate::log::flush();
     stopped
 }
 
@@ -329,7 +327,7 @@ fn read_loop<S: Service>(
         // read loop is the only thread that switches and nothing is in flight yet.
         if policy == SendMode::Adaptive && out.batch.get().is_none() {
             out.hand_to_sender();
-            process.log("switched to a batching sender: an answer left the read loop");
+            logn!("switched to a batching sender: an answer left the read loop");
             process.senders.fetch_add(1, Ordering::Relaxed);
         }
         let process = Arc::clone(process);
@@ -481,10 +479,10 @@ fn reply(process: &Process, service: &impl Service, out: &Out, request: Request,
     let response = answer(process, service, &request).to(&request);
     process.answered.fetch_add(1, Ordering::Relaxed);
     if let Err(e) = out.put(&response, settled) {
-        process.log(format!("could not answer {}: {e}", request.op));
+        logw!("could not answer {}: {e}", request.op);
     }
     if request.op == Op::Shutdown {
-        process.log("shutdown requested");
+        logn!("shutdown requested");
         process.stop_soon();
     }
 }
@@ -493,6 +491,17 @@ fn answer(process: &Process, service: &impl Service, request: &Request) -> Respo
     match request.op {
         Op::Ping => ping(process, request),
         Op::Status => Response::text(status(process, service)),
+        Op::Histogram => Response::text(
+            crate::log::histogram()
+                .iter()
+                .map(|(count, stride, where_)| {
+                    let sampled =
+                        if *stride > 1 { format!("1 in {stride}") } else { "all".to_string() };
+                    format!("{count:>12} to info {sampled:>10}  {where_}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
         Op::Shutdown => Response::ok(),
         _ => service.handle(process, request),
     }
@@ -509,6 +518,9 @@ fn ping(process: &Process, request: &Request) -> Response {
         }
     };
     if size == 0 {
+        // At debug, so it is off by default: a line per ping costs several times
+        // what the ping does. Turn the level down to reproduce that measurement.
+        logd!("pinged, reply size {size}");
         return Response::text(format!("{} is alive", process.identity()));
     }
     // Random padding is the honest default; the repetitive kind exists to give

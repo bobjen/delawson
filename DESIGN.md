@@ -9181,6 +9181,67 @@ the repetitive padding was built a byte at a time, which measured the loop rathe
 rule that fell out: **a benchmark's own inputs need the same suspicion as its outputs**, and the
 check that caught it was counting bytes in and bytes out rather than trusting the throughput.
 
+### 17.5d Logging: two files, and a histogram deciding what reaches the second
+
+Every process writes two rotating logs into its run directory:
+
+| | Carries | Reaches back |
+|---|---|---|
+| `ks0-0000000.log` | every line | hours |
+| `ks0-info-0000000.log` | a target share of them, a tenth by default | days |
+
+Both are configured by size and count, oldest deleted; the same bytes therefore cover a much longer
+span in the info log, which is the point of having two.
+
+A line is:
+
+```
+n,2026-08-16 23:31:32.538,pid=64967,tid=64967,file=common/src/server.rs,line=255,listening on 127.0.0.1:9601
+```
+
+Level as one letter, the time to the millisecond in UTC, the process and kernel thread ids, where in
+the source it came from, and the message. **The identity, host and version are written at the top of
+every file** rather than on every line, so a rotated file still says what it is. **Kernel thread id
+rather than a name**, so a line matches what `perf`, `gdb` and `top` say.
+
+**Write the words first and the values last** — `appending to %s length %s`, not
+`%s: appending, len %s`. The histogram is keyed on file and line and shows the start of the message,
+so a line that begins with its variables is unreadable in aggregate.
+
+**How much reaches the info log is a rate, not a rule about levels.** A running histogram counts
+each site; rare sites pass through whole, and the busy ones are sampled at a stride recomputed so
+the total comes out near the target share. Sampling rather than suppressing means the info log still
+shows what the busy traffic looks like. Counts are halved at each recount, so the answer follows the
+workload rather than being set by whatever happened first.
+
+**And there is a level above `info` for a line that must always be in both**: `notice`, from syslog's
+ladder. That answers a question worth stating, since `debug` is normally off and `info` is normally
+the floor — the levels are `d i n w e`, `info` is the default floor, and `notice` means *ordinary but
+not chatty*. Warnings and errors are also flushed to disk immediately, where everything else waits
+for a batch.
+
+#### 17.5e What a log line costs, which at these rates is a great deal
+
+One `info` line per ping, at 16 connections x 256 in flight:
+
+| | Round trips/s |
+|---|---|
+| No line (the level filters it out) | 12,933,000 |
+| One line per ping, written as it happens | 373,000 |
+| One line per ping, batched | 1,899,000 |
+
+**Measured, 2026-08-16.** Two things follow, and the second is the one to remember:
+
+- **Logs are written in batches** — a 64 KB buffer per file, flushed when it fills, every 200 ms, at
+  rotation, and immediately for anything at warning or above. That is worth **5x** over a write per
+  line, and it is the same argument the message path makes: a syscall per small thing dominates the
+  small thing.
+- ⚠️ **Even batched, a line per message costs 85% of throughput.** The line is about 105 bytes
+  against a ping's 20, so logging one produces five times the bytes the work does — 507 MB of log in
+  three seconds. There is no version of per-message logging that is cheap at millions of messages a
+  second, so the hot path logs at `debug` and is off by default. The knob stays so the measurement
+  can be repeated rather than remembered.
+
 ### 17.6 The harness reports what it cannot enforce
 
 One box is one domain at every level, so it satisfies no spreading rule. That is legal — §5.6.7

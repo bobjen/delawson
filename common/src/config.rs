@@ -176,6 +176,44 @@ impl Messaging {
     }
 }
 
+/// How much log a process keeps, and where the line between the two logs falls.
+/// Sizes are here rather than per machine type because a fleet wants one answer;
+/// a type that needs its own can grow one later.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Logging {
+    /// debug, info, notice, warning, error.
+    pub level: String,
+    /// Bytes per file, before the next one is started.
+    pub size: u64,
+    /// Files kept of the full log, which carries every line. Size times count is
+    /// how far back it reaches — hours.
+    pub full_files: usize,
+    /// Files kept of the info log, which carries everything but the chatty
+    /// lines, so the same bytes reach back days.
+    pub info_files: usize,
+    /// The share of the full log's lines the info log should carry. Rare lines
+    /// pass whole; busy ones are sampled to make the total come out here.
+    pub info_share: f64,
+    /// Lines between recounts of which sites are hot.
+    pub recount: usize,
+}
+
+impl Logging {
+    pub fn build(&self) -> Result<crate::log::Logging> {
+        Ok(crate::log::Logging {
+            level: crate::log::Level::parse(&self.level).ok_or_else(|| {
+                Error::new(format!("logging.level {:?} is not a level", self.level))
+            })?,
+            size: self.size,
+            full_files: self.full_files,
+            info_files: self.info_files,
+            info_share: self.info_share,
+            recount: self.recount,
+        })
+    }
+}
+
 /// Raft ring composition. One number fleet-wide for now; nothing yet
 /// distinguishes KS, DN and SN ring sizes.
 #[derive(Debug, Clone, Deserialize)]
@@ -206,6 +244,7 @@ pub struct ClusterConfig {
     pub failure_domains: FailureDomains,
     pub rings: Rings,
     pub messaging: Messaging,
+    pub logging: Logging,
     pub timeouts: Timeouts,
     #[serde(default, rename = "service")]
     pub services: Vec<ServiceEntry>,

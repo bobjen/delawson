@@ -70,6 +70,7 @@ ops! {
     Ping = 0x0001, "ping";
     Status = 0x0002, "status";
     Shutdown = 0x0003, "shutdown";
+    Histogram = 0x0004, "histogram";
 
     // KS: the registry, then the keys.
     Register = 0x0110, "register";

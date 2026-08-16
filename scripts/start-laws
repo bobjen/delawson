@@ -105,14 +105,16 @@ data_dir = "data"
 EOF
 
     rm -f "$dir/ready"
-    nohup "$bin/$kind" "$dir/process.toml" >> "$dir/log" 2>&1 &
+    # Whatever the process says before its own logs are open, plus anything the
+    # kernel says about it. Its real logs are in $dir/logs.
+    nohup "$bin/$kind" "$dir/process.toml" >> "$dir/stderr.log" 2>&1 &
     pid=$!
 
     waited=0
     while [[ ! -f $dir/ready ]]; do
         if ! kill -0 "$pid" 2>/dev/null; then
-            echo "start-laws: $identity died before it was ready; tail of $dir/log:" >&2
-            tail -n 20 "$dir/log" >&2
+            echo "start-laws: $identity died before it was ready; tail of $dir/stderr.log:" >&2
+            tail -n 20 "$dir/stderr.log" >&2
             exit 1
         fi
         sleep 0.02

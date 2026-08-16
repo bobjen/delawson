@@ -120,6 +120,8 @@ enum Cmd {
     Services,
     /// Every process KS knows about, with the port it registered.
     Registry,
+    /// What a process logs, by site, busiest first.
+    Histogram,
     /// KS's fixed address and the port base, which is what a starter needs.
     Bootstrap,
     /// Time the random generator that fills ping padding, single-threaded, so
@@ -296,6 +298,13 @@ fn run(cli: Cli) -> Result<()> {
                 println!("{:<6} {:<3} {}", s.identity, s.kind, s.domain.join("/"));
             }
             Ok(())
+        }
+        Cmd::Histogram => {
+            let target = resolve(&cluster, &cli, ServiceKind::Ks)?;
+            report(
+                &target,
+                &open(&target, timeout, &cluster.messaging)?.call(&Request::new(Op::Histogram))?,
+            )
         }
         Cmd::Registry => {
             let target = resolve(&cluster, &cli, ServiceKind::Ks)?;

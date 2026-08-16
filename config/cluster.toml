@@ -48,6 +48,19 @@ compress_sample = 4096
 # key hierarchy — KS handing out message keys is what replaces this.
 key = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
 
+# Two logs per process, both rotating. The full one carries every line; the info
+# one carries a target share of them — rare lines whole, busy ones sampled at a
+# stride a running histogram keeps up to date. So the same bytes reach back hours
+# in the full log and days in the info log. Say "notice" rather than "info" for a
+# line that must always be in both, whatever its rate.
+[logging]
+level = "info"
+size = 67108864
+full_files = 8
+info_files = 40
+info_share = 0.1
+recount = 65536
+
 [timeouts]
 request_ms = 2000
 shutdown_grace_ms = 2000
