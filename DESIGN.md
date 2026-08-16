@@ -44,7 +44,7 @@ it was computed or assumed.
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-100 things *not* decided.
+102 things *not* decided.
 
 **Priorities and framing**
 
@@ -74,7 +74,11 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | The 10× gap says **nine tenths of the unbatched cost is messaging**; the ping ceiling is >64M QPS | §1.4.0 |
 | Those figures are **end-to-end** — durable log write per message, encryption, compression, Nagle off | §1.4.0.1 |
 | **Batching subsumes io_uring** on the network path: batching gave all the gains, io_uring was a regression | §1.4.0.1 |
-| Read requests are logged because §12 requires **metering** them; batching is a billing mechanism too | §1.4.0.2 |
+| Read requests are logged because §12 requires **metering** them; batching is a billing mechanism too | §1.4.0.3 |
+| **Batch depth is set by the compression window and the log write** — overhead amortization saturates at ~100 | §1.4.0.2 |
+| Compression cuts **network and bytes written**, not just capacity, and the saving is realized per crossing | §7.1.3 |
+| So it pays for itself on HDD (threshold ~194 MB/s vs LZ4's 600) and does not on NVMe (~2.4 GB/s) | §7.1.3 |
+| Compression **shortens every repair window**, so it improves durability, not only cost | §7.1.3 |
 | A cluster may run **indefinitely** and lie dormant for eons — no absolute epochs, no work per elapsed time | §1.3 |
 
 **Object model**
@@ -538,7 +542,37 @@ needed to hide it.
 touches each is 10M misses/sec, well inside what 16 cores keep outstanding, and ~640 MB/s
 against a box doing ~90 GB/s (§7.2.1).
 
-#### 1.4.0.2 Billing is why a read request is logged at all
+#### 1.4.0.2 Batching has three motives, and they justify different depths
+
+Batching is usually presented as syscall amortization. It is doing three jobs here, and **the overhead
+argument is the one that saturates first** — which is why the measured configuration went to 1,000 deep
+rather than stopping at 100.
+
+Speedup at batch depth `b`, with `M = 9W` from above, is `10 / (9/b + 1)`:
+
+| Depth `b` | Speedup | Share of the available 10x |
+|---|---|---|
+| 10 | 5.3x | 53% |
+| 100 | 9.2x | **92%** |
+| 1,000 | 9.9x | 99% |
+
+**Derived.** So per-message overhead is essentially paid off by depth 100. The remaining factor of ten in
+depth buys two other things:
+
+**The durable log write.** At 2M QPS, one write per batch is 20,000 log writes/sec at depth 100 and
+**2,000/sec at depth 1,000.** That is the difference between a device requirement that is awkward and one
+that is easy, and per §1.4.0.3 the log is not optional.
+
+**Enough data for compression to work with** (Asserted, Bob, 2026-08-15). The measured path compressed
+messages, and compression needs a window: 1,000 small responses of ~100 B is ~100 KB, which compresses near
+its asymptotic ratio, where a single 100 B message has no redundancy to find and may expand. So message
+compression — which §7.1.3 shows is where the network saving comes from — is **only available at depth.**
+
+That is worth stating as a design rule rather than an observation: **batch depth is set by the compression
+window and the log write, not by overhead amortization.** Anyone tuning depth against a throughput graph
+alone will stop at 100 and silently lose both.
+
+#### 1.4.0.3 Billing is why a read request is logged at all
 
 Logging a *read* looks like pure overhead until §12 is taken seriously. §12.1 requires
 billing proportional to cost on **every scarce resource**, and §12.6.2 already prices
@@ -3443,6 +3477,59 @@ bandwidth loss — and that is **not a conflict the system has to adjudicate**, 
 makes it the user's economic choice: declining compression costs them more physical bytes and buys them
 bandwidth. One more case where billing proportional to cost removes a policy decision instead of adding one.
 
+#### 7.1.3 Compression usually pays for itself, because the bytes move more than once
+
+§7.1.2 asks only whether compression beats a *single* device read, and on that test NVMe fails it. That is
+the wrong test. **Compression reduces network traffic and the bytes written to HDD or SSD as well**
+(Asserted, Bob, 2026-08-15), and the saving is realized every time the compressed bytes move or are stored.
+
+Counting the crossings a logical byte actually makes:
+
+| Crossing | Times | Medium |
+|---|---|---|
+| client to primary | 1 | network |
+| primary broadcast to four ENs (§8.1.2) | 4 | network |
+| write to device | 1 | disk |
+| reads over the object's life | *E* | disk |
+| repair reads (§4.3.3.2d) | rare, large multiplier | network |
+
+So the break-even compression speed is the single-crossing threshold **divided by the number of times the
+saving is realized**. Writing `C` for compression speed and using `r = 2`:
+
+> win iff `1/C < (1 - 1/r) x [ 4/W_net + 1/W_write + E/W_read ]`
+
+| Device | Threshold `C` | LZ4 compress, ~0.6 GB/s/core |
+|---|---|---|
+| HDD, 200 MB/s, `E` = 1 | **~194 MB/s** | **wins by 3x** |
+| NVMe, ~2-4 GB/s, `E` = 1 | **~2.4 GB/s** | loses by 4x |
+
+**Derived.** Two things worth noticing in those numbers.
+
+**On HDD the disk dominates and the network is almost irrelevant** — 5 x 10^-9 s/byte for the two disk
+crossings against 3.2 x 10^-10 for all four network crossings, a factor of 15. So the network argument does
+*not* rescue compression on fast devices: on NVMe the two terms are comparable and both are small, which is
+why the conclusion matches §7.1.2's rather than overturning it.
+
+**But `E` is the term that decides it**, and `E` is a workload property, not a hardware one. Warm storage
+read a few times over its life pushes the HDD threshold well below 194 MB/s, at which point even zstd pays.
+An object written once and never read pays nothing back at all. ⚠️ Nothing in the design measures `E`, and
+§13.5's snapshots are where it would come from.
+
+**And compression improves durability, which is not a cost argument at all.** §4.3.2.2a shows repair is
+network-bound, and a repair window is bytes-to-move divided by bandwidth. Compression cuts the numerator
+directly, so it shortens every repair window in §4.3.3 by the compression ratio. That is a rare event per
+byte, so it barely registers in a steady-state cost ledger — but §1.1.1 says data loss happens during
+disasters, and during a disaster it is the only term that matters.
+
+⚠️ **This weakens §7.1's conclusion that compression must not run on ENs, and the tension should be
+resolved rather than left implicit.** That conclusion rests on compressing at NIC line rate, which needs
+~21 cores. But per §8.1.4.1 each byte is compressed **once cluster-wide**, by the primary, not once per
+instance — so an EN's compression load is its share of ingest, which §8.1.4.4 puts at ~63 MB/s sustained.
+That is **0.1 of a core**, not 21. The 21-core figure binds only if bursts to line rate must never be
+throttled, and §1.4 says throughput is what matters and a burst may queue. Per §0, the arithmetic wins and
+the label gets updated: either §7.1's rule needs restating as "must not compress at line rate", or the
+sustained-rate case needs a reason it is wrong.
+
 ### 7.2 Encryption details
 
 - Block-granular mode with a per-block IV/tweak derived from
@@ -3465,15 +3552,16 @@ AEAD, so it **authenticates and encrypts in one pass**.
 **That settles the cost question §7.1 left asymmetric**, and the arithmetic is worth
 writing out because the two stages differ by two orders of magnitude:
 
-| Stage | Per-core throughput | Cores to keep up with a 12.5 GB/s NIC |
-|---|---|---|
-| AEGIS-128X2 encrypt+authenticate | ~20 GB/s | **0.63** |
-| LZ4 *compression* | ~0.6 GB/s | **~21** |
+| Stage | Per-core throughput | Cores at 12.5 GB/s line rate | Cores at 63 MB/s sustained |
+|---|---|---|---|
+| AEGIS-128X2 encrypt+authenticate | ~20 GB/s | **0.63** | 0.003 |
+| LZ4 *compression* | ~0.6 GB/s | **~21** | **0.1** |
 
-**Derived.** So encryption at line rate costs a fraction of one core and fits inside
-§1.2's 5% server budget trivially, while compression at line rate does not — which is
-why §7.1 puts compression elsewhere and §7.3.1 can safely cache keys on ENs. At the
-sustained fill rate of §8.1.4.4 (~63 MB/s per EN) encryption is 0.3% of a core.
+**Derived.** Encryption fits §1.2's 5% server budget at *either* rate, which is why
+§7.3.1 can safely cache keys on ENs. Compression fits only at the sustained rate — see
+§7.1.3, which argues the sustained column is the relevant one because each byte is
+compressed once cluster-wide rather than once per instance, and flags the tension with
+§7.1's rule as needing resolution.
 
 **KS uses 256-bit keys and 256-bit encryption** (Asserted, Bob) — deliberately overkill,
 because the master keys are the most important secrets in the system and the volume
@@ -6822,6 +6910,16 @@ Roughly in order of how much else depends on them.
     is a documentation task with teeth — naming the essential work is what exposes the inessential — and it
     gates every measurement issue.
 
+101. **`E`, the expected number of reads over an object's life** (§7.1.3). It is the term that decides
+     whether compression pays for itself, it is a workload property rather than a hardware one, and nothing
+     currently measures it. §13.5's snapshots are where it would come from, and §12.6.1 already argues the
+     billing model is diagnostic of workload — so the data may already be there.
+102. **Whether compression may run on ENs after all** (§7.1, §7.1.3, §7.2.1). §7.1 forbids it from a
+     line-rate figure of ~21 cores, but each byte is compressed once cluster-wide by the primary
+     (§8.1.4.1), which makes an EN's share ~0.1 of a core at the sustained fill rate. Either §7.1's rule
+     restates as "not at line rate", or the sustained-rate case needs a reason it is wrong. This decides
+     whether #22's missing compaction machine is needed for compression as well as for recompression.
+
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
@@ -6902,4 +7000,4 @@ Roughly in order of how much else depends on them.
 - whether the measured throughput figures were in-memory-only — they were not: they include
   a durable log write per message, encryption, and message compression (§1.4.0.1);
 - why a read request would be logged at all — because §12 requires metering request rate,
-  so the log write is the billing record rather than overhead (§1.4.0.2).
+  so the log write is the billing record rather than overhead (§1.4.0.3).
