@@ -28,6 +28,31 @@ writes whose `file_path` is under `~/src/delawson`, `~/src/delawson-notes`, or
 them. `Bash` has no `file_path` and is therefore always checked — meaning even
 a harmless shell command that merely mentions those names is blocked.
 
+## Issues
+
+GitHub Issues on `bobjen/delawson` are the project's work queue. A large project
+accumulates millions of them, so filing is cheap and expected.
+
+**File an issue whenever you notice something that should be fixed or is worth
+thinking about, but acting on it now would derail what you are doing.** An issue
+only has to describe the question, problem, or need. It may leave the solution
+open, and it does not have to propose one.
+
+- **#1 is "Ship DeLawson"** — the checklist of everything that must be true
+  before a release is allowed. Nothing ships while a box there is unchecked.
+- Issues also track large work as **checklists with sub-issues**, so a complete
+  checklist means we are aware of nothing further outstanding.
+- **Grep open issues before filing**, to avoid duplicates. When you do find a
+  duplicate, close it *as a duplicate* pointing at the canonical issue.
+- Work them ordered by **(value delivered) / (remaining work)**. Compute that
+  exactly when it is easy; often it is not, and then it is not done.
+
+**Closing an issue requires updating the documentation first.** A closed issue is
+effectively forgotten, whereas `DESIGN.md` is expected to be read again for
+years. If an issue's resolution is not reflected in `DESIGN.md`, the issue is not
+done. `DESIGN.md` §16 — not the issue tracker — remains the canonical list of
+open design questions; do not mirror it into issues wholesale.
+
 ## Notes and memory
 
 Long-term project memory lives in the sibling repo `~/src/delawson-notes`
