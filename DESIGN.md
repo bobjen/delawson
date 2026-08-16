@@ -311,6 +311,9 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Reservations are the **hedge against spot peaks**, which is what their premium buys | §12.1.1.3, §5.12.6 |
 | **No dithering of deletes**: the outstanding-delete limit already defers, and only when saturated | §8.5.1a |
 | Back-pressure beats pre-emption whenever the pressure can be **measured** — §13.4.3.6's shape again | §8.5.1a |
+| But **back-pressure fixes load; only dithering fixes phase** — so *do* dither recurring per-pair work | §13.1.9.1 |
+| **Dither SN/EN cold syncs** from a hash of `(SnId, EnId)`: reimaging aligns them, and the spike would recur forever | §13.1.9.1 |
+| Deterministic, not random, so a **mass restart cannot re-align** them | §13.1.9.1 |
 | **DN owns expiry**, via a secondary keyed index on **expiry second** — a prefix scan, no sweep | §8.5.1b |
 | Costs ~5% more DN metadata and one insert per creation; **removes a correctness hole**, which decided it | §8.5.1b.0, §8.5.1b.2 |
 | So **one** mechanism smooths deletion load, not three | §8.5.1b.2 |
@@ -5444,6 +5447,11 @@ hazard; it no longer exists).
 peak-to-mean is invariant to cluster size, so a spike the design cannot flatten must be priced around forever.
 Flatten what the design creates — but prefer measuring the pressure to guessing at a spread.
 
+⚠️ **This argues against dithering *load*, not against dithering *phase*.** §13.1.9.1 dithers SN/EN cold syncs, and
+correctly: that work is recurring, so a spike there stays in phase and repeats indefinitely, which back-pressure
+cannot fix. Expiry deletes are one-shot, so the queue drains and there is no phase to break. The two rules look
+contradictory and are not.
+
 #### 8.5.1b How DN finds what to expire, given that its metadata is on disk
 
 **DN is in charge of expiring user objects** (Asserted, Bob, 2026-08-16). That is the natural owner — DN holds the
@@ -7205,6 +7213,51 @@ out-of-band run of that pass.**
 **This puts a real latency requirement on the full pass**, and not merely an amortized one: it is also the
 critical path for the largest repair event. 200 s is fine; 2,000 s would not be. That is the number §5.6.10's
 measurement should report first.
+
+##### 13.1.9.1 Dither the phase of cold syncs, per pair
+
+**Do dither SN/EN cold syncs** (Asserted, Bob, 2026-08-16). When an EN is reimaged it loses local state, so every SN
+holding instances there must begin a full cold enumeration — and they all begin it **at the same moment**. With a
+fan-out reaching thousands of SNs per EN (§5.10), that is a large simultaneous load on the one machine least able to
+absorb it.
+
+**The problem is not the size of the spike. It is that the spike repeats forever.** All those pairs are now in phase,
+so every subsequent cold-sync period they fire together again. Nothing in the system pulls them apart.
+
+**Which is exactly why §8.5.1a's answer does not apply here**, and the two cases are worth contrasting because the
+rules look contradictory and are not:
+
+| | Expiry deletes (§8.5.1a) | Cold syncs (here) |
+|---|---|---|
+| Work shape | **one-shot** — each expiry happens once | **recurring**, per (SN, EN) pair |
+| Does the spike self-perpetuate? | no; the queue drains and it is over | **yes** — phase alignment persists indefinitely |
+| Cost of dithering | delayed reclamation, and §12.8.2 bills for the delay | **~none** |
+| Right answer | **back-pressure**: defer under load, free when idle | **dither the phase** |
+
+> **Back-pressure fixes load. Only dithering fixes phase.** They are not alternatives, and neither substitutes for
+> the other: dither so the steady state is spread, and let back-pressure absorb whatever transient remains.
+
+**Dithering costs nothing here**, which is the other half of the difference. A cold sweep's timing is arbitrary — it
+exists to catch what the warm path missed (§13.1.9), so shifting any one pair by up to a period changes only the
+detection latency for silent corruption, which is already period-scale. Delaying a *delete* costs the customer real
+money; delaying an audit costs nothing.
+
+**Dither deterministically, from a hash of `(SnId, EnId)` into the period.** Not from a random draw, for a reason
+that matters more than it looks:
+
+- **Deterministic is stable across restarts**, so a mass restart — a rolling deployment, or the very reimage that
+  caused the problem — cannot re-align anything. A per-process random offset would spread correctly and then
+  re-randomize on every restart, giving up predictability for nothing.
+- **Both ends can compute it**, so the schedule needs no negotiation and fits §13.1.4's one-message-per-pair,
+  driven-from-above shape.
+- It is legible when debugging, which §4.6.3 gives as the reason for preferring a clock to a counter.
+
+**The same treatment belongs on the warm loop**, for the same reason and at lower stakes: all SNs polling one EN on
+the same second is a smaller spike at a one-minute period, but it costs nothing to spread and the alignment arises
+from the same reimage event.
+
+⚠️ Cluster-wide singletons need none of this. §13.5's snapshot, §12.8's billing and §5.6.8's audit are one job each,
+not one per pair, so there is no phase to align — and §5.12.6 reserves compute for them explicitly.
 
 ### 13.2 Recovering from a failed rollout
 
