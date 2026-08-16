@@ -1,5 +1,6 @@
 # KS: the Key Store. One file like this per machine type.
 
+
 # A day that creates no extents needs no master key.
 lazy_day_keys = true
 
@@ -10,3 +11,7 @@ require_unlock = false
 # Answer a ping on the connection's read loop instead of a worker thread. A ping
 # is far too small to be worth a queue hop; turn it off to price one.
 inline_ping = true
+
+# Threads answering requests off the read loop. Zero means one per core.
+[knobs]
+workers = 0

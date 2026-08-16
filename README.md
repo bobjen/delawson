@@ -11,8 +11,10 @@ See [his page](https://burtleburtle.net/gene/glowry18800117.html).
 
 ## Status
 
-Early implementation. The `laws` client and the KS daemon exist, plus the `common`
-library they share and a single-box test harness; DN, SN, EN and FE do not.
+Early implementation. All five daemons exist — KS, DN, SN, EN, FE — plus the `laws`
+client, the `common` library they share, and a single-box test harness. They have a
+lifecycle, registration, an encrypted and compressed message path, and logging; none
+of them stores anything yet.
 
 See [DESIGN.md](DESIGN.md) for the architecture, its Open Questions section for
 what is still undecided, and section 17 for what has been built.

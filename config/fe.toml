@@ -1,0 +1,10 @@
+# FE, the Front End. One file like this per machine type.
+
+
+# An FE keeps nothing across restarts, and saying so here makes a change to
+# that a decision rather than a drift.
+stateless = true
+
+# Threads answering requests off the read loop. Zero means one per core.
+[knobs]
+workers = 0

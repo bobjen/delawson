@@ -1,0 +1,11 @@
+# SN, the Stream Node. One file like this per machine type.
+
+
+# Share of a machine's metadata budget given to streams rather than extents.
+# A guess encoding an assumed workload mix, and the thing to rebalance when a
+# machine's mix drifts.
+stream_share = 0.333
+
+# Threads answering requests off the read loop. Zero means one per core.
+[knobs]
+workers = 0

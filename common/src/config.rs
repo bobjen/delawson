@@ -339,11 +339,21 @@ impl ClusterConfig {
     }
 }
 
+/// The part of a service configuration every machine type has. Each type's file
+/// carries this table and then whatever else that type owns.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Knobs {
+    /// Threads answering requests off the read loop. Zero means one per core.
+    pub workers: usize,
+}
+
 /// KS's own configuration. Every other machine type gets a file of this shape,
 /// holding the knobs that type owns and nothing else.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KsConfig {
+    pub knobs: Knobs,
     /// Generate a master key only for a day that creates extents. Marching one
     /// key per elapsed day through a long dormancy would take the store from
     /// megabytes to terabytes.
@@ -363,6 +373,59 @@ impl KsConfig {
         read_toml(path)
     }
 }
+
+/// DN's own configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DNConfig {
+    pub knobs: Knobs,
+    /// Object metadata is itself DeLawson keyed objects, reached through a root
+    /// held outside the object hierarchy. Nothing reads this yet; it is here so
+    /// the file exists where the decision will land.
+    pub self_hosted: bool,
+}
+
+/// SN's own configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SNConfig {
+    pub knobs: Knobs,
+    /// A machine's extent budget is split between streams and extents, and the
+    /// split encodes an assumed workload mix.
+    pub stream_share: f64,
+}
+
+/// EN's own configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ENConfig {
+    pub knobs: Knobs,
+    /// Which media-class row this node's disks follow. Must name a row in the
+    /// cluster table.
+    pub media_class: String,
+}
+
+/// FE's own configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FEConfig {
+    pub knobs: Knobs,
+    /// FE holds no persistent state, and this says so out loud: a front end that
+    /// starts keeping things is a design change, not a configuration one.
+    pub stateless: bool,
+}
+
+macro_rules! loaders {
+    ($($config:ident),*) => {
+        $(impl $config {
+            pub fn load(path: &Path) -> Result<$config> {
+                read_toml(path)
+            }
+        })*
+    };
+}
+
+loaders!(DNConfig, SNConfig, ENConfig, FEConfig);
 
 /// Written into each run directory by `start-laws`. Its whole job is to say who
 /// this process is and where the shared files are; identity comes from here

@@ -74,10 +74,27 @@ pub struct Process {
     senders: AtomicU64,
 }
 
-/// What a machine type adds to the common lifecycle.
+/// What a machine type adds to the common lifecycle. A new type needs `serves`
+/// and nothing else; everything below has an answer that is right until that type
+/// has something of its own to say.
 pub trait Service: Send + Sync + 'static {
+    /// The operations this machine type is the right place to send. Anything
+    /// here that is not built yet answers `unimplemented`; anything else answers
+    /// `bad request`, so a misdirected call is distinguishable from an unbuilt
+    /// one.
+    fn serves(&self) -> &'static [Op] {
+        &[]
+    }
+
     /// Everything but the control operations, which are answered here.
-    fn handle(&self, process: &Process, request: &Request) -> Response;
+    fn handle(&self, process: &Process, request: &Request) -> Response {
+        unbuilt(process, self.serves(), request)
+    }
+
+    /// Threads answering requests off the read loop. Zero means one per core.
+    fn workers(&self) -> usize {
+        0
+    }
 
     /// Whether to answer this operation on the connection's read loop instead of
     /// handing it to a worker. Only for work too small to be worth a queue hop.
@@ -242,7 +259,20 @@ pub fn ask(
     wire::connect(stream, config)?.call(request)
 }
 
-fn workers() -> usize {
+/// The answer for an operation this machine type has not built, or should never
+/// have been sent.
+pub fn unbuilt(process: &Process, serves: &[Op], request: &Request) -> Response {
+    if serves.contains(&request.op) {
+        Response::error(Status::Unimplemented, format!("{} is not built yet", request.op))
+    } else {
+        Response::error(
+            Status::BadRequest,
+            format!("{} does not serve {}", process.entry.kind.as_str().to_uppercase(), request.op),
+        )
+    }
+}
+
+fn cores() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
 }
 
@@ -251,8 +281,9 @@ pub fn serve(process: Arc<Process>, service: Arc<impl Service>) -> Result<()> {
     let listener =
         TcpListener::bind(process.address()).context(format!("binding {}", process.address()))?;
     let address = listener.local_addr()?;
-    let pool = Arc::new(Pool::new(workers()));
-    logn!("listening on {address} with {} workers", workers());
+    let workers = if service.workers() == 0 { cores() } else { service.workers() };
+    let pool = Arc::new(Pool::new(workers));
+    logn!("listening on {address} with {workers} workers");
 
     // KS cannot register with itself, and needs no one's permission to serve.
     if process.cluster.fixed_address(process.identity()).is_none() {
@@ -572,7 +603,7 @@ fn status(process: &Process, service: &impl Service) -> String {
         format!("cluster {}", process.cluster.cluster_name),
         format!("address {}", process.address()),
         format!("pid {}", std::process::id()),
-        format!("workers {}", workers()),
+        format!("workers {}", if service.workers() == 0 { cores() } else { service.workers() }),
         format!("uptime_seconds {}", process.started.elapsed().as_secs()),
         format!("answered {}", process.answered.load(Ordering::Relaxed)),
         format!("send {:?}", process.cluster.messaging.send),

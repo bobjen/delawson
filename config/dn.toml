@@ -1,0 +1,9 @@
+# DN, the Directory Node. One file like this per machine type.
+
+
+# DN metadata lives in DeLawson keyed objects rather than a store of its own.
+self_hosted = true
+
+# Threads answering requests off the read loop. Zero means one per core.
+[knobs]
+workers = 0

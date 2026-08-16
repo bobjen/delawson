@@ -1,0 +1,14 @@
+[package]
+name = "delawson-fe"
+description = "Front End: authorization, and coordinating a client's request across the tiers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "fe"
+path = "src/main.rs"
+
+[dependencies]
+delawson-common.workspace = true

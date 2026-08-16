@@ -73,6 +73,27 @@ identity = "KS0"
 kind = "ks"
 domain = ["region0", "dc0", "rack0", "box0", "disk0"]
 
+[[service]]
+identity = "DN0"
+kind = "dn"
+domain = ["region0", "dc0", "rack0", "box0", "disk0"]
+
+[[service]]
+identity = "SN0"
+kind = "sn"
+domain = ["region0", "dc0", "rack0", "box0", "disk0"]
+
+[[service]]
+identity = "EN0"
+kind = "en"
+domain = ["region0", "dc0", "rack0", "box0", "disk0"]
+media_class = "hdd"
+
+[[service]]
+identity = "FE0"
+kind = "fe"
+domain = ["region0", "dc0", "rack0", "box0", "disk0"]
+
 # Per-device-class constants. Every number here is a guess awaiting measurement;
 # the SSD row is the least trustworthy, spanning two orders of magnitude across
 # defensible assumptions about queue depth.

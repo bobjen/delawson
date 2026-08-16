@@ -1,0 +1,9 @@
+# EN, the Extent Node. One file like this per machine type.
+
+
+# Which row of the cluster's media-class table this node's disks follow.
+media_class = "hdd"
+
+# Threads answering requests off the read loop. Zero means one per core.
+[knobs]
+workers = 0

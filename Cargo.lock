@@ -130,6 +130,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "delawson-dn"
+version = "0.0.1"
+dependencies = [
+ "delawson-common",
+]
+
+[[package]]
+name = "delawson-en"
+version = "0.0.1"
+dependencies = [
+ "delawson-common",
+]
+
+[[package]]
+name = "delawson-fe"
+version = "0.0.1"
+dependencies = [
+ "delawson-common",
+]
+
+[[package]]
 name = "delawson-ks"
 version = "0.0.1"
 dependencies = [
@@ -141,6 +162,13 @@ name = "delawson-laws"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "delawson-common",
+]
+
+[[package]]
+name = "delawson-sn"
+version = "0.0.1"
+dependencies = [
  "delawson-common",
 ]
 

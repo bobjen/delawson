@@ -27,7 +27,18 @@ struct Ks {
     peers: Mutex<BTreeMap<String, Peer>>,
 }
 
+const SERVES: &[Op] =
+    &[Op::Register, Op::Lookup, Op::Registry, Op::Unlock, Op::SnMasterKey, Op::RotateMasterKey];
+
 impl Service for Ks {
+    fn serves(&self) -> &'static [Op] {
+        SERVES
+    }
+
+    fn workers(&self) -> usize {
+        self.config.knobs.workers
+    }
+
     fn handle(&self, process: &Process, request: &Request) -> Response {
         match request.op {
             Op::Register => self.enroll(process, request),
@@ -39,9 +50,9 @@ impl Service for Ks {
                 if !self.unlocked.load(Ordering::SeqCst) && request.op != Op::Unlock {
                     return Response::error(Status::Locked, "KS is locked");
                 }
-                Response::error(Status::Unimplemented, format!("{} is not built yet", request.op))
+                server::unbuilt(process, SERVES, request)
             }
-            op => Response::error(Status::BadRequest, format!("KS does not serve {op}")),
+            _ => server::unbuilt(process, SERVES, request),
         }
     }
 
