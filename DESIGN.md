@@ -98,7 +98,12 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | A hint `(extent, row)` is cluster-local by construction, and fails detectably across clusters | §4.6.3, §8.1.1a-10 |
 | The georep destination gets a **dedicated directory**, so replicas cannot collide with local objects | §13.4.5.4 |
 | So portability is relative to the replication root, and cross-cluster translation is **one prefix substitution** | §13.4.5.4 |
-| Failover is a **re-rooting**, which §5.5.4's `(parent dir id, name)` key makes one metadata change | §13.4.5.4, §5.5.4 |
+| Georep directories are **read-only permanently** — never promoted, so no offset-level split brain | §13.4.5.4 |
+| Failover is a **copy by concatenation**, sharing sealed extents — metadata-only, zero space at copy time | §13.4.5.5 |
+| Divergence is free: the shared base plus a private log is just §4.2 | §13.4.5.5 |
+| The copy is placed at the **original path**, so source-built indexes resolve with no translation | §13.4.5.5a |
+| Record numbers survive only if the **whole** object is copied in order | §13.4.5.5a |
+| A permanently read-only replica is a mechanism that **resists the operator** (§4.3.4.2) | §13.4.5.4 |
 | **Priority is door height, not a sort**: round-robin plus thresholds, so no heap over 2^31 items | §13.4.3.3 |
 | Two doors per purpose: a **floor** admitted readily, then competition for the surplus | §13.4.3.1 |
 | **Every door is below 10% remaining** — 1% for high priority, 9% for low; the bin runs nearly empty by design | §13.4.3.5 |
@@ -2816,15 +2821,14 @@ billion descendants must not be a billion-record rewrite, and prefix scans still
 make listing cheap because keyed objects are sorted. The cost is a lookup per
 path component, bounded by path depth and highly cacheable.
 
-**§13.4.5.4 strengthens this from a recommendation to close to a requirement.** A
-georeplication failover promotes a replica by re-rooting its dedicated subtree —
-`/georep/A/x/y` becomes `/x/y` — which is one metadata change under this key and a
-rewrite of every descendant under a full-path key. That rename happens during a
-disaster, under time pressure, over the entire replicated dataset. It is the worst
-possible moment to discover the key choice was wrong.
+⚠️ Not decided.
 
-⚠️ Still not formally decided, but the case against full-path keys is now much
-harder to argue with.
+An earlier draft argued that georeplication escalated this to a requirement, because
+failover would re-root a replica's subtree and that rename would be a full-dataset
+rewrite under a full-path key. **That argument is withdrawn**: §13.4.5.5 replaces
+promotion-by-rename with copy-by-concatenation, which creates new directory entries
+rather than renaming existing ones and is equally cheap under either key. The renaming
+argument above stands on its own merits and is unaffected.
 
 #### 5.5.5 Two dividends
 
@@ -7297,9 +7301,64 @@ decided and recommends it on renaming cost alone — **georeplication turns the 
 requirement**, because the rename in question happens during a disaster, under time pressure, on the entire
 replicated dataset.
 
-⚠️ Presumably the subtree is **read-only** while the source is authoritative, and promotion is what makes it
-writable. That interacts with §8.1.1a-3's single-writer machinery — a promoted replica must not accept appends at
-offsets the old primary may also have used — and nothing here designs that.
+**Georep directories are read-only permanently** (Asserted, Bob, 2026-08-16). They are never promoted. If you
+want a writable version you **copy** — see §13.4.5.5.
+
+That removes a hazard rather than deferring it. A promoted-in-place replica would have to accept appends under
+§8.1.1a-3's single-writer compare-and-append at offsets the old primary may also have used, which is split-brain
+at the offset level. An always-read-only replica cannot have that problem.
+
+It is also a mechanism that **resists the operator**, in §4.3.4.2's sense: a replica that is structurally
+incapable of being written cannot be corrupted by the destination cluster's users or by a bug in them. Given that
+§4.3.3.1 makes cross-cluster replication the answer to the *dominant* loss term, the copy being immune to local
+mistakes is most of its value.
+
+#### 13.4.5.5 Failover is a copy, and the copy is nearly free
+
+**Copy by concatenation, sharing the sealed extents** (Asserted, Bob). §8.6.1 already makes concatenation a
+metadata-only splice of sealed streams, and §4.6.1 already allows an extent to be shared between streams. So this
+is a composition of two existing mechanisms and not a new one.
+
+**Concatenation requires streams and extents to be sealed**, which a replica satisfies: it holds committed data.
+⚠️ Unless georeplication streams live appends, in which case the replica's tail extent is unsealed and cannot be
+shared by reference — it must be copied by value or left behind.
+
+**Divergence is free, because §4.2 already has base plus log.** The writable copy is a base-plus-log where the
+**base is shared by reference and the log is private**, so further edits become different change logs for the
+different streams. Nothing new is needed for copy-on-write; it falls out of the structure already there.
+
+##### 13.4.5.5a The copy restores the original path, so indexes work verbatim
+
+This is better than the promotion-by-rename story §13.4.5.4 sketched, and worth being explicit about.
+
+| Access mode | Path | What an index built on the source needs |
+|---|---|---|
+| Read the replica in place | `/georep/A/x/y` | one prefix substitution (§13.4.5.4) |
+| **After failover, copy to** | **`/x/y`** | **nothing — the original path resolves** |
+
+Because the copy is placed at the source's own path, `(path, record number)` from cluster A resolves on cluster B
+with no translation at all. **Derived.** So the prefix substitution is only needed for reading a replica *before*
+failover, which is the case where a user is deliberately looking at a replica and knows it.
+
+**Record numbers survive only if the whole object is copied, in order.** Concatenating the same sealed streams in
+the same sequence reproduces the same cumulative counts and therefore the same record numbers (§8.6.1). Copy a
+subset, or reorder, and that guarantee is gone — so "copy for failover" and "copy a slice for analysis" are
+different operations with different promises.
+
+##### 13.4.5.5b Three consequences
+
+**Space cost is zero at copy time**, growing only with divergence. That is the copy-on-write dividend, and it
+means a failover costs metadata proportional to stream count rather than anything proportional to data volume.
+
+**The replica stays intact and can keep tracking the source.** After failover the original cluster may come back
+and keep pushing; the replica continues to mirror it while the copy is the new authority. Two divergent lineages
+then exist deliberately, and reconciling them is the user's problem rather than the system's — which is the right
+allocation, and is only available because the replica was never promoted.
+
+⚠️ **Shared-extent billing stops being a policy detail.** §12.9 already lists it as open; failover makes it
+load-bearing, because immediately after a copy two objects reference one set of extents and one of them may belong
+to a different tenant. Charging both fully double-bills; charging neither loses revenue; splitting requires
+knowing the sharers. This now needs an answer before georeplication ships.
 
 ### 13.5 Metadata snapshots, and the jobs that run over them
 
@@ -7997,10 +8056,10 @@ Roughly in order of how much else depends on them.
      bandwidth plus one local write, where repair consumes the intra-cluster cross-section. A scalar bin cannot
      express "plenty of WAN, no local write bandwidth". Arbitrate a vector, or admit against the scarcer
      resource with the other as a constraint.
-118. **Whether a promoted replica may accept writes safely** (§13.4.5.4). The replicated subtree is presumably
-     read-only while the source is authoritative, and promotion makes it writable — but §8.1.1a-3's
-     single-writer compare-and-append means a promoted replica must not accept appends at offsets the old
-     primary may also have used. Split-brain at the offset level, and undesigned.
+118. **Shared-extent billing** (§13.4.5.5b, §12.9). Already listed as open policy; georeplication failover makes
+     it load-bearing, since immediately after a copy two objects reference one set of extents and they may belong
+     to different tenants. Charging both double-bills, charging neither loses revenue, splitting requires knowing
+     the sharers. Needed before georeplication ships.
 119. **What georeplication's unit and policy are** (§13.4.5). Per object, per directory, or per stream; which
      clusters pair with which; whether replication is symmetric; and how a reader chooses a replica. None of
      this is designed, and it is now a ship gate.
@@ -8087,6 +8146,12 @@ Roughly in order of how much else depends on them.
   cluster-local and cannot survive georeplication (§4.6.3, §13.4.5.3);
 - how a replica avoids colliding with the destination's local namespace — a **dedicated
   directory** per source, making cross-cluster translation one prefix substitution (§13.4.5.4);
+- whether a replica is ever promoted in place — **no**; georep directories stay read-only
+  permanently, and a writable version is made by copy-by-concatenation (§13.4.5.4, §13.4.5.5);
+- how a promoted replica avoids offset-level split brain — the question does not arise, since
+  nothing is promoted (§13.4.5.4);
+- whether copy-on-write needs new machinery — it does not: a shared sealed base plus a private
+  log is §4.2 (§13.4.5.5);
 - whether the throughput targets are per box or per cluster — **per box**, and both have
   already been reached on this box, so they are a floor rather than a stretch (§1.4.0);
 - whether the 200k/2M pair is two requirements or one — one, on messaging: the 10x gap
