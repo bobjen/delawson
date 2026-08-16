@@ -95,7 +95,10 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Total scratch byte-seconds fall too, so finishing sooner **also costs less** | §5.12.4.2 |
 | Compute is paid from a **bank of compute-hours**; a job starts when the balance covers its expected cost | §5.12.5 |
 | Fourth instance of: **guaranteed allocations partition a total** — and an accumulating one needs a ceiling too | §5.12.5 |
-| For compute, **quota and billing merge**: the balance is the quota, the hours spent are the record | §5.12.5.1 |
+| For compute, **quota and billing merge**: the balance is the quota, the hours spent are the record | §5.12.5.2 |
+| The bank has a **ceiling, and charging stops there** — an unspent compute-hour costs the provider nothing | §5.12.5.1 |
+| So storage bills **continuously** and compute bills **up to a cap**: same principle, different shapes | §5.12.5.1 |
+| Rate buys **throughput**, ceiling buys **burst**; Σ rates bounds the steady state, Σ ceilings the transient | §5.12.5.1a |
 | The floor staggers completion, so **whole users recover early** — worth more than partial recovery (§4.3.3.3) | §13.4.4.4 |
 | Its cost is a **cap-limited tail**, which gives the per-SN maximum a second job | §13.4.4.4a |
 | **Georeplication is a ship requirement**, and the only answer to §4.3.3.1's dominant loss term | §13.4.5 |
@@ -3801,7 +3804,49 @@ average; a cap bounds the burst. At this point the recurrence is established eno
 of guaranteed allocations is a partition of a total, and must be validated as one — and if the guarantee
 accumulates, it needs a ceiling as well as a rate.**
 
-##### 5.12.5.1 Two things the bank forces a decision about
+##### 5.12.5.1 The ceiling, and why charging stops when it is reached
+
+**The accumulated balance has a ceiling, and the customer stops being charged once it is reached** (Asserted, Bob,
+2026-08-16).
+
+**That is not generosity, it is §12.1.** Billing must be proportional to *actual cost*, and §12.1 is explicit that
+over-charging is as much a failure as under-charging because competitors undercut it. So ask what an unspent
+compute-hour costs the provider:
+
+| Resource | An unused reservation costs | So billing is |
+|---|---|---|
+| Storage | a disk, occupied whether read or not | **continuous** |
+| **Compute** | **nothing** — an unspent hour occupies no processor | **stops at the ceiling** |
+
+**Derived.** Compute-hours are not a stored good. Charging to accumulate them past a cap would bill for something
+that costs nothing to hold, which §12.1 forbids in the same breath as under-billing metadata. And it means the two
+resources genuinely have different billing *shapes* — which is what "bill every scarce resource" looks like when
+done properly rather than uniformly.
+
+**What is actually being sold** is then clear: the **accumulation rate** buys long-run throughput, and the
+**ceiling** buys burst size. Two dials, and they correspond exactly to the two constraints below. A customer sitting
+at their ceiling has bought all the burst they are entitled to, and there is nothing further to sell them until they
+spend some.
+
+**No exploit**, by the §12.6.3 check: holding an unspent balance is free, but spending it restarts the charging as
+the bank refills, so over any long period a customer pays rate × time for what they consumed. The only free thing
+costs the provider nothing.
+
+##### 5.12.5.1a The two constraints do different jobs
+
+| Constraint | Bounds |
+|---|---|
+| **Σ accumulation rates ≤ capacity** | the **steady state** — long-run demand cannot exceed what exists |
+| **Σ ceilings** | the **transient** — the largest simultaneous burst, in total work |
+
+**Derived.** If every account is at its ceiling and all burst at once, aggregate demand is `Σ ceilings` of work,
+which is *served* rather than refused — it simply drains over `Σ ceilings / capacity` of wall clock. So the system is
+stable with a bounded overshoot, and §5.12.4's serialization is what keeps that drain's latency distribution sane.
+
+⚠️ Which leaves the sizing question rather than the structural one: how large a simultaneous burst is acceptable,
+since that and not solvency is what `Σ ceilings` decides.
+
+##### 5.12.5.2 Two things the bank forces a decision about
 
 ⚠️ **Overrun.** Admission tests the *expected* cost, and estimates are wrong. Killing a job at its estimate is
 harsh and makes estimation adversarial; allowing unbounded debt invites abuse. The middle option — let the job
@@ -8291,10 +8336,10 @@ Roughly in order of how much else depends on them.
 123. **Overrun policy for the compute bank** (§5.12.5.1). Admission tests an estimate. Killing at the estimate
      makes estimation adversarial; unbounded debt invites abuse; letting the balance go negative and refusing new
      starts needs a bound on how negative.
-124. **The compute-hour accumulation rates and balance cap** (§5.12.5). Rates must sum within capacity or the bank
-     is insolvent; a cap is separately needed because correct rates still allow every account to hoard and burst
-     together. Two numbers per account, one constraint across all of them.
-
+124. **How large a simultaneous burst is acceptable** (§5.12.5.1a). Σ rates ≤ capacity settles solvency; Σ
+     ceilings settles nothing about solvency and everything about the worst-case transient, which is served rather
+     than refused but drains over `Σ ceilings / capacity`. That is a product decision about acceptable burst
+     latency, not an arithmetic one.
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
