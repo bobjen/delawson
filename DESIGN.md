@@ -44,7 +44,7 @@ it was computed or assumed.
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-102 things *not* decided.
+104 things *not* decided.
 
 **Priorities and framing**
 
@@ -204,8 +204,14 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | The receipt names the **final** extent; compression happens **upstream of the four-way fan-out** | §8.1.4, §8.1.4.1 |
 | The durable watermark is set at **staging**, not at coalescing | §8.1.4.2 |
 | 3-of-4 durability plus local coalescing gives **interior holes**, exactly detectable from the offset map | §8.1.4.3 |
-| Staging is sized by **endurance, not capacity**; stage only small appends | §8.1.4.4 |
-| Staging must be durable **with the power off**, so not DRAM | §8.1.4.4 |
+| Staging is sized by **endurance, not capacity**; stage only small appends | §8.1.4.5 |
+| Staging must be durable **with the power off**, so not DRAM | §8.1.4.5 |
+| **The `delawson` client library compresses**, cutting append size across the internet | §8.1.4.1 |
+| So initial compression is **never billed** by storage — it is the customer's CPU, or a compute job's | §8.1.4.1 |
+| The 4 copies while open are **the four ENs' staging**, not 4 dedicated replicas | §4.3, §8.1.4.4 |
+| Migration writes only the **1 or 2 instances EC needs** — write one, copy it — a **4× saving** | §8.1.4.4 |
+| Common extents are the protection **until the EC group can protect itself** | §8.1.4.4 |
+| So **recompression need never be deterministic**: exactly one node performs it | §8.1.4.4 |
 | Prior art returns an offset only with **one** unsealed region (VSAM RBA); parallel writers always change the **name space** | §8.1.1a-9 |
 | Three reference tiers: **durable** (key / record number), **hint** (extent, row), and **none** (object offset) | §8.1.1a-10 |
 | Hints fail **detectably** because extent identity carries a creation second — Oracle's logical rowid pattern | §8.1.1a-10 |
@@ -1042,15 +1048,23 @@ bound is far below the extent count.
 
 ### 4.3 Instances
 
-- While open, each instance is a **full replica** on a distinct EN in a distinct
-  failure domain, and on a distinct **disk** (§5.3.1). Writes go to all replicas.
-  **4 instances**, for the reason below.
-- After sealing, the extent is re-encoded to **erasure-coded fragments**,
-  reconstructible from any *k* of *n*. Replicas drop once encoding is durable
-  and verified.
+- While open, the data is held on **4 independent ENs** in distinct failure domains
+  and on distinct **disks** (§5.3.1). **4 copies**, for the reason below.
+- After sealing, the extent becomes a cell in an erasure-coded group of **whole
+  extents** (§4.3.2.3), with the number of *dedicated* instances set by the scheme:
+  one at 1.333x, two at 2.333x (§4.3.2.4).
 
-Because EC operates on already-compressed, already-encrypted bytes (§7),
-re-encoding needs no key access and no recompression.
+**Two corrections to earlier drafts, both from §8.1.4.**
+
+**The four copies while open are the four ENs' own staging — their common extents —
+not four dedicated replicas of the final extent.** Each is single-copy on its EN, and
+the independence of the four ENs is the durability. So the migration to the final form
+writes **only the 1 or 2 instances the scheme needs**, not 4 (§8.1.4.4).
+
+**Re-encoding is not free of recompression.** EC itself operates on already-compressed,
+already-encrypted bytes and so needs no keys — that part stands. But the migration from
+common extents to dedicated ones **coalesces small appends and may recompress**, which
+does need keys and CPU (§8.1.4.4).
 
 #### 4.3.1 Why four instances and not three
 
@@ -3524,7 +3538,7 @@ disasters, and during a disaster it is the only term that matters.
 ⚠️ **This weakens §7.1's conclusion that compression must not run on ENs, and the tension should be
 resolved rather than left implicit.** That conclusion rests on compressing at NIC line rate, which needs
 ~21 cores. But per §8.1.4.1 each byte is compressed **once cluster-wide**, by the primary, not once per
-instance — so an EN's compression load is its share of ingest, which §8.1.4.4 puts at ~63 MB/s sustained.
+instance — so an EN's compression load is its share of ingest, which §8.1.4.5 puts at ~63 MB/s sustained.
 That is **0.1 of a core**, not 21. The 21-core figure binds only if bursts to line rate must never be
 throttled, and §1.4 says throughput is what matters and a burst may queue. Per §0, the arithmetic wins and
 the label gets updated: either §7.1's rule needs restating as "must not compress at line rate", or the
@@ -4278,21 +4292,49 @@ only, so it is small, and it is the read path's authority: a read of a recently-
 touching the final device. That is what makes §8.1.1a-10's hint valid immediately on write rather than a
 forward-dated promise.
 
-##### 8.1.4.1 Compression and encryption must happen upstream of the four-way fan-out
+##### 8.1.4.1 The client compresses, which is as far upstream as it goes
 
-§4.3.2.3 requires byte-identical instances. If each EN compressed its own copy the bytes would differ —
-compressors are not bit-reproducible across versions or settings — and EC would break. So the primary (or FE)
-compresses and encrypts **once** and broadcasts opaque bytes. **Derived**, and it is better than the alternative
-on three counts:
+**Append blocks are compressed by the `delawson` client library** (Asserted, Bob, 2026-08-15). The client
+library is DeLawson code, so this is not user code doing it — and it **reduces append size across the
+internet**, which is the one link in the chain nobody controls the cost of.
 
-- 4x less compression CPU, which matters because §7.1 has already ruled compression off the EN;
-- no bit-reproducibility requirement on the codec, so codecs may be upgraded;
-- the primary knows the compressed size and can therefore assign the **physical** offset and detect the 32 MB
-  physical seal bound at the same moment it assigns the logical offset (§6).
+That is strictly further upstream than "at the primary", and it settles a constraint this section previously
+derived the hard way. §4.3.2.3 requires byte-identical instances, and four ENs compressing independently would
+not produce them; compressing once at the client makes every staging copy identical for free. Three dividends:
 
-It does put compression inside the append's critical path, which §1.4 says is an acceptable trade. ⚠️ It also
-raises whether ENs need keys at all, which cuts against §7.3.1 caching SN-master keys on ENs — "ENs never hold
-keys" is a strictly stronger §1.5 posture and should be decided rather than inherited.
+- **no compression CPU inside the datacenter on the ingest path at all**, which sidesteps §7.1's objection
+  rather than paying it;
+- **no bit-reproducibility requirement on the codec**, so codecs and levels may vary per client and be
+  upgraded;
+- **the primary still learns the compressed size on arrival**, so it can assign the physical offset and detect
+  the 32 MB physical seal bound at the same moment it assigns the logical one (§6).
+
+**So the common extent holds append blocks compressed however the client compressed them**, which means
+heterogeneous codecs and levels sitting side by side. Normalizing that is one of the jobs of the migration in
+§8.1.4.4.
+
+**It also takes the compression CPU off DeLawson's ledger entirely** (Asserted, Bob, 2026-08-15), and §12
+handles both cases with no new mechanism:
+
+| Client location | Whose CPU | How it is billed |
+|---|---|---|
+| Outside the cluster | the customer's own machine | **not billed at all** — DeLawson never spent it |
+| A Compute node (§5.12) | the cluster's | **billed to the compute job**, which is already metered |
+
+So the storage price of §12.7 does not have to carry compression CPU in either case, and the incentives come
+out right without a policy: an external client that compresses hard pays fewer physical bytes and spends only
+its own cycles, while a Compute-node client faces a real trade between compute charges and storage charges and
+can optimize it. §12.1's pattern once more — cost-proportional billing turning a policy question into an
+arithmetic one for the user.
+
+**Recompression is different, and must be billed**, because it *is* DeLawson's CPU (§8.1.4.4). That splits the
+ledger cleanly: initial compression is the client's cost and unbilled, recompression is the cluster's cost and
+metered.
+
+⚠️ Two consequences worth deciding rather than inheriting. **§12.3 bills physical bytes**, so a client that
+compresses badly is billed for it until recompression fixes it — which makes recompression latency a billing
+input, not only a space one. And a client that declines to compress is indistinguishable from one whose data is
+incompressible, which is fine for billing and awkward for capacity planning.
 
 ##### 8.1.4.2 The durable watermark is set at staging, not at coalescing
 
@@ -4315,7 +4357,53 @@ is a gap, with no byte comparison. So before seal, the primary confirms all four
 contiguously and any EN with gaps fetches them from a peer. **That is a required pre-EC step** and should be named
 as one rather than discovered.
 
-##### 8.1.4.4 Sizing is set by endurance, not capacity
+##### 8.1.4.4 Migration from common extents to dedicated ones
+
+The transition is not a copy. It **coalesces small appends and may recompress** (Asserted, Bob, 2026-08-15) —
+normalizing the heterogeneous client compression of §8.1.4.1, and turning many small append blocks into the
+block structure §7.1 wants for random access.
+
+**And it writes only the instances the scheme needs.** If EC needs 1 or 2 dedicated instances (§4.3.2.4), write
+only those — **write one and copy it to make two** — and **keep the common extents until the EC group can
+protect the data itself.**
+
+| | Migration writes | Protection during the window |
+|---|---|---|
+| Earlier draft: 4 replicas, then EC | 4x | the 4 dedicated replicas |
+| This: 1 or 2 instances | **1x or 2x** | the 4 ENs' common extents |
+
+**Derived saving: 4x on the migration write at 1.333x, 2x at 2.333x.** The common extents are already durable
+across four independent ENs, so writing four dedicated copies buys nothing that already-durable staging does
+not provide.
+
+**Copy, do not re-derive, for the second instance.** §4.3.2.3 requires the two to be byte-identical, and a byte
+copy guarantees that where two independent recompressions would not. This is the dividend that matters most:
+**recompression never needs to be deterministic**, because exactly one node ever performs it. That removes a
+constraint §8.1.4.1 previously had to design around.
+
+⚠️ **The retention requirement this creates is the part to get right.** Common extents cannot be released until
+the group's parity exists, so staging retention is set by **how long a group takes to complete** — which is a
+policy choice, not a data-availability limit:
+
+- **Data is available fast.** An SN covering ~34 ENs sees ~2.1 GB/s of ingest, so the 45 data cells of a 10x6
+  group (~1.44 GB at 32 MB physical) accumulate in **under a second**.
+- **But §13.5.1 forms groups in a daily offline job.** Waiting for it means retaining a **day** of ingest —
+  ~5.5 TB per EN against the ~1.8 TB device §8.1.4.5 sizes for endurance. **The device is 3x too small.**
+
+So one of three things must be true, and it should be decided rather than discovered:
+
+1. **Prompt online grouping** completes stripes in seconds, with the offline job advising only future
+   groupings. §13.5.1 already notes that grouping extents within a single stream is easy; the hard part it
+   solves is cross-directory optimality, which is exactly the part that can wait.
+2. **Write more instances up front** to release staging early — trading the 4x write saving back for staging
+   capacity.
+3. **Size staging for retention** rather than endurance, which changes §8.1.4.5's rule and its cost.
+
+Option 1 looks right, and it suggests the general shape: **protect promptly with a cheap grouping, optimize
+later by regrouping** — except that regrouping rewrites parity, so its cost is not zero and the choice is not
+obvious.
+
+##### 8.1.4.5 Sizing is set by endurance, not capacity
 
 Every ingested byte passes through the staging device once, so DWPD binds rather than GB. Using §12.7.2's
 20 TB/$923 drive and ~100 drives per EN (2 PB raw, ~$92k), filling that over a year is ~63 MB/s sustained, or
@@ -6920,6 +7008,14 @@ Roughly in order of how much else depends on them.
      restates as "not at line rate", or the sustained-rate case needs a reason it is wrong. This decides
      whether #22's missing compaction machine is needed for compression as well as for recompression.
 
+103. **How promptly EC groups are formed** (§8.1.4.4). Common extents cannot be released until parity exists,
+     so staging retention equals group-completion latency. Data accumulates in under a second, but §13.5.1
+     forms groups in a daily job — which would need ~5.5 TB of staging per EN against the ~1.8 TB §8.1.4.5
+     sizes for endurance. Prompt online grouping, more instances up front, or a bigger device: pick one.
+104. **Whether regrouping is worth its parity rewrite** (§8.1.4.4, §13.5.1). If groups are formed promptly and
+     optimized later, the optimization means recomputing parity over a whole group. That may cost more than
+     the co-deletion and size-binning it buys.
+
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
@@ -6988,7 +7084,7 @@ Roughly in order of how much else depends on them.
 - whether a separate checksum layer is needed — no, the AEAD tag is the checksum, and it
   makes every stored block self-verifying before EC uses it as a repair source (§7.2.1);
 - whether staging may live in DRAM — no; durable means durable with the power off, which
-  also removes the motive for power as an explicit failure domain (§8.1.4.4);
+  also removes the motive for power as an explicit failure domain (§8.1.4.5);
 - whether the erasure code is a single choice — it is a **catalog** with recommendations,
   and turbo codes suffice for shipping, so the patent is not a release gate (§4.3.2.5);
 - whether the throughput targets are per box or per cluster — **per box**, and both have
@@ -6999,5 +7095,12 @@ Roughly in order of how much else depends on them.
   syscall overhead, gave all the gains, and io_uring measured as a regression (§1.4.0.1);
 - whether the measured throughput figures were in-memory-only — they were not: they include
   a durable log write per message, encryption, and message compression (§1.4.0.1);
+- where initial compression happens — in the **`delawson` client library**, which is DeLawson
+  code, so it is upstream of the internet link and costs the cluster nothing (§8.1.4.1);
+- whether four dedicated replicas are written before EC — no; the four ENs' common extents
+  are the protection, and migration writes only the 1 or 2 instances the scheme needs
+  (§4.3, §8.1.4.4);
+- whether recompression must be deterministic across instances — no, because exactly one node
+  performs it and the second instance is a byte copy (§8.1.4.4);
 - why a read request would be logged at all — because §12 requires metering request rate,
   so the log write is the billing record rather than overhead (§1.4.0.3).
