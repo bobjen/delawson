@@ -90,6 +90,9 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **Equal sharing is pessimal**: with work and capacity fixed, the last completion is invariant, the earlier ones are free | §13.4.4.4, §5.12.4 |
 | So compute **serializes at maximum parallelism** — 45% lower mean latency, 10× on staggered arrivals, same throughput | §5.12.4 |
 | But bounded by Amdahl: run the **fewest concurrent jobs that saturates**, not literally one | §5.12.4.1 |
+| The same rule cuts **temporary storage** by the same factor — Little's law makes it one win, not two | §5.12.4.2 |
+| Which lands in **RAM**, the 5,000×-priced tier, because §5.12.2 wants working sets resident | §5.12.4.2 |
+| Total scratch byte-seconds fall too, so finishing sooner **also costs less** | §5.12.4.2 |
 | Compute is paid from a **bank of compute-hours**; a job starts when the balance covers its expected cost | §5.12.5 |
 | Fourth instance of: **guaranteed allocations partition a total** — and an accumulating one needs a ceiling too | §5.12.5 |
 | For compute, **quota and billing merge**: the balance is the quota, the hours spent are the record | §5.12.5.1 |
@@ -3729,6 +3732,44 @@ So the rule is not "one job at a time". It is:
 That degrades to one at a time when a single job can saturate, and to many when jobs are narrow. It also means the
 scheduler needs each job's *parallelism profile*, not just its total cost — and nothing here says how that is
 obtained. Declared by the submitter, measured from history, or discovered by ramping.
+
+##### 5.12.4.2 And it cuts temporary storage by the same factor
+
+Better still: if each job needs 1 GB of scratch, then ten jobs at one processor each hold **10 GB
+simultaneously**, where serializing at full parallelism holds **1 GB** (Asserted, Bob, 2026-08-16). Peak
+temporary storage is `concurrent jobs × temp per job`, and §5.12.4.1's rule minimizes exactly that first factor.
+
+**The latency win and the storage win are the same win, by Little's law. Derived.** With `L` jobs in flight, `λ`
+the throughput and `W` the latency, `L = λW`. Throughput is fixed by assumption, so any reduction in latency is a
+proportional reduction in jobs in flight, and temporary storage is proportional to jobs in flight:
+
+| Policy | `W` | `L = λW` | Peak scratch |
+|---|---|---|---|
+| Fair, one processor each | 10 min | 10 | 10 GB |
+| Serialize at full parallelism | 1 min | **1** | **1 GB** |
+
+So this is not a second benefit stacked on the first. It is the same improvement measured in a different unit,
+which is why they cannot be traded against each other.
+
+**Total consumption falls too, not only the peak.** Each job holds its scratch for a tenth as long, so billable
+byte-seconds go from 100 GB-min to 10 GB-min — a 10x reduction in what §12.3 charges for. **So the user who wants
+their job to finish sooner also pays less for scratch space**, with no policy required to align those. §12.1's
+pattern once more.
+
+**And it can decide feasibility, not just cost.** A cluster with 5 GB of scratch cannot run the fair schedule at
+all, while the serialized one needs 1 GB. That is a stronger claim than "cheaper": the wrong policy makes a
+workload impossible rather than expensive.
+
+**§5.12.2 makes this the most valuable of the three effects.** That section argues the phase-2 working set must be
+**RAM-resident in aggregate**, because no fabric closes the ~8x gap between local RAM and a 100 GbE link. Fewer
+concurrent jobs means fewer simultaneous working sets competing for RAM — and §12.2 prices RAM at ~5,000x disk per
+byte. So the factor-of-*L* saving lands in the **most expensive resource in the system**, not in scratch disk.
+
+⚠️ **This assumes temp storage per job is independent of how wide the job runs.** True for data-parallel work
+where intermediate data scales with *input* rather than with worker count — §5.12.2's filter-then-churn shape is
+exactly that. False where every worker keeps a full working copy, in which case widening a job multiplies its
+scratch and the saving evaporates. Which case a job is in is part of the parallelism profile §16 already needs
+(question 122), so it is one question rather than two.
 
 #### 5.12.5 Compute-hours in a bank account
 
