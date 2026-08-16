@@ -8910,33 +8910,47 @@ wakeup; answering it on the connection's read loop stalls the next read for as l
 takes. Ping is cheap enough that inline plainly wins and is what the code does; anything that
 touches a disk plainly does not. The middle is unknown, so it is a per-operation knob.
 
-**Measured, 2026-08-16, by flipping that knob for ping** (`inline_ping` in KS's configuration),
-round trips per second:
+**Measured, 2026-08-16**, by flipping that knob for ping (`inline_ping`) against the other half of
+the question — who decides when to send (`batch_sender`). Round trips per second:
 
-| Shape | Answered on the read loop | Handed to a worker | Cost |
-|---|---|---|---|
-| 1 connection, 1 in flight | 58,900 (17 µs) | 40,100 (25 µs) | +8 µs per round trip |
-| 1 connection, 64 in flight | 1,418,000 | 116,000 | **12x** |
-| 8 connections, 64 in flight | 5,279,000 | 234,000 | **23x** |
-| 16 connections, 256 in flight | 7,874,000 | 208,000 | **38x** |
+| Shape | Read loop, direct | Read loop, sender | Worker, sender | Worker, direct |
+|---|---|---|---|---|
+| 1 conn, 1 in flight | **59,900** | 47,700 | 36,100 | 40,600 |
+| 1 conn, 64 in flight | 1,651,000 | **1,784,000** | 1,158,000 | 123,000 |
+| 8 conns, 64 in flight | **6,633,000** | 4,381,000 | 2,535,000 | 240,000 |
+| 16 conns, 256 in flight | **12,399,000** | 8,407,000 | 2,906,000 | 211,000 |
 
-**Two different costs are in that table, and only the first is the queue hop.** At one request in
-flight there is nothing to coalesce, so the difference is the hop alone: **~8 µs**, and that is an
-upper bound, since this pool is one mutex-guarded queue shared by every worker rather than anything
-clever.
+Two designs are crossed there. **A batching sender** is a thread per connection that loops: write
+everything queued, and let the next batch be whatever piled up while that write was in flight. It is
+self-clocking — batch size rises with load and falls to one when idle, with no timer and nothing to
+tune. **Direct** means whoever produced the answer writes it, and flushes when it knows nothing more
+is in hand.
 
-The rest is worse and more interesting: **a worker cannot know whether more requests are already in
-hand, so it flushes its own answer, and the connection loses coalescing entirely.** That is why the
-pooled column is flat at ~200k no matter how many connections or how deep the pipeline — one syscall
-per message, which is exactly the rate the read loop gets at depth 1. Load stops helping.
+What the four columns say:
+
+- **Answers produced off the read loop need a sender.** A worker cannot see what else has arrived, so
+  writing its own answer means one syscall per message — the worker/direct column is flat near 200k
+  however much load arrives. Give those answers to a sender and the same work reaches 2.9M, **14x**.
+- **Answers produced on the read loop do not.** The read loop already knows when nothing more is in
+  hand, so a sender only adds a queue hop and a thread: 12.4M becomes 8.4M.
+- **Except when threads are idle.** At one connection the sender wins (1.78M against 1.65M), because
+  it puts framing and writing on a second core while the read loop parses. It loses once connections
+  outnumber cores.
+- **The hop itself is ~8 µs**, from the top row where there is nothing to coalesce.
 
 > **The dispatch decision is not "threads or an async runtime". It is whether the design still lets
 > answers pile up before they are sent.**
 
-Anything that hands each message to a scheduler and writes each answer when it completes pays this,
-whatever the scheduler is. So a machine type whose work genuinely must leave the read loop needs a
-flush policy of its own — batch the answers that are ready, rather than sending each — and that is
-tracked as work rather than assumed.
+Anything that hands each message to a scheduler and writes each answer when it completes pays the
+worker/direct column, whatever the scheduler is. Both mechanisms are built and both are
+configuration; the harness runs direct, because today every hot operation is answered on the read
+loop, and the sender is what the first machine type with real work off the read loop will turn on.
+
+**A third of the message path was allocation.** Framing a message allocated twice — once to encode
+the body, once to prefix the length — and answering allocated a third time. Encoding into a
+thread-local scratch buffer and backfilling the length instead was worth **58%** at 16 x 256
+(7.9M to 12.4M) and helped every column. Worth stating because it is the shape of most of what is
+left: the message path is short enough that an allocation is a large fraction of it.
 
 ### 17.5 The first measurements: a ping to KS0
 
@@ -8961,7 +8975,9 @@ Requests in flight per connection, against connections:
 | 16 | | 2,644,000 | 6,446,000 | 8,185,000 | |
 | 32 | | | 7,297,000 | | |
 
-Round trips per second. **Measured, 2026-08-16.** What it says:
+Round trips per second. **Measured, 2026-08-16**, before §17.4's allocation fix, which later lifted
+the 16 x 256 corner to 12.4M; the shape is what matters here, not the absolute numbers. What it
+says:
 
 - **Depth is worth 25x on one connection**, 59k to 1.48M, with average latency going 17 µs to 43 µs.
   Nothing about the work changed; the only difference is how many messages a syscall carries.
@@ -8976,7 +8992,7 @@ Round trips per second. **Measured, 2026-08-16.** What it says:
 - **Latency is the price and it is proportional**: at 16 x 256 the average is 500 µs. §1.4 wants
   throughput first, so that is the right trade, but it is a queue and it should be sized as one.
 
-**The 8.4M figure was checked rather than trusted**, because it is six times the prototype's ping and
+**The 8.4M corner of that table was checked rather than trusted**, because it is six times the prototype's ping and
 a surprise in the favourable direction deserves more suspicion than a disappointment does. KS counts
 the requests it answers, and over a 1 s warm-up plus 3 s measured run it answered 33.97M against the
 client's 25.3M measured — the difference being one warm-up second at the same rate. So the messages

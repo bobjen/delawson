@@ -20,6 +20,13 @@ levels = ["region", "datacenter", "rack", "machine", "disk"]
 [rings]
 members = 1
 
+# A sender per connection loops: write everything queued, and let the next batch
+# be whatever piled up meanwhile. It is what makes answers produced off the read
+# loop coalesce at all, and it costs when they are not — so it is false while
+# every hot operation is answered on the read loop.
+[messaging]
+batch_sender = false
+
 [timeouts]
 request_ms = 2000
 shutdown_grace_ms = 2000

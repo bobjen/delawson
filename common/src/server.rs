@@ -6,11 +6,19 @@
 //! let the caller sort them out, and a whole frame is written under one lock so
 //! frames never interleave.
 //!
-//! Answers are buffered and flushed when the read buffer runs dry, so a
-//! connection with several requests in flight costs one read and one write rather
-//! than one of each per message. This adds no latency: the flush happens exactly
-//! when there is nothing left to answer, which is when the alternative would have
-//! been to block.
+//! Answers are coalesced, so a connection with several requests in flight costs
+//! one read and one write rather than one of each per message. Two ways to decide
+//! when to send, chosen by configuration:
+//!
+//! - a **sender per connection**, looping: take everything queued, write it as one
+//!   batch, and let the next batch be whatever piled up while that was in flight.
+//!   Self-clocking — batch size rises with load and falls to one when idle — and it
+//!   works no matter which thread produced the answer.
+//! - **flush on the read loop**, when nothing more has arrived. Cheaper by a queue
+//!   hop, but it coalesces only what the read loop itself answered.
+//!
+//! Neither waits for anything, so neither adds latency: both send at the moment
+//! the alternative would have been to block.
 //!
 //! Where an answer is computed is per message type, and the trade is real:
 //! handing a request to a worker costs a queue hop and a wakeup, while answering
@@ -28,19 +36,25 @@ use crate::config::{ClusterConfig, ProcessConfig, ServiceEntry};
 use crate::random::Rng;
 use crate::registry::Peer;
 use crate::wire::{
-    Arg, Chan, MAX_FRAME_BYTES, Op, Request, Response, Status, read_request, read_response,
-    write_request, write_response,
+    Arg, BUF_BYTES, Chan, MAX_FRAME_BYTES, Op, Request, Response, Status, frame_into, read_request,
+    read_response, write_request, write_response,
 };
 use crate::{Context, Error, Result};
+use std::cell::RefCell;
 use std::io::{BufWriter, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const READY_FILE: &str = "ready";
+
+thread_local! {
+    /// Framing scratch for a worker, so answering allocates nothing.
+    static SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(BUF_BYTES));
+}
 
 pub struct Process {
     pub config: ProcessConfig,
@@ -280,44 +294,143 @@ fn read_loop<S: Service>(
 ) -> Result<()> {
     let chan = Chan::new(stream)?;
     let mut input = chan.input;
-    let out = Arc::new(Mutex::new(chan.output));
+    let out = if process.cluster.messaging.batch_sender {
+        let batch = Arc::new(Batch::new());
+        let sending = Arc::clone(&batch);
+        std::thread::spawn(move || run_sender(chan.output, sending));
+        Arc::new(Out::Queued(batch))
+    } else {
+        Arc::new(Out::Direct(Mutex::new(chan.output)))
+    };
+
     loop {
         // A client that closed the connection is the normal case.
         let Ok(request) = read_request(&mut input) else {
-            let _ = out.lock().expect("connection").flush();
+            out.close();
             return Ok(());
         };
         if service.inline(request.op) {
-            reply(process, &**service, &out, request);
-            // Nothing more has arrived, so the next read would block: send.
-            if input.buffer().is_empty() {
-                out.lock().expect("connection").flush()?;
-            }
+            // Nothing more in hand means the next read would block, so send.
+            let settled = input.buffer().is_empty();
+            reply(process, &**service, &out, request, settled);
             continue;
         }
         let process = Arc::clone(process);
         let service = Arc::clone(service);
         let out = Arc::clone(&out);
-        pool.run(move || reply(&process, &*service, &out, request));
+        // A worker cannot see what else has arrived, so with a direct writer it
+        // must send its own answer; with a sender, it need not.
+        pool.run(move || reply(&process, &*service, &out, request, true));
     }
 }
 
-type Out = Mutex<BufWriter<TcpStream>>;
+/// A connection's outgoing bytes, in two buffers: producers append to one while
+/// the sender writes the other. The next batch is whatever piled up during the
+/// last write, so batch size follows load with nothing to tune and no timer.
+struct Batch {
+    filling: Mutex<Vec<u8>>,
+    ready: Condvar,
+    open: AtomicBool,
+}
 
-/// Answer one request. Pooled work flushes for itself, since it finishes at a
-/// moment the read loop knows nothing about; inline work leaves the flush to the
-/// read loop, which knows whether more requests are already in hand.
-fn reply(process: &Process, service: &impl Service, out: &Out, request: Request) {
+impl Batch {
+    fn new() -> Batch {
+        Batch {
+            filling: Mutex::new(Vec::with_capacity(BUF_BYTES)),
+            ready: Condvar::new(),
+            open: AtomicBool::new(true),
+        }
+    }
+
+    /// Frame outside the lock, then hold it only for the copy. Wake the sender
+    /// only when it has something to wake for.
+    fn put(&self, response: &Response) -> Result<()> {
+        SCRATCH.with(|scratch| {
+            let mut framed = scratch.borrow_mut();
+            framed.clear();
+            frame_into(&mut framed, |buf| response.encode(buf))?;
+            let mut filling = self.filling.lock().expect("connection");
+            let woke = filling.is_empty();
+            filling.extend_from_slice(&framed);
+            drop(filling);
+            if woke {
+                self.ready.notify_one();
+            }
+            Ok(())
+        })
+    }
+
+    fn close(&self) {
+        self.open.store(false, Ordering::SeqCst);
+        self.ready.notify_one();
+    }
+
+    /// Take everything waiting, leaving the caller's empty buffer in its place.
+    /// Returns false when the connection is done.
+    fn take(&self, buf: &mut Vec<u8>) -> bool {
+        let mut filling = self.filling.lock().expect("connection");
+        while filling.is_empty() {
+            if !self.open.load(Ordering::SeqCst) {
+                return false;
+            }
+            filling = self.ready.wait(filling).expect("connection");
+        }
+        std::mem::swap(&mut *filling, buf);
+        true
+    }
+}
+
+fn run_sender(mut writer: BufWriter<TcpStream>, batch: Arc<Batch>) {
+    let mut buf = Vec::with_capacity(BUF_BYTES);
+    while batch.take(&mut buf) {
+        let sent = writer.write_all(&buf).and_then(|()| writer.flush());
+        buf.clear();
+        if sent.is_err() {
+            return;
+        }
+    }
+}
+
+/// Where a connection's answers go.
+enum Out {
+    /// Written by whoever produced them, coalescing only within one thread.
+    Direct(Mutex<BufWriter<TcpStream>>),
+    /// Handed to this connection's sender, which batches whatever has arrived.
+    Queued(Arc<Batch>),
+}
+
+impl Out {
+    /// `settled` means the caller knows nothing more is coming right now, so a
+    /// direct writer should flush. It means nothing to a sender, which decides
+    /// for itself.
+    fn put(&self, response: &Response, settled: bool) -> Result<()> {
+        match self {
+            Out::Direct(writer) => {
+                let mut writer = writer.lock().expect("connection");
+                write_response(&mut *writer, response)?;
+                if settled {
+                    writer.flush()?;
+                }
+                Ok(())
+            }
+            Out::Queued(batch) => batch.put(response),
+        }
+    }
+
+    fn close(&self) {
+        match self {
+            Out::Direct(writer) => {
+                let _ = writer.lock().expect("connection").flush();
+            }
+            Out::Queued(batch) => batch.close(),
+        }
+    }
+}
+
+fn reply(process: &Process, service: &impl Service, out: &Out, request: Request, settled: bool) {
     let response = answer(process, service, &request).to(&request);
     process.answered.fetch_add(1, Ordering::Relaxed);
-    let pooled = !service.inline(request.op);
-    let written = {
-        // One frame per lock, so two answers never interleave.
-        let mut out = out.lock().expect("connection");
-        write_response(&mut *out, &response)
-            .and_then(|()| if pooled { out.flush().map_err(Into::into) } else { Ok(()) })
-    };
-    if let Err(e) = written {
+    if let Err(e) = out.put(&response, settled) {
         process.log(format!("could not answer {}: {e}", request.op));
     }
     if request.op == Op::Shutdown {
@@ -380,6 +493,7 @@ fn status(process: &Process, service: &impl Service) -> String {
         format!("workers {}", workers()),
         format!("uptime_seconds {}", process.started.elapsed().as_secs()),
         format!("answered {}", process.answered.load(Ordering::Relaxed)),
+        format!("batch_sender {}", process.cluster.messaging.batch_sender),
         format!("domain {}", process.entry.domain.join("/")),
     ];
     if let Some(media_class) = &process.entry.media_class {

@@ -21,6 +21,7 @@
 //! when to send is made here and not by the kernel.
 
 use crate::{Context, Error, Result};
+use std::cell::RefCell;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
 
@@ -205,11 +206,10 @@ impl Request {
         self
     }
 
-    fn encode(&self) -> Vec<u8> {
-        let mut out = self.id.to_le_bytes().to_vec();
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend(self.id.to_le_bytes());
         out.extend(self.op.code().to_le_bytes());
-        encode_args(&self.args, &mut out);
-        out
+        encode_args(&self.args, out);
     }
 
     fn decode(payload: &[u8]) -> Result<Request> {
@@ -247,11 +247,10 @@ impl Response {
         }
     }
 
-    fn encode(&self) -> Vec<u8> {
-        let mut out = self.id.to_le_bytes().to_vec();
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend(self.id.to_le_bytes());
         out.extend((self.status as u16).to_le_bytes());
-        encode_args(&self.args, &mut out);
-        out
+        encode_args(&self.args, out);
     }
 
     fn decode(payload: &[u8]) -> Result<Response> {
@@ -354,17 +353,38 @@ impl<'a> Cursor<'a> {
 /// small messages leaves in one write.
 pub const BUF_BYTES: usize = 64 * 1024;
 
-/// Frames go into the buffer; the caller decides when to flush. Length and
-/// payload are one `write_all`, so a frame is never split across flushes.
-fn write_frame(out: &mut impl Write, payload: &[u8]) -> Result<()> {
-    if payload.len() > MAX_FRAME_BYTES {
-        return Err(Error::new(format!("frame of {} bytes is too large", payload.len())));
+thread_local! {
+    /// One scratch buffer per thread, so framing a message allocates nothing.
+    static SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(BUF_BYTES));
+}
+
+/// Frame a message into `buf`: four bytes of length, then whatever `body`
+/// appends. The length is backfilled, so the body is written once and never
+/// copied.
+pub fn frame_into(buf: &mut Vec<u8>, body: impl FnOnce(&mut Vec<u8>)) -> Result<()> {
+    let start = buf.len();
+    buf.extend([0u8; 4]);
+    body(buf);
+    let length = buf.len() - start - 4;
+    if length > MAX_FRAME_BYTES {
+        buf.truncate(start);
+        return Err(Error::new(format!("frame of {length} bytes is too large")));
     }
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend((payload.len() as u32).to_le_bytes());
-    frame.extend(payload);
-    out.write_all(&frame)?;
+    buf[start..start + 4].copy_from_slice(&(length as u32).to_le_bytes());
     Ok(())
+}
+
+/// Frames go into the caller's buffer; the caller decides when to flush. Length
+/// and payload are one `write_all`, so a frame is never split across flushes and
+/// an unbuffered writer still sends it as one.
+fn write_framed(out: &mut impl Write, body: impl FnOnce(&mut Vec<u8>)) -> Result<()> {
+    SCRATCH.with(|scratch| {
+        let mut buf = scratch.borrow_mut();
+        buf.clear();
+        frame_into(&mut buf, body)?;
+        out.write_all(&buf)?;
+        Ok(())
+    })
 }
 
 fn read_frame(input: &mut impl Read) -> Result<Vec<u8>> {
@@ -380,7 +400,7 @@ fn read_frame(input: &mut impl Read) -> Result<Vec<u8>> {
 }
 
 pub fn write_request(out: &mut impl Write, request: &Request) -> Result<()> {
-    write_frame(out, &request.encode())
+    write_framed(out, |buf| request.encode(buf))
 }
 
 /// A buffered connection. `more` says whether bytes are already in hand, which is
@@ -415,7 +435,7 @@ pub fn read_request(input: &mut impl Read) -> Result<Request> {
 }
 
 pub fn write_response(out: &mut impl Write, response: &Response) -> Result<()> {
-    write_frame(out, &response.encode())
+    write_framed(out, |buf| response.encode(buf))
 }
 
 pub fn read_response(input: &mut impl Read) -> Result<Response> {
@@ -472,12 +492,12 @@ mod tests {
 
     #[test]
     fn no_trailing_bytes() {
-        let mut payload = 0u32.to_le_bytes().to_vec();
-        payload.extend(Op::Ping.code().to_le_bytes());
-        encode_args(&[], &mut payload);
-        payload.push(0xff);
         let mut buffer = Vec::new();
-        write_frame(&mut buffer, &payload).unwrap();
+        write_framed(&mut buffer, |buf| {
+            Request::new(Op::Ping).encode(buf);
+            buf.push(0xff);
+        })
+        .unwrap();
         assert!(read_request(&mut buffer.as_slice()).is_err());
     }
 }

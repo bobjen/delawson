@@ -118,6 +118,17 @@ pub struct MediaClass {
     pub repair_bytes_sec: u64,
 }
 
+/// How a connection decides when to send.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Messaging {
+    /// Give each connection a sender that loops: take everything queued, write it
+    /// as one batch, and let the next batch be whatever piles up meanwhile. False
+    /// leaves each answer to be flushed by whoever produced it, which coalesces
+    /// only what one thread happens to hold.
+    pub batch_sender: bool,
+}
+
 /// Raft ring composition. One number fleet-wide for now; nothing yet
 /// distinguishes KS, DN and SN ring sizes.
 #[derive(Debug, Clone, Deserialize)]
@@ -147,6 +158,7 @@ pub struct ClusterConfig {
     pub ks: KsBootstrap,
     pub failure_domains: FailureDomains,
     pub rings: Rings,
+    pub messaging: Messaging,
     pub timeouts: Timeouts,
     #[serde(default, rename = "service")]
     pub services: Vec<ServiceEntry>,
