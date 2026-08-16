@@ -9196,10 +9196,10 @@ span in the info log, which is the point of having two.
 A line is:
 
 ```
-n,2026-08-16 23:31:32.538,pid=64967,tid=64967,file=common/src/server.rs,line=255,listening on 127.0.0.1:9601
+n,2026-08-16 23:31:32.538104,pid=64967,tid=64967,file=common/src/server.rs,line=255,listening on 127.0.0.1:9601
 ```
 
-Level as one letter, the time to the millisecond in UTC, the process and kernel thread ids, where in
+Level as one letter, the time to the microsecond in UTC, the process and kernel thread ids, where in
 the source it came from, and the message. **The identity, host and version are written at the top of
 every file** rather than on every line, so a rotated file still says what it is. **Kernel thread id
 rather than a name**, so a line matches what `perf`, `gdb` and `top` say.

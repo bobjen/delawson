@@ -450,11 +450,11 @@ fn stamp() -> String {
     let (days, rest) = (secs / 86_400, secs % 86_400);
     let (year, month, day) = civil(days as i64);
     format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}.{:03}",
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}.{:06}",
         rest / 3600,
         rest % 3600 / 60,
         rest % 60,
-        now.subsec_millis()
+        now.subsec_micros()
     )
 }
 
