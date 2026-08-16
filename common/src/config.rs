@@ -118,15 +118,25 @@ pub struct MediaClass {
     pub repair_bytes_sec: u64,
 }
 
-/// How a connection decides when to send.
+/// Who decides when a connection sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SendMode {
+    /// Whoever produced the answer writes it, and flushes when it knows nothing
+    /// more is in hand. Coalesces only what one thread holds.
+    Direct,
+    /// A sender per connection loops: write everything queued, and let the next
+    /// batch be whatever piled up meanwhile. Coalesces whoever produced it.
+    Sender,
+    /// Direct until an answer is produced off the read loop, then a sender for
+    /// the rest of that connection's life.
+    Adaptive,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Messaging {
-    /// Give each connection a sender that loops: take everything queued, write it
-    /// as one batch, and let the next batch be whatever piles up meanwhile. False
-    /// leaves each answer to be flushed by whoever produced it, which coalesces
-    /// only what one thread happens to hold.
-    pub batch_sender: bool,
+    pub send: SendMode,
 }
 
 /// Raft ring composition. One number fleet-wide for now; nothing yet

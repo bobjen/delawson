@@ -8942,9 +8942,29 @@ What the four columns say:
 > answers pile up before they are sent.**
 
 Anything that hands each message to a scheduler and writes each answer when it completes pays the
-worker/direct column, whatever the scheduler is. Both mechanisms are built and both are
-configuration; the harness runs direct, because today every hot operation is answered on the read
-loop, and the sender is what the first machine type with real work off the read loop will turn on.
+worker/direct column, whatever the scheduler is.
+
+**So the policy is adaptive, and it is the default: a connection writes directly until an answer is
+produced off its read loop, and hands its writer to a sender from then on.** The read loop knows at
+dispatch which it is about to do and is the only thread that switches, so the switch needs no
+agreement with anyone — it happens before the first off-loop answer exists. Anything already
+buffered is flushed before the writer moves, so the switch cannot reorder answers. In the steady
+state it costs one relaxed load per answer:
+
+| Shape | Adaptive, nothing leaves the read loop | Direct | Adaptive, everything leaves it | Sender |
+|---|---|---|---|---|
+| 1 conn, 1 in flight | 60,200 | 60,400 | 36,300 | 35,500 |
+| 1 conn, 64 in flight | 1,677,000 | 1,669,000 | 1,143,000 | 1,148,000 |
+| 8 conns, 64 in flight | 6,675,000 | 6,623,000 | 2,551,000 | 2,592,000 |
+| 16 conns, 256 in flight | **12,661,000** | 12,633,000 | **3,059,000** | 3,070,000 |
+
+**Measured, 2026-08-16.** Adaptive lands on whichever fixed policy is the right one, within noise,
+and KS reports how many connections switched — 0 in the left pair, one per connection in the right.
+
+⚠️ **The switch is one-way, so one off-loop answer commits the connection for its lifetime.** A
+connection that does a single metadata lookup and then a million pings runs the rest at sender speed,
+which the table above prices at about 30% off direct. Switching back would mean quiescing the sender
+to take the writer from it, which is real work for a case nobody has yet.
 
 **A third of the message path was allocation.** Framing a message allocated twice — once to encode
 the body, once to prefix the length — and answering allocated a third time. Encoding into a

@@ -20,12 +20,13 @@ levels = ["region", "datacenter", "rack", "machine", "disk"]
 [rings]
 members = 1
 
-# A sender per connection loops: write everything queued, and let the next batch
-# be whatever piled up meanwhile. It is what makes answers produced off the read
-# loop coalesce at all, and it costs when they are not — so it is false while
-# every hot operation is answered on the read loop.
+# Who decides when a connection sends: "direct", the producer of each answer;
+# "sender", a thread per connection batching whatever has piled up; or
+# "adaptive", direct until an answer is produced off the read loop and a sender
+# from then on. Direct is fastest while every hot operation is answered on the
+# read loop, and useless for answers that are not.
 [messaging]
-batch_sender = false
+send = "adaptive"
 
 [timeouts]
 request_ms = 2000

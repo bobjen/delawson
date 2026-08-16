@@ -16,6 +16,9 @@
 //!   works no matter which thread produced the answer.
 //! - **flush on the read loop**, when nothing more has arrived. Cheaper by a queue
 //!   hop, but it coalesces only what the read loop itself answered.
+//! - **adaptive**: the second until an answer is produced off the read loop, the
+//!   first from then on. The read loop knows at dispatch which it is about to do,
+//!   and it is the only thread that switches, so the switch needs no agreement.
 //!
 //! Neither waits for anything, so neither adds latency: both send at the moment
 //! the alternative would have been to block.
@@ -32,7 +35,7 @@
 //! that is. Stopping is a request, not a signal, so a process with state to flush
 //! gets the chance; a signal is the fallback.
 
-use crate::config::{ClusterConfig, ProcessConfig, ServiceEntry};
+use crate::config::{ClusterConfig, ProcessConfig, SendMode, ServiceEntry};
 use crate::random::Rng;
 use crate::registry::Peer;
 use crate::wire::{
@@ -66,6 +69,8 @@ pub struct Process {
     /// Requests answered, so a client's throughput claim can be checked against
     /// what the server thinks it did.
     answered: AtomicU64,
+    /// Connections that have moved from writing directly to a batching sender.
+    senders: AtomicU64,
 }
 
 /// What a machine type adds to the common lifecycle.
@@ -120,6 +125,7 @@ impl Process {
             started: Instant::now(),
             stopping: AtomicBool::new(false),
             answered: AtomicU64::new(0),
+            senders: AtomicU64::new(0),
         })
     }
 
@@ -294,14 +300,11 @@ fn read_loop<S: Service>(
 ) -> Result<()> {
     let chan = Chan::new(stream)?;
     let mut input = chan.input;
-    let out = if process.cluster.messaging.batch_sender {
-        let batch = Arc::new(Batch::new());
-        let sending = Arc::clone(&batch);
-        std::thread::spawn(move || run_sender(chan.output, sending));
-        Arc::new(Out::Queued(batch))
-    } else {
-        Arc::new(Out::Direct(Mutex::new(chan.output)))
-    };
+    let policy = process.cluster.messaging.send;
+    let out = Arc::new(match policy {
+        SendMode::Sender => Out::sending(chan.output),
+        SendMode::Direct | SendMode::Adaptive => Out::direct(chan.output),
+    });
 
     loop {
         // A client that closed the connection is the normal case.
@@ -315,11 +318,17 @@ fn read_loop<S: Service>(
             reply(process, &**service, &out, request, settled);
             continue;
         }
+        // A worker cannot see what else has arrived, so it would have to send its
+        // own answer. Hand the connection to a sender instead, once, here — the
+        // read loop is the only thread that switches and nothing is in flight yet.
+        if policy == SendMode::Adaptive && out.batch.get().is_none() {
+            out.hand_to_sender();
+            process.log("switched to a batching sender: an answer left the read loop");
+            process.senders.fetch_add(1, Ordering::Relaxed);
+        }
         let process = Arc::clone(process);
         let service = Arc::clone(service);
         let out = Arc::clone(&out);
-        // A worker cannot see what else has arrived, so with a direct writer it
-        // must send its own answer; with a sender, it need not.
         pool.run(move || reply(&process, &*service, &out, request, true));
     }
 }
@@ -391,38 +400,64 @@ fn run_sender(mut writer: BufWriter<TcpStream>, batch: Arc<Batch>) {
     }
 }
 
-/// Where a connection's answers go.
-enum Out {
-    /// Written by whoever produced them, coalescing only within one thread.
-    Direct(Mutex<BufWriter<TcpStream>>),
-    /// Handed to this connection's sender, which batches whatever has arrived.
-    Queued(Arc<Batch>),
+/// Where a connection's answers go. Starts as one of the two, and may move from
+/// direct to a sender exactly once — after which `batch` is set for good, so the
+/// hot path is one relaxed load.
+struct Out {
+    direct: Mutex<Option<BufWriter<TcpStream>>>,
+    batch: OnceLock<Arc<Batch>>,
 }
 
 impl Out {
+    fn direct(writer: BufWriter<TcpStream>) -> Out {
+        Out { direct: Mutex::new(Some(writer)), batch: OnceLock::new() }
+    }
+
+    fn sending(writer: BufWriter<TcpStream>) -> Out {
+        let out = Out { direct: Mutex::new(Some(writer)), batch: OnceLock::new() };
+        out.hand_to_sender();
+        out
+    }
+
+    /// Give the writer to a sender thread. Only the read loop calls this, and
+    /// only before it dispatches the first answer it will not write itself, so
+    /// nothing else is writing while it happens.
+    fn hand_to_sender(&self) {
+        let Some(mut writer) = self.direct.lock().expect("connection").take() else {
+            return;
+        };
+        // Anything already buffered goes first, so the switch cannot reorder.
+        let _ = writer.flush();
+        let batch = Arc::new(Batch::new());
+        let sending = Arc::clone(&batch);
+        std::thread::spawn(move || run_sender(writer, sending));
+        let _ = self.batch.set(batch);
+    }
+
     /// `settled` means the caller knows nothing more is coming right now, so a
     /// direct writer should flush. It means nothing to a sender, which decides
     /// for itself.
     fn put(&self, response: &Response, settled: bool) -> Result<()> {
-        match self {
-            Out::Direct(writer) => {
-                let mut writer = writer.lock().expect("connection");
-                write_response(&mut *writer, response)?;
-                if settled {
-                    writer.flush()?;
-                }
-                Ok(())
-            }
-            Out::Queued(batch) => batch.put(response),
+        if let Some(batch) = self.batch.get() {
+            return batch.put(response);
         }
+        let mut writer = self.direct.lock().expect("connection");
+        let writer = writer.as_mut().ok_or_else(|| Error::new("the writer moved mid-answer"))?;
+        write_response(writer, response)?;
+        if settled {
+            writer.flush()?;
+        }
+        Ok(())
     }
 
     fn close(&self) {
-        match self {
-            Out::Direct(writer) => {
-                let _ = writer.lock().expect("connection").flush();
+        match self.batch.get() {
+            Some(batch) => batch.close(),
+            None => {
+                if let Some(writer) = self.direct.lock().expect("connection").as_mut() {
+                    let _ = writer.flush();
+                }
             }
-            Out::Queued(batch) => batch.close(),
         }
     }
 }
@@ -493,7 +528,8 @@ fn status(process: &Process, service: &impl Service) -> String {
         format!("workers {}", workers()),
         format!("uptime_seconds {}", process.started.elapsed().as_secs()),
         format!("answered {}", process.answered.load(Ordering::Relaxed)),
-        format!("batch_sender {}", process.cluster.messaging.batch_sender),
+        format!("send {:?}", process.cluster.messaging.send),
+        format!("senders {}", process.senders.load(Ordering::Relaxed)),
         format!("domain {}", process.entry.domain.join("/")),
     ];
     if let Some(media_class) = &process.entry.media_class {
