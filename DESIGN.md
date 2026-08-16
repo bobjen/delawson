@@ -72,7 +72,8 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Stable record numbers and keys make **external indexes permanently valid**, which is what shared AI memory needs | §1.0, §3 |
 | The motivating case is public and specific: thousands of minds, 10,000 remember-test cycles/s each | §1.0.3 |
 | So it wants **~10^7 metadata QPS** — 5× the demonstrated target, ~1/4 of the hardware bound | §1.0.3 |
-| And it is the **one serial workload**: parallelism comes from the number of minds, not within one mind | §1.0.3 |
+| Latency bounds **depth** of reasoning; throughput bounds **breadth** — souls think in parallel, so §1.4 applies | §1.0.3 |
+| Aggregate demand plausibly **exceeds one cluster**, which is a second reason for multiple stores | §1.0.3 |
 | The scale ambition is ~10^57 bits; DeLawson addresses ~10^26, so it is **10^31 short** and directional | §1.0.4 |
 | Relative timestamps are why §1.3's rule survives a scale nobody designed for | §1.0.4, §4.6.3 |
 | The intermediate scale is a **torus Dyson swarm** — 2^18 elements, so **inside** DeLawson's addressing | §1.0.5 |
@@ -387,20 +388,28 @@ the motivating case sits *between* what has been demonstrated and what the machi
 the region §1.6 exists to make visible. It is also the strongest argument that §1.4.0's targets are a floor
 rather than an ambition.
 
-**And it introduces the one workload where §1.4's stance does not apply.** §1.4 prioritizes throughput
-because jobs are zillions of tiny *parallel* requests. But a remember-test cycle is **serial**: each step
-depends on the previous, so per-mind thinking speed is capped by round-trip latency at `1/latency` cycles per
-second — 10,000/s means a **100 µs budget per lookup**, end to end.
+**And latency bounds depth, not throughput.** An earlier draft of this section had it wrong, so the
+correction is worth stating plainly. **A soul is a set of goals and ongoing projects, and souls think in
+parallel** (Asserted, Bob, 2026-08-16) — a soul is not a thread. So parallelism comes from *within* a mind as
+well as from the number of minds, and §1.4's throughput-over-latency stance applies here like everywhere else.
+There is no serial-workload exception.
 
-That is not a contradiction, and the resolution should be stated rather than left to be rediscovered:
+What a single remember-test *chain* still gives is a bound on **depth**:
 
-> **Parallelism comes from the number of minds, not from within one mind.** Aggregate throughput scales with
-> soul count and is a §1.4 problem; per-mind thinking speed is a latency problem, and it is the only place in
-> this design where latency is not amortizable by batching.
+| | Set by | Scales with |
+|---|---|---|
+| **Throughput** — how much thinking happens | §1.4, batching, node count | souls × concurrent lines of thought |
+| **Depth** — how far one line of reasoning gets per unit time | round-trip **latency** | nothing; it is `1/latency` steps per second |
 
-Which puts a floor under §9.5's hedging and §1.1's timeout discussion that no other workload here does: a
-100 µs budget leaves no room for a 20-second TCP timeout to be part of the answer, so the tail matters
-per-request and not merely per-job.
+A conclusion needing `N` sequential remember-test steps takes `N x latency` of wall clock no matter how much
+hardware is thrown at it. At 100 µs a million-step chain is 100 seconds; at 10 ms it is nearly three hours.
+**Derived.** So latency buys depth of reasoning, and throughput buys breadth.
+
+**Which pushes the QPS estimate up rather than down.** §1.0.3's 10^7 assumed one line of thought per soul.
+With `k` concurrent lines the demand is 1,000 × `k` × 10,000/s, so even modest concurrency puts it past
+§1.6.2's ~40M/s bound for a single cluster. ⚠️ `k` is not given by the source and nothing here estimates it,
+but the direction matters: **the shared-memory workload's aggregate demand plausibly exceeds what one cluster
+can serve**, which is a second and quite independent reason the AI page insists on multiple stores.
 
 #### 1.0.4 The scale ambition, and the honest size of the gap
 
@@ -485,12 +494,17 @@ the four rows above DeLawson is actually built for.
 willing to call "close enough", and that choice fixes the diameter (Asserted, Bob, 2026-08-16). Fast means
 small, slow means large, and at slow enough you could take the whole solar system as one cluster.
 
-| Minimum communication time | Diameter, in fibre at ~2/3 *c* | What it serves |
-|---|---|---|
-| 100 µs | **~5-10 km** — a campus | §1.0.3's remember-test cycle |
-| 10 ms | ~1,000 km — continental | consensus with ~1 s failover, see below |
-| seconds | interplanetary | §1.4 batch work only |
-| minutes to hours | the solar system | asynchronous transfer, not one store |
+| Minimum communication time | Diameter, in fibre at ~2/3 *c* | Deepest chain per second | What it serves |
+|---|---|---|---|
+| 100 µs | **~5-10 km** — a campus | 10,000 steps | §1.0.3's remember-test cycle |
+| 10 ms | ~1,000 km — continental | 100 steps | consensus with ~1 s failover, see below |
+| seconds | interplanetary | ~1 step | §1.4 batch work only |
+| minutes to hours | the solar system | — | asynchronous transfer, not one store |
+
+**So the diameter choice trades depth of reasoning against breadth of everything else.** A small fast cluster
+reasons deeply over less data; a large slow one holds far more data and more nodes but advances any single line
+of thought a hundred or ten thousand times more slowly (§1.0.3). That is the actual shape of the decision, and
+it is not a storage tradeoff at all — it is a cognition one.
 
 So §1.0.3's few-kilometre figure is not a bound on DeLawson — it is the diameter *the AI workload* selects,
 and it is 300x tighter than anything the storage machinery itself needs. That is worth separating clearly,
