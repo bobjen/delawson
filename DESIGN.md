@@ -51,7 +51,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-124 things *not* decided.
+126 things *not* decided.
 
 **Priorities and framing**
 
@@ -99,6 +99,11 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | The bank has a **ceiling, and charging stops there** — an unspent compute-hour costs the provider nothing | §5.12.5.1 |
 | So storage bills **continuously** and compute bills **up to a cap**: same principle, different shapes | §5.12.5.1 |
 | Rate buys **throughput**, ceiling buys **burst**; Σ rates bounds the steady state, Σ ceilings the transient | §5.12.5.1a |
+| **Scheduled compute-hours** guarantee capacity at contention times, at a premium; unused ones fall into the bank | §5.12.6 |
+| The premium prices the **opportunity cost**, so there is no use-it-or-lose-it — only the certainty is spent | §5.12.6 |
+| **No overbooking**: Σ scheduled(t) ≤ cores at every instant — a calendar feasibility check, not a sum | §5.12.6.1 |
+| Solvency uses the **average** scheduled load; the peak constrains only that instant | §5.12.6.2 |
+| DeLawson's own recurring jobs are the **first customer** of scheduled compute | §5.12.6.2 |
 | The floor staggers completion, so **whole users recover early** — worth more than partial recovery (§4.3.3.3) | §13.4.4.4 |
 | Its cost is a **cap-limited tail**, which gives the per-SN maximum a second job | §13.4.4.4a |
 | **Georeplication is a ship requirement**, and the only answer to §4.3.3.1's dominant loss term | §13.4.5 |
@@ -3858,6 +3863,74 @@ is online and approximate. For compute the bank balance *is* the quota and compu
 billing record — one quantity doing both jobs. That works because compute is consumed in large lumps, where §12.8's
 per-request metering needed the split precisely because requests are tiny and numerous. Worth stating so nobody
 "fixes" the inconsistency.
+
+#### 5.12.6 Scheduled compute-hours, for predictable recurring load
+
+**Customers may schedule actual compute-hours for recurring work, at a somewhat higher price than normal
+compute-hours. Unused scheduled hours become normal unused hours in the bank account. The system may not reserve
+more scheduled compute at any instant than it has actual cores** (Asserted, Bob, 2026-08-16).
+
+That is what lets a customer guarantee their predictable load has compute available **at high-contention times** —
+the case §5.12.5.1a admits the bank alone cannot cover, since when everyone bursts together the drain is served but
+slowly.
+
+**The premium is correct under §12.1 rather than a revenue grab.** A reservation consumes the provider's ability to sell
+that instant to anyone else, whether or not the customer uses it, so it has an opportunity cost even when idle —
+and §12.1 says price the cost. What makes the product fair is that **the premium buys the guarantee while the
+underlying hours survive**: unused, they fall back into the bank, so there is no use-it-or-lose-it. The customer
+loses only the certainty they turned out not to need.
+
+⚠️ Except at the ceiling. A customer already at their §5.12.5.1 balance cap who does not use their scheduled hours
+**loses them**, because there is nowhere for them to convert to. That produces a sensible incentive — do not
+over-schedule when your bank is already full — but it is a surprise, and it should be stated in the product rather
+than discovered in an invoice.
+
+##### 5.12.6.1 No overbooking makes the constraint a calendar, not a sum
+
+Every previous instance of the partition rule (§13.4.3.4, §13.4.4.3, §5.12.5) has been a scalar: a set of floors
+summing within a total. This one is different:
+
+> **Σ scheduled(t) ≤ cores, for every instant t.**
+
+**So admission is a feasibility check over an interval, not a comparison of two numbers**, and the ledger is
+time-indexed. Two consequences follow. **Derived.**
+
+**Recurring reservations must be stored as rules, not expanded instances.** "Every day at 03:00 for twenty
+minutes" has no last occurrence, so expanding it is unbounded. The reservation is a period, a phase, a duration and
+a width.
+
+⚠️ **Feasibility over periodic patterns is the harder half.** Admitting a new reservation means finding the peak of
+a sum of periodic step functions, which is exact only over the least common multiple of all periods — and mixed
+hourly, daily and weekly periods make that large. Quantizing to a slot grid and checking one LCM window is the
+obvious approach; bounding the admissible periods to divisors of a day is the cheaper one. Undesigned.
+
+**Refusing to overbook is the conservative choice and worth keeping.** Providers normally overbook reservations
+because utilization is never 100%, trading a rare broken promise for more revenue. Declining that is consistent
+with §1.1's general refusal to promise what cannot be delivered: a reservation that sometimes fails is not a
+guarantee, and this design's whole availability argument rests on distinguishing the two.
+
+##### 5.12.6.2 How the two products fit inside one capacity
+
+The bank's rates and the reservations both draw on the same cores, and they constrain capacity at different time
+scales. Separating them is what keeps both promises honest:
+
+| Requirement | Constraint | What it protects |
+|---|---|---|
+| **Solvency** | Σ bank rates + *average* scheduled load ≤ capacity | the bank's long-run promises |
+| **Peak** | Σ scheduled(t) ≤ cores | the reservation guarantee at that instant |
+
+**Derived.** Note it is the *average* scheduled load that enters solvency, not the peak — a reservation occupying
+every core for one minute a day is 1/1440 of capacity in solvency terms, while being total at that minute.
+
+⚠️ **But at a peak instant, best-effort work gets `cores − Σ scheduled(t)`, which may be zero.** That is the same
+structural starvation as §13.4.3.4 and acceptable for the same reason, provided it is bounded — which argues for a
+**cap on the reservable fraction** of the cluster, so bank-account holders always have something. Otherwise a
+sufficiently popular reservation slot makes the bank's accumulation rate a promise that is briefly worthless.
+
+**And DeLawson is its own first customer.** §13.5's daily snapshot, the billing job (§12.8), EC grouping (§13.5.1)
+and the independence audit (§5.6.8) are exactly predictable recurring load. So the system should hold scheduled
+reservations for them — and §12.6.4 requires that cost to be tracked rather than absorbed silently, which makes the
+system's own reservations the first entry in that ledger.
 
 ## 6. Size limits and sealing
 
@@ -8340,6 +8413,14 @@ Roughly in order of how much else depends on them.
      ceilings settles nothing about solvency and everything about the worst-case transient, which is served rather
      than refused but drains over `Σ ceilings / capacity`. That is a product decision about acceptable burst
      latency, not an arithmetic one.
+125. **Feasibility checking for periodic reservations** (§5.12.6.1). Admitting one means finding the peak of a sum
+     of periodic step functions, exact only over the least common multiple of all periods — large once hourly,
+     daily and weekly mix. Quantize to a slot grid and check one LCM window, or restrict admissible periods to
+     divisors of a day. The second is much cheaper and constrains the product.
+126. **A cap on the reservable fraction of the cluster** (§5.12.6.2). At a peak instant best-effort work gets
+     `cores − Σ scheduled(t)`, which may be zero, making the bank's accumulation rate briefly worthless. Bounding
+     the reservable fraction fixes that and costs reservation revenue. Where the line goes is a product decision.
+
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
