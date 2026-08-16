@@ -29,11 +29,12 @@ it was computed or assumed.
 
 **Inputs currently asserted rather than derived**, in rough order of how much rests on them:
 
-Four public sources by Bob set the motivation and the scale, and are cited where used:
+Five public sources by Bob set the motivation and the scale, and are cited where used:
 [the erasure-coding song](https://youtu.be/oak6U2yBy94) (§4.3.4.2),
 [how AI should work](https://burtleburtle.net/bob/future/ai.html) (§1.0, §1.0.3),
 [really big data centers](https://burtleburtle.net/bob/future/bigdata.html) and
-[the dense torus core](https://burtleburtle.net/bob/future/dense.html) (§1.0.4).
+[the dense torus core](https://burtleburtle.net/bob/future/dense.html) (§1.0.4), and
+[the torus Dyson swarm](https://burtleburtle.net/bob/scifi/dyson.html) (§1.0.5).
 
 | Input | Value | Where |
 |---|---|---|
@@ -50,7 +51,7 @@ Four public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-104 things *not* decided.
+105 things *not* decided.
 
 **Priorities and framing**
 
@@ -74,6 +75,9 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | And it is the **one serial workload**: parallelism comes from the number of minds, not within one mind | §1.0.3 |
 | The scale ambition is ~10^57 bits; DeLawson addresses ~10^26, so it is **10^31 short** and directional | §1.0.4 |
 | Relative timestamps are why §1.3's rule survives a scale nobody designed for | §1.0.4, §4.6.3 |
+| The intermediate scale is a **torus Dyson swarm** — 2^18 elements, so **inside** DeLawson's addressing | §1.0.5 |
+| Its load-bearing property is **neighbours stay neighbours**, which is what lets placement never be revisited | §1.0.5 |
+| The AI workload bounds one store to a **few km** — the light-radius of a 100 µs thinking cycle | §1.0.5 |
 | Every append records its **durability second**, so time-range queries work indefinitely — distinct from the minutes-long SCN snapshot horizon | §9.7 |
 | **User code only on Compute; keys never where user code runs** | §1.5 |
 | The real boundary is **signed executables**, not absence of keys — which makes code signing load-bearing | §1.5 |
@@ -407,14 +411,17 @@ across a compact subset and 13 s across the whole.
 
 **Quantifying the gap is more useful than admiring it.** Three scales, and they are far apart:
 
-| | Nodes | Bits | Where |
+| | Elements or nodes | Bits | Where |
 |---|---|---|---|
-| Ship gate | 100,000 | ~10^21 | §1.4.0, issue #26 |
-| Addressable by design | 2^32 = 4.3 × 10^9 | ~7 × 10^25 | §5.10 |
-| The ambition | — | 1.2 × 10^57 | this section |
+| Ship gate | 100,000 nodes | ~10^21 | §1.4.0, issue #26 |
+| Addressable by design | 2^32 = 4.3 × 10^9 nodes | ~7 × 10^25 | §5.10 |
+| **Torus Dyson swarm**, as simulated | 32 rings × 8,192 = **2^18** elements | — | §1.0.5 |
+| The dense core | — | 1.2 × 10^57 | this section |
 
 So DeLawson's addressing tops out about **10^31 short** of the dense core. **Derived.** It is not the design
 that goes there, and saying so plainly is more useful than a hedge — the target is directional.
+
+**The intermediate scale is a different story**, and it is the one worth taking seriously — see §1.0.5.
 
 **But two parts of the design already come from the ambition, and that is why they look odd.**
 
@@ -434,6 +441,59 @@ structure. Against §1.0.3's 100 µs thinking budget, a mind cannot think across
 **DeLawson is one memory store among many, not the global memory** — and moving memories between stores,
 which the AI page describes as needing back-and-forth verification and questioning, is asynchronous, distinct,
 and out of scope per §2.
+
+#### 1.0.5 The intermediate scale, and the one property DeLawson actually needs from it
+
+Between today's data centers and the dense core sits Bob's [torus-shaped Dyson
+swarm](https://burtleburtle.net/bob/scifi/dyson.html) (Cited): satellites in elliptical orbits whose orbital
+planes are rotated about an axis through the star but outside the orbital plane, sweeping out a torus.
+
+**The load-bearing property is not the scale — it is that neighbors stay next to neighbors.** All satellites
+share the same period, so the torus surface can be covered without collisions and **relative positions are
+stable**, which is what makes tethers and mass exchange between neighbours possible at all rather than
+requiring high-velocity rendezvous. Compared with a spherical swarm it also avoids the collapse at the poles
+and the high-speed near-misses.
+
+**And it already exists at small scale.** Starlink is one of these torus swarms, around Earth, keeping
+neighbours next to neighbours, with the northward and southward paths separated by a few kilometres — so a
+very flattened torus (Asserted, Bob, 2026-08-16). That matters for how much weight to put on this row of the
+table: the intermediate scale is engineering rather than speculation.
+
+**Why a storage design should care.** §5.6.7 fixes placement at write time and **never revisits it**, and
+§5.6.8 accepts that the fleet's realized independence is whatever the rules allowed when each extent was
+written. That only works if the **failure-domain hierarchy is stable**. §13.1.10 already treats a disk being
+rehomed to a different rack as an event that can invalidate an otherwise untouched placement — and in a naive
+orbiting swarm, *every* neighbour relation churns continuously, so the hierarchy would never settle and
+placement would need constant re-verification.
+
+> **A neighbour-preserving topology is what makes "decide placement once and never revisit it" survive a
+> moving substrate.** It is the orbital-mechanics analogue of §5.6.2's requirement that domains be nested
+> rather than orthogonal.
+
+**Two numbers that make this concrete rather than decorative. Derived.**
+
+**The simulated swarm has 2^18 elements, and DeLawson addresses 2^32 nodes.** So unlike the dense core, this
+scale is *inside* the design's addressing — with room for ~16,000 nodes per element before the 32-bit
+identifiers of §5.10 run out. A coincidence of magnitudes rather than a design, but it identifies which of
+the four rows above DeLawson is actually built for.
+
+**A memory store is bounded by the light-radius of the thinking cycle.** §1.0.3 derives a 100 µs budget per
+remember-test cycle, and 100 µs of light is **30 km** in vacuum, ~15 km for a round trip, and ~5 km in fibre
+at 2/3 *c* before any switching latency. So:
+
+| | Diameter |
+|---|---|
+| One store, for the AI workload | **a few km** — a campus, not a metro |
+| Starlink's north/south path separation | a few km |
+| Dense core, compact subset | 1.2 light-seconds = 360,000 km |
+
+That is why the AI page insists on **multiple** memory stores rather than one, and it puts a physical bound on
+how large a single DeLawson cluster can usefully be *for this workload*: a metro-spanning cluster would break
+the thinking loop even though it would serve §1.4's batch workloads perfectly well. The neighbour-preserving
+topology is then what lets many such stores tile a structure far larger than any one of them.
+
+⚠️ Nothing in §5 currently bounds a cluster's physical diameter, and for the motivating workload there is one.
+Whether that belongs in the design or in deployment guidance is undecided.
 
 ### 1.1 Availability and reliability are separate goals
 
@@ -7145,6 +7205,11 @@ Roughly in order of how much else depends on them.
 104. **Whether regrouping is worth its parity rewrite** (§8.1.4.4, §13.5.1). If groups are formed promptly and
      optimized later, the optimization means recomputing parity over a whole group. That may cost more than
      the co-deletion and size-binning it buys.
+
+105. **Whether a cluster's physical diameter should be bounded in the design** (§1.0.5). The AI workload's
+     100 µs thinking cycle gives a light-radius of a few kilometres, so a metro-spanning cluster would break
+     it while serving §1.4's batch workloads perfectly. Nothing in §5 bounds diameter today. Design
+     constraint, or deployment guidance?
 
 **Closed** since earlier drafts:
 
