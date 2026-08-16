@@ -51,7 +51,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-116 things *not* decided.
+120 things *not* decided.
 
 **Priorities and framing**
 
@@ -86,6 +86,14 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Shared domains is why a coordinator is needed **and** why its per-SN ceiling rarely binds | §13.4.4.1 |
 | A **tree of coordinators rooted at SN0**; two levels covers any real cluster | §13.4.4.2 |
 | Recurring idiom: **a set of floors is a partition of a total** and must be validated as one | §13.4.4.3 |
+| Sum the minimums to **a half or a third** of the total | §13.4.4.4 |
+| **Pure proportional allocation is pessimal**: every SN finishes simultaneously, so nobody recovers early | §13.4.4.4 |
+| The floor staggers completion, so **whole users recover early** — worth more than partial recovery (§4.3.3.3) | §13.4.4.4 |
+| Its cost is a **cap-limited tail**, which gives the per-SN maximum a second job | §13.4.4.4a |
+| **Georeplication is a ship requirement**, and the only answer to §4.3.3.1's dominant loss term | §13.4.5 |
+| It costs **1 at each end**, plus WAN — the first purpose the scalar ball bin cannot express | §13.4.5.1 |
+| Re-encrypt at the **destination**; instances need not be byte-identical across clusters | §13.4.5.2 |
+| Durability seconds must survive the trip; **`(path, record number)` is the portable name**, not the `DnId` | §13.4.5.3 |
 | **Priority is door height, not a sort**: round-robin plus thresholds, so no heap over 2^31 items | §13.4.3.3 |
 | Two doors per purpose: a **floor** admitted readily, then competition for the surplus | §13.4.3.1 |
 | **Every door is below 10% remaining** — 1% for high priority, 9% for low; the bin runs nearly empty by design | §13.4.3.5 |
@@ -6849,6 +6857,8 @@ repair is scheduled its cost is **removed** from the available pool; when it com
 | EC global solve, `m` = 7 | 45 | 7 | 52 |
 | Vacating an EN scheduled to go down | 1 | 1 | 2 per extent, x very many |
 | **Reconstruct for read**, discarding the result (§9.8.2) | 45 | **0** | 45 |
+| **Georeplication**, receiving (§13.4.5) | 0 | 1 | 1, plus WAN |
+| **Georeplication**, sending (§13.4.5) | 1 | 0 | 1, plus WAN |
 
 **Derived** from §4.3.3.2d, and SN can estimate every one of these because it knows the instance state and the
 group's shape. The 26x spread between a copy and a global solve is the range the thresholds below have to
@@ -7096,6 +7106,139 @@ when proportions change fastest.
 Note also that the cluster figure being arbitrated is a **network cross-section**, not a sum of NICs.
 §4.3.2.2a's warning applies: a spine oversubscription ratio divides the total that the coordinator has to give
 away.
+
+#### 13.4.4.4 What the minimum buys: users recovered early, at almost no cost
+
+**Set the sum of minimums at about a half to a third of the total** (Asserted, Bob, 2026-08-16). Then watch a
+failed rollout delete 5% of the cluster (§13.2).
+
+**Before.** Not all bandwidth is handed out. SNs with work are running at up to **20x their minimum**, because
+the surplus has few claimants.
+
+**At the onset.** Every SN's demand suddenly exceeds its minimum, so every floor is claimed. With the minimums
+summing to a third, the remaining two thirds spread over everyone is **about 2x the minimum each** — so every
+SN drops to roughly **3x its minimum**, down from 20x. **Derived.**
+
+**Then the cascade.** SNs are not equal: §5.11 fills older SNs and redirects writes to newer ones, so an SN's
+repair work is proportional to the data it holds, and the 5% loss hits all of them evenly. So **small SNs finish
+long before big ones.** A finished SN asks for only the work it needs, far below its minimum — and the formula's
+`min(work_requested, minimum)` term hands the rest back rather than reserving it. That bandwidth flows to the
+SNs still working, whose share climbs in an accelerating progression — 3x, 5x, 8x, 13x, back to 20x their
+minimum — until they finish too.
+
+**What this buys is the recovery-time *distribution*, and the effect is larger than it looks. Derived:**
+
+> Under **pure proportional** allocation, share ∝ work, so every SN's completion time is `ΣW / T` — **they all
+> finish at exactly the same moment.** Nobody is recovered until everybody is.
+
+That makes pure proportional allocation *pessimal* for the metric that matters, and the floor is what breaks the
+tie. Since §1.1 promises availability **per record** rather than per cluster, and §1.4.1 makes a job's latency
+the maximum over its requests, a user whose data all sits on small SNs goes from "recovered at the very end" to
+"recovered early" — and their max drops with it.
+
+**And §4.3.3.3 explains why completing *some* users fully beats partially completing all of them.** A
+fully-recovered user is unambiguously fine; a 95%-recovered user may consider the remainder unsalvageable. So
+the staggered distribution is not merely nicer, it converts users from *possibly ruined* to *definitely fine*,
+one SN at a time.
+
+##### 13.4.4.4a The honest cost: the cap lengthens the tail
+
+Bob's account says total recovery finishes when the big SNs finish, so the minimum rule is free — "unless they
+are capped by the bandwidth where they would DOS themselves". That caveat is the whole cost, and it is worth
+stating precisely because the mechanism looks free otherwise.
+
+**Utilization is what determines total time.** Total work `ΣW` over total bandwidth `T` gives `ΣW / T` *provided
+the bandwidth stays fully used.* The reallocation above keeps it fully used while enough SNs still have work.
+But two things happen together at the end:
+
+- floors diverted bandwidth away from big SNs mid-recovery, so they have **more work left** at the end than pure
+  proportional would have left them;
+- by then **few SNs remain**, and each is limited by the per-SN maximum of §13.4.4.
+
+So if `k` SNs remain, each capped at `C`, utilization is `kC / T`, and the tail runs at that fraction. **Pure
+proportional has no such tail**, because everyone finishes together. So the minimum rule does not cost nothing —
+it trades a **longer tail for much earlier completion of most users.** Almost certainly the right trade, given
+§4.3.3.3, but it should be recorded as a trade rather than as a free lunch.
+
+**It also gives the per-SN maximum a second job, and a way to set it.** §13.4.4 introduces the cap purely as
+self-DOS protection. Here it turns out to bound the recovery tail: a higher cap shortens the tail and a lower one
+lengthens it. So the cap is not "as low as is safe" — it is the largest value an SN can absorb without damaging
+its foreground work, which makes §16 question 116 a measurement worth doing rather than a policy to be guessed.
+
+### 13.4.5 Georeplication is another large consumer of bandwidth, and a ship requirement
+
+**Georeplication from other clusters is required before going public** (Asserted, Bob, 2026-08-16), and it is a
+major bandwidth purpose alongside repair.
+
+**The design already proved it necessary and had not listed it as a requirement.** §4.3.3.1's arithmetic shows
+expected loss is dominated by whole-cluster disasters for *any* in-cluster code, and §4.3.4.2 reaches the same
+place from the song: erasure coding stops hardware leaks but not administrators. So georeplication is the only
+answer to the dominant loss term, and everything in §4.3 is a second-order refinement by comparison. Promoting it
+to a ship gate corrects an omission rather than adding a feature.
+
+#### 13.4.5.1 It is the first purpose that consumes a different resource
+
+§13.4.3's bin holds one kind of ball: extent reads plus writes against the intra-cluster network cross-section.
+Georeplication does not fit that shape.
+
+| | Source cluster | Destination cluster |
+|---|---|---|
+| Reads the extent | **1** | — |
+| Writes the extent | — | **1** |
+| WAN bandwidth | shared, and neither cluster's local resource | |
+
+**So a georeplicated extent costs 1 at each end rather than 2 at one end** (Derived) — and the binding resource
+may be the WAN link, which appears in neither cluster's cross-section figure.
+
+⚠️ **That makes the allocation multi-dimensional, and §13.4.3/§13.4.4 are scalar.** A single number cannot
+express "plenty of WAN, no local write bandwidth" or the reverse, and both states occur. Either the coordinator
+arbitrates a vector, or georeplication is admitted against whichever resource is scarcer with the other treated
+as a constraint. This is the first place the one-dimensional ball bin is inadequate, and it will not be the last.
+
+**WAN is also the most expensive bandwidth in the system.** §1.0 puts cloud egress at 48x the monthly cost of
+storing the data it moves. Whatever the transit arrangement between two clusters, §12.1 requires georeplication
+to be billed on the resource that actually binds — and that is the one term in §12 where the price per byte moved
+dwarfs the price per byte stored.
+
+#### 13.4.5.2 Crossing a cluster boundary crosses a key boundary
+
+§7.3 scopes keys by SN and by day precisely to bound blast radius, and §7.3.1 makes that scoping
+two-dimensional. A second cluster is outside all of it.
+
+| Approach | Problem |
+|---|---|
+| Share master keys between clusters | destroys §7.3.1's blast-radius argument, and the second cluster exists to be independent |
+| Re-encrypt at the source before sending | needs plaintext and CPU on a signed-code machine — §7.2.2's homeless job |
+| **Send over the encrypted wire, re-encrypt at the destination** | destination ENs already hold keys and run signed code (§1.5, §5.9.2) |
+
+The third looks right and costs least. Its consequences: instances are **not** byte-identical across clusters,
+which is fine because EC groups are per-cluster (§4.3.2.3); and the same logical data occupies different physical
+bytes in each cluster, so §12.3's physical billing legitimately differs between them.
+
+⚠️ **Compression may or may not survive the trip.** If the destination's media class matches, the source's
+compressed blocks ship as-is and save WAN bandwidth. If it does not, §7.4.2 makes compression block size a
+durable, media-specific property — so cross-media georeplication requires recompression, which is §7.2.2's
+missing machine yet again.
+
+#### 13.4.5.3 What must survive the trip, and one thing that currently cannot
+
+**Durability timestamps must be preserved.** §9.7's per-extent durability second is a property of *the data*, not
+of the cluster that holds it. If a replica re-stamped on arrival, §9.7's time-range queries would answer
+differently on each cluster and §1.0's "what did I do last Tuesday" would depend on which replica you asked.
+
+⚠️ **But identity as defined cannot survive it.** §4.6.3 makes ownership part of the name — a stream is
+`(DnId, StreamId)`, an extent is `(SnId, ExtentId, creation second)` — and those ids are **cluster-local**. Two
+clusters will collide. So either identity gains a cluster component, or replicated data is re-identified on
+arrival.
+
+**Re-identifying breaks §1.0's central promise at exactly the wrong moment.** The whole point of §1.0's stable
+record numbers and keys is that external indexes never need rebuilding — and a failover to the second cluster is
+precisely when a user cannot afford to rebuild every index they own.
+
+**The resolution is probably that the durable user-visible name is the path, not the `DnId`.** §5.1 gives objects
+a directory hierarchy, and a path is cluster-independent. So `(path, record number)` and `(path, key)` survive
+georeplication where `(DnId, ObjectId, record number)` does not. That deserves to be stated as the rule rather
+than left implicit, because §4.6.3 currently reads as though the id *is* the name.
 
 ### 13.5 Metadata snapshots, and the jobs that run over them
 
@@ -7788,6 +7931,21 @@ Roughly in order of how much else depends on them.
 116. **The values of the per-SN minimum and maximum** (§13.4.4). The minimum is bounded by the partition
      constraint above; the maximum is set by how much repair an SN can schedule before damaging its own
      foreground work, which is a measurement rather than a policy.
+
+117. **Whether the bandwidth allocation must be multi-dimensional** (§13.4.5.1). Georeplication consumes WAN
+     bandwidth plus one local write, where repair consumes the intra-cluster cross-section. A scalar bin cannot
+     express "plenty of WAN, no local write bandwidth". Arbitrate a vector, or admit against the scarcer
+     resource with the other as a constraint.
+118. **How georeplicated data is identified** (§13.4.5.3). §4.6.3 makes `DnId` and `SnId` part of the name, and
+     those are cluster-local, so two clusters collide. Add a cluster component to identity, or re-identify on
+     arrival — and re-identifying breaks §1.0's index-stability promise at failover, which is when it matters
+     most. The likely answer is that the portable name is the **path**, which needs stating in §4.6.3.
+119. **What georeplication's unit and policy are** (§13.4.5). Per object, per directory, or per stream; which
+     clusters pair with which; whether replication is symmetric; and how a reader chooses a replica. None of
+     this is designed, and it is now a ship gate.
+120. **Whether compressed blocks ship as-is across clusters** (§13.4.5.2). They can when media classes match,
+     saving WAN bandwidth; they cannot when they differ, since §7.4.2 makes compression block size durable and
+     media-specific — which needs recompression, and §7.2.2 has nowhere to run it.
 
 **Closed** since earlier drafts:
 
