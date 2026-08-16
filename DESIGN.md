@@ -312,8 +312,11 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **No dithering of deletes**: the outstanding-delete limit already defers, and only when saturated | §8.5.1a |
 | Back-pressure beats pre-emption whenever the pressure can be **measured** — §13.4.3.6's shape again | §8.5.1a |
 | But **back-pressure fixes load; only dithering fixes phase** — so *do* dither recurring per-pair work | §13.1.9.1 |
-| **Dither SN/EN cold syncs** from a hash of `(SnId, EnId)`: reimaging aligns them, and the spike would recur forever | §13.1.9.1 |
+| **Dither every recurring per-pair loop** — SN/EN warm, SN/EN cold, DN/SN — from a hash of the pair's ids | §13.1.9.1 |
+| Alignment is the **default**, not an incident: things are created in batches, and cold start aligns everything | §13.1.9.1 |
+| Aligned peak-to-mean ≈ **period / sync duration**, so the rarest loop (DN/SN) has the worst pathology | §13.1.9.1 |
 | Deterministic, not random, so a **mass restart cannot re-align** them | §13.1.9.1 |
+| §13.1.10's hourly verification budget **depends** on dithering; it is a precondition, not an optimization | §13.1.9.2 |
 | **DN owns expiry**, via a secondary keyed index on **expiry second** — a prefix scan, no sweep | §8.5.1b |
 | Costs ~5% more DN metadata and one insert per creation; **removes a correctness hole**, which decided it | §8.5.1b.0, §8.5.1b.2 |
 | So **one** mechanism smooths deletion load, not three | §8.5.1b.2 |
@@ -7214,50 +7217,87 @@ out-of-band run of that pass.**
 critical path for the largest repair event. 200 s is fine; 2,000 s would not be. That is the number §5.6.10's
 measurement should report first.
 
-##### 13.1.9.1 Dither the phase of cold syncs, per pair
+##### 13.1.9.1 Dither the phase of every recurring per-pair loop
 
-**Do dither SN/EN cold syncs** (Asserted, Bob, 2026-08-16). When an EN is reimaged it loses local state, so every SN
-holding instances there must begin a full cold enumeration — and they all begin it **at the same moment**. With a
-fan-out reaching thousands of SNs per EN (§5.10), that is a large simultaneous load on the one machine least able to
-absorb it.
+**Dither the SN/EN cold syncs, the SN/EN warm syncs, and the DN/SN syncs** (Asserted, Bob, 2026-08-16). That covers
+every recurring per-pair loop in §13.1, so it is one rule rather than three exceptions:
 
-**The problem is not the size of the spike. It is that the spike repeats forever.** All those pairs are now in phase,
-so every subsequent cold-sync period they fire together again. Nothing in the system pulls them apart.
-
-**Which is exactly why §8.5.1a's answer does not apply here**, and the two cases are worth contrasting because the
-rules look contradictory and are not:
-
-| | Expiry deletes (§8.5.1a) | Cold syncs (here) |
+| Loop | Period | Pairs |
 |---|---|---|
-| Work shape | **one-shot** — each expiry happens once | **recurring**, per (SN, EN) pair |
-| Does the spike self-perpetuate? | no; the queue drains and it is over | **yes** — phase alignment persists indefinitely |
-| Cost of dithering | delayed reclamation, and §12.8.2 bills for the delay | **~none** |
+| SN/EN liveness (warm) | ~1 minute | one per EN in the fan-out |
+| SN/EN per-instance sync | ~1 hour | one per EN |
+| SN/EN cold sweep | hour to week (§13.1.9) | one per EN |
+| DN/SN sync | day to month (§13.1.3) | one per SN |
+
+**Why alignment happens.** An EN reimage restarts every cold sync against that EN at the same instant. But that is
+only the most visible cause — **things are created in batches**, so alignment is the *default* rather than a rare
+event:
+
+- cluster cold start (§5.5.1.1) begins every loop at once, so a fresh cluster is entirely in phase;
+- a cluster expansion brings up a batch of SNs or ENs together;
+- a rolling deployment restarts a domain's worth of processes together.
+
+So an un-dithered system is not "occasionally aligned by an incident". Its **initial condition is aligned**, and
+nothing pulls it apart.
+
+**Why the spike is the wrong thing to worry about.** §8.5.1a rejects dithering for expiry deletes and this section
+requires it here; the rules only look contradictory:
+
+| | Expiry deletes (§8.5.1a) | Recurring syncs (here) |
+|---|---|---|
+| Work shape | **one-shot** — each expiry happens once | **recurring**, per pair |
+| Does the spike self-perpetuate? | no; the queue drains and it is over | **yes** — the phase persists indefinitely |
+| Cost of dithering | delayed reclamation, and §12.8.2 bills for it | **~none** |
 | Right answer | **back-pressure**: defer under load, free when idle | **dither the phase** |
 
-> **Back-pressure fixes load. Only dithering fixes phase.** They are not alternatives, and neither substitutes for
-> the other: dither so the steady state is spread, and let back-pressure absorb whatever transient remains.
+> **Back-pressure fixes load. Only dithering fixes phase.** Neither substitutes for the other: dither so the steady
+> state is spread, and let back-pressure absorb the transient that remains.
 
-**Dithering costs nothing here**, which is the other half of the difference. A cold sweep's timing is arbitrary — it
-exists to catch what the warm path missed (§13.1.9), so shifting any one pair by up to a period changes only the
-detection latency for silent corruption, which is already period-scale. Delaying a *delete* costs the customer real
-money; delaying an audit costs nothing.
+**The longest-period loops are the worst affected and the hardest to diagnose.** When *N* pairs are aligned, the
+instantaneous load is *N* syncs at once against a spread of *N* per period, so the peak-to-mean ratio is
+approximately **period / duration of one sync** (Derived; the durations below are guesses):
 
-**Dither deterministically, from a hash of `(SnId, EnId)` into the period.** Not from a random draw, for a reason
-that matters more than it looks:
+| Loop | Period | One sync | Aligned peak-to-mean |
+|---|---|---|---|
+| Warm liveness | 1 min | ~1 ms | ~6 × 10^4 |
+| Cold sweep | 1 week | ~1 s | ~6 × 10^5 |
+| **DN/SN** | 1 month | ~1 s | **~2.6 × 10^6** |
 
-- **Deterministic is stable across restarts**, so a mass restart — a rolling deployment, or the very reimage that
-  caused the problem — cannot re-align anything. A per-process random offset would spread correctly and then
-  re-randomize on every restart, giving up predictability for nothing.
+So DN/SN — the loop it would be most tempting to leave alone, being the rarest — has the worst pathology. It is also
+the one where the cause is least likely to be noticed, since observing the pattern takes a month. **That is the
+argument for dithering by default rather than in response to a measurement.**
+
+**Dithering costs nothing on any of these loops.** A sync's timing is arbitrary: §13.1.9 says the cold sweep exists to
+catch what the warm path missed, so shifting one pair by up to a period changes only the detection latency for silent
+corruption, which is already period-scale. Delaying a *delete* costs a customer money; delaying an audit costs
+nothing.
+
+**Dither deterministically, from a hash of the pair's identifiers** — `(SnId, EnId)` or `(DnId, SnId)` — into the
+period. Not from a random draw, for a reason that matters more than it looks:
+
+- **Deterministic is stable across restarts**, so a rolling deployment, or the very reimage that caused the
+  alignment, cannot re-align anything. A per-process random offset spreads correctly and then re-randomizes on every
+  restart, giving up predictability for no gain.
 - **Both ends can compute it**, so the schedule needs no negotiation and fits §13.1.4's one-message-per-pair,
   driven-from-above shape.
-- It is legible when debugging, which §4.6.3 gives as the reason for preferring a clock to a counter.
+- It is legible when debugging, which is §4.6.3's stated reason for preferring a clock to a counter.
 
-**The same treatment belongs on the warm loop**, for the same reason and at lower stakes: all SNs polling one EN on
-the same second is a smaller spike at a one-minute period, but it costs nothing to spread and the alignment arises
-from the same reimage event.
+**Implement it once, at the scheduling layer**, keyed on the pair and the period — not separately in each loop.
+There are four loops today and the fifth will forget.
 
-⚠️ Cluster-wide singletons need none of this. §13.5's snapshot, §12.8's billing and §5.6.8's audit are one job each,
-not one per pair, so there is no phase to align — and §5.12.6 reserves compute for them explicitly.
+##### 13.1.9.2 §13.1.10's cost estimate depends on this
+
+Worth making explicit, because it is a dependency and not a bonus. §13.1.10 concludes that unconditional verification
+is affordable at hourly cadence — 0.5-5% of a core — on the grounds that "the work spreads across the hour instead of
+arriving as a burst". **That spreading is exactly what dithering provides.** Without it, every EN reports at the same
+moment and the hourly pass arrives as the un-amortized 20-200 s burst that §13.1.10 rejects at one-minute cadence.
+
+So dithering is a **precondition** for the verification cadence, not an optimization applied afterwards.
+
+⚠️ One minor consequence for §13.4.4: with phases spread, no two SNs' work reports come from the same instant, so the
+coordinator sees a rolling picture rather than a synchronized one. That is smoother and therefore better, but it
+compounds the staleness §13.4.4.3 already flags — a proportional share is computed from reports taken at different
+times as well as at different ages.
 
 ### 13.2 Recovering from a failed rollout
 
