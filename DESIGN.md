@@ -51,7 +51,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-108 things *not* decided.
+109 things *not* decided.
 
 **Priorities and framing**
 
@@ -76,7 +76,11 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Aggregate demand plausibly **exceeds one cluster**, which is a second reason for multiple stores | §1.0.3 |
 | Depth is **per tier**, so the depth/breadth trade is really a **tiering** problem — DeLawson is one tier | §1.0.3.1 |
 | DeLawson spans **8 orders of magnitude** of read latency internally and exposes none of it | §1.0.3.1 |
-| A reconstruction read costs ~5 reads, so §12 should charge ~5× for it | §1.0.3.1, §4.3.3.2d |
+| **No reconstruct-for-read**: repair the whole group within the timeout, or flag it hot and fail | §9.8 |
+| Because reconstructing for a read **does work the system does not persist** | §9.8, §1.6.4 |
+| The **user sets the read timeout**, making availability-versus-latency their choice | §9.8 |
+| Repair priority takes a third input: **read demand**, +1 global read applied after the swap | §13.4.0, §9.8 |
+| So there is no expensive read to meter, and read billing can stay flat | §9.8.1 |
 | The scale ambition is ~10^57 bits; DeLawson addresses ~10^26, so it is **10^31 short** and directional | §1.0.4 |
 | Relative timestamps are why §1.3's rule survives a scale nobody designed for | §1.0.4, §4.6.3 |
 | The intermediate scale is a **torus Dyson swarm** — 2^18 elements, so **inside** DeLawson's addressing | §1.0.5 |
@@ -1192,7 +1196,22 @@ It also means **the essential work per operation has to be written down** before
 means anything. That is a real obligation, and it is where this rule does its work: naming the essential
 work is what exposes the inessential.
 
-#### 1.6.4 Two dividends
+#### 1.6.4 Work that is not persisted will be done again
+
+A corollary sharp enough to be worth its own name, and §9.8 is the case that produced it:
+
+> **Prefer doing more work once, and keeping it, over doing less work repeatedly and discarding it.**
+
+Reconstructing an erasure-coded cell to satisfy one read costs 5-45 reads and leaves nothing behind; repairing
+the whole group costs the same order and leaves the group repaired. Under §1.6's rule the first is the clearer
+violation, because the hardware is spent and the fraction of *durable* benefit is zero.
+
+This is not the same as "cache everything" — the persisted work has to be work someone will want again. It is
+the reason §13.5's snapshots are worth their 0.08%, and the reason §9.6 caches hot objects rather than
+recomputing them. Where it bites hardest is anywhere a read path is tempted to compute something it could
+instead have written down.
+
+#### 1.6.5 Two dividends
 
 **Fraction-of-bound targets survive hardware changes; absolute targets do not.** §7.4 expects a decade-long
 media transition and §1.3 expects the cluster to run indefinitely, so "2M QPS" ages badly where "5% of
@@ -5503,6 +5522,62 @@ exactly as good as the binary search it replaced.
 Per-object intervals are what make §8.6.3's directory-level time-range query cheap, since fan-out then only reaches
 objects whose interval overlaps the requested range.
 
+### 9.8 A read that would need reconstruction does not reconstruct
+
+**Policy: there are no reconstruct-for-read operations** (Asserted, Bob, 2026-08-16). If a read needs a cell
+that is missing, the system does **not** rebuild just that cell to satisfy the read.
+
+The reason is throughput, and it generalizes:
+
+> **Reconstructing for a read does work the system does not persist.** Five to forty-five reads are spent, one
+> read is served, and nothing is left behind — so the next read of the same cell pays it again.
+
+Instead, three things happen:
+
+1. **Repair the whole group, if that fits within the timeout.** Repairing persists the work, so the cost is
+   amortized over every future read of the group instead of charged to this one. The read then succeeds from
+   repaired data.
+2. **Otherwise flag the EC group as hot.** That bumps its repair priority by **one global read**, applied
+   *after* §13.4's 0-global-versus-1-global swap, and puts it in a queue for immediate reprocessing by GC.
+3. **If the bumped priority still does not meet the bar, it waits for the next GC pass.**
+
+**The user sets the timeout** (Asserted, Bob), which makes the choice theirs: a long timeout says *I will wait
+for the group to be repaired*, a short one says *fail fast*. That is §1.1's argument — availability includes
+waiting for a timeout — turned into a per-request control rather than a system-wide constant.
+
+**Why bumping *after* the swap is exactly right.** §13.4 deliberately deprioritizes the `g = 1` class so that
+it evolves into cheaper, higher-priority states, and the justification for that deprioritization is that
+**nobody is waiting.** A hot flag is the statement that somebody is. So the swap encodes absence of demand and
+the bump encodes its presence, and applying the bump afterwards is what keeps both arguments intact. A `g = 1`
+group flagged hot jumps from last place into the descending region — the largest single move the priority
+function can make, which is appropriate since it is the only class where demand and cost disagree.
+
+#### 9.8.1 Three consequences worth stating
+
+**It sharpens what §4.3.2.4's "usually available" means.** Not "slower to read" — a read of a missing cell in
+the 1.333x tier **fails, or waits for repair**, at the user's choice. So the availability difference between
+the two EC variants is a difference in *time to first successful read*, and §12.7.2.1a's minutes-versus-days
+figure is a repair-queue latency, not a reconstruction latency.
+
+**It removes the expensive read**, which resolves most of §16 question 108. If reads never reconstruct, then
+every read is either cheap (data present) or unserved — there is no 5x-cost read to meter, so read billing can
+stay flat and §12.6.2 needs no tier term. The expensive work is repair, which is system work benefiting every
+future reader. ⚠️ The one exception is case 1 above: a user with a long timeout triggers a whole-group repair,
+so they pay latency for work that benefits everyone else. Whether that is charged, unpriced, or credited is
+undecided.
+
+**It closes a read-amplification attack.** Without this policy, repeatedly reading a degraded group would force
+45 reads each time — a 45x amplifier available to any caller. With it, the first attempt triggers one repair and
+every later read is cheap.
+
+⚠️ **Does the hot bump accumulate?** If a hundred readers hit the same degraded group, a single +1 may still
+leave it below the bar, and it starves while demand mounts. Accumulating the bump makes read demand a real
+weight; not accumulating keeps §13.4's ordering simple and bounded. A decaying accumulation is the obvious
+compromise and is not obviously correct. Undecided.
+
+Note that §9.5's hedging cannot help here: at 1.333x there is one instance to read, so there is no second
+target to hedge to. Hedging is a 2.333x-tier mechanism (§4.3.2.4).
+
 ## 10. Compaction
 
 Compaction reads a base plus its log and writes a fresh base with updates
@@ -6640,6 +6715,21 @@ binds.
 
 **Turbo codes have the same pattern** with different constants (§4.3.3.2d), so the policy is not code-specific.
 
+#### 13.4.0 Read demand is the third input to priority
+
+The priority function takes three things, not one:
+
+| Input | From | Effect |
+|---|---|---|
+| `g`, global repairs needed | §4.3.3.2d | the base ordering, with the `g = 1` swap |
+| unavailability duration | §13.4.2 | separates transient from permanent, replacing a timeout |
+| **read demand** | §9.8's hot flag | **+1 global read, applied after the swap** |
+
+Demand belongs there for the same reason cost does: a group somebody is trying to read is a group whose repair
+delivers more value per byte moved. And it is what makes §9.8's refusal to reconstruct-for-read acceptable —
+without a demand term, a degraded group nobody has prioritized could stay unreadable indefinitely while the
+queue works on groups at lower risk.
+
 #### 13.4.1 The greedy order and the throughput-optimal order disagree
 
 Strictly by marginal risk reduction per byte read, a `g = 1` group is ~1/f times more likely to lose data than a
@@ -7317,15 +7407,20 @@ Roughly in order of how much else depends on them.
      disk, electricity and rent; in orbit, power is abundant and launch mass and heat radiation bind. §12.1's
      principle is unaffected, which is the point of it being a principle — but §12.7's whole chain to a price
      per byte would need rebuilding. Not near-term unless StarMind is.
-107. **Whether a read's latency tier is visible to the caller** (§1.0.3.1). DeLawson spans eight orders of
-     magnitude from an inlined tiny object to a reconstruction read, and a caller managing a depth budget
-     wants to know which it will get *before* issuing the read. §9.5's timeouts and hedging address the
-     consequences of a slow read, not the choice to avoid one. Candidates: an advertised tier per object, a
-     may-block flag on the request, or a fast-path-only mode that fails rather than waits.
-108. **Whether reads are billed by tier** (§1.0.3.1). A reconstruction read costs about five reads
-     (§4.3.3.2d) and a cached read costs almost nothing. §12.6.2 prices request rate without regard to tier,
-     which under-charges precisely the expensive reads — §12.2's failure mode relocated.
+107. **Whether a read's latency tier is visible to the caller** (§1.0.3.1). §9.8's user-settable timeout is
+     the actionable half — a caller can bound exposure without knowing the tier in advance — but it still
+     cannot *choose* the fast path. Candidates: an advertised tier per object, or a fast-path-only mode that
+     fails rather than waits. Note §9.8 already makes the latter nearly free, since a degraded read fails
+     anyway.
+108. **Whether a user-triggered whole-group repair is charged** (§9.8.1). A long timeout means one caller
+     pays latency for work that benefits every future reader. Charged, unpriced, or credited — and if
+     charged, it is the one read that is not flat.
+109. **Whether §9.8's hot bump accumulates** (§9.8.1). A single +1 global read may leave a heavily-read
+     degraded group below the bar, starving it while demand mounts. Accumulation makes read demand a real
+     weight; no accumulation keeps §13.4's ordering bounded. A decaying accumulation is the obvious
+     compromise and is not obviously right.
 
+**Closed** since earlier drafts:
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
@@ -7397,6 +7492,10 @@ Roughly in order of how much else depends on them.
   also removes the motive for power as an explicit failure domain (§8.1.4.5);
 - whether the erasure code is a single choice — it is a **catalog** with recommendations,
   and turbo codes suffice for shipping, so the patent is not a release gate (§4.3.2.5);
+- whether reads should be billed by latency tier — mostly moot: §9.8 removes the expensive
+  read entirely, so read billing can stay flat (§9.8.1);
+- what a read does when a cell needs reconstruction — it does **not** reconstruct; it repairs
+  the whole group if the timeout allows, else flags the group hot and fails (§9.8);
 - whether the throughput targets are per box or per cluster — **per box**, and both have
   already been reached on this box, so they are a floor rather than a stretch (§1.4.0);
 - whether the 200k/2M pair is two requirements or one — one, on messaging: the 10x gap
