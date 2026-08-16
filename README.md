@@ -29,6 +29,9 @@ scripts/stop-laws               # stop everything, either flavour
 KS holds the only fixed address in a cluster. `start-laws` hands every other process a
 port, the process announces it to KS, and everything else is found by name.
 
+Everything sent is encrypted, and compressed, in whole batches rather than per message —
+so a batch of small messages compresses even when nothing in it would on its own.
+
 ## Two object flavors
 
 - **Sequential** — variable-length records, appended only at the end,

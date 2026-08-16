@@ -9161,10 +9161,13 @@ random case is back to the no-compression rate exactly, and the 1 KB case is wit
 the sample itself at 4 KB against a 64 KB batch — while keeping the whole of the gain where there is
 something to find.
 
-**The default is still no compression**, because every measurement here is on loopback, where bytes
-are nearly free and only CPU is scarce. That is the wrong bias for a real network, where the 5.5x on
-bare pings would be bandwidth rather than waste, so this default should be revisited on the first
-two-machine measurement rather than kept out of habit.
+**Decided: compression is on by default** (Asserted, Bob, 2026-08-16). What the table shows on
+loopback is the worst case for that choice, because loopback makes bytes nearly free and CPU the only
+scarce thing — and even there the cost of leaving it on is 8% on bare pings and nothing at all on
+large incompressible replies, against 5.5x to 230x fewer bytes when there is anything to find. On a
+real network those bytes are the scarce resource, so the balance only improves. ⚠️ The residual 10%
+on 1 KB incompressible bodies is the sample itself, and it is the number to watch if a workload
+turns out to be mostly small and mostly incompressible.
 
 **What the padding cost had to be measured separately**, because a reply body has to come from
 somewhere: the generator runs at **10.2 GB/s** producing words and **11.1 GB/s** filling a buffer,

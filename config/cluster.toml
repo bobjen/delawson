@@ -34,8 +34,8 @@ send = "adaptive"
 encrypt = true
 
 # Compression, also per batch: a batch of small messages has repetition that any
-# one of them does not. "none" or "lz4".
-compress = "none"
+# one of them does not — headers alone compress 5x. "none" or "lz4".
+compress = "lz4"
 compress_min = 256
 
 # Judge a large batch by its first few kilobytes rather than compressing it all
