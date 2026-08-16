@@ -40,7 +40,7 @@ it was computed or assumed.
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-96 things *not* decided.
+98 things *not* decided.
 
 **Priorities and framing**
 
@@ -62,6 +62,9 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Everything is encrypted **on the wire and on disk**; KS uses 256-bit | §7.2, §7.2.1 |
 | Targets: **200k QPS** small metadata requests, **2M+ batched**, **per box** — both already reached, so a floor | §1.4.0 |
 | The 10× gap says **nine tenths of the unbatched cost is messaging**; the ping ceiling is >64M QPS | §1.4.0 |
+| Those figures are **end-to-end** — durable log write per message, encryption, compression, Nagle off | §1.4.0.1 |
+| **Batching subsumes io_uring** on the network path: batching gave all the gains, io_uring was a regression | §1.4.0.1 |
+| Read requests are logged because §12 requires **metering** them; batching is a billing mechanism too | §1.4.0.2 |
 | A cluster may run **indefinitely** and lie dormant for eons — no absolute epochs, no work per elapsed time | §1.3 |
 
 **Object model**
@@ -471,31 +474,72 @@ Bob's instruction budget makes that concrete. Taking **~64 G instructions/sec** 
 | | Instructions per request | Note |
 |---|---|---|
 | Ping — the floor | **< 1,000** | so a pure ping ceiling is **> 64M QPS** |
-| Batched lookup at 2M QPS | ~32,000 | this is `W`, the real work |
+| Batched lookup at 2M QPS | ~32,000 | an **upper bound** on `W` — see §1.4.0.1 |
 | Unbatched lookup at 200k QPS | ~320,000 | `M + W`, so `M` ≈ 288,000 |
 
-**Derived**, from Bob's 64 G figure and the two QPS numbers. Three things follow.
-
-**2M QPS is where an implementation landed, not a ceiling.** The architectural ceiling for
-a trivial request is >64M QPS, and the batched lookup sits **32x** above the ping floor in
-per-request work. How much of those 32,000 instructions is essential is an open and
-answerable question — a random lookup over 20 M objects should cost a handful of cache
-misses, and 32,000 instruction-slots is on the order of eighty. That gap is where headroom
-is, if headroom is wanted.
-
-**It is not memory-bound**, which is worth checking before assuming otherwise: 2M QPS at
-~5 random cache-line touches each is 10M misses/sec, well inside what 16 cores can keep
-outstanding, and ~640 MB/s of traffic against a box that does ~90 GB/s (§7.2.1).
-
-**And `M ≈ 288,000` instructions is the target to attack.** A syscall per request cannot
-reach a fraction of that, so the unbatched path points at io_uring or shared memory (§15's
-calibration table). That is why the first implementation milestone is a ping benchmark
-rather than a feature: the batched number is bounded by `W`, and the unbatched number is
-almost entirely `M`.
+**Derived**, from Bob's 64 G figure and the two QPS numbers — but read §1.4.0.1 before
+treating any of it as a measurement of work.
 
 Note also what these targets are *not*: they say nothing about bulk bandwidth, and they
 are about **metadata**. Bulk data is bounded by disks and the network, and is the subject
 of §1.4.2.
+
+#### 1.4.0.1 What the measured configuration included, and what it rules out
+
+The two figures are **end-to-end, not in-memory-only** (Asserted, Bob, 2026-08-15). The
+measured path included:
+
+- a **durable log write to disk per message** — one write per 1,000-request batch;
+- **encryption**;
+- **message compression**, at the TCP level, with **Nagle disabled**;
+- the lookup itself.
+
+Amortized over 1,000 requests, encryption is ~20 instructions per request at §7.2.1's rate
+and compression a few hundred, so neither is the bulk. But **the log write may be the actual
+ceiling**: 2M QPS at one durable write per 1,000 requests is **2,000 log writes per second**,
+and if each is a sync that is a device requirement, not a CPU one.
+
+So the honest reading of 32,000 is **instruction-slots of wall-clock per request — an upper
+bound on work, not a measurement of it.** A box waiting on `fsync` retires no instructions.
+Whether the batched path is CPU-bound or log-bound is the first thing to determine, and it
+decides whether there is headroom at all.
+
+**Do not reach for io_uring on the network path.** Batching and io_uring amortize the same
+thing — per-request syscall overhead — and in Bob's prototype **batching delivered all of the
+gains and io_uring was a regression** (Asserted, Bob). Once a batch is 1,000 deep there is
+nothing left for io_uring to amortize, and it brings its own cost. Batching was implemented
+*in preparation* for io_uring and made it unnecessary. That negative result is worth keeping,
+because io_uring is the obvious thing to try and trying it costs weeks.
+
+⚠️ **io_uring for EN-to-SSD was still expected to help, and was never tried.** That is a
+different problem — deep queues of independent device reads — and it is exactly §7.1.1's
+observation that §1.4's zillions of tiny parallel requests keep SSD queues deep. Untested,
+positive prior.
+
+**Nagle must be off** wherever batches are built in userspace. Batching and then letting the
+kernel coalesce adds latency to a decision already made.
+
+`M` = 288,000 instructions remains the target for the unbatched path, but the remedy is now
+known to be **batching**, not a faster syscall. That is still why the first milestone is a
+ping benchmark: it establishes `M` for one message, which is what tells you the batch depth
+needed to hide it.
+
+**It is not memory-bound**, worth checking before assuming: 2M QPS at ~5 random cache-line
+touches each is 10M misses/sec, well inside what 16 cores keep outstanding, and ~640 MB/s
+against a box doing ~90 GB/s (§7.2.1).
+
+#### 1.4.0.2 Billing is why a read request is logged at all
+
+Logging a *read* looks like pure overhead until §12 is taken seriously. §12.1 requires
+billing proportional to cost on **every scarce resource**, and §12.6.2 already prices
+metadata request rate — so read requests must be **metered**, and metering that survives a
+crash means a durable record.
+
+So the log write in the measured configuration is not incidental overhead to be optimized
+away: **it is the billing record.** What makes it affordable is exactly the amortization —
+one write per 1,000 requests instead of per request — which makes **batching a billing
+mechanism as much as a throughput mechanism.** The two motives point the same way, which is
+rare enough to be worth noticing.
 
 #### 1.4.1 But job latency is the *maximum* over requests
 
@@ -6678,10 +6722,18 @@ Roughly in order of how much else depends on them.
     SNs; what partial failure means when 1,000 lookups share one message; and whether the batch is a client
     convenience or a wire-level primitive. §9.5's hedging interacts, since a batch's latency is the maximum
     over its members (§1.4.1) and one straggler delays a thousand answers.
-96. **How much of the ~32,000 instructions per batched lookup is essential** (§1.4.0). A random lookup over
-    20 M objects should cost a handful of cache misses; 32,000 instruction-slots is on the order of eighty.
-    The ping floor is under 1,000, so there is a 32x gap. Worth understanding before deciding whether more
-    than 2M QPS is available, since the target is already met.
+96. **How much of the ~32,000 instruction-slots per batched lookup is real work** (§1.4.0, §1.4.0.1). The
+    ping floor is under 1,000, so the gap is 32x — but the figure is wall-clock per request, and question 98
+    may account for most of it as waiting on the log. If it does not, a random lookup over 20 M objects
+    costing eighty cache misses' worth of time is worth understanding. Not blocking: the target is met.
+97. **io_uring for EN-to-SSD** (§1.4.0.1). Untried, with a positive prior: deep queues of independent
+    device reads is the case it is built for, and §7.1.1 expects §1.4's request pattern to keep SSD queues
+    deep. Distinct from the network path, where batching already subsumed it.
+98. **Whether the batched metadata path is CPU-bound or log-bound** (§1.4.0.1). At one durable write per
+    1,000 requests, 2M QPS is 2,000 log writes/sec, so the ceiling may be the device rather than the CPU.
+    Until this is known, the ~32,000 instruction-slots per request is an upper bound on work and not a
+    measurement of it — and it decides whether question 96's headroom exists.
+
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
@@ -6756,4 +6808,10 @@ Roughly in order of how much else depends on them.
 - whether the throughput targets are per box or per cluster — **per box**, and both have
   already been reached on this box, so they are a floor rather than a stretch (§1.4.0);
 - whether the 200k/2M pair is two requirements or one — one, on messaging: the 10x gap
-  says nine tenths of the unbatched cost is per-message overhead (§1.4.0).
+  says nine tenths of the unbatched cost is per-message overhead (§1.4.0);
+- whether io_uring is wanted for the network path — **no**; batching amortizes the same
+  syscall overhead, gave all the gains, and io_uring measured as a regression (§1.4.0.1);
+- whether the measured throughput figures were in-memory-only — they were not: they include
+  a durable log write per message, encryption, and message compression (§1.4.0.1);
+- why a read request would be logged at all — because §12 requires metering request rate,
+  so the log write is the billing record rather than overhead (§1.4.0.2).
