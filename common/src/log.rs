@@ -69,6 +69,8 @@ pub struct Site {
     count: AtomicU64,
     /// One line in this many reaches the info log. One means all of them.
     stride: AtomicU64,
+    /// For a rate-limited site: the second in which it last said anything.
+    said: AtomicU64,
     listed: AtomicBool,
     /// The start of the first line this site produced, for reading histograms.
     text: OnceLock<String>,
@@ -81,6 +83,7 @@ impl Site {
             line,
             count: AtomicU64::new(0),
             stride: AtomicU64::new(1),
+            said: AtomicU64::new(0),
             listed: AtomicBool::new(false),
             text: OnceLock::new(),
         }
@@ -109,10 +112,19 @@ struct Logger {
     info: Mutex<Rotating>,
 }
 
+/// The current second, kept by the ticker so a rate-limited line costs a load
+/// rather than a clock read.
+static SECOND: AtomicU64 = AtomicU64::new(0);
+
 /// How long a line may sit in a buffer before it reaches the disk. A crash loses
 /// what is still buffered, which is why anything at warning or above is flushed
 /// as it is written.
 const FLUSH_MS: u64 = 200;
+
+/// How often the second is refreshed. Rate limiting is to the nearest tick,
+/// which is close enough for something whose point is "not more than about once
+/// a second".
+const TICK_MS: u64 = 100;
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
@@ -141,12 +153,7 @@ pub fn open(dir: &Path, identity: &str, config: Logging) -> Result<()> {
     FLOOR.store(config.level as u8, Ordering::Relaxed);
     let _ = LOGGER.set(Logger { config, full: Mutex::new(full), info: Mutex::new(info) });
 
-    std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(FLUSH_MS));
-            flush();
-        }
-    });
+    tick();
     Ok(())
 }
 
@@ -167,6 +174,58 @@ thread_local! {
 }
 
 static PID: OnceLock<u32> = OnceLock::new();
+
+/// One thread keeps the clock and pushes the buffers, started by whichever comes
+/// first: a logger opening, or a rate-limited line needing to know the second.
+fn tick() {
+    static TICKING: AtomicBool = AtomicBool::new(false);
+    if TICKING.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    SECOND.store(now_secs(), Ordering::Relaxed);
+    std::thread::spawn(|| {
+        let mut ticks = 0u64;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
+            SECOND.store(now_secs(), Ordering::Relaxed);
+            ticks += 1;
+            if ticks % (FLUSH_MS / TICK_MS) == 0 {
+                flush();
+            }
+        }
+    });
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// One line a second from this site, and the first of the second is the one that
+/// gets through. For a place that would otherwise say the same thing millions of
+/// times: a sample says what is happening, and the rest says nothing new.
+///
+/// The suppressed path is a load and a compare, with no atomic write — counting
+/// what was skipped would put every thread onto one cache line, which is the cost
+/// this exists to avoid.
+pub fn sample(site: &'static Site, level: Level, message: std::fmt::Arguments) {
+    let now = match SECOND.load(Ordering::Relaxed) {
+        // Nothing has started the clock, so this line pays for it once.
+        0 => {
+            tick();
+            now_secs()
+        }
+        second => second,
+    };
+    let said = site.said.load(Ordering::Relaxed);
+    if said == now {
+        return;
+    }
+    // Whichever thread claims the second writes the line; the rest carry on.
+    if site.said.compare_exchange(said, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    write(site, level, message);
+}
 
 /// Write one line. Called by the macros, which supply the site.
 pub fn write(site: &'static Site, level: Level, message: std::fmt::Arguments) {
@@ -425,6 +484,19 @@ macro_rules! logd {
     }};
 }
 
+/// At most one line a second from this site, at notice: rate-limited already, so
+/// it is not the chatty kind and belongs in both logs. The first message of the
+/// second is the one written, as a sample of what the rest would have said.
+#[macro_export]
+macro_rules! logsec {
+    ($($arg:tt)*) => {{
+        if $crate::log::enabled($crate::log::Level::Notice) {
+            static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
+            $crate::log::sample(&SITE, $crate::log::Level::Notice, format_args!($($arg)*));
+        }
+    }};
+}
+
 #[macro_export]
 macro_rules! logi {
     ($($arg:tt)*) => {{
@@ -504,6 +576,31 @@ mod tests {
 mod cost {
     use super::*;
 
+    /// Only an optimized build has anything to say about nanoseconds.
+    fn too_slow(each: f64) {
+        if cfg!(debug_assertions) {
+            return;
+        }
+        assert!(each < 20.0, "{each} ns is too much for a line nobody writes");
+    }
+
+    /// What a rate-limited line costs when it is not the one being written.
+    #[test]
+    fn a_rate_limited_line_is_nearly_free() {
+        set_floor(Level::Info);
+        crate::logsec!("start the clock");
+        let rounds = 10_000_000;
+        let mut sink = 0u64;
+        let start = std::time::Instant::now();
+        for n in 0..rounds {
+            sink = sink.wrapping_add(n);
+            crate::logsec!("a line with a value {n} and another {sink}");
+        }
+        let each = start.elapsed().as_secs_f64() * 1e9 / rounds as f64;
+        println!("rate limited: {each:.2} ns per line (sink {sink})");
+        too_slow(each);
+    }
+
     /// What a line costs when the level filters it out. It has to be nothing
     /// worth measuring, or a debug line cannot be left in a hot path.
     #[test]
@@ -519,6 +616,6 @@ mod cost {
         let each = start.elapsed().as_secs_f64() * 1e9 / rounds as f64;
         println!("filtered: {each:.2} ns per line (sink {sink})");
         set_floor(Level::Info);
-        assert!(each < 20.0, "{each} ns is too much for a line nobody writes");
+        too_slow(each);
     }
 }

@@ -42,7 +42,7 @@ use crate::wire::{
     self, Arg, BUF_BYTES, MAX_FRAME_BYTES, Op, Request, Response, Status, Wire, put_response,
 };
 use crate::{Context, Error, Result};
-use crate::{logd, logi, logn, logw};
+use crate::{logd, logi, logn, logsec, logw};
 use std::cell::RefCell;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -521,6 +521,8 @@ fn ping(process: &Process, request: &Request) -> Response {
         // At debug, so it is off by default: a line per ping costs several times
         // what the ping does. Turn the level down to reproduce that measurement.
         logd!("pinged, reply size {size}");
+        // And once a second regardless, which says the same thing for nothing.
+        logsec!("pinged, reply size {size}");
         return Response::text(format!("{} is alive", process.identity()));
     }
     // Random padding is the honest default; the repetitive kind exists to give

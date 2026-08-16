@@ -9219,6 +9219,12 @@ the total comes out near the target share. Sampling rather than suppressing mean
 shows what the busy traffic looks like. Counts are halved at each recount, so the answer follows the
 workload rather than being set by whatever happened first.
 
+**A third kind of line: at most one a second, whichever message got there first.** For a place that
+would otherwise say the same thing millions of times, a sample says what is happening and the rest
+says nothing new. It logs at `notice` — being rate-limited already, it is not the chatty kind, so it
+belongs in both logs. ⚠️ It does not count what it skipped: a counter would put every thread onto one
+cache line, which is exactly the cost the rate limit exists to avoid.
+
 **And there is a level above `info` for a line that must always be in both**: `notice`, from syslog's
 ladder. That answers a question worth stating, since `debug` is normally off and `info` is normally
 the floor — the levels are `d i n w e`, `info` is the default floor, and `notice` means *ordinary but
@@ -9241,6 +9247,11 @@ One `info` line per ping, at 16 connections x 256 in flight:
   rotation, and immediately for anything at warning or above. That is worth **5x** over a write per
   line, and it is the same argument the message path makes: a syscall per small thing dominates the
   small thing.
+- **A line rate-limited to one a second costs 2.87 ns when it is not the one written**, and the
+  ping keeps 13,169,000 round trips/s with one in it — inside the noise of the 13,235,000 it runs at
+  with nothing. So the whole of the useful signal, one line a second saying what the traffic is
+  doing, is available for nothing. The suppressed path is two relaxed loads and a compare; the
+  second comes from a ticker rather than a clock read, which is what makes it 3 ns instead of 30.
 - **A line the level filters out costs 0.52 ns** — about two cycles, since the macro tests the floor
   before it evaluates anything, so neither the arguments nor the formatting happen. At 16 x 256 the
   ping runs at 13,235,000 with its debug line filtered out against 13,213,000 with no line at all,
