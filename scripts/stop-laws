@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Stop everything start-laws started, debug or retail, in reverse cold-start
+# order.
+#
+# Stopping is a request first: a process that has state to flush gets the chance,
+# and signals are the fallback for one that will not answer.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+run_dir=$root/run
+grace=3        # seconds to wait for a polite shutdown, then for SIGTERM
+keep=no        # keep the run directories and their data
+
+usage() {
+    cat <<'EOF'
+usage: stop-laws [--run-dir DIR] [--grace SECONDS] [--clean]
+
+  --run-dir   where the per-process directories are (default: run/)
+  --grace     seconds to wait at each escalation (default: 3)
+  --clean     remove the run directories once everything has stopped
+EOF
+}
+
+while (($#)); do
+    case $1 in
+        --run-dir) run_dir=$2; shift ;;
+        --grace) grace=$2; shift ;;
+        --clean) keep=clean ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "stop-laws: unknown argument $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+[[ -d $run_dir ]] || { echo "stop-laws: no $run_dir, nothing to stop"; exit 0; }
+
+# Whichever client is built; either can talk to either flavor of daemon.
+laws=""
+for candidate in "$root/target/$(cat "$run_dir/flavor" 2>/dev/null || echo debug)/laws" \
+                 "$root/target/debug/laws" "$root/target/release/laws"; do
+    if [[ -x $candidate ]]; then laws=$candidate; break; fi
+done
+
+# Reverse cold-start order: nothing should outlive what it depends on.
+order=(fe en sn dn ks)
+dirs=()
+for kind in "${order[@]}"; do
+    for dir in "$run_dir"/*/; do
+        [[ -f ${dir}process.toml ]] || continue
+        [[ $(sed -n 's/^kind = "\(.*\)"/\1/p' "${dir}process.toml") == "$kind" ]] || continue
+        dirs+=("${dir%/}")
+    done
+done
+
+wait_gone() {   # pid, seconds
+    local pid=$1 waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 0.05
+        waited=$((waited + 1))
+        ((waited < $2 * 20)) || return 1
+    done
+    return 0
+}
+
+for dir in "${dirs[@]}"; do
+    identity=$(basename "$dir")
+    if [[ ! -f $dir/ready ]]; then
+        echo "$identity was not running"
+        continue
+    fi
+    pid=$(sed -n 's/^pid=//p' "$dir/ready")
+    if [[ -z $pid ]] || ! kill -0 "$pid" 2>/dev/null; then
+        echo "$identity had stopped already"
+        rm -f "$dir/ready"
+        continue
+    fi
+
+    how=""
+    if [[ -n $laws ]] && "$laws" --config "$dir/cluster.toml" --to "$identity" shutdown \
+        > /dev/null 2>&1 && wait_gone "$pid" "$grace"; then
+        how="on request"
+    elif kill -TERM "$pid" 2>/dev/null && wait_gone "$pid" "$grace"; then
+        how="on SIGTERM"
+    elif kill -KILL "$pid" 2>/dev/null && wait_gone "$pid" "$grace"; then
+        how="on SIGKILL"
+    fi
+    rm -f "$dir/ready"
+    echo "stopped $identity (pid $pid) ${how:-but it is still alive}"
+    [[ -n $how ]] || exit 1
+done
+
+if [[ $keep == clean ]]; then
+    rm -rf "$run_dir"
+    echo "removed $run_dir"
+fi

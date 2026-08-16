@@ -1,0 +1,47 @@
+# The common configuration: everything every process must agree on.
+#
+# This copy describes the single-box test cluster. One machine means one domain
+# at every level, so it satisfies no spreading rule; `laws placement` says which.
+
+schema_version = 1
+cluster_name = "laws-test"
+
+# Coarse to fine, each level a refinement of the one above.
+[failure_domains]
+levels = ["region", "datacenter", "rack", "machine", "disk"]
+
+[rings]
+members = 1
+
+[timeouts]
+request_ms = 2000
+shutdown_grace_ms = 2000
+
+# The service directory. In production one machine holds one EN, or several SN
+# processes; here every entry is a process on this box.
+[[service]]
+identity = "KS0"
+kind = "ks"
+address = "127.0.0.1:9601"
+domain = ["region0", "dc0", "rack0", "box0", "disk0"]
+
+# Per-device-class constants. Every number here is a guess awaiting measurement;
+# the SSD row is the least trustworthy, spanning two orders of magnitude across
+# defensible assumptions about queue depth.
+[[media_class]]
+name = "hdd"
+index_interval = 1048576
+min_read_bytes = 1048576
+compress_block = 262144
+staging_bypass = 4194304
+compress_read_win = true
+repair_bytes_sec = 20000000
+
+[[media_class]]
+name = "ssd"
+index_interval = 20480
+min_read_bytes = 20480
+compress_block = 65536
+staging_bypass = 1048576
+compress_read_win = false
+repair_bytes_sec = 400000000

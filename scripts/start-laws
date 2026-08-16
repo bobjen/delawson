@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Start every process in the service directory, in cold-start order, each in its
+# own run directory holding its own configuration.
+#
+# Keeping processes up and keeping machines patched is outside DeLawson's scope;
+# this script substitutes for that on one box by starting them once.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+flavor=debug
+run_dir=$root/run
+config_dir=$root/config
+ready_wait=10   # seconds to wait for a process to announce itself
+
+usage() {
+    cat <<'EOF'
+usage: start-laws [--debug | --retail] [--run-dir DIR] [--config DIR] [--no-build]
+
+  --debug     build and run the debug binaries (default)
+  --retail    build and run the optimized binaries; measure with these
+  --run-dir   where the per-process directories go (default: run/)
+  --config    where the checked-in configuration lives (default: config/)
+  --no-build  use the binaries already built
+EOF
+}
+
+build=yes
+while (($#)); do
+    case $1 in
+        --debug) flavor=debug ;;
+        --retail|--release) flavor=retail ;;
+        --run-dir) run_dir=$2; shift ;;
+        --config) config_dir=$2; shift ;;
+        --no-build) build=no ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "start-laws: unknown argument $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+target=debug
+cargo_args=()
+if [[ $flavor == retail ]]; then
+    target=release
+    cargo_args+=(--release)
+fi
+
+cluster=$config_dir/cluster.toml
+[[ -f $cluster ]] || { echo "start-laws: no $cluster" >&2; exit 1; }
+
+if [[ $build == yes ]]; then
+    cargo build --manifest-path "$root/Cargo.toml" "${cargo_args[@]}"
+fi
+bin=$root/target/$target
+laws=$bin/laws
+[[ -x $laws ]] || { echo "start-laws: no $laws; drop --no-build" >&2; exit 1; }
+
+# Refuse to start a second copy on top of a live one.
+for ready in "$run_dir"/*/ready; do
+    [[ -f $ready ]] || continue
+    pid=$(sed -n 's/^pid=//p' "$ready")
+    if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then
+        echo "start-laws: $(dirname "$ready") is still running as pid $pid; stop-laws first" >&2
+        exit 1
+    fi
+    rm -f "$ready"
+done
+
+mkdir -p "$run_dir"
+echo "$flavor" > "$run_dir/flavor"
+
+started=()
+while read -r identity kind address _; do
+    dir=$run_dir/$identity
+    service_config=$config_dir/$kind.toml
+    [[ -f $service_config ]] || { echo "start-laws: no $service_config" >&2; exit 1; }
+    [[ -x $bin/$kind ]] || { echo "start-laws: no $bin/$kind" >&2; exit 1; }
+
+    mkdir -p "$dir/data"
+    cp "$cluster" "$dir/cluster.toml"
+    cp "$service_config" "$dir/$kind.toml"
+    cat > "$dir/process.toml" <<EOF
+# Written by start-laws. Says who this process is and where the shared
+# configuration is; everything else comes from those files.
+identity = "$identity"
+kind = "$kind"
+cluster_config = "cluster.toml"
+service_config = "$kind.toml"
+data_dir = "data"
+EOF
+
+    rm -f "$dir/ready"
+    nohup "$bin/$kind" "$dir/process.toml" >> "$dir/log" 2>&1 &
+    pid=$!
+
+    waited=0
+    while [[ ! -f $dir/ready ]]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "start-laws: $identity died before it was ready; tail of $dir/log:" >&2
+            tail -n 20 "$dir/log" >&2
+            exit 1
+        fi
+        sleep 0.02
+        waited=$((waited + 1))
+        if ((waited > ready_wait * 50)); then
+            echo "start-laws: $identity did not become ready in ${ready_wait}s" >&2
+            exit 1
+        fi
+    done
+    echo "started $identity ($kind, $flavor) on $address as pid $pid"
+    started+=("$identity")
+done < <("$laws" --config "$cluster" services)
+
+((${#started[@]})) || echo "start-laws: the service directory is empty" >&2
+
+echo
+"$laws" --config "$cluster" placement
+echo "run dir $run_dir"
+echo "try: $laws --config $cluster ping --to ${started[0]:-KS0} --count 10000"

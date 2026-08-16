@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Start a cluster, ping it in parallel from several clients, report throughput
+# and latency, stop the cluster.
+#
+# The ping asks for a few hundred instructions of work, so what this measures is
+# per-message overhead. That number is the one that says how deep later batching
+# has to be.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+flavor=--retail
+clients=8
+warmup=2
+seconds=10
+to=KS0
+
+usage() {
+    cat <<'EOF'
+usage: bench-laws [--debug] [--clients N] [--warmup SECONDS] [--seconds N] [--to IDENTITY]
+
+  --debug     measure the debug build (the default is retail, which is what to quote)
+  --clients   parallel clients, one connection and thread each (default: 8)
+  --warmup    unmeasured seconds first (default: 2)
+  --seconds   measured seconds (default: 10)
+  --to        which process to ping (default: KS0)
+EOF
+}
+
+while (($#)); do
+    case $1 in
+        --debug) flavor=--debug ;;
+        --retail) flavor=--retail ;;
+        --clients) clients=$2; shift ;;
+        --warmup) warmup=$2; shift ;;
+        --seconds) seconds=$2; shift ;;
+        --to) to=$2; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "bench-laws: unknown argument $1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+target=release
+[[ $flavor == --debug ]] && target=debug
+
+"$root/scripts/start-laws" "$flavor" > /dev/null
+trap '"$root/scripts/stop-laws" > /dev/null' EXIT
+
+laws=$root/target/$target/laws
+cluster=$root/config/cluster.toml
+"$laws" --config "$cluster" --to "$to" bench \
+    --clients "$clients" --warmup "$warmup" --seconds "$seconds"

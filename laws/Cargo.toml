@@ -1,0 +1,15 @@
+[package]
+name = "delawson-laws"
+description = "The DeLawson client: a CLI, and the library it is a thin shell over"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "laws"
+path = "src/main.rs"
+
+[dependencies]
+delawson-common.workspace = true
+clap.workspace = true

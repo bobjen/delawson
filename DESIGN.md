@@ -8819,3 +8819,95 @@ Roughly in order of how much else depends on them.
   performs it and the second instance is a byte copy (§8.1.4.4);
 - why a read request would be logged at all — because §12 requires metering request rate,
   so the log write is the billing record rather than overhead (§1.4.0.3).
+
+---
+
+## 17. The implementation, as it stands
+
+Implementation began 2026-08-16 with two processes — the `laws` client and KS — plus the
+`common` library they share, checked-in configuration, and a single-box harness. This
+section records the decisions that writing them forced, which §5 and §7 did not specify.
+
+### 17.1 Layout
+
+| Directory | What it is |
+|---|---|
+| `common/` | configuration, wire protocol, daemon lifecycle, placement-rule report |
+| `laws/` | the client: a CLI over a library, holding no persistent state |
+| `ks/` | the Key Store daemon; the template the other machine types are copied from |
+| `config/` | the checked-in cluster and per-service configuration |
+| `scripts/` | `start-laws`, `stop-laws`, `bench-laws` |
+| `run/` | created by `start-laws`, one directory per process, not checked in |
+
+DN, SN, EN and FE do not exist yet. A client command with no service to reach fails locally
+saying so, rather than pretending.
+
+### 17.2 Configuration is three layers
+
+- **Cluster** — one file, identical fleet-wide: the failure-domain levels, ring size,
+  timeouts, the service directory, and the per-media-class table of §7.4.1.
+- **Service** — one file per machine type, holding only what that type owns.
+- **Process** — one small file per process, written by `start-laws`, saying who the process
+  is and where the other two files are.
+
+Two decisions inside that:
+
+- **Identity comes from the process file, not from argv.** A process's whole identity is then
+  one file that a harness or a deployment system writes, and nothing depends on how it was
+  invoked. The only command-line argument any daemon takes is the path to that file.
+- **A process's listening address comes from the cluster service directory, keyed by
+  identity.** Every process needs the directory anyway in order to reach the others, so a
+  second copy in its own file would only be somewhere for the two to disagree.
+
+### 17.3 Lifecycle: ready is a file, stopping is a request
+
+- **Ready means the `ready` file exists**, written after the listener is accepting, holding
+  the pid and the bound address. That is the whole readiness contract, and it is what the
+  harness waits on.
+- **Stopping is a request, not a signal.** `stop-laws` sends `shutdown` so that a process with
+  state to flush gets the chance, and escalates to `SIGTERM` then `SIGKILL` only for one that
+  will not answer. It works on either build flavour because it stops processes by pid.
+- **Cold start order is by machine type** — KS, DN, SN, EN, FE — which is §5.5.1.1's order,
+  and shutdown is its reverse.
+
+### 17.4 Every call is asynchronous
+
+**Decided: nothing in any service is lock-step** (Asserted, Bob, 2026-08-16). A request carries
+a 32-bit id and a response echoes it, so a caller may keep any number of requests outstanding
+on one connection and a service may answer them in whatever order it finishes them. Whole
+frames are written under one lock, so frames never interleave.
+
+**Where an answer is computed is per message type, and it is a measurement rather than a
+decision** (Asserted, Bob, 2026-08-16). Handing a request to a worker costs a queue hop and a
+wakeup; answering it on the connection's read loop stalls the next read for as long as it
+takes. Ping is cheap enough that inline plainly wins and is what the code does; anything that
+touches a disk plainly does not. The middle is unknown, so it is a per-operation knob.
+
+### 17.5 The first measurement: a ping to KS0
+
+Loopback TCP, this box, retail build, `bench-laws`, ping answered on the read loop. The work
+requested is a few hundred instructions, so essentially all of this is message overhead.
+
+| Clients | Outstanding each | Round trips/s | Average latency |
+|---|---|---|---|
+| 1 | 1 | 55,000 | 13 µs |
+| 8 | 1 | 230,000 | 25 µs |
+| 8 | 8 | 525,000 | 112 µs |
+| 16 | 1 | 400,000 | 15 µs |
+| 16 | 8 | 424,000 | 276 µs |
+
+**Measured, 2026-08-16.** The single-client round trip of ~13–18 µs came in at the ~15 µs that
+issue #5 calibrated a Unix-domain socket at, rather than the ~40 µs it guessed for TCP loopback.
+It is the per-message overhead `M` that sets how deep later batching has to be. Two things to read from the rest of the table: throughput scales
+with clients until the box saturates near half a million round trips per second, and depth buys
+throughput only until then — past saturation it buys latency and nothing else. §1.4's targets are
+200k QPS unbatched and 2M+ batched, so the unbatched target is met by parallelism alone on one
+box, and the batched one is the open work.
+
+### 17.6 The harness reports what it cannot enforce
+
+One box is one domain at every level, so it satisfies no spreading rule. That is legal — §5.6.7
+skips a rule it cannot enforce — but `start-laws` prints the report anyway, and `laws placement`
+computes it on demand: per rule, how many distinct things it wants, the coarsest failure-domain
+level that has that many, and a loud line when no level does. A rule wanting one of something is
+reported as vacuous rather than as enforced.

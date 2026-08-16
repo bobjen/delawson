@@ -11,10 +11,19 @@ See [his page](https://burtleburtle.net/gene/glowry18800117.html).
 
 ## Status
 
-**Design phase. No implementation yet.**
+Early implementation. The `laws` client and the KS daemon exist, plus the `common`
+library they share and a single-box test harness; DN, SN, EN and FE do not.
 
-See [DESIGN.md](DESIGN.md) for the architecture, and its Open Questions
-section for what is still undecided.
+See [DESIGN.md](DESIGN.md) for the architecture, its Open Questions section for
+what is still undecided, and section 17 for what has been built.
+
+```sh
+scripts/start-laws              # build debug, start every configured process
+laws --to KS0 ping              # "KS0 is alive"
+laws placement                  # which spreading rules this cluster can enforce
+scripts/bench-laws --clients 8  # start retail, measure ping, stop
+scripts/stop-laws               # stop everything, either flavour
+```
 
 ## Two object flavors
 

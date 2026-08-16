@@ -1,0 +1,8 @@
+# KS: the Key Store. One file like this per machine type.
+
+# A day that creates no extents needs no master key.
+lazy_day_keys = true
+
+# No operator secrets and no hardware devices on a test box, so KS comes up
+# already unlocked. Nothing but a test configuration may say false here.
+require_unlock = false
