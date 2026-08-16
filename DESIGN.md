@@ -77,6 +77,8 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Read requests are logged because §12 requires **metering** them; batching is a billing mechanism too | §1.4.0.3 |
 | **Batch depth is set by the compression window and the log write** — overhead amortization saturates at ~100 | §1.4.0.2 |
 | Compression cuts **network and bytes written**, not just capacity, and the saving is realized per crossing | §7.1.3 |
+| The gap is **repeated keyed compaction**, not compression — a **signed compute tier** is the likely home | §7.2.2.1 |
+| Compaction frequency now trades **four** ways: write amp, read amp, hint validity, recompression CPU | §7.2.2.1 |
 | So it pays for itself on HDD (threshold ~194 MB/s vs LZ4's 600) and does not on NVMe (~2.4 GB/s) | §7.1.3 |
 | Compression **shortens every repair window**, so it improves durability, not only cost | §7.1.3 |
 | A cluster may run **indefinitely** and lie dormant for eons — no absolute epochs, no work per elapsed time | §1.3 |
@@ -3607,19 +3609,48 @@ argument for block granularity collapses.
 
 | Candidate | CPU to spare? | Signed-only? |
 |---|---|---|
-| EN | **no** — §7.1, §1.2 give it almost none | yes |
+| EN | **little** — §7.1, §1.2 give it almost none | yes |
 | Compute | yes | **no** — it runs user code (§1.5) |
 | DN, SN | some, but sized for metadata rings (§5.8) | yes |
 | FE | undesigned | yes |
+| **A signed compute tier** — Compute's shape without user code | yes | yes |
 
-⚠️ So the fleet as specified has **no machine that both has CPU to spare and runs only
-signed executables.** That is a gap, not a detail, because §10 makes compaction the
-place where recompression, EC re-encoding, key rotation, media migration and code
-promotion all happen — and all of them need plaintext and CPU.
+⚠️ So the fleet **as originally specified** had no machine with both properties. That is a
+gap and not a detail, because §10 makes compaction the place where recompression, EC
+re-encoding, key rotation, media migration and code promotion all happen, and every one of
+them needs plaintext and CPU.
 
-The candidates are a dedicated compaction role, an FE-side one, or accepting the CPU on
-DN/SN. It should be settled before compaction is built, since it decides what compaction
-*is*: a background loop on an existing tier, or a machine type.
+**Bob's phrasing names the likely resolution**: the work is done by the EN "or some other
+signed DeLawson equivalent of a compute node" (2026-08-15). That last is a real machine
+type rather than a hedge — **Compute's hardware shape without Compute's user code**, and
+therefore permitted to hold keys under §1.5. It is the bottom row of the table above.
+
+#### 7.2.2.1 The gap is narrower than it first looked
+
+Two findings shrink it, and what remains is worth naming precisely.
+
+**Initial compression is not in the problem at all.** §8.1.4.1 puts it in the `delawson`
+client library, so no compression happens on the ingest path inside the datacenter.
+
+**Migration recompression fits on the EN.** The common-to-dedicated migration (§8.1.4.4)
+recompresses each byte **once**, at the ingest rate — ~63 MB/s sustained per EN
+(§8.1.4.5), which is ~0.1 of a core for LZ4. §7.1's 21-core objection was computed at NIC
+line rate, which this is not.
+
+| Job | Times per byte | Cores per EN, sustained |
+|---|---|---|
+| Initial compression | — | **0**, it is the client's (§8.1.4.1) |
+| Migration recompression | once | **~0.1** |
+| Repeated keyed base-plus-log compaction | many | multiplies with compaction frequency |
+
+**So the live gap is repeated compaction of keyed objects**, where the same bytes are
+rewritten every time a log merges into a base, and CPU scales with compaction frequency
+rather than with ingest. That is also the case §8.1.1a-10 shows is already trading against
+hint validity, so compaction frequency now has a **fourth** term: write amplification, read
+amplification, hint hit rate, and recompression CPU.
+
+It should be settled before compaction is built, because it decides what compaction *is*:
+a background loop on an existing tier, or a machine type of its own.
 
 #### 7.2.3 A user who encrypts first pays for it, automatically
 
