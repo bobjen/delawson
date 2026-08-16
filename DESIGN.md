@@ -85,6 +85,8 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Two doors per purpose: a **floor** admitted readily, then competition for the surplus | §13.4.3.1 |
 | **Every door is below 10% remaining** — 1% for high priority, 9% for low; the bin runs nearly empty by design | §13.4.3.5 |
 | Low priority therefore runs **only at idle**, and resolution improves under congestion | §13.4.3.4, §13.4.3.5 |
+| The scheme is **work-conserving**: alone, any purpose reaches ~91%+ — doors arbitrate, they do not partition | §13.4.3.6 |
+| So `sufficient` is a **floor, never a ceiling**; implementing it as a quota destroys that | §13.4.3.6 |
 | So there is no expensive read to meter, and read billing can stay flat | §9.8.1 |
 | The scale ambition is ~10^57 bits; DeLawson addresses ~10^26, so it is **10^31 short** and directional | §1.0.4 |
 | Relative timestamps are why §1.3's rule survives a scale nobody designed for | §1.0.4, §4.6.3 |
@@ -6897,9 +6899,46 @@ cleared by anything, so "immediately reprocessed by GC" is not delivered by door
 have its own *sufficient* allocation under §13.4.3.1, so that it is admitted through the lower door of its own
 purpose rather than competing for a sliver.
 
-**Starvation is therefore structural rather than incidental** (§13.4.3.4). With low priority at 9% remaining and
-the level designed to sit below 10%, low-priority work runs only when the fleet is genuinely quiet. That is the
-intended behaviour, but it is stronger than "can starve" — it is "does not run except at idle."
+##### 13.4.3.6 The scheme is work-conserving: alone, any purpose gets at least 90%
+
+**This is why the doors must sit near the bottom, and it is the property that makes the mechanism sound**
+(Asserted, Bob, 2026-08-16). Since even the highest door is below 10% remaining, a purpose with no competition
+keeps being admitted until the level reaches its own high door — so it consumes **91% to 99% of the allocation**
+depending on which door that is.
+
+> **Every purpose can use at least 90% of the bandwidth if no other purpose is competing for it.**
+
+**So the doors arbitrate contention; they do not partition capacity.** That is the difference between this and
+the obvious alternative, and the obvious alternative is worse:
+
+| | Idle-capacity behaviour |
+|---|---|
+| Static partition — each purpose reserved *X*% | bandwidth sits **unused** when only one purpose has work |
+| Doors near zero remaining | any purpose alone reaches ~91%+ |
+
+Static partitioning would leave allocated repair bandwidth idle whenever the mix of pending work is lopsided,
+which is precisely the waste §1.6 forbids. **Placing every door near zero remaining is what makes the scheme
+work-conserving without a scheduler.**
+
+**Therefore `sufficient` is a floor, never a ceiling**, and this is the likely implementation error. Exceeding
+its sufficient amount does not cap a purpose — it only moves it from its low door to its high door, and the high
+door is still near the bottom. A purpose that has plenty of work and no competition sails past `sufficient` and
+keeps going. Anyone who implements `sufficient` as a quota has built the static partition in the table above and
+lost the property this section exists to state.
+
+**And work-conservation and starvation are the same choice seen from two sides. Derived.** Both follow from
+placing all doors near zero:
+
+- **alone** — the level stays high enough to clear even a high door, so a purpose reaches ~91%+;
+- **under contention** — high-priority work holds the level near the bottom, so higher doors are essentially
+  never cleared and low-priority work does not run.
+
+So §13.4.3.4's starvation is not a defect to be fixed but the contended-case face of the property that gives
+full utilization in the uncontended case. What keeps it from being unbounded is the `sufficient` floors, which is
+why §16 question 111 treats them as a partition to be validated rather than as knobs.
+
+**That is stronger than "low priority can starve"** — it is "low priority does not run except at idle", and the
+right response is to make sure nothing correctness-critical is filed under low priority.
 
 ⚠️ **Vacating a scheduled-down EN is the one purpose with a deadline**, and thresholds cannot express
 deadlines. Every other repair type is "sooner is better"; a decommission has a date, after which the machine
