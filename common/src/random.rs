@@ -41,9 +41,16 @@ impl Rng {
     }
 
     pub fn fill(&mut self, buf: &mut [u8]) {
-        for chunk in buf.chunks_mut(8) {
+        // chunks_exact_mut, not chunks_mut: the bulk loop then has no per-word
+        // length check, which was costing more than generating the word.
+        let mut chunks = buf.chunks_exact_mut(8);
+        for chunk in &mut chunks {
+            chunk.copy_from_slice(&self.next().to_le_bytes());
+        }
+        let tail = chunks.into_remainder();
+        if !tail.is_empty() {
             let bytes = self.next().to_le_bytes();
-            chunk.copy_from_slice(&bytes[..chunk.len()]);
+            tail.copy_from_slice(&bytes[..tail.len()]);
         }
     }
 }

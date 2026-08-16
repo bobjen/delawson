@@ -35,16 +35,14 @@
 //! that is. Stopping is a request, not a signal, so a process with state to flush
 //! gets the chance; a signal is the fallback.
 
-use crate::config::{ClusterConfig, ProcessConfig, SendMode, ServiceEntry};
+use crate::config::{ClusterConfig, Messaging, ProcessConfig, SendMode, ServiceEntry};
 use crate::random::Rng;
 use crate::registry::Peer;
 use crate::wire::{
-    Arg, BUF_BYTES, Chan, MAX_FRAME_BYTES, Op, Request, Response, Status, frame_into, read_request,
-    read_response, write_request, write_response,
+    self, Arg, BUF_BYTES, MAX_FRAME_BYTES, Op, Request, Response, Status, Wire, put_response,
 };
 use crate::{Context, Error, Result};
 use std::cell::RefCell;
-use std::io::{BufWriter, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -57,6 +55,8 @@ pub const READY_FILE: &str = "ready";
 thread_local! {
     /// Framing scratch for a worker, so answering allocates nothing.
     static SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(BUF_BYTES));
+    /// One generator per thread, so padding needs no lock.
+    static NOISE: RefCell<Rng> = RefCell::new(Rng::new());
 }
 
 pub struct Process {
@@ -142,8 +142,12 @@ impl Process {
         if let Some(address) = self.cluster.fixed_address(identity) {
             return Ok(address);
         }
-        let response =
-            ask(self.cluster.ks.address, &Request::new(Op::Lookup).text(identity), self.timeout())?;
+        let response = ask(
+            self.cluster.ks.address,
+            &Request::new(Op::Lookup).text(identity),
+            self.timeout(),
+            &self.cluster.messaging,
+        )?;
         match response.status {
             Status::Ok => match response.message() {
                 Some(address) => address
@@ -168,7 +172,8 @@ impl Process {
             domain: self.entry.domain.clone(),
             media_class: self.entry.media_class.clone(),
         };
-        let response = ask(self.cluster.ks.address, &peer.request(), self.timeout())?;
+        let response =
+            ask(self.cluster.ks.address, &peer.request(), self.timeout(), &self.cluster.messaging)?;
         match response.status {
             Status::Ok => Ok(()),
             status => Err(Error::new(format!(
@@ -228,14 +233,16 @@ impl Pool {
 }
 
 /// One request on a fresh connection, for the few calls a daemon makes itself.
-pub fn ask(address: SocketAddr, request: &Request, timeout: Duration) -> Result<Response> {
-    let mut stream =
+pub fn ask(
+    address: SocketAddr,
+    request: &Request,
+    timeout: Duration,
+    config: &Messaging,
+) -> Result<Response> {
+    let stream =
         TcpStream::connect_timeout(&address, timeout).context(format!("connecting {address}"))?;
-    stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(timeout))?;
-    write_request(&mut stream, request)?;
-    stream.flush()?;
-    read_response(&mut stream)
+    wire::connect(stream, config)?.call(request)
 }
 
 fn workers() -> usize {
@@ -298,23 +305,22 @@ fn read_loop<S: Service>(
     pool: &Pool,
     stream: TcpStream,
 ) -> Result<()> {
-    let chan = Chan::new(stream)?;
-    let mut input = chan.input;
+    let (mut input, output) = wire::accept(stream, &process.cluster.messaging)?;
     let policy = process.cluster.messaging.send;
     let out = Arc::new(match policy {
-        SendMode::Sender => Out::sending(chan.output),
-        SendMode::Direct | SendMode::Adaptive => Out::direct(chan.output),
+        SendMode::Sender => Out::sending(output),
+        SendMode::Direct | SendMode::Adaptive => Out::direct(output),
     });
 
     loop {
         // A client that closed the connection is the normal case.
-        let Ok(request) = read_request(&mut input) else {
+        let Ok(request) = input.request() else {
             out.close();
             return Ok(());
         };
         if service.inline(request.op) {
             // Nothing more in hand means the next read would block, so send.
-            let settled = input.buffer().is_empty();
+            let settled = !input.more();
             reply(process, &**service, &out, request, settled);
             continue;
         }
@@ -357,7 +363,7 @@ impl Batch {
         SCRATCH.with(|scratch| {
             let mut framed = scratch.borrow_mut();
             framed.clear();
-            frame_into(&mut framed, |buf| response.encode(buf))?;
+            put_response(&mut framed, response)?;
             let mut filling = self.filling.lock().expect("connection");
             let woke = filling.is_empty();
             filling.extend_from_slice(&framed);
@@ -389,12 +395,11 @@ impl Batch {
     }
 }
 
-fn run_sender(mut writer: BufWriter<TcpStream>, batch: Arc<Batch>) {
+fn run_sender(mut wire: Wire, batch: Arc<Batch>) {
     let mut buf = Vec::with_capacity(BUF_BYTES);
     while batch.take(&mut buf) {
-        let sent = writer.write_all(&buf).and_then(|()| writer.flush());
-        buf.clear();
-        if sent.is_err() {
+        // One segment per batch: sealing happens here, off every other thread.
+        if wire.send(&mut buf).is_err() {
             return;
         }
     }
@@ -404,17 +409,27 @@ fn run_sender(mut writer: BufWriter<TcpStream>, batch: Arc<Batch>) {
 /// direct to a sender exactly once — after which `batch` is set for good, so the
 /// hot path is one relaxed load.
 struct Out {
-    direct: Mutex<Option<BufWriter<TcpStream>>>,
+    direct: Mutex<Option<Direct>>,
     batch: OnceLock<Arc<Batch>>,
 }
 
+/// The read loop's own writer: messages accumulate here and are sealed when it
+/// says nothing more is in hand.
+struct Direct {
+    wire: Wire,
+    plain: Vec<u8>,
+}
+
 impl Out {
-    fn direct(writer: BufWriter<TcpStream>) -> Out {
-        Out { direct: Mutex::new(Some(writer)), batch: OnceLock::new() }
+    fn direct(wire: Wire) -> Out {
+        Out {
+            direct: Mutex::new(Some(Direct { wire, plain: Vec::with_capacity(BUF_BYTES) })),
+            batch: OnceLock::new(),
+        }
     }
 
-    fn sending(writer: BufWriter<TcpStream>) -> Out {
-        let out = Out { direct: Mutex::new(Some(writer)), batch: OnceLock::new() };
+    fn sending(wire: Wire) -> Out {
+        let out = Out::direct(wire);
         out.hand_to_sender();
         out
     }
@@ -423,14 +438,14 @@ impl Out {
     /// only before it dispatches the first answer it will not write itself, so
     /// nothing else is writing while it happens.
     fn hand_to_sender(&self) {
-        let Some(mut writer) = self.direct.lock().expect("connection").take() else {
+        let Some(mut direct) = self.direct.lock().expect("connection").take() else {
             return;
         };
-        // Anything already buffered goes first, so the switch cannot reorder.
-        let _ = writer.flush();
+        // Anything already accumulated goes first, so the switch cannot reorder.
+        let _ = direct.wire.send(&mut direct.plain);
         let batch = Arc::new(Batch::new());
         let sending = Arc::clone(&batch);
-        std::thread::spawn(move || run_sender(writer, sending));
+        std::thread::spawn(move || run_sender(direct.wire, sending));
         let _ = self.batch.set(batch);
     }
 
@@ -441,11 +456,11 @@ impl Out {
         if let Some(batch) = self.batch.get() {
             return batch.put(response);
         }
-        let mut writer = self.direct.lock().expect("connection");
-        let writer = writer.as_mut().ok_or_else(|| Error::new("the writer moved mid-answer"))?;
-        write_response(writer, response)?;
+        let mut direct = self.direct.lock().expect("connection");
+        let direct = direct.as_mut().ok_or_else(|| Error::new("the writer moved mid-answer"))?;
+        put_response(&mut direct.plain, response)?;
         if settled {
-            writer.flush()?;
+            direct.wire.send(&mut direct.plain)?;
         }
         Ok(())
     }
@@ -454,8 +469,8 @@ impl Out {
         match self.batch.get() {
             Some(batch) => batch.close(),
             None => {
-                if let Some(writer) = self.direct.lock().expect("connection").as_mut() {
-                    let _ = writer.flush();
+                if let Some(direct) = self.direct.lock().expect("connection").as_mut() {
+                    let _ = direct.wire.send(&mut direct.plain);
                 }
             }
         }
@@ -496,7 +511,10 @@ fn ping(process: &Process, request: &Request) -> Response {
     if size == 0 {
         return Response::text(format!("{} is alive", process.identity()));
     }
-    match noise(size) {
+    // Random padding is the honest default; the repetitive kind exists to give
+    // compression something to find.
+    let dull = matches!(request.args.get(1), Some(Arg::Flag(true)));
+    match if dull { repetition(size) } else { noise(size) } {
         Some(bytes) => Response { id: 0, status: Status::Ok, args: vec![Arg::Bytes(bytes)] },
         None => Response::error(
             Status::BadRequest,
@@ -505,17 +523,32 @@ fn ping(process: &Process, request: &Request) -> Response {
     }
 }
 
-/// Random bytes for a reply body, cut from one block generated at first use.
-/// Generating them per reply would measure this generator instead of the
-/// message path, and zeros would let compression and the kernel cheat.
-fn noise(size: usize) -> Option<Vec<u8>> {
+/// Padding a compressor can do something with: a short phrase repeated. Cut from
+/// one block, which is honest here in a way it was not for random padding —
+/// repetition is the point.
+fn repetition(size: usize) -> Option<Vec<u8>> {
     static BLOCK: OnceLock<Vec<u8>> = OnceLock::new();
     let block = BLOCK.get_or_init(|| {
-        let mut block = vec![0u8; MAX_FRAME_BYTES];
-        Rng::new().fill(&mut block);
-        block
+        const WORDS: &[u8] = b"the same words over and over, as a batch of small messages is. ";
+        WORDS.iter().copied().cycle().take(MAX_FRAME_BYTES).collect()
     });
     block.get(..size).map(|slice| slice.to_vec())
+}
+
+/// Random bytes for a reply body, fresh each time, from a generator this thread
+/// owns. Handing out slices of one block was cheaper but wrong: every reply was
+/// then the same bytes, so a batch of them compressed, and a measurement of
+/// compression measured the padding instead of the wire. What generating them
+/// costs is measurable on its own — `laws generator`.
+fn noise(size: usize) -> Option<Vec<u8>> {
+    if size == 0 || size > MAX_FRAME_BYTES {
+        return None;
+    }
+    NOISE.with(|rng| {
+        let mut body = vec![0u8; size];
+        rng.borrow_mut().fill(&mut body);
+        Some(body)
+    })
 }
 
 fn status(process: &Process, service: &impl Service) -> String {
@@ -529,6 +562,10 @@ fn status(process: &Process, service: &impl Service) -> String {
         format!("uptime_seconds {}", process.started.elapsed().as_secs()),
         format!("answered {}", process.answered.load(Ordering::Relaxed)),
         format!("send {:?}", process.cluster.messaging.send),
+        {
+            let (plain, wire) = crate::seal::totals();
+            format!("sealed_plain {plain} sealed_wire {wire}")
+        },
         format!("senders {}", process.senders.load(Ordering::Relaxed)),
         format!("domain {}", process.entry.domain.join("/")),
     ];

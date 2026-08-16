@@ -10,12 +10,14 @@ mod client;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use client::{Conn, Stats, Tally};
-use common::config::{ClusterConfig, ServiceKind};
+use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::placement;
+use common::random::Rng;
 use common::wire::{Arg, Op, Request, Response, Status};
 use common::{Error, Result};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -58,10 +60,14 @@ enum Cmd {
         /// Connections, each on its own thread, all pinging at once.
         #[arg(long, default_value_t = 1)]
         conns: usize,
-        /// Bytes of random padding to ask for in the reply. Zero answers in
-        /// words; anything else makes message size the variable.
+        /// Bytes of padding to ask for in the reply. Zero answers in words;
+        /// anything else makes message size the variable.
         #[arg(long, default_value_t = 0)]
         size: u64,
+        /// Pad with repetitive bytes instead of random ones, so compression has
+        /// something to find.
+        #[arg(long)]
+        dull: bool,
         /// Open a fresh connection for each round trip.
         #[arg(long)]
         reconnect: bool,
@@ -75,9 +81,12 @@ enum Cmd {
         /// Seconds of unmeasured pinging first.
         #[arg(long, default_value_t = 2)]
         warmup: u64,
-        /// Bytes of random padding in each reply.
+        /// Bytes of padding in each reply.
         #[arg(long, default_value_t = 0)]
         size: u64,
+        /// Pad with repetitive bytes instead of random ones.
+        #[arg(long)]
+        dull: bool,
         /// Independent requests each client keeps in flight. Above one, pending
         /// messages leave in one syscall — the only kind of batching there is.
         #[arg(long, default_value_t = 1)]
@@ -113,6 +122,15 @@ enum Cmd {
     Registry,
     /// KS's fixed address and the port base, which is what a starter needs.
     Bootstrap,
+    /// Time the random generator that fills ping padding, single-threaded, so
+    /// its cost is known rather than mixed into a measurement of the wire.
+    Generator {
+        #[arg(long, default_value_t = 1 << 30)]
+        bytes: usize,
+        /// Bytes per call, as a reply body would be.
+        #[arg(long, default_value_t = 16384)]
+        chunk: usize,
+    },
     /// Which spreading rules this cluster can enforce.
     Placement,
     /// The per-media-class constant table.
@@ -281,7 +299,8 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Registry => {
             let target = resolve(&cluster, &cli, ServiceKind::Ks)?;
-            let response = open(&target, timeout)?.call(&Request::new(Op::Registry))?;
+            let response =
+                open(&target, timeout, &cluster.messaging)?.call(&Request::new(Op::Registry))?;
             if response.args.is_empty() {
                 println!("{} nothing has registered", target.identity);
             }
@@ -291,6 +310,41 @@ fn run(cli: Cli) -> Result<()> {
             println!("registrar {}", cluster.registrar()?.identity);
             println!("address {}", cluster.ks.address);
             println!("port_base {}", cluster.ks.port_base);
+            Ok(())
+        }
+        Cmd::Generator { bytes, chunk } => {
+            let mut rng = Rng::new();
+
+            // The generator alone, with nowhere to put the words: this is the
+            // dependency chain and nothing else.
+            let words = bytes / 8;
+            let start = std::time::Instant::now();
+            let mut sum = 0u64;
+            for _ in 0..words {
+                sum ^= rng.next();
+            }
+            let bare = start.elapsed().as_secs_f64();
+            println!(
+                "generating:  {:.2} GB/s, {:.2} ns per 8-byte word (checksum {sum:x})",
+                (words * 8) as f64 / bare / 1e9,
+                bare * 1e9 / words as f64
+            );
+
+            // And the same words written into a buffer, which is what filling a
+            // reply body actually does.
+            let mut buf = vec![0u8; *chunk];
+            let mut done = 0;
+            let start = std::time::Instant::now();
+            while done < *bytes {
+                rng.fill(&mut buf);
+                done += *chunk;
+            }
+            let filling = start.elapsed().as_secs_f64();
+            println!(
+                "filling:     {:.2} GB/s, {:.1} ns per {chunk}-byte body",
+                done as f64 / filling / 1e9,
+                filling * 1e9 / (done / chunk) as f64
+            );
             Ok(())
         }
         Cmd::Placement => {
@@ -313,12 +367,18 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Ping { count, conns, size, reconnect } => {
-            let plan =
-                Plan { count: *count, conns: *conns, size: *size, reconnect: *reconnect, timeout };
+        Cmd::Ping { count, conns, size, dull, reconnect } => {
+            let plan = Plan {
+                count: *count,
+                conns: *conns,
+                size: *size,
+                dull: *dull,
+                reconnect: *reconnect,
+                timeout,
+            };
             ping(&cluster, &cli, &plan)
         }
-        Cmd::Bench { clients, warmup, size, depth, seconds } => {
+        Cmd::Bench { clients, warmup, size, dull, depth, seconds } => {
             // Anything answers a ping, so an unnamed target is KS, which is the
             // one process that is always there.
             let target = resolve(&cluster, &cli, ServiceKind::Ks)?;
@@ -326,15 +386,19 @@ fn run(cli: Cli) -> Result<()> {
                 clients: *clients,
                 warmup: *warmup,
                 size: *size,
+                dull: *dull,
                 depth: *depth,
                 seconds: *seconds,
                 timeout,
             };
-            bench(&target, &plan)
+            bench(&target, &plan, &cluster.messaging)
         }
         Cmd::Status => {
             for target in targets(&cluster, &cli, ServiceKind::Ks)? {
-                report(&target, &open(&target, timeout)?.call(&Request::new(Op::Status))?)?;
+                report(
+                    &target,
+                    &open(&target, timeout, &cluster.messaging)?.call(&Request::new(Op::Status))?,
+                )?;
             }
             Ok(())
         }
@@ -346,14 +410,18 @@ fn run(cli: Cli) -> Result<()> {
                 targets.reverse();
             }
             for target in targets {
-                report(&target, &open(&target, timeout)?.call(&Request::new(Op::Shutdown))?)?;
+                report(
+                    &target,
+                    &open(&target, timeout, &cluster.messaging)?
+                        .call(&Request::new(Op::Shutdown))?,
+                )?;
             }
             Ok(())
         }
         cmd => {
             let request = build(cmd)?;
             let target = resolve(&cluster, &cli, serves(cmd))?;
-            report(&target, &open(&target, timeout)?.call(&request)?)
+            report(&target, &open(&target, timeout, &cluster.messaging)?.call(&request)?)
         }
     }
 }
@@ -362,20 +430,22 @@ struct Plan {
     count: usize,
     conns: usize,
     size: u64,
+    dull: bool,
     reconnect: bool,
     timeout: Duration,
 }
 
 /// A ping, asking for `size` bytes of padding back.
-fn ping_request(size: u64) -> Request {
+fn ping_request(size: u64, dull: bool) -> Request {
     let request = Request::new(Op::Ping);
-    if size == 0 { request } else { request.number(size) }
+    if size == 0 { request } else { request.number(size).flag(dull) }
 }
 
 /// The ping is a benchmark, not a feature: the work it asks for is a few hundred
 /// instructions, so with a bare reply what comes back is per-message overhead,
 /// and with a padded one it is that plus what size costs.
 fn ping(cluster: &ClusterConfig, cli: &Cli, plan: &Plan) -> Result<()> {
+    let shared = Arc::new(cluster.messaging.clone());
     if plan.count == 0 || plan.conns == 0 {
         return Err(Error::new("--count 0 or --conns 0 measures nothing"));
     }
@@ -384,16 +454,17 @@ fn ping(cluster: &ClusterConfig, cli: &Cli, plan: &Plan) -> Result<()> {
         let start = std::time::Instant::now();
         let threads: Vec<_> = (0..plan.conns)
             .map(|_| {
-                let (count, size) = (plan.count, plan.size);
+                let (count, size, dull) = (plan.count, plan.size, plan.dull);
                 let (reconnect, timeout) = (plan.reconnect, plan.timeout);
+                let messaging = Arc::clone(&shared);
                 std::thread::spawn(move || -> Result<(Vec<Duration>, Response)> {
-                    let request = ping_request(size);
-                    let mut conn = Conn::open(addr, timeout)?;
+                    let request = ping_request(size, dull);
+                    let mut conn = Conn::open(addr, timeout, &messaging)?;
                     let mut samples = Vec::with_capacity(count);
                     let mut last = conn.call(&request)?;
                     for _ in 0..count {
                         if reconnect {
-                            conn = Conn::open(addr, timeout)?;
+                            conn = Conn::open(addr, timeout, &messaging)?;
                         }
                         let (response, elapsed) = conn.timed(&request)?;
                         samples.push(elapsed);
@@ -431,6 +502,7 @@ struct Bench {
     clients: usize,
     warmup: u64,
     size: u64,
+    dull: bool,
     depth: usize,
     seconds: u64,
     timeout: Duration,
@@ -438,7 +510,8 @@ struct Bench {
 
 /// Warm up, then measure. Throughput is the number to want first, and average
 /// latency is what says how much of it is per-message overhead.
-fn bench(target: &Target, plan: &Bench) -> Result<()> {
+fn bench(target: &Target, plan: &Bench, messaging: &Messaging) -> Result<()> {
+    let shared = Arc::new(messaging.clone());
     if plan.clients == 0 || plan.depth == 0 || plan.seconds == 0 {
         return Err(Error::new("--clients, --depth and --seconds must all be positive"));
     }
@@ -448,10 +521,12 @@ fn bench(target: &Target, plan: &Bench) -> Result<()> {
 
     let threads: Vec<_> = (0..plan.clients)
         .map(|_| {
-            let (size, depth, timeout) = (plan.size, plan.depth, plan.timeout);
+            let (size, dull) = (plan.size, plan.dull);
+            let (depth, timeout) = (plan.depth, plan.timeout);
+            let messaging = Arc::clone(&shared);
             std::thread::spawn(move || -> Result<Tally> {
-                let request = ping_request(size);
-                let mut conn = Conn::open(addr, timeout)?;
+                let request = ping_request(size, dull);
+                let mut conn = Conn::open(addr, timeout, &messaging)?;
                 conn.press(&request, depth, warm_end, &mut Tally::new())?;
                 let mut tally = Tally::new();
                 conn.press(&request, depth, end, &mut tally)?;
@@ -520,8 +595,8 @@ struct Target {
     address: SocketAddr,
 }
 
-fn open(target: &Target, timeout: Duration) -> Result<Conn> {
-    Conn::open(target.address, timeout)
+fn open(target: &Target, timeout: Duration, config: &Messaging) -> Result<Conn> {
+    Conn::open(target.address, timeout, config)
 }
 
 /// Which machine type answers a command, when none was named.
@@ -565,7 +640,7 @@ fn resolve(cluster: &ClusterConfig, cli: &Cli, kind: ServiceKind) -> Result<Targ
 /// Ask KS where a process is. Nothing but KS has an address of its own.
 fn lookup(cluster: &ClusterConfig, identity: &str) -> Result<SocketAddr> {
     let timeout = Duration::from_millis(cluster.timeouts.request_ms);
-    let mut ks = Conn::open(cluster.ks.address, timeout)?;
+    let mut ks = Conn::open(cluster.ks.address, timeout, &cluster.messaging)?;
     let response = ks.call(&Request::new(Op::Lookup).text(identity))?;
     match response.status {
         Status::Ok => response

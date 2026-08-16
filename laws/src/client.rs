@@ -8,41 +8,43 @@
 //! together leave in one syscall. Nothing here is a batch *message* — every
 //! request is separate and independently answerable; only the transport coalesces.
 
-use common::wire::{Chan, Request, Response, Status, read_response, write_request};
+use common::config::Messaging;
+use common::wire::{self, Link, Request, Response, Status, put_request};
 use common::{Context, Error, Result};
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 pub struct Conn {
-    chan: Chan,
+    link: Link,
     next_id: u32,
 }
 
 impl Conn {
-    pub fn open(addr: SocketAddr, timeout: Duration) -> Result<Conn> {
+    pub fn open(addr: SocketAddr, timeout: Duration, config: &Messaging) -> Result<Conn> {
         let stream =
             TcpStream::connect_timeout(&addr, timeout).context(format!("connecting {addr}"))?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
-        Ok(Conn { chan: Chan::new(stream)?, next_id: 0 })
+        Ok(Conn { link: wire::connect(stream, config)?, next_id: 0 })
     }
 
     /// Buffer a request without waiting for it, and return the id to expect back.
-    /// Nothing goes out until a flush.
+    /// Nothing goes out until a flush, which seals whatever has piled up.
     pub fn send(&mut self, request: &Request) -> Result<u32> {
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
-        write_request(&mut self.chan.output, &request.clone().id(id))?;
+        put_request(&mut self.link.plain, &request.clone().id(id))?;
         Ok(id)
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.chan.flush()
+        let Link { wire, plain, .. } = &mut self.link;
+        wire.send(plain)
     }
 
     pub fn recv(&mut self) -> Result<Response> {
-        read_response(&mut self.chan.input)
+        self.link.reader.response()
     }
 
     pub fn call(&mut self, request: &Request) -> Result<Response> {
@@ -90,7 +92,7 @@ impl Conn {
                 return self.flush();
             }
             // Nothing more to read, so the next recv would block: send.
-            if !self.chan.more() {
+            if !self.link.reader.more() {
                 self.flush()?;
             }
             let response = self.recv()?;

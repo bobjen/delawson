@@ -28,6 +28,20 @@ members = 1
 [messaging]
 send = "adaptive"
 
+# Everything sent is encrypted, in whole batches rather than per message, so the
+# nonce and tag are paid per write. false is for measuring what it costs, not for
+# running.
+encrypt = true
+
+# Compression, also per batch: a batch of small messages has repetition that any
+# one of them does not. "none" or "lz4".
+compress = "none"
+compress_min = 256
+
+# ⚠️ A pre-shared test key. Every process in the cluster uses it, which is not a
+# key hierarchy — KS handing out message keys is what replaces this.
+key = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+
 [timeouts]
 request_ms = 2000
 shutdown_grace_ms = 2000

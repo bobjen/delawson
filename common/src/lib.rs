@@ -5,6 +5,7 @@ pub mod config;
 pub mod placement;
 pub mod random;
 pub mod registry;
+pub mod seal;
 pub mod server;
 pub mod wire;
 

@@ -133,10 +133,44 @@ pub enum SendMode {
     Adaptive,
 }
 
+/// What to do to a batch before it is encrypted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compress {
+    None,
+    Lz4,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Messaging {
     pub send: SendMode,
+    /// Every message is encrypted. False exists to measure what that costs, and
+    /// is not a configuration to run.
+    pub encrypt: bool,
+    pub compress: Compress,
+    /// Batches smaller than this are not worth trying to compress.
+    pub compress_min: usize,
+    /// ⚠️ A pre-shared key, in hex, which is a stand-in until KS hands out
+    /// message keys. Everything in a cluster shares it, so it is a test key and
+    /// nothing else.
+    pub key: String,
+}
+
+impl Messaging {
+    pub fn key(&self) -> Result<[u8; 16]> {
+        let hex = self.key.as_bytes();
+        if hex.len() != 32 {
+            return Err(Error::new("messaging.key is 32 hex digits, for 16 bytes"));
+        }
+        let mut key = [0u8; 16];
+        for (byte, pair) in key.iter_mut().zip(hex.chunks(2)) {
+            let digits = std::str::from_utf8(pair).map_err(|_| Error::new("messaging.key"))?;
+            *byte = u8::from_str_radix(digits, 16)
+                .map_err(|_| Error::new(format!("messaging.key has {digits:?} in it")))?;
+        }
+        Ok(key)
+    }
 }
 
 /// Raft ring composition. One number fleet-wide for now; nothing yet

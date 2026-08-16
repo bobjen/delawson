@@ -14,19 +14,30 @@
 //! have as many requests outstanding as it likes, and a service may answer them
 //! in whatever order it finishes them.
 //!
-//! Frames are written into a buffer and flushed deliberately, so several messages
-//! that happen to be pending on one connection leave in one syscall. That is the
-//! only batching there is: no message means "do these N things", the transport
-//! simply carries whatever has piled up. Nagle stays off, because the decision of
-//! when to send is made here and not by the kernel.
+//! Messages are written into a buffer and sent deliberately, so several that
+//! happen to be pending on one connection leave in one syscall. That is the only
+//! batching there is: no message means "do these N things", the transport simply
+//! carries whatever has piled up. Nagle stays off, because the decision of when
+//! to send is made here and not by the kernel.
+//!
+//! **What goes on the wire is a sealed segment, not a message.** Everything a
+//! connection sends in one write is compressed and encrypted together, so a
+//! nonce, a tag and a compression attempt are paid per write. Inside the segment
+//! the messages are just length-prefixed.
 
+use crate::config::Messaging;
+use crate::random::Rng;
+use crate::seal::{self, Seal};
 use crate::{Context, Error, Result};
-use std::cell::RefCell;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 
-/// Refuse anything larger rather than allocating what a peer asks for.
+/// Refuse a message larger than this rather than allocating what a peer asks for.
 pub const MAX_FRAME_BYTES: usize = 1 << 20;
+
+/// And a batch of them is sealed in pieces no larger than this, so one busy
+/// connection cannot make the far side allocate without bound.
+pub const MAX_SEGMENT_BYTES: usize = 8 << 20;
 
 macro_rules! ops {
     ($($name:ident = $code:expr, $text:expr;)*) => {
@@ -353,11 +364,6 @@ impl<'a> Cursor<'a> {
 /// small messages leaves in one write.
 pub const BUF_BYTES: usize = 64 * 1024;
 
-thread_local! {
-    /// One scratch buffer per thread, so framing a message allocates nothing.
-    static SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(BUF_BYTES));
-}
-
 /// Frame a message into `buf`: four bytes of length, then whatever `body`
 /// appends. The length is backfilled, so the body is written once and never
 /// copied.
@@ -374,77 +380,182 @@ pub fn frame_into(buf: &mut Vec<u8>, body: impl FnOnce(&mut Vec<u8>)) -> Result<
     Ok(())
 }
 
-/// Frames go into the caller's buffer; the caller decides when to flush. Length
-/// and payload are one `write_all`, so a frame is never split across flushes and
-/// an unbuffered writer still sends it as one.
-fn write_framed(out: &mut impl Write, body: impl FnOnce(&mut Vec<u8>)) -> Result<()> {
-    SCRATCH.with(|scratch| {
-        let mut buf = scratch.borrow_mut();
-        buf.clear();
-        frame_into(&mut buf, body)?;
-        out.write_all(&buf)?;
+/// A buffered connection. `more` says whether bytes are already in hand, which is
+/// how both sides know they may keep piling up work instead of flushing.
+/// The write half of a connection. Producers append messages to a plain buffer
+/// of their own; this seals whatever they hand over and writes it as one segment.
+pub struct Wire {
+    stream: TcpStream,
+    seal: Seal,
+    sealed: Vec<u8>,
+}
+
+impl Wire {
+    /// Seal everything in `plain` and send it, leaving `plain` empty. A batch
+    /// larger than a segment is split at a message boundary rather than refused.
+    pub fn send(&mut self, plain: &mut Vec<u8>) -> Result<()> {
+        let mut at = 0;
+        while at < plain.len() {
+            let end = segment_end(&plain[at..])? + at;
+            self.sealed.clear();
+            self.seal.seal(&mut plain[at..end].to_vec(), &mut self.sealed)?;
+            self.stream.write_all(&self.sealed)?;
+            at = end;
+        }
+        plain.clear();
         Ok(())
+    }
+}
+
+/// The read half. A segment arrives whole and is opened whole; `more` says
+/// whether messages from it are still in hand, which is how the reader knows it
+/// may keep working instead of sending.
+pub struct Reader {
+    stream: TcpStream,
+    seal: Seal,
+    open: Vec<u8>,
+    at: usize,
+}
+
+impl Reader {
+    pub fn more(&self) -> bool {
+        self.at < self.open.len()
+    }
+
+    /// The next message, reading and opening a segment if none is in hand.
+    fn next(&mut self) -> Result<&[u8]> {
+        if !self.more() {
+            self.fill()?;
+        }
+        let bytes = &self.open[self.at..];
+        if bytes.len() < 4 {
+            return Err(Error::new("a segment ending mid-message"));
+        }
+        let length = u32::from_le_bytes(bytes[..4].try_into().expect("length")) as usize;
+        if bytes.len() < 4 + length {
+            return Err(Error::new("a message longer than its segment"));
+        }
+        self.at += 4 + length;
+        Ok(&bytes[4..4 + length])
+    }
+
+    fn fill(&mut self) -> Result<()> {
+        let mut header = [0u8; seal::HEADER];
+        self.stream.read_exact(&mut header)?;
+        let length = u32::from_le_bytes(header[..4].try_into().expect("length")) as usize;
+        if length > MAX_SEGMENT_BYTES + seal::OVERHEAD {
+            return Err(Error::new(format!("peer announced a {length}-byte segment")));
+        }
+        let mut sealed = vec![0u8; length];
+        self.stream.read_exact(&mut sealed)?;
+        self.open.clear();
+        self.at = 0;
+        self.seal.open(&header, &sealed, &mut self.open)
+    }
+
+    pub fn request(&mut self) -> Result<Request> {
+        Request::decode(self.next()?)
+    }
+
+    pub fn response(&mut self) -> Result<Response> {
+        Response::decode(self.next()?)
+    }
+}
+
+/// How much of a batch fits in one segment, cut at a message boundary. At least
+/// one message always goes, since a message cannot exceed a segment.
+fn segment_end(plain: &[u8]) -> Result<usize> {
+    let mut at = 0;
+    while at < plain.len() {
+        if plain.len() - at < 4 {
+            return Err(Error::new("a batch ending mid-message"));
+        }
+        let length = u32::from_le_bytes(plain[at..at + 4].try_into().expect("length")) as usize;
+        let next = at + 4 + length;
+        if next > plain.len() {
+            return Err(Error::new("a message longer than its batch"));
+        }
+        if next > MAX_SEGMENT_BYTES && at > 0 {
+            return Ok(at);
+        }
+        at = next;
+    }
+    Ok(at)
+}
+
+/// Append a message to a plain buffer, to be sealed with whatever else is there.
+pub fn put_request(plain: &mut Vec<u8>, request: &Request) -> Result<()> {
+    frame_into(plain, |buf| request.encode(buf))
+}
+
+pub fn put_response(plain: &mut Vec<u8>, response: &Response) -> Result<()> {
+    frame_into(plain, |buf| response.encode(buf))
+}
+
+/// The two halves of one connection, for a caller that uses both from one thread.
+pub struct Link {
+    pub reader: Reader,
+    pub wire: Wire,
+    pub plain: Vec<u8>,
+}
+
+impl Link {
+    pub fn call(&mut self, request: &Request) -> Result<Response> {
+        put_request(&mut self.plain, request)?;
+        self.wire.send(&mut self.plain)?;
+        self.reader.response()
+    }
+}
+
+/// The connecting side picks the nonce prefix and states it before anything is
+/// sealed. Directions differ by a byte in the nonce, so one prefix is enough for
+/// both and no two segments under one key can share a nonce.
+pub fn connect(stream: TcpStream, config: &Messaging) -> Result<Link> {
+    stream.set_nodelay(true)?;
+    let mut prefix = [0u8; 8];
+    Rng::new().fill(&mut prefix);
+    let mut writing = stream.try_clone()?;
+    writing.write_all(&prefix)?;
+    Ok(Link {
+        reader: Reader {
+            stream: stream.try_clone()?,
+            seal: Seal::new(config, prefix, 1)?,
+            open: Vec::with_capacity(BUF_BYTES),
+            at: 0,
+        },
+        wire: Wire { stream: writing, seal: Seal::new(config, prefix, 0)?, sealed: Vec::new() },
+        plain: Vec::with_capacity(BUF_BYTES),
     })
 }
 
-fn read_frame(input: &mut impl Read) -> Result<Vec<u8>> {
-    let mut length = [0u8; 4];
-    input.read_exact(&mut length)?;
-    let length = u32::from_le_bytes(length) as usize;
-    if length > MAX_FRAME_BYTES {
-        return Err(Error::new(format!("peer announced a {length}-byte frame")));
-    }
-    let mut payload = vec![0u8; length];
-    input.read_exact(&mut payload)?;
-    Ok(payload)
-}
-
-pub fn write_request(out: &mut impl Write, request: &Request) -> Result<()> {
-    write_framed(out, |buf| request.encode(buf))
-}
-
-/// A buffered connection. `more` says whether bytes are already in hand, which is
-/// how both sides know they may keep piling up work instead of flushing.
-pub struct Chan {
-    pub input: BufReader<TcpStream>,
-    pub output: BufWriter<TcpStream>,
-}
-
-impl Chan {
-    pub fn new(stream: TcpStream) -> Result<Chan> {
-        stream.set_nodelay(true)?;
-        Ok(Chan {
-            input: BufReader::with_capacity(BUF_BYTES, stream.try_clone()?),
-            output: BufWriter::with_capacity(BUF_BYTES, stream),
-        })
-    }
-
-    /// Bytes already read from the socket and not yet parsed.
-    pub fn more(&self) -> bool {
-        !self.input.buffer().is_empty()
-    }
-
-    pub fn flush(&mut self) -> Result<()> {
-        self.output.flush()?;
-        Ok(())
-    }
-}
-
-pub fn read_request(input: &mut impl Read) -> Result<Request> {
-    Request::decode(&read_frame(input)?)
-}
-
-pub fn write_response(out: &mut impl Write, response: &Response) -> Result<()> {
-    write_framed(out, |buf| response.encode(buf))
-}
-
-pub fn read_response(input: &mut impl Read) -> Result<Response> {
-    Response::decode(&read_frame(input)?)
+/// The accepting side takes the prefix it is given.
+pub fn accept(stream: TcpStream, config: &Messaging) -> Result<(Reader, Wire)> {
+    stream.set_nodelay(true)?;
+    let mut prefix = [0u8; 8];
+    let mut reading = stream.try_clone()?;
+    reading.read_exact(&mut prefix)?;
+    Ok((
+        Reader {
+            stream: reading,
+            seal: Seal::new(config, prefix, 0)?,
+            open: Vec::with_capacity(BUF_BYTES),
+            at: 0,
+        },
+        Wire { stream, seal: Seal::new(config, prefix, 1)?, sealed: Vec::new() },
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn round_trip_request(request: &Request) -> Request {
+        let mut plain = Vec::new();
+        put_request(&mut plain, request).unwrap();
+        let length = u32::from_le_bytes(plain[..4].try_into().unwrap()) as usize;
+        assert_eq!(length + 4, plain.len());
+        Request::decode(&plain[4..]).unwrap()
+    }
 
     #[test]
     fn req_round_trip() {
@@ -454,17 +565,15 @@ mod tests {
             .number(17)
             .flag(true)
             .bytes(vec![1, 2, 3]);
-        let mut buffer = Vec::new();
-        write_request(&mut buffer, &request).unwrap();
-        assert_eq!(read_request(&mut buffer.as_slice()).unwrap(), request);
+        assert_eq!(round_trip_request(&request), request);
     }
 
     #[test]
     fn resp_round_trip() {
         let response = Response::error(Status::Unimplemented, "no FE yet");
-        let mut buffer = Vec::new();
-        write_response(&mut buffer, &response).unwrap();
-        assert_eq!(read_response(&mut buffer.as_slice()).unwrap(), response);
+        let mut plain = Vec::new();
+        put_response(&mut plain, &response).unwrap();
+        assert_eq!(Response::decode(&plain[4..]).unwrap(), response);
     }
 
     #[test]
@@ -483,21 +592,20 @@ mod tests {
 
     #[test]
     fn truncated_frame_errs() {
-        let mut buffer = Vec::new();
-        write_request(&mut buffer, &Request::new(Op::Ping).text("hello")).unwrap();
-        buffer.truncate(buffer.len() - 2);
-        // The length prefix promises more than the payload delivers.
-        assert!(read_request(&mut buffer.as_slice()).is_err());
+        let mut plain = Vec::new();
+        put_request(&mut plain, &Request::new(Op::Ping).text("hello")).unwrap();
+        plain.truncate(plain.len() - 2);
+        assert!(Request::decode(&plain[4..]).is_err());
     }
 
     #[test]
     fn no_trailing_bytes() {
-        let mut buffer = Vec::new();
-        write_framed(&mut buffer, |buf| {
+        let mut plain = Vec::new();
+        frame_into(&mut plain, |buf| {
             Request::new(Op::Ping).encode(buf);
             buf.push(0xff);
         })
         .unwrap();
-        assert!(read_request(&mut buffer.as_slice()).is_err());
+        assert!(Request::decode(&plain[4..]).is_err());
     }
 }

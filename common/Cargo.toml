@@ -11,5 +11,7 @@ name = "common"
 path = "src/lib.rs"
 
 [dependencies]
+aegis = "0.9.15"
+lz4_flex = "0.14.0"
 serde.workspace = true
 toml.workspace = true

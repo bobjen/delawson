@@ -156,7 +156,7 @@ mod tests {
         ks = { address = "127.0.0.1:9601", port_base = 9602 }
         failure_domains = { levels = ["datacenter", "rack", "machine"] }
         rings = { members = 5 }
-        messaging = { send = "direct" }
+        messaging = { send = "direct", encrypt = false, compress = "none", compress_min = 256, key = "0f1e2d3c4b5a69788796a5b4c3d2e1f0" }
         timeouts = { request_ms = 1000, shutdown_grace_ms = 1000 }
     "#;
 

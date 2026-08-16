@@ -9080,6 +9080,72 @@ kilobyte** and costs from there: 8 KB costs 28% of the round-trip rate and past 
 as 1/size, so the cost model turns from per-message to per-byte somewhere between 1 and 8 KB. That is
 the number to know before choosing any granule or batch size.
 
+### 17.5a Every message is encrypted, and batches are the unit
+
+**Decided: everything sent is encrypted, and the unit of sealing is the batch**
+(Asserted, Bob, 2026-08-16). Not the message: whatever one write carries is compressed and
+encrypted together, so a nonce, a tag and a compression attempt are paid per write rather than per
+message — and a batch of small messages has repetition that no one of them has.
+
+What goes on the wire is therefore a segment:
+
+```
+u32 length | u64 counter | AEGIS-128X2( u8 form | [u32 length | message]... )
+```
+
+- **The cipher is AEGIS-128X2**, which §7.2.1 already chose for extents and messages both.
+- **The nonce is a connection prefix, a direction byte, and the segment counter.** The connecting
+  side picks the prefix and states it before anything is sealed; the direction byte is why one
+  prefix suffices for both ways. No two segments under one key can then share a nonce.
+- **The length and counter are authenticated** as associated data although they travel in the
+  clear, and a segment that arrives out of order does not open — the counter must be the expected
+  one.
+- **Compress before encrypt**, for the reason §7 gives: ciphertext does not compress. The form byte
+  says which was done, and it is inside the sealed region.
+- ⚠️ **The key is currently one pre-shared test key in the cluster configuration.** That is a
+  stand-in, not a hierarchy: KS handing out message keys is what replaces it, and until then a
+  cluster's processes all share one key.
+
+#### 17.5b What encryption and compression cost
+
+Retail, loopback, this box. "Round trips" is per second; "wire" is how much smaller the sealed
+bytes were than the plain ones, which KS counts.
+
+| Shape | Plain | Encrypted | Encrypted + lz4 | Wire, with lz4 |
+|---|---|---|---|---|
+| 16 conns x 256, bare ping | 14,381,000 | 14,423,000 | 13,024,000 | **5.5x smaller** |
+| 8 x 64, 1 KB random reply | 3,080,000 | 2,565,000 | 1,566,000 | 1.0x |
+| 8 x 64, 1 KB repetitive reply | 2,897,000 | 2,807,000 | **3,379,000** | 93.6x smaller |
+| 8 x 64, 16 KB random reply | 76,200 | 60,600 | 54,500 | 1.0x |
+| 8 x 64, 16 KB repetitive reply | 78,500 | 61,200 | **146,700** | 230.2x smaller |
+
+**Measured, 2026-08-16.** Four things worth keeping:
+
+- **Encryption is free on small messages and costs about 20% on large ones.** A bare ping is
+  unchanged inside the noise; a 16 KB body drops from 1,249 to 992 MB/s. Both ends run on this box,
+  so that is a sealing *and* an opening — AEGIS is doing roughly 10 GB/s per direction, which is
+  what §7.2.1 assumed when it called encryption nearly free.
+- **Headers compress even when bodies cannot** (Asserted, Bob, 2026-08-16). A batch of bare pings
+  is almost entirely framing and identity, and it compresses **5.5x** — with no user data in it at
+  all. That is the case for compressing batches rather than messages, in one number.
+- **Compressible bodies pay for themselves twice over**: 230x less wire and 2.4x the throughput at
+  16 KB, because bytes not sent are also bytes not copied.
+- ⚠️ **A failed compression attempt is expensive.** With random 1 KB bodies, lz4 finds nothing and
+  costs **39%** of throughput for it. Compression must therefore not be a global switch that is
+  simply left on: it needs to notice that it is not working. That is the next thing to build here.
+
+**What the padding cost had to be measured separately**, because a reply body has to come from
+somewhere: the generator runs at **10.2 GB/s** producing words and **11.1 GB/s** filling a buffer,
+which is 0.78 ns per 8 bytes and 1.5 µs for a 16 KB body. Worth knowing before reading any
+large-reply number as a measurement of the wire.
+
+⚠️ **Three measurement flaws found while getting here, all of which flattered compression.** Reply
+padding was a slice of one block, so every reply was the same bytes and a batch of them compressed
+41x; giving each reply a different offset made them overlapping windows, which also compressed; and
+the repetitive padding was built a byte at a time, which measured the loop rather than the wire. The
+rule that fell out: **a benchmark's own inputs need the same suspicion as its outputs**, and the
+check that caught it was counting bytes in and bytes out rather than trusting the throughput.
+
 ### 17.6 The harness reports what it cannot enforce
 
 One box is one domain at every level, so it satisfies no spreading rule. That is legal — §5.6.7
