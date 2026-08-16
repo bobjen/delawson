@@ -51,7 +51,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-105 things *not* decided.
+106 things *not* decided.
 
 **Priorities and framing**
 
@@ -77,7 +77,11 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Relative timestamps are why §1.3's rule survives a scale nobody designed for | §1.0.4, §4.6.3 |
 | The intermediate scale is a **torus Dyson swarm** — 2^18 elements, so **inside** DeLawson's addressing | §1.0.5 |
 | Its load-bearing property is **neighbours stay neighbours**, which is what lets placement never be revisited | §1.0.5 |
-| The AI workload bounds one store to a **few km** — the light-radius of a 100 µs thinking cycle | §1.0.5 |
+| Cluster diameter is a **choice of minimum communication time** — fast means small, slow means large | §1.0.5 |
+| **Cluster diameter is free; ring diameter is not** — ~1,000 km at a 1 s failover target | §1.0.5 |
+| The AI workload selects a **few km**, 300× tighter than consensus needs | §1.0.3, §1.0.5 |
+| **StarMind** is a plausible near-term platform; a fast cluster is a circular section of the torus surface | §1.0.5.1 |
+| In orbit the scarce resources are **launch mass and heat rejection**, so §1.2's basis changes and §12.1's rule does not | §1.0.5.1 |
 | Every append records its **durability second**, so time-range queries work indefinitely — distinct from the minutes-long SCN snapshot horizon | §9.7 |
 | **User code only on Compute; keys never where user code runs** | §1.5 |
 | The real boundary is **signed executables**, not absence of keys — which makes code signing load-bearing | §1.5 |
@@ -477,23 +481,58 @@ scale is *inside* the design's addressing — with room for ~16,000 nodes per el
 identifiers of §5.10 run out. A coincidence of magnitudes rather than a design, but it identifies which of
 the four rows above DeLawson is actually built for.
 
-**A memory store is bounded by the light-radius of the thinking cycle.** §1.0.3 derives a 100 µs budget per
-remember-test cycle, and 100 µs of light is **30 km** in vacuum, ~15 km for a round trip, and ~5 km in fibre
-at 2/3 *c* before any switching latency. So:
+**A cluster's size is a definition, not a constraint.** You choose the **minimum communication time** you are
+willing to call "close enough", and that choice fixes the diameter (Asserted, Bob, 2026-08-16). Fast means
+small, slow means large, and at slow enough you could take the whole solar system as one cluster.
 
-| | Diameter |
-|---|---|
-| One store, for the AI workload | **a few km** — a campus, not a metro |
-| Starlink's north/south path separation | a few km |
-| Dense core, compact subset | 1.2 light-seconds = 360,000 km |
+| Minimum communication time | Diameter, in fibre at ~2/3 *c* | What it serves |
+|---|---|---|
+| 100 µs | **~5-10 km** — a campus | §1.0.3's remember-test cycle |
+| 10 ms | ~1,000 km — continental | consensus with ~1 s failover, see below |
+| seconds | interplanetary | §1.4 batch work only |
+| minutes to hours | the solar system | asynchronous transfer, not one store |
 
-That is why the AI page insists on **multiple** memory stores rather than one, and it puts a physical bound on
-how large a single DeLawson cluster can usefully be *for this workload*: a metro-spanning cluster would break
-the thinking loop even though it would serve §1.4's batch workloads perfectly well. The neighbour-preserving
-topology is then what lets many such stores tile a structure far larger than any one of them.
+So §1.0.3's few-kilometre figure is not a bound on DeLawson — it is the diameter *the AI workload* selects,
+and it is 300x tighter than anything the storage machinery itself needs. That is worth separating clearly,
+because the two get conflated:
 
-⚠️ Nothing in §5 currently bounds a cluster's physical diameter, and for the motivating workload there is one.
-Whether that belongs in the design or in deployment guidance is undecided.
+> **Cluster diameter is free. Ring diameter is not.**
+
+§5.7's Raft rings need heartbeats, and an election timeout must comfortably exceed the round trip — call it
+two orders of magnitude for stability. Targeting §5.7.1's fastest failover tier at ~1 second gives a round
+trip of ~10 ms, or a **ring radius near 1,000 km**. **Derived.** Extents may sit anywhere the operator likes;
+the *consensus* has to be local-ish, and §5.7's separation of consensus membership from RAM membership is
+what makes that a workable division rather than a contradiction with §5.6's demand that ring members fail
+independently.
+
+At the slow end the machinery does not merely get slower, it stops applying: §13.1's one-minute liveness
+loop, §9.5's timeouts, and Raft itself all assume round trips far below their own periods. A solar-system
+"cluster" would be the multiple-stores regime the AI page describes — asynchronous transfer with
+back-and-forth verification — which §2 puts out of scope. **The name still fits; the design does not.**
+
+#### 1.0.5.1 StarMind is a plausible near-term platform
+
+SpaceX's **StarMind** — the same flattened torus design as Starlink — is a plausible near-term deployment
+platform for DeLawson (Asserted, Bob, 2026-08-16). That makes §1.0.5 something other than a thought
+experiment, and it is the reason to record it here rather than in a speculation appendix.
+
+**How a fast cluster would be carved out of it:** take a roughly circular section of the torus *surface*, of
+whatever radius the chosen communication time allows, **near the equator** (Asserted, Bob).
+
+The neighbour-preservation property is what makes that work. The section is in constant motion, but because
+all satellites share one period and neighbours stay neighbours, **the set of satellites in the section is
+stable even though the section is moving.** Without that, a "cluster" would be a continuously changing
+membership and §5.6.7's decide-placement-once rule would have nothing to hold onto.
+
+⚠️ **It also invalidates §1.2's cost basis, though not §12's principle.** §1.2 puts ~95% of cost in disk plus
+electricity plus rent, all terrestrial terms. In orbit, solar power is abundant and the scarce resources are
+**launch mass** and **the ability to radiate heat** — the dense-core page names heat rejection as the limiting
+factor on habitat design. So §12.7's chain from raw disk to a price per byte would need rebuilding on a
+different basis.
+
+That §12.1 survives unchanged is the point of having stated it as a principle: *bill proportional to actual
+cost on every scarce resource* does not care which resources are scarce. A platform where mass and heat
+rejection are the binding terms needs a new cost model and the same billing rule.
 
 ### 1.1 Availability and reliability are separate goals
 
@@ -7206,11 +7245,15 @@ Roughly in order of how much else depends on them.
      optimized later, the optimization means recomputing parity over a whole group. That may cost more than
      the co-deletion and size-binning it buys.
 
-105. **Whether a cluster's physical diameter should be bounded in the design** (§1.0.5). The AI workload's
-     100 µs thinking cycle gives a light-radius of a few kilometres, so a metro-spanning cluster would break
-     it while serving §1.4's batch workloads perfectly. Nothing in §5 bounds diameter today. Design
-     constraint, or deployment guidance?
-
+105. **Which constants are functions of the cluster's chosen communication time** (§1.0.5). Diameter is a
+     definition, not a bound — but §13.1's one-minute liveness loop, §9.5's timeouts, §5.7's election
+     timeouts and §8.1.1's watermark round trip all assume round trips far below their own periods. Those
+     assumptions should be collected and expressed against the chosen minimum communication time rather than
+     left as constants that happen to work terrestrially.
+106. **A cost model for a platform where mass and heat rejection are scarce** (§1.0.5.1). §1.2's basis is
+     disk, electricity and rent; in orbit, power is abundant and launch mass and heat radiation bind. §12.1's
+     principle is unaffected, which is the point of it being a principle — but §12.7's whole chain to a price
+     per byte would need rebuilding. Not near-term unless StarMind is.
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
