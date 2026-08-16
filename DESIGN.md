@@ -88,6 +88,8 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | The scheme is **work-conserving**: alone, any purpose reaches ~91%+ — doors arbitrate, they do not partition | §13.4.3.6 |
 | So `sufficient` is a **floor, never a ceiling**; implementing it as a quota destroys that | §13.4.3.6 |
 | So there is no expensive read to meter, and read billing can stay flat | §9.8.1 |
+| Idle-time reconstruct-for-read is expressible as a **very high door** — but is **not worth building** | §9.8.2, §9.8.3 |
+| Because a solve that writes its result **already exists** as repair with read-demand priority | §9.8.3 |
 | The scale ambition is ~10^57 bits; DeLawson addresses ~10^26, so it is **10^31 short** and directional | §1.0.4 |
 | Relative timestamps are why §1.3's rule survives a scale nobody designed for | §1.0.4, §4.6.3 |
 | The intermediate scale is a **torus Dyson swarm** — 2^18 elements, so **inside** DeLawson's addressing | §1.0.5 |
@@ -5531,8 +5533,10 @@ objects whose interval overlaps the requested range.
 
 ### 9.8 A read that would need reconstruction does not reconstruct
 
-**Policy: there are no reconstruct-for-read operations** (Asserted, Bob, 2026-08-16). If a read needs a cell
-that is missing, the system does **not** rebuild just that cell to satisfy the read.
+**Policy: reconstruct-for-read never competes with repair** (Asserted, Bob, 2026-08-16). If a read needs a
+missing cell, rebuilding just that cell to satisfy the read is **not** done at the expense of other work — but
+it is permitted when nothing else wants the bandwidth, via a purpose with a **very high door** in §13.4.3's
+sense (§9.8.2).
 
 The reason is throughput, and it generalizes:
 
@@ -5584,6 +5588,66 @@ compromise and is not obviously correct. Undecided.
 
 Note that §9.5's hedging cannot help here: at 1.333x there is one instance to read, so there is no second
 target to hedge to. Hedging is a 2.333x-tier mechanism (§4.3.2.4).
+
+#### 9.8.2 …except at idle, where the objection stops applying
+
+The argument against reconstruct-for-read is a **throughput** argument: hardware spent, nothing persisted
+(§1.6.4). Under contention that is decisive. At idle it is empty — §1.6 says allocated bandwidth left unused is
+wasted, so spending idle bandwidth on a non-persisted read costs nothing and serves a user.
+
+So reconstruct-for-read becomes a **purpose with the highest door of any**, and the admission mechanism
+reconciles the two concerns with no separate policy: real work drives the level down, the highest door stops
+being cleared, and read reconstruction stops. Exactly the desired behaviour, obtained from a threshold rather
+than from a rule.
+
+**Its door belongs above the 1-9% band, and it is the only purpose for which that is true.** Two reasons, both
+Derived:
+
+- **The level moves slowly** (§13.4.3.4). A door inside the narrow band would let read reconstruction hold
+  bandwidth that newly-arrived repair work cannot reclaim promptly. The one purpose whose work is *discardable*
+  should also be the one that yields with the most margin.
+- **It is the only preemptible purpose.** Abandoning an in-flight read reconstruction costs nothing — the caller
+  simply gets the failure it would have got anyway. Abandoning a repair means the work must be redone. So it is
+  safe to give this purpose a hair trigger, and unsafe to give one to anything else.
+
+The consequence for §4.3.2.4's availability tiers is a better story than §9.8.1 told: a degraded read in the
+1.333x tier fails **under load** and succeeds **at idle**, automatically, with the user's timeout (§9.8) deciding
+how long they are willing to find out.
+
+⚠️ **But if you have paid for the solve, why not write the result?** A global solve costs ~45 reads; writing the
+rebuilt cell costs 1 more and makes the work permanent — 2% for a durable benefit, which §1.6.4 says take every
+time. And having solved, there is no reason to rebuild only the cell that was asked for rather than every
+recoverable cell in the group.
+
+Follow that through and "reconstruct for read" collapses into **ordinary repair with read-demand priority**,
+which §13.4.0 already provides. Which leaves a genuine question rather than a rhetorical one: **is there a case
+where the solve is possible but the write is not?** Plausibly yes — placement may be unsolvable, the group may be
+mid-regrouping (§16 question 104), or the target media class may be full (§5.11). If those are the only cases,
+then non-persisting reconstruction is a narrow fallback and not a general mode, and its door can be set
+accordingly.
+
+#### 9.8.3 Disposition: available, and not worth building
+
+**Decided: do not build it** (Asserted, Bob, 2026-08-16 — "I doubt it's worth the coding effort"). The section
+above stays because the reasoning is what justifies the omission, and because the same reasoning is what someone
+would have to overturn to add it later.
+
+The argument for leaving it out is stronger than effort-versus-value, and §9.8.2 is what makes it so:
+
+| | |
+|---|---|
+| Read-triggered solve **that writes its result** | already exists — ordinary repair with read-demand priority (§13.4.0) |
+| Read-triggered solve that **discards** its result | needs new code, and §1.6.4 says writing costs 2% more for a durable benefit |
+| So the new code buys | only the cases where the solve is possible and the **write** is not |
+
+Those cases — unsolvable placement, a group mid-regrouping, a full media class — are narrow, and in each of them
+the right answer is probably to fix the blocking condition rather than to serve a read from work that is thrown
+away. So the feature is not merely low-value; **the case for it nearly closes on inspection.**
+
+What remains true and worth keeping is the general lesson, which §13.4.3.6 states: because the admission
+mechanism is work-conserving, **a purpose whose work is worthless under load but harmless at idle can be
+expressed as a very high door rather than as a policy.** That pattern will come up again for something that *is*
+worth building.
 
 ## 10. Compaction
 
@@ -6779,6 +6843,7 @@ repair is scheduled its cost is **removed** from the available pool; when it com
 | EC global solve, `m` = 2 | 45 | 2 | **47** |
 | EC global solve, `m` = 7 | 45 | 7 | 52 |
 | Vacating an EN scheduled to go down | 1 | 1 | 2 per extent, x very many |
+| **Reconstruct for read**, discarding the result (§9.8.2) | 45 | **0** | 45 |
 
 **Derived** from §4.3.3.2d, and SN can estimate every one of these because it knows the instance state and the
 group's shape. The 26x spread between a copy and a global solve is the range the thresholds below have to
