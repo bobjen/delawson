@@ -18,12 +18,16 @@ See [DESIGN.md](DESIGN.md) for the architecture, its Open Questions section for
 what is still undecided, and section 17 for what has been built.
 
 ```sh
-scripts/start-laws              # build debug, start every configured process
+scripts/start-laws              # build debug, start every process in the roster
 laws --to KS0 ping              # "KS0 is alive"
+laws registry                   # what KS knows: identity -> machine, port
 laws placement                  # which spreading rules this cluster can enforce
 scripts/bench-laws --clients 8  # start retail, measure ping, stop
 scripts/stop-laws               # stop everything, either flavour
 ```
+
+KS holds the only fixed address in a cluster. `start-laws` hands every other process a
+port, the process announces it to KS, and everything else is found by name.
 
 ## Two object flavors
 

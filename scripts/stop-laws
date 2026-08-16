@@ -41,11 +41,13 @@ for candidate in "$root/target/$(cat "$run_dir/flavor" 2>/dev/null || echo debug
     if [[ -x $candidate ]]; then laws=$candidate; break; fi
 done
 
-# Reverse cold-start order: nothing should outlive what it depends on.
+# Reverse cold-start order: nothing should outlive what it depends on, and within
+# a kind the highest-numbered instance goes first, so KS0 - the registrar - is the
+# last process in the cluster to stop.
 order=(fe en sn dn ks)
 dirs=()
 for kind in "${order[@]}"; do
-    for dir in "$run_dir"/*/; do
+    for dir in $(printf '%s\n' "$run_dir"/*/ | sort -r); do
         [[ -f ${dir}process.toml ]] || continue
         [[ $(sed -n 's/^kind = "\(.*\)"/\1/p' "${dir}process.toml") == "$kind" ]] || continue
         dirs+=("${dir%/}")
@@ -75,9 +77,12 @@ for dir in "${dirs[@]}"; do
         continue
     fi
 
+    # Straight to the address in the run directory: a shutdown must not depend on
+    # KS still being up to look the process up.
+    listen=$(sed -n 's/^listen = "\(.*\)"/\1/p' "$dir/process.toml")
     how=""
-    if [[ -n $laws ]] && "$laws" --config "$dir/cluster.toml" --to "$identity" shutdown \
-        > /dev/null 2>&1 && wait_gone "$pid" "$grace"; then
+    if [[ -n $laws && -n $listen ]] && "$laws" --config "$dir/cluster.toml" --at "$listen" \
+        --to "$identity" shutdown > /dev/null 2>&1 && wait_gone "$pid" "$grace"; then
         how="on request"
     elif kill -TERM "$pid" 2>/dev/null && wait_gone "$pid" "$grace"; then
         how="on SIGTERM"

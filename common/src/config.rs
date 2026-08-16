@@ -6,11 +6,13 @@
 //! | service | machine type | yes | knobs one machine type owns |
 //! | process | process | no, written by `start-laws` | identity, and where the other two are |
 //!
-//! A process is told who it is and where to look, and learns everything else
-//! from files that are identical fleet-wide. Its listening address comes from
-//! the cluster service directory keyed by identity, not from its own file: every
-//! process needs the directory anyway to reach the others, so a second copy
-//! would only be somewhere for the two to disagree.
+//! A process is told who it is, which port to listen on, and where to look;
+//! everything else comes from files that are identical fleet-wide.
+//!
+//! Only KS has a fixed address, and it is in the cluster file. Every other
+//! process is handed a port by whatever starts it, announces that port to KS, and
+//! asks KS where its peers are — so no process's address is checked in, and no
+//! two copies of one address can disagree.
 
 use crate::{Context, Error, Result};
 use serde::Deserialize;
@@ -69,7 +71,6 @@ pub struct ServiceEntry {
     /// `KS0`, `FE0`: kind plus instance number.
     pub identity: String,
     pub kind: ServiceKind,
-    pub address: SocketAddr,
     /// Position in the nested failure-domain hierarchy, outermost first, one
     /// entry per level of `FailureDomains::levels`.
     pub domain: Vec<String>,
@@ -77,6 +78,14 @@ pub struct ServiceEntry {
     /// nothing else does.
     #[serde(default)]
     pub media_class: Option<String>,
+}
+
+/// Where KS listens, which is the one address a cluster cannot discover.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KsBootstrap {
+    pub address: SocketAddr,
+    /// Ports from here upward are what a starter hands out to everything else.
+    pub port_base: u16,
 }
 
 /// Nested failure domains, coarse to fine, each level a refinement of the one
@@ -128,6 +137,7 @@ pub struct ClusterConfig {
     /// does not understand rather than misreading it.
     pub schema_version: u32,
     pub cluster_name: String,
+    pub ks: KsBootstrap,
     pub failure_domains: FailureDomains,
     pub rings: Rings,
     pub timeouts: Timeouts,
@@ -189,6 +199,21 @@ impl ClusterConfig {
         self.services.iter().find(|s| s.identity == identity)
     }
 
+    /// The KS that holds the registry. One for now; a KS ring of several members
+    /// needs an address for each, since none of them can be looked up.
+    pub fn registrar(&self) -> Result<&ServiceEntry> {
+        self.services_of_kind(ServiceKind::Ks)
+            .next()
+            .ok_or_else(|| Error::new("no KS in the roster, so nothing can register"))
+    }
+
+    /// The address of a process, for the one process whose address is known
+    /// without asking KS.
+    pub fn fixed_address(&self, identity: &str) -> Option<SocketAddr> {
+        let registrar = self.registrar().ok()?;
+        (registrar.identity == identity).then_some(self.ks.address)
+    }
+
     pub fn services_of_kind(&self, kind: ServiceKind) -> impl Iterator<Item = &ServiceEntry> {
         self.services.iter().filter(move |s| s.kind == kind)
     }
@@ -237,6 +262,8 @@ impl KsConfig {
 pub struct ProcessConfig {
     pub identity: String,
     pub kind: ServiceKind,
+    /// Assigned by whatever started this process, and announced to KS.
+    pub listen: SocketAddr,
     pub cluster_config: PathBuf,
     pub service_config: PathBuf,
     /// Persistent state. KS, DN, SN and EN have state; FE and the client do not.

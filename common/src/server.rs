@@ -14,13 +14,16 @@
 //! than a decision.
 //!
 //! A process is ready when its `ready` file exists, written once the listener is
-//! accepting. Stopping is a request, not a signal, so a process with state to
-//! flush gets the chance; a signal is the fallback.
+//! accepting and, for everything but KS itself, once KS has been told which port
+//! that is. Stopping is a request, not a signal, so a process with state to flush
+//! gets the chance; a signal is the fallback.
 
 use crate::config::{ClusterConfig, ProcessConfig, ServiceEntry};
 use crate::random::Rng;
+use crate::registry::Peer;
 use crate::wire::{
-    Arg, MAX_FRAME_BYTES, Op, Request, Response, Status, read_request, write_response,
+    Arg, MAX_FRAME_BYTES, Op, Request, Response, Status, read_request, read_response,
+    write_request, write_response,
 };
 use crate::{Context, Error, Result};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -28,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const READY_FILE: &str = "ready";
 
@@ -100,7 +103,48 @@ impl Process {
     }
 
     pub fn address(&self) -> SocketAddr {
-        self.entry.address
+        self.config.listen
+    }
+
+    /// Where a peer is, which only KS knows.
+    pub fn peer(&self, identity: &str) -> Result<SocketAddr> {
+        if let Some(address) = self.cluster.fixed_address(identity) {
+            return Ok(address);
+        }
+        let response =
+            ask(self.cluster.ks.address, &Request::new(Op::Lookup).text(identity), self.timeout())?;
+        match response.status {
+            Status::Ok => match response.message() {
+                Some(address) => address
+                    .parse()
+                    .map_err(|_| Error::new(format!("KS answered {address:?} for {identity}"))),
+                None => Err(Error::new(format!("KS answered nothing for {identity}"))),
+            },
+            status => Err(Error::new(format!("KS answered {status} for {identity}"))),
+        }
+    }
+
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.cluster.timeouts.request_ms)
+    }
+
+    /// Announce this process's port to KS, which is how anything else finds it.
+    fn register(&self) -> Result<()> {
+        let peer = Peer {
+            identity: self.identity().to_string(),
+            kind: self.entry.kind,
+            address: self.address(),
+            domain: self.entry.domain.clone(),
+            media_class: self.entry.media_class.clone(),
+        };
+        let response = ask(self.cluster.ks.address, &peer.request(), self.timeout())?;
+        match response.status {
+            Status::Ok => Ok(()),
+            status => Err(Error::new(format!(
+                "KS refused the registration: {status}, {}",
+                response.message().unwrap_or("no reason given")
+            ))),
+        }
     }
 
     pub fn log(&self, message: impl std::fmt::Display) {
@@ -152,6 +196,16 @@ impl Pool {
     }
 }
 
+/// One request on a fresh connection, for the few calls a daemon makes itself.
+pub fn ask(address: SocketAddr, request: &Request, timeout: Duration) -> Result<Response> {
+    let mut stream =
+        TcpStream::connect_timeout(&address, timeout).context(format!("connecting {address}"))?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(timeout))?;
+    write_request(&mut stream, request)?;
+    read_response(&mut stream)
+}
+
 fn workers() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
 }
@@ -161,13 +215,22 @@ pub fn serve(process: Arc<Process>, service: Arc<impl Service>) -> Result<()> {
     let listener =
         TcpListener::bind(process.address()).context(format!("binding {}", process.address()))?;
     let address = listener.local_addr()?;
+    let pool = Arc::new(Pool::new(workers()));
+    process.log(format!("listening on {address} with {} workers", workers()));
+
+    // KS cannot register with itself, and needs no one's permission to serve.
+    if process.cluster.fixed_address(process.identity()).is_none() {
+        process.register()?;
+        process.log(format!("registered with KS at {}", process.cluster.ks.address));
+    }
+
+    // Ready last: a process is ready when it can be found, not merely when it is
+    // listening.
     std::fs::write(
         process.ready_file(),
         format!("pid={}\naddress={address}\n", std::process::id()),
     )
     .context(process.ready_file().display())?;
-    let pool = Arc::new(Pool::new(workers()));
-    process.log(format!("listening on {address} with {} workers", workers()));
 
     for connection in listener.incoming() {
         if process.stopping.load(Ordering::SeqCst) {

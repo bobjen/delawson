@@ -6,6 +6,13 @@
 schema_version = 1
 cluster_name = "laws-test"
 
+# KS's address is the one address a cluster cannot discover: every other process
+# is handed a port by whatever starts it, announces that port here, and asks here
+# where its peers are. start-laws hands out ports from port_base upward.
+[ks]
+address = "127.0.0.1:9601"
+port_base = 9602
+
 # Coarse to fine, each level a refinement of the one above.
 [failure_domains]
 levels = ["region", "datacenter", "rack", "machine", "disk"]
@@ -17,16 +24,12 @@ members = 1
 request_ms = 2000
 shutdown_grace_ms = 2000
 
-# The service directory. In production one machine holds one EN, or several SN
-# processes; here every entry is a process on this box.
-#
-# Addresses are hand-assigned only until KS becomes the registrar. Then KS's port
-# is the one fixed address, every other process binds an ephemeral port and
-# registers, and what stays here is identity, kind, domain and media class.
+# The roster: who may exist, and where each one sits in the hierarchy. No
+# addresses — a registration announces a port, it does not invent an identity, so
+# KS checks what registers against this.
 [[service]]
 identity = "KS0"
 kind = "ks"
-address = "127.0.0.1:9601"
 domain = ["region0", "dc0", "rack0", "box0", "disk0"]
 
 # Per-device-class constants. Every number here is a guess awaiting measurement;

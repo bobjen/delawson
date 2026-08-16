@@ -10,10 +10,11 @@ mod client;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use client::{Conn, Stats, Tally};
-use common::config::{ClusterConfig, ServiceEntry, ServiceKind};
+use common::config::{ClusterConfig, ServiceKind};
 use common::placement;
 use common::wire::{Arg, Op, Request, Response, Status};
 use common::{Error, Result};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -26,9 +27,14 @@ struct Cli {
 
     /// Which process to talk to. Control commands accept any identity; the rest
     /// go to an FE, since that is the only thing a client talks to in
-    /// production.
+    /// production. Anything but KS is looked up in KS's registry.
     #[arg(long, global = true)]
     to: Option<String>,
+
+    /// Talk straight to this address, skipping the registry. For a process that
+    /// has not registered, or a KS that is not answering.
+    #[arg(long, global = true)]
+    at: Option<SocketAddr>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -97,8 +103,12 @@ enum Cmd {
     /// Generate today's master key.
     RotateMasterKey,
 
-    /// The configured service directory, in cold-start order.
+    /// The configured roster, in cold-start order. Needs no running cluster.
     Services,
+    /// Every process KS knows about, with the port it registered.
+    Registry,
+    /// KS's fixed address and the port base, which is what a starter needs.
+    Bootstrap,
     /// Which spreading rules this cluster can enforce.
     Placement,
     /// The per-media-class constant table.
@@ -261,8 +271,22 @@ fn run(cli: Cli) -> Result<()> {
     match &cli.cmd {
         Cmd::Services => {
             for s in cluster.cold_start_order() {
-                println!("{:<6} {:<4} {} {}", s.identity, s.kind, s.address, s.domain.join("/"));
+                println!("{:<6} {:<3} {}", s.identity, s.kind, s.domain.join("/"));
             }
+            Ok(())
+        }
+        Cmd::Registry => {
+            let target = resolve(&cluster, &cli, ServiceKind::Ks)?;
+            let response = open(&target, timeout)?.call(&Request::new(Op::Registry))?;
+            if response.args.is_empty() {
+                println!("{} nothing has registered", target.identity);
+            }
+            report(&target, &response)
+        }
+        Cmd::Bootstrap => {
+            println!("registrar {}", cluster.registrar()?.identity);
+            println!("address {}", cluster.ks.address);
+            println!("port_base {}", cluster.ks.port_base);
             Ok(())
         }
         Cmd::Placement => {
@@ -291,9 +315,9 @@ fn run(cli: Cli) -> Result<()> {
             ping(&cluster, &cli, &plan)
         }
         Cmd::Bench { clients, warmup, size, seconds } => {
-            // Anything answers a ping, so an unnamed target is just the first
-            // thing that comes up.
-            let target = targets(&cluster, &cli)?[0];
+            // Anything answers a ping, so an unnamed target is KS, which is the
+            // one process that is always there.
+            let target = resolve(&cluster, &cli, ServiceKind::Ks)?;
             let plan = Bench {
                 clients: *clients,
                 warmup: *warmup,
@@ -301,31 +325,30 @@ fn run(cli: Cli) -> Result<()> {
                 seconds: *seconds,
                 timeout,
             };
-            bench(target, &plan)
+            bench(&target, &plan)
         }
         Cmd::Status => {
-            for target in targets(&cluster, &cli)? {
-                let mut conn = Conn::open(target.address, timeout)?;
-                report(target, &conn.call(&Request::new(Op::Status))?)?;
+            for target in targets(&cluster, &cli, ServiceKind::Ks)? {
+                report(&target, &open(&target, timeout)?.call(&Request::new(Op::Status))?)?;
             }
             Ok(())
         }
         Cmd::Shutdown { all } => {
-            let mut targets = targets(&cluster, &cli)?;
+            // Reverse cold-start order: nothing outlives what it depends on, and
+            // KS goes last because everything else is found through it.
+            let mut targets = targets(&cluster, &cli, ServiceKind::Ks)?;
             if *all {
                 targets.reverse();
             }
             for target in targets {
-                let mut conn = Conn::open(target.address, timeout)?;
-                report(target, &conn.call(&Request::new(Op::Shutdown))?)?;
+                report(&target, &open(&target, timeout)?.call(&Request::new(Op::Shutdown))?)?;
             }
             Ok(())
         }
         cmd => {
             let request = build(cmd)?;
-            let target = one_target(&cluster, &cli, serves(cmd))?;
-            let mut conn = Conn::open(target.address, timeout)?;
-            report(target, &conn.call(&request)?)
+            let target = resolve(&cluster, &cli, serves(cmd))?;
+            report(&target, &open(&target, timeout)?.call(&request)?)
         }
     }
 }
@@ -351,7 +374,7 @@ fn ping(cluster: &ClusterConfig, cli: &Cli, plan: &Plan) -> Result<()> {
     if plan.count == 0 || plan.conns == 0 {
         return Err(Error::new("--count 0 or --conns 0 measures nothing"));
     }
-    for target in targets(cluster, cli)? {
+    for target in targets(cluster, cli, ServiceKind::Ks)? {
         let addr = target.address;
         let start = std::time::Instant::now();
         let threads: Vec<_> = (0..plan.conns)
@@ -387,7 +410,7 @@ fn ping(cluster: &ClusterConfig, cli: &Cli, plan: &Plan) -> Result<()> {
         let wall = start.elapsed();
 
         if let Some(response) = last {
-            report(target, &response)?;
+            report(&target, &response)?;
         }
         if plan.count * plan.conns > 1 {
             let stats = Stats::of(&mut samples).expect("count > 0");
@@ -409,7 +432,7 @@ struct Bench {
 
 /// Warm up, then measure. Throughput is the number to want first, and average
 /// latency is what says how much of it is per-message overhead.
-fn bench(target: &ServiceEntry, plan: &Bench) -> Result<()> {
+fn bench(target: &Target, plan: &Bench) -> Result<()> {
     if plan.clients == 0 || plan.seconds == 0 {
         return Err(Error::new("--clients and --seconds must both be positive"));
     }
@@ -461,7 +484,7 @@ fn bench(target: &ServiceEntry, plan: &Bench) -> Result<()> {
 }
 
 /// Print a response, and fail the process if the service refused.
-fn report(target: &ServiceEntry, response: &Response) -> Result<()> {
+fn report(target: &Target, response: &Response) -> Result<()> {
     for arg in &response.args {
         match arg {
             // A reply that already names its sender does not get named twice.
@@ -484,45 +507,96 @@ fn report(target: &ServiceEntry, response: &Response) -> Result<()> {
     }
 }
 
-/// Which processes a control command addresses: the named one, or all of them.
-fn targets<'a>(cluster: &'a ClusterConfig, cli: &Cli) -> Result<Vec<&'a ServiceEntry>> {
-    match &cli.to {
-        Some(identity) => Ok(vec![find(cluster, identity)?]),
-        None => {
-            let all = cluster.cold_start_order();
-            if all.is_empty() {
-                return Err(Error::new("the service directory is empty"));
-            }
-            Ok(all)
-        }
-    }
+/// A process to talk to: a name to print, and an address to reach it at.
+#[derive(Clone)]
+struct Target {
+    identity: String,
+    address: SocketAddr,
+}
+
+fn open(target: &Target, timeout: Duration) -> Result<Conn> {
+    Conn::open(target.address, timeout)
 }
 
 /// Which machine type answers a command, when none was named.
 fn serves(cmd: &Cmd) -> ServiceKind {
     match cmd {
-        Cmd::Unlock | Cmd::SnMasterKey { .. } | Cmd::RotateMasterKey => ServiceKind::Ks,
+        Cmd::Unlock | Cmd::SnMasterKey { .. } | Cmd::RotateMasterKey | Cmd::Registry => {
+            ServiceKind::Ks
+        }
         _ => ServiceKind::Fe,
     }
 }
 
-fn one_target<'a>(
-    cluster: &'a ClusterConfig,
-    cli: &Cli,
-    kind: ServiceKind,
-) -> Result<&'a ServiceEntry> {
-    match &cli.to {
-        Some(identity) => find(cluster, identity),
-        None => cluster.services_of_kind(kind).next().ok_or_else(|| {
-            Error::new(format!("no {} in the service directory", kind.as_str().to_uppercase()))
-        }),
+/// One process: whatever --at says, or the named one, or the first of the kind
+/// that answers this command.
+fn resolve(cluster: &ClusterConfig, cli: &Cli, kind: ServiceKind) -> Result<Target> {
+    if let Some(address) = cli.at {
+        return Ok(Target {
+            identity: cli.to.clone().unwrap_or_else(|| address.to_string()),
+            address,
+        });
+    }
+    let identity = match &cli.to {
+        Some(identity) => identity.clone(),
+        None => {
+            let entry = cluster.services_of_kind(kind).next().ok_or_else(|| {
+                Error::new(format!("no {} in the roster", kind.as_str().to_uppercase()))
+            })?;
+            entry.identity.clone()
+        }
+    };
+    if cluster.service(&identity).is_none() {
+        return Err(Error::new(format!("{identity} is not in the roster")));
+    }
+    let address = match cluster.fixed_address(&identity) {
+        Some(address) => address,
+        None => lookup(cluster, &identity)?,
+    };
+    Ok(Target { identity, address })
+}
+
+/// Ask KS where a process is. Nothing but KS has an address of its own.
+fn lookup(cluster: &ClusterConfig, identity: &str) -> Result<SocketAddr> {
+    let timeout = Duration::from_millis(cluster.timeouts.request_ms);
+    let mut ks = Conn::open(cluster.ks.address, timeout)?;
+    let response = ks.call(&Request::new(Op::Lookup).text(identity))?;
+    match response.status {
+        Status::Ok => response
+            .message()
+            .and_then(|text| text.parse().ok())
+            .ok_or_else(|| Error::new(format!("KS gave no usable address for {identity}"))),
+        status => Err(Error::new(format!(
+            "KS answered {status} for {identity}: {}",
+            response.message().unwrap_or("no reason given")
+        ))),
     }
 }
 
-fn find<'a>(cluster: &'a ClusterConfig, identity: &str) -> Result<&'a ServiceEntry> {
-    cluster
-        .service(identity)
-        .ok_or_else(|| Error::new(format!("{identity} is not in the service directory")))
+/// Which processes a control command addresses: the one named, or every one that
+/// has registered, in cold-start order.
+fn targets(cluster: &ClusterConfig, cli: &Cli, kind: ServiceKind) -> Result<Vec<Target>> {
+    if cli.at.is_some() || cli.to.is_some() {
+        return Ok(vec![resolve(cluster, cli, kind)?]);
+    }
+    let mut targets = Vec::new();
+    for entry in cluster.cold_start_order() {
+        match cluster.fixed_address(&entry.identity) {
+            Some(address) => {
+                targets.push(Target { identity: entry.identity.clone(), address });
+            }
+            // A process that has not registered is not reachable, and saying so
+            // beats failing the whole command.
+            None => match lookup(cluster, &entry.identity) {
+                Ok(address) => targets.push(Target { identity: entry.identity.clone(), address }),
+                Err(e) => eprintln!("laws: skipping {}: {e}", entry.identity),
+            },
+        }
+    }
+    if targets.is_empty() {
+        return Err(Error::new("nothing in the roster is reachable"));
+    }
+    Ok(targets)
 }
 
 fn build(cmd: &Cmd) -> Result<Request> {

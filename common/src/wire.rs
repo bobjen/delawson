@@ -52,7 +52,11 @@ ops! {
     Status = 0x0002, "status";
     Shutdown = 0x0003, "shutdown";
 
-    // KS.
+    // KS: the registry, then the keys.
+    Register = 0x0110, "register";
+    Lookup = 0x0111, "lookup";
+    Registry = 0x0112, "registry";
+
     Unlock = 0x0101, "unlock";
     SnMasterKey = 0x0102, "sn-master-key";
     RotateMasterKey = 0x0103, "rotate-master-key";

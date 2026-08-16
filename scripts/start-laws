@@ -69,21 +69,34 @@ done
 mkdir -p "$run_dir"
 echo "$flavor" > "$run_dir/flavor"
 
+# KS's address is fixed; every other process is handed a port from the base up.
+eval "$("$laws" --config "$cluster" bootstrap | sed 's/^/ks_/;s/ /=/')"
+ks_host=${ks_address%:*}
+next_port=$ks_port_base
+
 started=()
-while read -r identity kind address _; do
+while read -r identity kind domain _; do
     dir=$run_dir/$identity
     service_config=$config_dir/$kind.toml
     [[ -f $service_config ]] || { echo "start-laws: no $service_config" >&2; exit 1; }
     [[ -x $bin/$kind ]] || { echo "start-laws: no $bin/$kind" >&2; exit 1; }
 
+    if [[ $identity == "$ks_registrar" ]]; then
+        listen=$ks_address
+    else
+        listen=$ks_host:$next_port
+        next_port=$((next_port + 1))
+    fi
+
     mkdir -p "$dir/data"
     cp "$cluster" "$dir/cluster.toml"
     cp "$service_config" "$dir/$kind.toml"
     cat > "$dir/process.toml" <<EOF
-# Written by start-laws. Says who this process is and where the shared
-# configuration is; everything else comes from those files.
+# Written by start-laws. Says who this process is, which port it was given, and
+# where the shared configuration is; everything else comes from those files.
 identity = "$identity"
 kind = "$kind"
+listen = "$listen"
 cluster_config = "cluster.toml"
 service_config = "$kind.toml"
 data_dir = "data"
@@ -107,11 +120,11 @@ EOF
             exit 1
         fi
     done
-    echo "started $identity ($kind, $flavor) on $address as pid $pid"
+    echo "started $identity ($kind, $flavor) on $listen as pid $pid"
     started+=("$identity")
 done < <("$laws" --config "$cluster" services)
 
-((${#started[@]})) || echo "start-laws: the service directory is empty" >&2
+((${#started[@]})) || echo "start-laws: the roster is empty" >&2
 
 echo
 "$laws" --config "$cluster" placement

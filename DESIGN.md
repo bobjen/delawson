@@ -815,7 +815,14 @@ them is a regression rather than a missed target. It also pins the workload defi
 random object info, tiny objects, ~20 M of them, metadata RAM-resident — and answers a
 question this section previously left open: the figures are **per box**, this box.
 
-**The 10x gap between them is the whole design content of these numbers.** The work itself
+**The prototype's *ping* was ~1.4M QPS** (Asserted, Bob, 2026-08-16), which is a different number
+from either row above and easy to confuse with them. The 200k figure is **ObjectInfo** — a request
+that goes `laws` → FE → DN → SN and fetches one of 20 million object metadata records from RAM — so
+it is four hops and a lookup, not a message. Ping is one hop and no work, and it ran seven times
+faster. Both bars matter, and they measure different things: ping bounds the messaging layer, and
+ObjectInfo bounds the messaging layer plus the metadata path built on top of it.
+
+**The 10x gap between the two ObjectInfo figures is the whole design content of those numbers.** The work itself
 does not change; only the per-request message overhead is amortized. So the pair is really
 one requirement on messaging.
 
@@ -828,7 +835,7 @@ Bob's instruction budget makes that concrete. Taking **~64 G instructions/sec** 
 
 | | Instructions per request | Note |
 |---|---|---|
-| Ping — the floor | **< 1,000** | so a pure ping ceiling is **> 64M QPS** |
+| Ping — the floor | **< 1,000** | so a pure ping ceiling is **> 64M QPS**; the prototype reached 1.4M |
 | Batched lookup at 2M QPS | ~32,000 | an **upper bound** on `W` — see §1.4.0.1 |
 | Unbatched lookup at 200k QPS | ~320,000 | `M + W`, so `M` ≈ 288,000 |
 
@@ -8844,20 +8851,23 @@ saying so, rather than pretending.
 
 ### 17.2 Configuration is three layers
 
-- **Cluster** — one file, identical fleet-wide: the failure-domain levels, ring size,
-  timeouts, the service directory, and the per-media-class table of §7.4.1.
+- **Cluster** — one file, identical fleet-wide: KS's address and the port base, the
+  failure-domain levels, ring size, timeouts, the roster, and the per-media-class table of
+  §7.4.1. The roster says *who may exist* — identity, kind, failure domain, media class —
+  and carries no addresses.
 - **Service** — one file per machine type, holding only what that type owns.
 - **Process** — one small file per process, written by `start-laws`, saying who the process
-  is and where the other two files are.
+  is, which port it was given, and where the other two files are.
 
 Two decisions inside that:
 
-- **Identity comes from the process file, not from argv.** A process's whole identity is then
-  one file that a harness or a deployment system writes, and nothing depends on how it was
-  invoked. The only command-line argument any daemon takes is the path to that file.
-- **A process's listening address comes from the cluster service directory, keyed by
-  identity.** Every process needs the directory anyway in order to reach the others, so a
-  second copy in its own file would only be somewhere for the two to disagree.
+- **Identity and port come from the process file, not from argv.** A process's whole
+  assignment is then one file that a harness or a deployment system writes, and nothing
+  depends on how it was invoked. The only command-line argument any daemon takes is the path
+  to that file.
+- **No process's address is checked in except KS's.** Whatever starts a process hands it a
+  port; the process announces that port to KS and asks KS where its peers are (§17.7). So an
+  address exists in exactly one place at a time and two copies cannot disagree.
 
 ### 17.3 Lifecycle: ready is a file, stopping is a request
 
@@ -8922,8 +8932,12 @@ Then holding the client count fixed and varying the reply body:
 - **The bandwidth ceiling is ~730 MB/s for one client and ~2.4 GB/s for eight**, both far under
   memory bandwidth, so it is the message path and not the copy that binds.
 
-§1.4's targets are 200k QPS unbatched and 2M+ batched, so the unbatched target is met by
-parallelism alone on one box, and the batched one is the open work.
+**The bar to compare against is the prototype's ping, not §1.4's QPS targets.** Those targets are
+ObjectInfo — four hops and a metadata lookup — while the prototype's *ping* ran at **~1.4M QPS**
+(§1.4.0). So this ping is a factor of **three to four short** of what has already been done on one
+box, and closing that gap is the work, not a floor already cleared. Nothing here is batched and
+Nagle is off on every connection, so the gap is in the message path itself: one write and one read
+per message, a thread per connection, and no batching of independent requests into one syscall.
 
 **A batched ping was considered and rejected** (Asserted, Bob, 2026-08-16): pipelining one client's
 pings measures nothing the client count does not, while a variable reply size measures something
@@ -8941,15 +8955,33 @@ reported as vacuous rather than as enforced.
 ### 17.7 KS is also the registrar
 
 **Decided: KS holds the process registry, and its port is the one fixed address in a cluster**
-(Asserted, Bob, 2026-08-16). Every other process registers with KS on startup and is told where the
-processes it must talk to are, and on which port. That is why KS is the first daemon built rather
-than FE: it is what the others need in order to find anything, and it is already the one type that
-must come up first for keys.
+(Asserted, Bob, 2026-08-16). That is why KS is the first daemon built rather than FE: it is what the
+others need in order to find anything, and it is already the one type that must come up first for
+keys. It is also why cold start is acyclic — KS's own address cannot come from a registry, so it is
+configuration, and nothing else needs to be.
 
-It also explains why cold start is acyclic. KS's own address cannot come from a registry, so it is
-configuration; nothing else needs to be.
+Built, and the division of labour is deliberate:
 
-Until it exists, the cluster configuration carries a service directory of fixed addresses, which is
-what the harness uses today. Two things that changes when registration lands: ports become
-ephemeral rather than assigned by hand, and a process's address stops being checked-in
-configuration — leaving the checked-in part as identity, kind, failure domain, and media class.
+| Who | Decides | Because |
+|---|---|---|
+| Whatever starts a process | which port it gets | it is the thing that knows what else it has already placed on that machine |
+| The process | announcing that port to KS | only it knows it came up |
+| KS | `identity → (machine, port)` for everyone else | it is the one address that was already known |
+
+So `start-laws` hands out ports from `ks.port_base` upward, writes each into that process's own
+configuration file, and the process registers it once it is listening. **A registration announces a
+port; it does not invent an identity** — KS checks what registers against the roster and refuses an
+identity that is not there or a kind that disagrees, so a misconfigured process is a reported error
+rather than a peer that quietly exists.
+
+Two consequences worth stating:
+
+- **Ready now means findable, not merely listening.** A process writes its `ready` file after it has
+  registered, so a harness that waits for ready knows the process can be reached by name.
+- **Shutdown must not depend on lookup.** `stop-laws` talks to each process at the address in its own
+  run directory, and stops the registrar last, so stopping a cluster does not become
+  order-dependent on the thing that resolves names.
+
+The registry is in KS's memory for now, so a KS restart makes every other process re-register.
+Putting it in KS's Raft state, and deciding whether a registration is a lease that expires, are
+tracked in the issue for this work.
