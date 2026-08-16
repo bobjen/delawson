@@ -9131,8 +9131,40 @@ bytes were than the plain ones, which KS counts.
 - **Compressible bodies pay for themselves twice over**: 230x less wire and 2.4x the throughput at
   16 KB, because bytes not sent are also bytes not copied.
 - ⚠️ **A failed compression attempt is expensive.** With random 1 KB bodies, lz4 finds nothing and
-  costs **39%** of throughput for it. Compression must therefore not be a global switch that is
-  simply left on: it needs to notice that it is not working. That is the next thing to build here.
+  costs **39%** of throughput for it. So compression is not a switch that is simply left on — it
+  samples first.
+
+#### 17.5c Sampling: judge a batch by pieces of it, from end to end
+
+**A large batch is judged before it is compressed.** A few kilobytes are taken from it, compressed,
+and the rest is attempted only if that much shrank. Two rules make it worth doing:
+
+- **Only when the sample is small against the batch** — an eighth or less. A wasted sample then
+  costs an eighth of the attempt it was meant to avoid, and a batch smaller than that is cheap
+  enough to compress outright.
+- **The sample is several pieces spread from the first byte to the last**, not a prefix. A batch is
+  whatever happened to be pending, and it will hold a mixture of message kinds; a prefix judges all
+  of it by whichever arrived first (Asserted, Bob, 2026-08-16). The pieces are concatenated, which
+  hides redundancy spanning the gaps between them, so the sampler is pessimistic rather than
+  optimistic — the safe direction.
+
+| Shape | No compression | lz4, always | lz4, sampled | Wire |
+|---|---|---|---|---|
+| 16 conns x 256, bare ping | 14,353,000 | 13,187,000 | 13,166,000 | 5.5x smaller |
+| 8 x 64, 1 KB random | 2,741,000 | 1,546,000 | **2,477,000** | 1.0x |
+| 8 x 64, 1 KB repetitive | 2,808,000 | 3,302,000 | 3,256,000 | 93.8x smaller |
+| 8 x 64, 16 KB random | 60,700 | 54,900 | **60,600** | 1.0x |
+| 8 x 64, 16 KB repetitive | 61,200 | 141,500 | 141,000 | 230.2x smaller |
+
+**Measured, 2026-08-16.** Sampling gives back nearly all of what a failed attempt cost — the 16 KB
+random case is back to the no-compression rate exactly, and the 1 KB case is within 10%, which is
+the sample itself at 4 KB against a 64 KB batch — while keeping the whole of the gain where there is
+something to find.
+
+**The default is still no compression**, because every measurement here is on loopback, where bytes
+are nearly free and only CPU is scarce. That is the wrong bias for a real network, where the 5.5x on
+bare pings would be bandwidth rather than waste, so this default should be revisited on the first
+two-machine measurement rather than kept out of habit.
 
 **What the padding cost had to be measured separately**, because a reply body has to come from
 somewhere: the generator runs at **10.2 GB/s** producing words and **11.1 GB/s** filling a buffer,

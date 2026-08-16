@@ -38,6 +38,12 @@ encrypt = true
 compress = "none"
 compress_min = 256
 
+# Judge a large batch by its first few kilobytes rather than compressing it all
+# to find out: an attempt that finds nothing costs a third of throughput. Only
+# batches at least eight times this are sampled; smaller ones are cheap to try
+# outright.
+compress_sample = 4096
+
 # ⚠️ A pre-shared test key. Every process in the cluster uses it, which is not a
 # key hierarchy — KS handing out message keys is what replaces this.
 key = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"

@@ -33,10 +33,24 @@ const LZ4: u8 = 1;
 
 /// One direction of one connection. The nonce is the connection's prefix, the
 /// direction, and a counter, so no two segments under one key share one.
+/// A sample is only worth taking when it is small against the batch it stands
+/// for. At an eighth, a wasted sample costs an eighth of the attempt it was
+/// meant to avoid, and a batch smaller than that is cheap to compress outright.
+const SAMPLE_SHARE: usize = 8;
+
+/// The sample is taken in this many pieces, spread evenly from the first byte to
+/// the last. A batch is whatever happened to be pending, so it holds a mixture —
+/// a prefix would judge the whole of it by whichever kind of message arrived
+/// first.
+const SAMPLE_PIECES: usize = 4;
+
 pub struct Seal {
     key: Option<[u8; 16]>,
     compress: Compress,
     compress_min: usize,
+    compress_sample: usize,
+    /// Reused by the sampler, so judging a batch allocates nothing.
+    sample_buf: Vec<u8>,
     prefix: [u8; 8],
     dir: u8,
     counter: u64,
@@ -49,6 +63,8 @@ impl Seal {
             key,
             compress: config.compress,
             compress_min: config.compress_min,
+            compress_sample: config.compress_sample,
+            sample_buf: Vec::with_capacity(config.compress_sample),
             prefix,
             dir,
             counter: 0,
@@ -68,19 +84,18 @@ impl Seal {
         let counter = self.counter;
         self.counter += 1;
 
+        let attempt = self.compress == Compress::Lz4
+            && plain.len() >= self.compress_min
+            && self.worth_trying(plain);
+
         let mut body = vec![PLAIN];
-        match self.compress {
-            Compress::Lz4 if plain.len() >= self.compress_min => {
-                let squeezed = lz4_flex::compress(plain);
-                // Only if it actually helped; a batch of ciphertext or random
-                // bytes will not compress, and must not pay to find out twice.
-                if squeezed.len() < plain.len() {
-                    body[0] = LZ4;
-                    body.extend((plain.len() as u32).to_le_bytes());
-                    body.extend(squeezed);
-                } else {
-                    body.extend(plain.iter());
-                }
+        // Even past the sampler, only if it actually helped.
+        let squeezed = attempt.then(|| lz4_flex::compress(plain));
+        match squeezed {
+            Some(squeezed) if squeezed.len() < plain.len() => {
+                body[0] = LZ4;
+                body.extend((plain.len() as u32).to_le_bytes());
+                body.extend(squeezed);
             }
             _ => body.extend(plain.iter()),
         }
@@ -106,6 +121,27 @@ impl Seal {
             None => out.extend(&body),
         }
         Ok(())
+    }
+
+    /// Whether to attempt the whole batch, judged by a few pieces of it taken
+    /// from end to end. Finding out the expensive way costs a third of
+    /// throughput on traffic that never compresses.
+    ///
+    /// ⚠️ Pieces are concatenated, which hides any redundancy that spans the gaps
+    /// between them. That makes the sampler pessimistic, never optimistic.
+    fn worth_trying(&mut self, plain: &[u8]) -> bool {
+        let sample = self.compress_sample;
+        if sample == 0 || plain.len() < sample * SAMPLE_SHARE {
+            return true;
+        }
+        let piece = sample / SAMPLE_PIECES;
+        let stride = (plain.len() - piece) / (SAMPLE_PIECES - 1);
+        self.sample_buf.clear();
+        for n in 0..SAMPLE_PIECES {
+            let at = n * stride;
+            self.sample_buf.extend_from_slice(&plain[at..at + piece]);
+        }
+        lz4_flex::compress(&self.sample_buf).len() < self.sample_buf.len()
     }
 
     /// Open a segment whose header has already been read, leaving the messages
@@ -166,6 +202,7 @@ mod tests {
             encrypt,
             compress,
             compress_min: 64,
+            compress_sample: 4096,
             key: "000102030405060708090a0b0c0d0e0f".to_string(),
         }
     }
@@ -270,6 +307,77 @@ mod ratio {
                 batch.len() as f64 / squeezed as f64
             );
             assert!(squeezed as f64 > batch.len() as f64 * 0.98, "random should not shrink");
+        }
+    }
+}
+
+#[cfg(test)]
+mod sampling {
+    use super::*;
+    use crate::config::{Compress, SendMode};
+    use crate::random::Rng;
+
+    fn config(sample: usize) -> Messaging {
+        Messaging {
+            send: SendMode::Direct,
+            encrypt: false,
+            compress: Compress::Lz4,
+            compress_min: 64,
+            compress_sample: sample,
+            key: "000102030405060708090a0b0c0d0e0f".to_string(),
+        }
+    }
+
+    fn sealed_size(config: &Messaging, plain: &[u8]) -> usize {
+        let mut out = Vec::new();
+        Seal::new(config, [1u8; 8], 0).unwrap().seal(&mut plain.to_vec(), &mut out).unwrap();
+        out.len()
+    }
+
+    fn noise(bytes: usize, seed: u64) -> Vec<u8> {
+        let mut noise = vec![0u8; bytes];
+        Rng::from_seed(seed).fill(&mut noise);
+        noise
+    }
+
+    /// Nothing to find either way, so the sizes match; what the sample saves is
+    /// work, which the wire cannot show.
+    #[test]
+    fn noise_is_left_alone() {
+        let noise = noise(1 << 20, 9);
+        assert_eq!(sealed_size(&config(4096), &noise), sealed_size(&config(0), &noise));
+    }
+
+    #[test]
+    fn repetition_gets_through() {
+        let dull = b"over and over ".repeat(1 << 16);
+        let sampled = sealed_size(&config(4096), &dull);
+        assert!(sampled < dull.len() / 50, "{sampled} of {}", dull.len());
+        assert_eq!(sampled, sealed_size(&config(0), &dull));
+    }
+
+    /// Below eight samples' worth there is nothing to save, so it is compressed
+    /// outright rather than judged.
+    #[test]
+    fn a_small_batch_is_not_judged() {
+        let dull = b"over and over ".repeat(1024);
+        assert!(dull.len() < 4096 * SAMPLE_SHARE);
+        assert!(sealed_size(&config(4096), &dull) < dull.len() / 50);
+    }
+
+    /// The reason the sample is spread rather than a prefix: a batch holds
+    /// whatever was pending, and the compressible part may be anywhere in it.
+    #[test]
+    fn compressible_at_either_end_is_found() {
+        let dull = b"over and over ".repeat(1 << 14);
+        for (head, tail) in [(noise(1 << 18, 3), dull.clone()), (dull.clone(), noise(1 << 18, 4))] {
+            let mut batch = head;
+            batch.extend(tail);
+            assert_eq!(
+                sealed_size(&config(4096), &batch),
+                sealed_size(&config(0), &batch),
+                "a spread sample should reach it wherever it is"
+            );
         }
     }
 }

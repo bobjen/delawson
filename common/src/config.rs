@@ -151,6 +151,9 @@ pub struct Messaging {
     pub compress: Compress,
     /// Batches smaller than this are not worth trying to compress.
     pub compress_min: usize,
+    /// Compress this many bytes of a large batch first, and give up on the rest
+    /// if that much did not shrink. Zero always compresses the whole batch.
+    pub compress_sample: usize,
     /// ⚠️ A pre-shared key, in hex, which is a stand-in until KS hands out
     /// message keys. Everything in a cluster shares it, so it is a test key and
     /// nothing else.
