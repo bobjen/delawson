@@ -1,18 +1,11 @@
 # DeLawson
 
-A distributed store for very large objects, written in Rust.
+An open source distributed store, written in Rust.
 
 Named after George DeLawson Lowry (b. 17 January 1880, Hagersville, Ontario;
-d. 1919, Buffalo, New York) — Bob's great-grandfather, a piano teacher who
+d. 1919, Buffalo, New York) — a piano teacher who
 played jazz in the style of Gershwin. He went by **Laws**, short for DeLawson.
 See [his page](https://burtleburtle.net/gene/glowry18800117.html).
-
-**Intended to be open source**, so a storage cluster can run inside a compute cluster and avoid
-ingress and egress charges — which for read-heavy analytics run to tens of times the cost of the
-storage itself. One motivating use case is shared AI memory: because unkeyed objects only ever
-append at the end and keyed objects are addressed by sorted key, **external indexes stay
-permanently valid** without rebuilding, and every append records the second it became durable, so
-time-range queries work indefinitely.
 
 ## Status
 
@@ -23,9 +16,8 @@ section for what is still undecided.
 
 ## The shape of it
 
-A single DeLawson object holds up to 2^64 records. No machine in the cluster
-is large enough to hold such an object alone, so an object is decomposed
-through four levels:
+A single DeLawson object holds up to 2^64 records. A cluster can have up to 2^32 machines.
+An object is decomposed through four levels:
 
 ```
 object  ──▶ metadata + list of streams      (cumulative record count per stream)
@@ -33,10 +25,6 @@ stream  ──▶ list of extents                 (cumulative record count per e
 extent  ──▶ list of instances               (replicas; erasure-coded once sealed)
 instance ─▶ contiguous block of data on disk
 ```
-
-Nothing in the system holds a per-record index. Locating record *N* is three
-binary searches over cumulative counts, then one device-sized read and a short
-forward scan. That is what makes 2^64 records addressable.
 
 Those levels are split across three node types, because the map to an extent
 must not die with the extent:
@@ -49,8 +37,8 @@ EN  Extent Node      the bytes on disk
 
 Around those sit `FE` (Front End: authorization and coordination), `KS` (Key
 Store: the daily master keys), the `delawson` client, and eventually Compute
-machines. User code runs only on Compute, and decryption keys never go where
-user code runs.
+machines. User code runs only on Compute, and decryption keys never go
+on machines where user code runs.
 
 The DN tier is self-hosted: directory and object metadata live in DeLawson
 keyed objects, reached through a small bootstrap root that is the only state
@@ -62,3 +50,7 @@ stored outside the object hierarchy.
   addressed by 64-bit record number.
 - **Keyed** — records ordered by sorted key, insertion permitted in the
   middle.
+
+Since it is open source, a storage cluster can run inside a compute cluster, sharing network.
+One motivating use case is shared AI memory. Indexes are possible, referencing 
+(object, record number) for sequential objects and (object, key) for keyed objects.
