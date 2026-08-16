@@ -51,7 +51,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-120 things *not* decided.
+121 things *not* decided.
 
 **Priorities and framing**
 
@@ -291,6 +291,12 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Billing tracks **actual cost within 2× slack**, on every scarce resource | §12.1, §12.4 |
 | **Physical, not logical** bytes — forced by the same slack rule | §12.3 |
 | A complex model with a **simple presentation**: top charges plus "everything else" while under 1% | §12.6 |
+| Shared extents: **charge per billed reference = extent cost / number of billed references** | §12.6.3 |
+| Total revenue is **invariant** under any regrouping of references, so sharing is not exploitable | §12.6.3 |
+| Only the **shared** cost divides — each sharer pays its own reference's SN-memory cost in full | §12.6.3.1 |
+| The denominator moves, so integrate **piecewise** from reference lifetimes rather than sampling | §12.6.3.2 |
+| Unbilled (system) references mean real cost nobody is charged — track it in §12.7's chain | §12.6.4 |
+| **Zero references is an orphan: a bug signal**, and the billing sweep detects it for free | §12.6.4 |
 | **Billing is a job over snapshots**, never over live DN/SN/EN metadata — reproducibility demands it | §12.8 |
 | Retain **outputs for years, inputs for weeks** | §12.8.1 |
 | Soft delete's 3-day window is what makes **daily sampling exact**; the opt-out therefore needs a billing tombstone | §12.8.2 |
@@ -6073,6 +6079,79 @@ metered and that bound a stream. The §15.1 self-concatenation test is the extre
 workload that stresses the system hardest is also the one the billing model charges most
 heavily for.** If those two ever disagreed, one of them would be wrong.
 
+#### 12.6.3 Sharing divides the charge among billed references
+
+Sharing sealed extents (§4.6.1, §13.4.5.5) means **refcounts that cross tenants**, so a rule is needed
+(Asserted, Bob, 2026-08-16):
+
+> **charge per billed reference = extent cost / number of billed references**
+
+Two tenants sharing an extent each pay half. **Total charged equals total cost exactly** — not within §12.1's 2x
+slack but exactly — which is what makes it the only cost-proportional option:
+
+| Alternative | Failure |
+|---|---|
+| Charge every referrer in full | over-bills by *n*; breaks §12.1's slack for *n* > 2 |
+| Charge only the creating referrer | the creator subsidizes everyone, and their delete leaves nobody paying |
+| Charge nobody until sharing resolves | loses revenue, and sharing may never resolve |
+
+**It is not exploitable**, which is worth checking since §12.2 exists because of an exploit. Creating a thousand
+dummy tenants to reference your data divides your share by a thousand and creates a thousand shares of the same
+size, so an attacker who owns all of them pays exactly what they paid before. **Total revenue is invariant under
+any regrouping of references.**
+
+##### 12.6.3.1 Only the shared cost divides
+
+This is the refinement §12.6.2 forces, and getting it wrong would under-bill sharing badly. An extent shared by
+*n* streams has **one** extent record and ***n*** list entries. So:
+
+| Cost component | Divided? |
+|---|---|
+| The extent's physical bytes on disk | **yes**, by the number of billed references |
+| **Each reference's own SN-memory entry** | **no** — every sharer has its own, and pays for it in full |
+
+**Derived.** So the charge is `(extent disk cost / n) + (own reference's metadata cost)`, and since §12.2 prices
+SN memory at ~5,000x disk per byte, the second term is not a rounding error. Sharing an extent does not share the
+reference to it — which is exactly §12.6.2's point, and it means heavy sharing reduces a tenant's *byte* charges
+while raising the fleet's *metadata* charges. The §15.1 self-concatenation case is the limit: 2^31 references
+paying 1/2^31 of one extent's disk cost each, plus full price for 2^31 references.
+
+##### 12.6.3.2 The denominator moves, and two consequences follow
+
+⚠️ **A tenant's bill depends on strangers' behaviour.** When someone else copies an object that shares your
+extents your bill falls; when they delete, it rises. Total revenue is invariant so this is not a correctness
+problem, but it is a **predictability** problem, and §12.6's simple presentation has to survive a customer asking
+why their bill moved when they changed nothing. Not resolved here.
+
+**And a co-tenant's delete raises your bill**, which also means "delete to save money" works less well than
+expected under sharing — §8.4.1's deferred decrement frees nothing until the last reference goes.
+
+**Billing must integrate over a changing denominator**, piecewise rather than by sampling. §12.8's daily snapshots
+would get the denominator wrong for part of any day in which sharing changed — but §12.8.2 already retains
+creation and deletion seconds for references, so the denominator at any instant is **computable exactly** from
+reference lifetimes rather than sampled. That is the same mechanism that made daily existence-sampling exact, used
+a second time.
+
+#### 12.6.4 Unbilled references, and orphans as a bug signal
+
+**Not every reference is billed.** System data — DN metadata, §13.5's snapshots, the bootstrap chain — holds
+references that belong to no tenant. An extent whose references are all unbilled has **no** billed references, so
+nobody is charged and the cost is real: it lands in §12.7's chain as system overhead, where §12.7's ~58%
+space-efficiency figure already accounts for its kind. **Billing must track that cost rather than ignoring it**,
+or the price per byte sold is understated.
+
+**An extent with *zero* references of any kind is orphaned, and should not exist.** §8.4.1's refcount reaching
+zero is what triggers reclamation, so an orphan means the decrement was lost or the reclaim never ran.
+
+> **Orphaned data is a bug signal, not a billing category.** Its bytes must be counted, and its existence must
+> raise an alarm.
+
+**And the billing job is the orphan detector, for free.** Computing per-reference charges requires enumerating
+every reference to every extent — which is precisely the sweep that finds extents with no references at all. So
+§13.5's job gains a correctness check as a by-product of a revenue calculation, with no extra pass. That is the
+same fusion argument as §13.1.10's verification riding the instance sync, and it is worth making explicit because
+the two jobs would otherwise be written by different people at different times.
+
 ### 12.7 From raw disk to a price per byte
 
 The 95% of §1.2 is about cost composition. **Space efficiency is a separate and much larger effect**,
@@ -8067,6 +8146,11 @@ Roughly in order of how much else depends on them.
      saving WAN bandwidth; they cannot when they differ, since §7.4.2 makes compression block size durable and
      media-specific — which needs recompression, and §7.2.2 has nowhere to run it.
 
+121. **Bill predictability under sharing** (§12.6.3.2). A tenant's charge falls when a stranger copies an object
+     sharing their extents and rises when that stranger deletes. Total revenue is invariant so this is not a
+     correctness problem, but §12.6 promises a simple presentation, and it has to survive a customer asking why
+     their bill moved when they changed nothing.
+
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
@@ -8152,6 +8236,10 @@ Roughly in order of how much else depends on them.
   nothing is promoted (§13.4.5.4);
 - whether copy-on-write needs new machinery — it does not: a shared sealed base plus a private
   log is §4.2 (§13.4.5.5);
+- how a shared extent is billed — **cost divided by the number of billed references**, exactly,
+  with each sharer paying its own reference's metadata cost in full (§12.6.3, §12.6.3.1);
+- whether cross-tenant sharing can be gamed to cut a bill — it cannot; total revenue is invariant
+  under any regrouping of references (§12.6.3);
 - whether the throughput targets are per box or per cluster — **per box**, and both have
   already been reached on this box, so they are a floor rather than a stretch (§1.4.0);
 - whether the 200k/2M pair is two requirements or one — one, on messaging: the 10x gap
