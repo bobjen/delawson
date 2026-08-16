@@ -6855,9 +6855,19 @@ distinction the mechanism makes happens inside the last tenth of the headroom.
 the target state is *nearly all of it committed*. The doors are not there to hold the level up; they are there
 to decide who gets the last sliver.
 
-⚠️ **Read "90% allocated" as 90% of the repair allocation, not 90% of the fleet.** The allocation is itself a cap
-on what repair may take from foreground work, so a nearly-empty bin says nothing about cluster utilization.
-These two get conflated and the mistake is alarming in the wrong direction.
+**Notation: always state these as *percent remaining*, near 0 — never as percent allocated, near 100.** Two
+reasons, and the second is the load-bearing one:
+
+- *Remaining* is the quantity the mechanism actually compares. The ball level **is** remaining bandwidth, so a
+  door expressed in remaining needs no mental inversion at the comparison site.
+- In the remaining framing, **a lower number means a lower door means higher priority** — the ordering reads
+  monotonically. In the allocated framing the sense flips: 99% allocated is the *high*-priority door, and any
+  reader or implementer who forgets that inverts the entire priority scheme. It is a one-character bug with a
+  data-loss failure mode.
+
+⚠️ And read "9% remaining" as remaining out of the *repair allocation*, not out of the fleet. The allocation is
+itself a cap on what repair may take from foreground work, so a nearly-empty bin says nothing about cluster
+utilization. These get conflated and the mistake alarms in the wrong direction.
 
 **It creates a resolution requirement, and this needs checking. Derived.** Doors 8 percentage points apart, with
 the lowest at 1%, cannot be distinguished unless the level resolves much finer than one repair. The largest
