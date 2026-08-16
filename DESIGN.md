@@ -40,7 +40,7 @@ it was computed or assumed.
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-95 things *not* decided.
+96 things *not* decided.
 
 **Priorities and framing**
 
@@ -55,6 +55,12 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Stable record numbers and keys make **external indexes permanently valid**, which is what shared AI memory needs | §1.0, §3 |
 | Every append records its **durability second**, so time-range queries work indefinitely — distinct from the minutes-long SCN snapshot horizon | §9.7 |
 | **User code only on Compute; keys never where user code runs** | §1.5 |
+| The real boundary is **signed executables**, not absence of keys — which makes code signing load-bearing | §1.5 |
+| **Extent decryption happens on the EN**; end-to-end encryption is a user-side option, not a product | §5.9.2, §7.2.3 |
+| **AEGIS-128X2**, ~20 GB/s per core: encryption is 0.63 of a core at line rate where compression would be ~21 | §7.2.1 |
+| The **AEAD tag is the checksum**, so every block is self-verifying before EC uses it as a repair source | §7.2.1 |
+| Everything is encrypted **on the wire and on disk**; KS uses 256-bit | §7.2, §7.2.1 |
+| Targets: **200k QPS** small metadata requests, **2M+ batched** — the 10× gap is a messaging requirement | §1.4.0 |
 | A cluster may run **indefinitely** and lie dormant for eons — no absolute epochs, no work per elapsed time | §1.3 |
 
 **Object model**
@@ -91,6 +97,8 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Working assumption **Reed-Solomon, MDS, m = 4**; overhead chosen from disaster tolerance | §4.3.2 |
 | Local codes trade minimum distance for locality, and are **patent-blocked until 2034** — **turbo codes** are the unencumbered fallback, at 1.5× and 2.5× instead of 1.333× and 2.333×, so the patent is worth **~$0.24/TB-month** | §4.3.2.1 |
 | The two EC tiers are one **10×6 LRC** (1.333×) and its **data-duplicated variant** (2.333×) | §12.7.2.1 |
+| The deliverable is a **catalog of codes with recommendations**, not one code; **turbo codes suffice for shipping** | §4.3.2.5 |
+| Overhead is a **parameter**, not a discriminator — compare families at matched overhead | §4.3.2.5 |
 | Codes are judged by **equivalence to 3× or 4× replication** — what customers already accept — under independent loss and under domain-loss-plus-independent-loss | §4.3.3.2a |
 | The second instance buys **removal of repair from the read path**, not durability — minutes to readable instead of days | §12.7.2.1a |
 | Erasure coding does not address **software bugs, admin error, or running out of space** | §4.3.4 |
@@ -179,6 +187,7 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | The durable watermark is set at **staging**, not at coalescing | §8.1.4.2 |
 | 3-of-4 durability plus local coalescing gives **interior holes**, exactly detectable from the offset map | §8.1.4.3 |
 | Staging is sized by **endurance, not capacity**; stage only small appends | §8.1.4.4 |
+| Staging must be durable **with the power off**, so not DRAM | §8.1.4.4 |
 | Prior art returns an offset only with **one** unsealed region (VSAM RBA); parallel writers always change the **name space** | §8.1.1a-9 |
 | Three reference tiers: **durable** (key / record number), **hint** (extent, row), and **none** (object offset) | §8.1.1a-10 |
 | Hints fail **detectably** because extent identity carries a creation second — Oracle's logical rowid pattern | §8.1.1a-10 |
@@ -425,6 +434,36 @@ The arithmetic behind the priority is Little's Law. Sustained throughput needs o
 A few hundred outstanding requests sustain a terabyte a second, so **concurrency is cheap and
 per-request latency is hidden almost entirely.** Doubling latency while doubling concurrency
 is a wash; halving throughput is not.
+
+#### 1.4.0 The throughput targets, and what they imply
+
+Two figures, both shipping requirements (Asserted, Bob, 2026-08-15):
+
+| Workload | Target |
+|---|---|
+| Small metadata info requests | **200,000+ QPS** |
+| The same, **batched** | **2,000,000+ QPS** |
+
+**The 10x gap between them is the whole design content of these numbers.** The work
+itself does not change; only the per-request message overhead is amortized. So the pair
+is really one requirement on messaging.
+
+Working it out on a 16-core box: a small metadata lookup is §9.1's three binary searches
+over RAM-resident structures — call it 10-30 cache misses, ~1-3 us of CPU. Then
+
+- **200k QPS** needs ~0.5 core of lookup plus whatever the messaging costs. At ~10 us of
+  CPU per unbatched round trip that is ~2 cores. Comfortable.
+- **2M QPS** needs ~3-6 cores of lookup, leaving room for at most **~1 us of message
+  overhead per request** — and realistically under 0.5 us.
+
+**Derived.** Which rules out a syscall per request and points at io_uring or shared
+memory, per the calibration table in §15. That is why the first implementation milestone
+is a ping benchmark rather than a feature: 2M QPS is not reachable by making the lookup
+faster, only by making the message nearly free.
+
+Note also what these targets are *not*: they say nothing about bulk bandwidth, and they
+are about **metadata**. Bulk data is bounded by disks and the network, and is the subject
+of §1.4.2.
 
 #### 1.4.1 But job latency is the *maximum* over requests
 
@@ -691,6 +730,21 @@ plain two-replica extents "lost a trickle of data constantly."
 **User code runs only on Compute machines, and decryption keys are never on a
 machine that runs user code** (§5.9.1). Stated here because it constrains the
 machine layout rather than following from it.
+
+**The boundary is signed code, not absence of keys** (Asserted, Bob, 2026-08-15).
+An EN holds keys and decrypts extents (§5.9.2); it is trusted because **ENs run no
+user code and only signed executables.** So the fleet divides into two populations:
+
+| Population | Runs | Holds keys |
+|---|---|---|
+| DN, SN, EN, FE, KS | **signed executables only** | yes |
+| Compute | user code | **never** |
+
+That makes "no keys where user code runs" a consequence of a simpler rule — *keys
+live only where the executables are signed* — and it means **code signing is a
+load-bearing security mechanism**, not an operational nicety. It also becomes a
+placement constraint on work rather than only on data: anything needing plaintext
+must run on a signed-code machine, which §7.2.2 shows is not free to satisfy.
 
 ## 2. Non-goals
 
@@ -1129,6 +1183,48 @@ same. It means a read can never be forced to do EC work: there is always a live 
 must be rederived before it can be served, hence "usually available, always reliable". The availability
 difference between the two tiers is entirely about whether §4.3.2.3's promise — EC stays off the read path —
 can ever be broken.
+
+#### 4.3.2.5 The deliverable is a catalog with recommendations, not a code
+
+**There will be a list of erasure codings to choose from, and DeLawson will recommend a few for different use
+cases** (Asserted, Bob, 2026-08-15). So the question this section has been circling is misframed: it is not
+"which code", it is "what is in the catalog, and what does each entry recommend itself for".
+
+**Two families, and within each it is mostly parameters.** Rectangular LRC and turbo codes are structurally
+different — one has local parities and maximal recoverability, the other is a product code decoded iteratively.
+Inside either family, choosing dimensions and parity counts is a parameter sweep.
+
+**Therefore overhead is a parameter, not a discriminator.** Nearly any overhead is reachable in either family:
+§4.3.3.2b's `(27+3)x(5+1)` turbo code hits 1.333x, the same as the 10x6 LRC. What differs at equal overhead is
+**reliability, repair reads, and domain floor** — which is exactly what §4.3.3.2c measures, and why the
+comparison has to be done at matched overhead rather than across it.
+
+**Each catalog entry must record**, so that a recommendation is justified rather than asserted:
+
+| Field | Source |
+|---|---|
+| family and parameters | — |
+| storage overhead | direct |
+| minimum distance `d` | §4.3.3.2b, closed form for both families |
+| minimum-weight uncorrectable pattern count | §4.3.3.2c, closed form for turbo, simulation for LRC |
+| equal-lossiness point vs 4-instance data | §4.3.3.2c |
+| common and worst-case repair reads | §4.3.3.2d |
+| domain floor per recovery set | §4.3.3.2e |
+| data-instance count, 1 or 2 | §4.3.2.4 |
+
+**The recommendation axes are not just overhead.** A user or operator is really choosing along four:
+
+- **overhead** they are willing to pay;
+- **cluster size**, since a wide code silently under-delivers below its domain floor (§4.3.3.2e, §5.6.7);
+- **whether a read may ever wait for reconstruction** — the 1-vs-2 data-instance choice of §4.3.2.4, which is
+  an availability decision and not a durability one;
+- **data lifetime**, since §8.5.3 argues short-lived data should skip erasure coding entirely.
+
+**And turbo codes suffice for shipping** (Asserted, Bob). That is a scheduling fact worth recording plainly: the
+patent question of §4.3.2.1, worth ~$0.24/TB-month, is a **later optimization and not a release gate.** The
+catalog ships with an unencumbered family in it, and an LRC family can be added when the patent question is
+settled — which is straightforward precisely because §4.3.3.2e already makes the scheme a recorded per-group
+property with promotion done as compaction.
 
 #### 4.3.3 What size of disaster survives, and what it costs
 
@@ -2664,18 +2760,33 @@ invariant as stated is machine-level and excludes it. Either the invariant relax
 to a hardware-isolation boundary, or the decryption tier's bandwidth has to scale
 with Compute's input rate. This needs deciding before Compute is built, not after.
 
-#### 5.9.2 Where decryption happens
+#### 5.9.2 Where decryption happens: on the EN
 
-⚠️ Genuinely open, and consequential:
+**Decided: extent decryption happens on the EN** (Asserted, Bob, 2026-08-15). Neither
+option this section previously weighed is taken.
 
-| Decrypt at | Consequence |
+| Decrypt at | Why not |
 |---|---|
-| **FE** | FE sees plaintext for everything passing through it; keys never leave the datacenter; FE bandwidth must carry all bulk data |
-| **Client** | End-to-end encryption — the operator cannot read customer data — but keys leave the datacenter and the client must be trusted to hold them |
+| FE | FE bandwidth would have to carry all bulk data, which §5.12.1 already shows is the expensive shape |
+| Client | Pushes keys out of the datacenter, and makes DeLawson's own compression and coalescing impossible |
 
-The stated invariant forbids keys on Compute but says nothing about the client, so
-both remain open. They are very different products: the second is a much stronger
-privacy claim and a much harder key-management problem.
+**It follows from §1.5's sharpened boundary.** ENs run only signed executables and no
+user code, so holding keys there does not violate the invariant — and it puts
+decryption at the one place that already touches every byte, so no tier has to be
+sized to carry bulk plaintext it would not otherwise see. §7.2.1 shows the CPU cost is
+a fraction of a core.
+
+Two things this makes possible that FE-decrypts did not:
+
+- **Reads are served from the EN directly**, with no decryption tier in the path, which
+  is what §1.4.2's read-amplification budget assumes.
+- **The EN can act on record framing during coalescing** (§8.2.1), which needs
+  plaintext.
+
+**End-to-end encryption remains available to the user, as a user-side choice.** Anyone
+who wants it may encrypt before sending, and DeLawson will store the result faithfully
+(Asserted, Bob). What it costs them is stated in §7.2.3 — it is not free, and the price
+is charged automatically rather than administered.
 
 ### 5.10 Node identifiers and bounded fan-out
 
@@ -3185,6 +3296,88 @@ bandwidth. One more case where billing proportional to cost removes a policy dec
 - Keys are per-extent, but **derived, not stored** — see §7.3.
 - Sealed extents are immutable, so keys never need rotation in place; **rotation
   happens by rewriting during compaction** (§10), which is a rewrite anyway.
+- Decryption happens **on the EN** (§5.9.2), which runs only signed executables (§1.5).
+- **Everything is encrypted on the wire and on disk.** Not only extent bodies: all
+  messages are encrypted too (Asserted, Bob, 2026-08-15).
+
+#### 7.2.1 AEGIS-128X2, and why encryption is free where compression is not
+
+**The working codec is AEGIS-128X2**, measured by Bob at **20 GB/s on a single core**,
+with the whole 16-core box topping out near **90 GB/s** — so the box saturates well
+below 16x one core, as a memory-bandwidth ceiling rather than a compute one. It is an
+AEAD, so it **authenticates and encrypts in one pass**.
+
+**That settles the cost question §7.1 left asymmetric**, and the arithmetic is worth
+writing out because the two stages differ by two orders of magnitude:
+
+| Stage | Per-core throughput | Cores to keep up with a 12.5 GB/s NIC |
+|---|---|---|
+| AEGIS-128X2 encrypt+authenticate | ~20 GB/s | **0.63** |
+| LZ4 *compression* | ~0.6 GB/s | **~21** |
+
+**Derived.** So encryption at line rate costs a fraction of one core and fits inside
+§1.2's 5% server budget trivially, while compression at line rate does not — which is
+why §7.1 puts compression elsewhere and §7.3.1 can safely cache keys on ENs. At the
+sustained fill rate of §8.1.4.4 (~63 MB/s per EN) encryption is 0.3% of a core.
+
+**KS uses 256-bit keys and 256-bit encryption** (Asserted, Bob) — deliberately overkill,
+because the master keys are the most important secrets in the system and the volume
+protected by them is negligible, so the stronger primitive costs nothing. Bulk extent
+and message encryption stays at 128-bit. See §7.3.
+
+**Authentication in the same pass is a larger dividend than the speed**, and it removes
+a layer the design would otherwise have needed:
+
+- **The AEAD tag is the checksum.** No separate CRC layer, and no question about whether
+  the checksum covers what the encryption covers.
+- **Every stored block is self-verifying**, which is exactly what EC repair needs: a
+  corrupt source is detected *before* it is used to rederive a lost cell, so corruption
+  cannot propagate into parity (§4.3.2.3).
+- **§13.1.9's cold sweep gets its detector for free**, and an exact one rather than a
+  probabilistic one.
+- **§4.3.4 observes that erasure coding faithfully preserves corrupt data.**
+  Authentication is what separates "faithfully preserved" from "correct", so this
+  partially answers it — for corruption in flight or at rest, though not for logical
+  corruption written by a bug through the normal path.
+
+The tag must be **per block**, not per extent, or random access is lost and §7.1's
+argument for block granularity collapses.
+
+#### 7.2.2 Recompression has no machine to run on
+
+**Recompression needs significant CPU *and* a node running only signed executables**
+(Asserted, Bob, 2026-08-15). Those two requirements do not currently intersect:
+
+| Candidate | CPU to spare? | Signed-only? |
+|---|---|---|
+| EN | **no** — §7.1, §1.2 give it almost none | yes |
+| Compute | yes | **no** — it runs user code (§1.5) |
+| DN, SN | some, but sized for metadata rings (§5.8) | yes |
+| FE | undesigned | yes |
+
+⚠️ So the fleet as specified has **no machine that both has CPU to spare and runs only
+signed executables.** That is a gap, not a detail, because §10 makes compaction the
+place where recompression, EC re-encoding, key rotation, media migration and code
+promotion all happen — and all of them need plaintext and CPU.
+
+The candidates are a dedicated compaction role, an FE-side one, or accepting the CPU on
+DN/SN. It should be settled before compaction is built, since it decides what compaction
+*is*: a background loop on an existing tier, or a machine type.
+
+#### 7.2.3 A user who encrypts first pays for it, automatically
+
+Users are welcome to encrypt before sending (§5.9.2). The consequences are not
+prohibitions, they are prices:
+
+- **Their data will not compress**, so they pay more physical bytes under §12.3 — which
+  is the correct outcome rather than a penalty, and needs no policy to enforce.
+- **DeLawson cannot re-frame their records** during coalescing (§8.2.1), so the
+  read-path translation §8.2.1 wants to remove stays.
+- **Their records are opaque to Compute**, so §5.12's near-data work cannot see them
+  without the user's own keys.
+
+That is the §12.1 pattern once more: billing proportional to cost turns what would have
+to be an administered restriction into a self-enforcing trade.
 
 ### 7.3 The key hierarchy: daily, derived, and scoped by SN
 
@@ -3891,11 +4084,19 @@ stays inside §1.2's 5% budget. **Derived.** The sizing rule is therefore "endur
 sequential write — so writing those through directly cuts staging wear to the small-append fraction, which is the
 only fraction that needed the IOPS conversion. The threshold is a per-media-class constant (§7.4.1).
 
-⚠️ On an all-SSD EN, staging on SSD writes every byte to the expensive device twice. The staging tier should then
-become **DRAM**, whose durability rests on exactly the argument above — four independent ENs, single copy each —
-but which is sound only if the four ENs cannot lose power together. That requires **power to be one of the nested
-failure domains** of §5.6.2, which is currently implicit. With it, DRAM staging is licensed by an argument already
-in the design; without it, DRAM staging is unsound.
+**Staging must be durable with the power off.** An earlier draft proposed DRAM staging on an all-SSD EN, on the
+grounds that four independent ENs each holding one copy give the same exposure as four final instances. **That is
+rejected** (Asserted, Bob, 2026-08-15): *durable* means durable with the power off, and DRAM is not, however many
+machines hold it. Independence across ENs addresses uncorrelated failure; a power event is not the only way to
+lose volatile state, and losing an accepted append is exactly what §8.1.1's watermark promises cannot happen.
+
+So on an all-SSD EN the choice is to stage on the SSD and accept writing each byte twice, or to stage on some
+other non-volatile device. The arithmetic above sizes the first: at the sustained fill rate, doubled wear is
+still inside §1.2's budget, so the simple answer survives.
+
+This also removes the motivating case for making **power** an explicit nested failure domain. It may still be one
+for other reasons — a correlated power event is a disaster in the §1.1.1 sense — but nothing in the write path now
+depends on it.
 
 ### 8.2 Record framing
 
@@ -6165,39 +6366,33 @@ Roughly in order of how much else depends on them.
 1. **The bootstrap root**: what exactly it holds, and how it is made durable and
    strongly consistent *outside* DeLawson (§5.5.1, §5.5.3). It must anchor the
    key hierarchy as well as the object hierarchy.
-2. **Where decryption happens — FE or client** (§5.9.2). Two different products:
-   operator-readable, or end-to-end encrypted with keys leaving the datacenter.
-3. **Compute-near-data vs the key boundary** (§5.9.1). As stated the invariant is
-   machine-level, which funnels all of Compute's input through a decryption tier.
-   Relax it to hardware isolation, or size the tier's bandwidth accordingly —
-   decide before Compute is built.
-4. **Ring reassignment, fan-out mutability, and cluster topology** (§13, §5.10.3).
+2. **Ring reassignment, fan-out mutability, and cluster topology** (§13, §5.10.3).
    How a stream moves from a failed ring to a fresh one that may not be able to
    reach its ENs; whether fan-out sets are mutable; and where the failure-domain
    hierarchy that §5.6 depends on is stored — plausibly the bootstrap root, since
    placement decisions cannot be made without it.
-5. **Fan-out policy and EN sizing together** (§5.10.1). G, the sharing factor, is
+3. **Fan-out policy and EN sizing together** (§5.10.1). G, the sharing factor, is
    what gives repair and balance room to move, and EN capacity is what makes G
    affordable. One decision, not two.
-6. **Soft allocation of SN memory between streams and extents** (§14.1.1). The 1/3
+4. **Soft allocation of SN memory between streams and extents** (§14.1.1). The 1/3
    : 2/3 split encodes a workload mix that varies wildly by tenant, so it must
    rebalance — and when a machine's mix drifts past what it was assigned, streams
    have to migrate, which is reassignment arriving from workload drift rather than
    failure.
-7. **Shared-extent and shared-stream consequences** (§4.6.1): copy-on-write
+5. **Shared-extent and shared-stream consequences** (§4.6.1): copy-on-write
    compaction, and billing attribution between a clone and its original.
-8. **The DN-side stream-list entry has no budget** (§14.1.2). Sizings currently use
+6. **The DN-side stream-list entry has no budget** (§14.1.2). Sizings currently use
    the 200 B stream record as a loose upper bound; a real figure would shrink every
    stream-list number severalfold.
-9. **Digest-based instance confirmation** (§13.1.9). A per-disk hash tree would make
+7. **Digest-based instance confirmation** (§13.1.9). A per-disk hash tree would make
    steady-state cost proportional to divergence rather than instance count, and
    divergence is normally zero.
-10. **The maximum sync message size** (§13.1.5), which sets how much bucketing either
+8. **The maximum sync message size** (§13.1.5), which sets how much bucketing either
     sync pair needs.
-11. **How widely an SN's streams spread across DNs** (§13.1.5). It swings the DN→SN
+9. **How widely an SN's streams spread across DNs** (§13.1.5). It swings the DN→SN
     digest from 0.4 MB to 85 MB per pair, and it is not determined by anything decided
     so far.
-12. **Should streams carry a creation timestamp too?** (§4.6.3) Bob's expectation is
+10. **Should streams carry a creation timestamp too?** (§4.6.3) Bob's expectation is
     yes, not yet thought through. Two asymmetries make it a different problem from the
     extent case rather than the same one: a stream is not itself encrypted, so a stream
     timestamp would be for id-reuse safety only and would not select a key; but
@@ -6205,239 +6400,252 @@ Roughly in order of how much else depends on them.
     references it, where rewriting an extent is something compaction does anyway. So the
     wrap obligation is cheap for extents and expensive for streams — an argument for
     giving streams a *wider* timestamp rather than an equal one.
-13. **How a DN range splits** (§5.11). The only place fullness forces movement. It should
+11. **How a DN range splits** (§5.11). The only place fullness forces movement. It should
     reuse the keyed-object split of §10, but the interaction with in-flight writes to the
     range is undesigned.
-14. **What ring unavailability *p* actually is** (§5.11.1). The locality argument and the
+12. **What ring unavailability *p* actually is** (§5.11.1). The locality argument and the
     per-record availability contract both turn on it, and nothing has measured or targeted it.
-15. **Hedge delays per tier** (§9.5). The *percentile* is settled at p99.9+ (§1.4.1), but the
+13. **Hedge delays per tier** (§9.5). The *percentile* is settled at p99.9+ (§1.4.1), but the
     absolute delays differ by orders of magnitude between an EN granule read, a metadata
     lookup and a client-to-FE request. Also: may a ring's hot backup serve hedged metadata
     reads, and what staleness does that admit?
-16. **The give-up budget for seal-short** (§9.5, §13). It must sit far below a 40-second TCP
+14. **The give-up budget for seal-short** (§9.5, §13). It must sit far below a 40-second TCP
     retry or one dead EN stalls a writer for a timeout.
-17. **Read hot spots** (§13.1.2, §1.4.4). Free-space-weighted placement balances space and
+15. **Read hot spots** (§13.1.2, §1.4.4). Free-space-weighted placement balances space and
     is blind to read load. Colossus runs a balancing custodian, which suggests this is real.
     Adding instances to hot extents would fix it without relocating anything, but nothing is
     designed.
-18. **Where the hot-object cache lives** (§9.6.1) — an EN cache of ciphertext adds no new
+16. **Where the hot-object cache lives** (§9.6.1) — an EN cache of ciphertext adds no new
     plaintext location, while an FE cache of whole objects removes a hop but does.
-19. **The broadcast tool for Compute** (§9.6.2): tree fan-out, how a job's vertex set is
+17. **The broadcast tool for Compute** (§9.6.2): tree fan-out, how a job's vertex set is
     discovered, and what happens when a forwarding vertex dies mid-distribution.
-20. **Compute allocation** (§5.12). Not Virtual Clusters, but nothing yet in their place, and
+18. **Compute allocation** (§5.12). Not Virtual Clusters, but nothing yet in their place, and
     §12 means whatever appears has to be billable.
-21. **Telling a job whether its remainder fits** (§5.12.2). Phase 2 is a memory workload or a
+19. **Telling a job whether its remainder fits** (§5.12.2). Phase 2 is a memory workload or a
     storage workload depending on the filtering ratio, differing by the iteration count. That
     looks like the most useful thing DeLawson could tell a scheduler, and nothing computes it.
-22. **Does the flat-network assumption hold at the intended scale?** (§5.12.3) Affinity is
+20. **Does the flat-network assumption hold at the intended scale?** (§5.12.3) Affinity is
     unnecessary only while intra-cluster network is flat, which costs ~6% of an EN and is tight
     against a strict 5% overhead target. If a cluster ever spans an unflattenable boundary,
     topology and affinity both return.
-23. **Pick the repair window, then the replica count** (§4.3.1.1). *p_gone* = 10^-4 implies a
+21. **Pick the repair window, then the replica count** (§4.3.1.1). *p_gone* = 10^-4 implies a
     58-hour window; a 1–4 hour window costs 0.04–0.18% of fleet read bandwidth and makes three
     replicas sufficient. So four instances is a decision to repair slowly, not a reliability
     necessity — and the window is the number to set deliberately.
-24. **Deployment increment size** (§13.2.3). Expected loss from a failed rollout scales as
+22. **Deployment increment size** (§13.2.3). Expected loss from a failed rollout scales as
     D^-4, so ~1% increments instead of 5% is a sixteen-to-six-hundred-fold reliability
     improvement for no design change. Needs to become policy, and it interacts with the
     utilization ceiling of 1 - 1/D (§5.11).
-25. **How much fleet bandwidth repair may take** (§13.2.1). Recovery at full tilt stops all
+23. **How much fleet bandwidth repair may take** (§13.2.1). Recovery at full tilt stops all
     customer work; at 10% it takes five days. The split is a business decision nobody has made.
-26. **Soft-delete authority split** (§8.4.2). The window is only a safeguard if the principal who
+24. **Soft-delete authority split** (§8.4.2). The window is only a safeguard if the principal who
     deleted cannot also shorten or waive it. Needs a concrete authority model; everything else about
     soft delete is bookkeeping.
-27. **The hard-delete brake** (§8.4.1b). A cluster-wide switch halting all hard deletion, usable by
+25. **The hard-delete brake** (§8.4.1b). A cluster-wide switch halting all hard deletion, usable by
     someone who knows only that something is wrong. It is what makes three days sufficient, since
     diagnosis does not fit in the window.
-28. **Aggregate retention against the repair reserve** (§8.4.3). The opt-out makes the punishing cases
+26. **Aggregate retention against the repair reserve** (§8.4.3). The opt-out makes the punishing cases
     self-select out, but a tenant with month-scale data and no opt-out sits at 10% and exceeds a 5%
     reserve alone. Retention needs admission control, jointly with the utilization target and D.
-29. **The directory as the unit of policy** (§8.4.3). Expiry grouping, soft-delete opt-out and default
+27. **The directory as the unit of policy** (§8.4.3). Expiry grouping, soft-delete opt-out and default
     locality are all converging on the directory. Better to design that scope once than to let three
     mechanisms each invent their own.
-30. **Name the durability tiers honestly** (§12.7.2.1). "Usually available, always reliable" hides that
+28. **Name the durability tiers honestly** (§12.7.2.1). "Usually available, always reliable" hides that
     1.333× also survives only a 25% disaster against 2.333×'s 57% — and large correlated events are the
     dominant loss mode. A customer-facing tier list should state disaster tolerance, not just availability.
-31. **Turbo codes' disaster tolerance** (§4.3.2.1, §4.3.3.2a). The storage cost of not licensing is priced
+29. **Turbo codes' disaster tolerance** (§4.3.2.1, §4.3.3.2a). The storage cost of not licensing is priced
     at ~$0.24/TB-month; the *reliability* cost is not. §4.3.3.2a gives the procedure — two failure models,
     Monte Carlo or pattern-counting, expressed as "equivalent to 3× or 4× replication at what loss rate" —
     and the candidate to evaluate is a (5+1)×(12+3) matrix. Arithmetic, not research, and it should be done
     before the choice is made on price.
-32. **The 1.333× guarantee is tight against the 10% outage case** (§12.7.2.1a). The LRC tolerates at most
+30. **The 1.333× guarantee is tight against the 10% outage case** (§12.7.2.1a). The LRC tolerates at most
     11.7% of fragments by the Singleton-like bound, and the worked scenario is a 10% loss. Worth confirming
     that maximal recoverability covers the realistic patterns, since the margin is thin.
-33. **Why the price undercuts B2 threefold** (§12.7.2.2). Either disk density and cost discipline are a
+31. **Why the price undercuts B2 threefold** (§12.7.2.2). Either disk density and cost discipline are a
     real advantage, or the efficiency chain is optimistic. B2 runs a lower-overhead code, so it is not the
     coding. Worth resolving before the number is quoted to anyone.
-34. **Truncation above the durable watermark on handover** (§8.1.1a). This, not exactly-once semantics, is
+32. **Truncation above the durable watermark on handover** (§8.1.1a). This, not exactly-once semantics, is
     what erasure coding actually requires — an instance holding an unagreed suffix must discard it. Raft log
     truncation in another guise, and unspecified.
-35. **Bound and timeout on the out-of-order cache** (§8.1.1a-4). Together they set how far ahead a single
+33. **Bound and timeout on the out-of-order cache** (§8.1.1a-4). Together they set how far ahead a single
     writer may pipeline, and a gap that never fills must not pin cached data indefinitely.
-36. **Which corner of the ingest trilemma the shared-memory case takes** (§8.6.2). Parallel bandwidth,
+34. **Which corner of the ingest trilemma the shared-memory case takes** (§8.6.2). Parallel bandwidth,
     dense stable object offsets, and a timestamp-monotone extent list are not simultaneously available.
     §8.6.6 proposes the sealed-prefix-plus-growing-frontier shape as the default, but §1.0's case has not
     been made to choose, and the choice is visible in the API. Related: whether the frontier's stream count
     is user-visible, since an object's total record count is unknown while it is open.
-37. **When coalescing should re-frame** (§8.2.1). Matching the dominant read format takes translation off
+35. **When coalescing should re-frame** (§8.2.1). Matching the dominant read format takes translation off
     the read path, but nothing tracks what the dominant read format is.
-38. **Waste from a large append at a nearly-full extent** (§8.1.1c). The 32 MB logical bound (§8.1.1a-2)
+36. **Waste from a large append at a nearly-full extent** (§8.1.1c). The 32 MB logical bound (§8.1.1a-2)
     caps it, but a 32 MB append arriving at an extent with 1 MB left still seals that extent 31 MB short.
     Lands in §12.7's garbage term rather than in silent padding.
-39. **Does shared AI memory need latency this design deprioritizes?** (§1.0.2) Near-real-time is
+37. **Does shared AI memory need latency this design deprioritizes?** (§1.0.2) Near-real-time is
     comfortable; millisecond index lookups are not what §1.4 optimizes for. If the motivating use case
     wants them, that is a conflict to resolve rather than assume away.
-40. **A time-based sealing trigger** (§9.7.1). It would bound the durability-timestamp table, which a
+38. **A time-based sealing trigger** (§9.7.1). It would bound the durability-timestamp table, which a
     slowly-written extent grows to 0.8% of its size, and open extents are expensive anyway — but hourly
     sealing of a slow stream makes nine times as many extents, and extent metadata is priced. A three-way
     trade, undecided.
-41. **Time-range queries on keyed objects** (§9.7.2). Record number is not monotonic in time there, so the
+39. **Time-range queries on keyed objects** (§9.7.2). Record number is not monotonic in time there, so the
     query is a scan over candidate extents rather than a binary search, and its cost is unworked.
-42. **Governance and licence** (§1.0). An open-source data store needs a licence choice, a contribution
+40. **Governance and licence** (§1.0). An open-source data store needs a licence choice, a contribution
     model, and a position on whether a hosted service competes with its own users. None decided.
-43. **What FE-layer retention means** (§8.4.1c). DN, SN and EN retention is a deferred decrement; FE
+41. **What FE-layer retention means** (§8.4.1c). DN, SN and EN retention is a deferred decrement; FE
     holds no durable state, so its window presumably means declining to issue the hard delete until its
     timer expires. Worth stating, since a layer that gets this wrong silently leaves the protection.
-44. **Retention window versus the repair reserve** (§8.4.3). Window × churn consumes the 1 − 1/D
+42. **Retention window versus the repair reserve** (§8.4.3). Window × churn consumes the 1 − 1/D
     headroom that durability depends on, so windows must be admission-controlled rather than freely
     chosen. A 30-day window at 100%/yr churn already exceeds a 5% reserve.
-45. **Measure the space-efficiency chain** (§12.7). Every factor is a guess and they multiply: the
+43. **Measure the space-efficiency chain** (§12.7). Every factor is a guess and they multiply: the
     difference between 58% and 55% billable is a 5% swing in revenue per disk bought. The
     undeletable-garbage term is the one most under the design's control, via compaction policy.
-46. **Expiry-aware placement** (§8.5.1). Grouping objects by declared expiry so extents die whole is
+44. **Expiry-aware placement** (§8.5.1). Grouping objects by declared expiry so extents die whole is
     the strongest lever on the efficiency chain, worth ~30× the entire extent-size range. Needs a
     placement policy, an API field, and a decision on how hard to discourage "never".
-47. **A lifetime dimension in the price list** (§8.5.3). Short-lived data skips erasure coding and so
+45. **A lifetime dimension in the price list** (§8.5.3). Short-lived data skips erasure coding and so
     costs 2.7× more per byte-day. Correct, but it means price cannot be one figure per byte.
-48. **A guaranteed repair-bandwidth floor** (§4.3.4.1). Repair below the failure arrival rate makes
+46. **A guaranteed repair-bandwidth floor** (§4.3.4.1). Repair below the failure arrival rate makes
     loss certain rather than unlikely. The floor is ~7.6 GB/s per 100,000 disks — cheap, but it has to
     be reserved rather than left to compete with foreground traffic.
-49. **Treat utilization as a durability limit** (§4.3.4). A full cluster cannot repair, so 1 − 1/D is
+47. **Treat utilization as a durability limit** (§4.3.4). A full cluster cannot repair, so 1 − 1/D is
     not a capacity guideline. Needs enforcement, and an answer for what happens when a tenant's growth
     would cross it.
-50. **Defence against logical corruption** (§4.3.4). Erasure coding faithfully preserves corrupted
+48. **Defence against logical corruption** (§4.3.4). Erasure coding faithfully preserves corrupted
     data. Scrubbing catches bit rot, not a bug that wrote the wrong bytes correctly.
-51. **What disaster size to design for** (§4.3.3). Overhead = 1/(1−s) makes this the single largest
+49. **What disaster size to design for** (§4.3.3). Overhead = 1/(1−s) makes this the single largest
     cost-versus-reliability decision in the system: 33% survivability at 1.50×, 50% at 2.00×. It
     should be settled before the erasure code is chosen.
-52. **Do real disasters respect the domain hierarchy?** (§4.3.3) The guarantee depends entirely on it.
+50. **Do real disasters respect the domain hierarchy?** (§4.3.3) The guarantee depends entirely on it.
     A cross-cutting failure mode returns loss to the binomial regime, where a 5% event loses hundreds
     of terabytes outright instead of ~3 extents.
-53. **Measure the disaster frequency exponent α** (§4.3.3.1). Every expected-loss figure depends on it,
+51. **Measure the disaster frequency exponent α** (§4.3.3.1). Every expected-loss figure depends on it,
     5×- and 10×-per-halving differ by ~6×, and for α > m the integral diverges and needs a floor.
-54. **A second cluster** (§4.3.3.1). Expected loss is of order the whole-cluster disaster rate for every
+52. **A second cluster** (§4.3.3.1). Expected loss is of order the whole-cluster disaster rate for every
     in-cluster code, so geo-replication is the only answer to the top of the distribution — and nothing
     in this document addresses it.
-55. **Is durability a per-customer billable tier?** (§4.3.3.3) Write-off fractions span 1/1000 to
+53. **Is durability a per-customer billable tier?** (§4.3.3.3) Write-off fractions span 1/1000 to
     999/1000, a 250× spread in effective loss rate on identical storage. Overhead = 1/(1−s) makes the
     knob natural and §12 bills it for free, but nothing offers it.
-56. **Do local codes actually lose on disasters, or only in the worst case?** (§4.3.2.1) Guaranteed
+54. **Do local codes actually lose on disasters, or only in the worst case?** (§4.3.2.1) Guaranteed
     tolerance is 7.5% against MDS's 33%, but maximal recoverability plus a good domain-to-local-group
     mapping may recover most real patterns — worth analysing before writing off the construction or the
     patent question.
-57. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
+55. **Placement retry behaviour in a lopsided cluster** (§5.6.3). Free-space weighting
     and domain constraints interact: a markedly emptier domain attracts weighted picks and
     then rejects them, which is worst right after adding capacity. Bounded, but worth
     measuring.
-58. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
+56. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
     safe, but who chooses the primary, and how a new one is appointed when it fails, is
     undesigned.
-59. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
+57. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
     must be chosen together; a Raft log index is a natural per-ring counter, but what an
     SCN is scoped to is unsettled while objects span many rings.
-60. **Expected object count** (§14.5). DN cost scales with object count rather than
+58. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
-61. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
+59. **Why nesting forces serialized planned disruptions** (§5.6.5) — the
     arithmetic is verified but this operational constraint is asserted, and it
     determines how the cluster is actually operated.
-62. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
+60. **Choosing P, the rings per machine** (§5.8.1). Not a tuning knob: it trades
     core utilization and failover speed against stream-list size, and it multiplies
     with the unmeasured extent-entry size — the stream list grows as the *square*
     of that entry size across the plausible range.
-63. **Transactions and long consistent reads** (§5.7). Getting them would drop the
+61. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
     more attainable than when first raised.
-64. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
+62. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
-65. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+63. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-66. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
+64. **Bounding open logs per stream** (§4.2). RAM bounds the extent list; nothing
     bounds the logs, and each costs EN replicas and network.
-67. **Background loop scheduling** (§13.3): prioritisation and rate limiting
+65. **Background loop scheduling** (§13.3): prioritisation and rate limiting
     against foreground traffic, and whether the rewrite-shaped work — compaction,
     re-encoding, re-keying, garbage reclamation — is scheduled as one pass or many.
-68. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
+66. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
     metadata write per data write.
-69. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
+67. **The metadata key** (§5.5.4): `(parent dir id, name)` recommended over full
     path, so directory rename stays O(1).
-70. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
+68. **Do inline and packed remain distinct regimes?** (§11) Self-hosting makes
     inline objects pack automatically inside metadata extents, which may leave the
     explicit packed regime with nothing to add.
-71. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
+69. **Metadata-tier placement policy** (§5.5.3): more redundancy, maximal spread,
     replicas retained rather than erasure-coded?
-72. **Remaining directory semantics** (§5.1): listing huge directories,
+70. **Remaining directory semantics** (§5.1): listing huge directories,
     permissions, quotas.
-73. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
+71. **The keyed `first_key` in the extent entry** (§14.1, §5.10.4). The only field
     whose size is unknown, and the stream list grows as the *square* of the entry —
     so a bounded key prefix with disambiguation-by-read looks strongly preferable to
     inlining an arbitrary key. Also: confirm the 60 B estimate by measurement.
-74. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
+72. **Local-index namespace and lifecycle** (§5.10.4): per-stream or per-ring, and
     how a slot is retired without silently re-pointing the extents that name it.
-75. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
+73. **Compression block size vs index granularity** (§7.1, §1.4.2). Now a throughput trade on
     both sides: coarse granules compress better and bill less, fine granules cut read
     amplification, which is a 50× throughput factor for point reads.
-76. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
+74. **Keyed objects** generally — the split-on-overflow B-tree shape of §10 needs
     its own pass.
-77. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
+75. **The packing threshold** (§11) — half of *which* maximum? Presumably ~16 MB
     physical.
-78. **Packed-object billing attribution** (§11, §12) — per-object physical size is
+76. **Packed-object billing attribution** (§11, §12) — per-object physical size is
     not additive under shared-extent compression.
-79. **Billing policy** (§12.9): garbage, transient double footprint, shared-extent
+77. **Billing policy** (§12.9): garbage, transient double footprint, shared-extent
     attribution, instantaneous-usage contract, reporting granularity. Slack itself is
     settled at 2× (§4.7).
-80. **Key custody within KS** (§7.3): how the daily master keys are themselves
+78. **Key custody within KS** (§7.3): how the daily master keys are themselves
     protected beyond the unlocking key, and whether customers may supply their own.
-81. ~~**EC vs read locality**~~ — moot: EC groups whole extents (§4.3.2.3). Formerly: align the fragment stripe to the granule, or
+79. ~~**EC vs read locality**~~ — moot: EC groups whole extents (§4.3.2.3). Formerly: align the fragment stripe to the granule, or
     keep a full replica?
-82. **Compaction policy** (§10) — now partly a pricing decision.
-83. **Membership and leader election** (§13).
-84. `Nul` and `\0` framing were both listed originally and are folded together
+80. **Compaction policy** (§10) — now partly a pricing decision.
+81. **Membership and leader election** (§13).
+82. `Nul` and `\0` framing were both listed originally and are folded together
     (§8.2). Confirm no distinction was meant.
-85. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
+83. Does a tombstoned unkeyed record number stay readable as "deleted" forever?
     Reclaiming it would renumber, so presumably never — worth stating
     deliberately.
 
-86. **Whether the stripe of a `(12+3)x(5+1)` turbo code is 90 cells or 108** (§4.3.3.2e). The 4/3 rule
+84. **Whether the stripe of a `(12+3)x(5+1)` turbo code is 90 cells or 108** (§4.3.3.2e). The 4/3 rule
     reproduces 8 and 20 exactly but needs 108 to reach 144; 15 x 6 is 90, which wants 120. It decides
     where the code reaches designed reliability.
-87. **Whether ENs need keys at all** (§8.1.4.1). Compressing and encrypting upstream of the four-way
-    fan-out means ENs could store opaque bytes, which is a strictly stronger §1.5 posture than §7.3.1's
-    cached SN-master keys. Decide rather than inherit.
-88. **Whether power is a nested failure domain** (§5.6.2, §8.1.4.4). DRAM staging on an all-SSD EN is
-    sound only if four independent ENs cannot lose power together. Without it, the all-SSD staging tier has
-    no home.
-89. **Whether 4-instance collapses at the EN level or the disk level on one machine** (§5.6.8). Four
+85. **Whether 4-instance collapses at the EN level or the disk level on one machine** (§5.6.8). Four
     instances on four disks of one machine protect against the commonest failure there is; collapsing to one
     gives that up. The difference is 4x in space.
-90. **The hint window's real value** (§10.1). 10 minutes is a guess; it should be derived from how far a
+86. **The hint window's real value** (§10.1). 10 minutes is a guess; it should be derived from how far a
     tail-following consumer may lag before falling back to a key lookup.
-91. **The SSD seek/scan break-even** (§7.1.1). It spans 4 KB to 320 KB across defensible assumptions —
+87. **The SSD seek/scan break-even** (§7.1.1). It spans 4 KB to 320 KB across defensible assumptions —
     the widest uncertainty in the document, and it sets index density, compression block size, and the
     staging bypass threshold.
-92. **How inline tiny object bodies are kept out of Compute-readable snapshots** (§12.8.4). Exclude them,
+88. **How inline tiny object bodies are kept out of Compute-readable snapshots** (§12.8.4). Exclude them,
     or encrypt them under a key Compute lacks. §11 inlines them and §12.8 reads the snapshot on Compute.
-93. **Padding versus size-binning for EC groups** (§4.3.2.3, §13.5.1). Whether an unfilled cell is padded
+89. **Padding versus size-binning for EC groups** (§4.3.2.3, §13.5.1). Whether an unfilled cell is padded
     to a fixed EC unit or matched by size offline, and what the residual waste is in §12.7's chain.
-94. **What retires a snapshot schema version** (§13.5.5). Several jobs read one artifact, and old
+90. **What retires a snapshot schema version** (§13.5.5). Several jobs read one artifact, and old
     snapshots must stay readable by newer code; nothing says for how long.
-95. **Whether the append-rate ceiling should be surfaced** (§8.1.1a-8). A single unkeyed object appends at
+91. **Whether the append-rate ceiling should be surfaced** (§8.1.1a-8). A single unkeyed object appends at
     ~200 MB/s. That is discoverable by benchmark and surprising if undocumented.
+
+92. **Where recompression runs** (§7.2.2). It needs significant CPU *and* a node running only signed
+    executables, and no machine type currently has both: ENs have no CPU budget, Compute runs user code.
+    Since §10 makes compaction the home of recompression, EC re-encoding, key rotation, media migration and
+    code promotion, this decides whether compaction is a background loop on an existing tier or a machine
+    type of its own.
+93. **What verifies executable signatures, and what happens when verification fails** (§1.5). Code signing
+    is now load-bearing rather than operational: it is the entire justification for ENs holding keys. A
+    machine that cannot verify its own executables must not receive keys, and nothing says how that is
+    enforced or who notices.
+94. **What is in the erasure-code catalog, and what each entry recommends itself for** (§4.3.2.5). Not
+    "which code" — a list, with a few recommendations per use case, each justified by the fields §4.3.2.5
+    enumerates. Turbo codes suffice for shipping, so this is not a release gate.
+95. **Whether the throughput targets are per box or per cluster** (§1.4.0). 200k and 2M QPS were stated
+    without a denominator. Per 16-core box they imply a sub-microsecond per-request message budget in the
+    batched path; per cluster they imply almost nothing.
+96. **Whether small metadata requests have a defined batch API** (§1.4.0). The 10x gap between the two
+    targets exists only if batching is expressible by callers, which makes it an API question rather than
+    an implementation one.
 
 **Closed** since earlier drafts:
 
@@ -6494,4 +6702,19 @@ Roughly in order of how much else depends on them.
   soft delete outlasts the interval, provided the opt-out still leaves a tombstone
   (§12.8.2);
 - whether SN knows an extent's sealed physical size — it must, for three independent
-  reasons (§13.5.1).
+  reasons (§13.5.1);
+- where decryption happens — **on the EN** (§5.9.2), which is licensed by §1.5's real
+  boundary: keys live where the executables are signed, and ENs run no user code;
+- whether ENs need keys at all — they do, and they cache SN-master keys and derive extent
+  keys from the creation timestamp, as §7.3 already had it (§5.9.2, §7.3.1);
+- whether end-to-end encryption is offered — not by DeLawson, but users may encrypt
+  before sending and pay for it in physical bytes (§7.2.3);
+- which AEAD, and whether encryption fits the EN's CPU budget — AEGIS-128X2 at ~20 GB/s
+  per core, so line-rate encryption is 0.63 of a core where compression would be ~21
+  (§7.2.1); KS uses 256-bit;
+- whether a separate checksum layer is needed — no, the AEAD tag is the checksum, and it
+  makes every stored block self-verifying before EC uses it as a repair source (§7.2.1);
+- whether staging may live in DRAM — no; durable means durable with the power off, which
+  also removes the motive for power as an explicit failure domain (§8.1.4.4);
+- whether the erasure code is a single choice — it is a **catalog** with recommendations,
+  and turbo codes suffice for shipping, so the patent is not a release gate (§4.3.2.5).
