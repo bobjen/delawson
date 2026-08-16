@@ -822,6 +822,19 @@ it is four hops and a lookup, not a message. Ping is one hop and no work, and it
 faster. Both bars matter, and they measure different things: ping bounds the messaging layer, and
 ObjectInfo bounds the messaging layer plus the metadata path built on top of it.
 
+**Two different things are called batching here, and they must not be conflated**
+(Asserted, Bob, 2026-08-16):
+
+| | What it is | Where it appears |
+|---|---|---|
+| Transport coalescing | several independent messages pending on one connection leave in one syscall | how the ping reaches millions/s (§17.5) |
+| An explicit batch request | one message that asks for 1,000 random objects at once | how ObjectInfo reached 2M QPS |
+
+The 2M ObjectInfo figure was the second kind — a request that explicitly looked up 1,000 random
+objects. The 10x it bought over 200k is therefore per-*request* amortization, not just per-message.
+Transport coalescing is available to everything and needs no new message; an explicit batch API is a
+design choice per operation.
+
 **The 10x gap between the two ObjectInfo figures is the whole design content of those numbers.** The work itself
 does not change; only the per-request message overhead is amortized. So the pair is really
 one requirement on messaging.
@@ -8887,62 +8900,96 @@ a 32-bit id and a response echoes it, so a caller may keep any number of request
 on one connection and a service may answer them in whatever order it finishes them. Whole
 frames are written under one lock, so frames never interleave.
 
+**Asynchrony is what makes transport coalescing possible**, which is where the throughput comes
+from (§17.5): if a caller could have only one request outstanding there would never be two messages
+pending to carry in one syscall. So ids are not a convenience, they are the mechanism.
+
 **Where an answer is computed is per message type, and it is a measurement rather than a
 decision** (Asserted, Bob, 2026-08-16). Handing a request to a worker costs a queue hop and a
 wakeup; answering it on the connection's read loop stalls the next read for as long as it
 takes. Ping is cheap enough that inline plainly wins and is what the code does; anything that
 touches a disk plainly does not. The middle is unknown, so it is a per-operation knob.
 
-### 17.5 The first measurement: a ping to KS0
+### 17.5 The first measurements: a ping to KS0
 
-Loopback TCP, this box, retail build, `bench-laws`, ping answered on the connection's read loop,
-one round trip at a time per client. A ping asks for a reply of a stated size, filled with random
+Loopback TCP, this box (16 cores, client and server both on it), retail build, `bench-laws`, ping
+answered on the connection's read loop. A ping asks for a reply of a stated size, filled with random
 bytes, so **message size is a knob rather than a constant** — zeros would let compression and a
 page-sharing kernel cheat, and a per-reply generator would measure the generator, so one random
 block is made at first use and replies are slices of it.
 
-A bare ping, which asks for a few hundred instructions of work and therefore measures almost pure
-per-message overhead:
+**Batching here means per-connection coalescing at the transport, not a batch message.** Every
+request is separate and independently answerable; what changes is how many are pending when a
+syscall happens. Both sides buffer and flush when they have nothing left to answer or to read, which
+adds no latency: the flush happens exactly where the alternative was to block. Nagle stays off,
+because the decision of when to send is made in DeLawson and not in the kernel.
 
-| Clients | Round trips/s | Average latency |
-|---|---|---|
-| 1 | 55,800 | 18 µs |
-| 8 | 231,000 | 34 µs |
-| 16 | 400,000 | 15 µs |
+Requests in flight per connection, against connections:
 
-Then holding the client count fixed and varying the reply body:
+| Connections | 1 in flight | 8 | 64 | 256 | 1,024 |
+|---|---|---|---|---|---|
+| 1 | 59,000 | 396,000 | **1,483,000** | 2,088,000 | 2,393,000 |
+| 8 | 244,000 | 1,635,000 | 5,471,000 | 7,015,000 | |
+| 16 | | 2,644,000 | 6,446,000 | 8,185,000 | |
+| 32 | | | 7,297,000 | | |
 
-| Reply bytes | 1 client: round trips/s | body MB/s | 8 clients: round trips/s | body MB/s |
+Round trips per second. **Measured, 2026-08-16.** What it says:
+
+- **Depth is worth 25x on one connection**, 59k to 1.48M, with average latency going 17 µs to 43 µs.
+  Nothing about the work changed; the only difference is how many messages a syscall carries.
+- **One connection at 64 in flight reaches the prototype's ~1.4M ping** (§1.4.0). That is the bar,
+  and coalescing is what clears it.
+- **More connections still help on this box**, to ~8.2M at 16 x 256 — which qualifies an earlier
+  expectation that one connection per address was optimal because it batched most. Depth is indeed
+  what matters most, and a single connection gets most of the way, but it does not win outright
+  here. ⚠️ The client is on the same box as the server, so every client thread costs a core the
+  server could have used; the honest reading is that this box saturates around 7-8M with either
+  shape, and which is optimal cannot be settled without the two on separate machines.
+- **Latency is the price and it is proportional**: at 16 x 256 the average is 500 µs. §1.4 wants
+  throughput first, so that is the right trade, but it is a queue and it should be sized as one.
+
+**The 8.4M figure was checked rather than trusted**, because it is six times the prototype's ping and
+a surprise in the favourable direction deserves more suspicion than a disappointment does. KS counts
+the requests it answers, and over a 1 s warm-up plus 3 s measured run it answered 33.97M against the
+client's 25.3M measured — the difference being one warm-up second at the same rate. So the messages
+are real and the arithmetic is right.
+
+What it cost, from the KS process's own CPU accounting: **27.5 s of core time for 34M messages, or
+0.81 µs of server core per message** — about 2,400 cycles at 3 GHz. Against §1.4.0's instruction
+budget that is a few thousand instructions of *message path* per message, versus the < 1,000 that
+the ping's actual work costs. The server used ~6.5 of 16 cores; the 16 client threads used most of
+the rest, which is more evidence for §17.5's caveat that the client is the co-resident cost.
+
+⚠️ **This is not the prototype's ping, and the gap is mostly things this one does not do.** §1.4.0.1
+records that the measured prototype path included a durable log write per message batch, encryption,
+and message compression. None of those are here yet. So the honest claim is narrow: **the message
+path alone, stripped of everything that will later share it, costs about 0.8 µs of core per message
+and reaches millions per second.** Expect that number to get worse as the omitted work returns, and
+treat 8.4M as a ceiling on this box rather than a result to defend.
+
+Then message size, holding 64 in flight:
+
+| Reply bytes | 1 connection | body MB/s | 8 connections | body MB/s |
 |---|---|---|---|---|
-| 0 | 55,800 | — | 231,000 | — |
-| 64 | 54,600 | 3 | | |
-| 1,024 | 54,200 | 56 | 223,000 | 228 |
-| 8,192 | 40,300 | 330 | | |
-| 65,536 | 9,900 | 650 | 37,400 | 2,449 |
-| 524,288 | 1,400 | 726 | 4,300 | 2,268 |
+| 0 | 1,483,000 | — | 5,471,000 | — |
+| 1,024 | 952,000 | 974 | 1,710,000 | 1,751 |
 
-**Measured, 2026-08-16.** Three things to take from it:
+And with one request in flight, where the round trip is the whole cost:
 
-- **`M`, the per-message overhead, is 15-18 µs.** That is the ~15 µs issue #5 calibrated for a
-  *Unix-domain socket*, not the ~40 µs it guessed for TCP loopback.
-- **Size is free up to about a kilobyte** and costs from there: a 1 KB reply is within 3% of a bare
-  one, 8 KB costs 28%, and past that the round-trip rate falls roughly as 1/size. So the cost model
-  changes from per-message to per-byte somewhere between 1 and 8 KB, which is the number to know
-  before choosing any batch or granule size.
-- **The bandwidth ceiling is ~730 MB/s for one client and ~2.4 GB/s for eight**, both far under
-  memory bandwidth, so it is the message path and not the copy that binds.
+| Reply bytes | Round trips/s | Average latency | body MB/s |
+|---|---|---|---|
+| 0 | 55,800 | 18 µs | — |
+| 64 | 54,600 | 18 µs | 3 |
+| 1,024 | 54,200 | 18 µs | 56 |
+| 8,192 | 40,300 | 25 µs | 330 |
+| 65,536 | 9,900 | 101 µs | 650 |
+| 524,288 | 1,400 | 721 µs | 726 |
 
-**The bar to compare against is the prototype's ping, not §1.4's QPS targets.** Those targets are
-ObjectInfo — four hops and a metadata lookup — while the prototype's *ping* ran at **~1.4M QPS**
-(§1.4.0). So this ping is a factor of **three to four short** of what has already been done on one
-box, and closing that gap is the work, not a floor already cleared. Nothing here is batched and
-Nagle is off on every connection, so the gap is in the message path itself: one write and one read
-per message, a thread per connection, and no batching of independent requests into one syscall.
-
-**A batched ping was considered and rejected** (Asserted, Bob, 2026-08-16): pipelining one client's
-pings measures nothing the client count does not, while a variable reply size measures something
-new. Asynchrony (§17.4) is still what the protocol provides; it is simply not what this benchmark
-varies.
+**`M`, the per-message overhead, is 15-18 µs** unbatched — the ~15 µs issue #5 calibrated for a
+*Unix-domain socket*, not the ~40 µs it guessed for TCP loopback. **Size is free to about a
+kilobyte** and costs from there: 8 KB costs 28% of the round-trip rate and past that it falls roughly
+as 1/size, so the cost model turns from per-message to per-byte somewhere between 1 and 8 KB. That is
+the number to know before choosing any granule or batch size.
 
 ### 17.6 The harness reports what it cannot enforce
 

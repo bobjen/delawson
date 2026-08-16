@@ -153,6 +153,7 @@ mod tests {
     const HEADER: &str = r#"
         schema_version = 1
         cluster_name = "test"
+        ks = { address = "127.0.0.1:9601", port_base = 9602 }
         failure_domains = { levels = ["datacenter", "rack", "machine"] }
         rings = { members = 5 }
         timeouts = { request_ms = 1000, shutdown_grace_ms = 1000 }
@@ -163,8 +164,7 @@ mod tests {
         let mut toml = HEADER.to_string();
         for i in 0..4 {
             toml.push_str(&format!(
-                "[[service]]\nidentity = \"EN{i}\"\nkind = \"en\"\n\
-                 address = \"127.0.0.1:960{i}\"\ndomain = {}\n",
+                "[[service]]\nidentity = \"EN{i}\"\nkind = \"en\"\ndomain = {}\n",
                 domain(i)
             ));
         }

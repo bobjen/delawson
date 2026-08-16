@@ -78,6 +78,10 @@ enum Cmd {
         /// Bytes of random padding in each reply.
         #[arg(long, default_value_t = 0)]
         size: u64,
+        /// Independent requests each client keeps in flight. Above one, pending
+        /// messages leave in one syscall — the only kind of batching there is.
+        #[arg(long, default_value_t = 1)]
+        depth: usize,
         /// Seconds to measure.
         #[arg(long, default_value_t = 10)]
         seconds: u64,
@@ -314,7 +318,7 @@ fn run(cli: Cli) -> Result<()> {
                 Plan { count: *count, conns: *conns, size: *size, reconnect: *reconnect, timeout };
             ping(&cluster, &cli, &plan)
         }
-        Cmd::Bench { clients, warmup, size, seconds } => {
+        Cmd::Bench { clients, warmup, size, depth, seconds } => {
             // Anything answers a ping, so an unnamed target is KS, which is the
             // one process that is always there.
             let target = resolve(&cluster, &cli, ServiceKind::Ks)?;
@@ -322,6 +326,7 @@ fn run(cli: Cli) -> Result<()> {
                 clients: *clients,
                 warmup: *warmup,
                 size: *size,
+                depth: *depth,
                 seconds: *seconds,
                 timeout,
             };
@@ -426,6 +431,7 @@ struct Bench {
     clients: usize,
     warmup: u64,
     size: u64,
+    depth: usize,
     seconds: u64,
     timeout: Duration,
 }
@@ -433,8 +439,8 @@ struct Bench {
 /// Warm up, then measure. Throughput is the number to want first, and average
 /// latency is what says how much of it is per-message overhead.
 fn bench(target: &Target, plan: &Bench) -> Result<()> {
-    if plan.clients == 0 || plan.seconds == 0 {
-        return Err(Error::new("--clients and --seconds must both be positive"));
+    if plan.clients == 0 || plan.depth == 0 || plan.seconds == 0 {
+        return Err(Error::new("--clients, --depth and --seconds must all be positive"));
     }
     let addr = target.address;
     let warm_end = std::time::Instant::now() + Duration::from_secs(plan.warmup);
@@ -442,13 +448,13 @@ fn bench(target: &Target, plan: &Bench) -> Result<()> {
 
     let threads: Vec<_> = (0..plan.clients)
         .map(|_| {
-            let (size, timeout) = (plan.size, plan.timeout);
+            let (size, depth, timeout) = (plan.size, plan.depth, plan.timeout);
             std::thread::spawn(move || -> Result<Tally> {
                 let request = ping_request(size);
                 let mut conn = Conn::open(addr, timeout)?;
-                conn.press(&request, warm_end, &mut Tally::new())?;
+                conn.press(&request, depth, warm_end, &mut Tally::new())?;
                 let mut tally = Tally::new();
-                conn.press(&request, end, &mut tally)?;
+                conn.press(&request, depth, end, &mut tally)?;
                 Ok(tally)
             })
         })
@@ -463,8 +469,8 @@ fn bench(target: &Target, plan: &Bench) -> Result<()> {
     let us = |d: Duration| d.as_secs_f64() * 1e6;
     let rate = total.count as f64 / measured;
     println!(
-        "{} {} clients, {} byte replies, {measured:.1} s measured after {} s warm-up",
-        target.identity, plan.clients, plan.size, plan.warmup
+        "{} {} clients x {} in flight, {} byte replies, {measured:.1} s measured after {} s warm-up",
+        target.identity, plan.clients, plan.depth, plan.size, plan.warmup
     );
     println!(
         "{} {rate:.0} round trips per second, average {:.1} us, min {:.1} us, max {:.1} us",

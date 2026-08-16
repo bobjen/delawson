@@ -6,6 +6,12 @@
 //! let the caller sort them out, and a whole frame is written under one lock so
 //! frames never interleave.
 //!
+//! Answers are buffered and flushed when the read buffer runs dry, so a
+//! connection with several requests in flight costs one read and one write rather
+//! than one of each per message. This adds no latency: the flush happens exactly
+//! when there is nothing left to answer, which is when the alternative would have
+//! been to block.
+//!
 //! Where an answer is computed is per message type, and the trade is real:
 //! handing a request to a worker costs a queue hop and a wakeup, while answering
 //! it on the read loop stalls the next read for as long as it takes. A ping is
@@ -22,13 +28,14 @@ use crate::config::{ClusterConfig, ProcessConfig, ServiceEntry};
 use crate::random::Rng;
 use crate::registry::Peer;
 use crate::wire::{
-    Arg, MAX_FRAME_BYTES, Op, Request, Response, Status, read_request, read_response,
+    Arg, Chan, MAX_FRAME_BYTES, Op, Request, Response, Status, read_request, read_response,
     write_request, write_response,
 };
 use crate::{Context, Error, Result};
+use std::io::{BufWriter, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -42,6 +49,9 @@ pub struct Process {
     pub run_dir: PathBuf,
     pub started: Instant,
     stopping: AtomicBool,
+    /// Requests answered, so a client's throughput claim can be checked against
+    /// what the server thinks it did.
+    answered: AtomicU64,
 }
 
 /// What a machine type adds to the common lifecycle.
@@ -95,6 +105,7 @@ impl Process {
             run_dir,
             started: Instant::now(),
             stopping: AtomicBool::new(false),
+            answered: AtomicU64::new(0),
         })
     }
 
@@ -203,6 +214,7 @@ pub fn ask(address: SocketAddr, request: &Request, timeout: Duration) -> Result<
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(timeout))?;
     write_request(&mut stream, request)?;
+    stream.flush()?;
     read_response(&mut stream)
 }
 
@@ -266,14 +278,21 @@ fn read_loop<S: Service>(
     pool: &Pool,
     stream: TcpStream,
 ) -> Result<()> {
-    stream.set_nodelay(true)?;
-    let out = Arc::new(Mutex::new(stream.try_clone()?));
-    let mut input = stream;
+    let chan = Chan::new(stream)?;
+    let mut input = chan.input;
+    let out = Arc::new(Mutex::new(chan.output));
     loop {
         // A client that closed the connection is the normal case.
-        let Ok(request) = read_request(&mut input) else { return Ok(()) };
+        let Ok(request) = read_request(&mut input) else {
+            let _ = out.lock().expect("connection").flush();
+            return Ok(());
+        };
         if service.inline(request.op) {
             reply(process, &**service, &out, request);
+            // Nothing more has arrived, so the next read would block: send.
+            if input.buffer().is_empty() {
+                out.lock().expect("connection").flush()?;
+            }
             continue;
         }
         let process = Arc::clone(process);
@@ -283,10 +302,22 @@ fn read_loop<S: Service>(
     }
 }
 
-fn reply(process: &Process, service: &impl Service, out: &Mutex<TcpStream>, request: Request) {
+type Out = Mutex<BufWriter<TcpStream>>;
+
+/// Answer one request. Pooled work flushes for itself, since it finishes at a
+/// moment the read loop knows nothing about; inline work leaves the flush to the
+/// read loop, which knows whether more requests are already in hand.
+fn reply(process: &Process, service: &impl Service, out: &Out, request: Request) {
     let response = answer(process, service, &request).to(&request);
-    // One frame per lock, so two answers never interleave.
-    if let Err(e) = write_response(&mut *out.lock().expect("connection"), &response) {
+    process.answered.fetch_add(1, Ordering::Relaxed);
+    let pooled = !service.inline(request.op);
+    let written = {
+        // One frame per lock, so two answers never interleave.
+        let mut out = out.lock().expect("connection");
+        write_response(&mut *out, &response)
+            .and_then(|()| if pooled { out.flush().map_err(Into::into) } else { Ok(()) })
+    };
+    if let Err(e) = written {
         process.log(format!("could not answer {}: {e}", request.op));
     }
     if request.op == Op::Shutdown {
@@ -348,6 +379,7 @@ fn status(process: &Process, service: &impl Service) -> String {
         format!("pid {}", std::process::id()),
         format!("workers {}", workers()),
         format!("uptime_seconds {}", process.started.elapsed().as_secs()),
+        format!("answered {}", process.answered.load(Ordering::Relaxed)),
         format!("domain {}", process.entry.domain.join("/")),
     ];
     if let Some(media_class) = &process.entry.media_class {

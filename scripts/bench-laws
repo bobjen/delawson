@@ -3,23 +3,25 @@
 # and latency, stop the cluster.
 #
 # The ping asks for a few hundred instructions of work, so what this measures is
-# per-message overhead. That number is the one that says how deep later batching
-# has to be.
+# the message path: per-message overhead at depth 1, and what per-connection
+# coalescing recovers at depth above 1.
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 flavor=--retail
 clients=8
+depth=64
 warmup=2
 seconds=10
 to=KS0
 
 usage() {
     cat <<'EOF'
-usage: bench-laws [--debug] [--clients N] [--warmup SECONDS] [--seconds N] [--to IDENTITY]
+usage: bench-laws [--debug] [--clients N] [--depth N] [--warmup SECONDS] [--seconds N] [--to IDENTITY]
 
   --debug     measure the debug build (the default is retail, which is what to quote)
   --clients   parallel clients, one connection and thread each (default: 8)
+  --depth     independent requests in flight per connection (default: 64)
   --warmup    unmeasured seconds first (default: 2)
   --seconds   measured seconds (default: 10)
   --to        which process to ping (default: KS0)
@@ -31,6 +33,7 @@ while (($#)); do
         --debug) flavor=--debug ;;
         --retail) flavor=--retail ;;
         --clients) clients=$2; shift ;;
+        --depth) depth=$2; shift ;;
         --warmup) warmup=$2; shift ;;
         --seconds) seconds=$2; shift ;;
         --to) to=$2; shift ;;
@@ -49,4 +52,4 @@ trap '"$root/scripts/stop-laws" > /dev/null' EXIT
 laws=$root/target/$target/laws
 cluster=$root/config/cluster.toml
 "$laws" --config "$cluster" --to "$to" bench \
-    --clients "$clients" --warmup "$warmup" --seconds "$seconds"
+    --clients "$clients" --depth "$depth" --warmup "$warmup" --seconds "$seconds"

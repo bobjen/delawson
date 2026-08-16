@@ -13,9 +13,16 @@
 //! and nothing requires the two to be adjacent on the connection. A caller may
 //! have as many requests outstanding as it likes, and a service may answer them
 //! in whatever order it finishes them.
+//!
+//! Frames are written into a buffer and flushed deliberately, so several messages
+//! that happen to be pending on one connection leave in one syscall. That is the
+//! only batching there is: no message means "do these N things", the transport
+//! simply carries whatever has piled up. Nagle stays off, because the decision of
+//! when to send is made here and not by the kernel.
 
 use crate::{Context, Error, Result};
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::net::TcpStream;
 
 /// Refuse anything larger rather than allocating what a peer asks for.
 pub const MAX_FRAME_BYTES: usize = 1 << 20;
@@ -343,16 +350,20 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Buffer size on each side of a connection. Big enough that a deep pipeline of
+/// small messages leaves in one write.
+pub const BUF_BYTES: usize = 64 * 1024;
+
+/// Frames go into the buffer; the caller decides when to flush. Length and
+/// payload are one `write_all`, so a frame is never split across flushes.
 fn write_frame(out: &mut impl Write, payload: &[u8]) -> Result<()> {
     if payload.len() > MAX_FRAME_BYTES {
         return Err(Error::new(format!("frame of {} bytes is too large", payload.len())));
     }
-    // One write, so a small request is one packet.
     let mut frame = Vec::with_capacity(4 + payload.len());
     frame.extend((payload.len() as u32).to_le_bytes());
     frame.extend(payload);
     out.write_all(&frame)?;
-    out.flush()?;
     Ok(())
 }
 
@@ -370,6 +381,33 @@ fn read_frame(input: &mut impl Read) -> Result<Vec<u8>> {
 
 pub fn write_request(out: &mut impl Write, request: &Request) -> Result<()> {
     write_frame(out, &request.encode())
+}
+
+/// A buffered connection. `more` says whether bytes are already in hand, which is
+/// how both sides know they may keep piling up work instead of flushing.
+pub struct Chan {
+    pub input: BufReader<TcpStream>,
+    pub output: BufWriter<TcpStream>,
+}
+
+impl Chan {
+    pub fn new(stream: TcpStream) -> Result<Chan> {
+        stream.set_nodelay(true)?;
+        Ok(Chan {
+            input: BufReader::with_capacity(BUF_BYTES, stream.try_clone()?),
+            output: BufWriter::with_capacity(BUF_BYTES, stream),
+        })
+    }
+
+    /// Bytes already read from the socket and not yet parsed.
+    pub fn more(&self) -> bool {
+        !self.input.buffer().is_empty()
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        self.output.flush()?;
+        Ok(())
+    }
 }
 
 pub fn read_request(input: &mut impl Read) -> Result<Request> {

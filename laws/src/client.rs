@@ -1,17 +1,20 @@
 //! Talking to one process, and timing it.
 //!
 //! Calls are asynchronous: `send` and `recv` are separate, so a caller may keep
-//! many requests outstanding on one connection and match answers by id. `call`
-//! is the one-at-a-time convenience on top, and it is what the measurements use:
-//! parallelism comes from more clients, not from pipelining one.
+//! many requests outstanding on one connection and match answers by id. `call` is
+//! the one-at-a-time convenience on top.
+//!
+//! Sends are buffered and flushed deliberately, so requests that are pending
+//! together leave in one syscall. Nothing here is a batch *message* — every
+//! request is separate and independently answerable; only the transport coalesces.
 
-use common::wire::{Request, Response, Status, read_response, write_request};
+use common::wire::{Chan, Request, Response, Status, read_response, write_request};
 use common::{Context, Error, Result};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 pub struct Conn {
-    stream: TcpStream,
+    chan: Chan,
     next_id: u32,
 }
 
@@ -19,26 +22,31 @@ impl Conn {
     pub fn open(addr: SocketAddr, timeout: Duration) -> Result<Conn> {
         let stream =
             TcpStream::connect_timeout(&addr, timeout).context(format!("connecting {addr}"))?;
-        stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
-        Ok(Conn { stream, next_id: 0 })
+        Ok(Conn { chan: Chan::new(stream)?, next_id: 0 })
     }
 
-    /// Send a request without waiting for it, and return the id to expect back.
+    /// Buffer a request without waiting for it, and return the id to expect back.
+    /// Nothing goes out until a flush.
     pub fn send(&mut self, request: &Request) -> Result<u32> {
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
-        write_request(&mut self.stream, &request.clone().id(id))?;
+        write_request(&mut self.chan.output, &request.clone().id(id))?;
         Ok(id)
     }
 
+    pub fn flush(&mut self) -> Result<()> {
+        self.chan.flush()
+    }
+
     pub fn recv(&mut self) -> Result<Response> {
-        read_response(&mut self.stream)
+        read_response(&mut self.chan.input)
     }
 
     pub fn call(&mut self, request: &Request) -> Result<Response> {
         let id = self.send(request)?;
+        self.flush()?;
         let response = self.recv()?;
         if response.id != id {
             return Err(Error::new(format!("asked {id} and heard {}", response.id)));
@@ -54,16 +62,43 @@ impl Conn {
         Ok((response, start.elapsed()))
     }
 
-    /// Round trip one request over and over until `until`, tallying each.
-    pub fn press(&mut self, request: &Request, until: Instant, tally: &mut Tally) -> Result<()> {
-        while Instant::now() < until {
-            let (response, elapsed) = self.timed(request)?;
+    /// Keep `depth` requests in flight until `until`, then drain, tallying each
+    /// round trip. Sends pile up in the buffer and go out when there is nothing
+    /// left to read, so depth is what gives the transport something to coalesce.
+    ///
+    /// Latency here includes queuing, which is the point: depth trades it for
+    /// throughput.
+    pub fn press(
+        &mut self,
+        request: &Request,
+        depth: usize,
+        until: Instant,
+        tally: &mut Tally,
+    ) -> Result<()> {
+        // At most `depth` are outstanding and ids are handed out in order, so an
+        // id's send time lives at `id % depth`.
+        let mut sent = vec![Instant::now(); depth.max(1)];
+        let mut out = 0;
+        loop {
+            while out < depth && Instant::now() < until {
+                let id = self.send(request)?;
+                sent[id as usize % depth] = Instant::now();
+                out += 1;
+            }
+            if out == 0 {
+                return self.flush();
+            }
+            // Nothing more to read, so the next recv would block: send.
+            if !self.chan.more() {
+                self.flush()?;
+            }
+            let response = self.recv()?;
             if response.status != Status::Ok {
                 return Err(Error::new(format!("answered {}", response.status)));
             }
-            tally.add(elapsed);
+            tally.add(sent[response.id as usize % depth].elapsed());
+            out -= 1;
         }
-        Ok(())
     }
 }
 

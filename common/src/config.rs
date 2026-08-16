@@ -67,6 +67,7 @@ impl std::fmt::Display for ServiceKind {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceEntry {
     /// `KS0`, `FE0`: kind plus instance number.
     pub identity: String,
@@ -82,6 +83,7 @@ pub struct ServiceEntry {
 
 /// Where KS listens, which is the one address a cluster cannot discover.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KsBootstrap {
     pub address: SocketAddr,
     /// Ports from here upward are what a starter hands out to everything else.
@@ -91,6 +93,7 @@ pub struct KsBootstrap {
 /// Nested failure domains, coarse to fine, each level a refinement of the one
 /// above. Cross-cutting domain types are a bug, not a configuration option.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FailureDomains {
     pub levels: Vec<String>,
 }
@@ -99,6 +102,7 @@ pub struct FailureDomains {
 /// will be mixed for years, so they live in one table rather than scattered
 /// through the code. Every value is a guess until measured.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MediaClass {
     pub name: String,
     /// Sparse-index checkpoint interval, in physical bytes.
@@ -117,6 +121,7 @@ pub struct MediaClass {
 /// Raft ring composition. One number fleet-wide for now; nothing yet
 /// distinguishes KS, DN and SN ring sizes.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Rings {
     pub members: usize,
 }
@@ -124,6 +129,7 @@ pub struct Rings {
 /// Hedge delays are deliberately absent: they differ per tier by orders of
 /// magnitude and are undesigned, and a wrong global value is worse than none.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Timeouts {
     pub request_ms: u64,
     /// How long `stop-laws` waits after asking a process to stop, before
@@ -132,6 +138,7 @@ pub struct Timeouts {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     /// Bumped on an incompatible change, so a process refuses a configuration it
     /// does not understand rather than misreading it.
@@ -237,6 +244,7 @@ impl ClusterConfig {
 /// KS's own configuration. Every other machine type gets a file of this shape,
 /// holding the knobs that type owns and nothing else.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KsConfig {
     /// Generate a master key only for a day that creates extents. Marching one
     /// key per elapsed day through a long dormancy would take the store from
@@ -259,6 +267,7 @@ impl KsConfig {
 /// rather than argv, so a process's identity is one file a harness or a
 /// deployment system writes.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
     pub identity: String,
     pub kind: ServiceKind,
