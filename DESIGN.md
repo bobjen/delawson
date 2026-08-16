@@ -19,6 +19,10 @@ confirmed. Where the two conflict, the arithmetic wins and the label gets update
 | **Asserted** | stated from experience without derivation — usable, but flagged so it can be revisited |
 | ⚠️ | unresolved; collected again in §16 |
 
+**Performance claims carry a third thing**, per §1.6: achieved, the computed hardware bound, and the
+fraction of bound. A throughput number without its ceiling is as much a liability as an unlabelled
+constant, because it cannot distinguish good from merely better than the alternative.
+
 The distinction matters because this document is long and will be read by people who cannot
 re-derive it from scratch. An unlabelled number is a liability: in a year nobody can tell whether
 it was computed or assumed.
@@ -40,7 +44,7 @@ it was computed or assumed.
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-98 things *not* decided.
+100 things *not* decided.
 
 **Priorities and framing**
 
@@ -50,6 +54,12 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **Data loss happens during disasters**, not steady state — a failed rollout beats a millennium of disk attrition | §1.1.1, §13.2 |
 | Availability is promised **per record**, and is **time-bounded** — a timeout is part of it | §1.1, §5.11.2, §9.5 |
 | **Throughput over latency**; job latency is the *maximum* over requests, so hedge at p99.9+ | §1.4, §9.5 |
+| **Software should not matter**: if the hardware can do it, the software should deliver it | §1.6 |
+| So the metric is **distance from the hardware bound**, never distance from a competitor | §1.6 |
+| Every performance claim states **achieved, bound, and fraction** — a bare number is a liability | §1.6.1, §0 |
+| The bound is for the work the design **chose** to do, so compression and EC are inside the rule | §1.6.3 |
+| Fraction-of-bound targets **survive hardware changes**; absolute ones age out | §1.6.4 |
+| Batched metadata is at **~5% of bound**, unbatched at **~0.5%** — both already meet the target | §1.6.2 |
 | **~95% of hardware cost is disk**; that is cost composition and says nothing about space efficiency | §1.2, §12.7 |
 | **Open source**, so storage can sit inside a compute cluster and egress fees — 48× the storage cost — vanish | §1.0 |
 | Stable record numbers and keys make **external indexes permanently valid**, which is what shared AI memory needs | §1.0, §3 |
@@ -821,6 +831,75 @@ live only where the executables are signed* — and it means **code signing is a
 load-bearing security mechanism**, not an operational nicety. It also becomes a
 placement constraint on work rather than only on data: anything needing plaintext
 must run on a signed-code machine, which §7.2.2 shows is not free to satisfy.
+
+### 1.6 Software should not matter
+
+**If the hardware can do it, the software should deliver it and not get in the way** (Asserted, Bob,
+2026-08-15). Message overhead, disk throughput, CPU consumption for compute — in each case:
+
+> **The measurement is not how much better than competitors. The measurement is distance from the
+> theoretical upper bound given the hardware.**
+
+This is a stronger discipline than it sounds, and it is not the same as "be fast".
+
+#### 1.6.1 It makes every performance claim two-sided
+
+A number on its own is not a claim under this rule. Every performance figure needs a **computed hardware
+ceiling beside it and the fraction stated**, because "3x better than the alternative" is compatible with
+being at 1% of what the machine can do — and 1% is the interesting fact.
+
+So the labelling discipline of §0 gains a companion: performance claims carry **achieved, bound, and
+fraction of bound.** An unaccompanied throughput number is the same liability as an unlabelled constant.
+
+#### 1.6.2 Applying it to the numbers already here
+
+| Resource | Hardware bound | Where we are | Fraction |
+|---|---|---|---|
+| Trivial message (ping) | **>64M/s** — <1,000 instructions at ~64 G inst/s | unmeasured | — |
+| Metadata lookup, batched | **~40M/s** — see below | 2M/s (§1.4.0) | **~5%** |
+| Metadata lookup, unbatched | same | 200k/s | **~0.5%** |
+| Bulk read per EN | **12.5 GB/s** — the NIC binds, devices give 20-400 (§4.3.2.2a) | unmeasured | — |
+| Encrypt + authenticate | ~90 GB/s box | 20 GB/s on one core (§7.2.1) | 22% of the box, on 1/16 of it |
+| Compress (LZ4) | ~90 GB/s box | 0.6 GB/s per core | **0.7%** |
+
+The metadata bound: a lookup over 20 M objects touches perhaps 5 cache lines — a depth-4 B-tree plus the
+record — so 320 B per lookup. Against ~90 GB/s peak at a realistic ~15% efficiency for random access, that
+is **~40M lookups/s**. **Derived**, on a stated assumption about random-access efficiency that deserves
+measuring rather than believing.
+
+**So the batched metadata path is at roughly 5% of its bound, and the unbatched at 0.5%.** That is the
+philosophy earning its keep: both figures already *meet* the shipping targets of §1.4.0, and this rule is
+what says there is a 20x gap worth understanding anyway. §1.4.0.1 warns the gap may be mostly waiting on
+the log rather than computing — which is precisely the kind of thing this discipline forces you to find out
+instead of shipping past.
+
+#### 1.6.3 The bound must be for the work the design chose to do
+
+Read naively, "software should not matter" forbids compression: LZ4 at 0.7% of memory bandwidth looks like
+the most egregious row in the table. But LZ4 is a heavily optimized implementation, so that 0.7% is what
+the **algorithm** costs, not what the software wastes.
+
+So the rule needs sharpening to be testable:
+
+> Software may consume hardware to buy a **stated benefit**. It may not consume hardware for nothing. The
+> bound is computed for the work the design has deliberately chosen, not for the least work imaginable.
+
+That keeps compression (buys disk, §12.3), erasure coding (buys durability at low overhead, §4.3), and
+encryption (§7.2, non-negotiable) inside the rule, while still condemning an extra copy, a per-request
+allocation, or a syscall that batching could have amortized (§1.4.0.1).
+
+It also means **the essential work per operation has to be written down** before a fraction-of-bound number
+means anything. That is a real obligation, and it is where this rule does its work: naming the essential
+work is what exposes the inessential.
+
+#### 1.6.4 Two dividends
+
+**Fraction-of-bound targets survive hardware changes; absolute targets do not.** §7.4 expects a decade-long
+media transition and §1.3 expects the cluster to run indefinitely, so "2M QPS" ages badly where "5% of
+bound" stays meaningful and keeps getting harder in the right way.
+
+**A large gap is a defect, not a fact.** It should be filed rather than noted — which is why §1.4.0's 20x
+gap is tracked as an issue even though the target it fails to reach is already met.
 
 ## 2. Non-goals
 
@@ -6733,6 +6812,15 @@ Roughly in order of how much else depends on them.
     1,000 requests, 2M QPS is 2,000 log writes/sec, so the ceiling may be the device rather than the CPU.
     Until this is known, the ~32,000 instruction-slots per request is an upper bound on work and not a
     measurement of it — and it decides whether question 96's headroom exists.
+
+99. **Random-access memory efficiency, which every metadata bound rests on** (§1.6.2). The ~40M lookups/s
+    ceiling assumes ~15% of peak bandwidth for random 64-byte access. That single assumption sets the
+    denominator for every metadata fraction-of-bound figure in the document, so it should be measured on the
+    actual box rather than believed.
+100. **Writing down the essential work per operation** (§1.6.3). Fraction-of-bound means nothing until the
+    numerator's denominator is defined: what a lookup, an append, a repair and a compaction *must* do. This
+    is a documentation task with teeth — naming the essential work is what exposes the inessential — and it
+    gates every measurement issue.
 
 **Closed** since earlier drafts:
 
