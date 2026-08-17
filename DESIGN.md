@@ -9229,6 +9229,30 @@ says nothing new. It logs at `notice` — being rate-limited already, it is not 
 belongs in both logs. ⚠️ It does not count what it skipped: a counter would put every thread onto one
 cache line, which is exactly the cost the rate limit exists to avoid.
 
+#### 17.5d.1 Many lines in the code, few in the log
+
+**Write a new line at `notice`, and demote it only once a histogram proves it noisy**
+(Asserted, Bob, 2026-08-16). The aim is *more* logging sites in the code and *fewer* lines in the log,
+and those are compatible because most sites are rare — so the levels are a demotion path rather than a
+taxonomy:
+
+| Level | Where a line goes | What it means |
+|---|---|---|
+| `notice` | both logs, always | where every line starts |
+| `info` | the full log, sampled into the info log | proven noisy once |
+| `debug` | nowhere, unless the level is turned down | proven ruinous |
+
+**The pass is periodic and cheap**: every year or so, run the histogram, look at the top of it, and
+demote what is loudest. The rows carry the level, the file and the line, so the histogram is both the
+evidence and the worklist — and demotion to `info` does not lose the line, it only stops it filling the
+log that is kept for days.
+
+Today that has happened exactly twice, which is the discipline working: the per-request `answered` line
+is `info` because it was measured at 270,000 in a run, and the ping's line is `debug` because it cost
+85% of throughput. Everything else — including a *failed* answer, which is rare and wanted — is
+`notice`. The consequence is the right shape for the log that lives longest: **the info log keeps every
+problem and a sample of the successes.**
+
 **And there is a level above `info` for a line that must always be in both**: `notice`, from syslog's
 ladder. That answers a question worth stating, since `debug` is normally off and `info` is normally
 the floor — the levels are `d i n w e`, `info` is the default floor, and `notice` means *ordinary but

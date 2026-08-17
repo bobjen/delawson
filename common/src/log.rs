@@ -12,6 +12,17 @@
 //! The second is what keeps a line that was quiet when it was written from
 //! flooding the info log once the system is busy.
 //!
+//! **Write a new line at `notice`, and demote it only once a histogram proves it
+//! noisy.** The aim is many lines in the code and few in the log, which works
+//! because most sites are rare: the ladder is a demotion path rather than a
+//! taxonomy —
+//!
+//! | Level | Where it goes |
+//! |---|---|
+//! | `notice` | both logs, always: where a line starts |
+//! | `info` | the full log, sampled into the info log |
+//! | `debug` | nowhere, unless someone turns the level down |
+//!
 //! Every macro invocation gets its own `Site`, so counting a line is one relaxed
 //! increment and deciding where it goes is one relaxed load.
 //!

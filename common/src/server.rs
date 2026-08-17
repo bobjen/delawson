@@ -393,7 +393,9 @@ pub fn serve(process: Arc<Process>, service: Arc<impl Service>) -> Result<()> {
         let pool = Arc::clone(&pool);
         std::thread::spawn(move || {
             if let Err(e) = read_loop(&process, &service, &pool, stream) {
-                logi!("connection ended", "{e}");
+                // Notice until proven noisy: a connection ending is worth seeing,
+                // and a workload of short-lived connections is what would demote it.
+                logn!("connection ended", "{e}");
             }
         });
     }
@@ -504,7 +506,9 @@ impl Reply {
                     logi!("answered", "op {},about {},us {us}", self.op, self.about);
                 }
                 _ => {
-                    logi!(
+                    // Notice, not info: it is rare, and until a histogram proves
+                    // otherwise a new line belongs in both logs.
+                    logn!(
                         "answered with a problem",
                         "op {},status {status},about {},us {us}",
                         self.op,
