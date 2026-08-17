@@ -72,6 +72,9 @@ struct Open {
     /// The stream-local number of this extent's first record, which is what turns an
     /// extent-local number into a durable reference.
     first_record: u64,
+    /// Records in it, or zero for the extent still being appended to — whose count
+    /// changes with every append and is therefore not a thing to remember.
+    records: u64,
     /// The instances, primary first.
     instances: Vec<u32>,
 }
@@ -80,8 +83,13 @@ impl Open {
     /// The id, the second, the first record, then the instances, which is the order
     /// the SN answers in.
     fn of(sn: u32, args: &[Arg]) -> Option<Open> {
-        let [Arg::Number(id), Arg::Number(created), Arg::Number(first_record), instances @ ..] =
-            args
+        let [
+            Arg::Number(id),
+            Arg::Number(created),
+            Arg::Number(first_record),
+            Arg::Number(records),
+            instances @ ..,
+        ] = args
         else {
             return None;
         };
@@ -97,21 +105,16 @@ impl Open {
             id: *id,
             created: *created,
             first_record: *first_record,
+            records: *records,
             instances,
         })
     }
 
-    /// Whether a stream-local record is in this extent, for one whose count is known.
-    fn holds(&self, records: u64, record: u64) -> bool {
-        record >= self.first_record && record < self.first_record + records
+    /// Whether a stream-local record is in this extent. False for an extent whose
+    /// count is not known, which is the one still being appended to.
+    fn holds(&self, record: u64) -> bool {
+        self.records > 0 && record >= self.first_record && record < self.first_record + self.records
     }
-}
-
-/// A sealed extent and what it came to. Its record range never changes again, which
-/// is what makes remembering it safe.
-struct Kept {
-    extent: Open,
-    records: u64,
 }
 
 /// An append waiting for an extent to append to.
@@ -129,9 +132,10 @@ struct Wanting {
 struct Stream {
     /// The extent appends are landing in.
     open: Option<Open>,
-    /// Extents that have sealed, in record order, so a read knows where a record
-    /// lives without asking the SN.
-    sealed: Vec<Kept>,
+    /// Extents that have sealed, so a read knows where a record lives without asking
+    /// the SN. Learned two ways: by being the one to report a seal, and from a read
+    /// the SN answered — since an SN naming a sealed extent says how much it holds.
+    sealed: Vec<Open>,
     /// **Set means a request for the next extent is in flight**, and the appends in
     /// it are waiting for that one answer rather than each asking for themselves.
     getting: Option<Vec<Wanting>>,
@@ -161,9 +165,10 @@ impl Stream {
             return Plan::Use;
         }
         if let Some((id, records)) = sealed
-            && let Some(open) = self.open.take().filter(|open| open.id == id)
+            && let Some(mut open) = self.open.take().filter(|open| open.id == id)
         {
-            self.sealed.push(Kept { extent: open, records });
+            open.records = records;
+            self.remember(open);
         }
         match &self.getting {
             Some(_) => Plan::Join,
@@ -174,12 +179,17 @@ impl Stream {
         }
     }
 
-    /// The sealed extent holding a stream-local record, if this FE has seen it seal.
+    /// The sealed extent holding a stream-local record, if this FE knows of it.
     fn holding(&self, record: u64) -> Option<Open> {
-        self.sealed
-            .iter()
-            .find(|kept| kept.extent.holds(kept.records, record))
-            .map(|kept| kept.extent.clone())
+        self.sealed.iter().find(|extent| extent.holds(record)).cloned()
+    }
+
+    /// Keep a sealed extent, unless it is already kept. Two appends and any number of
+    /// reads can each learn the same one.
+    fn remember(&mut self, extent: Open) {
+        if extent.records > 0 && !self.sealed.iter().any(|kept| kept.id == extent.id) {
+            self.sealed.push(extent);
+        }
     }
 }
 
@@ -663,6 +673,7 @@ impl FE {
             .number(located.dn as u64)
             .number(located.stream)
             .number(record);
+        let fe = Arc::clone(self);
         let onward = Arc::clone(process);
         let named = identity.clone();
         let asked = process.ask(&identity, &ask, move |answer| {
@@ -673,6 +684,15 @@ impl FE {
                 return reply
                     .send(Response::error(Status::Internal, "that answer named no extent"));
             };
+            // A sealed extent the SN just named is one to remember: its record range
+            // is fixed, so no read of it need ask again — including on an FE that
+            // never wrote to it.
+            fe.streams
+                .lock()
+                .expect("streams")
+                .entry((located.dn, located.stream))
+                .or_default()
+                .remember(open.clone());
             from_instance(&onward, &located, &open, record, reply);
         });
         if let Err(e) = asked {
@@ -877,6 +897,7 @@ mod tests {
             Arg::Number(7),
             Arg::Number(1_000_000),
             Arg::Number(40),
+            Arg::Number(90),
             Arg::Number(2),
             Arg::Number(3),
             Arg::Number(0),
@@ -884,6 +905,7 @@ mod tests {
         ];
         let open = Open::of(0, &args).expect("an extent");
         assert_eq!((open.sn, open.id, open.created, open.first_record), (0, 7, 1_000_000, 40));
+        assert_eq!(open.records, 90, "sealed, so its range is known");
         assert_eq!(open.instances, [2, 3, 0, 1]);
         // The primary is the first, which is the one an append is sent to.
         assert_eq!(open.instances[0], 2);
@@ -892,7 +914,10 @@ mod tests {
     /// An extent with nowhere to put it is not an extent.
     #[test]
     fn an_extent_with_no_instances_is_refused() {
-        assert!(Open::of(0, &[Arg::Number(7), Arg::Number(1_000_000), Arg::Number(0)]).is_none());
+        assert!(
+            Open::of(0, &[Arg::Number(7), Arg::Number(1_000_000), Arg::Number(0), Arg::Number(0)])
+                .is_none()
+        );
         assert!(Open::of(0, &[Arg::Number(7), Arg::Number(1_000_000)]).is_none());
         assert!(Open::of(0, &[]).is_none());
     }
@@ -924,8 +949,14 @@ mod tests {
     #[test]
     fn a_receipt_leads_with_the_durable_reference() {
         let located = Located { dn: 0, stream: 17, sn: 0, framing: Framing::Lf, first_record: 0 };
-        let open =
-            Open { sn: 0, id: 7, created: 1_000_000, first_record: 40, instances: vec![2, 3] };
+        let open = Open {
+            sn: 0,
+            id: 7,
+            created: 1_000_000,
+            first_record: 40,
+            records: 0,
+            instances: vec![2, 3],
+        };
         let from_en = Response {
             id: 0,
             status: Status::Ok,
@@ -963,13 +994,27 @@ mod tests {
     #[test]
     fn a_failed_append_is_not_dressed_up_as_a_receipt() {
         let located = Located { dn: 0, stream: 17, sn: 0, framing: Framing::Lf, first_record: 0 };
-        let open = Open { sn: 0, id: 7, created: 1_000_000, first_record: 0, instances: vec![2] };
+        let open = Open {
+            sn: 0,
+            id: 7,
+            created: 1_000_000,
+            first_record: 0,
+            records: 0,
+            instances: vec![2],
+        };
         let refused = Response::error(Status::Internal, "two instances would not apply it");
         assert_eq!(receipt(&located, &open, refused.clone()), refused);
     }
 
     fn extent(id: u64, first_record: u64) -> Open {
-        Open { sn: 0, id, created: 1_000_000, first_record, instances: vec![2, 3, 0, 1] }
+        Open {
+            sn: 0,
+            id,
+            created: 1_000_000,
+            first_record,
+            records: 0,
+            instances: vec![2, 3, 0, 1],
+        }
     }
 
     /// One append asks the SN and the rest join it. Without this, every append in
@@ -1029,6 +1074,31 @@ mod tests {
         // In the extent still open, so the SN has to be asked.
         assert!(stream.holding(170).is_none());
         assert!(stream.holding(5000).is_none());
+    }
+
+    /// An FE that never wrote an extent can still learn where its records are, because
+    /// an SN naming a sealed extent says how much it holds. Otherwise a read-only front
+    /// end asks about every read for ever.
+    #[test]
+    fn a_read_teaches_an_fe_that_never_wrote() {
+        let mut stream = Stream::default();
+        assert!(stream.holding(5).is_none(), "nothing known yet");
+
+        // What a locate answers for a sealed extent: 90 records from 0.
+        let mut sealed = extent(1, 0);
+        sealed.records = 90;
+        stream.remember(sealed);
+        assert_eq!(stream.holding(5).unwrap().id, 1);
+        assert_eq!(stream.holding(89).unwrap().id, 1);
+        assert!(stream.holding(90).is_none());
+
+        // Learning it twice keeps one copy, since appends and reads both teach it.
+        stream.remember(stream.holding(5).unwrap());
+        assert_eq!(stream.sealed.len(), 1);
+
+        // And the extent still open says zero records, which is not rememberable.
+        stream.remember(extent(2, 90));
+        assert_eq!(stream.sealed.len(), 1, "an open extent is not a fact to keep");
     }
 
     /// Both are answered by somebody else, so neither may be answered on the read

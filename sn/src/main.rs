@@ -85,11 +85,20 @@ struct Extent {
 }
 
 impl Extent {
-    /// The id, the second, the first record, then the instances with the primary
-    /// first, which is the order an FE needs them in.
-    fn args(&self) -> Vec<Arg> {
-        let mut args =
-            vec![Arg::Number(self.id), Arg::Number(self.created), Arg::Number(self.first_record)];
+    /// The id, the second, the first record, how many records it holds, then the
+    /// instances with the primary first, which is the order an FE needs them in.
+    ///
+    /// **The record count is zero unless the extent is sealed**, because until then it
+    /// grows with every append. A count is what lets whoever asked remember where
+    /// those records live and never ask again — so it is worth sending even to a
+    /// reader that did not write them.
+    fn args(&self, records: u64) -> Vec<Arg> {
+        let mut args = vec![
+            Arg::Number(self.id),
+            Arg::Number(self.created),
+            Arg::Number(self.first_record),
+            Arg::Number(records),
+        ];
         args.extend(self.instances.iter().map(|en| Arg::Number(*en as u64)));
         args
     }
@@ -277,7 +286,7 @@ impl SN {
         let ens: Vec<u32> =
             process.cluster.services_of_kind(ServiceKind::En).map(|en| en.number()).collect();
         match self.open(dn, stream, now(), &ens, process.cluster.extents.instances) {
-            Ok(extent) => Response { id: 0, status: Status::Ok, args: extent.args() },
+            Ok(extent) => Response { id: 0, status: Status::Ok, args: extent.args(0) },
             Err(Full { records, why: None }) => {
                 Response { id: 0, status: Status::Sealed, args: vec![Arg::Number(records)] }
             }
@@ -308,14 +317,18 @@ impl SN {
         // The sealed extents are in record order, so this is a search over a sorted
         // run; a scan is what it costs while a stream has few extents.
         if let Some(sealed) = held.sealed.iter().find(|sealed| sealed.holds(record)) {
-            return Response { id: 0, status: Status::Ok, args: sealed.extent.args() };
+            return Response {
+                id: 0,
+                status: Status::Ok,
+                args: sealed.extent.args(sealed.records),
+            };
         }
         match &held.open {
             // How far the open extent reaches is not known here — an SN keeps its
             // record totals lazily — so anything at or past its first record is
             // routed to it and the EN says whether it is there.
             Some(extent) if record >= extent.first_record => {
-                Response { id: 0, status: Status::Ok, args: extent.args() }
+                Response { id: 0, status: Status::Ok, args: extent.args(0) }
             }
             Some(_) | None => Response::error(
                 Status::NotFound,
@@ -356,7 +369,7 @@ impl SN {
             process.cluster.extents.instances,
             process.cluster.extents.per_stream,
         ) {
-            Ok(extent) => Response { id: 0, status: Status::Ok, args: extent.args() },
+            Ok(extent) => Response { id: 0, status: Status::Ok, args: extent.args(0) },
             // The stream is full, which is the DN's business: it says what the
             // stream came to so the object's next stream can carry on from there.
             Err(Full { records, why: None }) => {

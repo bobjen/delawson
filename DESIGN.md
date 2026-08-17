@@ -10821,3 +10821,50 @@ That is precisely the gap §15.3's one end-to-end test exists to fill, and it is
 **the argument order between two processes is a contract that no unit test on either side can check.**
 Both sides pass their own tests while disagreeing. The candidates for catching it are the end-to-end test
 (#45) or giving a request shape a name both sides share rather than a position both sides count.
+
+### 17.14 Several front ends, each with its own clients
+
+The single-box cluster now runs **four FEs**, and a client is **pinned** to one with `--to` rather than
+round-robined across them (Asserted, Bob, 2026-08-17). Pinning is what makes an FE's memory worth having:
+a client that goes somewhere else next time is a client whose coordinator knows nothing about it.
+
+**What the SN sees scales with front ends, not with clients.** 200 appends from eight clients, two pinned
+to each of four FEs, into one object across three extents:
+
+| | SN requests |
+|---|---|
+| One FE | **4** — one stream, one open, two seals |
+| Four FEs | **13** — one stream, and four × three extents |
+
+**Measured, 2026-08-17.** Which is the floor and the expected shape: §17.13's collapse is per FE, so each
+front end discovers each extent once. *n* FEs cost *n* requests per extent and clients cost none, so the
+metadata tier's load is set by how many coordinators there are — a number the operator chooses — rather
+than by how many writers there are, which is a number the customer chooses.
+
+#### 17.14.1 A read-only front end has to be told, and now is
+
+Running more than one FE immediately exposed something one FE could not: **an FE learned where records
+lived only by being the one to report a seal**, so an FE that had never written to a stream asked the SN
+about every read for ever. Measured before the fix: reads through the writing FE, 0 requests for 40 reads;
+reads of the same records through another FE, **40 requests for 40 reads, and 40 again on the second
+pass.** It never warmed up, because the answer it got carried no record count and a range is not something
+to guess.
+
+**The fix is one number in the answer.** An SN naming a *sealed* extent now says how many records it
+holds, so any FE can remember it — the count is zero for the extent still being appended to, whose reach
+changes with every append and is therefore not a fact to keep.
+
+| Reads of sealed records through an FE that never wrote them | SN requests |
+|---|---|
+| First pass, 40 reads | **1** |
+| Second pass, 40 reads | **0** |
+| Ten reads of the tail, in the extent still open | 10 |
+
+**Measured, 2026-08-17.** So a reader pays one request per extent it reads from, ever, and a reader of the
+tail pays one per read — which is the case #54 is about and caching cannot fix.
+
+⚠️ **The general shape is worth naming, because it will recur.** A cache that is only filled by the write
+path serves writers and starves readers, and the two look identical from the writing side — every
+measurement passes. What made it visible was running more than one of something, which is the same reason
+§17.11.1's bugs needed eight writers: **a single instance of a thing cannot exhibit the disagreements
+between instances.**

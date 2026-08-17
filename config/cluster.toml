@@ -139,9 +139,12 @@ count = 4
 domain = ["region0", "dc0", "rack0", "box0", "disk0"]
 media_class = "hdd"
 
+# Several, because a client is pinned to one rather than round-robined across them
+# — so the extent each FE remembers is only useful if the same client comes back, and
+# what the SN sees scales with the number of front ends rather than of clients.
 [[service]]
 kind = "fe"
-count = 1
+count = 4
 domain = ["region0", "dc0", "rack0", "box0", "disk0"]
 
 # Per-device-class constants. Every number here is a guess awaiting measurement;
