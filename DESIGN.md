@@ -1335,6 +1335,35 @@ Fixed at creation; determines how records are addressed.
 | Delete | tombstone, count-preserving | tombstone |
 | Positional access | yes, `O(log)` | no (§9.4) |
 
+### 3.0 Why keyed objects are in the core rather than built on top
+
+Keyed objects double a great deal of surface: every mechanism has a keyed story and an unkeyed one —
+addressing, hints, compare-and-append, counts-as-statistics, the read path. It is fair to ask what that
+buys over building a keyed index *as* an ordinary unkeyed object. The answer is that the surface is
+mostly not theirs (Asserted, Bob, 2026-08-17):
+
+- **DeLawson is to have updatable sorted indexes regardless.** They are wanted as a feature, not as
+  scaffolding for something else — and they are where the hard parts live: ordered placement, insert in
+  the middle, mutation, merging.
+- **A keyed object is then a small step.** Storing the rows *in* the index rather than a reference to
+  them elsewhere is Oracle's index-organized table, and **all the mechanism is already needed for the
+  indexes themselves.** So keyed objects are close to free once indexes exist, and expensive only if
+  you imagine building them first.
+- **What index-only buys over index-plus-reference is locality for range scans**: the rows are already
+  in key order where the scan is already reading, so a range is sequential instead of a chase per key.
+- ⚠️ **And mutation is not optional anyway.** A right to erasure wants **deletes, and probably updates,
+  of individual rows** — including in objects a user would call append-only. That forces change logs
+  and extent merging into the design whether or not anything is keyed. So the machinery keyed objects
+  are accused of requiring is machinery an append-only store already has to have.
+
+The last two arrive from outside the storage argument, which is why they are easy to miss when weighing
+the surface area: the expensive parts are wanted for other reasons, and what "keyed" adds on top of
+them is small.
+
+⚠️ **Updatable sorted indexes are not on §1's ship gate**, and they should be placed deliberately —
+either as a ship requirement, which makes them a large piece of unscheduled work, or as explicitly
+after it, which means the keyed flavour arrives with them rather than before.
+
 The asymmetry follows from one fact: **record counts are stable under update
 and tombstoned delete, but not under insert.** An update replaces a record and
 a tombstone leaves it present-but-dead, so every cumulative count in the object
@@ -5170,6 +5199,17 @@ through one extent whose instances sit on one disk each.
 the one §1.0 names: many writers recording shared experiences into one object, wanting both a single ordered
 sequence and stable references. §8.6 works that conflict through and finds it is a trilemma rather than a
 choice.
+
+⚠️ **And the ceiling comes from the promise, not from the storage** (Asserted, Bob, 2026-08-17). It is one
+disk's bandwidth because the append returns `(object, row)` immediately, which needs one place deciding the
+order. **A writer willing not to be told its row straight away could be served at an SN's throughput instead
+of a disk's** — many disks rather than one, which is orders of magnitude.
+
+So this is an option to offer rather than a limit to live with. What it costs is exactly what §8.1.1a-9
+argues against making the *default*: an answer that arrives later, order fixed at extent creation rather than
+at seal, and head-of-line blocking behind the slowest concurrent writer. **Those objections are decisive for
+a default and not for a choice** — a writer bulk-loading can accept all three, and a writer that wants a
+stable reference in hand cannot. The design should let the writer say which it is.
 
 #### 8.1.1a-9 Prior art for the receipt: VSAM returns it, POSIX does not
 
@@ -9300,6 +9340,25 @@ is a pass over 171 GB of RAM. That is seconds, once per disk failure. So what de
 disk failure rate an SN sees and whether repair may wait seconds to begin, neither of which is a
 memory-budget question.
 
+#### 14.1.4 Why the SN's table has to be in memory at all
+
+**Not for read latency — for the loops that walk it** (Asserted, Bob, 2026-08-17). RAM-residency is
+**required by the fast-twitch SN/EN sync (§13.1) and by the GC that replaces missing instances**. Those
+do not look up one extent; they sweep the table, repeatedly, and compare it against what the ENs report.
+A disk-backed structure with a cache serves point lookups well and sweeps badly, and sweeping is what
+this tier does.
+
+That is worth stating because the obvious prior art went the other way — Colossus keeps metadata in a
+key-value store rather than in memory — and the difference is not a disagreement about latency. It is
+that **the sweep is the workload**, and a design whose reconciliation and repair loops are continuous
+cannot page its own working set.
+
+⚠️ **The open risk is the DN, not the SN** (Asserted, Bob, 2026-08-17): **how much of the DN needs to be
+in RAM is not known.** §14.2 has it disk-backed and unbounded in object count, which is the right shape
+for a tier whose size is set by a customer's object count — but a directory listing, a keyed lookup and
+the self-hosting bootstrap all touch it, and nothing has established what fraction has to be resident
+for those to be quick.
+
 ### 14.2 DN: unbounded in object count, disk-backed
 
 The SN's problem is bounding a single stream. The DN's is the opposite: nothing
@@ -9650,6 +9709,24 @@ sample cannot say whether a 5% move is a regression or noise.
 
 ---
 
+### 15.4 Where this is, and how big it is
+
+**The project is about the scope of Hadoop** (Asserted, Bob, 2026-08-17): the basics of the store are
+CRUD, directories, concatenate, and keeping the data durable — and then there are user accounts, and
+then there is Compute. That is the measure to keep in mind when reading the sections that go into
+tenths of a percent: the whole is large, and most of it is not built.
+
+⚠️ **And the current state is early**, whatever the depth of this document suggests: *"we're rapidly
+putting pieces in place and rolling marbles through them, which is a milestone but one far away from
+shipping"* (Asserted, Bob, 2026-08-17). §17 records real measurements of real code, and every one of
+them is of a placeholder standing in for the thing that will exist.
+
+**The operational assumption follows from the scope.** Bob can watch a first large deployment; **after
+that, whoever deploys DeLawson keeps it running themselves** (Asserted, Bob, 2026-08-17). So the design
+cannot assume a privileged operator who knows where the bodies are buried — which is the standard the
+log tool is already built to (§17.5h: nobody should have to log into a machine to read a log) and the
+standard the rest of the operational surface has to reach too.
+
 ## 16. Open questions
 
 Roughly in order of how much else depends on them.
@@ -9694,8 +9771,14 @@ Roughly in order of how much else depends on them.
 11. **How a DN range splits** (§5.11). The only place fullness forces movement. It should
     reuse the keyed-object split of §10, but the interaction with in-flight writes to the
     range is undesigned.
-12. **What ring unavailability *p* actually is** (§5.11.1). The locality argument and the
-    per-record availability contract both turn on it, and nothing has measured or targeted it.
+12. **What ring unavailability *p* actually is** (§5.11.1). ⚠️ **Partly answered, and the answer
+    changes the question** (Asserted, Bob, 2026-08-17): **the system does not work if a ring is
+    unavailable**, so *p* is not a quantity to accept and design around — it is a quantity to drive to
+    nothing. The design response is to **switch to a new primary in less time than a timeout**, so that
+    an unavailable ring is never observed as one, and **ring size is the lever**: seven members, going
+    to nine if seven does not deliver no-long-downtime. What remains open is the measurement that says
+    which it is, and what *p* residually is once failover is that fast — which is what the locality
+    argument and the availability contract actually need.
 13. **Hedge delays per tier** (§9.5). The *percentile* is settled at p99.9+ (§1.4.1), but the
     absolute delays differ by orders of magnitude between an EN granule read, a metadata
     lookup and a client-to-FE request. Also: may a ring's hot backup serve hedged metadata
@@ -9849,7 +9932,10 @@ Roughly in order of how much else depends on them.
     large object from serial into parallel, since a consistent view makes chunk
     boundaries computable rather than discoverable.
 62. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
-    DN ring, and does the 4/3 default hold for both?
+    DN ring, for KS. ⚠️ **A working figure exists** (Asserted, Bob, 2026-08-17): **seven members, and
+    nine if seven cannot deliver no-long-downtime** — chosen for availability under failover (question
+    12) rather than for durability. What is open is whether seven suffices, which is a measurement of
+    failover time and not an argument.
 63. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
     away, so this is now a write-amplification question only: keep the
     authoritative count on the SN and let the DN cache it lazily, or accept one
