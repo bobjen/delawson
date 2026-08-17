@@ -4723,7 +4723,7 @@ data. So the check happens at every point where the logical bytes exist again, w
 it can mean anything.
 
 On the read path that place is **whoever decompresses** — the client if it may hold whole blocks, the FE
-if it may not (§9.1.1). The client is the better answer, because then the same machine that computed the
+if it may not (§9.1.2). The client is the better answer, because then the same machine that computed the
 CRC going in checks it coming out and nothing in between looks inside.
 
 **The EN never checks a CRC**, and could not: it holds what the writer compressed, it does not
@@ -4747,7 +4747,7 @@ cross-tenant metadata lives would leak a fingerprint of one tenant's data to ano
 the block, inside what is encrypted — never in the metadata that describes where the block is.
 
 **The block itself is single-tenant, though**, and so is a coalesced extent: an append block comes from
-one writer, and coalescing works only within one tenant's extents (§9.1.1). It is the staging extents
+one writer, and coalescing works only within one tenant's extents (§9.1.2). It is the staging extents
 that mix, which is why the boundary falls between a block and the metadata about it rather than between
 a block and its neighbours.
 
@@ -5295,7 +5295,7 @@ path and append size across the internet. Neither version troubles §4.3.2.3's b
 instances, since one compressor is one compressor wherever it sits — the argument is about where the
 CPU and the bytes are, not about reproducibility.
 
-**And it settles who checks the user's CRC** (§9.1.1). A client that compresses is a client that has
+**And it settles who checks the user's CRC** (§9.1.2). A client that compresses is a client that has
 the codec, so it can decompress what comes back and compare it against the CRC it computed going in.
 **Nothing between the two ever looks inside.**
 
@@ -6368,11 +6368,50 @@ requested data.** Two independent reasons, and either alone would settle it:
 - **ENs are CPU-poor by design** (§1.2 puts the money in disks, not cores), and
   decompressing and parsing on the tier that owns the disks spends the resource that
   tier does not have.
-- **An EN need not hold keys at all** (§7.2, and it is why EC runs over ciphertext), so
-  it *cannot* look inside a block. Returning bytes it cannot read is not a limitation
-  to work around — it is the property that keeps plaintext off the storage tier.
+- **A block is the unit an EN deals in.** Its business is bytes and offsets; what a
+  record is belongs above it, which is why a read needs no framing argument at all.
 
-#### 9.1.1 How far the block travels decides who checks the CRC
+⚠️ An earlier version of this paragraph said an EN *cannot* look inside a block because
+it holds no keys. That is wrong: **ENs do cache daily SN-master keys and do decrypt**
+(§7.3, §5.9.2). Returning whole blocks is a division of labour, not an inability — and
+the next section is a check that depends on the EN being able to look.
+
+#### 9.1.1 The EN checks the auth code on every read off disk
+
+**An EN reads a block off a disk, and the block is encrypted, so it has an auth code to check —
+and it should check it on every read off disk** (Asserted, Bob, 2026-08-17). A tag that does not
+verify means those bytes on that device are corrupt, and the EN is the one place that can say so.
+
+**Off disk, not per client read**, and the distinction is real rather than pedantic because **an EN
+will have a small cache of recently read data** (Asserted, Bob, 2026-08-17). A block already in
+memory has nothing new to learn from being re-verified — that would spend CPU on the hot path to
+re-detect a fault RAM has its own defences against — while a block coming off a device is exactly
+where media corruption appears. So the check is attached to the device read, and a cache hit costs
+nothing at all.
+
+**That cache holds blocks as stored**, which is to say encrypted and compressed, because that is
+what an EN has and what it hands back (§9.1). So it needs no keys to serve a hit, adds no place
+plaintext sits, and costs exactly its bytes — the cheapest possible shape for a cache, and the
+reason a *small* one is worth having even on a tier that must stay CPU-poor.
+
+It is affordable for the reason §7.2.1 gives: AEGIS is nearly free, so verifying costs about what
+reading cost, and an EN is already paying that.
+
+**This is a different check from the user's CRC, and the difference is what makes it worth having**
+in addition:
+
+| | Covers | At | Says |
+|---|---|---|---|
+| **Auth code** | one encrypted block, as stored | the EN, on every read off disk | *this instance's copy is bad* |
+| **CRC** (§7.5) | the writer's logical bytes, end to end | whoever decompresses | *something between my buffer and here is wrong* |
+
+⚠️ **The EN's check is the one that localizes, and localizing is what makes corruption
+actionable.** A failed tag names an instance, so the read can be retried against another and the
+bad copy repaired by the ordinary path (§13.1) — the user never sees it. A CRC mismatch says only
+that something is wrong somewhere, which is the right guarantee to offer and a poor place to start
+an investigation. The two layers are detection and diagnosis, and neither substitutes for the other.
+
+#### 9.1.2 How far the block travels decides who checks the CRC
 
 **If an FE can return whole compressed blocks to the client, then the client is what checks
 the CRC** (Asserted, Bob, 2026-08-17) — **unless there is a security reason insisting the FE
@@ -6563,8 +6602,14 @@ Where it lives is a real trade:
 ⚠️ Undecided. The security asymmetry is worth weighing: an EN cache of ciphertext creates no
 new exposure, while an FE plaintext cache does.
 
-**Two things narrow it** (Asserted, Bob, 2026-08-17). **The FE is a cache** — that is what it is for,
-beyond authorization and coordination. But **an extent is usually read once**, and a cache of
+**Part of it is already settled: an EN will have a small cache of recently read data** (Asserted,
+Bob, 2026-08-17) — the top row of the table above, in miniature. It holds blocks as stored, so it
+needs no keys, adds no plaintext location, and a hit also skips the auth-code check of §9.1.1. What
+remains open is the *large* cache for hot objects, which is a different question from a small one for
+recently read blocks.
+
+**Two things narrow that** (Asserted, Bob, 2026-08-17). **The FE is a cache** — that is what it is
+for, beyond authorization and coordination. But **an extent is usually read once**, and a cache of
 read-once data is only a cost, so it is *unclear that the FE is the right cache for hot extents*
 specifically. What the FE is unambiguously the right cache for is what §17.13 already does with it:
 **where records live**, which is metadata, is small, and is asked about repeatedly even when the bytes
