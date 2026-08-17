@@ -429,6 +429,10 @@ impl EN {
 
 /// Counting instances towards a quorum. Separate from what to do about it, so the
 /// arithmetic can be tested without a connection to answer down.
+///
+/// This is an ordinary quorum, the same as Paxos and Raft: nothing here is new, and
+/// the order statistic a failure-mode seal uses is the one Raft advances its commit
+/// index by.
 struct Counting {
     /// Instances asked besides the primary.
     others: usize,

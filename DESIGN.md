@@ -5294,6 +5294,19 @@ have to overlap or two disjoint sets could each hold an append the other never s
 two, while **2 of 4 do not overlap at all** and 3 of 6 do not either. §8.1.1 argues this; the config
 now enforces it rather than trusting whoever edits the file.
 
+**And none of this is new: it is a quorum read, the same algorithm as Paxos and Raft** (Asserted, Bob,
+2026-08-17). The order statistic is the giveaway — **Raft advances its commit index to the largest
+index a majority of its followers have matched**, which sorted is the same (*I* − *Q* + 1)-th smallest
+this rule takes (Cited: [Raft](https://raft.github.io/raft.pdf)). The overlap requirement is Paxos's
+intersection argument, and "a new primary polls a quorum and sees everything committed" is leader
+election with the log names changed.
+
+That is worth stating rather than glossing, for two reasons. A reader who recognizes the mechanism can
+stop looking for what is different about it — **nothing is** — and inherit its failure modes and its
+proofs instead of re-deriving them. And where DeLawson *does* differ from a consensus log, the
+difference is not in the quorum but in what is being agreed: byte ranges in an extent rather than
+entries in a log, so the "index" is a length and the record rules of §8.2.3 sit on top of it.
+
 #### 8.1.7.1 Why the second-smallest is the right statistic
 
 Sort the accepted lengths of the four instances, *a* ≤ *b* ≤ *c* ≤ *d*. Discarding the smallest and
