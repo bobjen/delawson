@@ -166,6 +166,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "delawson-logs"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "delawson-common",
+]
+
+[[package]]
 name = "delawson-sn"
 version = "0.0.1"
 dependencies = [

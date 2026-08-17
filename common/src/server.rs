@@ -126,7 +126,8 @@ pub trait Service: Send + Sync + Sized + 'static {
     /// Whether to answer this operation on the connection's read loop instead of
     /// handing it to a worker. Only for work too small to be worth a queue hop.
     fn inline(&self, op: Op) -> bool {
-        matches!(op, Op::Ping | Op::Status | Op::Shutdown | Op::Histogram)
+        // Reading log files is neither cheap nor urgent, so it goes to a worker.
+        matches!(op, Op::Ping | Op::Status | Op::Shutdown | Op::Sites)
     }
 
     /// Lines appended to the common `status` reply.
@@ -356,12 +357,12 @@ pub fn serve(process: Arc<Process>, service: Arc<impl Service>) -> Result<()> {
     let address = listener.local_addr()?;
     let workers = if service.workers() == 0 { cores() } else { service.workers() };
     let pool = Arc::new(Pool::new(workers));
-    logn!("listening on {address} with {workers} workers");
+    logn!("listening", "address {address} workers {workers}");
 
     // KS cannot register with itself, and needs no one's permission to serve.
     if process.cluster.fixed_address(process.identity()).is_none() {
         process.register()?;
-        logn!("registered with KS at {}", process.cluster.ks.address);
+        logn!("registered with KS", "at {}", process.cluster.ks.address);
     }
 
     // Ready last: a process is ready when it can be found, not merely when it is
@@ -379,7 +380,7 @@ pub fn serve(process: Arc<Process>, service: Arc<impl Service>) -> Result<()> {
         let stream = match connection {
             Ok(stream) => stream,
             Err(e) => {
-                logw!("accept failed: {e}");
+                logw!("accept failed", "{e}");
                 continue;
             }
         };
@@ -388,7 +389,7 @@ pub fn serve(process: Arc<Process>, service: Arc<impl Service>) -> Result<()> {
         let pool = Arc::clone(&pool);
         std::thread::spawn(move || {
             if let Err(e) = read_loop(&process, &service, &pool, stream) {
-                logi!("connection ended: {e}");
+                logi!("connection ended", "{e}");
             }
         });
     }
@@ -429,7 +430,9 @@ fn read_loop<S: Service>(
             && out.batch.get().is_none()
         {
             out.hand_to_sender();
-            logn!("switched to a batching sender: an answer will not come from the read loop");
+            logn!(
+                "switched to a batching sender because an answer will not come from the read loop"
+            );
             process.senders.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -484,14 +487,18 @@ impl Reply {
         let status = response.status;
         let response = Response { id: self.id, ..response };
         if let Err(e) = self.out.put(&response, self.settled) {
-            logw!("could not answer {}: {e}", self.op);
+            logw!("could not answer", "op {},{e}", self.op);
         }
         if let Some(started) = self.started {
+            // Low-cardinality values first, then the subject, then the duration:
+            // a histogram groups on a prefix, so the order of the values is what
+            // decides which groupings are available at all.
             logi!(
-                "answered, op {} status {status} in {} us about {}",
+                "answered",
+                "op {},status {status},about {},us {}",
                 self.op,
-                started.elapsed().as_micros(),
-                self.about
+                self.about,
+                started.elapsed().as_micros()
             );
         }
     }
@@ -669,7 +676,8 @@ fn answer_here<S: Service>(
         Op::Ping => reply.send(ping(process, &request)),
         Op::Status => reply.send(Response::text(status(process, &**service))),
         Op::Shutdown => reply.send(Response::ok()),
-        Op::Histogram => reply.send(Response::text(
+        Op::LogHistogram | Op::LogGrep | Op::LogLines => reply.send(read_logs(process, &request)),
+        Op::Sites => reply.send(Response::text(
             crate::log::histogram()
                 .iter()
                 .map(|(count, stride, where_)| {
@@ -688,6 +696,57 @@ fn answer_here<S: Service>(
     }
 }
 
+/// Answer one of the three questions about this process's own log files. It runs
+/// here because the machine holding the files runs signed code, and this process
+/// is already signed and already there — the standalone `logs` tool is the same
+/// library, for when the process is not answering.
+fn read_logs(process: &Process, request: &Request) -> Response {
+    let text = |n: usize| match request.args.get(n) {
+        Some(Arg::Text(text)) => text.as_str(),
+        _ => "",
+    };
+    let number = |n: usize, default: usize| match request.args.get(n) {
+        Some(Arg::Number(number)) => *number as usize,
+        _ => default,
+    };
+
+    // The info log by name, so a reader can ask for the long-lived one.
+    let which = match text(0) {
+        "info" => format!("{}-info", process.identity().to_lowercase()),
+        _ => process.identity().to_lowercase(),
+    };
+    let dir = crate::log::dir_of(&process.run_dir);
+    // Everything this process has said is on its way to those files; without
+    // this, the last few hundred lines are missing from every answer.
+    crate::log::flush();
+    // All of it unless the caller says otherwise: reading a log takes as long as
+    // it takes, and doing it serially is how it stays out of the way of the work.
+    let budget = match request.args.last() {
+        Some(Arg::Number(budget)) if request.args.len() > 3 => *budget,
+        _ => u64::MAX,
+    };
+    let logs = match crate::logread::Logs::open(&dir, &which, budget) {
+        Ok(logs) => logs,
+        Err(e) => return Response::error(Status::Internal, e.to_string()),
+    };
+
+    let read = match request.op {
+        Op::LogHistogram => logs.histogram(number(1, 1), number(2, 40)),
+        Op::LogGrep => logs.grep(text(1), number(2, 100)),
+        _ => logs.range(text(1), text(2), number(3, 100)),
+    };
+    match read {
+        Err(e) => Response::error(Status::Internal, e.to_string()),
+        // The count of lines scanned comes back too: an answer with nothing in it
+        // means something different if it read nothing than if it read millions.
+        Ok((seen, lines)) => Response {
+            id: 0,
+            status: Status::Ok,
+            args: vec![Arg::Number(seen), Arg::Text(lines.join("\n"))],
+        },
+    }
+}
+
 /// A ping asks for a reply of a given size, so that message size is a knob and
 /// not a constant. Bare, it answers in words.
 fn ping(process: &Process, request: &Request) -> Response {
@@ -701,9 +760,9 @@ fn ping(process: &Process, request: &Request) -> Response {
     if size == 0 {
         // At debug, so it is off by default: a line per ping costs several times
         // what the ping does. Turn the level down to reproduce that measurement.
-        logd!("pinged, reply size {size}");
+        logd!("pinged", "reply size {size}");
         // And once a second regardless, which says the same thing for nothing.
-        logsec!("pinged, reply size {size}");
+        logsec!("pinged", "reply size {size}");
         return Response::text(format!("{} is alive", process.identity()));
     }
     // Random padding is the honest default; the repetitive kind exists to give

@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod log;
+pub mod logread;
 pub mod peer;
 pub mod placement;
 pub mod random;

@@ -1,0 +1,15 @@
+[package]
+name = "delawson-logs"
+description = "Read a process's log files where they are: histogram, grep, or a range of lines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "logs"
+path = "src/main.rs"
+
+[dependencies]
+delawson-common.workspace = true
+clap.workspace = true

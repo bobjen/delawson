@@ -95,7 +95,7 @@ impl Service for DN {
     fn inline(&self, op: Op) -> bool {
         matches!(
             op,
-            Op::ObjectInfo | Op::BatchInfo | Op::Ping | Op::Status | Op::Shutdown | Op::Histogram
+            Op::ObjectInfo | Op::BatchInfo | Op::Ping | Op::Status | Op::Shutdown | Op::Sites
         )
     }
 
@@ -229,7 +229,7 @@ impl DN {
             reply.send(say(count));
         });
         if let Err(e) = asked {
-            logw!("could not reach {sn}: {e}");
+            logw!("could not reach an SN", "sn {sn},{e}");
         }
     }
 

@@ -60,6 +60,11 @@ key = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
 # line that must always be in both, whatever its rate.
 [logging]
 level = "info"
+
+# Store the files compressed: nothing reads them except the log tool, so plain
+# text buys nothing, and lines compress several fold — which is retention for the
+# same bytes. Turn it off to read a file with ordinary tools.
+compress = true
 size = 67108864
 full_files = 8
 info_files = 40

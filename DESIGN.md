@@ -9196,11 +9196,15 @@ span in the info log, which is the point of having two.
 A line is:
 
 ```
-n,2026-08-16 23:31:32.538104,pid=64967,tid=64967,file=common/src/server.rs,line=255,listening on 127.0.0.1:9601
+n,2026-08-16 23:31:32.538104,pid=64967,tid=64967,file=common/src/server.rs,line=360,listening,address 127.0.0.1:9601 workers 16
 ```
 
 Level as one letter, the time to the microsecond in UTC, the process and kernel thread ids, where in
-the source it came from, and the message. **The identity, host and version are written at the top of
+the source it came from, and then **two messages: a constant and the values**
+(Asserted, Bob, 2026-08-16). The constant is what a histogram groups on, exactly, so grouping needs
+no guess about where the words stop and the values start — which is what grouping on a prefix of a
+rendered message could never do. `logi!("answered", "op {} status {} …", …)`, and the constant may not
+contain a comma, since it is a field. **The identity, host and version are written at the top of
 every file** rather than on every line, so a rotated file still says what it is. **Kernel thread id
 rather than a name**, so a line matches what `perf`, `gdb` and `top` say.
 
@@ -9209,9 +9213,10 @@ Only code serving a request has one; a compaction, a sync loop or a repair does 
 field would be empty for most of what a storage system does. Where a line belongs to a request, the
 id goes in the message with the rest of that line's values.
 
-**Write the words first and the values last** — `appending to %s length %s`, not
-`%s: appending, len %s`. The histogram is keyed on file and line and shows the start of the message,
-so a line that begins with its variables is unreadable in aggregate.
+**Separate the values with commas as well**, and order them low-cardinality first. A reader can then
+group on the first few of them *exactly*, so **nothing about a histogram needs truncating**
+(Asserted, Bob, 2026-08-16): the constant is whole, and a value is either in the grouping or it is
+not. A count of characters was what this replaced.
 
 **How much reaches the info log is a rate, not a rule about levels.** A running histogram counts
 each site; rare sites pass through whole, and the busy ones are sampled at a stride recomputed so
@@ -9417,6 +9422,54 @@ high enough to expose it. They are worth stating because they are the same mista
 3. **One connection between two processes is one read loop on the far side.** However many workers a
    tier has, it cannot outrun a single thread reading its requests. Processes now keep a fan of
    connections to each peer, and the last plateau went with it.
+
+### 17.5h Reading the logs without logging in
+
+A log nobody can read is a log nobody keeps. But the machines hold signed code
+only, so reading them is not a matter of shipping a script — it needs deciding
+who runs the reader. **Both, and one implementation** (Asserted, Bob, 2026-08-16):
+
+| Reader | Answers | Good for |
+|---|---|---|
+| The process itself, over three operations | its own files | the ordinary case, no deployment, already signed and already there |
+| `logs`, one standalone signed binary | any files it is pointed at | a process that has died, is wedged, or is too busy to answer — which is when logs are most wanted |
+
+Both are the same library, so neither is a second implementation of anything. **Three answers are
+enough to stop anyone wanting a shell**:
+
+- **histogram** — what this process is mostly saying,
+- **grep** — whole lines mentioning a thing,
+- **lines** — a range by time, or the last few.
+
+The histogram row is `000000123,i,file,line,message prefix`, sorted by frequency — and it sorts by
+plain text order because the count is zero-padded, which is why it is. **`width` is the whole row,
+so it is also what decides how much of the message is grouped on**, which is the knob that matters:
+
+```
+values 0:  000268175,i,common/src/server.rs,496,answered
+           000000050,n,common/src/server.rs,433,switched to a batching sender because an answer will not come from the read loop
+values 1:  000265175,i,common/src/server.rs,496,answered,op object-info
+           000003000,i,common/src/server.rs,496,answered,op batch-create
+values 2:  000265175,i,common/src/server.rs,496,answered,op object-info,status ok
+```
+
+**Nothing is cut at any setting.** Zero values is a row per logging site — "what is this process
+mostly saying" in its purest form. One is a row per operation, two adds the status, and a setting that
+reached the object name would be a row per object, which is useless and is now the reader's choice
+rather than a limit of the format.
+
+**Reading is deliberately serial and takes as long as it takes** (Asserted, Bob, 2026-08-16). It is
+competing with a server for the same CPU and the same disk, so it reads one file at a time and one
+block at a time, holds only what the answer needs, and the caller waits — the client allows half an
+hour. Nothing about it is parallel, and that is the design rather than an omission.
+
+**And the files are compressed**, which follows from nobody reading them directly: the only consumer
+is a tool that can decompress. Each flush is one independent lz4 block, so a torn last block from a
+process that died ends the walk instead of failing the answer, and the extension says which a file
+is — `.logz` compressed, `.log` not. **Measured: 402,614 lines, about 50 MB of text, in 8.0 MB —
+6.3x.** That is 28 MB/s of lines becoming 4.4 MB/s on the disk, and it turns §17.5g.1's 18 seconds of
+full log into a couple of minutes for the same bytes. It does not solve retention by itself; it moves
+it by a factor of six.
 
 ### 17.6 The harness reports what it cannot enforce
 

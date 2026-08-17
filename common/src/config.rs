@@ -207,6 +207,8 @@ impl Messaging {
 pub struct Logging {
     /// debug, info, notice, warning, error.
     pub level: String,
+    /// Store the files compressed, since the log tool is what reads them.
+    pub compress: bool,
     /// Bytes per file, before the next one is started.
     pub size: u64,
     /// Files kept of the full log, which carries every line. Size times count is
@@ -228,6 +230,7 @@ impl Logging {
             level: crate::log::Level::parse(&self.level).ok_or_else(|| {
                 Error::new(format!("logging.level {:?} is not a level", self.level))
             })?,
+            compress: self.compress,
             size: self.size,
             full_files: self.full_files,
             info_files: self.info_files,
@@ -569,7 +572,7 @@ mod tests {
         rings = { members = 1 }
         messaging = { send = "direct", encrypt = false, compress = "none", compress_min = 256, compress_sample = 4096, peer_conns = 2, key = "0f1e2d3c4b5a69788796a5b4c3d2e1f0" }
         timeouts = { request_ms = 1000, shutdown_grace_ms = 1000 }
-        logging = { level = "info", size = 1024, full_files = 2, info_files = 2, info_share = 0.1, recount = 16 }
+        logging = { level = "info", compress = false, size = 1024, full_files = 2, info_files = 2, info_share = 0.1, recount = 16 }
     "#;
 
     fn parse(roster: &str) -> Result<ClusterConfig> {

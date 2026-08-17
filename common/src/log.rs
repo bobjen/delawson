@@ -15,9 +15,17 @@
 //! Every macro invocation gets its own `Site`, so counting a line is one relaxed
 //! increment and deciding where it goes is one relaxed load.
 //!
-//! Write messages with the words first and the values last — `appending to %s
-//! length %s`, not `%s: appending, len %s` — because the histogram is read by
-//! the beginning of the line.
+//! **A line is two messages: a constant and the values.** The constant is what the
+//! histogram groups on, exactly, so grouping needs no guess about where the words
+//! stop and the values start. Put the values in the order that makes their
+//! prefixes worth grouping on too — the low-cardinality ones first.
+//!
+//! The constant is a field of a comma-separated line, so it may not contain a
+//! comma. Say "because" rather than ", ".
+//!
+//! Separate the values with commas too — `"op {},status {}"` — so a reader can
+//! group on the first few of them exactly. Nothing then needs truncating: the
+//! constant is whole, and a value is either in the grouping or not.
 
 use crate::{Context, Result};
 use std::fmt::Write as _;
@@ -97,6 +105,11 @@ static SINCE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub struct Logging {
     pub level: Level,
+    /// Store the files compressed. Nothing reads them without the log tool, so
+    /// there is nothing left for plain text to be convenient for — and lines
+    /// compress several fold, which is the difference between minutes and hours
+    /// of retention for the same bytes.
+    pub compress: bool,
     pub size: u64,
     pub full_files: usize,
     pub info_files: usize,
@@ -148,8 +161,16 @@ pub fn open(dir: &Path, identity: &str, config: Logging) -> Result<()> {
         host(),
         env!("CARGO_PKG_VERSION"),
     );
-    let full = Rotating::new(dir, &name, config.size, config.full_files, header.clone())?;
-    let info = Rotating::new(dir, &format!("{name}-info"), config.size, config.info_files, header)?;
+    let packed = config.compress;
+    let full = Rotating::new(dir, &name, config.size, config.full_files, header.clone(), packed)?;
+    let info = Rotating::new(
+        dir,
+        &format!("{name}-info"),
+        config.size,
+        config.info_files,
+        header,
+        packed,
+    )?;
     FLOOR.store(config.level as u8, Ordering::Relaxed);
     let _ = LOGGER.set(Logger { config, full: Mutex::new(full), info: Mutex::new(info) });
 
@@ -207,7 +228,7 @@ fn now_secs() -> u64 {
 /// The suppressed path is a load and a compare, with no atomic write — counting
 /// what was skipped would put every thread onto one cache line, which is the cost
 /// this exists to avoid.
-pub fn sample(site: &'static Site, level: Level, message: std::fmt::Arguments) {
+pub fn sample(site: &'static Site, level: Level, what: &'static str, values: std::fmt::Arguments) {
     let now = match SECOND.load(Ordering::Relaxed) {
         // Nothing has started the clock, so this line pays for it once.
         0 => {
@@ -224,11 +245,14 @@ pub fn sample(site: &'static Site, level: Level, message: std::fmt::Arguments) {
     if site.said.compare_exchange(said, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
         return;
     }
-    write(site, level, message);
+    write(site, level, what, values);
 }
 
 /// Write one line. Called by the macros, which supply the site.
-pub fn write(site: &'static Site, level: Level, message: std::fmt::Arguments) {
+pub fn write(site: &'static Site, level: Level, what: &'static str, values: std::fmt::Arguments) {
+    // The constant is a field of a comma-separated line, so it cannot contain
+    // one; this is checked where it is cheap to check rather than trusted.
+    debug_assert!(!what.contains(','), "a log constant with a comma in it: {what:?}");
     let stride = site.stride.load(Ordering::Relaxed);
     let seen = site.count.fetch_add(1, Ordering::Relaxed);
     if !site.listed.swap(true, Ordering::Relaxed) {
@@ -240,21 +264,21 @@ pub fn write(site: &'static Site, level: Level, message: std::fmt::Arguments) {
         line.clear();
         let pid = PID.get_or_init(std::process::id);
         let tid = TID.with(|tid| *tid);
+        // The constant, then the values: two fields, so a reader can group on the
+        // first without cutting into the second.
         let _ = write!(
             line,
-            "{},{},pid={pid},tid={tid},file={},line={},",
+            "{},{},pid={pid},tid={tid},file={},line={},{what},",
             level.letter(),
             stamp(),
             site.file,
             site.line
         );
-        let text_at = line.len();
-        let _ = line.write_fmt(message);
+        let _ = line.write_fmt(values);
         line.push('\n');
 
         if site.text.get().is_none() {
-            let end = line[text_at..].char_indices().map(|(i, _)| i).nth(60).unwrap_or(0);
-            let _ = site.text.set(line[text_at..text_at + end].to_string());
+            let _ = site.text.set(what.to_string());
         }
 
         match LOGGER.get() {
@@ -371,10 +395,21 @@ struct Rotating {
     /// one of them, and a line alone does not say which process or machine it
     /// came from.
     header: String,
+    /// Lines waiting to be written. With compression they are a block; without,
+    /// they are just the next write.
+    pending: Vec<u8>,
+    packed: bool,
 }
 
 impl Rotating {
-    fn new(dir: &Path, name: &str, size: u64, keep: usize, header: String) -> Result<Rotating> {
+    fn new(
+        dir: &Path,
+        name: &str,
+        size: u64,
+        keep: usize,
+        header: String,
+        packed: bool,
+    ) -> Result<Rotating> {
         std::fs::create_dir_all(dir).context(dir.display())?;
         let mut rotating = Rotating {
             dir: dir.to_path_buf(),
@@ -385,9 +420,11 @@ impl Rotating {
             written: 0,
             file: BufWriter::with_capacity(
                 BUFFER_BYTES,
-                File::create(path(dir, name, 0)).context(dir.display())?,
+                File::create(path(dir, name, 0, packed)).context(dir.display())?,
             ),
             header,
+            pending: Vec::with_capacity(BUFFER_BYTES),
+            packed,
         };
         let header = rotating.header.clone();
         let _ = rotating.write(header.as_bytes(), true);
@@ -395,18 +432,35 @@ impl Rotating {
     }
 
     fn write(&mut self, bytes: &[u8], urgent: bool) -> std::io::Result<()> {
-        if self.written + bytes.len() as u64 > self.size {
-            self.roll()?;
-        }
-        self.file.write_all(bytes)?;
-        self.written += bytes.len() as u64;
-        if urgent {
-            self.file.flush()?;
+        self.pending.extend_from_slice(bytes);
+        if urgent || self.pending.len() >= BUFFER_BYTES {
+            self.flush()?;
         }
         Ok(())
     }
 
+    /// Put what is pending into the file, as a compressed block or as it stands.
     fn flush(&mut self) -> std::io::Result<()> {
+        if self.pending.is_empty() {
+            return self.file.flush();
+        }
+        // Taken out of `self` so the file can be rolled while it is held.
+        let mut block = std::mem::take(&mut self.pending);
+        if self.packed {
+            let mut packed = Vec::new();
+            // A block too large to compress goes as it is rather than being lost.
+            if crate::logread::pack(&block, &mut packed).is_ok() {
+                block = packed;
+            }
+        }
+
+        if self.written + block.len() as u64 > self.size {
+            self.roll()?;
+        }
+        self.file.write_all(&block)?;
+        self.written += block.len() as u64;
+        block.clear();
+        self.pending = block;
         self.file.flush()
     }
 
@@ -415,14 +469,24 @@ impl Rotating {
         self.seq += 1;
         self.file = BufWriter::with_capacity(
             BUFFER_BYTES,
-            File::create(path(&self.dir, &self.name, self.seq))?,
+            File::create(path(&self.dir, &self.name, self.seq, self.packed))?,
         );
         self.written = 0;
+        // The header goes at the top of the new file as its own block.
         let header = self.header.clone();
-        self.file.write_all(header.as_bytes())?;
-        self.written = header.len() as u64;
+        let mut first = Vec::new();
+        let bytes: &[u8] = if self.packed {
+            match crate::logread::pack(header.as_bytes(), &mut first) {
+                Ok(()) => &first,
+                Err(_) => header.as_bytes(),
+            }
+        } else {
+            header.as_bytes()
+        };
+        self.file.write_all(bytes)?;
+        self.written = bytes.len() as u64;
         if let Some(gone) = self.seq.checked_sub(self.keep) {
-            let _ = std::fs::remove_file(path(&self.dir, &self.name, gone));
+            let _ = std::fs::remove_file(path(&self.dir, &self.name, gone, self.packed));
         }
         Ok(())
     }
@@ -439,8 +503,42 @@ fn host() -> String {
     String::from_utf8_lossy(&name[..end]).into_owned()
 }
 
-fn path(dir: &Path, name: &str, seq: usize) -> PathBuf {
-    dir.join(format!("{name}-{seq:07}.log"))
+/// Every file of one log, oldest first. The names carry the order, so this is a
+/// sort rather than a walk of anything's state.
+pub fn files(dir: &Path, name: &str) -> crate::Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    let listing = match std::fs::read_dir(dir) {
+        Ok(listing) => listing,
+        // A process that has logged nothing has no directory, which is not an
+        // error to ask about.
+        Err(_) => return Ok(found),
+    };
+    for entry in listing.flatten() {
+        let path = entry.path();
+        let file = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        // `<name>-0000000.log` or `.logz`, and not `<name>-info-0000000.log` when
+        // asked for `<name>`.
+        if let Some(tail) = file.strip_prefix(&format!("{name}-")) {
+            let numbered = tail.split('.').next().is_some_and(|n| n.len() == 7);
+            if numbered && (tail.ends_with(".log") || tail.ends_with(".logz")) {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Where a process's logs are, given its run directory.
+pub fn dir_of(run_dir: &Path) -> PathBuf {
+    run_dir.join("logs")
+}
+
+fn path(dir: &Path, name: &str, seq: usize, packed: bool) -> PathBuf {
+    // The extension says which, because a compressed file that claims to be text
+    // is a trap for whoever tries to read it with the wrong thing.
+    let kind = if packed { "logz" } else { "log" };
+    dir.join(format!("{name}-{seq:07}.{kind}"))
 }
 
 /// `2026-08-16 15:04:05.123`, from the epoch, without pulling in a calendar.
@@ -474,12 +572,23 @@ fn civil(days: i64) -> (i64, u32, u32) {
 
 #[macro_export]
 macro_rules! logd {
-    ($($arg:tt)*) => {{
+    ($what:literal) => {{
+        if $crate::log::enabled($crate::log::Level::Debug) {
+            static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
+            $crate::log::write(&SITE, $crate::log::Level::Debug, $what, format_args!(""));
+        }
+    }};
+    ($what:literal, $($arg:tt)*) => {{
         // The floor is tested first, so a filtered line does not even evaluate
         // its arguments.
         if $crate::log::enabled($crate::log::Level::Debug) {
             static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
-            $crate::log::write(&SITE, $crate::log::Level::Debug, format_args!($($arg)*));
+            $crate::log::write(
+                &SITE,
+                $crate::log::Level::Debug,
+                $what,
+                format_args!($($arg)*),
+            );
         }
     }};
 }
@@ -489,58 +598,113 @@ macro_rules! logd {
 /// second is the one written, as a sample of what the rest would have said.
 #[macro_export]
 macro_rules! logsec {
-    ($($arg:tt)*) => {{
+    ($what:literal) => {{
         if $crate::log::enabled($crate::log::Level::Notice) {
             static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
-            $crate::log::sample(&SITE, $crate::log::Level::Notice, format_args!($($arg)*));
+            $crate::log::sample(&SITE, $crate::log::Level::Notice, $what, format_args!(""));
+        }
+    }};
+    ($what:literal, $($arg:tt)*) => {{
+        if $crate::log::enabled($crate::log::Level::Notice) {
+            static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
+            $crate::log::sample(
+                &SITE,
+                $crate::log::Level::Notice,
+                $what,
+                format_args!($($arg)*),
+            );
         }
     }};
 }
 
 #[macro_export]
 macro_rules! logi {
-    ($($arg:tt)*) => {{
+    ($what:literal) => {{
+        if $crate::log::enabled($crate::log::Level::Info) {
+            static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
+            $crate::log::write(&SITE, $crate::log::Level::Info, $what, format_args!(""));
+        }
+    }};
+    ($what:literal, $($arg:tt)*) => {{
         // The floor is tested first, so a filtered line does not even evaluate
         // its arguments.
         if $crate::log::enabled($crate::log::Level::Info) {
             static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
-            $crate::log::write(&SITE, $crate::log::Level::Info, format_args!($($arg)*));
+            $crate::log::write(
+                &SITE,
+                $crate::log::Level::Info,
+                $what,
+                format_args!($($arg)*),
+            );
         }
     }};
 }
 
 #[macro_export]
 macro_rules! logn {
-    ($($arg:tt)*) => {{
+    ($what:literal) => {{
+        if $crate::log::enabled($crate::log::Level::Notice) {
+            static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
+            $crate::log::write(&SITE, $crate::log::Level::Notice, $what, format_args!(""));
+        }
+    }};
+    ($what:literal, $($arg:tt)*) => {{
         // The floor is tested first, so a filtered line does not even evaluate
         // its arguments.
         if $crate::log::enabled($crate::log::Level::Notice) {
             static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
-            $crate::log::write(&SITE, $crate::log::Level::Notice, format_args!($($arg)*));
+            $crate::log::write(
+                &SITE,
+                $crate::log::Level::Notice,
+                $what,
+                format_args!($($arg)*),
+            );
         }
     }};
 }
 
 #[macro_export]
 macro_rules! logw {
-    ($($arg:tt)*) => {{
+    ($what:literal) => {{
+        if $crate::log::enabled($crate::log::Level::Warning) {
+            static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
+            $crate::log::write(&SITE, $crate::log::Level::Warning, $what, format_args!(""));
+        }
+    }};
+    ($what:literal, $($arg:tt)*) => {{
         // The floor is tested first, so a filtered line does not even evaluate
         // its arguments.
         if $crate::log::enabled($crate::log::Level::Warning) {
             static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
-            $crate::log::write(&SITE, $crate::log::Level::Warning, format_args!($($arg)*));
+            $crate::log::write(
+                &SITE,
+                $crate::log::Level::Warning,
+                $what,
+                format_args!($($arg)*),
+            );
         }
     }};
 }
 
 #[macro_export]
 macro_rules! loge {
-    ($($arg:tt)*) => {{
+    ($what:literal) => {{
+        if $crate::log::enabled($crate::log::Level::Error) {
+            static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
+            $crate::log::write(&SITE, $crate::log::Level::Error, $what, format_args!(""));
+        }
+    }};
+    ($what:literal, $($arg:tt)*) => {{
         // The floor is tested first, so a filtered line does not even evaluate
         // its arguments.
         if $crate::log::enabled($crate::log::Level::Error) {
             static SITE: $crate::log::Site = $crate::log::Site::new(file!(), line!());
-            $crate::log::write(&SITE, $crate::log::Level::Error, format_args!($($arg)*));
+            $crate::log::write(
+                &SITE,
+                $crate::log::Level::Error,
+                $what,
+                format_args!($($arg)*),
+            );
         }
     }};
 }
@@ -562,7 +726,7 @@ mod tests {
     fn rotation_keeps_the_last_few() {
         let dir = std::env::temp_dir().join(format!("laws-log-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut rotating = Rotating::new(&dir, "test", 64, 3, String::new()).unwrap();
+        let mut rotating = Rotating::new(&dir, "test", 64, 3, String::new(), false).unwrap();
         for n in 0..40 {
             rotating.write(format!("line {n} of some length\n").as_bytes(), true).unwrap();
         }
@@ -594,7 +758,7 @@ mod cost {
         let start = std::time::Instant::now();
         for n in 0..rounds {
             sink = sink.wrapping_add(n);
-            crate::logsec!("a line with a value {n} and another {sink}");
+            crate::logsec!("a line", "value {n} another {sink}");
         }
         let each = start.elapsed().as_secs_f64() * 1e9 / rounds as f64;
         println!("rate limited: {each:.2} ns per line (sink {sink})");
@@ -611,7 +775,7 @@ mod cost {
         let start = std::time::Instant::now();
         for n in 0..rounds {
             sink = sink.wrapping_add(n);
-            crate::logd!("a line with a value {n} and another {sink}");
+            crate::logd!("a line", "value {n} another {sink}");
         }
         let each = start.elapsed().as_secs_f64() * 1e9 / rounds as f64;
         println!("filtered: {each:.2} ns per line (sink {sink})");

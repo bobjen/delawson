@@ -46,7 +46,7 @@ impl Service for Ks {
             Op::Registry => registry::response(self.peers.lock().expect("peers").values().cloned()),
 
             Op::Unlock | Op::SnMasterKey | Op::RotateMasterKey => {
-                logn!("asked for {}", request.op);
+                logn!("asked for a key", "op {}", request.op);
                 if !self.unlocked.load(Ordering::SeqCst) && request.op != Op::Unlock {
                     return Response::error(Status::Locked, "KS is locked");
                 }
@@ -59,7 +59,7 @@ impl Service for Ks {
     fn inline(&self, op: Op) -> bool {
         match op {
             Op::Ping => self.config.inline_ping,
-            Op::Status | Op::Shutdown | Op::Histogram => true,
+            Op::Status | Op::Shutdown | Op::Sites => true,
             // A registry lookup takes a lock, so it goes to a worker.
             _ => false,
         }
@@ -98,7 +98,7 @@ impl Ks {
                 format!("{} is a {} in the roster, not a {}", peer.identity, entry.kind, peer.kind),
             );
         }
-        logn!("registered {} at {}", peer.identity, peer.address);
+        logn!("registered a peer", "identity {},at {}", peer.identity, peer.address);
         self.peers.lock().expect("peers").insert(peer.identity.clone(), peer);
         Response::ok()
     }
@@ -118,7 +118,7 @@ fn main() {
     let result = server::main(|process| {
         let config = KsConfig::load(&process.config.service_config)?;
         if !config.require_unlock {
-            logn!("no unlock ceremony required: this is a test configuration");
+            logn!("no unlock ceremony required because this is a test configuration");
         }
         let unlocked = AtomicBool::new(!config.require_unlock);
         Ok(Ks { config, unlocked, peers: Mutex::new(BTreeMap::new()) })

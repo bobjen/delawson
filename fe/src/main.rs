@@ -66,8 +66,7 @@ impl Service for FE {
 
     /// Issuing a forward is a write, not work, so it happens on the read loop.
     fn inline(&self, op: Op) -> bool {
-        FORWARDED.contains(&op)
-            || matches!(op, Op::Ping | Op::Status | Op::Shutdown | Op::Histogram)
+        FORWARDED.contains(&op) || matches!(op, Op::Ping | Op::Status | Op::Shutdown | Op::Sites)
     }
 
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Request, mut reply: Reply) {
@@ -81,11 +80,11 @@ impl Service for FE {
         };
         // Which DN it went to belongs on the line, since that is the hop a
         // live-site argument is about.
-        reply.about(format_args!("{} dn {dn}", first(&request)));
+        reply.about(format_args!("{},dn {dn}", first(&request)));
         // The answer is whatever the DN says, since FE adds nothing to it yet.
         if let Err(e) = process.ask(&dn, &request, move |answer| reply.send(answer)) {
             // The reply went into the closure, so this needs its own.
-            logw!("could not reach {dn}: {e}");
+            logw!("could not reach a DN", "dn {dn},{e}");
         }
     }
 

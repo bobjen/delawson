@@ -73,7 +73,12 @@ ops! {
     Ping = 0x0001, "ping";
     Status = 0x0002, "status";
     Shutdown = 0x0003, "shutdown";
-    Histogram = 0x0004, "histogram";
+    // Sites is the live counters, per logging site in the code; the three below
+    // read what was written to the files.
+    Sites = 0x0004, "sites";
+    LogHistogram = 0x0005, "log-histogram";
+    LogGrep = 0x0006, "log-grep";
+    LogLines = 0x0007, "log-lines";
 
     // KS: the registry, then the keys.
     Register = 0x0110, "register";

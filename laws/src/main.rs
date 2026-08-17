@@ -121,8 +121,39 @@ enum Cmd {
     Services,
     /// Every process KS knows about, with the port it registered.
     Registry,
-    /// What a process logs, by site, busiest first.
-    Histogram,
+    /// What a process logs, by site, busiest first: the live counters.
+    Sites,
+    /// A histogram of the lines in a process's log files, most frequent first.
+    LogHistogram {
+        /// How many of a line's values join the grouping. Zero is a row per
+        /// logging site; one is usually a row per operation.
+        #[arg(long, default_value_t = 1)]
+        values: usize,
+        #[arg(long, default_value_t = 40)]
+        rows: usize,
+        /// Which log: the full one, or "info" for the one reaching further back.
+        #[arg(long, default_value = "full")]
+        which: String,
+    },
+    /// Whole log lines containing something.
+    LogGrep {
+        what: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, default_value = "full")]
+        which: String,
+    },
+    /// Log lines between two times, or the last few.
+    LogLines {
+        #[arg(long, default_value = "")]
+        from: String,
+        #[arg(long, default_value = "")]
+        to: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, default_value = "full")]
+        which: String,
+    },
     /// KS's fixed address and the port base, which is what a starter needs.
     Bootstrap,
     /// Time the random generator that fills ping padding, single-threaded, so
@@ -329,7 +360,12 @@ fn main() {
 
 fn run(cli: Cli) -> Result<()> {
     let cluster = ClusterConfig::load(&cli.config)?;
-    let timeout = Duration::from_millis(cluster.timeouts.request_ms);
+    let mut timeout = Duration::from_millis(cluster.timeouts.request_ms);
+    // Reading log files is not an ordinary request: it can take minutes, being
+    // serial on purpose so as not to compete with the work. So it gets minutes.
+    if matches!(cli.cmd, Cmd::LogHistogram { .. } | Cmd::LogGrep { .. } | Cmd::LogLines { .. }) {
+        timeout = timeout.max(Duration::from_secs(1800));
+    }
 
     match &cli.cmd {
         Cmd::Services => {
@@ -338,11 +374,11 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Histogram => {
+        Cmd::Sites => {
             let target = resolve(&cluster, &cli, ServiceKind::Ks)?;
             report(
                 &target,
-                &open(&target, timeout, &cluster.messaging)?.call(&Request::new(Op::Histogram))?,
+                &open(&target, timeout, &cluster.messaging)?.call(&Request::new(Op::Sites))?,
             )
         }
         Cmd::Registry => {
@@ -864,6 +900,8 @@ fn open(target: &Target, timeout: Duration, config: &Messaging) -> Result<Conn> 
 /// Which machine type answers a command, when none was named.
 fn serves(cmd: &Cmd) -> ServiceKind {
     match cmd {
+        // Any process can be asked about its own logs; without --to, ask KS.
+        Cmd::LogHistogram { .. } | Cmd::LogGrep { .. } | Cmd::LogLines { .. } => ServiceKind::Ks,
         Cmd::Unlock | Cmd::SnMasterKey { .. } | Cmd::RotateMasterKey | Cmd::Registry => {
             ServiceKind::Ks
         }
@@ -948,6 +986,15 @@ fn build(cmd: &Cmd) -> Result<Request> {
         Cmd::SnMasterKey { sn, day } => Request::new(Op::SnMasterKey).number(*sn).number(*day),
         Cmd::RotateMasterKey => Request::new(Op::RotateMasterKey),
 
+        Cmd::LogHistogram { values, rows, which } => {
+            Request::new(Op::LogHistogram).text(which).number(*values as u64).number(*rows as u64)
+        }
+        Cmd::LogGrep { what, limit, which } => {
+            Request::new(Op::LogGrep).text(which).text(what).number(*limit as u64)
+        }
+        Cmd::LogLines { from, to, limit, which } => {
+            Request::new(Op::LogLines).text(which).text(from).text(to).number(*limit as u64)
+        }
         Cmd::ObjectInfo { path } => Request::new(Op::ObjectInfo).text(path),
         Cmd::Mkdir { path } => Request::new(Op::MakeDirectory).text(path),
         Cmd::Rmdir { path } => Request::new(Op::RemoveDirectory).text(path),

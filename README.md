@@ -26,6 +26,11 @@ laws registry                   # what KS knows: identity -> machine, port
 laws placement                  # which spreading rules this cluster can enforce
 scripts/bench-laws --clients 8  # start retail, measure ping, stop
 scripts/stop-laws               # stop everything, either flavour
+
+laws create /bob/notes --flavor keyed   # laws -> FE -> DN -> SN
+laws object-info /bob/notes             # laws -> FE -> DN
+laws log-histogram --to DN0 --width 1   # what DN0 is mostly saying
+logs --dir run/DN0/logs --of dn0 grep "an error"   # or read the files directly
 ```
 
 KS holds the only fixed address in a cluster. `start-laws` hands every other process a
