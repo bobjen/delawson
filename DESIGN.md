@@ -6465,16 +6465,34 @@ And the capability question settles the same way: **the client compresses** (§8
 client has the codec and can decompress what comes back. So the answer is the strong one —
 **the client checks its own CRC** — and it holds all the way down.
 
-**One dividend, and it is smaller than it first looks.** If the client compresses going in and
-decompresses coming out, then **no tier in the middle spends CPU on compression in either
-direction**, and no tier above an EN ever needs a *disk* key (§7.3.5).
+⚠️ **But an FE has to see plaintext whenever the user asked for part of a compressed block**
+(Asserted, Bob, 2026-08-17), because somebody has to decompress it and cut the requested piece
+out, and there is nobody else between the EN and the caller. So the two shapes are not a global
+choice — they are a property of each read:
 
-⚠️ **It does not follow that the FE holds nothing readable.** An FE terminates a wire segment,
-so it sees the user's compressed bytes, and **compression is not confidentiality** — anybody
-holding a compressed block can decompress it. So the honest statement is that the read path
-makes the FE hold no more than the write path already does, not that it holds nothing. §9.6.1's
-cache asymmetry is therefore narrower than an earlier version of this section claimed: an FE
-cache of blocks adds no *new* kind of exposure, which is not the same as adding none.
+| The caller asks for | Then | The FE sees | The CRC is checked by |
+|---|---|---|---|
+| **a whole block** | the FE passes it through | compressed bytes | **the client**, end to end |
+| **part of a block** — one record | the FE decompresses, extracts, returns the piece | **plaintext** | the FE |
+
+**Which means the client should be able to ask either way**, because the right answer differs
+per read rather than per deployment. A scan will use every byte of a block, so asking for blocks
+wastes nothing and keeps the check end to end. A point read of a 50-byte record out of a 256 KB
+block would ship the whole block across the internet — the one link §8.1.4.1 says nobody controls
+the cost of, and the one §12 bills for — to use 0.02% of it.
+
+⚠️ **And that is a real limit on the guarantee, worth stating plainly rather than in a footnote:
+a caller that asks for part of a block gets the FE's word that the CRC matched.** The end-to-end
+version is available — ask for the block — and it costs egress. A user who wants both cheap point
+reads and an unbroken chain of custody cannot have them from the same request, and knowing which
+one they bought is better than assuming.
+
+**What survives regardless**: no tier in the middle spends CPU on *compression* on the write path,
+and no tier above an EN ever needs a *disk* key (§7.3.5). What does not survive is any claim that
+the FE holds nothing readable — it terminates a wire segment, so it sees compressed bytes on every
+read and plaintext on some, and **compression is not confidentiality**. §9.6.1's cache asymmetry is
+narrower than an earlier version of this section claimed: an FE cache adds no *new* kind of
+exposure, which is not the same as adding none.
 
 ⚠️ **"Any instance" holds for a sealed extent, and not for an unsealed one — and the reason is
 the watermark, not the data** (Asserted, Bob, 2026-08-17). Below the durable length every instance
@@ -10862,6 +10880,11 @@ remember when a read rate is quoted.
 
 **What is deliberately not here**: reading by key (`--key` answers `unimplemented`, since keyed
 reads need the key ordering of §9.2), scans, counts, and the sparse index.
+
+⚠️ **And the shape of `read` is the record-oriented one**, which §9.1.2 shows is the shape that
+forces an FE to see plaintext. A block-oriented read — the client asks for the block and extracts
+locally, keeping the CRC check end to end — is the other half of #63, and the client should be able
+to ask either way rather than the wire API choosing for it.
 
 #### 17.9.4 The order the rest arrives in
 
