@@ -250,6 +250,7 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Compression and encryption are **block-granular** at the index granule; the index points at **physical** offsets | §7.1, §9.3 |
 | Keys: **daily master keys in KS only**, daily SN-master keys cached on ENs, extent keys derived. ~1 MB per century | §7.3 |
 | **The EN does the on-disk crypto** — derives and caches a key per extent, encrypts and decrypts stored data, re-encrypts for the wire. Wire encryption is a self-contained layer the rest of the design ignores | §7.3.5, §17.5a |
+| **Every tier sees some user data** — a DN compares user keys, an FE cuts records out of blocks — so the trust boundary is **DeLawson code against user code**, not tier against tier. Disk keys live only on ENs | §7.3.6, §1.5 |
 | KS is unlocked by **operator secrets plus hardware** — the only step needing people | §7.3.2 |
 | Index granularity is `latency × bandwidth / 2` — **1 MB HDD, 20 KB SSD**, in *physical* bytes | §7.1.1 |
 | Compression improves **HDD** read bandwidth and degrades **NVMe** read bandwidth; it is mandatory regardless | §7.1.2 |
@@ -4595,6 +4596,40 @@ read stored data even if it holds bytes, and an EN's exposure is bounded to the 
 SNs whose keys it caches (§7.3.1).
 
 ---
+
+#### 7.3.6 Every tier sees some user data; the boundary is code, not tier
+
+Collecting the answers, because they arrived one at a time and the summary is the useful
+form. **A DN has to see plaintext in order to do keyed objects** (Asserted, Bob,
+2026-08-17): a keyed lookup is a comparison against **user keys**, so the keys are in the
+metadata and the metadata is user data. And a DN already holds object *names*, which are
+user data too.
+
+| Tier | Sees | Because |
+|---|---|---|
+| **client** | everything | it is the user's data, and it compresses and checks it (§7.5) |
+| **DN** | object names, and **user keys** for keyed objects | a keyed lookup is a key comparison (§9.2) |
+| **SN** | `first_key` per extent, for keyed objects | choosing an extent is the same comparison one level down |
+| **FE** | compressed bytes always; **plaintext** when a caller asks for part of a block | somebody has to cut the piece out (§9.1.2) |
+| **EN** | stored bytes, and their plaintext transiently | it does the on-disk crypto (§7.3.5) |
+
+⚠️ **So "where does plaintext live" has no single answer, and it was the wrong question.**
+Every tier sees the part of the user's data it needs to do its job, and the design has never
+depended on any of them not seeing it. What it depends on is narrower and checkable:
+
+- **Disk keys live only on ENs** (§7.3.5), so a machine that is not an EN cannot read stored
+  data even if it holds the bytes.
+- **No tier runs user code** (§1.5), which is why every tier can be trusted with what it
+  sees. That is the actual trust boundary — **DeLawson code against user code, not tier
+  against tier.**
+- **Compute is therefore the boundary that matters**, and §5.12 already draws it the right
+  way round: Compute machines receive plaintext and never keys, because they are the one
+  place user code runs.
+
+Which also explains why §7.5.3 keeps the CRC out of stream and extent metadata even though
+that metadata is already full of user data: the objection is not that a tier would see it
+but that **one tenant would see another's**, since staging extents mix tenants. Tenancy and
+trust are different boundaries and only one of them runs along tier lines.
 
 ### 7.4 Media classes, and why an extent has exactly one
 
