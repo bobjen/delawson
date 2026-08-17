@@ -33,6 +33,9 @@ type Waiting = HashMap<(u32, u64), Vec<Arc<Pending>>>;
 /// this id — and the second, which is part of the name too.
 struct Extent {
     created: u64,
+    /// Closed: no more appends, however much room is left. What is here is what the
+    /// extent came to, for ever.
+    sealed: bool,
     /// Where the next append to this extent will start. Compressed, because what
     /// arrives here is what a writer compressed and what a device will hold.
     end: COff,
@@ -52,6 +55,19 @@ struct Append {
     extent: usize,
     offset: COff,
     bytes: Vec<u8>,
+}
+
+/// What became of an append: a place in the extent, or an extent that is closed.
+enum Took {
+    Landed(Landed),
+    /// What the extent came to, which is what the SN has to record. `closing` marks
+    /// the block that found it full, as against the ones arriving afterwards, so a
+    /// count of sealed extents counts extents and not refusals.
+    Sealed {
+        records: u64,
+        length: COff,
+        closing: bool,
+    },
 }
 
 /// Where an append landed and what it numbered.
@@ -119,7 +135,13 @@ impl Extents {
             }
             return Ok(*place);
         }
-        self.extents.push(Extent { created, end: COff::ZERO, records: 0, open: Vec::new() });
+        self.extents.push(Extent {
+            created,
+            sealed: false,
+            end: COff::ZERO,
+            records: 0,
+            open: Vec::new(),
+        });
         let place = self.extents.len() - 1;
         self.at.insert((sn, id), place);
         Ok(place)
@@ -128,10 +150,28 @@ impl Extents {
     /// Take the next offset in an extent, put the bytes there, and count the
     /// records they complete. This is the one serialized step of an append;
     /// everything expensive happens after it.
-    fn take(&mut self, appending: &Appending, framing: Framing) -> Result<Landed> {
+    ///
+    /// Or seal, if the extent is full: a block goes wholly into this extent or
+    /// wholly into the next one, never split, so a block that will not fit gets an
+    /// extent that is closed instead of a place in it.
+    fn take(&mut self, appending: &Appending, framing: Framing, cap: COff) -> Result<Took> {
         let length = COff::of_len(appending.bytes.len())?;
         let place = self.place(appending.sn, appending.extent, appending.created)?;
         let extent = &mut self.extents[place];
+
+        // A record already open must finish here, since an extent holds whole
+        // records — so an extent with one cannot seal, whatever the cap says. The
+        // client never leaves one open, so this is for a writer using the protocol
+        // directly.
+        let sealable = extent.open.is_empty();
+        if extent.sealed || (sealable && extent.end.plus(length)? > cap) {
+            // Whether this block is the one that closed it, so a counter of sealed
+            // extents counts extents and not refusals.
+            let closing = !extent.sealed;
+            extent.sealed = true;
+            return Ok(Took::Sealed { records: extent.records, length: extent.end, closing });
+        }
+
         // Before the bytes are taken, so a block that breaks the record rule
         // changes nothing.
         let (closed, open) = framing.advance(&extent.open, appending.bytes)?;
@@ -141,7 +181,7 @@ impl Extents {
         extent.records += closed;
         extent.open = open;
         self.appends.push(Append { extent: place, offset, bytes: appending.bytes.to_vec() });
-        Ok(Landed { offset, first_record, records: closed })
+        Ok(Took::Landed(Landed { offset, first_record, records: closed }))
     }
 
     /// Put an append at an offset another instance chose. The offset is given, so
@@ -188,6 +228,7 @@ struct EN {
     waiting: Mutex<Waiting>,
     appends: AtomicU64,
     bytes: AtomicU64,
+    sealed: AtomicU64,
 }
 
 impl Service for EN {
@@ -230,6 +271,7 @@ impl Service for EN {
             format!("extents {extents}"),
             format!("appends {}", self.appends.load(Ordering::Relaxed)),
             format!("appended_bytes {}", self.bytes.load(Ordering::Relaxed)),
+            format!("sealed_extents {}", self.sealed.load(Ordering::Relaxed)),
             format!("media_class {}", self.config.media_class),
         ]
     }
@@ -243,6 +285,7 @@ impl EN {
             waiting: Mutex::new(HashMap::new()),
             appends: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            sealed: AtomicU64::new(0),
         }
     }
 
@@ -273,8 +316,28 @@ impl EN {
             }
         };
         let length = appending.bytes.len() as u64;
-        let landed = match self.take(&appending, framing) {
-            Ok(landed) => landed,
+        let cap = match COff::of_number(process.cluster.extents.seal_bytes) {
+            Ok(cap) => cap,
+            Err(e) => return reply.send(Response::error(Status::Internal, e.to_string())),
+        };
+        let landed = match self.take(&appending, framing, cap) {
+            Ok(Took::Landed(landed)) => landed,
+            // Sealed: what the extent came to, so whoever asked can tell the SN and
+            // come back with the next extent.
+            Ok(Took::Sealed { records, length, closing }) => {
+                if closing {
+                    self.sealed.fetch_add(1, Ordering::Relaxed);
+                }
+                reply.about(format_args!(
+                    "extent {} of sn {},records {records},bytes {length}",
+                    appending.extent, appending.sn
+                ));
+                return reply.send(Response {
+                    id: 0,
+                    status: Status::Sealed,
+                    args: vec![Arg::Number(records), Arg::Number(length.number())],
+                });
+            }
             Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
         };
         reply.about(format_args!(
@@ -342,11 +405,13 @@ impl EN {
         }
     }
 
-    fn take(&self, appending: &Appending, framing: Framing) -> Result<Landed> {
-        let landed = self.held.lock().expect("extents").take(appending, framing)?;
-        self.appends.fetch_add(1, Ordering::Relaxed);
-        self.bytes.fetch_add(appending.bytes.len() as u64, Ordering::Relaxed);
-        Ok(landed)
+    fn take(&self, appending: &Appending, framing: Framing, cap: COff) -> Result<Took> {
+        let took = self.held.lock().expect("extents").take(appending, framing, cap)?;
+        if let Took::Landed(_) = &took {
+            self.appends.fetch_add(1, Ordering::Relaxed);
+            self.bytes.fetch_add(appending.bytes.len() as u64, Ordering::Relaxed);
+        }
+        Ok(took)
     }
 
     /// A record closed, so every append still waiting on this extent is waiting on
@@ -605,8 +670,14 @@ mod tests {
         format!("{text}\n").into_bytes()
     }
 
+    /// Room enough that nothing seals, for the tests that are not about sealing.
+    const ROOM: COff = COff::new(1 << 20);
+
     fn append(en: &EN, extent: u64, bytes: &[u8]) -> Landed {
-        en.take(&appending(0, extent, bytes), LF).expect("an append")
+        match en.take(&appending(0, extent, bytes), LF, ROOM).expect("an append") {
+            Took::Landed(landed) => landed,
+            Took::Sealed { .. } => panic!("that should have fitted"),
+        }
     }
 
     /// Offsets are handed out in order, each one where the last append ended.
@@ -635,8 +706,8 @@ mod tests {
     #[test]
     fn an_extent_is_named_by_its_sn_too() {
         let en = EN::new(testing::en_config());
-        en.take(&appending(0, 1, &line("from sn0")), LF).unwrap();
-        en.take(&appending(1, 1, &line("from sn1")), LF).unwrap();
+        en.take(&appending(0, 1, &line("from sn0")), LF, ROOM).unwrap();
+        en.take(&appending(1, 1, &line("from sn1")), LF, ROOM).unwrap();
         assert_eq!(en.held.lock().unwrap().extents.len(), 2);
     }
 
@@ -647,7 +718,7 @@ mod tests {
         let en = EN::new(testing::en_config());
         append(&en, 1, &line("first"));
         let later = Appending { sn: 0, extent: 1, created: 1_000_001, bytes: &line("second") };
-        assert!(en.take(&later, LF).is_err());
+        assert!(en.take(&later, LF, ROOM).is_err());
         assert_eq!(en.held.lock().unwrap().read(0, 1), b"first\n");
     }
 
@@ -682,7 +753,7 @@ mod tests {
     #[test]
     fn a_block_that_closes_a_record_may_not_end_inside_another() {
         let en = EN::new(testing::en_config());
-        assert!(en.take(&appending(0, 1, b"one\ntw"), LF).is_err());
+        assert!(en.take(&appending(0, 1, b"one\ntw"), LF, ROOM).is_err());
         // And the refusal left the extent alone.
         assert!(en.held.lock().unwrap().read(0, 1).is_empty());
     }
@@ -783,6 +854,47 @@ mod tests {
         assert_eq!(read(1, 1_000_000), Status::Ok);
         assert_eq!(read(2, 1_000_000), Status::NotFound, "no such extent");
         assert_eq!(read(1, 1_000_001), Status::NotFound, "a rewritten extent is a new one");
+    }
+
+    /// An extent that has no room for the next block is closed rather than stretched,
+    /// and the answer says what it came to.
+    #[test]
+    fn a_full_extent_seals_instead_of_taking_the_block() {
+        let en = EN::new(testing::en_config());
+        let cap = COff::new(10);
+        let took = |en: &EN, bytes: &'static [u8]| en.take(&appending(0, 1, bytes), LF, cap);
+        // "one\n" and "two\n" fit in ten bytes; "three\n" does not.
+        assert!(matches!(took(&en, b"one\n"), Ok(Took::Landed(_))));
+        assert!(matches!(took(&en, b"two\n"), Ok(Took::Landed(_))));
+        match took(&en, b"three\n") {
+            Ok(Took::Sealed { records, length, .. }) => {
+                assert_eq!(records, 2, "what the extent came to");
+                assert_eq!(length, COff::new(8));
+            }
+            other => panic!("should have sealed, not {:?}", other.is_ok()),
+        }
+        // And it stays sealed: the block that found it full does not land later.
+        assert!(matches!(took(&en, b"x\n"), Ok(Took::Sealed { .. })));
+        // What was in it is still readable.
+        assert_eq!(en.held.lock().unwrap().record(0, 1, LF, 1).unwrap(), b"two");
+    }
+
+    /// An extent with a record still open cannot seal, however full it is: an extent
+    /// holds whole records, so the open one has to finish here.
+    #[test]
+    fn an_open_record_keeps_an_extent_from_sealing() {
+        let en = EN::new(testing::en_config());
+        let cap = COff::new(4);
+        // A block with no boundary in it, which leaves a record open.
+        assert!(matches!(en.take(&appending(0, 1, b"half"), LF, cap), Ok(Took::Landed(_))));
+        // Past the cap, and it still has to be taken, because the record is open.
+        match en.take(&appending(0, 1, b" and half\n"), LF, cap) {
+            Ok(Took::Landed(landed)) => assert_eq!(landed.records, 1),
+            _ => panic!("an open record must be allowed to finish"),
+        }
+        assert_eq!(en.held.lock().unwrap().record(0, 1, LF, 0).unwrap(), b"half and half");
+        // Now that nothing is open, the next block finds it full.
+        assert!(matches!(en.take(&appending(0, 1, b"x\n"), LF, cap), Ok(Took::Sealed { .. })));
     }
 
     /// Three of four, so two of the three secondaries settle it and the third's

@@ -10345,11 +10345,97 @@ reads need the key ordering of §9.2), scans, counts, and the sparse index.
 Bob's sequence, 2026-08-17, and each step is a knob turned small rather than a new mechanism:
 
 1. **Done**: an append that creates its object, and a read that gets the record back.
-2. **Next: shrink the extent sealing limit** to something small, so sealing happens constantly — an
-   extent seals, the SN allocates another, and a read finds records in both. That is what makes
-   `first_record` on an extent do real work rather than always being zero.
-3. **Then: shrink the extents-per-stream limit**, so a stream fills and the DN allocates another —
-   driven by the previous stream reporting that it sealed.
+2. **Done: extent sealing**, with the limit shrunk to 4 KB so it happens constantly — see §17.11.
+3. **Next: shrink the extents-per-stream limit**, so a stream fills and the DN allocates another —
+   driven by the previous stream reporting that it sealed. That needs #56 first, because a DN
+   allocating a stream is a round trip and several appends will want it at once.
 
 The point of the order is that each step turns a configured limit into a constantly-exercised path,
 which is the same trick the small log files play: make the rare case the common one on one box.
+
+### 17.10 One request does the work; the rest are given its answer
+
+**When several requests need the same new thing, one of them makes it and the others queue behind it
+and get that same thing** (Asserted, Bob, 2026-08-17). Three places want this, and they are the same
+rule with different costs:
+
+| Who | Needs | Cost of making it | So the queue is |
+|---|---|---|---|
+| SN | the next extent for a stream | a counter and an instance list | **the stream's lock** |
+| DN | a new stream for an object | **a round trip to an SN** | an in-flight table (#56) |
+| DN | the object for a name | a round trip, once per name | the name being inserted first |
+
+**Built, at the SN**: the stream's lock is held across the naming, so a burst of appends to a fresh
+stream — or to one that has just sealed — produces one extent and not one apiece. Sealing and opening
+happen under the same lock, which is what makes a second request that finds the extent already sealed
+get *the extent that replaced it* rather than an error.
+
+**Built, at the DN, for names**: whoever inserts the name owns the object and asks for its stream;
+anyone else finds the name already there and never asks. Same rule, and it is why a create that loses
+a race does not leave a stream behind.
+
+⚠️ **The lock is only the right queue while the work is arithmetic.** Opening an extent today is a
+counter increment, so a waiter blocking for it costs nothing. **A DN allocating a stream has to ask an
+SN**, and blocking a worker per waiter on somebody else's round trip is exactly what §17.4 forbids —
+so that one needs an in-flight table where the first request registers what it is doing and the rest
+attach to its answer. The distinction is worth stating because the two look identical in a design
+sketch and are not the same code.
+
+And the same caution applies to the SN once opening an extent is recorded durably rather than in
+memory: the moment it becomes a Raft round trip, the lock has to become an attachment.
+
+
+### 17.11 Sealing, and what a burst of writers found
+
+Built, 2026-08-17. The seal limit is configuration (`extents.seal_bytes`), and the single-box cluster
+sets it to **4 KB** so that sealing is the common path rather than one nothing reaches.
+
+**The primary decides, and says so in the answer.** When a block will not fit, the extent is closed and
+the append is answered `Sealed` with what the extent came to — a record count and a length. Not a
+failure: the writer is being told where to go. The FE then reports that to the SN, which records it and
+names the next extent **in the same round trip**, since whoever saw the seal wants both.
+
+| Who | Does |
+|---|---|
+| primary EN | closes the extent, answers `Sealed` with its record count and length |
+| FE | forgets the extent it cached, reports the seal, takes the next extent, sends the append again |
+| SN | records what the extent came to, and names the next one — under the stream's lock (§17.10) |
+
+**An extent with a record still open cannot seal**, whatever the cap says, because an extent holds
+whole records — so the open record finishes there and the seal happens after it. That falls straight
+out of §8.2.4 and needed no special case.
+
+**Reads span extents.** A stream keeps its sealed extents in record order, so locating a record is a
+search over a sorted run; anything at or past the open extent's first record is routed there, because
+how far *that* one reaches is the EN's to say and not the SN's.
+
+#### 17.11.1 What eight concurrent writers found
+
+Three hundred and twenty records from eight clients into one object that did not exist yet, which is
+worth doing precisely because it is the case single-threaded testing cannot reach. It failed, in three
+ways, and all three are worth recording because none of them is exotic:
+
+- ⚠️ **An append arriving while the object was half made was told "that object has no stream yet".**
+  The DN takes the name first and asks for the stream after (§17.10), so for the width of one round
+  trip an object exists with no stream — and a second writer's append hit exactly that window and
+  failed. **Seven records were lost this way.** The fix is §17.10's rule applied to lookups: a lookup
+  that finds a name taken but its stream unnamed **parks behind whoever is naming it** and is answered
+  when the stream exists. A lookup can therefore be answered by another request's completion, which is
+  why `object-info` now defers.
+- ⚠️ **One retry was not enough.** An append that stepped into a fresh extent could find *that* one
+  already full, because other writers fill extents while one append is being placed. Retrying a fixed
+  number of times is right, but the number is not one — and the case that must not be retried is
+  distinguishable rather than a guess: **an extent that sealed with nothing in it** is one this block
+  could not fit even empty, which is the block's fault and gets `bad request`.
+- **A counter counted the wrong thing.** Every append that found a sealed extent incremented the count
+  of sealed extents, so an EN reported five where the SN reported three. Only the block that *closes*
+  an extent is closing it; the rest are being turned away.
+
+After all three: **320 of 320 records durable, readable, and numbered without gaps**, across four
+extents with three seals, and the tiers agree — the SN counts four extents and three seals, the EN
+counts four extents, 320 appends and three seals, the DN counts one object and nothing waiting.
+
+The interleaving is a writer-visible consequence worth stating: record 0 came from client 7. Several
+writers appending to one object get **at-least-once ordering by arrival**, which is §8.1.1a's
+multi-writer mode working as designed, and a reason a writer wanting its own order wants its own
+object.

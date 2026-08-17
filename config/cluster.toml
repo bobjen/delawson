@@ -29,6 +29,13 @@ levels = ["region", "datacenter", "rack", "machine", "disk"]
 instances = 4
 quorum = 3
 
+# ⚠️ Deliberately tiny. The design's figure is 32 MB compressed, and on one box that
+# would mean nothing ever seals — so sealing, the SN opening the next extent, and a
+# read spanning both would all be untested paths. Small here makes the rare case the
+# common one. Raise it before quoting a throughput number, since sealing every few
+# records is not what a real cluster does.
+seal_bytes = 4096
+
 [rings]
 members = 1
 

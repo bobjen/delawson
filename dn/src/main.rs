@@ -82,9 +82,18 @@ impl Wanted {
     }
 }
 
+/// Requests parked until an object's stream exists, keyed by name.
+type Waiting = HashMap<Box<str>, Vec<Reply>>;
+
 struct DN {
     config: DNConfig,
     shards: Vec<Mutex<HashMap<Box<str>, Object>>>,
+    /// Lookups that arrived while an object was half made: the name is taken and
+    /// its stream is not named yet. Whoever took the name is asking an SN for the
+    /// stream, and these are handed the answer when it arrives rather than being
+    /// told the object has no stream — which is true for a moment and useless to
+    /// hear.
+    waiting: Mutex<Waiting>,
     objects: AtomicU64,
     next_object: AtomicU64,
     next_stream: AtomicU64,
@@ -117,7 +126,9 @@ impl Service for DN {
     /// A create is answered once its streams exist, which is another process's
     /// business; a lookup is answered here.
     fn defers(&self, op: Op) -> bool {
-        matches!(op, Op::CreateObject | Op::BatchCreate)
+        // A lookup can park behind a create, so its answer need not come from the
+        // thread that read it either.
+        matches!(op, Op::CreateObject | Op::BatchCreate | Op::ObjectInfo)
     }
 
     /// A lookup is a hash and a read, which is not worth a queue hop. Taking
@@ -133,7 +144,7 @@ impl Service for DN {
         match request.op {
             Op::CreateObject => self.create(process, &request, reply),
             Op::BatchCreate => self.create_many(process, &request, reply),
-            Op::ObjectInfo => reply.send(self.info(&request)),
+            Op::ObjectInfo => self.info(&request, reply),
             Op::BatchInfo => reply.send(self.info_many(&request)),
             _ => reply.send(server::unbuilt(process, SERVES, &request)),
         }
@@ -142,6 +153,7 @@ impl Service for DN {
     fn status(&self, _process: &Process) -> Vec<String> {
         vec![
             format!("objects {}", self.objects.load(Ordering::Relaxed)),
+            format!("waiting_for_a_stream {}", self.waiting.lock().expect("waiting").len()),
             format!("self_hosted {}", self.config.self_hosted),
         ]
     }
@@ -235,7 +247,9 @@ impl DN {
         let sn = match process.pick(ServiceKind::Sn) {
             Ok(sn) => sn.to_string(),
             Err(e) => {
-                return reply.send(self.give_back(&mine, Status::Internal, e.to_string()));
+                let failed = self.give_back(&mine, Status::Internal, e.to_string());
+                self.wake(&mine, Some(&failed));
+                return reply.send(failed);
             }
         };
         let ask = Request::new(Op::CreateStream)
@@ -250,7 +264,9 @@ impl DN {
         let asked = process.ask(&sn, &ask, move |answer| {
             if answer.status != Status::Ok {
                 let why = format!("{named} would not make {count} streams");
-                return reply.send(dn.give_back(&mine, answer.status, why));
+                let failed = dn.give_back(&mine, answer.status, why);
+                dn.wake(&mine, Some(&failed));
+                return reply.send(failed);
             }
             for (n, name) in mine.iter().enumerate() {
                 let mut shard = dn.shards[shard_of(name)].lock().expect("objects");
@@ -260,6 +276,7 @@ impl DN {
                 }
             }
             dn.objects.fetch_add(count, Ordering::Relaxed);
+            dn.wake(&mine, None);
             // The stream range is how this request is matched with the SN's line
             // for it: SN does not know names, and should not.
             reply
@@ -279,14 +296,52 @@ impl DN {
         Response::error(status, why)
     }
 
-    fn info(&self, request: &Request) -> Response {
+    fn info(&self, request: &Request, reply: Reply) {
         let name = match request.args.first() {
             Some(Arg::Text(name)) => name.as_str(),
-            _ => return Response::error(Status::BadRequest, "object-info takes a name"),
+            _ => {
+                return reply.send(Response::error(Status::BadRequest, "object-info takes a name"));
+            }
         };
         match self.look(name) {
-            Some(args) => Response { id: 0, status: Status::Ok, args },
-            None => Response::error(Status::NotFound, format!("no object {name}")),
+            Some(args) => reply.send(Response { id: 0, status: Status::Ok, args }),
+            None if self.taken(name) => {
+                // Half made: park behind whoever is naming its stream.
+                self.waiting
+                    .lock()
+                    .expect("waiting")
+                    .entry(Box::from(name))
+                    .or_default()
+                    .push(reply);
+            }
+            None => reply.send(Response::error(Status::NotFound, format!("no object {name}"))),
+        }
+    }
+
+    /// Whether the name is taken by an object whose stream is not named yet.
+    fn taken(&self, name: &str) -> bool {
+        let shard = self.shards[shard_of(name)].lock().expect("objects");
+        shard.get(name).is_some_and(|object| object.stream == 0)
+    }
+
+    /// Answer everything parked on these names, now that their streams exist. A name
+    /// whose create failed is answered too, with whatever the failure was, so nothing
+    /// waits for an answer that is never coming.
+    fn wake(&self, names: &[String], failed: Option<&Response>) {
+        for name in names {
+            let parked = self.waiting.lock().expect("waiting").remove(name.as_str());
+            for reply in parked.unwrap_or_default() {
+                match (failed, self.look(name)) {
+                    (None, Some(args)) => reply.send(Response { id: 0, status: Status::Ok, args }),
+                    (failed, _) => reply.send(match failed {
+                        Some(answer) => answer.clone(),
+                        None => Response::error(
+                            Status::Internal,
+                            format!("{name} was made and then lost"),
+                        ),
+                    }),
+                }
+            }
         }
     }
 
@@ -323,6 +378,11 @@ impl DN {
     fn look(&self, name: &str) -> Option<Vec<Arg>> {
         let shard = self.shards[shard_of(name)].lock().expect("objects");
         let object = shard.get(name)?;
+        // A name with no stream is an object that is still being made, and saying so
+        // is worse than useless — whoever asked would have to guess how long to wait.
+        if object.stream == 0 {
+            return None;
+        }
         let (kind, width) = object.framing.wire();
         Some(vec![
             Arg::Number(object.id),
@@ -336,19 +396,115 @@ impl DN {
     }
 }
 
-fn main() {
-    let result = server::main(|process| {
-        let config = DNConfig::load(&process.config.service_config)?;
-        Ok(DN {
+impl DN {
+    fn new(config: DNConfig) -> DN {
+        DN {
             config,
             shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            waiting: Mutex::new(HashMap::new()),
             objects: AtomicU64::new(0),
             next_object: AtomicU64::new(1),
             next_stream: AtomicU64::new(1),
-        })
-    });
+        }
+    }
+}
+
+fn main() {
+    let result =
+        server::main(|process| Ok(DN::new(DNConfig::load(&process.config.service_config)?)));
     if let Err(e) = result {
         eprintln!("dn: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::testing;
+
+    /// An object as `record` leaves it before the SN has answered: the name is
+    /// taken and the stream is not named.
+    fn half_made(dn: &DN, name: &str) {
+        dn.shards[shard_of(name)].lock().unwrap().insert(
+            Box::from(name),
+            Object {
+                id: 1,
+                framing: Framing::Lf,
+                stream: 0,
+                sn: 0,
+                keyed: false,
+                created: 1_000_000,
+            },
+        );
+    }
+
+    /// The stream is what everything below the DN needs, so an object without one
+    /// is not something to describe — the name is taken, and that is a different
+    /// answer from "no object".
+    #[test]
+    fn an_object_being_made_does_not_look_like_a_finished_one() {
+        let dn = DN::new(testing::dn_config());
+        half_made(&dn, "/half");
+        assert!(dn.look("/half").is_none(), "nothing to say about it yet");
+        assert!(dn.taken("/half"), "but the name is taken");
+        assert!(!dn.taken("/nothing"), "unlike a name nobody has");
+
+        // Once the stream is named it describes normally.
+        dn.shards[shard_of("/half")].lock().unwrap().get_mut("/half").unwrap().stream = 7;
+        let args = dn.look("/half").expect("an object");
+        assert_eq!(args[1], Arg::Number(7), "its stream");
+        assert!(!dn.taken("/half"), "and it is no longer half made");
+    }
+
+    /// A name is taken before its stream is asked for, so two creates of one name
+    /// ask for one stream. That is the rule that stops a create leaving a stream
+    /// behind when it loses the race.
+    #[test]
+    fn one_name_is_taken_once() {
+        let dn = DN::new(testing::dn_config());
+        let mine = |dn: &DN| {
+            let mut taken = Vec::new();
+            let name = "/same".to_string();
+            let mut shard = dn.shards[shard_of(&name)].lock().unwrap();
+            if !shard.contains_key(name.as_str()) {
+                shard.insert(
+                    Box::from(name.as_str()),
+                    Object {
+                        id: dn.next_object.fetch_add(1, Ordering::Relaxed),
+                        framing: Framing::Lf,
+                        stream: 0,
+                        sn: 0,
+                        keyed: false,
+                        created: 1_000_000,
+                    },
+                );
+                taken.push(name);
+            }
+            taken
+        };
+        assert_eq!(mine(&dn).len(), 1, "the first one takes it");
+        assert!(mine(&dn).is_empty(), "the second finds it there");
+    }
+
+    /// A create carries a name, a flavour and a framing, and anything after those is
+    /// something this tier does not read yet rather than a malformed request.
+    #[test]
+    fn a_create_reads_its_first_four_arguments() {
+        let (kind, width) = Framing::CrLf.wire();
+        let args =
+            vec![Arg::Text("/x".into()), Arg::Flag(true), Arg::Number(kind), Arg::Number(width)];
+        let wanted = Wanted::of(&args).expect("an object");
+        assert_eq!((wanted.name.as_str(), wanted.keyed), ("/x", true));
+        assert_eq!(wanted.framing, Framing::CrLf);
+
+        // A media class after the framing is not this tier's business, and the head
+        // of the request still parses.
+        let mut more = args.clone();
+        more.push(Arg::Text("ssd".into()));
+        assert!(Wanted::of(&more[..Wanted::ARGS]).is_ok());
+        // But a framing that means nothing is a bad request.
+        let bad = vec![Arg::Text("/x".into()), Arg::Flag(false), Arg::Number(9), Arg::Number(0)];
+        assert!(Wanted::of(&bad).is_err());
     }
 }

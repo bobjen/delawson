@@ -274,6 +274,11 @@ impl Logging {
 pub struct Extents {
     pub instances: usize,
     pub quorum: usize,
+    /// Compressed bytes an extent may accumulate before it seals. The design's
+    /// figure is 32 MB and it is a guess bracketed from both sides; a test cluster
+    /// sets it small so that sealing is the common path rather than the rare one.
+    /// It bounds the first write only — recompression may leave an extent larger.
+    pub seal_bytes: u64,
 }
 
 impl Extents {
@@ -291,6 +296,15 @@ impl Extents {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.seal_bytes == 0 {
+            return Err(Error::new("extents.seal_bytes of zero seals every extent empty"));
+        }
+        if self.seal_bytes > u32::MAX as u64 {
+            return Err(Error::new(format!(
+                "extents.seal_bytes {} is past what a position in an extent can name",
+                self.seal_bytes
+            )));
+        }
         if self.quorum == 0 || self.instances == 0 {
             return Err(Error::new("extents.instances and extents.quorum must be positive"));
         }
@@ -646,7 +660,7 @@ mod tests {
         cluster_name = "test"
         ks = { address = "127.0.0.1:9601", port_base = 9602 }
         failure_domains = { levels = ["rack", "machine"] }
-        extents = { instances = 4, quorum = 3 }
+        extents = { instances = 4, quorum = 3, seal_bytes = 4096 }
         rings = { members = 1 }
         messaging = { send = "direct", encrypt = false, compress = "none", compress_min = 256, compress_sample = 4096, peer_conns = 2, key = "0f1e2d3c4b5a69788796a5b4c3d2e1f0" }
         timeouts = { request_ms = 1000, shutdown_grace_ms = 1000 }
@@ -736,7 +750,8 @@ mod tests {
     /// append the other never saw.
     #[test]
     fn a_quorum_that_does_not_overlap_itself_is_refused() {
-        let extents = |instances, quorum| Extents { instances, quorum }.validate();
+        let extents =
+            |instances, quorum| Extents { instances, quorum, seal_bytes: 4096 }.validate();
         assert!(extents(4, 3).is_ok(), "the shipped shape");
         assert!(extents(3, 3).is_ok(), "every instance, which is its own quorum");
         assert!(extents(5, 3).is_ok());
@@ -748,12 +763,23 @@ mod tests {
         assert!(extents(0, 0).is_err());
     }
 
+    /// A cap of zero would seal every extent while it was still empty, and one past
+    /// what a position can name could never be reached.
+    #[test]
+    fn a_seal_limit_has_to_be_reachable() {
+        let capped = |seal_bytes| Extents { instances: 4, quorum: 3, seal_bytes }.validate();
+        assert!(capped(64).is_ok());
+        assert!(capped(32 << 20).is_ok());
+        assert!(capped(0).is_err());
+        assert!(capped(u32::MAX as u64 + 1).is_err());
+    }
+
     /// What a failure-mode seal discards, which is what makes the same rule work at
     /// any size: the minimum over responses, less the smallest few.
     #[test]
     fn what_a_seal_discards_follows_from_the_two_numbers() {
         let shape = |instances, quorum| {
-            let extents = Extents { instances, quorum };
+            let extents = Extents { instances, quorum, seal_bytes: 4096 };
             (extents.discard(), extents.least_heard())
         };
         // Four of three discards one, so "the minimum, discarding the smallest".

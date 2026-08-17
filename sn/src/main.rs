@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SERVES: &[Op] = &[Op::CreateStream, Op::OpenExtent, Op::LocateRecord];
+const SERVES: &[Op] = &[Op::CreateStream, Op::OpenExtent, Op::LocateRecord, Op::SealExtent];
 
 /// Locks over the stream table. Enough that sixteen cores rarely collide,
 /// few enough to walk when something wants a total.
@@ -33,13 +33,32 @@ struct Stream {
     /// creation timestamp of its own at all is an open question.
     #[allow(dead_code)]
     created: u64,
-    /// The extent appends to this stream are landing in, once anything has asked
-    /// for one. A stream that has only been created has none.
+    /// This stream's sealed extents, oldest first, each with the record count it
+    /// came to. In record order, because a stream only ever appends — which is what
+    /// makes finding the extent holding a record a search rather than a scan.
+    sealed: Vec<Sealed>,
+    /// The extent appends are landing in, once anything has asked for one.
     open: Option<Extent>,
-    /// Records in this stream's sealed extents, which is where the open extent's
-    /// numbering starts from. Nothing seals yet, so it is always zero — and when
-    /// sealing arrives this is what has to be right.
+    /// Records in the sealed extents, which is where the open extent's numbering
+    /// starts from.
     sealed_records: u64,
+}
+
+/// An extent that is closed, and what it came to.
+#[derive(Clone)]
+struct Sealed {
+    extent: Extent,
+    records: u64,
+    /// Compressed bytes. Nothing reads it yet; billing and repair scheduling will.
+    #[allow(dead_code)]
+    length: u64,
+}
+
+impl Sealed {
+    /// Whether a stream-local record number falls in this extent.
+    fn holds(&self, record: u64) -> bool {
+        record >= self.extent.first_record && record < self.extent.first_record + self.records
+    }
 }
 
 /// Where an extent is, under the name this SN gave it.
@@ -114,6 +133,7 @@ struct SN {
     naming: Naming,
     streams: AtomicU64,
     extents: AtomicU64,
+    sealed: AtomicU64,
 }
 
 fn shard_of(dn: u32, stream: u64) -> usize {
@@ -150,6 +170,7 @@ impl Service for SN {
             Op::CreateStream => self.create(request),
             Op::OpenExtent => self.open_extent(process, request),
             Op::LocateRecord => self.locate(request),
+            Op::SealExtent => self.seal(process, request),
             _ => server::unbuilt(process, SERVES, request),
         }
     }
@@ -158,6 +179,7 @@ impl Service for SN {
         vec![
             format!("streams {}", self.streams.load(Ordering::Relaxed)),
             format!("extents {}", self.extents.load(Ordering::Relaxed)),
+            format!("sealed_extents {}", self.sealed.load(Ordering::Relaxed)),
             format!("stream_share {}", self.config.stream_share),
         ]
     }
@@ -171,6 +193,7 @@ impl SN {
             naming: Naming::new(),
             streams: AtomicU64::new(0),
             extents: AtomicU64::new(0),
+            sealed: AtomicU64::new(0),
         }
     }
 
@@ -192,7 +215,10 @@ impl SN {
         for n in 0..count {
             let id = first + n;
             let mut shard = self.shards[shard_of(dn, id)].lock().expect("streams");
-            shard.insert((dn, id), Stream { created, open: None, sealed_records: 0 });
+            shard.insert(
+                (dn, id),
+                Stream { created, sealed: Vec::new(), open: None, sealed_records: 0 },
+            );
         }
         self.streams.fetch_add(count, Ordering::Relaxed);
         Response::ok()
@@ -238,12 +264,18 @@ impl SN {
         let Some(held) = shard.get(&(dn, stream)) else {
             return Response::error(Status::NotFound, format!("no stream {stream} from dn {dn}"));
         };
+        // The sealed extents are in record order, so this is a search over a sorted
+        // run; a scan is what it costs while a stream has few extents.
+        if let Some(sealed) = held.sealed.iter().find(|sealed| sealed.holds(record)) {
+            return Response { id: 0, status: Status::Ok, args: sealed.extent.args() };
+        }
         match &held.open {
+            // How far the open extent reaches is not known here — an SN keeps its
+            // record totals lazily — so anything at or past its first record is
+            // routed to it and the EN says whether it is there.
             Some(extent) if record >= extent.first_record => {
                 Response { id: 0, status: Status::Ok, args: extent.args() }
             }
-            // Before the open extent means a sealed one, and nothing seals yet, so
-            // there is nowhere else for it to be.
             Some(_) | None => Response::error(
                 Status::NotFound,
                 format!("stream {stream} has no extent holding record {record}"),
@@ -251,9 +283,73 @@ impl SN {
         }
     }
 
-    /// The stream's open extent, naming one if it has none. Holding the shard
-    /// across the naming is what stops two appends to a fresh stream from opening
-    /// two extents for it.
+    /// `(DnId, StreamId, sealed extent, records, length)`: record what an extent
+    /// came to and open the next one, which is one round trip rather than two
+    /// because whoever saw the seal wants both.
+    fn seal(&self, process: &Process, request: &Request) -> Response {
+        let (dn, stream, id, records, length) = match request.args.as_slice() {
+            [
+                Arg::Number(dn),
+                Arg::Number(stream),
+                Arg::Number(id),
+                Arg::Number(records),
+                Arg::Number(length),
+            ] => (*dn as u32, *stream, *id, *records, *length),
+            _ => {
+                return Response::error(
+                    Status::BadRequest,
+                    "seal-extent takes a DnId, a StreamId, an extent, a record count and a length",
+                );
+            }
+        };
+        let ens: Vec<u32> =
+            process.cluster.services_of_kind(ServiceKind::En).map(|en| en.number()).collect();
+        match self.close(
+            dn,
+            stream,
+            id,
+            records,
+            length,
+            now(),
+            &ens,
+            process.cluster.extents.instances,
+        ) {
+            Ok(extent) => Response { id: 0, status: Status::Ok, args: extent.args() },
+            Err(e) => Response::error(Status::Internal, e.to_string()),
+        }
+    }
+
+    /// Seal the stream's open extent and name the next one, both under the stream's
+    /// lock, so a request that finds the extent already sealed gets the extent that
+    /// replaced it rather than an error.
+    #[allow(clippy::too_many_arguments)]
+    fn close(
+        &self,
+        dn: u32,
+        stream: u64,
+        id: u64,
+        records: u64,
+        length: u64,
+        second: u64,
+        ens: &[u32],
+        instances: usize,
+    ) -> Result<Extent> {
+        let mut shard = self.shards[shard_of(dn, stream)].lock().expect("streams");
+        let Some(held) = shard.get_mut(&(dn, stream)) else {
+            return Err(Error::new(format!("no stream {stream} from dn {dn}")));
+        };
+        // Only whoever names the open extent seals it. Two appends can find the same
+        // extent full at once, and the second one has nothing left to do.
+        if held.open.as_ref().is_some_and(|open| open.id == id) {
+            let extent = held.open.take().expect("an open extent");
+            held.sealed_records = extent.first_record + records;
+            held.sealed.push(Sealed { extent, records, length });
+            self.sealed.fetch_add(1, Ordering::Relaxed);
+        }
+        self.appendable(held, second, ens, instances)
+    }
+
+    /// The stream's open extent, naming one if it has none.
     fn open(
         &self,
         dn: u32,
@@ -263,20 +359,42 @@ impl SN {
         instances: usize,
     ) -> Result<Extent> {
         let mut shard = self.shards[shard_of(dn, stream)].lock().expect("streams");
-        let Some(record) = shard.get_mut(&(dn, stream)) else {
+        let Some(held) = shard.get_mut(&(dn, stream)) else {
             return Err(Error::new(format!("no stream {stream} from dn {dn}")));
         };
-        if let Some(extent) = &record.open {
+        self.appendable(held, second, ens, instances)
+    }
+
+    /// The extent this stream can be appended to, named here if there is not one.
+    ///
+    /// **The stream's lock is held across the naming, so several requests for a new
+    /// extent produce one extent**: whoever gets the lock does the work and the rest
+    /// queue behind it and are handed the same answer. That is what stops a burst of
+    /// appends to a fresh stream — or to one that has just sealed — from opening an
+    /// extent apiece.
+    ///
+    /// ⚠️ The queue is the mutex only because the work is a counter and an instance
+    /// list. When opening an extent has to be recorded durably, this becomes a wait
+    /// on somebody else's round trip, and blocking a worker per waiter would be the
+    /// wrong shape — the waiters must attach to the one in flight instead.
+    fn appendable(
+        &self,
+        held: &mut Stream,
+        second: u64,
+        ens: &[u32],
+        instances: usize,
+    ) -> Result<Extent> {
+        if let Some(extent) = &held.open {
             return Ok(extent.clone());
         }
         let (id, created) = self.naming.name(second)?;
         let extent = Extent {
             id,
             created,
-            first_record: record.sealed_records,
+            first_record: held.sealed_records,
             instances: self.naming.instances(ens, instances)?,
         };
-        record.open = Some(extent.clone());
+        held.open = Some(extent.clone());
         self.extents.fetch_add(1, Ordering::Relaxed);
         Ok(extent)
     }
@@ -326,6 +444,96 @@ mod tests {
     fn an_extent_on_a_stream_that_does_not_exist_is_refused() {
         let sn = SN::new(testing::sn_config());
         assert!(sn.open(0, 7, 1_000_000, &[0, 1, 2, 3], 4).is_err());
+    }
+
+    /// Sealing records what the extent came to and names the next one, whose
+    /// numbering starts where the last one stopped.
+    #[test]
+    fn sealing_starts_the_next_extent_where_the_last_one_stopped() {
+        let sn = sn_with_stream(0, 7);
+        let ens = [0, 1, 2, 3];
+        let want = testing::extents().instances;
+        let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
+        assert_eq!(first.first_record, 0);
+
+        // Twelve records in it, and 400 bytes.
+        let second = sn.close(0, 7, first.id, 12, 400, 1_000_001, &ens, want).unwrap();
+        assert_ne!(second.id, first.id, "a fresh extent");
+        assert_eq!(second.first_record, 12, "numbering carries on");
+
+        let third = sn.close(0, 7, second.id, 5, 90, 1_000_002, &ens, want).unwrap();
+        assert_eq!(third.first_record, 17);
+        assert_eq!(sn.sealed.load(Ordering::Relaxed), 2);
+    }
+
+    /// An extent already sealed by somebody else does not fail: the caller wanted
+    /// somewhere to append, and the extent that replaced it is the answer. This is
+    /// the race the stream's lock exists to make harmless.
+    #[test]
+    fn sealing_an_extent_that_is_already_gone_gives_the_one_that_replaced_it() {
+        let sn = sn_with_stream(0, 7);
+        let ens = [0, 1, 2, 3];
+        let want = testing::extents().instances;
+        let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
+        let second = sn.close(0, 7, first.id, 4, 100, 1_000_001, &ens, want).unwrap();
+        // A request that saw the seal a moment later, naming the extent that is now
+        // sealed, and one naming an extent this stream never had.
+        assert_eq!(sn.close(0, 7, first.id, 4, 100, 1_000_002, &ens, want).unwrap().id, second.id);
+        assert_eq!(sn.close(0, 7, 999, 0, 0, 1_000_003, &ens, want).unwrap().id, second.id);
+        assert_eq!(sn.sealed.load(Ordering::Relaxed), 1, "sealed once");
+        assert_eq!(sn.extents.load(Ordering::Relaxed), 2, "two extents, not four");
+    }
+
+    /// Two appends can find the same extent full at once, so sealing it twice must
+    /// not open two extents. The second one gets whatever is open now.
+    #[test]
+    fn sealing_the_same_extent_twice_opens_one_extent() {
+        let sn = sn_with_stream(0, 7);
+        let ens = [0, 1, 2, 3];
+        let want = testing::extents().instances;
+        let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
+        let second = sn.close(0, 7, first.id, 4, 100, 1_000_001, &ens, want).unwrap();
+        let repeat = sn.close(0, 7, first.id, 4, 100, 1_000_002, &ens, want).unwrap();
+        assert_eq!(repeat.id, second.id, "the extent that is open now");
+        assert_eq!(sn.sealed.load(Ordering::Relaxed), 1, "sealed once");
+    }
+
+    /// A record in a sealed extent is found there; one past everything sealed goes to
+    /// the open extent, because how far that reaches is the EN's to say.
+    #[test]
+    fn a_record_is_found_in_the_extent_holding_it() {
+        let sn = sn_with_stream(0, 7);
+        let ens = [0, 1, 2, 3];
+        let want = testing::extents().instances;
+        let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
+        let second = sn.close(0, 7, first.id, 3, 60, 1_000_001, &ens, want).unwrap();
+        let third = sn.close(0, 7, second.id, 2, 40, 1_000_002, &ens, want).unwrap();
+
+        let holds = |record: u64| {
+            let answer =
+                sn.locate(&Request::new(Op::LocateRecord).number(0).number(7).number(record));
+            assert_eq!(answer.status, Status::Ok, "record {record}");
+            match answer.args.first() {
+                Some(Arg::Number(id)) => *id,
+                _ => panic!("no extent"),
+            }
+        };
+        // Records 0 to 2 are in the first extent, 3 and 4 in the second, and
+        // anything from 5 on is routed to the one still open.
+        assert_eq!(holds(0), first.id);
+        assert_eq!(holds(2), first.id);
+        assert_eq!(holds(3), second.id);
+        assert_eq!(holds(4), second.id);
+        assert_eq!(holds(5), third.id);
+        assert_eq!(holds(500), third.id, "the EN says whether it is really there");
+    }
+
+    /// A stream with no extent at all has nowhere to look.
+    #[test]
+    fn a_record_in_a_stream_with_no_extent_is_not_found() {
+        let sn = sn_with_stream(0, 7);
+        let answer = sn.locate(&Request::new(Op::LocateRecord).number(0).number(7).number(0));
+        assert_eq!(answer.status, Status::NotFound);
     }
 
     /// The second names the key, so an id must never carry one that has already

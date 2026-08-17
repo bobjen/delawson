@@ -55,6 +55,11 @@ const SERVES: &[Op] = &[
 /// sending it is told it is unbuilt rather than misdirected.
 const FORWARDED: &[Op] = &[Op::CreateObject, Op::BatchCreate, Op::ObjectInfo, Op::BatchInfo];
 
+/// How many sealed extents an append will step over before giving up. More than one
+/// because other writers are filling extents at the same time; bounded because
+/// stepping over them for ever would be a livelock rather than progress.
+const TRIES: u32 = 8;
+
 /// What FE coordinates rather than forwards.
 const COORDINATED: &[Op] = &[Op::AppendRecord, Op::ReadRecord];
 
@@ -258,7 +263,7 @@ impl FE {
     ) {
         let key = (located.dn, located.stream);
         if let Some(open) = self.open.lock().expect("extents").get(&key) {
-            return self.to_primary(process, located, open.clone(), body, reply);
+            return self.to_primary(process, located, open.clone(), body, TRIES, reply);
         }
         let identity = format!("SN{}", located.sn);
         let ask = Request::new(Op::OpenExtent).number(located.dn as u64).number(located.stream);
@@ -274,7 +279,7 @@ impl FE {
                     .send(Response::error(Status::Internal, "that answer named no extent"));
             };
             fe.open.lock().expect("extents").insert(key, open.clone());
-            fe.to_primary(&onward, located, open, body, reply);
+            fe.to_primary(&onward, located, open, body, TRIES, reply);
         });
         if let Err(e) = asked {
             logw!("could not reach an SN", "sn {named},{e}");
@@ -284,12 +289,18 @@ impl FE {
     /// The bytes, to the primary instance. The framing and the instance list travel
     /// with them: the primary is what counts the records and what broadcasts to the
     /// others, and the SN is not in this path to be asked again.
+    ///
+    /// `tries` is what is left of the retries an append gets: a full extent is
+    /// answered `Sealed`, and the append belongs in the next one. Several writers can
+    /// fill successive extents while one append is being placed, so a retry is not
+    /// always the last one needed.
     fn to_primary(
-        &self,
+        self: &Arc<Self>,
         process: &Arc<Process>,
         located: Located,
         open: Open,
         body: Vec<u8>,
+        tries: u32,
         reply: Reply,
     ) {
         let identity = format!("EN{}", open.instances[0]);
@@ -303,13 +314,80 @@ impl FE {
         for en in &open.instances {
             ask = ask.number(*en as u64);
         }
-        let ask = ask.bytes(body);
+        let ask = ask.bytes(body.clone());
         let named = identity.clone();
+        let fe = Arc::clone(self);
+        let onward = Arc::clone(process);
         let asked = process.ask(&identity, &ask, move |answer| {
+            if answer.status == Status::Sealed {
+                return fe.after_seal(&onward, located, open, body, tries, answer, reply);
+            }
             reply.send(receipt(&located, &open, answer));
         });
         if let Err(e) = asked {
             logw!("could not reach an EN", "en {named},{e}");
+        }
+    }
+
+    /// The extent filled up. Tell the SN what it came to, take the next one, and
+    /// send the append again — once. A fresh extent that also says it is sealed
+    /// means the append is larger than an extent can hold, which is a bad request
+    /// and not a loop to keep going round.
+    #[allow(clippy::too_many_arguments)]
+    fn after_seal(
+        self: &Arc<Self>,
+        process: &Arc<Process>,
+        located: Located,
+        open: Open,
+        body: Vec<u8>,
+        tries: u32,
+        answer: Response,
+        reply: Reply,
+    ) {
+        let [Arg::Number(records), Arg::Number(length)] = answer.args.as_slice() else {
+            return reply
+                .send(Response::error(Status::Internal, "a seal said nothing about the extent"));
+        };
+        // An extent that sealed with nothing in it is one this block could not fit
+        // even empty, which is the block's fault and not worth another extent.
+        if *records == 0 && *length == 0 {
+            return reply.send(Response::error(
+                Status::BadRequest,
+                format!("{} bytes will not fit an extent of its own", body.len()),
+            ));
+        }
+        if tries == 0 {
+            return reply.send(Response::error(
+                Status::Internal,
+                "kept finding a sealed extent, which should not go on this long",
+            ));
+        }
+        // What was cached is closed, so nothing should hand it out again.
+        let key = (located.dn, located.stream);
+        self.open.lock().expect("extents").remove(&key);
+
+        let identity = format!("SN{}", located.sn);
+        let ask = Request::new(Op::SealExtent)
+            .number(located.dn as u64)
+            .number(located.stream)
+            .number(open.id)
+            .number(*records)
+            .number(*length);
+        let fe = Arc::clone(self);
+        let onward = Arc::clone(process);
+        let named = identity.clone();
+        let asked = process.ask(&identity, &ask, move |answer| {
+            if answer.status != Status::Ok {
+                return reply.send(answer);
+            }
+            let Some(next) = Open::of(located.sn, &answer.args) else {
+                return reply.send(Response::error(Status::Internal, "that seal opened no extent"));
+            };
+            fe.open.lock().expect("extents").insert(key, next.clone());
+            fe.to_primary(&onward, located, next, body, tries - 1, reply);
+        });
+        if let Err(e) = asked {
+            logw!("could not reach an SN", "sn {named},{e}");
         }
     }
 

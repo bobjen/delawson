@@ -112,6 +112,9 @@ ops! {
     // there is not one already, and which extent holds a given record.
     OpenExtent = 0x0502, "open-extent";
     LocateRecord = 0x0503, "locate-record";
+    // Sealing is reported to the SN, which records what the extent came to and
+    // opens the next one in the same breath.
+    SealExtent = 0x0504, "seal-extent";
 
     // EN. An append arrives from an FE at the primary; the primary broadcasts the
     // same bytes at a fixed offset to the other three instances.
@@ -147,6 +150,10 @@ pub enum Status {
     /// KS has not been unlocked.
     Locked = 4,
     Internal = 5,
+    /// That extent is sealed, so the append belongs in the next one. Not a failure:
+    /// the caller is being told where to go, and the answer carries what the extent
+    /// came to.
+    Sealed = 6,
 }
 
 impl Status {
@@ -158,6 +165,7 @@ impl Status {
             3 => Status::NotFound,
             4 => Status::Locked,
             5 => Status::Internal,
+            6 => Status::Sealed,
             other => return Err(Error::new(format!("unknown status {other}"))),
         })
     }
@@ -172,6 +180,7 @@ impl std::fmt::Display for Status {
             Status::NotFound => "not found",
             Status::Locked => "locked",
             Status::Internal => "internal error",
+            Status::Sealed => "that extent is sealed",
         };
         f.write_str(text)
     }
