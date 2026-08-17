@@ -2,8 +2,14 @@
 //!
 //! Nobody logs into a machine to read these. The three answers here are what
 //! replaces that, and they are deliberately the three that between them settle
-//! most questions: what is this process mostly saying, which lines mention this
-//! thing, and what did it say around then.
+//! most questions: what is this process saying, which lines mention this thing,
+//! and what did it say around then.
+//!
+//! **A histogram is read from both ends.** The top says what is happening most,
+//! which is the obvious use; the bottom says what happened once, which is the
+//! needle in the haystack when the thing being chased is rare. So it returns every
+//! row rather than the busiest few, and it takes a time range, because a rare event
+//! is usually being looked for in the minute it happened.
 //!
 //! It lives in `common` because it has to run on the machine holding the files,
 //! and a machine that only runs signed code has two ways to do that: ask the
@@ -77,7 +83,8 @@ impl Logs {
     }
 
     /// Every line, oldest first, one file and one block at a time. Returns how
-    /// many lines went past.
+    /// many lines went past — including the ones a time range excluded, since
+    /// "nothing in that minute" and "nothing at all" are different answers.
     pub fn scan(&self, mut each: impl FnMut(&str)) -> Result<u64> {
         let mut seen = 0;
         for path in &self.paths {
@@ -121,22 +128,23 @@ impl Logs {
     }
 
     /// `000000123,i,file=…,line=…,constant`, sorted by frequency: a row per place
-    /// in the code that said anything.
+    /// in the code that said anything, in a window of time.
     ///
     /// The fields are spelled as the lines spell them, so everything after the
     /// count and the level is **literally a substring of the lines it counts** —
     /// a row is what to paste into the next query.
     ///
-    /// **There is nothing to tune.** The constant does not vary, so grouping on it
-    /// is exact and no row needs truncating — and there is no need to fold values
-    /// into the grouping either, because the row tells you the file, the line and
-    /// the constant, and a grep for that constant is the next question
-    /// (Asserted, Bob, 2026-08-16). Two cheap queries beat one query with a knob.
-    pub fn histogram(&self, rows: usize) -> Result<(u64, Vec<String>)> {
+    /// **Every row comes back**, because the bottom of the list is half the point:
+    /// a count of one is the rare event someone is looking for, and truncating to
+    /// the busiest rows would throw away exactly that.
+    pub fn histogram(&self, from: &str, to: &str) -> Result<(u64, Vec<String>)> {
         let mut counts: HashMap<String, u64> = HashMap::new();
         let mut key = String::new();
         let seen = self.scan(|whole| {
             let line = Line::of(whole);
+            if !within(line.time, from, to) {
+                return;
+            }
             key.clear();
             key.push_str(line.level);
             key.push_str(",file=");
@@ -148,24 +156,37 @@ impl Logs {
             match counts.get_mut(&key) {
                 Some(count) => *count += 1,
                 None => {
-                    counts.insert(key.clone(), 1);
+                    // A log of nothing but unique lines would be a histogram of
+                    // itself, so there is a stop — said out loud when it is hit.
+                    if counts.len() < MAX_ROWS {
+                        counts.insert(key.clone(), 1);
+                    }
                 }
             }
         })?;
 
+        let full = counts.len() >= MAX_ROWS;
         let mut counted: Vec<String> =
             counts.into_iter().map(|(what, count)| format!("{count:09},{what}")).collect();
         // Zero-padded, so the plain order is the frequency order.
         counted.sort_by(|a, b| b.cmp(a));
-        counted.truncate(rows);
+        if full {
+            counted.push(format!("stopped counting at {MAX_ROWS} kinds of line"));
+        }
         Ok((seen, counted))
     }
 
-    /// Whole lines containing `what`, oldest first.
-    pub fn grep(&self, what: &str, limit: usize) -> Result<(u64, Vec<String>)> {
+    /// Whole lines containing `what`, oldest first, in a window of time.
+    pub fn grep(
+        &self,
+        what: &str,
+        from: &str,
+        to: &str,
+        limit: usize,
+    ) -> Result<(u64, Vec<String>)> {
         let mut found = Vec::new();
         let seen = self.scan(|line| {
-            if found.len() < limit && line.contains(what) {
+            if found.len() < limit && line.contains(what) && within(Line::of(line).time, from, to) {
                 found.push(line.to_string());
             }
         })?;
@@ -187,17 +208,22 @@ impl Logs {
                 }
                 return;
             }
-            if found.len() >= limit {
-                return;
-            }
-            let time = Line::of(line).time;
-            if (from.is_empty() || time >= from) && (to.is_empty() || time <= to) {
+            if found.len() < limit && within(Line::of(line).time, from, to) {
                 found.push_back(line.to_string());
             }
         })?;
         Ok((seen, found.into()))
     }
 }
+
+/// Whether a line's time is in the window. Times are written so that comparing
+/// the text is comparing the instant, and an empty end is no bound.
+fn within(time: &str, from: &str, to: &str) -> bool {
+    (from.is_empty() || time >= from) && (to.is_empty() || time <= to)
+}
+
+/// A histogram of a log that is all unique lines would be as large as the log.
+const MAX_ROWS: usize = 10_000;
 
 /// The largest block a writer may emit, and so the largest a reader will allocate
 /// for one. A writer with more than this pending cuts it at a line boundary.
@@ -226,8 +252,6 @@ i,2026-08-17 01:00:00.000002,pid=1,tid=2,file=dn/src/main.rs,line=10,answered,op
 i,2026-08-17 01:00:00.000003,pid=1,tid=3,file=dn/src/main.rs,line=10,answered,op object-info,status ok,us 2
 n,2026-08-17 01:00:01.000000,pid=1,tid=1,file=common/src/server.rs,line=99,listening,address 127.0.0.1:9601
 ";
-    const ROWS: usize = 100;
-
     /// A log of one file, plain or compressed, in a directory of its own.
     fn logs(packed: bool) -> Logs {
         // Tests run at the same time in one process, so the name has to be
@@ -249,13 +273,29 @@ n,2026-08-17 01:00:01.000000,pid=1,tid=1,file=common/src/server.rs,line=99,liste
         Logs::open(&dir, "dn0", u64::MAX).unwrap()
     }
 
-    /// A row per site, whole, with nothing cut and nothing to choose.
+    /// A row per site, whole, with nothing cut and nothing to choose — and the rare
+    /// one at the bottom, which is the half of the answer that finds a needle.
     #[test]
-    fn a_row_per_site() {
-        let (seen, rows) = logs(false).histogram(ROWS).unwrap();
+    fn a_row_per_site_including_the_rare_one() {
+        let (seen, rows) = logs(false).histogram("", "").unwrap();
         assert_eq!(seen, 4);
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0], "000000003,i,file=dn/src/main.rs,line=10,answered", "{rows:?}");
+        assert_eq!(
+            rows[rows.len() - 1],
+            "000000001,n,file=common/src/server.rs,line=99,listening",
+            "{rows:?}"
+        );
+    }
+
+    /// A window narrows it, because a rare event is looked for in the minute it
+    /// happened rather than in everything the process ever said.
+    #[test]
+    fn a_window_narrows_the_histogram() {
+        let (seen, rows) = logs(false).histogram("2026-08-17 01:00:01", "").unwrap();
+        assert_eq!(seen, 4, "every line is still read");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].ends_with("listening"), "{rows:?}");
     }
 
     /// And a row is what to grep for: the part after the count and the level is a
@@ -263,20 +303,20 @@ n,2026-08-17 01:00:01.000000,pid=1,tid=1,file=common/src/server.rs,line=99,liste
     #[test]
     fn a_row_says_what_to_grep_for() {
         let logs = logs(false);
-        let (_, rows) = logs.histogram(ROWS).unwrap();
+        let (_, rows) = logs.histogram("", "").unwrap();
         let site = rows[0].splitn(3, ',').nth(2).expect("count, level, then the rest");
-        let (_, found) = logs.grep(site, 10).unwrap();
+        let (_, found) = logs.grep(site, "", "", 10).unwrap();
         assert_eq!(found.len(), 3, "{found:?}");
     }
 
     #[test]
     fn a_compressed_log_reads_the_same() {
-        assert_eq!(logs(false).histogram(ROWS).unwrap(), logs(true).histogram(ROWS).unwrap());
+        assert_eq!(logs(false).histogram("", "").unwrap(), logs(true).histogram("", "").unwrap());
     }
 
     #[test]
     fn grep_returns_whole_lines() {
-        let (_, found) = logs(true).grep("object-info", 10).unwrap();
+        let (_, found) = logs(true).grep("object-info", "", "", 10).unwrap();
         assert_eq!(found.len(), 1);
         assert!(found[0].starts_with("i,2026-08-17 01:00:00.000003,pid=1"));
     }

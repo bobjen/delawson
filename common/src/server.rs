@@ -494,16 +494,24 @@ impl Reply {
             logw!("could not answer", "op {},{e}", self.op);
         }
         if let Some(started) = self.started {
-            // Low-cardinality values first, then the subject, then the duration:
-            // a histogram groups on a prefix, so the order of the values is what
-            // decides which groupings are available at all.
-            logi!(
-                "answered",
-                "op {},status {status},about {},us {}",
-                self.op,
-                self.about,
-                started.elapsed().as_micros()
-            );
+            let us = started.elapsed().as_micros();
+            // An answer that went wrong gets its own constant, not just a
+            // different value: a histogram separates kinds by constant, so one
+            // refusal among a million successes is a row of its own — findable
+            // without knowing to look for it. That is what the rare end is for.
+            match status {
+                Status::Ok => {
+                    logi!("answered", "op {},about {},us {us}", self.op, self.about);
+                }
+                _ => {
+                    logi!(
+                        "answered with a problem",
+                        "op {},status {status},about {},us {us}",
+                        self.op,
+                        self.about
+                    );
+                }
+            }
         }
     }
 }
@@ -734,9 +742,11 @@ fn read_logs(process: &Process, request: &Request) -> Response {
         Err(e) => return Response::error(Status::Internal, e.to_string()),
     };
 
+    // Each of the three takes the same window: a rare thing is looked for in the
+    // minute it happened.
     let read = match request.op {
-        Op::LogHistogram => logs.histogram(number(1, 40)),
-        Op::LogGrep => logs.grep(text(1), number(2, 100)),
+        Op::LogHistogram => logs.histogram(text(1), text(2)),
+        Op::LogGrep => logs.grep(text(1), text(2), text(3), number(4, 100)),
         _ => logs.range(text(1), text(2), number(3, 100)),
     };
     match read {

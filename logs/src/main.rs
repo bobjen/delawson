@@ -30,15 +30,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// What this process is mostly saying, most frequent first.
+    /// What this process said, most frequent first — and read the bottom for what
+    /// it said once, which finds a rare event without knowing what to look for.
     Histogram {
-        /// Rows to return, most frequent first.
-        #[arg(long, default_value_t = 40)]
-        rows: usize,
+        #[arg(long, default_value = "")]
+        from: String,
+        #[arg(long, default_value = "")]
+        to: String,
     },
     /// Whole lines containing something.
     Grep {
         what: String,
+        #[arg(long, default_value = "")]
+        from: String,
+        #[arg(long, default_value = "")]
+        to: String,
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
@@ -63,8 +69,8 @@ fn main() {
         }
     };
     let read = match &cli.cmd {
-        Cmd::Histogram { rows } => logs.histogram(*rows),
-        Cmd::Grep { what, limit } => logs.grep(what, *limit),
+        Cmd::Histogram { from, to } => logs.histogram(from, to),
+        Cmd::Grep { what, from, to, limit } => logs.grep(what, from, to, *limit),
         Cmd::Lines { from, to, limit } => logs.range(from, to, *limit),
     };
     match read {

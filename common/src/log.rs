@@ -23,9 +23,14 @@
 //! The constant is a field of a comma-separated line, so it may not contain a
 //! comma. Say "because" rather than ", ".
 //!
-//! Separate the values with commas too — `"op {},status {}"` — so a reader can
-//! group on the first few of them exactly. Nothing then needs truncating: the
-//! constant is whole, and a value is either in the grouping or not.
+//! Separate the values with commas too — `"op {},status {}"` — so a line is a row
+//! of fields rather than a sentence.
+//!
+//! **An outcome worth finding deserves its own constant.** A histogram separates
+//! kinds by constant, so a refusal logged with the same constant as a success is
+//! one row among a million and invisible; logged with its own, it is a row with a
+//! count of one, which is how a rare thing is found by someone who does not know
+//! what they are looking for.
 
 use crate::{Context, Result};
 use std::fmt::Write as _;
@@ -868,7 +873,7 @@ mod blocks {
         rotating.flush().unwrap();
 
         let logs = crate::logread::Logs::open(&dir, "dn0", u64::MAX).unwrap();
-        let (seen, rows) = logs.histogram(10).unwrap();
+        let (seen, rows) = logs.histogram("", "").unwrap();
         assert_eq!(seen, count as u64, "every line should come back");
         assert_eq!(rows.len(), 1, "{rows:?}");
         let _ = std::fs::remove_dir_all(&dir);

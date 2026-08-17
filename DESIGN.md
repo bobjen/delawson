@@ -9443,8 +9443,15 @@ enough to stop anyone wanting a shell**:
 The histogram row is `000000123,i,file=…,line=…,constant`, sorted by frequency — and it sorts by plain
 text order because the count is zero-padded, which is why it is.
 
-**It has nothing to tune, and that is the point** (Asserted, Bob, 2026-08-16). A row per place in the
-code that said anything, the constant whole, nothing truncated and no knob:
+**It is read from both ends** (Asserted, Bob, 2026-08-16). The top says what is happening most, which
+is the obvious use. **The bottom says what happened once, which is the needle in the haystack** — and
+it finds that needle *without anyone knowing what the needle is*, which no grep can do. So every row
+comes back rather than the busiest few, since truncating to the top would throw away exactly the half
+that finds a rare thing. All three answers take a time range as well, because a rare event is looked
+for in the minute it happened.
+
+**It has nothing to tune.** A row per place in the code that said anything, the constant whole,
+nothing truncated and no knob:
 
 ```
 000268456,i,file=common/src/server.rs,line=496,answered
@@ -9463,6 +9470,32 @@ laws log-grep --to DN0 "file=common/src/server.rs,line=496,answered"
 
 Earlier versions folded a character width, and then a count of values, into the grouping. Both were
 answering the second question inside the first one, which is why neither was needed.
+
+⚠️ **This puts a requirement on the code that writes the lines: an outcome worth finding needs its own
+constant.** The first attempt logged every answer with the constant `answered` and the status as a
+value — so a duplicate create and a lookup of a missing name, deliberately hidden among 270,000
+successes, did not appear in the histogram at all. They were inside the big row. Giving a failed
+answer its own constant makes them a row of their own:
+
+```
+000268709,i,file=common/src/server.rs,line=504,answered
+000000048,n,file=common/src/server.rs,line=437,switched to a batching sender because …
+000000002,i,file=common/src/server.rs,line=507,answered with a problem      <- the needle
+000000001,n,file=common/src/server.rs,line=369,registered with KS
+```
+
+and the row leads straight to them:
+
+```
+laws log-grep --to DN0 "line=507,answered with a problem"
+  i,…,answered with a problem,op create,status bad request,about /bench/1,us 30
+  i,…,answered with a problem,op object-info,status not found,about /nowhere,us 26
+```
+
+**So the rule for writing a line is: constants separate kinds, values carry detail.** A status that
+distinguishes a failure from a success belongs in the constant, not only in the values, or the
+histogram cannot see it — and the whole point of the rare end is to see what nobody thought to search
+for.
 
 **Reading is deliberately serial and takes as long as it takes** (Asserted, Bob, 2026-08-16). It is
 competing with a server for the same CPU and the same disk, so it reads one file at a time and one

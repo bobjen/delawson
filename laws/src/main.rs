@@ -123,11 +123,16 @@ enum Cmd {
     Registry,
     /// What a process logs, by site, busiest first: the live counters.
     Sites,
-    /// A histogram of a process's log files, most frequent first: a row per place
-    /// in the code that said anything. Grep for a row's constant to see the lines.
+    /// A histogram of a process's log files: a row per place in the code that said
+    /// anything, most frequent first. Read the bottom for what happened once, which
+    /// is how a rare event is found without knowing what to look for; then grep for
+    /// that row.
     LogHistogram {
-        #[arg(long, default_value_t = 40)]
-        rows: usize,
+        /// Narrow it to a window, which is usually what a rare event wants.
+        #[arg(long, default_value = "")]
+        from: String,
+        #[arg(long, default_value = "")]
+        to: String,
         /// Which log: the full one, or "info" for the one reaching further back.
         #[arg(long, default_value = "full")]
         which: String,
@@ -135,6 +140,10 @@ enum Cmd {
     /// Whole log lines containing something.
     LogGrep {
         what: String,
+        #[arg(long, default_value = "")]
+        from: String,
+        #[arg(long, default_value = "")]
+        to: String,
         #[arg(long, default_value_t = 100)]
         limit: usize,
         #[arg(long, default_value = "full")]
@@ -983,12 +992,15 @@ fn build(cmd: &Cmd) -> Result<Request> {
         Cmd::SnMasterKey { sn, day } => Request::new(Op::SnMasterKey).number(*sn).number(*day),
         Cmd::RotateMasterKey => Request::new(Op::RotateMasterKey),
 
-        Cmd::LogHistogram { rows, which } => {
-            Request::new(Op::LogHistogram).text(which).number(*rows as u64)
+        Cmd::LogHistogram { from, to, which } => {
+            Request::new(Op::LogHistogram).text(which).text(from).text(to)
         }
-        Cmd::LogGrep { what, limit, which } => {
-            Request::new(Op::LogGrep).text(which).text(what).number(*limit as u64)
-        }
+        Cmd::LogGrep { what, from, to, limit, which } => Request::new(Op::LogGrep)
+            .text(which)
+            .text(what)
+            .text(from)
+            .text(to)
+            .number(*limit as u64),
         Cmd::LogLines { from, to, limit, which } => {
             Request::new(Op::LogLines).text(which).text(from).text(to).number(*limit as u64)
         }
