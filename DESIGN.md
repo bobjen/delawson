@@ -4666,7 +4666,8 @@ durable wrong data.
 #### 7.5.2 The client compresses out of place, then re-verifies
 
 **The `laws` client compresses the buffer — not in place — and then verifies that the buffer still
-matches the CRC** (Asserted, Bob, 2026-08-17). The order is the point: compressing out of place leaves
+matches the CRC** (Asserted, Bob, 2026-08-17). Compression belongs to the client rather than to an FE
+(§8.1.4.1), which is what makes this possible at all. The order is the point: compressing out of place leaves
 the original intact to be re-read, so **a corruption that happened before or during compression is
 caught by the mismatch.** Compressing in place would destroy the evidence.
 
@@ -4740,11 +4741,15 @@ combine their CRCs arithmetically, and only a coalesce that re-frames has to rea
 recompute.
 
 ⚠️ **The CRC is not exposed in object info** (Asserted, Bob, 2026-08-17), and the reason is a tenancy
-boundary rather than tidiness: **different tenants' data is mixed in one extent** (§4.6.1, §8.1.4), so
-**stream and extent metadata is not protected information.** A CRC is derived from user bytes, so
-putting one where cross-tenant metadata lives would leak a fingerprint of one tenant's data to
-another. It belongs with the block, inside what is encrypted — never in the metadata that describes
-where the block is.
+boundary rather than tidiness: **an EN's common extents combine tenants** (§8.1.4), so **stream and
+extent metadata is not protected information.** A CRC is derived from user bytes, so putting one where
+cross-tenant metadata lives would leak a fingerprint of one tenant's data to another. It belongs with
+the block, inside what is encrypted — never in the metadata that describes where the block is.
+
+**The block itself is single-tenant, though**, and so is a coalesced extent: an append block comes from
+one writer, and coalescing works only within one tenant's extents (§9.1.1). It is the staging extents
+that mix, which is why the boundary falls between a block and the metadata about it rather than between
+a block and its neighbours.
 
 ## 8. Writing
 
@@ -5282,6 +5287,17 @@ touching the final device. That is what makes §8.1.1a-10's hint valid immediate
 forward-dated promise.
 
 ##### 8.1.4.1 The client compresses, which is as far upstream as it goes
+
+**Settled twice.** An FE compressing each append block was considered and rejected on 2026-08-17:
+**"client compressing is better than FE compressing"** (Asserted, Bob). What the client version keeps
+is below; what an FE version would have cost is compression CPU inside the datacenter on the ingest
+path and append size across the internet. Neither version troubles §4.3.2.3's byte-identical
+instances, since one compressor is one compressor wherever it sits — the argument is about where the
+CPU and the bytes are, not about reproducibility.
+
+**And it settles who checks the user's CRC** (§9.1.1). A client that compresses is a client that has
+the codec, so it can decompress what comes back and compare it against the CRC it computed going in.
+**Nothing between the two ever looks inside.**
 
 **Append blocks are compressed by the `delawson` client library** (Asserted, Bob, 2026-08-15). The client
 library is DeLawson code, so this is not user code doing it — and it **reduces append size across the
@@ -6369,18 +6385,29 @@ decompresses and checks going out is comparing its own buffer against its own pr
 keys, and the guarantee covers the FE as well as everything below it. A check at the FE
 covers everything below the FE and takes the FE's word for the rest.
 
-⚠️ **And there is a candidate security reason, which turns on one property: whether a
-compression block can contain two tenants' records** (#64). §7.5.3 notes that **extents mix
-tenants**, and a compression block is a unit of compressed bytes rather than a unit of
-ownership — so if coalescing may pack two tenants' appends into one block, then handing that
-block to a client hands one tenant another's data, and the FE must extract instead. If a
-block is tenant-pure by construction, the client may hold it and the end-to-end version
-stands.
+**The candidate security reason turns out not to apply** (Asserted, Bob, 2026-08-17), and the
+reason is a constraint that was already true rather than one that had to be added:
 
-So the deciding question is not about reads at all. It is a constraint on **coalescing**, and
-it has a cost either way: tenant-pure blocks waste the tail of a block at every tenant
-boundary, which matters precisely for §1's enormous numbers of tiny objects, while
-tenant-mixed blocks put plaintext and CPU back on the FE for every read.
+| | Tenants |
+|---|---|
+| An **append block** | **one** — a block comes from one writer |
+| An EN's **common extent** | many, since staging combines whatever arrives (§8.1.4) |
+| **Coalescing** | within one tenant's extents only, so a dedicated extent is single-tenant |
+
+So a whole append block is one tenant's data by construction, and handing one to a client
+leaks nothing. **The end-to-end version stands**: the client may hold whole blocks and check
+its own CRC, and no tier between it and the disk has to look inside.
+
+And the capability question settles the same way: **the client compresses** (§8.1.4.1), so the
+client has the codec and can decompress what comes back. So the answer is the strong one —
+**the client checks its own CRC** — and it holds all the way down.
+
+**One dividend worth naming, because it is not obvious.** If the client compresses going in and
+decompresses coming out, then on the read path **the FE never holds plaintext either**: it
+authorizes, it finds the blocks, and it passes bytes it cannot read. That removes the security
+asymmetry §9.6.1 weighs — an FE cache of blocks would add no new plaintext location, just as an
+EN cache does not — and it means neither middle tier spends CPU on compression in either
+direction.
 
 ⚠️ **"Any instance" holds for a sealed extent, and not for an unsealed one — and the reason is
 the watermark, not the data** (Asserted, Bob, 2026-08-17). Below the durable length every instance
