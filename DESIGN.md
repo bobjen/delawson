@@ -6634,8 +6634,69 @@ unbounded: one object might contribute a hundred thousand extents to the answer.
 **That is the same problem a job scheduler has**, one level up: partitioning work across vertices
 needs the object sizes, and the sizes are what the lookups are for. §5.12.2 already names telling a
 job whether its remainder fits as the most useful thing DeLawson could tell a scheduler; this is the
-same gap arriving during *planning* rather than during execution. Nothing here solves it, and it
-should not be left for whoever writes the first scheduler to discover (#65).
+same gap arriving during *planning* rather than during execution.
+
+#### 9.1.3.2 A partial answer that carries complete counts
+
+Two things together reduce that to one round trip.
+
+**A caller works from a queue rather than a chain** (Asserted, Bob, 2026-08-17): split the objects
+into ranges, put the ranges in a queue, issue asynchronous requests for whatever is in it, and when
+an answer reveals more work, **put that at the end of the queue.** Discovery does not disappear, but
+it stops being the critical path — the pipe stays full while it happens, and the depth of the chain
+stops mattering because nothing waits on any particular answer.
+
+**And an answer says how much it did not tell you** (Asserted, Bob, 2026-08-17). An answer that is
+partial in *detail* can still be complete in *counts*:
+
+| The answer carries | Even when |
+|---|---|
+| how many **streams** the object has | it can only describe the first one |
+| how many **extents** the stream has | it returns only some of their metadata |
+| which range of extents this answer covers | that range is a small part of them |
+
+**That is what makes the rest trivial.** With the total extent count in hand, a caller computes every
+subsequent request by arithmetic — the same trick as §9.1.3.1's fixed chunks, applied to metadata
+instead of data — and the queue keeps them all in flight. So the shape is **one round trip to learn
+the shape, then everything else at once.** The counts are cheap to include: they are maintained
+already, because billing needs them (§12.8).
+
+**Multiple streams should be rare** (Asserted, Bob, 2026-08-17), which is why the stream count is
+worth carrying even though it is almost always one: a single stream reaches **51 PiB** before an SN's
+memory bounds it (§14.1), so an object needs a second only when it is enormous. The extent count is
+the interesting number in nearly every case, and the stream count is there so that the rare case is
+not a surprise.
+
+#### 9.1.3.3 The first round of discovery is the directory listing
+
+**A query over many objects will usually be preceded by a directory listing from the DN, and that
+listing is the first round of discovery** (Asserted, Bob, 2026-08-17). It can **estimate** the number
+of streams, extents and records in each object — so a caller planning work over a directory learns the
+shape of all of it in one answer, before asking about any object in particular.
+
+⚠️ **The accuracies differ, and which number a caller may rely on follows from where it lives:**
+
+| From the DN's listing | Accuracy | Because |
+|---|---|---|
+| streams per object | **exact** | the DN allocates them, so it owns the count (§17.12) |
+| extents per stream | **stale** | extents are the SN's, learned lazily (§8.1.3, §4.5) |
+| records per stream | **stale** | same, and for the same reason |
+
+**And stale is the right accuracy for what it is used for.** Partitioning work across vertices needs
+sizes to within a factor, not to the byte: a scheduler balancing 10,000 objects does not care that one
+of them has grown by three extents since the summary was written. Demanding exactness here would put
+§13.1's sync loops on the critical path of every job that plans — which is precisely the coupling that
+lazy summaries exist to avoid.
+
+So the discovery has three rounds and each is cheaper than it looks:
+
+1. **The listing**, once, giving estimates for every object in a directory.
+2. **A lookup per object it decides to read**, giving exact counts and the first range of extents
+   (§9.1.3.2) — all of these in flight at once, since the listing said how many to expect.
+3. **The ranges**, computed by arithmetic from the exact counts, also all at once.
+
+**Nothing in that chain waits on a number it could have estimated**, which is the property worth
+keeping when any of it is implemented.
 
 **Two consequences worth noting before it is built:**
 
