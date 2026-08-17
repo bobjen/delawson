@@ -5094,6 +5094,48 @@ This also removes the motivating case for making **power** an explicit nested fa
 for other reasons — a correlated power event is a disaster in the §1.1.1 sense — but nothing in the write path now
 depends on it.
 
+### 8.1.5 What an EN keeps on disk: a journal of extent metadata, per disk
+
+The bytes of an extent are on a disk; what says which extent they belong to, and at what
+offsets, has to be somewhere too. **That is a journal of extent metadata, one per disk**
+(Asserted, Bob, 2026-08-17), and it is an ordinary journal in the §4.4 sense — the same shape
+Raft state has, for the same reason:
+
+| Part | Holds |
+|---|---|
+| **Snapshot** | the disk's extent metadata as of a moment |
+| **Log** | every change since |
+
+**A new snapshot is written when the log gets big.** Nothing more elaborate: the log bounds
+recovery time, and rewriting the snapshot is what shortens it again.
+
+#### 8.1.5.1 Only coalesced extents are self-describing
+
+This is the part that decides how much the journal matters. **A coalesced extent should be
+self-describing** — it carries enough of its own metadata to be read without asking anything
+— **but a freshly written, un-coalesced extent is interpretable only with that disk's
+journal** (Asserted, Bob, 2026-08-17).
+
+⚠️ **So the journal sharpens a claim made in three other places.** §5.2, §5.5.3 and §8.4.1's
+heroics path all say that a disaster is recoverable by scanning ENs for self-describing
+extents. That is true of the coalesced ones. For everything written since the last
+coalescing, the scan finds bytes it cannot interpret, and the disk's journal is the only thing
+that says what they are. The recovery story therefore has two halves, and the second one is
+new: **coalesced data is recoverable from the data itself, recent data is recoverable from the
+journal.**
+
+And the exposure is per disk rather than per extent: **every un-coalesced extent on a disk
+depends on that one file.** Which makes it tempting to keep the journal on *two* different
+disks in the EN — a cheap, purely local piece of redundancy for something whose loss costs
+much more than it does — and that is worth deciding rather than assuming (#46).
+
+#### 8.1.5.2 Where the implementation starts
+
+**An EN begins with a vector of extents and a vector of appends, in memory** (Asserted, Bob,
+2026-08-17). That is enough to get the command working end to end, and the journal comes
+after — the same stand-in bargain as DN's in-memory object index (§17.5g), and the same
+caution: nothing about the in-memory version is evidence about what the durable one costs.
+
 ### 8.2 Record framing
 
 An object declares a framing at creation, and **appends are stored in the format the writer gave
