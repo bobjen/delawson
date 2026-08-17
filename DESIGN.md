@@ -9610,6 +9610,41 @@ pending is cut into blocks — always at a line boundary, since a line split acr
 no grep would find. Without that, the compression simply gave up on every block and wrote the text as
 it stood, which is the kind of failure that looks like it is working.
 
+### 17.5i Measure three times
+
+**Any timing is measured at least three times** (Asserted, Bob, 2026-08-16). One number is not a
+measurement: the spread is what says whether a difference between two configurations means anything,
+and this project has twice drawn a conclusion from single samples that repeats then overturned — an
+"11% slower" that was noise, and a "13% faster" that was a different variable. The benchmarks do three
+trials by default and print each one, then the mean and the spread.
+
+It paid for itself immediately, because the spreads are not all alike:
+
+| Measurement | Spread over three trials |
+|---|---|
+| ping, 16 x 256 | **1.9%** |
+| object-info, one per request | 2.8% |
+| create, 10 objects per request | 0.7% |
+| create, 1,000 objects per request | **51%** |
+
+⚠️ **That last row is not noise, it is the placeholder index growing.** Successive trials in one
+process ran 2.88M, 2.56M and 1.67M objects a second, with the slowest request in each going 348 ms,
+727 ms, 1.82 s. In a *fresh* process every trial gives 2.79M to 2.81M — a 0.9% spread — so what
+degrades is the table, not the message path. Pre-sizing the shards so nothing resizes gives 3.9M a
+second and a 67 ms worst case, which confirms it: **a hash table doubling under a lock is a latency
+cliff, and a create can wait seconds behind one.**
+
+**Not fixed, deliberately** (Asserted, Bob, 2026-08-16): the in-memory table is a stand-in for the
+disk-backed index of §14.2, and the goal here is messaging overhead rather than a metadata structure
+that is going to be replaced. What the measurement is worth is the requirement it puts on whatever
+replaces it — **the index must grow incrementally**, because growth that copies everything under a lock
+turns a metadata create into a multi-second stall. Two things follow for how numbers here are quoted:
+a create rate belongs to a stated table size, and it should come from a fresh process.
+
+(An attempt to stagger the shards' initial capacities so they would not all double at once made no
+difference at all: hashbrown rounds capacity to a power of two, so every shard ended up the same size
+anyway. Recorded because it looked obviously right and was not.)
+
 ### 17.6 The harness reports what it cannot enforce
 
 One box is one domain at every level, so it satisfies no spreading rule. That is legal — §5.6.7

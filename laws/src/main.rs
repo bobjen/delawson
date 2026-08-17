@@ -95,6 +95,10 @@ enum Cmd {
         /// Seconds to measure.
         #[arg(long, default_value_t = 10)]
         seconds: u64,
+        /// How many times to measure. One number is not a measurement: the spread
+        /// is what says whether a difference means anything.
+        #[arg(long, default_value_t = 3)]
+        trials: usize,
     },
     /// What a process says about itself.
     Status,
@@ -224,6 +228,9 @@ enum Cmd {
         prefix: String,
         #[arg(long, value_enum, default_value_t = Flavor::Unkeyed)]
         flavor: Flavor,
+        /// How many times to measure, each trial creating its own names.
+        #[arg(long, default_value_t = 3)]
+        trials: usize,
     },
     /// Look objects up at random, and time it. Run after bench-create with the
     /// same count and prefix.
@@ -242,6 +249,8 @@ enum Cmd {
         seconds: u64,
         #[arg(long, default_value = "/bench/")]
         prefix: String,
+        #[arg(long, default_value_t = 3)]
+        trials: usize,
     },
 
     /// A second name for an object, sharing its bytes.
@@ -468,7 +477,7 @@ fn run(cli: Cli) -> Result<()> {
             };
             ping(&cluster, &cli, &plan)
         }
-        Cmd::Bench { clients, warmup, size, dull, depth, seconds } => {
+        Cmd::Bench { clients, warmup, size, dull, depth, seconds, trials } => {
             // Anything answers a ping, so an unnamed target is KS, which is the
             // one process that is always there.
             let target = resolve(&cluster, &cli, ServiceKind::Ks)?;
@@ -479,6 +488,7 @@ fn run(cli: Cli) -> Result<()> {
                 dull: *dull,
                 depth: *depth,
                 seconds: *seconds,
+                trials: *trials,
                 timeout,
             };
             bench(&target, &plan, &cluster.messaging)
@@ -508,7 +518,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::BenchCreate { objects, batch, clients, depth, prefix, flavor } => {
+        Cmd::BenchCreate { objects, batch, clients, depth, prefix, flavor, trials } => {
             let target = resolve(&cluster, &cli, ServiceKind::Fe)?;
             let plan = Objects {
                 objects: *objects,
@@ -518,11 +528,12 @@ fn run(cli: Cli) -> Result<()> {
                 prefix: prefix.clone(),
                 keyed: *flavor == Flavor::Keyed,
                 seconds: 0,
+                trials: *trials,
                 timeout,
             };
             bench_create(&target, &plan, &cluster.messaging)
         }
-        Cmd::BenchInfo { objects, batch, clients, depth, seconds, prefix } => {
+        Cmd::BenchInfo { objects, batch, clients, depth, seconds, prefix, trials } => {
             let target = resolve(&cluster, &cli, ServiceKind::Fe)?;
             let plan = Objects {
                 objects: *objects,
@@ -532,6 +543,7 @@ fn run(cli: Cli) -> Result<()> {
                 prefix: prefix.clone(),
                 keyed: false,
                 seconds: *seconds,
+                trials: *trials,
                 timeout,
             };
             bench_info(&target, &plan, &cluster.messaging)
@@ -616,6 +628,31 @@ fn ping(cluster: &ClusterConfig, cli: &Cli, plan: &Plan) -> Result<()> {
     Ok(())
 }
 
+/// Run a measurement several times and say what came out.
+///
+/// **Three is the default, because one number is not a measurement**
+/// (Asserted, Bob, 2026-08-16): the spread is what says whether a difference
+/// between two configurations means anything, and a single sample hides it. This
+/// project has already drawn a wrong conclusion from single samples twice.
+fn trials(name: &str, times: usize, mut once: impl FnMut() -> Result<f64>) -> Result<()> {
+    let mut rates = Vec::with_capacity(times);
+    for _ in 0..times.max(1) {
+        rates.push(once()?);
+    }
+    if rates.len() > 1 {
+        let mean = rates.iter().sum::<f64>() / rates.len() as f64;
+        let low = rates.iter().copied().fold(f64::MAX, f64::min);
+        let high = rates.iter().copied().fold(0.0, f64::max);
+        println!(
+            "{name} {mean:.0} per second on average of {}, from {low:.0} to {high:.0}, \
+             a spread of {:.1}%",
+            rates.len(),
+            (high - low) / mean * 100.0
+        );
+    }
+    Ok(())
+}
+
 struct Bench {
     clients: usize,
     warmup: u64,
@@ -623,12 +660,17 @@ struct Bench {
     dull: bool,
     depth: usize,
     seconds: u64,
+    trials: usize,
     timeout: Duration,
 }
 
 /// Warm up, then measure. Throughput is the number to want first, and average
 /// latency is what says how much of it is per-message overhead.
 fn bench(target: &Target, plan: &Bench, messaging: &Messaging) -> Result<()> {
+    trials(&target.identity, plan.trials, || once(target, plan, messaging))
+}
+
+fn once(target: &Target, plan: &Bench, messaging: &Messaging) -> Result<f64> {
     let shared = Arc::new(messaging.clone());
     if plan.clients == 0 || plan.depth == 0 || plan.seconds == 0 {
         return Err(Error::new("--clients, --depth and --seconds must all be positive"));
@@ -679,9 +721,10 @@ fn bench(target: &Target, plan: &Bench, messaging: &Messaging) -> Result<()> {
             rate * plan.size as f64 / 1e6
         );
     }
-    Ok(())
+    Ok(rate)
 }
 
+#[derive(Clone)]
 struct Objects {
     objects: u64,
     batch: usize,
@@ -690,12 +733,24 @@ struct Objects {
     prefix: String,
     keyed: bool,
     seconds: u64,
+    trials: usize,
     timeout: Duration,
 }
 
 /// Create `objects` objects, sharing them out among the clients, each keeping
 /// `depth` requests in flight.
 fn bench_create(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<()> {
+    let mut trial = 0;
+    trials(&target.identity, plan.trials, || {
+        trial += 1;
+        // Each trial needs names nobody has taken, or the second one creates
+        // nothing and measures the refusing.
+        let mine = Objects { prefix: format!("{}{trial}/", plan.prefix), ..plan.clone() };
+        create_once(target, &mine, messaging)
+    })
+}
+
+fn create_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f64> {
     if plan.batch == 0 || plan.clients == 0 || plan.depth == 0 {
         return Err(Error::new("--batch, --clients and --depth must all be positive"));
     }
@@ -780,12 +835,16 @@ fn bench_create(target: &Target, plan: &Objects, messaging: &Messaging) -> Resul
         total.min.as_secs_f64() * 1e6,
         total.max.as_secs_f64() * 1e6
     );
-    Ok(())
+    Ok(made as f64 / seconds)
 }
 
 /// Look up objects at random for a while. Random because a benchmark that walks
 /// in order measures the cache rather than the index.
 fn bench_info(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<()> {
+    trials(&target.identity, plan.trials, || info_once(target, plan, messaging))
+}
+
+fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f64> {
     if plan.batch == 0 || plan.clients == 0 || plan.depth == 0 || plan.seconds == 0 {
         return Err(Error::new("--batch, --clients, --depth and --seconds must all be positive"));
     }
@@ -865,7 +924,7 @@ fn bench_info(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<
         total.min.as_secs_f64() * 1e6,
         total.max.as_secs_f64() * 1e6
     );
-    Ok(())
+    Ok(asked as f64 / seconds)
 }
 
 /// Print a response, and fail the process if the service refused.
