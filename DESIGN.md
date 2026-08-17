@@ -10439,3 +10439,42 @@ The interleaving is a writer-visible consequence worth stating: record 0 came fr
 writers appending to one object get **at-least-once ordering by arrival**, which is §8.1.1a's
 multi-writer mode working as designed, and a reason a writer wanting its own order wants its own
 object.
+
+#### 17.11.2 What the SN can and cannot see
+
+**The extent-create *request* rate climbs towards the append rate when the ENs are busy, while the
+actual number of extents created stays exactly what it always was** (Asserted, Bob, 2026-08-17). Every
+append that is in flight when an extent fills gets `Sealed`, and each of them asks the SN for the next
+extent — so the requests multiply with the number of appends in flight, and the SN collapses them all
+into one extent under the stream's lock (§17.10).
+
+Measured on one box, 160 appends of 44 bytes at a 4 KB seal limit:
+
+| | SN requests | Extents created | Requests per creation |
+|---|---|---|---|
+| One append at a time | 2 | 2 | **1** |
+| Eight writers at once | 9 | 2 | **~4** |
+
+**Measured, 2026-08-17.** Eight concurrent writers is a shallow queue; the ceiling is one request per
+append, reached when every append in flight hits the same seal.
+
+⚠️ **So three things must not be read off the SN, and one may be:**
+
+- **Not the append rate.** Appends never reach the SN, by design (§8.1.3). The only append-shaped
+  traffic it sees is the seal burst, and that measures **how many appends were in flight**, not how
+  many there were.
+- **Not a workload change.** A jump in extent-create requests is not a user doing something new. **It
+  is a symptom of the ENs being busy** — deeper queues mean more appends caught by each seal. Reading
+  it as offered load would send an operator to look in the wrong tier.
+- **Not extent-creation cost.** The requests multiply; the creations do not. An SN doing four times
+  the request rate is doing the same amount of work.
+- **The read rate, though, it does see**: one `locate-record` per read, since nothing caches where a
+  record lives. That part of its traffic *is* proportional to reads.
+
+Two consequences for what to build, and both are §17.10's rule in new places:
+
+- **The FE should collapse the storm** — one seal in flight per stream, with the other appends
+  attaching to it rather than each asking the SN (#57). The requests exist only because eight
+  coordinators independently discovered the same fact.
+- **The FE should cache where a record lives** for reads (#58). A sealed extent is immutable, so its
+  record range never changes; §9.1 already says a warm client goes straight to the EN.

@@ -175,6 +175,24 @@ impl FE {
         reply: Reply,
         then: impl FnOnce(&Arc<FE>, &Arc<Process>, Located, Reply) + Send + 'static,
     ) {
+        self.resolving(process, path, make, true, reply, then)
+    }
+
+    /// `again` is the one retry a lost race gets: two appends to a name that does not
+    /// exist both try to make it, and the one that loses is told the name is taken.
+    /// That is the right answer to a create and the wrong answer to an append, so the
+    /// append looks the object up again — by then it is there, and a lookup waits for
+    /// its stream (`Op::ObjectInfo` parks at the DN).
+    #[allow(clippy::too_many_arguments)]
+    fn resolving(
+        self: &Arc<Self>,
+        process: &Arc<Process>,
+        path: &str,
+        make: Option<Framing>,
+        again: bool,
+        reply: Reply,
+        then: impl FnOnce(&Arc<FE>, &Arc<Process>, Located, Reply) + Send + 'static,
+    ) {
         let dn = match process.pick(ServiceKind::Dn) {
             Ok(dn) => dn.to_string(),
             Err(e) => return reply.send(Response::error(Status::Internal, e.to_string())),
@@ -192,7 +210,9 @@ impl FE {
             // An append may make the object it is appending to, which is one more
             // hop and only on the first append.
             if let (Status::NotFound, Some(framing)) = (answer.status, make) {
-                return make_object(&fe, &onward, &named, owner, &path, framing, reply, then);
+                return make_object(
+                    &fe, &onward, &named, owner, &path, framing, again, reply, then,
+                );
             }
             if answer.status != Status::Ok {
                 return reply.send(answer);
@@ -458,6 +478,7 @@ fn make_object(
     owner: u32,
     path: &str,
     framing: Framing,
+    again: bool,
     reply: Reply,
     then: impl FnOnce(&Arc<FE>, &Arc<Process>, Located, Reply) + Send + 'static,
 ) {
@@ -468,7 +489,13 @@ fn make_object(
     let fe = Arc::clone(fe);
     let onward = Arc::clone(process);
     let named = dn.to_string();
+    let path = path.to_string();
     let asked = process.ask(dn, &ask, move |answer| {
+        // Somebody else made it first. For a create that is the answer; for an
+        // append it is only a reason to look again.
+        if answer.status == Status::BadRequest && again {
+            return fe.resolving(&onward, &path, Some(framing), false, reply, then);
+        }
         if answer.status != Status::Ok {
             return reply.send(answer);
         }
