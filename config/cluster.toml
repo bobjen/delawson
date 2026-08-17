@@ -68,30 +68,37 @@ shutdown_grace_ms = 2000
 # The roster: who may exist, and where each one sits in the hierarchy. No
 # addresses — a registration announces a port, it does not invent an identity, so
 # KS checks what registers against this.
+#
+# A line may say `count = n` for n processes of that kind, named KIND0, KIND1 and
+# so on in roster order; give `identity` instead when naming a single one. Rings
+# have one member for now, so KS, DN and SN are one apiece.
 [[service]]
-identity = "KS0"
 kind = "ks"
+count = 1
 domain = ["region0", "dc0", "rack0", "box0", "disk0"]
 
 [[service]]
-identity = "DN0"
 kind = "dn"
+count = 1
 domain = ["region0", "dc0", "rack0", "box0", "disk0"]
 
 [[service]]
-identity = "SN0"
 kind = "sn"
+count = 1
 domain = ["region0", "dc0", "rack0", "box0", "disk0"]
 
+# Four, because that is how many instances an extent has. They are all on this
+# box, so they share every failure domain and the rule stays unenforced — but the
+# count is what the placement report is about to have an opinion on.
 [[service]]
-identity = "EN0"
 kind = "en"
+count = 4
 domain = ["region0", "dc0", "rack0", "box0", "disk0"]
 media_class = "hdd"
 
 [[service]]
-identity = "FE0"
 kind = "fe"
+count = 1
 domain = ["region0", "dc0", "rack0", "box0", "disk0"]
 
 # Per-device-class constants. Every number here is a guess awaiting measurement;

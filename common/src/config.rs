@@ -16,7 +16,7 @@
 
 use crate::{Context, Error, Result};
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -66,8 +66,27 @@ impl std::fmt::Display for ServiceKind {
     }
 }
 
+/// A roster line. One line may stand for several processes of one kind, which is
+/// what a test cluster wants and what a real one wants per rack.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ServiceSpec {
+    /// Given only for a single process. With a count, identities are the kind
+    /// and a number, taken in roster order.
+    identity: Option<String>,
+    kind: ServiceKind,
+    #[serde(default = "one")]
+    count: usize,
+    domain: Vec<String>,
+    #[serde(default)]
+    media_class: Option<String>,
+}
+
+fn one() -> usize {
+    1
+}
+
+#[derive(Debug, Clone)]
 pub struct ServiceEntry {
     /// `KS0`, `FE0`: kind plus instance number.
     pub identity: String,
@@ -77,7 +96,6 @@ pub struct ServiceEntry {
     pub domain: Vec<String>,
     /// Which media-class row this process's storage follows. ENs have one;
     /// nothing else does.
-    #[serde(default)]
     pub media_class: Option<String>,
 }
 
@@ -233,8 +251,26 @@ pub struct Timeouts {
     pub shutdown_grace_ms: u64,
 }
 
+/// The cluster file as written. Roster lines are expanded into one entry per
+/// process before anything else sees them.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ClusterFile {
+    schema_version: u32,
+    cluster_name: String,
+    ks: KsBootstrap,
+    failure_domains: FailureDomains,
+    rings: Rings,
+    messaging: Messaging,
+    logging: Logging,
+    timeouts: Timeouts,
+    #[serde(default, rename = "service")]
+    service: Vec<ServiceSpec>,
+    #[serde(default, rename = "media_class")]
+    media_class: Vec<MediaClass>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ClusterConfig {
     /// Bumped on an incompatible change, so a process refuses a configuration it
     /// does not understand rather than misreading it.
@@ -246,9 +282,7 @@ pub struct ClusterConfig {
     pub messaging: Messaging,
     pub logging: Logging,
     pub timeouts: Timeouts,
-    #[serde(default, rename = "service")]
     pub services: Vec<ServiceEntry>,
-    #[serde(default, rename = "media_class")]
     pub media_classes: Vec<MediaClass>,
 }
 
@@ -256,8 +290,54 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 impl ClusterConfig {
     pub fn load(path: &Path) -> Result<ClusterConfig> {
-        let config: ClusterConfig = read_toml(path)?;
-        config.validate().context(path.display())?;
+        let text = std::fs::read_to_string(path).context(path.display())?;
+        ClusterConfig::parse(&text).context(path.display())
+    }
+
+    pub fn parse(text: &str) -> Result<ClusterConfig> {
+        let file: ClusterFile = toml::from_str(text).context("cluster config")?;
+
+        // One entry per process, numbered per kind in roster order, so a line
+        // saying `count = 4` needs no hand-written identities to go with it.
+        let mut services = Vec::new();
+        let mut next: BTreeMap<ServiceKind, usize> = BTreeMap::new();
+        for spec in file.service {
+            if spec.identity.is_some() && spec.count != 1 {
+                return Err(Error::new(format!(
+                    "{:?} names one process but asks for {}",
+                    spec.identity.unwrap_or_default(),
+                    spec.count
+                )));
+            }
+            for _ in 0..spec.count {
+                let number = next.entry(spec.kind).or_insert(0);
+                let identity = spec
+                    .identity
+                    .clone()
+                    .unwrap_or_else(|| format!("{}{number}", spec.kind.as_str().to_uppercase()));
+                *number += 1;
+                services.push(ServiceEntry {
+                    identity,
+                    kind: spec.kind,
+                    domain: spec.domain.clone(),
+                    media_class: spec.media_class.clone(),
+                });
+            }
+        }
+
+        let config = ClusterConfig {
+            schema_version: file.schema_version,
+            cluster_name: file.cluster_name,
+            ks: file.ks,
+            failure_domains: file.failure_domains,
+            rings: file.rings,
+            messaging: file.messaging,
+            logging: file.logging,
+            timeouts: file.timeouts,
+            services,
+            media_classes: file.media_class,
+        };
+        config.validate()?;
         Ok(config)
     }
 
@@ -462,4 +542,117 @@ fn resolve(base: &Path, path: &Path) -> PathBuf {
 fn read_toml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let text = std::fs::read_to_string(path).context(path.display())?;
     toml::from_str(&text).context(path.display())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HEADER: &str = r#"
+        schema_version = 1
+        cluster_name = "test"
+        ks = { address = "127.0.0.1:9601", port_base = 9602 }
+        failure_domains = { levels = ["rack", "machine"] }
+        rings = { members = 1 }
+        messaging = { send = "direct", encrypt = false, compress = "none", compress_min = 256, compress_sample = 4096, key = "0f1e2d3c4b5a69788796a5b4c3d2e1f0" }
+        timeouts = { request_ms = 1000, shutdown_grace_ms = 1000 }
+        logging = { level = "info", size = 1024, full_files = 2, info_files = 2, info_share = 0.1, recount = 16 }
+    "#;
+
+    fn parse(roster: &str) -> Result<ClusterConfig> {
+        ClusterConfig::parse(&format!("{HEADER}{roster}"))
+    }
+
+    #[test]
+    fn a_count_becomes_numbered_processes() {
+        let cluster = parse(
+            r#"
+            [[service]]
+            kind = "ks"
+            domain = ["rack0", "box0"]
+
+            [[service]]
+            kind = "en"
+            count = 3
+            domain = ["rack0", "box0"]
+            media_class = "hdd"
+
+            [[media_class]]
+            name = "hdd"
+            index_interval = 1048576
+            min_read_bytes = 1048576
+            compress_block = 262144
+            staging_bypass = 4194304
+            compress_read_win = true
+            repair_bytes_sec = 20000000
+            "#,
+        )
+        .unwrap();
+        let names: Vec<&str> = cluster.services.iter().map(|s| s.identity.as_str()).collect();
+        assert_eq!(names, ["KS0", "EN0", "EN1", "EN2"]);
+        assert!(cluster.services_of_kind(ServiceKind::En).all(|en| en.media_class.is_some()));
+    }
+
+    /// Numbering runs on across lines, so a second group of a kind does not
+    /// collide with the first.
+    #[test]
+    fn numbering_runs_on() {
+        let cluster = parse(
+            r#"
+            [[service]]
+            kind = "ks"
+            domain = ["rack0", "box0"]
+
+            [[service]]
+            kind = "sn"
+            count = 2
+            domain = ["rack0", "box0"]
+
+            [[service]]
+            kind = "sn"
+            count = 2
+            domain = ["rack1", "box1"]
+            "#,
+        )
+        .unwrap();
+        let sns: Vec<&str> =
+            cluster.services_of_kind(ServiceKind::Sn).map(|s| s.identity.as_str()).collect();
+        assert_eq!(sns, ["SN0", "SN1", "SN2", "SN3"]);
+    }
+
+    #[test]
+    fn a_named_process_may_not_also_be_counted() {
+        assert!(
+            parse(
+                r#"
+                [[service]]
+                identity = "EN7"
+                kind = "en"
+                count = 3
+                domain = ["rack0", "box0"]
+                "#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn two_processes_may_not_share_an_identity() {
+        assert!(
+            parse(
+                r#"
+                [[service]]
+                identity = "EN0"
+                kind = "en"
+                domain = ["rack0", "box0"]
+
+                [[service]]
+                identity = "EN0"
+                kind = "en"
+                domain = ["rack0", "box0"]
+                "#,
+            )
+            .is_err()
+        );
+    }
 }

@@ -9263,6 +9263,22 @@ One `info` line per ping, at 16 connections x 256 in flight:
   second, so the hot path logs at `debug` and is off by default. The knob stays so the measurement
   can be repeated rather than remembered.
 
+### 17.5f The roster says how many of each, and the harness starts them all
+
+`start-laws` starts whatever the roster lists, so several of a kind needs no new mechanism: each
+gets the next port, its own run directory and configuration, and registers itself with KS. A roster
+line may say `count = n` for n processes of one kind, named `EN0`, `EN1` and so on in roster order,
+or `identity` for a single named one; numbering runs on across lines, so a second group of a kind
+does not collide with the first. `stop-laws` reverses cold-start order and, within a kind, stops the
+highest-numbered first, which leaves KS0 last because everything is found through it.
+
+The single-box roster is one KS, one DN, one SN, **four ENs** and one FE. Rings are one member for
+now, so the three ring-hosting types are one apiece; four ENs is the number of instances an extent
+has, which is the count the placement report has an opinion about. All four are on this box, so they
+share every failure domain and the rule stays unenforced — but giving four ENs distinct racks in the
+roster is now enough to see it become `enforced at rack`, which is the smallest demonstration that
+the report is measuring the cluster rather than restating the configuration.
+
 ### 17.6 The harness reports what it cannot enforce
 
 One box is one domain at every level, so it satisfies no spreading rule. That is legal — §5.6.7

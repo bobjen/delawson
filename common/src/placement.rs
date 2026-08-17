@@ -170,7 +170,7 @@ mod tests {
                 domain(i)
             ));
         }
-        toml::from_str(&toml).expect("test config parses")
+        ClusterConfig::parse(&toml).expect("test config parses")
     }
 
     #[test]
