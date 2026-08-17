@@ -8809,7 +8809,46 @@ in Rust is normally the slower or fatter thing, and here the safe representation
 one. §15's self-concatenation test depends on the same 4 bytes, since 31 doublings is what fits in
 2^32 references.
 
-#### 14.6.3 Two more consequences worth stating now
+#### 14.6.3 One shared lock per process, and a short list of what takes it exclusively
+
+**The expected shape is a global shared/exclusive lock per process** (Asserted, Bob, 2026-08-17).
+Everything ordinary runs under the **shared** side; a named and rare set of operations take it
+**exclusively**, and taking it exclusively stops the process.
+
+**Separate free and deleted lists are what keep create and delete on the shared side:**
+
+| Operation | Lock | Does |
+|---|---|---|
+| create | **shared** | takes a slot off the **free** list |
+| delete | **shared** | puts a slot on the **deleted** list |
+| GC | **exclusive**, occasionally | moves the deleted list to the free list |
+
+⚠️ **The two lists exist so that reclamation can wait for a moment when it is provably safe.** A slot
+just deleted may still be named by an id some other thread is holding — §14.6.2 makes ids the way
+everything references everything — so handing it straight back to the free list would let a create
+overwrite a slot somebody is about to read. **Exclusivity is the proof that nobody holds one.** That is
+the same argument epoch reclamation and hazard pointers make, arrived at from the other end: rather than
+tracking which ids are live, wait until no thread can hold any.
+
+So the design buys reclamation safety without per-slot reference counting, and pays for it with a
+periodic process-wide stall. Which makes two things load-bearing:
+
+- **The list of exclusive operations must be short and written down.** Bob's C++ experience is the
+  reason this is stated as a rule: *whether* something is lock-free and *how wide* its implicit locks
+  are is exactly what goes wrong quietly. A caller cannot see, at the call site, that the thing it just
+  did serializes the process — so the set that does must be enumerable rather than discovered.
+- **Growth is probably on that list too, and probably need not be.** §14.6.1 chose segmented arrays and
+  linear hashing so growth adds a segment or splits a bucket instead of copying — which means growth may
+  be able to stay on the shared side, publishing a new segment atomically. Whether it does is the
+  question #59 exists to settle, and it is the difference between an occasional stall and a frequent one.
+
+**The shared side looks affordable, on evidence already collected.** §17.5d measured a single shared
+relaxed counter increment against per-thread counters at 13 million calls a second on sixteen cores:
+**12.83M against 12.71M round trips, inside the noise.** A shared-lock acquire is that plus a compare, so
+the reader side of a global lock is not obviously the thing to fear. **What to fear is an unexpected
+exclusive acquisition**, which no amount of cheapness on the shared side helps with.
+
+#### 14.6.4 Two more consequences worth stating now
 
 - **Locking a parent then a child is the discipline, and it constrains the B-tree's shape.** A read and
   write lock per node with hand-over-hand acquisition is what lets many readers descend while a writer
