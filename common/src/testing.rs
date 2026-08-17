@@ -15,9 +15,9 @@
 //! do. A test wanting the old path turns it off itself.
 
 use crate::config::{
-    ClusterConfig, Compress, DNConfig, ENConfig, FEConfig, FailureDomains, Knobs, KsBootstrap,
-    Logging, MediaClass, Messaging, Rings, SCHEMA_VERSION, SNConfig, SendMode, ServiceEntry,
-    ServiceKind, Timeouts,
+    ClusterConfig, Compress, DNConfig, ENConfig, Extents, FEConfig, FailureDomains, Knobs,
+    KsBootstrap, Logging, MediaClass, Messaging, Rings, SCHEMA_VERSION, SNConfig, SendMode,
+    ServiceEntry, ServiceKind, Timeouts,
 };
 
 /// One of everything, four ENs because that is an extent's instance count, all in
@@ -28,7 +28,7 @@ pub fn cluster() -> ClusterConfig {
         entry("DN0", ServiceKind::Dn, None),
         entry("SN0", ServiceKind::Sn, None),
     ];
-    for n in 0..crate::INSTANCES {
+    for n in 0..extents().instances {
         services.push(entry(&format!("EN{n}"), ServiceKind::En, Some("hdd")));
     }
     services.push(entry("FE0", ServiceKind::Fe, None));
@@ -42,6 +42,7 @@ pub fn cluster() -> ClusterConfig {
                 .map(str::to_string)
                 .to_vec(),
         },
+        extents: extents(),
         rings: Rings { members: 1 },
         messaging: messaging(),
         logging: logging(),
@@ -49,6 +50,11 @@ pub fn cluster() -> ClusterConfig {
         services,
         media_classes: vec![hdd(), ssd()],
     }
+}
+
+/// Four instances and a quorum of three, which is the shipped shape.
+pub fn extents() -> Extents {
+    Extents { instances: 4, quorum: 3 }
 }
 
 /// A roster entry in the one domain a single box has.

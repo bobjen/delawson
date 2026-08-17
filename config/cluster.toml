@@ -17,6 +17,18 @@ port_base = 9602
 [failure_domains]
 levels = ["region", "datacenter", "rack", "machine", "disk"]
 
+# An extent's instances, and how many must have applied an append before it is
+# durable. Two quorums have to overlap — three of four share two members, so a new
+# primary polling any three has seen everything durable — and two of four would not
+# overlap at all, so the configuration is refused rather than merely unwise.
+#
+# It is also what a failure-mode seal discards: the smallest (instances - quorum)
+# responses, then the minimum of the rest. Three of three discards none, so that is
+# plainly the minimum.
+[extents]
+instances = 4
+quorum = 3
+
 [rings]
 members = 1
 

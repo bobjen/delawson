@@ -212,7 +212,7 @@ impl SN {
         };
         let ens: Vec<u32> =
             process.cluster.services_of_kind(ServiceKind::En).map(|en| en.number()).collect();
-        match self.open(dn, stream, now(), &ens) {
+        match self.open(dn, stream, now(), &ens, process.cluster.extents.instances) {
             Ok(extent) => Response { id: 0, status: Status::Ok, args: extent.args() },
             Err(e) => Response::error(Status::Internal, e.to_string()),
         }
@@ -254,7 +254,14 @@ impl SN {
     /// The stream's open extent, naming one if it has none. Holding the shard
     /// across the naming is what stops two appends to a fresh stream from opening
     /// two extents for it.
-    fn open(&self, dn: u32, stream: u64, second: u64, ens: &[u32]) -> Result<Extent> {
+    fn open(
+        &self,
+        dn: u32,
+        stream: u64,
+        second: u64,
+        ens: &[u32],
+        instances: usize,
+    ) -> Result<Extent> {
         let mut shard = self.shards[shard_of(dn, stream)].lock().expect("streams");
         let Some(record) = shard.get_mut(&(dn, stream)) else {
             return Err(Error::new(format!("no stream {stream} from dn {dn}")));
@@ -267,7 +274,7 @@ impl SN {
             id,
             created,
             first_record: record.sealed_records,
-            instances: self.naming.instances(ens, common::INSTANCES)?,
+            instances: self.naming.instances(ens, instances)?,
         };
         record.open = Some(extent.clone());
         self.extents.fetch_add(1, Ordering::Relaxed);
@@ -307,8 +314,9 @@ mod tests {
     fn a_stream_opens_one_extent_however_often_it_is_asked() {
         let sn = sn_with_stream(0, 7);
         let ens = [0, 1, 2, 3];
-        let first = sn.open(0, 7, 1_000_000, &ens).unwrap();
-        let again = sn.open(0, 7, 1_000_001, &ens).unwrap();
+        let want = testing::extents().instances;
+        let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
+        let again = sn.open(0, 7, 1_000_001, &ens, want).unwrap();
         assert_eq!(first.id, again.id, "the second ask should find the open extent");
         assert_eq!(first.created, again.created);
         assert_eq!(sn.extents.load(Ordering::Relaxed), 1);
@@ -317,7 +325,7 @@ mod tests {
     #[test]
     fn an_extent_on_a_stream_that_does_not_exist_is_refused() {
         let sn = SN::new(testing::sn_config());
-        assert!(sn.open(0, 7, 1_000_000, &[0, 1, 2, 3]).is_err());
+        assert!(sn.open(0, 7, 1_000_000, &[0, 1, 2, 3], 4).is_err());
     }
 
     /// The second names the key, so an id must never carry one that has already
@@ -345,12 +353,12 @@ mod tests {
         let naming = Naming::new();
         let ens = [0, 1, 2, 3, 4, 5, 6];
         for _ in 0..20 {
-            let picked = naming.instances(&ens, common::INSTANCES).unwrap();
-            assert_eq!(picked.len(), common::INSTANCES);
+            let picked = naming.instances(&ens, testing::extents().instances).unwrap();
+            assert_eq!(picked.len(), testing::extents().instances);
             let mut sorted = picked.clone();
             sorted.sort();
             sorted.dedup();
-            assert_eq!(sorted.len(), common::INSTANCES, "{picked:?} repeats an EN");
+            assert_eq!(sorted.len(), testing::extents().instances, "{picked:?} repeats an EN");
         }
     }
 
@@ -359,7 +367,7 @@ mod tests {
     #[test]
     fn too_few_ens_is_an_error_not_a_repeat() {
         let naming = Naming::new();
-        assert!(naming.instances(&[0, 1, 2], common::INSTANCES).is_err());
+        assert!(naming.instances(&[0, 1, 2], testing::extents().instances).is_err());
     }
 
     /// The four ENs in the default roster are exactly what an extent needs.
@@ -368,7 +376,7 @@ mod tests {
         let cluster = testing::cluster();
         let ens: Vec<u32> =
             cluster.services_of_kind(ServiceKind::En).map(|en| en.number()).collect();
-        assert_eq!(ens.len(), common::INSTANCES);
-        assert!(Naming::new().instances(&ens, common::INSTANCES).is_ok());
+        assert_eq!(ens.len(), testing::extents().instances);
+        assert!(Naming::new().instances(&ens, testing::extents().instances).is_ok());
     }
 }

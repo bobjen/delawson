@@ -16,12 +16,6 @@ pub mod server;
 pub mod testing;
 pub mod wire;
 
-/// Instances an extent has, and how many must have applied an append before it is
-/// durable. Three of four is a quorum: any two of its 3-subsets overlap in two
-/// members, so a new primary that polls any three has seen everything durable.
-pub const INSTANCES: usize = 4;
-pub const QUORUM: usize = 3;
-
 #[derive(Debug)]
 pub struct Error(String);
 

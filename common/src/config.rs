@@ -267,6 +267,52 @@ impl Logging {
     }
 }
 
+/// How many instances an extent has, and how many must have applied an append
+/// before it is durable.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Extents {
+    pub instances: usize,
+    pub quorum: usize,
+}
+
+impl Extents {
+    /// How many of the smallest responses a failure-mode seal discards. With four
+    /// instances and a quorum of three that is one, so "the minimum, discarding the
+    /// smallest"; with three of three it is none, so plainly the minimum.
+    pub fn discard(&self) -> usize {
+        self.instances.saturating_sub(self.quorum)
+    }
+
+    /// Responses a failure-mode seal needs before it can compute anything at all:
+    /// one more than it discards.
+    pub fn least_heard(&self) -> usize {
+        self.discard() + 1
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.quorum == 0 || self.instances == 0 {
+            return Err(Error::new("extents.instances and extents.quorum must be positive"));
+        }
+        if self.quorum > self.instances {
+            return Err(Error::new(format!(
+                "extents.quorum {} is more instances than the {} an extent has",
+                self.quorum, self.instances
+            )));
+        }
+        // Two quorums must overlap, or two disjoint sets could each hold an append
+        // the other never saw and a new primary polling one of them would miss it.
+        // Three of four overlaps in two; two of four does not overlap at all.
+        if 2 * self.quorum <= self.instances {
+            return Err(Error::new(format!(
+                "extents.quorum {} of {} lets two quorums be disjoint because {} plus {} is not more than {}",
+                self.quorum, self.instances, self.quorum, self.quorum, self.instances
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Raft ring composition. One number fleet-wide for now; nothing yet
 /// distinguishes KS, DN and SN ring sizes.
 #[derive(Debug, Clone, Deserialize)]
@@ -295,6 +341,7 @@ struct ClusterFile {
     cluster_name: String,
     ks: KsBootstrap,
     failure_domains: FailureDomains,
+    extents: Extents,
     rings: Rings,
     messaging: Messaging,
     logging: Logging,
@@ -313,6 +360,7 @@ pub struct ClusterConfig {
     pub cluster_name: String,
     pub ks: KsBootstrap,
     pub failure_domains: FailureDomains,
+    pub extents: Extents,
     pub rings: Rings,
     pub messaging: Messaging,
     pub logging: Logging,
@@ -373,6 +421,7 @@ impl ClusterConfig {
             cluster_name: file.cluster_name,
             ks: file.ks,
             failure_domains: file.failure_domains,
+            extents: file.extents,
             rings: file.rings,
             messaging: file.messaging,
             logging: file.logging,
@@ -394,6 +443,7 @@ impl ClusterConfig {
         if self.failure_domains.levels.is_empty() {
             return Err(Error::new("failure_domains.levels is empty"));
         }
+        self.extents.validate()?;
         let mut seen = BTreeSet::new();
         for service in &self.services {
             if !seen.insert(&service.identity) {
@@ -596,6 +646,7 @@ mod tests {
         cluster_name = "test"
         ks = { address = "127.0.0.1:9601", port_base = 9602 }
         failure_domains = { levels = ["rack", "machine"] }
+        extents = { instances = 4, quorum = 3 }
         rings = { members = 1 }
         messaging = { send = "direct", encrypt = false, compress = "none", compress_min = 256, compress_sample = 4096, peer_conns = 2, key = "0f1e2d3c4b5a69788796a5b4c3d2e1f0" }
         timeouts = { request_ms = 1000, shutdown_grace_ms = 1000 }
@@ -678,6 +729,39 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Two quorums must overlap, so a quorum has to be more than half. Two of four
+    /// is the case the design warns about: two disjoint pairs could each hold an
+    /// append the other never saw.
+    #[test]
+    fn a_quorum_that_does_not_overlap_itself_is_refused() {
+        let extents = |instances, quorum| Extents { instances, quorum }.validate();
+        assert!(extents(4, 3).is_ok(), "the shipped shape");
+        assert!(extents(3, 3).is_ok(), "every instance, which is its own quorum");
+        assert!(extents(5, 3).is_ok());
+        assert!(extents(5, 4).is_ok());
+        assert!(extents(4, 2).is_err(), "two disjoint pairs");
+        assert!(extents(6, 3).is_err(), "two disjoint triples");
+        assert!(extents(4, 5).is_err(), "more than there are");
+        assert!(extents(4, 0).is_err());
+        assert!(extents(0, 0).is_err());
+    }
+
+    /// What a failure-mode seal discards, which is what makes the same rule work at
+    /// any size: the minimum over responses, less the smallest few.
+    #[test]
+    fn what_a_seal_discards_follows_from_the_two_numbers() {
+        let shape = |instances, quorum| {
+            let extents = Extents { instances, quorum };
+            (extents.discard(), extents.least_heard())
+        };
+        // Four of three discards one, so "the minimum, discarding the smallest".
+        assert_eq!(shape(4, 3), (1, 2));
+        // Three of three discards none, so plainly the minimum.
+        assert_eq!(shape(3, 3), (0, 1));
+        assert_eq!(shape(5, 3), (2, 3));
+        assert_eq!(shape(5, 4), (1, 2));
     }
 
     #[test]

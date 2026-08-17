@@ -305,7 +305,8 @@ impl EN {
         ];
         // Two gates, and an append passes both or is not durable: a quorum of
         // instances, and a record that has actually finished.
-        let pending = Arc::new(Pending::new(receipt, reply));
+        let quorum_wants = process.cluster.extents.quorum;
+        let pending = Arc::new(Pending::new(receipt, quorum_wants, reply));
         match landed.records {
             0 => self
                 .waiting
@@ -319,7 +320,7 @@ impl EN {
                 self.finish(appending.sn, appending.extent);
             }
         }
-        let quorum = Arc::new(Quorum::new(others.len(), pending));
+        let quorum = Arc::new(Quorum::new(others.len(), quorum_wants, pending));
 
         let apply = Request::new(Op::ApplyAppend)
             .number(appending.sn as u64)
@@ -449,10 +450,11 @@ enum Verdict {
 impl Counting {
     /// `others` is how many instances besides the primary were asked. The primary
     /// has already applied it, so it is the first of the quorum.
-    fn new(others: usize) -> Counting {
+    fn new(others: usize, quorum: usize) -> Counting {
         Counting {
             others,
-            wanted: common::QUORUM.saturating_sub(1),
+            // The primary has already applied it, so it is the first of the quorum.
+            wanted: quorum.saturating_sub(1),
             applied: 0,
             failed: 0,
             settled: false,
@@ -497,8 +499,8 @@ struct Quorum {
 }
 
 impl Quorum {
-    fn new(others: usize, pending: Arc<Pending>) -> Quorum {
-        let quorum = Quorum { counting: Mutex::new(Counting::new(others)), pending };
+    fn new(others: usize, quorum: usize, pending: Arc<Pending>) -> Quorum {
+        let quorum = Quorum { counting: Mutex::new(Counting::new(others, quorum)), pending };
         // An append that cannot reach a quorum however well it goes is refused now
         // rather than after waiting for answers that cannot add up.
         if !quorum.counting.lock().expect("quorum").possible() {
@@ -522,6 +524,8 @@ impl Quorum {
 struct Pending {
     gates: Mutex<Gates>,
     receipt: Vec<Arg>,
+    /// Only so a refusal can say what it wanted.
+    quorum: usize,
 }
 
 struct Gates {
@@ -531,10 +535,11 @@ struct Gates {
 }
 
 impl Pending {
-    fn new(receipt: Vec<Arg>, reply: Reply) -> Pending {
+    fn new(receipt: Vec<Arg>, quorum: usize, reply: Reply) -> Pending {
         Pending {
             gates: Mutex::new(Gates { quorum: false, whole: false, reply: Some(reply) }),
             receipt,
+            quorum,
         }
     }
 
@@ -565,11 +570,7 @@ impl Pending {
         if let Some(reply) = gates.reply.take() {
             reply.send(Response::error(
                 Status::Internal,
-                format!(
-                    "fewer than {} of {} instances applied it",
-                    common::QUORUM,
-                    common::INSTANCES
-                ),
+                format!("fewer than the {} instances a quorum wants applied it", self.quorum),
             ));
         }
     }
@@ -784,7 +785,8 @@ mod tests {
     /// answer changes nothing.
     #[test]
     fn two_of_three_secondaries_make_it_durable() {
-        let mut counting = Counting::new(common::INSTANCES - 1);
+        let quorum = testing::extents().quorum;
+        let mut counting = Counting::new(testing::extents().instances - 1, quorum);
         assert_eq!(counting.answer(true), None);
         assert_eq!(counting.answer(true), Some(Verdict::Durable));
         assert_eq!(counting.answer(true), None, "the answer is sent once");
@@ -793,7 +795,8 @@ mod tests {
     /// A straggler costs nothing: the quorum is reached by the other two.
     #[test]
     fn one_slow_instance_does_not_hold_it_up() {
-        let mut counting = Counting::new(common::INSTANCES - 1);
+        let quorum = testing::extents().quorum;
+        let mut counting = Counting::new(testing::extents().instances - 1, quorum);
         assert_eq!(counting.answer(false), None);
         assert_eq!(counting.answer(true), None);
         assert_eq!(counting.answer(true), Some(Verdict::Durable));
@@ -803,7 +806,8 @@ mod tests {
     /// for an answer that cannot add up.
     #[test]
     fn two_failures_lose_the_append() {
-        let mut counting = Counting::new(common::INSTANCES - 1);
+        let quorum = testing::extents().quorum;
+        let mut counting = Counting::new(testing::extents().instances - 1, quorum);
         assert_eq!(counting.answer(false), None);
         assert_eq!(counting.answer(false), Some(Verdict::Lost));
     }
@@ -812,7 +816,7 @@ mod tests {
     /// three of four, and that is known before any answer arrives.
     #[test]
     fn too_few_instances_to_ask_is_hopeless_from_the_start() {
-        assert!(!Counting::new(1).possible());
-        assert!(Counting::new(2).possible());
+        assert!(!Counting::new(1, 3).possible());
+        assert!(Counting::new(2, 3).possible());
     }
 }

@@ -72,7 +72,14 @@ echo "$target" > "$run_dir/build"
 rm -f "$run_dir/flavor"
 
 # KS's address is fixed; every other process is handed a port from the base up.
-eval "$("$laws" --config "$cluster" bootstrap | sed 's/^/ks_/;s/ /=/')"
+# A bad configuration fails here, and it has to fail loudly: without this the
+# variables below are simply unset, and the error is about a shell variable
+# rather than about the configuration that is actually wrong.
+if ! bootstrap=$("$laws" --config "$cluster" bootstrap); then
+    echo "start-laws: $cluster is not a configuration this build will run" >&2
+    exit 1
+fi
+eval "$(sed 's/^/ks_/;s/ /=/' <<<"$bootstrap")"
 ks_host=${ks_address%:*}
 next_port=$ks_port_base
 

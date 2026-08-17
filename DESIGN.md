@@ -4562,6 +4562,11 @@ watermark and durability is the watermark reached by at least three of the four.
 what makes the bookkeeping cheap enough for a tier that must stay CPU-poor (§1.2): the
 primary tracks four numbers per open extent, not a set of outstanding appends.
 
+**Three of four is the default, not a constant.** Both numbers are configuration — `[extents]`
+`instances` and `quorum` — so 3 of 5 or 4 of 5 are a config change and not a code change (Asserted,
+Bob, 2026-08-17). What the code must not permit is a quorum that fails the overlap argument below, and
+it refuses to start rather than allowing it.
+
 **Three of four is a quorum, and that is load-bearing.** Any two 3-subsets of a 4-set
 overlap in at least two members, so a new primary that polls any three instances is
 guaranteed to see every durable append. Primary handover needs no separate reconciliation
@@ -5272,13 +5277,35 @@ instances are down the SN coordinates it instead** (#55), and the algorithm is B
 
 > **Seal at the minimum accepted length over all responses, discarding the smallest response.**
 
+⚠️ **And "the smallest response" is really "the smallest *I* − *Q* responses", because the quorum is
+configurable** (Asserted, Bob, 2026-08-17). With four instances and a quorum of three that is one
+response discarded; **with three of three it is none, so the rule is plainly the minimum**; with five
+of three it is two. One rule, and the two numbers in `[extents]` say what it means:
+
+| Instances | Quorum | Discard | Responses needed |
+|---|---|---|---|
+| 4 | 3 | 1 | 2 |
+| 3 | 3 | 0 | 1 |
+| 5 | 3 | 2 | 3 |
+| 5 | 4 | 1 | 2 |
+
+⚠️ **A quorum must be more than half, and the configuration is refused if it is not.** Two quorums
+have to overlap or two disjoint sets could each hold an append the other never saw — 3 of 4 overlap in
+two, while **2 of 4 do not overlap at all** and 3 of 6 do not either. §8.1.1 argues this; the config
+now enforces it rather than trusting whoever edits the file.
+
 #### 8.1.7.1 Why the second-smallest is the right statistic
 
 Sort the accepted lengths of the four instances, *a* ≤ *b* ≤ *c* ≤ *d*. Discarding the smallest and
 taking the minimum of the rest is **b**, the second-smallest — and *b* is exactly the largest length
 that three instances have, since *b*, *c* and *d* all reach it and only *c* and *d* reach *c*. So
-with every instance answering, **the rule computes the durable length exactly** (Derived; checked
-over every combination of four lengths).
+with every instance answering, **the rule computes the durable length exactly**.
+
+In general it is the (*I* − *Q* + 1)-th smallest, which is the largest length *Q* instances have.
+**Derived, and checked exhaustively** for 3-of-3, 4-of-3, 5-of-3, 5-of-4, 6-of-4 and 7-of-5 over
+every combination of lengths and every subset of responders: **never below the durable length in any
+case, exactly right whenever every instance answers, and the overshoot shrinks with each extra
+response.**
 
 With one instance missing, *b* is computed from three responses and the absent instance's length *m*
 is unknown. Then:
@@ -5302,13 +5329,15 @@ right way round, and it is the whole reason the rule is shaped this way:
 
 Two stopping rules, and they answer different questions:
 
-- **Stop at two responses if the computed length matches a durable length any responder reported.** An
-  instance's reported durable length is a length it knows reached a quorum, so a match is proof rather
-  than inference — three instances had it, and no fourth opinion can improve on proof.
-- **Otherwise wait a very short time — of order 100 ms — after the third response.** The usual cause
-  of failure-mode sealing is one instance being down, so **three responses will nearly always arrive
-  and the fourth is the one that turns an upper bound into the exact answer.** Every byte of overshoot
-  is a byte that has to be repaired to make good, so a little waiting buys a tighter seal.
+- **Stop as soon as the computed length matches a durable length any responder reported** — which
+  needs only *I* − *Q* + 1 responses, two in the shipped shape. An instance's reported durable length
+  is a length it knows reached a quorum, so a match is proof rather than inference, and no further
+  opinion can improve on proof.
+- **Otherwise wait a very short time — of order 100 ms — once a quorum of responses is in.** The usual
+  cause of failure-mode sealing is one instance being down, so **a quorum of responses will nearly
+  always arrive, and the ones after it are what turn an upper bound into the exact answer.** Every
+  byte of overshoot is a byte repair has to move to make good, so a little waiting buys a tighter
+  seal.
 
 ⚠️ **The grace period has to stay far below a TCP retry**, which is §16's open question 14: the whole
 point of seal-short is that one dead EN must not stall a writer for a timeout. 100 ms is comfortably
