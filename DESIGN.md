@@ -2529,6 +2529,12 @@ extents than 4 bytes can name. That is a floor, and §14.1.2 gives the ceiling f
 fleet size — the record is bracketed from both directions, which is a more
 comfortable position than a single guess.
 
+**And the 4 bytes buy something beyond addressability: they are what the data
+structures reference each other by.** §14.6.2 makes the case — an id rather than a
+pointer is how a B-tree or a hash table over an arena is expressible in safe Rust at
+all, and it happens to be half the width. Two independent reasons for the same
+number, which is why it is not a figure to revisit lightly.
+
 At the 100 B budget there is 2.5× headroom, and the itemized ~60 B (§5.10.4) still
 leaves 1.5×. Worth knowing that shrinking records is not free: past a point it trades
 metadata density for reference width.
@@ -8747,6 +8753,73 @@ nothing bounds (§14.2), so a tenant with a trillion tiny objects buys DN capaci
 rather than disk. The 0.2% above is the SN side only, and the DN side cannot be
 computed until object-count expectations are pinned. This is the same asymmetry as
 §14.2 and §14.4, arriving in the cost model.
+
+### 14.6 The data structures that will hold all this
+
+**Everything in the implementation today is temporary** (Asserted, Bob, 2026-08-17). What replaces it,
+per tier:
+
+| Tier | Will hold its metadata in |
+|---|---|
+| **DN** | a **B-tree**, with a read and a write lock **per node**, so a walker locks a parent and then a child |
+| **SN** | **segmented arrays** with a deleted list and a free list, and **hash tables that grow smoothly by linear hashing** — the hash tables being those same segmented arrays |
+| **EN** | extents kept **serialized**, with lookup tables beside them; in memory the serialized extents sit in segmented arrays too |
+
+**The segmented array is one primitive serving three tiers**, which is the part to notice before three
+copies of it get written (#59).
+
+#### 14.6.1 Why growth without copying is the requirement, not a preference
+
+§17.5i measured a placeholder failing in exactly the way these structures are chosen to avoid. An
+in-memory hash table doubling under a lock took successive trials from 2.88M creates a second to 1.67M,
+and the slowest request in each from 348 ms to **1.82 s** — a metadata create waiting seconds behind a
+rehash. The conclusion recorded there was that **the index must grow incrementally**, and this is what
+that means concretely:
+
+- **Linear hashing grows one bucket at a time**, so the work is amortized per insert instead of arriving
+  as one stop-the-world copy. There is no moment when a create waits for the whole table.
+- **A segmented array grows by adding a segment**, so nothing already in it moves. Pointers and indices
+  into it stay valid, which is what lets the hash table *be* the array rather than own a copy of one.
+- **A free list and a deleted list are what make reuse possible without compaction**, which the current
+  structures avoid needing only because nothing is deleted yet.
+
+So there is a measurable prediction attached to this work: **re-running the create benchmark after it
+should show the cliff gone** — three trials in one process staying within a few percent of each other
+instead of falling by 40%, and the slowest request staying in the tens of milliseconds. If it does not,
+the structure is not doing the thing it was chosen for.
+
+#### 14.6.2 An id is the reference, not a pointer
+
+**All three structures reference things by id — `ExtentId`, `StreamId`, a node number — rather than by
+pointer** (Asserted, Bob, 2026-08-17). Two reasons, and they are independent, which is why the decision
+is easy:
+
+- **It is how you build these shapes in Rust at all.** A B-tree whose nodes point at each other, or a
+  table whose buckets point into an array, is a graph with aliasing that ownership rules make painful
+  and `unsafe` makes dangerous. An id is a plain number: the structure holding the things is the arena,
+  and a reference into it borrows nothing. This is why the segmented array is the right primitive rather
+  than an incidental one — **an id into it is stable across growth (§14.6.1), so the id is the index.**
+- ⚠️ **And it costs 4 bytes instead of 8.** §4.6.4 already fixes references at 4 bytes for
+  addressability; this doubles the argument. At §14.1's ceiling of 1.7 × 10^9 extent references per SN,
+  every reference held as a pointer instead of an id costs an extra **6.8 GB** of a 171 GB budget —
+  **4% of the machine, per reference stored** — and a record holding several multiplies it. **Derived.**
+
+The two reasons pull the same way, which is worth noticing because they usually do not: the safe thing
+in Rust is normally the slower or fatter thing, and here the safe representation is also the smaller
+one. §15's self-concatenation test depends on the same 4 bytes, since 31 doublings is what fits in
+2^32 references.
+
+#### 14.6.3 Two more consequences worth stating now
+
+- **Locking a parent then a child is the discipline, and it constrains the B-tree's shape.** A read and
+  write lock per node with hand-over-hand acquisition is what lets many readers descend while a writer
+  splits a node elsewhere — and it means every operation must acquire locks in one direction only, root
+  downward, or two operations meeting in the middle deadlock. §17.12.1 has already paid for that lesson
+  once, at a smaller scale.
+- **Keeping extents serialized means the memory form and the disk form are the same bytes.** So an EN
+  writing its journal (§8.1.5) writes what it already has rather than serializing on the way out, and
+  reading one back is a lookup into bytes rather than building an object graph. The lookup tables are
+  what make that navigable, and they are the thing that has to be rebuilt on load — not the extents.
 
 ---
 

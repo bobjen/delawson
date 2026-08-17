@@ -1,12 +1,14 @@
 //! DN, the Directory Node: objects by name, and the streams they are made of.
 //!
-//! An object is indexed by name here, and every object gets one stream on an SN —
-//! no inlining of small objects and no coalescing of several objects into one
-//! stream, both of which come later and both of which would hide what a create
-//! costs. DN owns the `StreamId`; the SN it picks records `(DnId, StreamId)`.
+//! An object is indexed by name here, and it grows a stream at a time on the SNs
+//! that record them — no inlining of small objects and no coalescing of several
+//! objects into one stream, both of which come later and both of which would hide
+//! what a create costs. DN owns the `StreamId`; the SN it picks records
+//! `(DnId, StreamId)`.
 //!
-//! State is in memory and sharded by name. Nothing is deleted yet, so nothing
-//! here copes with reuse; an index that has to survive churn is a later problem.
+//! ⚠️ **The hash table sharded by name is a stand-in for a B-tree** with a read and
+//! a write lock per node, walked by locking a parent and then a child. Nothing is
+//! deleted yet either, so nothing here copes with reuse.
 //!
 //! A create waits on an SN, and waits without holding a worker: the names are
 //! taken, the streams are asked for, and the client's `Reply` travels with that
