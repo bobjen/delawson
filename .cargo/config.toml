@@ -1,0 +1,10 @@
+# The CRC's fast path is carryless multiply, and without this it is compiled for
+# baseline x86-64: measured on this box, 4.8 GB/s against 14.6 GB/s, for identical
+# CRCs. Since every append checksums its own bytes, that is worth having.
+#
+# ⚠️ **This is right for one box and wrong for a fleet.** `native` bakes in whatever
+# the build machine can do, so a binary built here may not run at all on an older CPU
+# — an illegal instruction rather than a slow path. A fleet wants a floor (a named
+# microarchitecture level) or runtime dispatch inside the CRC. See the issue.
+[build]
+rustflags = ["-C", "target-cpu=native"]

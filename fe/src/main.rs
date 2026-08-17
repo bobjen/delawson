@@ -23,7 +23,7 @@ use common::config::{FEConfig, ServiceKind};
 use common::framing::Framing;
 use common::logw;
 use common::server::{self, Process, Reply, Service};
-use common::wire::{Arg, Op, Request, Response, Status};
+use common::wire::{AppendBlock, Arg, Op, Request, Response, Status};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -122,6 +122,9 @@ struct Wanting {
     path: String,
     located: Located,
     body: Vec<u8>,
+    /// The caller's CRC of the block, if it sent one. Carried, never invented and
+    /// never dropped: it is the caller's guarantee and no tier here may weaken it.
+    crc: Option<u64>,
     tries: u32,
     reply: Reply,
 }
@@ -354,19 +357,24 @@ impl FE {
     /// An append: resolve the name — making the object if it is not there — find the
     /// extent, and hand the bytes to its primary.
     fn append(self: &Arc<Self>, process: &Arc<Process>, request: &Request, mut reply: Reply) {
-        let (path, framing, body) = match request.args.as_slice() {
-            [Arg::Text(path), Arg::Number(kind), Arg::Number(width), Arg::Bytes(body)] => {
-                match Framing::of_wire(*kind, *width) {
-                    Ok(framing) => (path.clone(), framing, body.clone()),
-                    Err(e) => {
-                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
-                    }
+        let (path, framing, crc, body) = match request.args.as_slice() {
+            [
+                Arg::Text(path),
+                Arg::Number(kind),
+                Arg::Number(width),
+                Arg::Flag(has_crc),
+                Arg::Number(crc),
+                Arg::Bytes(body),
+            ] => match Framing::of_wire(*kind, *width) {
+                Ok(framing) => (path.clone(), framing, has_crc.then_some(*crc), body.clone()),
+                Err(e) => {
+                    return reply.send(Response::error(Status::BadRequest, e.to_string()));
                 }
-            }
+            },
             _ => {
                 return reply.send(Response::error(
                     Status::BadRequest,
-                    "append takes a name, a framing and bytes",
+                    "append takes a name, a framing, a CRC and bytes",
                 ));
             }
         };
@@ -384,7 +392,7 @@ impl FE {
                     ),
                 ));
             }
-            let wanting = Wanting { path: named, located, body, tries: TRIES, reply };
+            let wanting = Wanting { path: named, located, body, crc, tries: TRIES, reply };
             fe.somewhere(process, wanting, None);
         });
     }
@@ -513,27 +521,26 @@ impl FE {
     /// with them: the primary is what counts the records and what broadcasts to the
     /// others, and the SN is not in this path to be asked again.
     fn to_primary(self: &Arc<Self>, process: &Arc<Process>, wanting: Wanting, open: Open) {
-        let Wanting { path, located, body, tries, reply } = wanting;
+        let Wanting { path, located, body, crc, tries, reply } = wanting;
         let identity = format!("EN{}", open.instances[0]);
-        let (kind, width) = located.framing.wire();
-        // The order the primary parses: the extent's name, the framing, the instance
-        // list, and the bytes last.
-        let mut ask = Request::new(Op::AppendExtent)
-            .number(open.sn as u64)
-            .number(open.id)
-            .number(open.created)
-            .number(kind)
-            .number(width);
-        for en in &open.instances {
-            ask = ask.number(*en as u64);
+        // One shape, built and read in `common`, so neither side counts positions.
+        let ask = AppendBlock {
+            sn: open.sn,
+            extent: open.id,
+            created: open.created,
+            framing: located.framing,
+            crc,
+            instances: open.instances.clone(),
+            offset: None,
+            bytes: body.clone(),
         }
-        let ask = ask.bytes(body.clone());
+        .request(Op::AppendExtent);
         let named = identity.clone();
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
         let asked = process.ask(&identity, &ask, move |answer| {
             if answer.status == Status::Sealed {
-                let wanting = Wanting { path, located, body, tries, reply };
+                let wanting = Wanting { path, located, body, crc, tries, reply };
                 return fe.after_seal(&onward, wanting, open, answer);
             }
             reply.send(receipt(&located, &open, answer));
@@ -584,7 +591,7 @@ impl FE {
                 "a full stream said nothing about itself",
             ));
         };
-        let Wanting { path, located, body, tries, reply } = wanting;
+        let Wanting { path, located, body, crc, tries, reply } = wanting;
         // Nothing may hand out an extent of a stream that will take no more, and what
         // is remembered about it is no use to an append either.
         self.streams.lock().expect("streams").remove(&(located.dn, located.stream));
@@ -609,7 +616,7 @@ impl FE {
                     format!("{path} was extended and is still on stream {}", next.stream),
                 ));
             }
-            let wanting = Wanting { path, located: next, body, tries, reply };
+            let wanting = Wanting { path, located: next, body, crc, tries, reply };
             fe.somewhere(&onward, wanting, None);
         });
         if let Err(e) = asked {

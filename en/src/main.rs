@@ -9,6 +9,12 @@
 //! **Durable means three of the four instances have applied it**, the primary
 //! included, so one slow instance costs nothing.
 //!
+//! **A caller's CRC is carried and stored, and not checked here.** An EN holds what
+//! the writer compressed, and it never decompresses — so the logical bytes the CRC is
+//! over do not exist on this machine. Checking would work today only because nothing
+//! compresses yet, and would start failing on every append the moment something did.
+//! The check belongs where the logical bytes come back.
+//!
 //! ⚠️ **Nothing is on a disk yet.** The extent table and the appends themselves are
 //! two vectors in memory, which is enough for the operation to work end to end and
 //! is not evidence about what a durable append costs. What replaces it is a
@@ -18,7 +24,7 @@ use common::config::ENConfig;
 use common::framing::Framing;
 use common::offset::COff;
 use common::server::{self, Process, Reply, Service};
-use common::wire::{Arg, Op, Request, Response, Status};
+use common::wire::{AppendBlock, Arg, Op, Request, Response, Status};
 use common::{Error, Result, logw};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,6 +60,13 @@ struct Append {
     /// Which extent, as an index into the extent table.
     extent: usize,
     offset: COff,
+    /// The caller's CRC of these bytes, if the caller gave one. It is the user's own
+    /// guarantee, so nothing here invents one and nothing here drops one.
+    ///
+    /// Nothing in a running process reads it back yet: what will is a read that
+    /// returns whole blocks, since whoever decompresses one is who checks it.
+    #[allow(dead_code)]
+    crc: Option<u64>,
     bytes: Vec<u8>,
 }
 
@@ -77,32 +90,6 @@ struct Landed {
     first_record: u64,
     /// Records it completed, which is zero for a block wholly inside one record.
     records: u64,
-}
-
-/// Which extent an append is for, and what it carries.
-struct Appending<'a> {
-    sn: u32,
-    extent: u64,
-    created: u64,
-    bytes: &'a [u8],
-}
-
-impl<'a> Appending<'a> {
-    /// Three numbers naming the extent, and the bytes last. What comes between
-    /// them differs by operation: the instance list on the way in, the offset the
-    /// primary chose on the way out.
-    fn of(args: &'a [Arg]) -> Result<(Appending<'a>, &'a [Arg])> {
-        let (
-            [Arg::Number(sn), Arg::Number(extent), Arg::Number(created), middle @ ..],
-            Some(Arg::Bytes(bytes)),
-        ) = (args, args.last())
-        else {
-            return Err(Error::new("an append takes an SnId, an extent, a second and bytes"));
-        };
-        let appending = Appending { sn: *sn as u32, extent: *extent, created: *created, bytes };
-        // The bytes are the last argument, so they are not one of the middle ones.
-        Ok((appending, &middle[..middle.len() - 1]))
-    }
 }
 
 /// Everything this EN holds. Two vectors, with a map from an extent's name to its
@@ -154,7 +141,7 @@ impl Extents {
     /// Or seal, if the extent is full: a block goes wholly into this extent or
     /// wholly into the next one, never split, so a block that will not fit gets an
     /// extent that is closed instead of a place in it.
-    fn take(&mut self, appending: &Appending, framing: Framing, cap: COff) -> Result<Took> {
+    fn take(&mut self, appending: &AppendBlock, cap: COff) -> Result<Took> {
         let length = COff::of_len(appending.bytes.len())?;
         let place = self.place(appending.sn, appending.extent, appending.created)?;
         let extent = &mut self.extents[place];
@@ -174,25 +161,35 @@ impl Extents {
 
         // Before the bytes are taken, so a block that breaks the record rule
         // changes nothing.
-        let (closed, open) = framing.advance(&extent.open, appending.bytes)?;
+        let (closed, open) = appending.framing.advance(&extent.open, &appending.bytes)?;
         let offset = extent.end;
         extent.end = offset.plus(length)?;
         let first_record = extent.records;
         extent.records += closed;
         extent.open = open;
-        self.appends.push(Append { extent: place, offset, bytes: appending.bytes.to_vec() });
+        self.appends.push(Append {
+            extent: place,
+            offset,
+            crc: appending.crc,
+            bytes: appending.bytes.clone(),
+        });
         Ok(Took::Landed(Landed { offset, first_record, records: closed }))
     }
 
     /// Put an append at an offset another instance chose. The offset is given, so
     /// this must not assign one — but the extent's end still moves, since an
     /// instance that never learns the end cannot become primary.
-    fn apply(&mut self, appending: &Appending, offset: COff) -> Result<()> {
+    fn apply(&mut self, appending: &AppendBlock, offset: COff) -> Result<()> {
         let length = COff::of_len(appending.bytes.len())?;
         let place = self.place(appending.sn, appending.extent, appending.created)?;
         let extent = &mut self.extents[place];
         extent.end = extent.end.max(offset.plus(length)?);
-        self.appends.push(Append { extent: place, offset, bytes: appending.bytes.to_vec() });
+        self.appends.push(Append {
+            extent: place,
+            offset,
+            crc: appending.crc,
+            bytes: appending.bytes.clone(),
+        });
         Ok(())
     }
 
@@ -229,6 +226,9 @@ struct EN {
     appends: AtomicU64,
     bytes: AtomicU64,
     sealed: AtomicU64,
+    /// Blocks stored with a CRC their caller gave, which is what a reader will have
+    /// to check with.
+    checksummed: AtomicU64,
 }
 
 impl Service for EN {
@@ -272,6 +272,7 @@ impl Service for EN {
             format!("appends {}", self.appends.load(Ordering::Relaxed)),
             format!("appended_bytes {}", self.bytes.load(Ordering::Relaxed)),
             format!("sealed_extents {}", self.sealed.load(Ordering::Relaxed)),
+            format!("blocks_with_a_crc {}", self.checksummed.load(Ordering::Relaxed)),
             format!("media_class {}", self.config.media_class),
         ]
     }
@@ -286,6 +287,7 @@ impl EN {
             appends: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             sealed: AtomicU64::new(0),
+            checksummed: AtomicU64::new(0),
         }
     }
 
@@ -293,34 +295,16 @@ impl EN {
     /// that offset to the other instances. The answer waits for a quorum of them,
     /// and waits without holding a worker.
     fn append(self: &Arc<Self>, process: &Arc<Process>, request: &Request, mut reply: Reply) {
-        let (appending, middle) = match Appending::of(&request.args) {
-            Ok(parsed) => parsed,
+        let appending = match AppendBlock::of(request) {
+            Ok(appending) => appending,
             Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
-        };
-        // The framing comes with the append, since the primary is what counts the
-        // records and an instance must not decide that for itself.
-        let (framing, instances) = match middle {
-            [Arg::Number(kind), Arg::Number(width), instances @ ..] => {
-                match Framing::of_wire(*kind, *width) {
-                    Ok(framing) => (framing, instances),
-                    Err(e) => {
-                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
-                    }
-                }
-            }
-            _ => {
-                return reply.send(Response::error(
-                    Status::BadRequest,
-                    "an append takes a framing and an instance list",
-                ));
-            }
         };
         let length = appending.bytes.len() as u64;
         let cap = match COff::of_number(process.cluster.extents.seal_bytes) {
             Ok(cap) => cap,
             Err(e) => return reply.send(Response::error(Status::Internal, e.to_string())),
         };
-        let landed = match self.take(&appending, framing, cap) {
+        let landed = match self.take(&appending, cap) {
             Ok(Took::Landed(landed)) => landed,
             // Sealed: what the extent came to, so whoever asked can tell the SN and
             // come back with the next extent.
@@ -348,14 +332,8 @@ impl EN {
         // This process is one of the instances, and has just applied it, so the
         // rest are who else must hear about it.
         let mine = process.entry.number();
-        let others: Vec<u32> = instances
-            .iter()
-            .filter_map(|arg| match arg {
-                Arg::Number(en) => Some(*en as u32),
-                _ => None,
-            })
-            .filter(|en| *en != mine)
-            .collect();
+        let others: Vec<u32> =
+            appending.instances.iter().copied().filter(|en| *en != mine).collect();
 
         let receipt = vec![
             Arg::Number(appending.sn as u64),
@@ -385,12 +363,14 @@ impl EN {
         }
         let quorum = Arc::new(Quorum::new(others.len(), quorum_wants, pending));
 
-        let apply = Request::new(Op::ApplyAppend)
-            .number(appending.sn as u64)
-            .number(appending.extent)
-            .number(appending.created)
-            .number(landed.offset.number())
-            .bytes(appending.bytes.to_vec());
+        // The same block, with the offset this primary chose and no instance list —
+        // a secondary has nobody to pass it on to.
+        let apply = AppendBlock {
+            instances: Vec::new(),
+            offset: Some(landed.offset.number()),
+            ..appending.clone()
+        }
+        .request(Op::ApplyAppend);
         // Issued to all of them before any of them answers: a quorum is straggler
         // tolerance only if the writes go out together.
         for en in others {
@@ -405,11 +385,14 @@ impl EN {
         }
     }
 
-    fn take(&self, appending: &Appending, framing: Framing, cap: COff) -> Result<Took> {
-        let took = self.held.lock().expect("extents").take(appending, framing, cap)?;
+    fn take(&self, appending: &AppendBlock, cap: COff) -> Result<Took> {
+        let took = self.held.lock().expect("extents").take(appending, cap)?;
         if let Took::Landed(_) = &took {
             self.appends.fetch_add(1, Ordering::Relaxed);
             self.bytes.fetch_add(appending.bytes.len() as u64, Ordering::Relaxed);
+            if appending.crc.is_some() {
+                self.checksummed.fetch_add(1, Ordering::Relaxed);
+            }
         }
         Ok(took)
     }
@@ -472,14 +455,14 @@ impl EN {
     /// way — the primary decided it, and an instance that worked it out for itself
     /// would be deciding something the extent did not.
     fn applied(&self, request: &Request) -> Response {
-        let (appending, middle) = match Appending::of(&request.args) {
-            Ok(parsed) => parsed,
+        let appending = match AppendBlock::of(request) {
+            Ok(appending) => appending,
             Err(e) => return Response::error(Status::BadRequest, e.to_string()),
         };
-        let Some(Arg::Number(offset)) = middle.first() else {
+        let Some(offset) = appending.offset else {
             return Response::error(Status::BadRequest, "apply-append takes an offset");
         };
-        let offset = match COff::of_number(*offset) {
+        let offset = match COff::of_number(offset) {
             Ok(offset) => offset,
             Err(e) => return Response::error(Status::BadRequest, e.to_string()),
         };
@@ -661,8 +644,17 @@ mod tests {
 
     const LF: Framing = Framing::Lf;
 
-    fn appending<'a>(sn: u32, extent: u64, bytes: &'a [u8]) -> Appending<'a> {
-        Appending { sn, extent, created: 1_000_000, bytes }
+    fn appending(sn: u32, extent: u64, bytes: &[u8]) -> AppendBlock {
+        AppendBlock {
+            sn,
+            extent,
+            created: 1_000_000,
+            framing: LF,
+            crc: None,
+            instances: Vec::new(),
+            offset: None,
+            bytes: bytes.to_vec(),
+        }
     }
 
     /// One whole record, which is what the client always sends.
@@ -674,7 +666,7 @@ mod tests {
     const ROOM: COff = COff::new(1 << 20);
 
     fn append(en: &EN, extent: u64, bytes: &[u8]) -> Landed {
-        match en.take(&appending(0, extent, bytes), LF, ROOM).expect("an append") {
+        match en.take(&appending(0, extent, bytes), ROOM).expect("an append") {
             Took::Landed(landed) => landed,
             Took::Sealed { .. } => panic!("that should have fitted"),
         }
@@ -706,8 +698,8 @@ mod tests {
     #[test]
     fn an_extent_is_named_by_its_sn_too() {
         let en = EN::new(testing::en_config());
-        en.take(&appending(0, 1, &line("from sn0")), LF, ROOM).unwrap();
-        en.take(&appending(1, 1, &line("from sn1")), LF, ROOM).unwrap();
+        en.take(&appending(0, 1, &line("from sn0")), ROOM).unwrap();
+        en.take(&appending(1, 1, &line("from sn1")), ROOM).unwrap();
         assert_eq!(en.held.lock().unwrap().extents.len(), 2);
     }
 
@@ -717,8 +709,8 @@ mod tests {
     fn a_second_that_disagrees_is_refused() {
         let en = EN::new(testing::en_config());
         append(&en, 1, &line("first"));
-        let later = Appending { sn: 0, extent: 1, created: 1_000_001, bytes: &line("second") };
-        assert!(en.take(&later, LF, ROOM).is_err());
+        let later = AppendBlock { created: 1_000_001, ..appending(0, 1, &line("second")) };
+        assert!(en.take(&later, ROOM).is_err());
         assert_eq!(en.held.lock().unwrap().read(0, 1), b"first\n");
     }
 
@@ -753,7 +745,7 @@ mod tests {
     #[test]
     fn a_block_that_closes_a_record_may_not_end_inside_another() {
         let en = EN::new(testing::en_config());
-        assert!(en.take(&appending(0, 1, b"one\ntw"), LF, ROOM).is_err());
+        assert!(en.take(&appending(0, 1, b"one\ntw"), ROOM).is_err());
         // And the refusal left the extent alone.
         assert!(en.held.lock().unwrap().read(0, 1).is_empty());
     }
@@ -762,12 +754,8 @@ mod tests {
     #[test]
     fn an_applied_append_keeps_the_offset_it_was_given() {
         let en = EN::new(testing::en_config());
-        let request = Request::new(Op::ApplyAppend)
-            .number(0)
-            .number(1)
-            .number(1_000_000)
-            .number(64)
-            .bytes(b"late".to_vec());
+        let request =
+            AppendBlock { offset: Some(64), ..appending(0, 1, b"late") }.request(Op::ApplyAppend);
         assert_eq!(en.applied(&request).status, Status::Ok);
         let held = en.held.lock().unwrap();
         assert_eq!(held.appends[0].offset, COff::new(64));
@@ -782,30 +770,48 @@ mod tests {
     fn applying_out_of_order_leaves_the_end_furthest_on() {
         let en = EN::new(testing::en_config());
         for offset in [100u64, 10] {
-            let request = Request::new(Op::ApplyAppend)
-                .number(0)
-                .number(1)
-                .number(1_000_000)
-                .number(offset)
-                .bytes(vec![0u8; 4]);
+            let request = AppendBlock { offset: Some(offset), ..appending(0, 1, &[0u8; 4]) }
+                .request(Op::ApplyAppend);
             assert_eq!(en.applied(&request).status, Status::Ok);
         }
         assert_eq!(en.held.lock().unwrap().extents[0].end, COff::new(104));
     }
 
     #[test]
-    fn an_append_without_bytes_is_a_bad_request() {
+    fn an_append_of_the_wrong_shape_is_a_bad_request() {
         let en = EN::new(testing::en_config());
         let request = Request::new(Op::ApplyAppend).number(0).number(1);
         assert_eq!(en.applied(&request).status, Status::BadRequest);
     }
 
+    /// A secondary is told where the primary put it, so an apply without an offset is
+    /// asking this instance to decide something that is not its to decide.
     #[test]
     fn an_applied_append_needs_an_offset() {
         let en = EN::new(testing::en_config());
-        let request =
-            Request::new(Op::ApplyAppend).number(0).number(1).number(1_000_000).bytes(vec![1, 2]);
+        let request = appending(0, 1, b"x\n").request(Op::ApplyAppend);
         assert_eq!(en.applied(&request).status, Status::BadRequest);
+    }
+
+    /// A caller's CRC is stored with the block and not checked here: an EN holds what
+    /// the writer compressed and never decompresses it, so the logical bytes the CRC
+    /// covers do not exist on this machine.
+    #[test]
+    fn a_crc_is_kept_and_not_judged() {
+        let en = EN::new(testing::en_config());
+        let block = line("checksummed");
+        let with = AppendBlock { crc: Some(common::crc::of(&block)), ..appending(0, 1, &block) };
+        assert!(matches!(en.take(&with, ROOM), Ok(Took::Landed(_))));
+
+        // A wrong one is stored just the same, because this tier cannot tell and must
+        // not pretend to: the bytes it holds are not the bytes the CRC is over.
+        let wrong = AppendBlock { crc: Some(0), ..appending(0, 1, &line("also fine")) };
+        assert!(matches!(en.take(&wrong, ROOM), Ok(Took::Landed(_))));
+
+        let held = en.held.lock().unwrap();
+        assert_eq!(held.appends[0].crc, Some(common::crc::of(&block)));
+        assert_eq!(held.appends[1].crc, Some(0));
+        assert_eq!(en.checksummed.load(Ordering::Relaxed), 2);
     }
 
     /// A read asks for one record by number, and gets its content without the
@@ -862,7 +868,7 @@ mod tests {
     fn a_full_extent_seals_instead_of_taking_the_block() {
         let en = EN::new(testing::en_config());
         let cap = COff::new(10);
-        let took = |en: &EN, bytes: &'static [u8]| en.take(&appending(0, 1, bytes), LF, cap);
+        let took = |en: &EN, bytes: &'static [u8]| en.take(&appending(0, 1, bytes), cap);
         // "one\n" and "two\n" fit in ten bytes; "three\n" does not.
         assert!(matches!(took(&en, b"one\n"), Ok(Took::Landed(_))));
         assert!(matches!(took(&en, b"two\n"), Ok(Took::Landed(_))));
@@ -886,15 +892,15 @@ mod tests {
         let en = EN::new(testing::en_config());
         let cap = COff::new(4);
         // A block with no boundary in it, which leaves a record open.
-        assert!(matches!(en.take(&appending(0, 1, b"half"), LF, cap), Ok(Took::Landed(_))));
+        assert!(matches!(en.take(&appending(0, 1, b"half"), cap), Ok(Took::Landed(_))));
         // Past the cap, and it still has to be taken, because the record is open.
-        match en.take(&appending(0, 1, b" and half\n"), LF, cap) {
+        match en.take(&appending(0, 1, b" and half\n"), cap) {
             Ok(Took::Landed(landed)) => assert_eq!(landed.records, 1),
             _ => panic!("an open record must be allowed to finish"),
         }
         assert_eq!(en.held.lock().unwrap().record(0, 1, LF, 0).unwrap(), b"half and half");
         // Now that nothing is open, the next block finds it full.
-        assert!(matches!(en.take(&appending(0, 1, b"x\n"), LF, cap), Ok(Took::Sealed { .. })));
+        assert!(matches!(en.take(&appending(0, 1, b"x\n"), cap), Ok(Took::Sealed { .. })));
     }
 
     /// Three of four, so two of the three secondaries settle it and the third's

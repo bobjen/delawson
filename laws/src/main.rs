@@ -273,6 +273,11 @@ enum Cmd {
         /// if it does not exist yet.
         #[arg(long, default_value = "lf")]
         framing: String,
+        /// Send a CRC of the framed block, which is the store's promise back that
+        /// what it holds is what was sent. A real caller computes this over its own
+        /// buffer, after its own checks; this computes it here.
+        #[arg(long)]
+        crc: bool,
         #[command(flatten)]
         body: Body,
     },
@@ -1239,14 +1244,21 @@ fn build(cmd: &Cmd) -> Result<Request> {
             request
         }
 
-        Cmd::Append { path, framing, body } => {
+        Cmd::Append { path, framing, crc, body } => {
             let framing = Framing::parse(framing)?;
             let (kind, width) = framing.wire();
+            let block = frame(framing, &body.bytes()?)?;
+            // Over the framed block, which is the logical form — not what the wire
+            // will compress it to, since that is the system's representation of the
+            // data rather than the data.
+            let checksum = crc.then(|| common::crc::of(&block));
             Request::new(Op::AppendRecord)
                 .text(path)
                 .number(kind)
                 .number(width)
-                .bytes(frame(framing, &body.bytes()?)?)
+                .flag(checksum.is_some())
+                .number(checksum.unwrap_or(0))
+                .bytes(block)
         }
         Cmd::Insert { path, key, body } => {
             Request::new(Op::InsertRecord).text(path).text(key).bytes(body.bytes()?)

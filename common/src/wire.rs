@@ -311,6 +311,91 @@ impl Response {
     }
 }
 
+/// An append as it goes from an FE to the primary EN, and from the primary to the
+/// other instances.
+///
+/// ⚠️ **This exists because the argument order was a contract neither side could
+/// test.** Two processes each counting positions in a list pass their own unit tests
+/// while disagreeing with each other — and reordering it once produced a primary that
+/// would have read the framing out of an instance number. One shape, built and read
+/// here, is what makes that a compile error instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendBlock {
+    pub sn: u32,
+    pub extent: u64,
+    /// The second the extent was created in, which is part of its name.
+    pub created: u64,
+    pub framing: crate::framing::Framing,
+    /// The caller's CRC of these bytes, if the caller gave one. It is the user's
+    /// guarantee rather than the system's, so it travels with the block and is not
+    /// something a tier may invent.
+    pub crc: Option<u64>,
+    /// Instances of the extent, primary first. Empty on the way to a secondary, which
+    /// has nothing to broadcast to.
+    pub instances: Vec<u32>,
+    /// The offset the primary chose, on the way to a secondary. None on the way in,
+    /// since choosing it is the primary's job.
+    pub offset: Option<u64>,
+    pub bytes: Vec<u8>,
+}
+
+impl AppendBlock {
+    pub fn request(&self, op: Op) -> Request {
+        let (kind, width) = self.framing.wire();
+        let mut request = Request::new(op)
+            .number(self.sn as u64)
+            .number(self.extent)
+            .number(self.created)
+            .number(kind)
+            .number(width)
+            .flag(self.crc.is_some())
+            .number(self.crc.unwrap_or(0))
+            .flag(self.offset.is_some())
+            .number(self.offset.unwrap_or(0));
+        for en in &self.instances {
+            request = request.number(*en as u64);
+        }
+        request.bytes(self.bytes.clone())
+    }
+
+    pub fn of(request: &Request) -> Result<AppendBlock> {
+        let [
+            Arg::Number(sn),
+            Arg::Number(extent),
+            Arg::Number(created),
+            Arg::Number(kind),
+            Arg::Number(width),
+            Arg::Flag(has_crc),
+            Arg::Number(crc),
+            Arg::Flag(has_offset),
+            Arg::Number(offset),
+            instances @ ..,
+        ] = request.args.as_slice()
+        else {
+            return Err(Error::new("an append does not have the shape of one"));
+        };
+        let Some((Arg::Bytes(bytes), instances)) = instances.split_last() else {
+            return Err(Error::new("an append carries bytes last"));
+        };
+        Ok(AppendBlock {
+            sn: *sn as u32,
+            extent: *extent,
+            created: *created,
+            framing: crate::framing::Framing::of_wire(*kind, *width)?,
+            crc: has_crc.then_some(*crc),
+            instances: instances
+                .iter()
+                .map(|arg| match arg {
+                    Arg::Number(en) => Ok(*en as u32),
+                    _ => Err(Error::new("an instance list is numbers")),
+                })
+                .collect::<Result<Vec<u32>>>()?,
+            offset: has_offset.then_some(*offset),
+            bytes: bytes.clone(),
+        })
+    }
+}
+
 fn encode_args(args: &[Arg], out: &mut Vec<u8>) {
     out.extend((args.len() as u16).to_le_bytes());
     for arg in args {
@@ -689,6 +774,48 @@ mod tests {
         let mut plain = Vec::new();
         put_response(&mut plain, &response).unwrap();
         assert_eq!(Response::decode(&plain[4..]).unwrap(), response);
+    }
+
+    /// The shape both an FE and an EN read, so neither counts positions.
+    #[test]
+    fn an_append_survives_the_wire() {
+        let block = AppendBlock {
+            sn: 3,
+            extent: 17,
+            created: 1_000_000,
+            framing: crate::framing::Framing::CrLf,
+            crc: Some(0xae8b_1486_0a79_9888),
+            instances: vec![2, 3, 0, 1],
+            offset: None,
+            bytes: b"one\r\ntwo\r\n".to_vec(),
+        };
+        assert_eq!(AppendBlock::of(&block.request(Op::AppendExtent)).unwrap(), block);
+
+        // On the way to a secondary: an offset, and no instance list.
+        let onward = AppendBlock { instances: Vec::new(), offset: Some(512), ..block.clone() };
+        assert_eq!(AppendBlock::of(&onward.request(Op::ApplyAppend)).unwrap(), onward);
+
+        // And no CRC, which is the caller's choice and not a tier's to invent.
+        let bare = AppendBlock { crc: None, ..block };
+        let read = AppendBlock::of(&bare.request(Op::AppendExtent)).unwrap();
+        assert_eq!(read.crc, None);
+    }
+
+    #[test]
+    fn an_append_of_the_wrong_shape_is_refused() {
+        assert!(AppendBlock::of(&Request::new(Op::AppendExtent).number(1)).is_err());
+        // Everything but the bytes.
+        let headless = Request::new(Op::AppendExtent)
+            .number(0)
+            .number(1)
+            .number(2)
+            .number(2)
+            .number(0)
+            .flag(false)
+            .number(0)
+            .flag(false)
+            .number(0);
+        assert!(AppendBlock::of(&headless).is_err());
     }
 
     #[test]

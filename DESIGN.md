@@ -4632,6 +4632,120 @@ Encryption reinforces the same conclusion: block boundaries and IV structure wou
 The exposure is entirely in the constants, which is the good case — provided they are constants in a table and
 not constants in the code.
 
+### 7.5 The CRC is the user's guarantee, and it is theirs to compute
+
+Encryption already detects tampering and corruption on the wire and on disk — an AEGIS tag fails to
+open a segment that has changed a bit (§7.2.1). **That is enough for the system's own purposes and it
+is not enough for the user's**, because it only ever covers a byte range the system already accepted.
+What the user wants to know is that the bytes DeLawson stored are the bytes the user's *buffer* held,
+including through everything that happened between the two.
+
+**So an append takes the CRC of its logical append block, in the user's chosen row format, as an
+optional argument** (Asserted, Bob, 2026-08-17). Optional, because a caller that does not care should
+not pay; given, it is a promise the store then keeps.
+
+#### 7.5.1 What the CRC is over, and what that buys
+
+**The logical bytes, framed the way the writer framed them.** Not the compressed form and not the
+encrypted form, because those are the system's representations of the data rather than the data. Which
+means the CRC survives every representation change the pipeline makes, and is what makes the guarantee
+end-to-end rather than hop-to-hop.
+
+The sequence a caller gets is worth spelling out, because it is what makes the guarantee stronger than
+a checksum computed by the store:
+
+1. The caller computes the CRC **on its own buffer**.
+2. The caller does **its own validation** of that buffer — whatever it means by correct.
+3. It passes **both the buffer and the CRC** to append.
+
+Step 2 is the one that matters. A checksum the store computes on arrival certifies whatever arrived; a
+checksum the caller computes before its own checks certifies what the caller *meant*, and any
+corruption between the caller's memory and the store's acceptance shows up as a mismatch instead of as
+durable wrong data.
+
+#### 7.5.2 The client compresses out of place, then re-verifies
+
+**The `laws` client compresses the buffer — not in place — and then verifies that the buffer still
+matches the CRC** (Asserted, Bob, 2026-08-17). The order is the point: compressing out of place leaves
+the original intact to be re-read, so **a corruption that happened before or during compression is
+caught by the mismatch.** Compressing in place would destroy the evidence.
+
+That places one CRC computation and one verification on the client's append path, which is affordable
+because the CRC is far faster than anything it sits beside. The implementation is
+[crc64nvme](https://github.com/bobjen/crc64nvme) — a port of the Cosmos 64-bit CRC, authorized by
+Microsoft, bitwise compatible with the CRC Azure uses — taken as a dependency rather than copied, and
+one we own, so an ARM branch is our work to do rather than somebody's to wait for.
+
+**Measured here, three trials over 512 MB:**
+
+| Build | Throughput |
+|---|---|
+| baseline `x86-64` | 4.8, 4.4, 4.8 GB/s |
+| `-C target-cpu=native` | 13.9, 13.9, **14.6 GB/s** |
+
+**Measured, 2026-08-17**, and the two builds produce identical CRCs, so this is purely how fast the same
+answer arrives. A **3x** difference from one compiler flag is worth knowing about, and it is a flag with
+a deployment consequence: `native` bakes in the build machine's instruction set, so a fleet needs a
+named floor or runtime dispatch rather than this (#62).
+
+**And it is fast at the sizes an append block actually comes in**, which is the number that decides
+whether the guarantee is affordable — a store of enormous objects still writes 50-byte records:
+
+| Append block | Per call | Rate |
+|---|---|---|
+| 16 B | **2.6 ns** | 6.1 GB/s |
+| 44 B — one small record | **5.6 ns** | 7.9 GB/s |
+| 256 B | 15.9 ns | 16.1 GB/s |
+| 4 KB | 233 ns | 17.6 GB/s |
+| 64 KB | 3.7 µs | **17.7 GB/s** |
+| 32 MB — the cap | 2.4 ms | 13.9 GB/s |
+
+**Measured, 2026-08-17.** There is no startup cost to speak of: the small sizes are slower per byte only
+because they are short, not because anything is being set up (§7.5's tables are built once per process).
+So the CRC is **5.6 ns on the smallest append and 2.4 ms on the largest** — against a request that takes
+microseconds and a 32 MB write that takes hundreds of milliseconds. It is noise at both ends, which is
+what makes it reasonable to put on every append rather than offering it as a premium.
+
+The peak is in the middle, at 4-64 KB, and the fall to 13.9 GB/s at 32 MB is memory rather than
+arithmetic — worth noting only so that the two figures above are not read as inconsistent.
+
+⚠️ **The tables are built once per process** (Asserted, Bob, 2026-08-17). Initialization is the
+expensive part, so there is one CRC per process, built on first use — a caller constructing one per
+append would pay setup per call and get right answers while doing it, which is the kind of mistake that
+never shows up as a bug.
+
+#### 7.5.3 It travels with the compressed block, and is checked on the way out
+
+**The CRC accompanies the compressed block throughout**, and **whenever a compressed block is
+decompressed the CRC is checked** — a mismatch is corruption, reported as such rather than returned as
+data. So the check happens at every point where the logical bytes exist again, which is the only place
+it can mean anything.
+
+On the read path that place is **whoever decompresses** — the client if it may hold whole blocks, the FE
+if it may not (§9.1.1). The client is the better answer, because then the same machine that computed the
+CRC going in checks it coming out and nothing in between looks inside.
+
+**The EN never checks a CRC**, and could not: it holds what the writer compressed, it does not
+decompress, and it may hold no keys. A check there would work only for as long as nothing compresses,
+and would then fail on every append.
+
+**Coalescing computes new CRCs** (§8.1.4.4, §10), and this is the subtle part: a CRC is over logical
+bytes *in a row format*, and coalescing may change the row format (§8.2.1). **So what is recorded is
+the CRC and the row format it was computed over.** A stored CRC without its framing is not
+interpretable, and re-framing without recomputing would silently invalidate every one of them.
+
+The chosen implementation helps here in a specific way: it can **concatenate two CRCs in O(log n)**
+without rescanning the bytes. So coalescing that merely joins blocks *in the same row format* can
+combine their CRCs arithmetically, and only a coalesce that re-frames has to read the data to
+recompute.
+
+⚠️ **The CRC is not exposed in object info** (Asserted, Bob, 2026-08-17), and the reason is a tenancy
+boundary rather than tidiness: **different tenants' data is mixed in one extent** (§4.6.1, §8.1.4), so
+**stream and extent metadata is not protected information.** A CRC is derived from user bytes, so
+putting one where cross-tenant metadata lives would leak a fingerprint of one tenant's data to
+another. It belongs with the block, inside what is encrypted — never in the metadata that describes
+where the block is.
+
 ## 8. Writing
 
 ### 8.1 Append blocks
@@ -6224,8 +6338,49 @@ discovered.
    extent-local record number; read *E*'s instance list.
 3. If *E* has a log, check it for a newer version or tombstone. If found, done.
 4. Otherwise binary search *E*'s sparse index → nearest preceding checkpoint.
-5. **EN**: read that granule from any instance, decrypt, decompress, parse
-   forward by framing, stop at the target.
+5. **EN**: read that granule from any instance and **return the whole compressed
+   block**, even when the caller asked for less.
+6. **Whoever extracts**: decrypt, decompress, check the CRC, parse forward by framing,
+   and take the record the caller wanted. That is the client if it may hold whole
+   blocks, and the FE if it may not — §9.1.1.
+
+⚠️ **An earlier draft had the EN doing steps 5 and 6 together — decrypting, parsing and
+returning one record. That is the wrong division** (Asserted, Bob, 2026-08-17): **the EN
+returns whole compressed blocks and it is up to whoever asked to extract the exact
+requested data.** Two independent reasons, and either alone would settle it:
+
+- **ENs are CPU-poor by design** (§1.2 puts the money in disks, not cores), and
+  decompressing and parsing on the tier that owns the disks spends the resource that
+  tier does not have.
+- **An EN need not hold keys at all** (§7.2, and it is why EC runs over ciphertext), so
+  it *cannot* look inside a block. Returning bytes it cannot read is not a limitation
+  to work around — it is the property that keeps plaintext off the storage tier.
+
+#### 9.1.1 How far the block travels decides who checks the CRC
+
+**If an FE can return whole compressed blocks to the client, then the client is what checks
+the CRC** (Asserted, Bob, 2026-08-17) — **unless there is a security reason insisting the FE
+does it.**
+
+The client is the better answer wherever it is available, and the reason is symmetry: the
+client compressed the bytes and computed the CRC going in (§7.5.2), so a client that
+decompresses and checks going out is comparing its own buffer against its own promise, with
+**nothing in between ever needing to look inside**. No tier spends CPU on it, no tier needs
+keys, and the guarantee covers the FE as well as everything below it. A check at the FE
+covers everything below the FE and takes the FE's word for the rest.
+
+⚠️ **And there is a candidate security reason, which turns on one property: whether a
+compression block can contain two tenants' records** (#64). §7.5.3 notes that **extents mix
+tenants**, and a compression block is a unit of compressed bytes rather than a unit of
+ownership — so if coalescing may pack two tenants' appends into one block, then handing that
+block to a client hands one tenant another's data, and the FE must extract instead. If a
+block is tenant-pure by construction, the client may hold it and the end-to-end version
+stands.
+
+So the deciding question is not about reads at all. It is a constraint on **coalescing**, and
+it has a cost either way: tenant-pure blocks waste the tail of a block at every tenant
+boundary, which matters precisely for §1's enormous numbers of tiny objects, while
+tenant-mixed blocks put plaintext and CPU back on the FE for every read.
 
 ⚠️ **"Any instance" holds for a sealed extent, and not for an unsealed one — and the reason is
 the watermark, not the data** (Asserted, Bob, 2026-08-17). Below the durable length every instance
@@ -10906,3 +11061,38 @@ path serves writers and starves readers, and the two look identical from the wri
 measurement passes. What made it visible was running more than one of something, which is the same reason
 §17.11.1's bugs needed eight writers: **a single instance of a thing cannot exhibit the disagreements
 between instances.**
+
+### 17.15 The CRC, as far as it can go before compression exists
+
+Built, 2026-08-17. `laws append --crc` computes the CRC of the framed block and sends it; the FE carries
+it; the primary EN stores it with the block and broadcasts it to the other instances. `status` on an EN
+reports how many blocks it holds a CRC for.
+
+**Everything the design asks for except the checking**, and that is not an omission: §7.5.3 puts the
+check where a compressed block becomes logical bytes again, and **nothing compresses yet**. So there is
+nowhere honest to check it.
+
+⚠️ **A check at the EN would have worked today and been wrong tomorrow**, which is worth recording as a
+kind of mistake rather than as a fact about CRCs. An EN currently holds exactly the bytes the writer
+sent, so an EN-side comparison would pass — and would fail on every append the moment the client
+started compressing, because the stored bytes would no longer be the bytes the CRC covers. **A check
+that only works while a feature is missing is worse than no check**: it passes its tests, and it breaks
+when something unrelated is switched on.
+
+The implementation is the dependency, not a copy: `crc64-nvme` from
+[crc64nvme](https://github.com/bobjen/crc64nvme). Two things about taking it that way are worth noting:
+
+- **The catalogue's check value is a test here**, because the polynomial has two forms and the wrong one
+  produces plausible values that agree with nothing. It was written from memory first, in the reflected
+  form of the catalogue's constant, and failed — the authorized implementation's constant is
+  `0x9a6c9329ac4bc9b5` and the check value then matched. That test now says this build agrees with Azure,
+  with Cosmos, and with the crate.
+- **The chaining convention is the crate's**, not the one a table-driven implementation uses: the seed
+  is the previous *finished* CRC, so `continuing(0, bytes)` is `of(bytes)`. The unit test that caught
+  this was written against the wrong convention, which is the useful direction for a test to be wrong in.
+
+**And the shared append shape came out of §17.13.3's lesson.** Adding the CRC meant adding a field to a
+message two processes each parse by counting positions — the exact contract that had already gone wrong
+once. So `common::wire::AppendBlock` is now built and read in one place and used by both the FE and the
+EN, which turns that class of mistake into a compile error. Its round trip is a unit test; the positions
+are nobody's business.
