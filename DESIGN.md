@@ -9213,10 +9213,9 @@ Only code serving a request has one; a compaction, a sync loop or a repair does 
 field would be empty for most of what a storage system does. Where a line belongs to a request, the
 id goes in the message with the rest of that line's values.
 
-**Separate the values with commas as well**, and order them low-cardinality first. A reader can then
-group on the first few of them *exactly*, so **nothing about a histogram needs truncating**
-(Asserted, Bob, 2026-08-16): the constant is whole, and a value is either in the grouping or it is
-not. A count of characters was what this replaced.
+**Separate the values with commas as well**, and order them low-cardinality first — the low ones are
+what a reader greps for. The file's first line is the same shape, at level `h` with constant `opened`,
+so nothing reading a log needs a special case for it.
 
 **How much reaches the info log is a rate, not a rule about levels.** A running histogram counts
 each site; rare sites pass through whole, and the busy ones are sampled at a stride recomputed so
@@ -9441,22 +9440,29 @@ enough to stop anyone wanting a shell**:
 - **grep** — whole lines mentioning a thing,
 - **lines** — a range by time, or the last few.
 
-The histogram row is `000000123,i,file,line,message prefix`, sorted by frequency — and it sorts by
-plain text order because the count is zero-padded, which is why it is. **`width` is the whole row,
-so it is also what decides how much of the message is grouped on**, which is the knob that matters:
+The histogram row is `000000123,i,file=…,line=…,constant`, sorted by frequency — and it sorts by plain
+text order because the count is zero-padded, which is why it is.
+
+**It has nothing to tune, and that is the point** (Asserted, Bob, 2026-08-16). A row per place in the
+code that said anything, the constant whole, nothing truncated and no knob:
 
 ```
-values 0:  000268175,i,common/src/server.rs,496,answered
-           000000050,n,common/src/server.rs,433,switched to a batching sender because an answer will not come from the read loop
-values 1:  000265175,i,common/src/server.rs,496,answered,op object-info
-           000003000,i,common/src/server.rs,496,answered,op batch-create
-values 2:  000265175,i,common/src/server.rs,496,answered,op object-info,status ok
+000268456,i,file=common/src/server.rs,line=496,answered
+000000042,n,file=common/src/server.rs,line=433,switched to a batching sender because an answer will not come from the read loop
+000000001,n,file=common/src/server.rs,line=365,registered with KS
 ```
 
-**Nothing is cut at any setting.** Zero values is a row per logging site — "what is this process
-mostly saying" in its purest form. One is a row per operation, two adds the status, and a setting that
-reached the object name would be a row per object, which is useless and is now the reader's choice
-rather than a limit of the format.
+**Two cheap queries beat one query with a knob.** The row's fields are spelled exactly as the lines
+spell them, so everything after the count and the level is literally a substring of the lines it
+counted — the answer to "what is it mostly saying" is also the argument for the next question:
+
+```
+laws log-grep --to DN0 "file=common/src/server.rs,line=496,answered"
+  i,…,file=common/src/server.rs,line=496,answered,op batch-create,status ok,about /bench/200 …,us 27242
+```
+
+Earlier versions folded a character width, and then a count of values, into the grouping. Both were
+answering the second question inside the first one, which is why neither was needed.
 
 **Reading is deliberately serial and takes as long as it takes** (Asserted, Bob, 2026-08-16). It is
 competing with a server for the same CPU and the same disk, so it reads one file at a time and one

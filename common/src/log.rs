@@ -154,8 +154,10 @@ pub fn enabled(level: Level) -> bool {
 /// never calls it — lines go to standard error.
 pub fn open(dir: &Path, identity: &str, config: Logging) -> Result<()> {
     let name = identity.to_lowercase();
+    // The same shape as every other line, so the reader needs no special case for
+    // it: level `h`, no source location, and the constant `opened`.
     let header = format!(
-        "h,{},pid={},identity={identity},host={},version={},times are UTC\n",
+        "h,{},pid={},tid=0,file=,line=0,opened,identity {identity},host {},version {},times are UTC\n",
         stamp(),
         std::process::id(),
         host(),

@@ -731,7 +731,7 @@ fn read_logs(process: &Process, request: &Request) -> Response {
     };
 
     let read = match request.op {
-        Op::LogHistogram => logs.histogram(number(1, 1), number(2, 40)),
+        Op::LogHistogram => logs.histogram(number(1, 40)),
         Op::LogGrep => logs.grep(text(1), number(2, 100)),
         _ => logs.range(text(1), text(2), number(3, 100)),
     };

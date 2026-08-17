@@ -123,12 +123,9 @@ enum Cmd {
     Registry,
     /// What a process logs, by site, busiest first: the live counters.
     Sites,
-    /// A histogram of the lines in a process's log files, most frequent first.
+    /// A histogram of a process's log files, most frequent first: a row per place
+    /// in the code that said anything. Grep for a row's constant to see the lines.
     LogHistogram {
-        /// How many of a line's values join the grouping. Zero is a row per
-        /// logging site; one is usually a row per operation.
-        #[arg(long, default_value_t = 1)]
-        values: usize,
         #[arg(long, default_value_t = 40)]
         rows: usize,
         /// Which log: the full one, or "info" for the one reaching further back.
@@ -986,8 +983,8 @@ fn build(cmd: &Cmd) -> Result<Request> {
         Cmd::SnMasterKey { sn, day } => Request::new(Op::SnMasterKey).number(*sn).number(*day),
         Cmd::RotateMasterKey => Request::new(Op::RotateMasterKey),
 
-        Cmd::LogHistogram { values, rows, which } => {
-            Request::new(Op::LogHistogram).text(which).number(*values as u64).number(*rows as u64)
+        Cmd::LogHistogram { rows, which } => {
+            Request::new(Op::LogHistogram).text(which).number(*rows as u64)
         }
         Cmd::LogGrep { what, limit, which } => {
             Request::new(Op::LogGrep).text(which).text(what).number(*limit as u64)

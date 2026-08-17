@@ -32,10 +32,7 @@ struct Cli {
 enum Cmd {
     /// What this process is mostly saying, most frequent first.
     Histogram {
-        /// How many of a line's values join the grouping. Zero is a row per
-        /// logging site; one is usually a row per operation.
-        #[arg(long, default_value_t = 1)]
-        values: usize,
+        /// Rows to return, most frequent first.
         #[arg(long, default_value_t = 40)]
         rows: usize,
     },
@@ -66,7 +63,7 @@ fn main() {
         }
     };
     let read = match &cli.cmd {
-        Cmd::Histogram { values, rows } => logs.histogram(*values, *rows),
+        Cmd::Histogram { rows } => logs.histogram(*rows),
         Cmd::Grep { what, limit } => logs.grep(what, *limit),
         Cmd::Lines { from, to, limit } => logs.range(from, to, *limit),
     };

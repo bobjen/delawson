@@ -120,30 +120,31 @@ impl Logs {
         Ok(seen)
     }
 
-    /// `000000123,i,file,line,constant,first values`, sorted by frequency.
+    /// `000000123,i,file=…,line=…,constant`, sorted by frequency: a row per place
+    /// in the code that said anything.
     ///
-    /// **Nothing is truncated.** The constant does not vary, so grouping on it is
-    /// exact; `values` says how many of the comma-separated values join the
-    /// grouping, and they are written low-cardinality first — so one is a row per
-    /// operation and none is a row per site. A count of characters was what the
-    /// two-message line replaced.
-    pub fn histogram(&self, values: usize, rows: usize) -> Result<(u64, Vec<String>)> {
+    /// The fields are spelled as the lines spell them, so everything after the
+    /// count and the level is **literally a substring of the lines it counts** —
+    /// a row is what to paste into the next query.
+    ///
+    /// **There is nothing to tune.** The constant does not vary, so grouping on it
+    /// is exact and no row needs truncating — and there is no need to fold values
+    /// into the grouping either, because the row tells you the file, the line and
+    /// the constant, and a grep for that constant is the next question
+    /// (Asserted, Bob, 2026-08-16). Two cheap queries beat one query with a knob.
+    pub fn histogram(&self, rows: usize) -> Result<(u64, Vec<String>)> {
         let mut counts: HashMap<String, u64> = HashMap::new();
         let mut key = String::new();
         let seen = self.scan(|whole| {
             let line = Line::of(whole);
             key.clear();
             key.push_str(line.level);
-            key.push(',');
+            key.push_str(",file=");
             key.push_str(line.file);
-            key.push(',');
+            key.push_str(",line=");
             key.push_str(line.at);
             key.push(',');
             key.push_str(line.what);
-            for value in line.values.split(',').take(values) {
-                key.push(',');
-                key.push_str(value);
-            }
             match counts.get_mut(&key) {
                 Some(count) => *count += 1,
                 None => {
@@ -248,30 +249,29 @@ n,2026-08-17 01:00:01.000000,pid=1,tid=1,file=common/src/server.rs,line=99,liste
         Logs::open(&dir, "dn0", u64::MAX).unwrap()
     }
 
-    /// One value in the grouping is the operation, so the two creates are one row
-    /// and the lookup is another.
+    /// A row per site, whole, with nothing cut and nothing to choose.
     #[test]
-    fn one_value_separates_the_ops() {
-        let (seen, rows) = logs(false).histogram(1, ROWS).unwrap();
+    fn a_row_per_site() {
+        let (seen, rows) = logs(false).histogram(ROWS).unwrap();
         assert_eq!(seen, 4);
-        assert_eq!(rows.len(), 3, "{rows:?}");
-        assert_eq!(rows[0], "000000002,i,dn/src/main.rs,10,answered,op create", "{rows:?}");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0], "000000003,i,file=dn/src/main.rs,line=10,answered", "{rows:?}");
     }
 
-    /// No values is a row per site, with the constant whole and nothing cut.
+    /// And a row is what to grep for: the part after the count and the level is a
+    /// substring of every line it counted, so the second query needs no thought.
     #[test]
-    fn no_values_is_a_row_per_site() {
-        let (_, rows) = logs(false).histogram(0, ROWS).unwrap();
-        assert_eq!(rows.len(), 2, "{rows:?}");
-        assert_eq!(rows[0], "000000003,i,dn/src/main.rs,10,answered", "{rows:?}");
+    fn a_row_says_what_to_grep_for() {
+        let logs = logs(false);
+        let (_, rows) = logs.histogram(ROWS).unwrap();
+        let site = rows[0].splitn(3, ',').nth(2).expect("count, level, then the rest");
+        let (_, found) = logs.grep(site, 10).unwrap();
+        assert_eq!(found.len(), 3, "{found:?}");
     }
 
     #[test]
     fn a_compressed_log_reads_the_same() {
-        assert_eq!(
-            logs(false).histogram(90, ROWS).unwrap(),
-            logs(true).histogram(90, ROWS).unwrap()
-        );
+        assert_eq!(logs(false).histogram(ROWS).unwrap(), logs(true).histogram(ROWS).unwrap());
     }
 
     #[test]
