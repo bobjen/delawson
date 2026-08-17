@@ -199,9 +199,9 @@ impl Logs {
     }
 }
 
-/// A compressed block is one buffer's worth, so anything larger says the file is
-/// not what it claims to be.
-const MAX_BLOCK: usize = 8 << 20;
+/// The largest block a writer may emit, and so the largest a reader will allocate
+/// for one. A writer with more than this pending cuts it at a line boundary.
+pub const MAX_BLOCK: usize = 8 << 20;
 
 /// Compress one block of lines for a log file: the loose length, the tight
 /// length, then the bytes. Lengths first, so a reader can walk without a table.

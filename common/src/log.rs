@@ -408,6 +408,22 @@ pub fn histogram() -> Vec<(u64, u64, String)> {
     rows
 }
 
+/// Where a block has to end: at the last line boundary inside the limit, or at the
+/// end of what is pending. A whole line always fits, since a line is far shorter
+/// than a block.
+fn block_end(pending: &[u8], from: usize) -> usize {
+    let room = crate::logread::MAX_BLOCK;
+    if pending.len() - from <= room {
+        return pending.len();
+    }
+    match pending[from..from + room].iter().rposition(|byte| *byte == b'\n') {
+        Some(last) => from + last + 1,
+        // No line boundary in a whole block: one absurd line, cut rather than held
+        // for ever.
+        None => from + room,
+    }
+}
+
 /// A run of numbered files, oldest deleted once there are too many.
 struct Rotating {
     dir: PathBuf,
@@ -467,30 +483,48 @@ impl Rotating {
         Ok(())
     }
 
-    /// Put what is pending into the file, as a compressed block or as it stands.
+    /// Put what is pending into the file: one compressed block, or several when
+    /// there is more pending than a block may hold.
+    ///
+    /// A reader can only read whole blocks, so a block has a limit and the pending
+    /// bytes have to be cut to fit it — always at a line boundary, since a line
+    /// split across blocks would be a line no grep could find.
     fn flush(&mut self) -> std::io::Result<()> {
         if self.pending.is_empty() {
-            return self.file.flush();
+            return Ok(());
         }
         // Taken out of `self` so the file can be rolled while it is held.
-        let mut block = std::mem::take(&mut self.pending);
-        if self.packed {
-            let mut packed = Vec::new();
-            // A block too large to compress goes as it is rather than being lost.
-            if crate::logread::pack(&block, &mut packed).is_ok() {
-                block = packed;
-            }
-        }
+        let pending = std::mem::take(&mut self.pending);
+        let mut at = 0;
+        let mut packed = Vec::new();
+        while at < pending.len() {
+            let end = if self.packed { block_end(&pending, at) } else { pending.len() };
+            let piece = &pending[at..end];
+            at = end;
 
-        if self.written + block.len() as u64 > self.size {
-            self.roll()?;
+            let bytes: &[u8] = if self.packed {
+                packed.clear();
+                match crate::logread::pack(piece, &mut packed) {
+                    Ok(()) => &packed,
+                    // Written as it stands rather than lost; the file says per
+                    // block which it is.
+                    Err(_) => piece,
+                }
+            } else {
+                piece
+            };
+
+            if self.written + bytes.len() as u64 > self.size {
+                self.roll()?;
+            }
+            self.file.write_all(bytes)?;
+            FILE_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            self.written += bytes.len() as u64;
         }
-        self.file.write_all(&block)?;
-        FILE_BYTES.fetch_add(block.len() as u64, Ordering::Relaxed);
-        self.written += block.len() as u64;
-        block.clear();
-        self.pending = block;
-        self.file.flush()
+        let mut pending = pending;
+        pending.clear();
+        self.pending = pending;
+        Ok(())
     }
 
     fn roll(&mut self) -> std::io::Result<()> {
@@ -807,5 +841,36 @@ mod cost {
         println!("filtered: {each:.2} ns per line (sink {sink})");
         set_floor(Level::Info);
         too_slow(each);
+    }
+}
+
+#[cfg(test)]
+mod blocks {
+    use super::*;
+
+    /// More pending than a block may hold has to become several blocks, cut at
+    /// line boundaries, and read back as the same lines.
+    #[test]
+    fn a_long_delay_becomes_several_blocks() {
+        let dir = std::env::temp_dir().join(format!("laws-blocks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A block target larger than a block may be, which is what an HDD's
+        // 14 MB of text asks for.
+        let block = crate::logread::MAX_BLOCK * 3;
+        let mut rotating =
+            Rotating::new(&dir, "dn0", u64::MAX, 4, String::new(), true, block).unwrap();
+
+        let line = "i,2026-08-17 01:00:00.000001,pid=1,tid=1,file=x.rs,line=1,said,value 1\n";
+        let count = block / line.len() + 10;
+        for _ in 0..count {
+            rotating.write(line.as_bytes(), false).unwrap();
+        }
+        rotating.flush().unwrap();
+
+        let logs = crate::logread::Logs::open(&dir, "dn0", u64::MAX).unwrap();
+        let (seen, rows) = logs.histogram(10).unwrap();
+        assert_eq!(seen, count as u64, "every line should come back");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

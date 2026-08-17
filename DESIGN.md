@@ -9493,9 +9493,17 @@ seek for less work.
 
 **The 200 ms flush timer is the other bound, and on HDD it usually wins** (Asserted, Bob,
 2026-08-16): a 14 MB block needs 70 MB/s of lines to fill inside the timer, so below that the log is
-written every 200 ms in whatever size has accumulated. The two bounds do different jobs — the timer
-decides how stale the file may be, the block decides whether a write is worth making — and whichever
-comes first is the right answer.
+written every 200 ms in whatever size has accumulated. Measured with the log disk set to HDD, the
+blocks came out **0.7 to 1.0 MB** rather than 14, which is the timer deciding. The two bounds do
+different jobs — the timer decides how stale a file may be, the block whether a write is worth making —
+and whichever comes first is the right answer. The ratio barely notices: 7.5x at 280 KB blocks, 7.6x
+at a megabyte.
+
+⚠️ **A reader can only read whole blocks, so a delayed write may have to become several of them**
+(Asserted, Bob, 2026-08-16). HDD's 14 MB of text is larger than the 8 MB a block may be, so what is
+pending is cut into blocks — always at a line boundary, since a line split across two blocks is a line
+no grep would find. Without that, the compression simply gave up on every block and wrote the text as
+it stood, which is the kind of failure that looks like it is working.
 
 ### 17.6 The harness reports what it cannot enforce
 
