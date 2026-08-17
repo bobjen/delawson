@@ -3283,9 +3283,17 @@ many more. Two reasons:
 - **Cost amortization.** Expensive roles (CPU for primaries, RAM for materialized
   backups) and the cheap one (a log on disk) mix on every machine, so no machine
   is all-expensive and none sits idle.
-- **Core utilization.** Write-lock work within a ring is serialized, so one ring
-  keeps about one core busy. To use *C* cores a machine needs on the order of *C*
-  rings in a primary role. **Ring count per machine is set by core count.**
+- **Core utilization.** Write work within a ring is serialized, so one ring keeps
+  only so many cores busy. To use *C* cores a machine needs several rings in a
+  primary role. **Ring count per machine is set by core count** — and by how much of
+  a ring's work is serialized, which is a number nobody has measured (§5.8.2).
+
+**What serializes it is the process-wide exclusive lock** (Asserted, Bob,
+2026-08-17): **work persisted to the ring is done under the exclusive side** of
+§14.6.3's global shared/exclusive lock. So this is not a ring-specific mechanism
+sitting beside the metadata structures' locking — it is the same lock, and persisting
+a mutation is one of the operations §14.6.3 requires to be enumerable. **Bob's
+expectation is around 10 rings per machine.**
 
 #### 5.8.1 Rings are a concurrency unit, not a capacity unit
 
@@ -3974,6 +3982,69 @@ sufficiently popular reservation slot makes the bank's accumulation rate a promi
 and the independence audit (§5.6.8) are exactly predictable recurring load. So the system should hold scheduled
 reservations for them — and §12.6.4 requires that cost to be tracked rather than absorbed silently, which makes the
 system's own reservations the first entry in that ledger.
+
+#### 5.8.2 How many cores a ring process can use is the number to measure
+
+**There will be some average number of cores a ring process can use before the
+exclusive-lock work leaves the others idle, and it has to be measured** (Asserted,
+Bob, 2026-08-17). It is Amdahl's law with the serial fraction being whatever share of
+a ring's work is persisted:
+
+| Share under the exclusive lock | Cores one ring process can use | Rings to fill 32 cores | To fill 64 |
+|---|---|---|---|
+| 5% | 20 | 2 | 3 |
+| 10% | 10 | 3 | 6 |
+| 20% | 5 | 6 | 13 |
+| 35% | 2.9 | 11 | 22 |
+| 50% | 2 | 16 | 32 |
+
+**Derived.** So the three numbers — the exclusive share, cores per ring process, and
+rings per machine — are one relation with one unknown. An earlier draft of this section
+asserted "one ring keeps about one core busy", which is the 100% row and much too
+pessimistic.
+
+**The estimate to design against: cores per ring process is probably between 2 and 50,
+and 8 is a good guess** (Guess, Bob, 2026-08-17). Reading the relation from that side:
+
+| Cores per ring process | Implied exclusive share | Rings to fill 32 cores | To fill 64 |
+|---|---|---|---|
+| 2 — the pessimistic end | 50% | 16 | 32 |
+| **8 — the guess** | **12.5%** | **4** | **8** |
+| 50 — the optimistic end | 2% | 1 — one ring more than fills it | 2 |
+
+Which is consistent with around ten rings per machine on a machine of a few dozen
+cores, and it says what the range costs: at the pessimistic end a machine wants a few
+dozen rings and pays §5.8.1's failover and stream-list costs for them; at the
+optimistic end one or two rings would fill the machine and role mixing (below) becomes
+the binding reason for more.
+
+⚠️ **And it varies by user** (Asserted, Bob, 2026-08-17), because what share of the
+work is persisted is a property of the workload: a read-heavy tenant persists almost
+nothing and fills many cores per ring, a write-heavy one fills few. So *P* is not one
+fleet-wide number derived once — **which is a third argument for many rings per
+machine**: a machine holding rings for many tenants sees the average of their mixes
+rather than one tenant's, so the number it should be configured with is stable even
+though the per-ring figure is not.
+
+⚠️ **The measurement is not "how fast is a ring".** It is the *share* of the work that
+has to be serialized, because that is what bounds the parallelism however fast each
+part is. A ring twice as fast with the same share fills the same number of cores.
+
+**And role mixing wants several rings for a second, independent reason.** A machine is
+primary for a ring or it is not, so with one ring its CPU load is feast or famine. The
+count of primary roles is binomial, so the swing narrows as 1/√*R*:
+
+| Rings per machine | Primary roles, mean (ring of 5) | Spread |
+|---|---|---|
+| 1 | 0.2 | 200% |
+| 5 | 1.0 | 89% |
+| 10 | 2.0 | **63%** |
+| 40 | 8.0 | 32% |
+
+**Derived.** Which says something useful about *why* the answer is around ten rather
+than around one hundred: the smoothing is a diminishing return, and by ten the swing
+is already a third of what a single ring gives, while §5.8.1's failover cost and the
+stream-list cost both keep rising with *P*.
 
 ## 6. Size limits and sealing
 
