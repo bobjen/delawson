@@ -5094,6 +5094,34 @@ This also removes the motivating case for making **power** an explicit nested fa
 for other reasons — a correlated power event is a disaster in the §1.1.1 sense — but nothing in the write path now
 depends on it.
 
+##### 8.1.4.6 An extent known to age out quickly is never coalesced at all
+
+**If it is known that an extent will age out quickly, never write the coalesced version**
+(Asserted, Bob, 2026-08-17). This is §8.5.3's argument one level down, and it is the stronger
+version of it: coalescing is a rewrite whose cost is amortized over the data's remaining life,
+so for data with almost no remaining life the right amount of rewriting is none. What is saved
+is the whole migration write of §8.1.4.4, the recompression CPU that goes with it, and the
+garbage both leave behind.
+
+**Declared expiry decides it, exactly as it decides encoding.** An object with a one-day
+expiry (§8.5.1) already skips the encode queue; the same declaration should skip the coalesce.
+One signal, two decisions, neither of them a guess.
+
+Two consequences, and the second is the awkward one:
+
+- ⚠️ **Data that is never coalesced is never self-describing.** §8.1.5.1 makes coalescing the
+  moment an extent becomes interpretable on its own, so skipping it leaves that extent
+  dependent on its disk's journal for the whole of its life rather than for a window. The
+  journal's blast radius is therefore not purely transient, which is an argument for #46's
+  second copy rather than against it.
+- ⚠️ **It keeps the data on the staging device for its lifetime.** Appends land in common
+  extents (§8.1.4), so an extent that is never migrated is one that never leaves them.
+  §8.1.4.5 sizes staging by *endurance* at ~1.8 TB, and §8.1.4.4 already finds that device 3x
+  too small to *retain* a day of ingest. So the rule has a lifetime threshold set by staging
+  capacity and not by the amortization argument: skipping the coalesce is free for data that
+  ages out in minutes and unaffordable for data that ages out in a week, with the crossover
+  set by a device sized for something else (#47).
+
 ### 8.1.5 What an EN keeps on disk: a journal of extent metadata, per disk
 
 The bytes of an extent are on a disk; what says which extent they belong to, and at what
