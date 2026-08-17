@@ -65,6 +65,14 @@ level = "info"
 # text buys nothing, and lines compress several fold — which is retention for the
 # same bytes. Turn it off to read a file with ordinary tools.
 compress = true
+
+# Which media class the log disk is, and what lines compress by. Between them they
+# set how much text to gather before writing: the device's minimum write, times the
+# ratio. SSD at 40 KB and 7x is a 280 KB block of text; HDD at 2 MB and 7x is 14
+# MB, where the flush timer arrives first at any ordinary rate. 7x is measured, and
+# status reports what a run actually achieved.
+disk = "ssd"
+compress_ratio = 7
 size = 67108864
 full_files = 8
 info_files = 40
@@ -118,6 +126,7 @@ domain = ["region0", "dc0", "rack0", "box0", "disk0"]
 name = "hdd"
 index_interval = 1048576
 min_read_bytes = 1048576
+min_write_bytes = 2097152
 compress_block = 262144
 staging_bypass = 4194304
 compress_read_win = true
@@ -127,6 +136,7 @@ repair_bytes_sec = 20000000
 name = "ssd"
 index_interval = 20480
 min_read_bytes = 20480
+min_write_bytes = 40960
 compress_block = 65536
 staging_bypass = 1048576
 compress_read_win = false

@@ -163,7 +163,11 @@ impl Process {
         }
         std::fs::create_dir_all(&config.data_dir).context(config.data_dir.display())?;
         let run_dir = process_config.parent().unwrap_or(Path::new(".")).to_path_buf();
-        crate::log::open(&run_dir.join("logs"), &config.identity, cluster.logging.build()?)?;
+        crate::log::open(
+            &run_dir.join("logs"),
+            &config.identity,
+            cluster.logging.build(&cluster.media_classes)?,
+        )?;
         let peers = Peers::new(
             cluster.messaging.clone(),
             Duration::from_millis(cluster.timeouts.request_ms),
@@ -821,6 +825,12 @@ fn status(process: &Process, service: &impl Service) -> String {
             let (plain, wire) = crate::seal::totals();
             format!("sealed_plain {plain} sealed_wire {wire}")
         },
+        {
+            let (lines, files) = crate::log::written();
+            let ratio = lines as f64 / files.max(1) as f64;
+            format!("log_lines {lines} log_files {files} log_ratio {ratio:.1}")
+        },
+        format!("log_block {}", crate::log::block()),
         format!("senders {}", process.senders.load(Ordering::Relaxed)),
         format!("domain {}", process.entry.domain.join("/")),
     ];

@@ -125,8 +125,13 @@ pub struct MediaClass {
     pub name: String,
     /// Sparse-index checkpoint interval, in physical bytes.
     pub index_interval: u64,
-    /// Never read less than this from the device.
+    /// Never read less than this from the device: half the break-even, since past
+    /// that point the seek is already amortized.
     pub min_read_bytes: u64,
+    /// And never write less than this, which is the whole break-even rather than
+    /// half of it: a short read still delivers the bytes asked for, while a short
+    /// write pays the same seek for less work.
+    pub min_write_bytes: u64,
     pub compress_block: u64,
     /// Appends at least this large skip EN-internal staging.
     pub staging_bypass: u64,
@@ -209,6 +214,14 @@ pub struct Logging {
     pub level: String,
     /// Store the files compressed, since the log tool is what reads them.
     pub compress: bool,
+    /// Which media class the log disk is, by name in the cluster table. A block
+    /// of lines is accumulated until it will be a write that device wants: the
+    /// table's minimum read is the same number.
+    pub disk: String,
+    /// What a block of lines is expected to compress by, which is what turns the
+    /// device's wanted write size into an amount of text to accumulate. A guess,
+    /// and `status` reports what was actually achieved.
+    pub compress_ratio: u64,
     /// Bytes per file, before the next one is started.
     pub size: u64,
     /// Files kept of the full log, which carries every line. Size times count is
@@ -225,8 +238,20 @@ pub struct Logging {
 }
 
 impl Logging {
-    pub fn build(&self) -> Result<crate::log::Logging> {
+    /// The media-class table is what says how large a write the log disk wants, so
+    /// the block size is derived rather than configured twice.
+    pub fn build(&self, media: &[MediaClass]) -> Result<crate::log::Logging> {
+        let disk = media.iter().find(|class| class.name == self.disk).ok_or_else(|| {
+            Error::new(format!("logging.disk {:?} is not a media class", self.disk))
+        })?;
+        // What the device wants of a write, times what the text shrinks by.
+        let block = if self.compress {
+            disk.min_write_bytes * self.compress_ratio.max(1)
+        } else {
+            disk.min_write_bytes
+        };
         Ok(crate::log::Logging {
+            block: block as usize,
             level: crate::log::Level::parse(&self.level).ok_or_else(|| {
                 Error::new(format!("logging.level {:?} is not a level", self.level))
             })?,
@@ -572,7 +597,7 @@ mod tests {
         rings = { members = 1 }
         messaging = { send = "direct", encrypt = false, compress = "none", compress_min = 256, compress_sample = 4096, peer_conns = 2, key = "0f1e2d3c4b5a69788796a5b4c3d2e1f0" }
         timeouts = { request_ms = 1000, shutdown_grace_ms = 1000 }
-        logging = { level = "info", compress = false, size = 1024, full_files = 2, info_files = 2, info_share = 0.1, recount = 16 }
+        logging = { level = "info", compress = false, disk = "hdd", compress_ratio = 6, size = 1024, full_files = 2, info_files = 2, info_share = 0.1, recount = 16 }
     "#;
 
     fn parse(roster: &str) -> Result<ClusterConfig> {
@@ -597,6 +622,7 @@ mod tests {
             name = "hdd"
             index_interval = 1048576
             min_read_bytes = 1048576
+            min_write_bytes = 2097152
             compress_block = 262144
             staging_bypass = 4194304
             compress_read_win = true

@@ -30,7 +30,7 @@
 use crate::{Context, Result};
 use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{BufWriter, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -105,6 +105,10 @@ static SINCE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub struct Logging {
     pub level: Level,
+    /// Bytes of lines to accumulate before writing them. Derived from what the log
+    /// disk wants of a write and what the lines compress by, so a compressed block
+    /// lands at the device's size rather than a sixth of it.
+    pub block: usize,
     /// Store the files compressed. Nothing reads them without the log tool, so
     /// there is nothing left for plain text to be convenient for — and lines
     /// compress several fold, which is the difference between minutes and hours
@@ -164,7 +168,15 @@ pub fn open(dir: &Path, identity: &str, config: Logging) -> Result<()> {
         env!("CARGO_PKG_VERSION"),
     );
     let packed = config.compress;
-    let full = Rotating::new(dir, &name, config.size, config.full_files, header.clone(), packed)?;
+    let full = Rotating::new(
+        dir,
+        &name,
+        config.size,
+        config.full_files,
+        header.clone(),
+        packed,
+        config.block,
+    )?;
     let info = Rotating::new(
         dir,
         &format!("{name}-info"),
@@ -172,6 +184,7 @@ pub fn open(dir: &Path, identity: &str, config: Logging) -> Result<()> {
         config.info_files,
         header,
         packed,
+        config.block,
     )?;
     FLOOR.store(config.level as u8, Ordering::Relaxed);
     let _ = LOGGER.set(Logger { config, full: Mutex::new(full), info: Mutex::new(info) });
@@ -305,6 +318,20 @@ pub fn write(site: &'static Site, level: Level, what: &'static str, values: std:
     }
 }
 
+/// Bytes of lines given to the logger, and bytes the files took, so the ratio a
+/// run achieved is a fact rather than the guess the block size was derived from.
+static LINE_BYTES: AtomicU64 = AtomicU64::new(0);
+static FILE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The bytes of lines a block gathers before it is written.
+pub fn block() -> usize {
+    LOGGER.get().map(|logger| logger.config.block).unwrap_or(0)
+}
+
+pub fn written() -> (u64, u64) {
+    (LINE_BYTES.load(Ordering::Relaxed), FILE_BYTES.load(Ordering::Relaxed))
+}
+
 /// Push both buffers to the disk. Called on a timer, and worth calling before a
 /// process stops.
 pub fn flush() {
@@ -381,9 +408,6 @@ pub fn histogram() -> Vec<(u64, u64, String)> {
     rows
 }
 
-/// Buffer per log file. Big enough that a busy process writes whole pages.
-const BUFFER_BYTES: usize = 64 << 10;
-
 /// A run of numbered files, oldest deleted once there are too many.
 struct Rotating {
     dir: PathBuf,
@@ -392,7 +416,7 @@ struct Rotating {
     keep: usize,
     seq: usize,
     written: u64,
-    file: BufWriter<File>,
+    file: File,
     /// Written at the top of every file. Rotation means a reader may hold only
     /// one of them, and a line alone does not say which process or machine it
     /// came from.
@@ -400,6 +424,8 @@ struct Rotating {
     /// Lines waiting to be written. With compression they are a block; without,
     /// they are just the next write.
     pending: Vec<u8>,
+    /// How many bytes of lines to gather first.
+    block: usize,
     packed: bool,
 }
 
@@ -411,6 +437,7 @@ impl Rotating {
         keep: usize,
         header: String,
         packed: bool,
+        block: usize,
     ) -> Result<Rotating> {
         std::fs::create_dir_all(dir).context(dir.display())?;
         let mut rotating = Rotating {
@@ -420,12 +447,10 @@ impl Rotating {
             keep: keep.max(1),
             seq: 0,
             written: 0,
-            file: BufWriter::with_capacity(
-                BUFFER_BYTES,
-                File::create(path(dir, name, 0, packed)).context(dir.display())?,
-            ),
+            file: File::create(path(dir, name, 0, packed)).context(dir.display())?,
             header,
-            pending: Vec::with_capacity(BUFFER_BYTES),
+            pending: Vec::with_capacity(block),
+            block,
             packed,
         };
         let header = rotating.header.clone();
@@ -434,8 +459,9 @@ impl Rotating {
     }
 
     fn write(&mut self, bytes: &[u8], urgent: bool) -> std::io::Result<()> {
+        LINE_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         self.pending.extend_from_slice(bytes);
-        if urgent || self.pending.len() >= BUFFER_BYTES {
+        if urgent || self.pending.len() >= self.block {
             self.flush()?;
         }
         Ok(())
@@ -460,6 +486,7 @@ impl Rotating {
             self.roll()?;
         }
         self.file.write_all(&block)?;
+        FILE_BYTES.fetch_add(block.len() as u64, Ordering::Relaxed);
         self.written += block.len() as u64;
         block.clear();
         self.pending = block;
@@ -469,10 +496,7 @@ impl Rotating {
     fn roll(&mut self) -> std::io::Result<()> {
         self.file.flush()?;
         self.seq += 1;
-        self.file = BufWriter::with_capacity(
-            BUFFER_BYTES,
-            File::create(path(&self.dir, &self.name, self.seq, self.packed))?,
-        );
+        self.file = File::create(path(&self.dir, &self.name, self.seq, self.packed))?;
         self.written = 0;
         // The header goes at the top of the new file as its own block.
         let header = self.header.clone();
@@ -728,7 +752,7 @@ mod tests {
     fn rotation_keeps_the_last_few() {
         let dir = std::env::temp_dir().join(format!("laws-log-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut rotating = Rotating::new(&dir, "test", 64, 3, String::new(), false).unwrap();
+        let mut rotating = Rotating::new(&dir, "test", 64, 3, String::new(), false, 1).unwrap();
         for n in 0..40 {
             rotating.write(format!("line {n} of some length\n").as_bytes(), true).unwrap();
         }

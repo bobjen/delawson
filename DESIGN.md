@@ -9470,12 +9470,32 @@ block at a time, holds only what the answer needs, and the caller waits — the 
 hour. Nothing about it is parallel, and that is the design rather than an omission.
 
 **And the files are compressed**, which follows from nobody reading them directly: the only consumer
-is a tool that can decompress. Each flush is one independent lz4 block, so a torn last block from a
-process that died ends the walk instead of failing the answer, and the extension says which a file
-is — `.logz` compressed, `.log` not. **Measured: 402,614 lines, about 50 MB of text, in 8.0 MB —
-6.3x.** That is 28 MB/s of lines becoming 4.4 MB/s on the disk, and it turns §17.5g.1's 18 seconds of
-full log into a couple of minutes for the same bytes. It does not solve retention by itself; it moves
-it by a factor of six.
+is a tool that can decompress. Each block is independent, so a torn last block from a process that
+died ends a walk instead of failing an answer, and the extension says which a file is — `.logz`
+compressed, `.log` not. **Measured: 74 MB of lines in 9.9 MB of file, 7.5x** (Bob's guess of "more
+than 6x" was right), and `status` reports the ratio a run achieved rather than leaving it a guess.
+28 MB/s of lines becomes 3.7 MB/s on the disk, which turns §17.5g.1's 18 seconds of full log into a
+couple of minutes for the same bytes.
+
+**How much text a block gathers is derived from the disk, not configured** (Asserted, Bob,
+2026-08-16). A device wants a write of at least its break-even, and compression means the text has to
+be that much larger — so the block is `min_write_bytes x compress_ratio`, and both come from the
+media-class table:
+
+| Log disk | Wants a write of | Block of text | Which writes | Fills at 28 MB/s in |
+|---|---|---|---|---|
+| SSD | 40 KB | 280 KB | 37 KB | 10 ms |
+| HDD | 2 MB | 14 MB | 1.9 MB | 500 ms |
+
+⚠️ **The table gained a `min_write_bytes`**, which is the *whole* break-even rather than the half that
+`min_read_bytes` is: a short read still delivers the bytes asked for, while a short write pays the same
+seek for less work.
+
+**The 200 ms flush timer is the other bound, and on HDD it usually wins** (Asserted, Bob,
+2026-08-16): a 14 MB block needs 70 MB/s of lines to fill inside the timer, so below that the log is
+written every 200 ms in whatever size has accumulated. The two bounds do different jobs — the timer
+decides how stale the file may be, the block decides whether a write is worth making — and whichever
+comes first is the right answer.
 
 ### 17.6 The harness reports what it cannot enforce
 
