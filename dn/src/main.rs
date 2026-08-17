@@ -13,9 +13,9 @@
 //! request to be answered when the SN says the streams exist.
 
 use common::config::{DNConfig, ServiceKind};
-use common::logw;
 use common::server::{self, Process, Reply, Service};
 use common::wire::{Arg, Op, Request, Response, Status};
+use common::{logi, logw};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -219,6 +219,7 @@ impl DN {
                 }
             }
             dn.objects.fetch_add(count, Ordering::Relaxed);
+            logi!("created objects, count {count} streams from {first} on {named}");
             reply.send(say(count));
         });
         if let Err(e) = asked {
@@ -240,8 +241,14 @@ impl DN {
             _ => return Response::error(Status::BadRequest, "object-info takes a name"),
         };
         match self.look(name) {
-            Some(args) => Response { id: 0, status: Status::Ok, args },
-            None => Response::error(Status::NotFound, format!("no object {name}")),
+            Some(args) => {
+                logi!("looked up an object, name {name}");
+                Response { id: 0, status: Status::Ok, args }
+            }
+            None => {
+                logi!("looked up a name with no object, name {name}");
+                Response::error(Status::NotFound, format!("no object {name}"))
+            }
         }
     }
 
@@ -268,6 +275,7 @@ impl DN {
                 ]),
             }
         }
+        logi!("looked up objects, count {}", request.args.len());
         Response { id: 0, status: Status::Ok, args }
     }
 

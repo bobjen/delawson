@@ -9331,6 +9331,37 @@ what a small metadata request pays for. Batched, the whole cost collapses by a f
 balance inverts, because a batch amortizes the forward and leaves DN doing the only real work there
 is: 20 million random hash lookups a second across 64 shards.
 
+#### 17.5g.1 A line per request is affordable; keeping it for hours is not
+
+**Every request through FE, DN and SN logs one `info` line.** What that costs:
+
+| | Line written | Line filtered | Cost |
+|---|---|---|---|
+| create, 1,000 per request | 2,851,000 /s | 2,820,000 /s | none |
+| create, one per request | 127,000 /s | 144,000 /s | **11%** |
+| `object-info`, one per request | 228,000 /s | 262,000 /s | **13%** |
+| `batch-object-info`, 1,000 | 5,481,000 /s | 5,474,000 /s | none |
+
+**Measured, 2026-08-16.** A batched request pays nothing, because the line is per *request* and the
+request carries a thousand objects — the same amortization the batch exists for. A single-object
+request pays 11 to 13%, which is worth it: every request is then accounted for, and the alternative
+is a system whose busiest paths say nothing. Rate-limited sampling is the fallback if a path ever
+turns out not to afford it, not the default.
+
+⚠️ **What is not affordable is keeping it.** At §1.4's target rate and a ~125-byte line, a process
+writes **28 MB/s, or 103 GB an hour** — so the 512 MB of full log that §17.5d's configuration keeps
+wraps in **18 seconds**, and the info log's tenth of it lasts a quarter of an hour rather than days.
+Three things follow, and they are policy rather than code:
+
+- **The retention targets and the line rate have to be set together.** Hours of full log at target
+  QPS is a few hundred gigabytes per process; that is affordable on a storage machine and absurd on a
+  front end, so the sizes belong per machine type rather than fleet-wide, which is a change to where
+  §17.5d put them.
+- **The header is most of the line.** Level, time, pid, tid, file and line are ~85 of the ~125 bytes,
+  so what a shorter or binary header buys is not a few percent but most of the volume.
+- **28 MB/s of log competes with the workload it is describing.** On an EN that is disk bandwidth the
+  storage pipeline wanted, which makes the log's share a budget like any other.
+
 ⚠️ **Three serializations had to be removed to get here**, and each was invisible until the rate was
 high enough to expose it. They are worth stating because they are the same mistake in three costumes:
 

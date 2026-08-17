@@ -12,9 +12,9 @@
 //! costs a thread.
 
 use common::config::{FEConfig, ServiceKind};
-use common::logw;
 use common::server::{self, Process, Reply, Service};
 use common::wire::{Op, Request, Response, Status};
+use common::{logi, logw};
 use std::sync::Arc;
 
 const SERVES: &[Op] = &[
@@ -79,6 +79,7 @@ impl Service for FE {
             Ok(dn) => dn.to_string(),
             Err(e) => return reply.send(Response::error(Status::Internal, e.to_string())),
         };
+        logi!("forwarding, op {} dn {dn}", request.op);
         // The answer is whatever the DN says, since FE adds nothing to it yet.
         if let Err(e) = process.ask(&dn, &request, move |answer| reply.send(answer)) {
             // The reply went into the closure, so this needs its own.

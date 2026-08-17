@@ -9,6 +9,7 @@
 //! to cope with reuse — an index that has to survive churn is a later problem.
 
 use common::config::SNConfig;
+use common::logi;
 use common::server::{self, Process, Service};
 use common::wire::{Arg, Op, Request, Response, Status};
 use std::collections::HashMap;
@@ -86,6 +87,7 @@ impl SN {
             shard.insert((dn, id), Stream { created });
         }
         self.streams.fetch_add(count, Ordering::Relaxed);
+        logi!("created streams, count {count} from {first} for dn {dn}");
         Response::ok()
     }
 }
