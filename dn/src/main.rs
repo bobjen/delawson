@@ -432,10 +432,8 @@ impl DN {
                     // Whoever names the stream that filled is the one that seals it in
                     // the list; the rest are late and have nothing to record.
                     let ours = object.streams.last().is_some_and(|last| last.id == sealed);
-                    if ours {
-                        if let Some(last) = object.streams.last_mut() {
-                            last.records = Some(records);
-                        }
+                    if let Some(last) = object.streams.last_mut().filter(|_| ours) {
+                        last.records = Some(records);
                     }
                     if object.extending {
                         object.waiting.push(carry.take().expect("a reply"));

@@ -10766,3 +10766,58 @@ correctly; it can only be made safe by not having the gap.
 
 Both of the second two are §17.10's pattern being got wrong in the same function, and both are invisible to
 a single writer. The run that found them was eight.
+
+### 17.13 The FE asks once per extent, and reads of sealed data ask nothing
+
+Built, 2026-08-17, closing #57 and #58. §17.11.2 measured the problem: eight concurrent writers turned
+2 extent creations into 9 SN requests, and every read cost one more. Both were the same mistake — several
+coordinators independently discovering the same fact.
+
+| | Before | After |
+|---|---|---|
+| SN requests, 200 appends over 3 extents | ~1 per append at the ceiling | **4** — a stream, an open, and two seals |
+| SN requests, 100 reads of sealed extents | 100 | **0** |
+| SN requests, 10 reads of the extent still open | 10 | 10 |
+
+**Measured, 2026-08-17.** So the append side is at its floor — one request per extent created, plus one
+for the stream — and the read side is at zero for everything sealed.
+
+#### 17.13.1 One request in flight per stream, and the rest join it
+
+Opening the first extent and replacing a full one are the same operation, so they collapse together: a
+stream either has an extent to use, or has a request in flight for one, or has neither and the asker
+becomes the one asking. **The third case is the only one that talks to the SN.**
+
+The decision is a method on what the FE remembers about a stream, and the reply is queued **inside the
+same lock that made the decision** — §17.12.1's missed wakeup is the reason that is stated as a rule
+rather than left to care. Being a method rather than a passage inside a lock block also makes it four
+unit tests instead of an integration test: one append asks and the rest join; several appends that saw
+the same extent fill still ask once; an append late to a seal uses whatever replaced it.
+
+#### 17.13.2 Why a sealed extent is rememberable and an open one is not
+
+**A sealed extent's record range never changes.** So when the FE reports a seal it keeps what the extent
+came to, and a read of any record in that range goes straight to the EN. Nothing invalidates it: if
+compaction later rewrites the extent, §4.6.3 gives the rewrite a **different identity**, so a stale entry
+fails loudly rather than reading the wrong bytes.
+
+⚠️ **The extent still being appended to is deliberately not remembered.** It reaches further with every
+append, so how far it reaches is not a fact to keep — and a read of the tail is exactly the read that has
+to reach the primary anyway (#54). That is why the third row of the table above did not move, and it is
+the right answer rather than a gap: **the cache holds only what cannot go stale.**
+
+The FE's `status` now reports what it is remembering — open extents, known sealed extents, and appends
+waiting for an extent — because a collapse that is not working looks exactly like one that is, except in
+those three numbers.
+
+#### 17.13.3 A wire contract with no test, found by breaking it
+
+Rewriting the append path reordered the arguments of `append-extent`, putting the framing after the
+instance list instead of before it. **It compiled, and the primary would have read the framing out of the
+first two instance numbers** — silently interpreting "EN2" as a framing. Nothing caught it but reading the
+code again.
+
+That is precisely the gap §15.3's one end-to-end test exists to fill, and it is worth naming as a class:
+**the argument order between two processes is a contract that no unit test on either side can check.**
+Both sides pass their own tests while disagreeing. The candidates for catching it are the end-to-end test
+(#45) or giving a request shape a name both sides share rather than a position both sides count.

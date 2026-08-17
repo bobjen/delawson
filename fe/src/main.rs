@@ -63,22 +63,22 @@ const TRIES: u32 = 8;
 /// What FE coordinates rather than forwards.
 const COORDINATED: &[Op] = &[Op::AppendRecord, Op::ReadRecord];
 
-/// An extent a stream is appending to, as the SN described it.
+/// An extent, as the SN described it.
 #[derive(Clone)]
 struct Open {
     sn: u32,
     id: u64,
     created: u64,
-    /// The stream-local number of this extent's first record, which is what turns
-    /// an extent-local number into a durable reference.
+    /// The stream-local number of this extent's first record, which is what turns an
+    /// extent-local number into a durable reference.
     first_record: u64,
     /// The instances, primary first.
     instances: Vec<u32>,
 }
 
 impl Open {
-    /// The id, the second, the first record, then the instances, which is the
-    /// order the SN answers in.
+    /// The id, the second, the first record, then the instances, which is the order
+    /// the SN answers in.
     fn of(sn: u32, args: &[Arg]) -> Option<Open> {
         let [Arg::Number(id), Arg::Number(created), Arg::Number(first_record), instances @ ..] =
             args
@@ -100,12 +100,93 @@ impl Open {
             instances,
         })
     }
+
+    /// Whether a stream-local record is in this extent, for one whose count is known.
+    fn holds(&self, records: u64, record: u64) -> bool {
+        record >= self.first_record && record < self.first_record + records
+    }
+}
+
+/// A sealed extent and what it came to. Its record range never changes again, which
+/// is what makes remembering it safe.
+struct Kept {
+    extent: Open,
+    records: u64,
+}
+
+/// An append waiting for an extent to append to.
+struct Wanting {
+    path: String,
+    located: Located,
+    body: Vec<u8>,
+    tries: u32,
+    reply: Reply,
+}
+
+/// What the FE remembers about one stream. Nothing here is state in the sense that
+/// matters: losing all of it costs asks, not correctness.
+#[derive(Default)]
+struct Stream {
+    /// The extent appends are landing in.
+    open: Option<Open>,
+    /// Extents that have sealed, in record order, so a read knows where a record
+    /// lives without asking the SN.
+    sealed: Vec<Kept>,
+    /// **Set means a request for the next extent is in flight**, and the appends in
+    /// it are waiting for that one answer rather than each asking for themselves.
+    getting: Option<Vec<Wanting>>,
+}
+
+/// What an append should do about finding somewhere to put itself.
+#[derive(Debug, PartialEq, Eq)]
+enum Plan {
+    /// Use the extent that is open.
+    Use,
+    /// Ask the SN for the next one; nobody else is asking.
+    Ask,
+    /// Somebody is already asking, so join them.
+    Join,
+}
+
+impl Stream {
+    /// Decide what an append should do, and record what the decision implies.
+    ///
+    /// `sealed` is `(extent, records)` when the caller has just been told that extent
+    /// filled up. Remembering it here rather than forgetting it is what lets a read of
+    /// those records skip the SN afterwards.
+    fn plan(&mut self, sealed: Option<(u64, u64)>) -> Plan {
+        let stale = sealed.map(|(id, _)| id);
+        if self.open.is_some() && self.open.as_ref().map(|open| open.id) != stale {
+            // Either nothing has filled, or somebody has already replaced what did.
+            return Plan::Use;
+        }
+        if let Some((id, records)) = sealed
+            && let Some(open) = self.open.take().filter(|open| open.id == id)
+        {
+            self.sealed.push(Kept { extent: open, records });
+        }
+        match &self.getting {
+            Some(_) => Plan::Join,
+            None => {
+                self.getting = Some(Vec::new());
+                Plan::Ask
+            }
+        }
+    }
+
+    /// The sealed extent holding a stream-local record, if this FE has seen it seal.
+    fn holding(&self, record: u64) -> Option<Open> {
+        self.sealed
+            .iter()
+            .find(|kept| kept.extent.holds(kept.records, record))
+            .map(|kept| kept.extent.clone())
+    }
 }
 
 struct FE {
     config: FEConfig,
-    /// The open extent per `(DnId, StreamId)`.
-    open: Mutex<HashMap<(u32, u64), Open>>,
+    /// Per `(DnId, StreamId)`.
+    streams: Mutex<HashMap<(u32, u64), Stream>>,
 }
 
 impl Service for FE {
@@ -153,16 +234,22 @@ impl Service for FE {
     }
 
     fn status(&self, _process: &Process) -> Vec<String> {
+        let streams = self.streams.lock().expect("streams");
+        let sealed: usize = streams.values().map(|stream| stream.sealed.len()).sum();
+        let waiting: usize =
+            streams.values().filter_map(|stream| stream.getting.as_ref().map(Vec::len)).sum();
         vec![
             format!("stateless {}", self.config.stateless),
-            format!("open_extents {}", self.open.lock().expect("extents").len()),
+            format!("open_extents {}", streams.len()),
+            format!("known_sealed_extents {sealed}"),
+            format!("appends_waiting_for_an_extent {waiting}"),
         ]
     }
 }
 
 impl FE {
     fn new(config: FEConfig) -> FE {
-        FE { config, open: Mutex::new(HashMap::new()) }
+        FE { config, streams: Mutex::new(HashMap::new()) }
     }
 
     /// What a DN says an object is. Every coordinated operation starts here,
@@ -287,70 +374,140 @@ impl FE {
                     ),
                 ));
             }
-            fe.to_extent(process, named, located, body, reply);
+            let wanting = Wanting { path: named, located, body, tries: TRIES, reply };
+            fe.somewhere(process, wanting, None);
         });
     }
 
-    /// The extent this stream is appending to, asked of the SN only if it is not
-    /// already known.
-    fn to_extent(
+    /// Find this append somewhere to go, and go there.
+    ///
+    /// **One request per stream asks the SN; the rest wait for its answer.** Every
+    /// append in flight when an extent fills is told the extent is sealed, and each of
+    /// them wants the same next extent — so without this they each ask, and the SN's
+    /// request rate climbs towards the append rate while the number of extents it
+    /// creates stays the same.
+    ///
+    /// `sealed` is set by whoever saw the extent fill: it carries what that extent came
+    /// to, which the SN needs and which is also what makes the extent rememberable for
+    /// reads.
+    fn somewhere(
         self: &Arc<Self>,
         process: &Arc<Process>,
-        path: String,
-        located: Located,
-        body: Vec<u8>,
-        reply: Reply,
+        wanting: Wanting,
+        sealed: Option<(u64, u64, u64)>,
     ) {
-        let key = (located.dn, located.stream);
-        if let Some(open) = self.open.lock().expect("extents").get(&key) {
-            return self.to_primary(process, path, located, open.clone(), body, TRIES, reply);
+        let key = (wanting.located.dn, wanting.located.stream);
+        // ⚠️ Deciding and waiting under one lock. With the lock released in between,
+        // the answer can arrive in the gap and wake nobody.
+        let mut carry = Some(wanting);
+        let (plan, open) = {
+            let mut streams = self.streams.lock().expect("streams");
+            let stream = streams.entry(key).or_default();
+            let plan = stream.plan(sealed.map(|(id, records, _)| (id, records)));
+            if plan == Plan::Join {
+                stream
+                    .getting
+                    .as_mut()
+                    .expect("a request in flight")
+                    .push(carry.take().expect("an append"));
+            }
+            (plan, stream.open.clone())
+        };
+
+        let Some(wanting) = carry else { return };
+        match (plan, open) {
+            (Plan::Join, _) => {}
+            (Plan::Use, Some(open)) => self.to_primary(process, wanting, open),
+            // Nothing to use after all, which only a race can produce; asking is
+            // always safe.
+            (Plan::Use, None) | (Plan::Ask, _) => {
+                let ask = wanting_extent(key, sealed);
+                let identity = format!("SN{}", wanting.located.sn);
+                let fe = Arc::clone(self);
+                let onward = Arc::clone(process);
+                let named = identity.clone();
+                let asked = process.ask(&identity, &ask, move |answer| {
+                    fe.arrived(&onward, key, wanting, answer);
+                });
+                if let Err(e) = asked {
+                    logw!("could not reach an SN", "sn {named},{e}");
+                    // Nothing is in flight any more, and whoever is waiting has to
+                    // be told rather than left holding a reply.
+                    self.give_up(key, Status::Internal, "could not reach an SN");
+                }
+            }
         }
-        let identity = format!("SN{}", located.sn);
-        let ask = Request::new(Op::OpenExtent).number(located.dn as u64).number(located.stream);
-        let fe = Arc::clone(self);
-        let onward = Arc::clone(process);
-        let named = identity.clone();
-        let asked = process.ask(&identity, &ask, move |answer| {
+    }
+
+    /// The SN answered about the next extent. Whoever asked, and everyone who queued
+    /// behind them, get the same answer.
+    fn arrived(
+        self: &Arc<Self>,
+        process: &Arc<Process>,
+        key: (u32, u64),
+        wanting: Wanting,
+        answer: Response,
+    ) {
+        let extent = match answer.status {
+            Status::Ok => Open::of(wanting.located.sn, &answer.args),
+            _ => None,
+        };
+        let waiting = {
+            let mut streams = self.streams.lock().expect("streams");
+            let stream = streams.entry(key).or_default();
+            if let Some(extent) = &extent {
+                stream.open = Some(extent.clone());
+            }
+            stream.getting.take().unwrap_or_default()
+        };
+
+        // Whoever was waiting wanted exactly what this answer says, so they are
+        // resumed the same way — including the awkward ones, since a full stream or a
+        // refusal is the same news for all of them.
+        for waiting in waiting {
+            self.resume(process, waiting, &answer, extent.clone());
+        }
+        self.resume(process, wanting, &answer, extent);
+    }
+
+    fn resume(
+        self: &Arc<Self>,
+        process: &Arc<Process>,
+        wanting: Wanting,
+        answer: &Response,
+        extent: Option<Open>,
+    ) {
+        match (answer.status, extent) {
+            (Status::Ok, Some(extent)) => self.to_primary(process, wanting, extent),
+            (Status::Ok, None) => {
+                wanting.reply.send(Response::error(Status::Internal, "that answer named no extent"))
+            }
             // The stream is full: the object needs another, which is the DN's to give.
-            if answer.status == Status::Sealed {
-                return fe.after_stream(&onward, path, located, body, answer, reply);
-            }
-            if answer.status != Status::Ok {
-                return reply.send(answer);
-            }
-            let Some(open) = Open::of(located.sn, &answer.args) else {
-                return reply
-                    .send(Response::error(Status::Internal, "that answer named no extent"));
-            };
-            fe.open.lock().expect("extents").insert(key, open.clone());
-            fe.to_primary(&onward, path, located, open, body, TRIES, reply);
-        });
-        if let Err(e) = asked {
-            logw!("could not reach an SN", "sn {named},{e}");
+            (Status::Sealed, _) => self.after_stream(process, wanting, answer.clone()),
+            _ => wanting.reply.send(answer.clone()),
+        }
+    }
+
+    /// Nothing is in flight, and nothing may be left waiting for it.
+    fn give_up(&self, key: (u32, u64), status: Status, why: &str) {
+        let waiting = {
+            let mut streams = self.streams.lock().expect("streams");
+            streams.get_mut(&key).and_then(|stream| stream.getting.take())
+        };
+        for wanting in waiting.unwrap_or_default() {
+            wanting.reply.send(Response::error(status, why));
         }
     }
 
     /// The bytes, to the primary instance. The framing and the instance list travel
     /// with them: the primary is what counts the records and what broadcasts to the
     /// others, and the SN is not in this path to be asked again.
-    ///
-    /// `tries` is what is left of the retries an append gets: a full extent is
-    /// answered `Sealed`, and the append belongs in the next one. Several writers can
-    /// fill successive extents while one append is being placed, so a retry is not
-    /// always the last one needed.
-    #[allow(clippy::too_many_arguments)]
-    fn to_primary(
-        self: &Arc<Self>,
-        process: &Arc<Process>,
-        path: String,
-        located: Located,
-        open: Open,
-        body: Vec<u8>,
-        tries: u32,
-        reply: Reply,
-    ) {
+    fn to_primary(self: &Arc<Self>, process: &Arc<Process>, wanting: Wanting, open: Open) {
+        let Wanting { path, located, body, tries, reply } = wanting;
         let identity = format!("EN{}", open.instances[0]);
         let (kind, width) = located.framing.wire();
+        // The order the primary parses: the extent's name, the framing, the instance
+        // list, and the bytes last.
         let mut ask = Request::new(Op::AppendExtent)
             .number(open.sn as u64)
             .number(open.id)
@@ -366,7 +523,8 @@ impl FE {
         let onward = Arc::clone(process);
         let asked = process.ask(&identity, &ask, move |answer| {
             if answer.status == Status::Sealed {
-                return fe.after_seal(&onward, path, located, open, body, tries, answer, reply);
+                let wanting = Wanting { path, located, body, tries, reply };
+                return fe.after_seal(&onward, wanting, open, answer);
             }
             reply.send(receipt(&located, &open, answer));
         });
@@ -375,95 +533,51 @@ impl FE {
         }
     }
 
-    /// The extent filled up. Tell the SN what it came to, take the next one, and
-    /// send the append again — once. A fresh extent that also says it is sealed
-    /// means the append is larger than an extent can hold, which is a bad request
-    /// and not a loop to keep going round.
-    #[allow(clippy::too_many_arguments)]
+    /// The extent filled up. Tell the SN what it came to and take the next one — which
+    /// is the same operation as opening the first, so it collapses the same way.
     fn after_seal(
         self: &Arc<Self>,
         process: &Arc<Process>,
-        path: String,
-        located: Located,
+        mut wanting: Wanting,
         open: Open,
-        body: Vec<u8>,
-        tries: u32,
         answer: Response,
-        reply: Reply,
     ) {
         let [Arg::Number(records), Arg::Number(length)] = answer.args.as_slice() else {
-            return reply
+            return wanting
+                .reply
                 .send(Response::error(Status::Internal, "a seal said nothing about the extent"));
         };
         // An extent that sealed with nothing in it is one this block could not fit
         // even empty, which is the block's fault and not worth another extent.
         if *records == 0 && *length == 0 {
-            return reply.send(Response::error(
+            return wanting.reply.send(Response::error(
                 Status::BadRequest,
-                format!("{} bytes will not fit an extent of its own", body.len()),
+                format!("{} bytes will not fit an extent of its own", wanting.body.len()),
             ));
         }
-        if tries == 0 {
-            return reply.send(Response::error(
+        if wanting.tries == 0 {
+            return wanting.reply.send(Response::error(
                 Status::Internal,
                 "kept finding a sealed extent, which should not go on this long",
             ));
         }
-        // What was cached is closed, so nothing should hand it out again.
-        let key = (located.dn, located.stream);
-        self.open.lock().expect("extents").remove(&key);
-
-        let identity = format!("SN{}", located.sn);
-        let ask = Request::new(Op::SealExtent)
-            .number(located.dn as u64)
-            .number(located.stream)
-            .number(open.id)
-            .number(*records)
-            .number(*length);
-        let fe = Arc::clone(self);
-        let onward = Arc::clone(process);
-        let named = identity.clone();
-        let asked = process.ask(&identity, &ask, move |answer| {
-            // That extent was the stream's last, so the stream is sealed too and the
-            // object needs another. Every place that asks about an extent has to
-            // handle this, which is why it is checked before anything else.
-            if answer.status == Status::Sealed {
-                return fe.after_stream(&onward, path, located, body, answer, reply);
-            }
-            if answer.status != Status::Ok {
-                return reply.send(answer);
-            }
-            let Some(next) = Open::of(located.sn, &answer.args) else {
-                return reply.send(Response::error(Status::Internal, "that seal opened no extent"));
-            };
-            fe.open.lock().expect("extents").insert(key, next.clone());
-            fe.to_primary(&onward, path, located, next, body, tries - 1, reply);
-        });
-        if let Err(e) = asked {
-            logw!("could not reach an SN", "sn {named},{e}");
-        }
+        wanting.tries -= 1;
+        self.somewhere(process, wanting, Some((open.id, *records, *length)));
     }
 
     /// The stream is full. The DN gives the object another, carrying on from where
-    /// this one stopped, and the append starts again there — the new stream has no
-    /// extent yet, so it goes round the whole path rather than just the last hop.
-    fn after_stream(
-        self: &Arc<Self>,
-        process: &Arc<Process>,
-        path: String,
-        located: Located,
-        body: Vec<u8>,
-        answer: Response,
-        reply: Reply,
-    ) {
+    /// this one stopped, and the append starts again there.
+    fn after_stream(self: &Arc<Self>, process: &Arc<Process>, wanting: Wanting, answer: Response) {
         let [Arg::Number(records)] = answer.args.as_slice() else {
-            return reply.send(Response::error(
+            return wanting.reply.send(Response::error(
                 Status::Internal,
                 "a full stream said nothing about itself",
             ));
         };
-        // Nothing may hand out an extent of a stream that will take no more.
-        self.open.lock().expect("extents").remove(&(located.dn, located.stream));
+        let Wanting { path, located, body, tries, reply } = wanting;
+        // Nothing may hand out an extent of a stream that will take no more, and what
+        // is remembered about it is no use to an append either.
+        self.streams.lock().expect("streams").remove(&(located.dn, located.stream));
 
         let dn = format!("DN{}", located.dn);
         let ask =
@@ -485,15 +599,16 @@ impl FE {
                     format!("{path} was extended and is still on stream {}", next.stream),
                 ));
             }
-            fe.to_extent(&onward, path, next, body, reply);
+            let wanting = Wanting { path, located: next, body, tries, reply };
+            fe.somewhere(&onward, wanting, None);
         });
         if let Err(e) = asked {
             logw!("could not reach a DN", "dn {named},{e}");
         }
     }
 
-    /// A read: resolve the name, ask the SN which extent holds the record, read it
-    /// from an instance.
+    /// A read: resolve the name, find the extent holding the record, read it from an
+    /// instance.
     fn read(self: &Arc<Self>, process: &Arc<Process>, request: &Request, mut reply: Reply) {
         let (path, record) = match request.args.as_slice() {
             [Arg::Text(path), Arg::Number(record)] => (path.clone(), *record),
@@ -519,9 +634,13 @@ impl FE {
         });
     }
 
-    /// Which extent holds a record. The SN answers that and nothing about the
-    /// record itself: it keeps its record totals lazily, so what it knows is where
-    /// an extent's numbering starts.
+    /// Which extent holds a record.
+    ///
+    /// **A sealed extent's record range never changes**, so one this FE has seen seal
+    /// is one it never has to ask about again — which is what keeps a read rate from
+    /// becoming an SN request rate. Anything else is the SN's to answer: the extent
+    /// still being appended to reaches further with every append, and how far is not
+    /// something to remember.
     fn locate(
         self: &Arc<Self>,
         process: &Arc<Process>,
@@ -529,6 +648,16 @@ impl FE {
         record: u64,
         reply: Reply,
     ) {
+        let known = self
+            .streams
+            .lock()
+            .expect("streams")
+            .get(&(located.dn, located.stream))
+            .and_then(|stream| stream.holding(record));
+        if let Some(open) = known {
+            return from_instance(process, &located, &open, record, reply);
+        }
+
         let identity = format!("SN{}", located.sn);
         let ask = Request::new(Op::LocateRecord)
             .number(located.dn as u64)
@@ -552,8 +681,21 @@ impl FE {
     }
 }
 
-/// Make the object an append is for, and go on with it. A create answers with the
-/// object it made, in the shape a lookup answers, so this costs one hop and not two.
+/// What to ask the SN for the next extent: open one, or report the one that filled
+/// and get its replacement in the same round trip.
+fn wanting_extent(key: (u32, u64), sealed: Option<(u64, u64, u64)>) -> Request {
+    let (dn, stream) = key;
+    match sealed {
+        None => Request::new(Op::OpenExtent).number(dn as u64).number(stream),
+        Some((id, records, length)) => Request::new(Op::SealExtent)
+            .number(dn as u64)
+            .number(stream)
+            .number(id)
+            .number(records)
+            .number(length),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn make_object(
     fe: &Arc<FE>,
@@ -824,6 +966,69 @@ mod tests {
         let open = Open { sn: 0, id: 7, created: 1_000_000, first_record: 0, instances: vec![2] };
         let refused = Response::error(Status::Internal, "two instances would not apply it");
         assert_eq!(receipt(&located, &open, refused.clone()), refused);
+    }
+
+    fn extent(id: u64, first_record: u64) -> Open {
+        Open { sn: 0, id, created: 1_000_000, first_record, instances: vec![2, 3, 0, 1] }
+    }
+
+    /// One append asks the SN and the rest join it. Without this, every append in
+    /// flight when an extent fills asks for the same next extent.
+    #[test]
+    fn one_append_asks_for_the_next_extent_and_the_rest_join() {
+        let mut stream = Stream::default();
+        // Nothing known yet: somebody has to ask.
+        assert_eq!(stream.plan(None), Plan::Ask);
+        // Everyone arriving while that is in flight joins it.
+        assert_eq!(stream.plan(None), Plan::Join);
+        assert_eq!(stream.plan(None), Plan::Join);
+
+        // The answer arrives.
+        stream.open = Some(extent(1, 0));
+        stream.getting = None;
+        assert_eq!(stream.plan(None), Plan::Use);
+    }
+
+    /// The extent filled: the first append to say so does the asking, and the ones
+    /// that saw the same extent fill join rather than asking again.
+    #[test]
+    fn appends_that_all_saw_the_same_extent_fill_ask_once() {
+        let mut stream = Stream { open: Some(extent(1, 0)), ..Stream::default() };
+        assert_eq!(stream.plan(Some((1, 90))), Plan::Ask, "the first to notice");
+        assert_eq!(stream.plan(Some((1, 90))), Plan::Join, "the rest of them");
+        assert_eq!(stream.plan(Some((1, 90))), Plan::Join);
+        // And it was remembered on the way past, which is what a read wants.
+        assert_eq!(stream.sealed.len(), 1);
+        assert_eq!(stream.sealed[0].records, 90);
+    }
+
+    /// An append that hears about an extent already replaced uses the replacement
+    /// rather than asking for a third one.
+    #[test]
+    fn an_append_late_to_a_seal_uses_what_replaced_it() {
+        let mut stream = Stream { open: Some(extent(2, 90)), ..Stream::default() };
+        assert_eq!(stream.plan(Some((1, 90))), Plan::Use);
+        assert!(stream.sealed.is_empty(), "extent 1 was not this FE's to remember");
+    }
+
+    /// A sealed extent's record range never changes, so a read of it never has to ask
+    /// the SN again. The extent still open is not rememberable — it reaches further
+    /// with every append.
+    #[test]
+    fn a_read_finds_a_record_in_a_remembered_extent() {
+        let mut stream = Stream { open: Some(extent(1, 0)), ..Stream::default() };
+        stream.plan(Some((1, 90)));
+        stream.open = Some(extent(2, 90));
+        stream.plan(Some((2, 80)));
+        stream.open = Some(extent(3, 170));
+
+        assert_eq!(stream.holding(0).unwrap().id, 1);
+        assert_eq!(stream.holding(89).unwrap().id, 1);
+        assert_eq!(stream.holding(90).unwrap().id, 2);
+        assert_eq!(stream.holding(169).unwrap().id, 2);
+        // In the extent still open, so the SN has to be asked.
+        assert!(stream.holding(170).is_none());
+        assert!(stream.holding(5000).is_none());
     }
 
     /// Both are answered by somebody else, so neither may be answered on the read
