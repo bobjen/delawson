@@ -4002,6 +4002,38 @@ A single object can therefore hold wildly heterogeneous extents — a 32 MB span
 beside a 1 GB span — so nothing may assume uniform extent size. All navigation
 is by cumulative totals (§4), which is indifferent to this.
 
+### 6.1 EC recovery cost is probably what limits it, and 32 MB is a guess
+
+The table above lists three reasons for an upper bound — compaction cost, repair granularity, and
+open-extent memory. **Of those, EC recovery cost is probably the limiting one, and 32 MB compressed
+is a guess until it can be measured** (Asserted, Bob, 2026-08-17).
+
+The reason it is the binding side is that **an extent is the unit of repair**. A fragment belongs to
+one extent, so repairing a loss reads *k* fragments of that extent (§4.3.2) and cannot read less.
+Total recovery bandwidth for a dead device is the same whatever the extent size — the same bytes come
+back either way — but the *unit* is not, and three things follow from the unit rather than the total:
+
+- **Exposure is per group, and it ends when that group's repair finishes.** §13.2.2's loss estimate
+  is driven by how long an individual group sits degraded, not by when the fleet-wide recovery
+  finishes, and losses go as the cube of that window.
+- **A repair is the smallest thing that can be scheduled, retried, or interrupted.** §13.4 sorts
+  repairs by amortized cost; a coarser unit is a coarser sort, and work lost to an interruption is
+  a whole unit.
+- **Nothing may reconstruct on the read path** (§9.8), so a repair's latency is not hidden behind a
+  read — it is the whole of the recovery for that group.
+
+Pushing the other way, and already derived: an extent must stay **above ~8 MB** so an HDD seek
+amortizes (above), and it must stay **large** so that SN metadata per byte stays affordable (§14.1)
+— halving the extent size doubles the extent records for the same data, and §14.1.2 says record
+count is what decides how many machines an object needs.
+
+⚠️ **So the number is bracketed by two measurements neither of which has been made.** What would
+replace the guess: repair time for one extent as a function of its size on the target media,
+including the code's read amplification, and how well repair parallelizes as the unit shrinks —
+against the seek-amortization floor (#6) and the metadata cost per byte. 32 MB is a placeholder
+sitting between two bounds, chosen because it is comfortably inside both, and #50 is the work of
+replacing it.
+
 ---
 
 ## 7. The storage pipeline
@@ -5163,6 +5195,28 @@ much more than it does — and that is worth deciding rather than assuming (#46)
 2026-08-17). That is enough to get the command working end to end, and the journal comes
 after — the same stand-in bargain as DN's in-memory object index (§17.5g), and the same
 caution: nothing about the in-memory version is evidence about what the durable one costs.
+
+### 8.1.6 Logical and compressed positions are different types
+
+**It is very easy to confuse logical and compressed values in append code, since both are 32-bit,
+so they are separate types and the compiler is what catches it** (Asserted, Bob, 2026-08-17). A
+logical position counts the bytes a writer wrote; a compressed one counts the bytes that were
+stored. An extent is capped well inside 32 bits either way, so nothing but a type distinguishes
+them — and they are *equal* in exactly the case that hides the mistake: while nothing is
+compressing yet.
+
+The vocabulary is worth pinning down, because this document has used two words for one thing:
+what §4.5 and §8.1.1a-2 call a **physical** position is what the code calls a **compressed**
+one. Same space, and the sparse index (§9.3) is what relates it to the logical one.
+
+⚠️ **And adopting the types immediately found a gap: an append carries no logical length, so the
+receipt cannot report a logical offset.** §8.1.1a-2 requires the locator returned to a writer to
+be logical, and §8.1.1a-7 makes the reportable offset a property of the object flavour. But the
+client compresses (§8.1.4.1), so what reaches the primary EN is already compressed and its
+logical size is known only to the client. The EN therefore has nothing to compute a logical
+position from, and what it returns today is a compressed one wearing the wrong name. **The append
+has to carry the logical length**, and until it does the receipt is only correct because nothing
+compresses (#48).
 
 ### 8.2 Record framing
 
@@ -7460,6 +7514,54 @@ once. The right reading of the table is that the *increment* should be ~1%, not 
   losses ~8×. The patent blocking it until 2034 therefore costs recovery time and rollout risk, not
   just steady-state repair bandwidth.
 
+#### 13.2.5 A new feature is a parameter, checked in off
+
+**Every new feature is protected by a parameter, checked in disabled, and enabled once it is fully
+deployed** (Asserted, Bob, 2026-08-17). Two reasons, and they are different from each other:
+
+- **The members of a ring must behave the same.** A rollout is gradual by design (§13.2.3 wants ~1%
+  increments), so for the length of it the ring is running two binaries. If the *binary* is what
+  decides whether a feature is on, the members disagree for the duration of every deployment. If a
+  parameter decides, they agree throughout, and the switch is thrown once when every member can
+  honour it.
+- **A live site needs a switch that is not a rollback.** When a new feature turns out to be the
+  thing that is broken, turning it off is a parameter change; rolling back the binaries is §13.2's
+  dominant data-loss mode. The cheap remedy has to exist, because the expensive one is dangerous.
+
+⚠️ **A parameter the ring must agree about is read by the leader and sent to the members** (Asserted,
+Bob, 2026-08-17), not read by each member from its own configuration. A configuration change reaches
+the fleet the same gradual way a binary does, so at any moment during one the members' files disagree
+— and a member that consults its own copy makes a decision the ring did not make. Reading it once,
+where the decision is made, and carrying it with the request is what makes "the ring agreed" true
+rather than probable. **The same rule holds for an extent's instances**: the primary reads it and it
+travels with the append, exactly as the creation second does (§8.1.5).
+
+**In tests the default is the other way round: the mock configuration is checked in with the new
+feature on** (Asserted, Bob, 2026-08-17). The tests should exercise what the code is going to do, so
+the checked-in cluster file and the checked-in test configuration deliberately disagree — off in the
+fleet, on in the tests — and a test that wants the old path turns it off explicitly. Since §15.3.2
+puts the test defaults in one routine, flipping one is one edit rather than a sweep.
+
+**And the parameter is temporary.** Once it has been constant-on in the fleet, the parameter *and the
+old code it protects* are deleted, the next version or a later one. That deadline is the point: an
+old path kept behind a parameter nobody ever turns off is untested code that still runs somewhere,
+and *n* of them make 2^*n* combinations nobody has tried. The switch buys a safe deployment, not a
+permanent second implementation.
+
+**Not yet, though** (Asserted, Bob, 2026-08-17): none of this is needed until something is
+*persisted*, and perhaps not until the code is released publicly. Nothing in memory survives a
+deployment, so there is no old state for a new binary to disagree with, and every process in this
+cluster is replaced at once. So the absence of any such parameter today is correct rather than an
+omission — the first one arrives with the first thing written to a disk that outlives the process
+that wrote it.
+
+⚠️ **After a public release, the upgrade graph sets the removal deadline.** A released system gets
+upgrade rules of the form *to go from X to Z you must pass through Y*, and those intermediate major
+versions are what decides when a parameter may go: **a feature may not be removed while a supported
+upgrade path still runs a version that needs it.** So "the next version or later" is a floor set by
+tidiness before release, and a constraint set by the upgrade graph afterwards — the two are the same
+rule at different stages, and the second one is not negotiable by whoever is tidying up.
+
 ### 13.3 Background loops
 
 Everything the write path is not allowed to do synchronously has to happen
@@ -8209,6 +8311,52 @@ entry* on a DN is a different and smaller thing — a 4-byte reference, a starti
 number, cumulative byte totals — and has no budget yet. Sizings that quote a stream-list
 size use 200 B as a deliberately loose upper bound; a real figure would shrink them
 severalfold.
+
+#### 14.1.3 Two fields worth their memory: compressed length, and which disk
+
+Two things about SN metadata were left iffy: **whether an extent record tracks its compressed
+length, and whether the SN keeps a reverse index from instances to the disk they are on.**
+**Bob leans to both, on the grounds that SN metadata is well under 1% of EN cost** (Asserted, Bob,
+2026-08-17), and that is checkable rather than a feeling:
+
+| | |
+|---|---|
+| One SN's extent budget (§14.1) | 1.7 × 10^9 references × 32 MB = **54 PB** of EN capacity |
+| EN cost for that, at §12.7.2's $923 / 20 TB drive and disk being 95% of it | **$2.64M** |
+| A 256 GB metadata machine | ~$4,000 to $10,000 |
+| **SN as a share of the EN capacity it maps** | **0.15% to 0.38%** |
+
+**Derived.** So the suspicion is right by a factor of three to seven, and a 1% budget would leave
+about **4x** headroom over a $6,000 machine.
+
+⚠️ **But cost is not the constraint the extent record is under**, so that headroom is not a licence
+to spend. §14.1.2 is the binding argument: record size decides *how many machines a given object
+needs*, because doubling the record doubles the fleet for the same data. What the cost check
+establishes is narrower and still useful — **the 100 B budget is not under dollar pressure**, so
+these two fields should be judged on whether they fit inside it, which they do. The itemization of
+§5.10.4 reaches ~60 B; a 4-byte compressed length and a disk identifier per instance take it to
+~72 B, inside the budget and not a reason to raise it (§14.1.2: budget and spend deliberately, do
+not re-baseline).
+
+**What each one buys:**
+
+- **Compressed length** is what makes an extent's *cost* knowable. Billing is physical bytes
+  (§12.3), and repair scheduling by amortized cost (§13.4) is arithmetic on bytes moved — both of
+  which are compressed bytes, not logical ones. It is also what retires an assumption: §14.1's
+  capacity table takes the worst case `compressed = physical` precisely because nothing records
+  the truth. Four bytes, and by §8.1.6 it is a `COff` and not interchangeable with a logical one.
+- **Which disk an instance is on** answers the question a disk failure asks: *which instances were
+  on it?* Repair is the dominant term in every loss calculation (§13.2, §4.3.3.1), and the window
+  starts with enumerating what was lost. Without this the SN cannot answer at all — the disk is
+  below the granularity anything records.
+
+⚠️ **The form of the reverse index is the part still to settle** (#49). Recording a disk identifier
+*per instance* is a few bytes in a record that has room, and is plainly worth it. A standing
+inverted index from disk to instances is the expensive half, since it costs a pointer per instance
+rather than a byte or two — and the alternative is to scan the extent table when a disk dies, which
+is a pass over 171 GB of RAM. That is seconds, once per disk failure. So what decides it is the
+disk failure rate an SN sees and whether repair may wait seconds to begin, neither of which is a
+memory-budget question.
 
 ### 14.2 DN: unbounded in object count, disk-backed
 
@@ -9840,3 +9988,56 @@ Two consequences worth stating:
 The registry is in KS's memory for now, so a KS restart makes every other process re-register.
 Putting it in KS's Raft state, and deciding whether a registration is a lease that expires, are
 tracked in the issue for this work.
+
+### 17.8 Append: three hops, and the first bytes to reach an EN
+
+Built, 2026-08-17. `laws append /notes/first --data "…"` works, which makes this the first
+operation that reaches an EN and the first that needs an extent.
+
+| Hop | Asked | Answers |
+|---|---|---|
+| FE → DN | once per append | which stream the object is: `(DnId, StreamId)` and its SN |
+| FE → SN | **once per extent** | the extent that stream is appending to: an id, its second, and its four instances |
+| FE → primary EN | once per append | the receipt, once a quorum of instances has the bytes |
+| primary EN → the other three | once per append | applied, or not |
+
+**The middle row is the one that had to be got right.** §8.1.3 says the SN places instances and
+then gets out of the write path, which it cannot do if every write consults it — so FE remembers
+the open extent per `(DnId, StreamId)` and asks the SN only on a miss. Measured: five successive
+appends to one object produced **no** requests to the SN at all. An FE holding that is still an FE
+that holds no state, because losing it costs one ask and nothing else.
+
+**An EN learns of an extent from the first append that names it.** The SN chose the instances and
+recorded them; telling the ENs in advance would be a round trip that buys nothing, since the
+append itself carries the extent's whole name. So there is no create-extent operation on an EN,
+and there does not need to be one.
+
+**The instance list travels with the append**, because the primary is what broadcasts and the SN is
+not there to be asked again. The primary assigns the offset, applies locally, and issues
+`apply-append` to the other three at once — all of them before any of them answers, since a quorum
+is straggler tolerance only if the writes go out together (§8.1.2).
+
+**Three of four, counted apart from what it means.** The arithmetic is its own type: it says
+`Durable` when two secondaries have applied, `Lost` when enough have failed that the rest cannot
+make up the quorum, and nothing at all thereafter — so the reply is sent exactly once and the
+counting is unit-testable without a connection to answer down. One slow instance is invisible;
+two failures settle it immediately rather than after a timeout.
+
+**A second is part of a name, in both directions.** The SN refuses to issue a second earlier than
+one it has already used, since the second selects the key and reaching back asks for one that may
+be retired. And an EN refuses an append naming a different second for an extent it already holds,
+rather than merging two extents that share an id.
+
+⚠️ **The receipt's offset is a compressed position, and the design wants a logical one** — see
+§8.1.6 and #48. It is correct only because nothing compresses yet.
+
+**What is deliberately not here**: implicit create (an append to a name that does not exist is
+`not found`), sealing and the extent size cap, record framing and therefore record numbers,
+EN-internal staging, the per-disk journal (§8.1.5), and any way to read the bytes back. The
+instances are chosen round robin, which on one box satisfies no spreading rule — `start-laws`
+says so, loudly, and that is the honest state of it.
+
+**And the tests are where the strategy of §15.3 first applied.** Twenty-nine new unit tests, none
+of which start a process: the offset arithmetic, the quorum counting, the extent naming, the
+instance choosing, and the argument parsing are each reachable directly, which is what §15.3.1
+means by packaging the code so a test can call it. The whole suite is 67 tests in 0.8 seconds.

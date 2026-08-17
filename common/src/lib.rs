@@ -4,13 +4,22 @@
 pub mod config;
 pub mod log;
 pub mod logread;
+pub mod offset;
 pub mod peer;
 pub mod placement;
 pub mod random;
 pub mod registry;
 pub mod seal;
 pub mod server;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod wire;
+
+/// Instances an extent has, and how many must have applied an append before it is
+/// durable. Three of four is a quorum: any two of its 3-subsets overlap in two
+/// members, so a new primary that polls any three has seen everything durable.
+pub const INSTANCES: usize = 4;
+pub const QUORUM: usize = 3;
 
 #[derive(Debug)]
 pub struct Error(String);

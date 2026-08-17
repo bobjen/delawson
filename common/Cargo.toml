@@ -10,6 +10,11 @@ publish.workspace = true
 name = "common"
 path = "src/lib.rs"
 
+# Configurations built in code, for other crates' tests. A test may not read a
+# configuration from disk, and a binary has no use for this.
+[features]
+testing = []
+
 [dependencies]
 aegis = "0.9.15"
 libc = "0.2.189"

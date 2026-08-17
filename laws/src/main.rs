@@ -551,7 +551,11 @@ fn run(cli: Cli) -> Result<()> {
         cmd => {
             let request = build(cmd)?;
             let target = resolve(&cluster, &cli, serves(cmd))?;
-            report(&target, &open(&target, timeout, &cluster.messaging)?.call(&request)?)
+            let answer = open(&target, timeout, &cluster.messaging)?.call(&request)?;
+            match request.op {
+                Op::AppendRecord => receipt(&target, &answer),
+                _ => report(&target, &answer),
+            }
         }
     }
 }
@@ -925,6 +929,26 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
         total.max.as_secs_f64() * 1e6
     );
     Ok(asked as f64 / seconds)
+}
+
+/// What an append answers: where the bytes went, once a quorum of instances had
+/// them. Five numbers read as one line rather than five.
+fn receipt(target: &Target, response: &Response) -> Result<()> {
+    if let [
+        Arg::Number(sn),
+        Arg::Number(extent),
+        Arg::Number(created),
+        Arg::Number(offset),
+        Arg::Number(length),
+    ] = response.args.as_slice()
+    {
+        println!(
+            "{} extent {extent} of SN{sn} made in second {created}, {length} bytes at offset {offset}",
+            target.identity
+        );
+        return Ok(());
+    }
+    report(target, response)
 }
 
 /// Print a response, and fail the process if the service refused.
