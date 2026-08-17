@@ -9,12 +9,11 @@
 //! to cope with reuse — an index that has to survive churn is a later problem.
 
 use common::config::SNConfig;
-use common::logi;
-use common::server::{self, Process, Service};
+use common::server::{self, Process, Reply, Service};
 use common::wire::{Arg, Op, Request, Response, Status};
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 const SERVES: &[Op] = &[Op::CreateStream];
 
@@ -48,6 +47,16 @@ impl Service for SN {
 
     fn workers(&self) -> usize {
         self.config.knobs.workers
+    }
+
+    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Request, mut reply: Reply) {
+        // The stream range, which is what a DN's line for the same request says.
+        if let [Arg::Number(dn), Arg::Number(first), Arg::Number(count), ..] =
+            request.args.as_slice()
+        {
+            reply.about(format_args!("count {count} from {first} for dn {dn}"));
+        }
+        reply.send(self.answer(process, &request));
     }
 
     fn answer(&self, process: &Process, request: &Request) -> Response {
@@ -87,7 +96,6 @@ impl SN {
             shard.insert((dn, id), Stream { created });
         }
         self.streams.fetch_add(count, Ordering::Relaxed);
-        logi!("created streams, count {count} from {first} for dn {dn}");
         Response::ok()
     }
 }

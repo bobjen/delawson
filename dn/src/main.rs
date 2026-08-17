@@ -13,9 +13,9 @@
 //! request to be answered when the SN says the streams exist.
 
 use common::config::{DNConfig, ServiceKind};
+use common::logw;
 use common::server::{self, Process, Reply, Service};
 use common::wire::{Arg, Op, Request, Response, Status};
-use common::{logi, logw};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -167,7 +167,7 @@ impl DN {
         self: &Arc<Self>,
         process: &Arc<Process>,
         wanted: Vec<(String, bool)>,
-        reply: Reply,
+        mut reply: Reply,
         say: impl FnOnce(u64) -> Response + Send + 'static,
     ) {
         let created = now();
@@ -189,6 +189,9 @@ impl DN {
             return reply.send(say(0));
         }
 
+        // The first name as well as the range: the name matches this line with
+        // FE's, the range matches it with the SN's.
+        let named_first = mine[0].clone();
         let count = mine.len() as u64;
         let first = self.next_stream.fetch_add(count, Ordering::Relaxed);
         let sn = match process.pick(ServiceKind::Sn) {
@@ -219,7 +222,10 @@ impl DN {
                 }
             }
             dn.objects.fetch_add(count, Ordering::Relaxed);
-            logi!("created objects, count {count} streams from {first} on {named}");
+            // The stream range is how this request is matched with the SN's line
+            // for it: SN does not know names, and should not.
+            reply
+                .about(format_args!("{named_first} count {count} streams from {first} on {named}"));
             reply.send(say(count));
         });
         if let Err(e) = asked {
@@ -241,14 +247,8 @@ impl DN {
             _ => return Response::error(Status::BadRequest, "object-info takes a name"),
         };
         match self.look(name) {
-            Some(args) => {
-                logi!("looked up an object, name {name}");
-                Response { id: 0, status: Status::Ok, args }
-            }
-            None => {
-                logi!("looked up a name with no object, name {name}");
-                Response::error(Status::NotFound, format!("no object {name}"))
-            }
+            Some(args) => Response { id: 0, status: Status::Ok, args },
+            None => Response::error(Status::NotFound, format!("no object {name}")),
         }
     }
 
@@ -275,7 +275,6 @@ impl DN {
                 ]),
             }
         }
-        logi!("looked up objects, count {}", request.args.len());
         Response { id: 0, status: Status::Ok, args }
     }
 

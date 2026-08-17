@@ -12,9 +12,9 @@
 //! costs a thread.
 
 use common::config::{FEConfig, ServiceKind};
+use common::logw;
 use common::server::{self, Process, Reply, Service};
-use common::wire::{Op, Request, Response, Status};
-use common::{logi, logw};
+use common::wire::{Arg, Op, Request, Response, Status};
 use std::sync::Arc;
 
 const SERVES: &[Op] = &[
@@ -70,7 +70,7 @@ impl Service for FE {
             || matches!(op, Op::Ping | Op::Status | Op::Shutdown | Op::Histogram)
     }
 
-    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Request, reply: Reply) {
+    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Request, mut reply: Reply) {
         if !FORWARDED.contains(&request.op) {
             reply.send(server::unbuilt(process, SERVES, &request));
             return;
@@ -79,7 +79,9 @@ impl Service for FE {
             Ok(dn) => dn.to_string(),
             Err(e) => return reply.send(Response::error(Status::Internal, e.to_string())),
         };
-        logi!("forwarding, op {} dn {dn}", request.op);
+        // Which DN it went to belongs on the line, since that is the hop a
+        // live-site argument is about.
+        reply.about(format_args!("{} dn {dn}", first(&request)));
         // The answer is whatever the DN says, since FE adds nothing to it yet.
         if let Err(e) = process.ask(&dn, &request, move |answer| reply.send(answer)) {
             // The reply went into the closure, so this needs its own.
@@ -89,6 +91,14 @@ impl Service for FE {
 
     fn status(&self, _process: &Process) -> Vec<String> {
         vec![format!("stateless {}", self.config.stateless)]
+    }
+}
+
+/// The request's first argument, which for anything about an object is the name.
+fn first(request: &Request) -> &str {
+    match request.args.first() {
+        Some(Arg::Text(name)) => name.as_str(),
+        _ => "",
     }
 }
 

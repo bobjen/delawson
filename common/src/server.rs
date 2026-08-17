@@ -451,6 +451,10 @@ fn read_loop<S: Service>(
 /// The right to answer one request, once. It may be carried to another thread and
 /// answered when that thread has something to say, which is how a request waits
 /// without holding a worker.
+///
+/// Sending the answer is also where the request is logged, one line, because that
+/// is the only moment that knows how long it took — and how long it took is what
+/// a live-site argument is about.
 pub struct Reply {
     out: Arc<Out>,
     id: u32,
@@ -458,13 +462,37 @@ pub struct Reply {
     /// Whether the caller knows nothing more is in hand, so a direct writer
     /// should send what it has.
     settled: bool,
+    /// When the request was picked up, if anything is going to read the answer's
+    /// line. `None` when the level is above `info`, so a filtered line costs no
+    /// clock read.
+    started: Option<Instant>,
+    /// What the line calls this request: by default whatever its first argument
+    /// is, which for anything about an object is the name.
+    about: String,
 }
 
 impl Reply {
+    /// Say what this request was about, where the service knows better than its
+    /// first argument does.
+    pub fn about(&mut self, what: impl std::fmt::Display) {
+        if self.started.is_some() {
+            self.about = what.to_string();
+        }
+    }
+
     pub fn send(self, response: Response) {
+        let status = response.status;
         let response = Response { id: self.id, ..response };
         if let Err(e) = self.out.put(&response, self.settled) {
             logw!("could not answer {}: {e}", self.op);
+        }
+        if let Some(started) = self.started {
+            logi!(
+                "answered, op {} status {status} in {} us about {}",
+                self.op,
+                started.elapsed().as_micros(),
+                self.about
+            );
         }
     }
 }
@@ -620,7 +648,22 @@ fn answer_here<S: Service>(
 ) {
     process.answered.fetch_add(1, Ordering::Relaxed);
     let op = request.op;
-    let reply = Reply { out: Arc::clone(out), id: request.id, op, settled };
+    // Both of these are for the answer's line, so neither is paid when the level
+    // is above info.
+    let logging = crate::log::enabled(crate::log::Level::Info);
+    let mut reply = Reply {
+        out: Arc::clone(out),
+        id: request.id,
+        op,
+        settled,
+        started: logging.then(Instant::now),
+        about: String::new(),
+    };
+    if logging {
+        if let Some(arg) = request.args.first() {
+            reply.about(arg);
+        }
+    }
     match op {
         Op::Ping => reply.send(ping(process, &request)),
         Op::Status => reply.send(Response::text(status(process, &**service))),

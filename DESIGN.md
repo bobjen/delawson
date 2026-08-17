@@ -9338,15 +9338,49 @@ is: 20 million random hash lookups a second across 64 shards.
 | | Line written | Line filtered | Cost |
 |---|---|---|---|
 | create, 1,000 per request | 2,851,000 /s | 2,820,000 /s | none |
-| create, one per request | 127,000 /s | 144,000 /s | **11%** |
-| `object-info`, one per request | 228,000 /s | 262,000 /s | **13%** |
+| create, one per request | 115,000 /s | 140,000 /s | **18%** |
+| `object-info`, one per request | 212,000 /s | 260,000 /s | **19%** |
 | `batch-object-info`, 1,000 | 5,481,000 /s | 5,474,000 /s | none |
 
 **Measured, 2026-08-16.** A batched request pays nothing, because the line is per *request* and the
 request carries a thousand objects — the same amortization the batch exists for. A single-object
-request pays 11 to 13%, which is worth it: every request is then accounted for, and the alternative
-is a system whose busiest paths say nothing. Rate-limited sampling is the fallback if a path ever
-turns out not to afford it, not the default.
+request pays 11 to 13%.
+
+**Decided: the lines stay, unless something forces them out** (Asserted, Bob, 2026-08-16). The reason
+is live-site argument rather than accounting: *"SN is taking 50 seconds to do an object info" — "no it
+is not, SN never received the message"*. That question is unanswerable without a line per request on
+each side of every hop, and it is the question that actually gets asked when a cluster misbehaves.
+Rate-limited sampling is the fallback for a path that turns out not to afford it, not the default.
+
+**Decided: the line is written when the answer is sent, and carries how long the request took**
+(Asserted, Bob, 2026-08-16). That is the only moment which knows the duration, and the duration is what
+the argument is about — so one line per request per process rather than one on the way in and another
+on the way out. It lives in `Reply::send`, which is the single place every answer passes through,
+so a machine type gets it without writing anything: five hand-written log sites went away when this
+arrived.
+
+The clock read and the subject are both skipped when the level is above `info`, so a filtered line
+still costs nothing. Holding the subject inline instead of allocating it was tried and **made no
+measurable difference** — the cost is the ~125 bytes of line, not the allocation — so the simpler code
+stays.
+
+**So each line carries what the argument is conducted in.** The correlator is not a request id — §17.5d
+says why there cannot be one for every line — it is the name, and where the name stops, the stream
+range:
+
+```
+SN  answered, op create-stream status ok    in    10 us  about count 1 from 1 for dn 0
+DN  answered, op create        status ok    in  1750 us  about /bob/notes count 1 streams from 1 on SN0
+FE  answered, op create        status ok    in  3816 us  about /bob/notes dn DN0
+DN  answered, op object-info   status ok    in    40 us  about /bob/notes
+FE  answered, op object-info   status ok    in   109 us  about /bob/notes dn DN0
+DN  answered, op object-info   status not found in 31 us  about /bob/nothing
+```
+
+FE to DN is matched by name; DN to SN by the stream range, because SN does not know names and should
+not — it indexes by `(DnId, StreamId)`. Read the pairs: a lookup took 109 µs at FE of which 40 µs was
+DN, so the hop is 69 µs and neither side was slow. That is the shape of the answer to the question
+this logging exists for.
 
 ⚠️ **What is not affordable is keeping it.** At §1.4's target rate and a ~125-byte line, a process
 writes **28 MB/s, or 103 GB an hour** — so the 512 MB of full log that §17.5d's configuration keeps
