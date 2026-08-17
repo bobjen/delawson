@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SERVES: &[Op] = &[Op::CreateStream, Op::OpenExtent];
+const SERVES: &[Op] = &[Op::CreateStream, Op::OpenExtent, Op::LocateRecord];
 
 /// Locks over the stream table. Enough that sixteen cores rarely collide,
 /// few enough to walk when something wants a total.
@@ -36,6 +36,10 @@ struct Stream {
     /// The extent appends to this stream are landing in, once anything has asked
     /// for one. A stream that has only been created has none.
     open: Option<Extent>,
+    /// Records in this stream's sealed extents, which is where the open extent's
+    /// numbering starts from. Nothing seals yet, so it is always zero — and when
+    /// sealing arrives this is what has to be right.
+    sealed_records: u64,
 }
 
 /// Where an extent is, under the name this SN gave it.
@@ -44,16 +48,21 @@ struct Extent {
     id: u64,
     /// The second it was made in, which selects its key.
     created: u64,
+    /// The stream-local number of this extent's first record. An extent numbers
+    /// its own records from zero, and this is what turns one of those into the
+    /// stream-local number that is a durable reference.
+    first_record: u64,
     /// The ENs holding its instances. The first is the primary, which is the one
     /// an append is sent to.
     instances: Vec<u32>,
 }
 
 impl Extent {
-    /// The id, the second, then the instances with the primary first, which is
-    /// the order an FE needs them in.
+    /// The id, the second, the first record, then the instances with the primary
+    /// first, which is the order an FE needs them in.
     fn args(&self) -> Vec<Arg> {
-        let mut args = vec![Arg::Number(self.id), Arg::Number(self.created)];
+        let mut args =
+            vec![Arg::Number(self.id), Arg::Number(self.created), Arg::Number(self.first_record)];
         args.extend(self.instances.iter().map(|en| Arg::Number(*en as u64)));
         args
     }
@@ -140,6 +149,7 @@ impl Service for SN {
         match request.op {
             Op::CreateStream => self.create(request),
             Op::OpenExtent => self.open_extent(process, request),
+            Op::LocateRecord => self.locate(request),
             _ => server::unbuilt(process, SERVES, request),
         }
     }
@@ -182,7 +192,7 @@ impl SN {
         for n in 0..count {
             let id = first + n;
             let mut shard = self.shards[shard_of(dn, id)].lock().expect("streams");
-            shard.insert((dn, id), Stream { created, open: None });
+            shard.insert((dn, id), Stream { created, open: None, sealed_records: 0 });
         }
         self.streams.fetch_add(count, Ordering::Relaxed);
         Response::ok()
@@ -208,6 +218,39 @@ impl SN {
         }
     }
 
+    /// `(DnId, StreamId, record)`, and back comes the extent whose numbering
+    /// starts at or before that record. Whether the record is actually there is
+    /// the EN's to say: an SN keeps its byte and record totals lazily, so it
+    /// routes a read and does not bound it.
+    fn locate(&self, request: &Request) -> Response {
+        let (dn, stream, record) = match request.args.as_slice() {
+            [Arg::Number(dn), Arg::Number(stream), Arg::Number(record), ..] => {
+                (*dn as u32, *stream, *record)
+            }
+            _ => {
+                return Response::error(
+                    Status::BadRequest,
+                    "locate-record takes a DnId, a StreamId and a record",
+                );
+            }
+        };
+        let shard = self.shards[shard_of(dn, stream)].lock().expect("streams");
+        let Some(held) = shard.get(&(dn, stream)) else {
+            return Response::error(Status::NotFound, format!("no stream {stream} from dn {dn}"));
+        };
+        match &held.open {
+            Some(extent) if record >= extent.first_record => {
+                Response { id: 0, status: Status::Ok, args: extent.args() }
+            }
+            // Before the open extent means a sealed one, and nothing seals yet, so
+            // there is nowhere else for it to be.
+            Some(_) | None => Response::error(
+                Status::NotFound,
+                format!("stream {stream} has no extent holding record {record}"),
+            ),
+        }
+    }
+
     /// The stream's open extent, naming one if it has none. Holding the shard
     /// across the naming is what stops two appends to a fresh stream from opening
     /// two extents for it.
@@ -220,8 +263,12 @@ impl SN {
             return Ok(extent.clone());
         }
         let (id, created) = self.naming.name(second)?;
-        let extent =
-            Extent { id, created, instances: self.naming.instances(ens, common::INSTANCES)? };
+        let extent = Extent {
+            id,
+            created,
+            first_record: record.sealed_records,
+            instances: self.naming.instances(ens, common::INSTANCES)?,
+        };
         record.open = Some(extent.clone());
         self.extents.fetch_add(1, Ordering::Relaxed);
         Ok(extent)

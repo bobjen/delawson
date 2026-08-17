@@ -4027,6 +4027,20 @@ amortizes (above), and it must stay **large** so that SN metadata per byte stays
 — halving the extent size doubles the extent records for the same data, and §14.1.2 says record
 count is what decides how many machines an object needs.
 
+#### 6.2 The physical cap bounds the first write, not the extent for life
+
+**32 MB compressed is a bound on what a sealing extent may accumulate, not a property an extent keeps**
+(Asserted, Bob, 2026-08-17). Recompression during coalescing (§8.1.4.4) or compaction (§10) may leave an
+extent larger than the cap, and that is fine: the cap exists to bound what one extent costs to write,
+repair and hold open, and once the bytes are written none of those are decided by it any more.
+
+⚠️ **So nothing may treat it as an invariant.** Two places in this document lean on extent size in ways
+worth re-reading with that in mind: §4.6.4's address arithmetic, which sizes a slot from extents per
+device, and §4.3.2.3's requirement that **EC group members have equal physical length** — a
+recompression that changes one member's size has to preserve that, which makes "recompress freely" and
+"members are equal" two constraints that meet. Neither is broken by the soft cap, but both are stated
+elsewhere as though the cap were fixed.
+
 ⚠️ **So the number is bracketed by two measurements neither of which has been made.** What would
 replace the guess: repair time for one extent as a function of its size on the target media,
 including the code's read amplification, and how well repair parallelizes as the unit shrinks —
@@ -4626,9 +4640,25 @@ Note the offset assigned in that window must be a **logical** position, since th
 known. Physical placement is determined afterwards and recorded in the sparse index (§9.3) — which is why §4
 carries logical *and* physical cumulative totals rather than one.
 
-**Append size is bounded at 32 MB logical**, matching the extent's physical cap (§6). The reasoning is that
-compression does not materially expand, so a 32 MB logical append is at most 32 MB physical and therefore
-always fits in a freshly opened extent. An append larger than the extent cap could never be placed at all.
+**Append size, record size and extent size are all the same bound: 4 GB logical, and 32 MB compressed on
+first write** (Asserted, Bob, 2026-08-17). One number for three things, and it is forced — an append must
+fit an extent or it could never be placed at all (§8.2.4 needs a block placeable wholly in a fresh extent),
+and a record must fit one too (§8.2.3 rule 1). An earlier draft bounded an append at 32 MB *logical* on the
+grounds that compression does not expand; the compressed cap is the one that decides whether a block fits,
+so that was the wrong measure, and the logical bound is 4 GB like everything else.
+
+⚠️ **The append half of that may yet come down, because a message is not an extent** (Asserted, Bob,
+2026-08-17). A frame is capped at 1 MB and a sealed segment at 8 MB, both to stop a peer making the far
+side allocate what it asks for — so a 32 MB append needs either a larger cap, a multi-frame append, or a
+lower append limit. The last is the cheap one, and a writer wanting a large record can still build it from
+several appends (§8.2.3), so the choice is about how many receipts a writer gets rather than what it can
+write. #53.
+
+**A large append becomes several device writes, and stays one append.** 32 MB compressed is ~213 ms of HDD
+at 150 MB/s, and holding a disk for that long delays everything queued behind it — so the primary may cut
+the write into pieces to interleave with other work. That is invisible to the writer: §8.1's atomicity is a
+property of the byte range, so the watermark advances only when every piece has landed, and a reader never
+sees half an append however many writes it took.
 
 **Durability returns the offset as a locator**, so a writer learns exactly where its data landed.
 
@@ -5196,6 +5226,23 @@ much more than it does — and that is worth deciding rather than assuming (#46)
 after — the same stand-in bargain as DN's in-memory object index (§17.5g), and the same
 caution: nothing about the in-memory version is evidence about what the durable one costs.
 
+#### 8.1.5.3 When transactions arrive, the EN's part of them lives in the journal
+
+**Not being attempted yet: system change numbers and transactions.** But the place they will go is
+already decided, and it is worth writing down because it constrains the journal being designed now:
+**the EN's portion will be purely in the disk journal, never in the final extents** (Asserted, Bob,
+2026-08-17).
+
+Two things follow, and both are about what *not* to build:
+
+- **The extent format does not grow a change number per record.** Extent bodies stay pure data, so
+  what gets compressed, encrypted, erasure-coded, repaired and shipped between clusters carries no
+  transaction state — and coalescing (§8.1.4.4) has nothing extra to preserve.
+- **The journal has to have room for it.** It is already the thing that makes a recent extent
+  interpretable (§8.1.5.1); it will also be the thing that says what is visible. A journal format
+  that can only describe extents and offsets would have to be replaced, so it should not be designed
+  as though extent metadata were all it will ever hold.
+
 ### 8.1.6 Logical and compressed positions are different types
 
 **It is very easy to confuse logical and compressed values in append code, since both are 32-bit,
@@ -5318,6 +5365,88 @@ record)*, a two-part token strictly worse than the single logical byte offset.
 
 So **the logical byte offset is the right token precisely because it is record-agnostic**, and the
 zero-width-fixed-length case is a genuine corner that simply needs forbidding rather than designing around.
+
+#### 8.2.3 An extent holds whole records; an append need not
+
+Four rules, all Bob's, 2026-08-17, and they are not the same rule at different scales:
+
+1. **An extent contains whole records.** Sealing is where this is enforced, and the boundary is the
+   extent's, not the append's.
+2. **A record may cross append blocks.** §8.2.2 already relies on this — a single writer controls the
+   whole byte stream, so an append boundary need not fall on a record boundary.
+3. **A terminator framing's data may not contain its terminator**, and **the `laws` client is what
+   checks it.** The client is the last place that holds records *as records* before they become a byte
+   stream; after that, a stray `\n` in `lf` data is not a violation anybody can detect — it is simply
+   two records. Checking where the information still exists is the only place the check means anything.
+4. **Every framing can face a partial record** — including `fixed`, where a block ending part-way
+   through the declared width is a partial record found by arithmetic rather than by a missing
+   terminator. What differs between framings is not whether a fragment can happen but whether a
+   reader can **resynchronize**: a terminator framing can find the next boundary by scanning, while
+   `fixed` and `length` are interpretable only from a known record boundary. So rule 1 is strictest
+   for those two — a boundary lost in `fixed` or `length` data is unrecoverable rather than merely
+   awkward — and it is why the seal boundary must land on a record end.
+
+⚠️ **The consequence for durability is the sharp one: an append whose trailing record is incomplete
+cannot be reported durable until a later append completes that record.** Bytes being on three of four
+disks is not enough, because half a record is not a record — so the append that *started* a record
+waits for the append that finishes it. Two things follow:
+
+- **A receipt can wait on a subsequent append**, not merely on the instances. §8.1.1's watermark is
+  about bytes; this is a second gate in front of it, and an append satisfies both or is not durable.
+  A writer that stops mid-record has an append that never completes, which is correct: it never
+  wrote a whole record. It is also what keeps an extent from sealing mid-record, which §8.2.4 turns
+  into the reason nothing ever has to be split.
+- **An append's receipt covers the records it completed**, which may include one begun by an earlier
+  append. Record numbers are assigned to complete records, so they are assigned in the append that
+  finishes them.
+
+#### 8.2.4 One rule removes the split: a block ends on a boundary, or holds no boundary at all
+
+The obvious reading of the rules above is that sealing must sometimes **split the final append and
+discard half a record**, leaving an append that committed some of its records and not others — an
+outcome that is neither a success nor a failure, and that a writer seeing only "ok" or "error" would
+either lose data over or duplicate data over. That is what an earlier draft of this section
+concluded, along with the observation that a writer can avoid it by ending every append on a record
+boundary.
+
+**But it can be removed rather than mitigated** (Asserted, Bob, 2026-08-17):
+
+> A record may fail to end in its append block **only if it began at the start of that block, or in
+> an earlier one.**
+
+Equivalently, and this is the form to check: **an append block either ends on a record boundary, or
+contains no record boundary at all.** A block may be all whole records, or it may be a slab of bytes
+wholly inside one record — never three records and half of a fourth.
+
+**Why that removes the split.** It makes every append block indivisible *and* placeable:
+
+- A block that **ends on a boundary** can go wholly into the current extent or wholly into a fresh
+  one. §8.1.1a-2 already bounds an append at 32 MB logical precisely so it always fits a fresh
+  extent, so the primary's choice is free.
+- A block that **holds no boundary** belongs to a record that is still open, and rule 1 of §8.2.3
+  keeps a whole record in one extent — so the extent cannot seal until that record closes.
+
+Put together: **an extent seals between records, and therefore between blocks.** Nothing is ever cut,
+no append is ever divided, and the partial-commit answer is not needed because the state it described
+cannot arise. The deferral rule of §8.2.3 is what enforces the second bullet — an append that closes
+no record is not durable yet, and an extent with an open record is not sealable yet, which are the
+same fact seen from the writer's side and the extent's side.
+
+**So a record's maximum size is an extent's maximum size** (Asserted, Bob, 2026-08-17): **4 GB
+logical, and 32 MB compressed on first write.** Rule 1 keeps a whole record in one extent, so the
+record cap cannot be anything else — and since a record may span appends, the cap is not the 32 MB
+logical append bound of §8.1.1a-2 either. A writer may build a record out of many appends, up to what
+an extent holds.
+
+⚠️ **And the compressed half of that is soft: it bounds the first write, not the extent for ever**
+(Asserted, Bob, 2026-08-17). If later recompression (§8.1.4.4, §10) makes an extent larger than
+32 MB, that is fine — nothing needs to hold the extent under the cap once the bytes are in it. See
+§6.2, because anything that reads the cap as an invariant is reading it wrongly.
+
+**And the check belongs in two places, for different reasons.** The `laws` client frames the record it
+is given, so what it sends always ends on a boundary and the rule is satisfied by construction. The
+primary EN checks it anyway, because the rule is what makes sealing simple and a writer talking to the
+protocol directly must not be able to break that.
 
 ### 8.3 The three mutations
 
@@ -10041,3 +10170,77 @@ says so, loudly, and that is the honest state of it.
 of which start a process: the offset arithmetic, the quorum counting, the extent naming, the
 instance choosing, and the argument parsing are each reachable directly, which is what §15.3.1
 means by packaging the code so a test can call it. The whole suite is 67 tests in 0.8 seconds.
+
+### 17.9 Read: framing, record numbers, and an append that makes the object
+
+Built, 2026-08-17, on the same day as append. `laws append /notes/journal --data "…"` creates the
+object if it is not there, and `laws read /notes/journal --record 0` gives the record back.
+
+**A read is by record number, because that is the only durable reference** (§8.1.1a-9). So records
+had to exist before a read could, and three things arrived together: framing, record numbering, and
+the read path.
+
+#### 17.9.1 Framing is declared at create and travels with every request
+
+All five framings of §8.2 are built: `nul`, `lf`, `crlf`, `length` and `fixed:WIDTH`. The object
+declares one at creation and `object-info` reports it, and it travels with every append and every
+read — because the primary EN is what counts the records and what parses them, and an instance that
+decided a framing for itself would be deciding something the object did not.
+
+**The client frames the record it is given**, which does two jobs at once:
+
+- **It checks what only it can check.** A terminator framing forbids its terminator inside a record
+  (§8.2.3 rule 3), and the client is the last place holding a record *as a record* — after that a
+  stray `\n` in `lf` data is not a violation anybody can detect, it is simply two records.
+- **What it sends always ends on a record boundary**, so a writer using `laws` never meets the
+  awkward corners of §8.2.4.
+
+`fixed:WIDTH` is checked the same way and locally: a five-byte record for a `fixed:4` object fails in
+the client without a round trip.
+
+#### 17.9.2 Records are numbered by the append that closes them
+
+An extent numbers its records from zero and the SN says what stream-local number its first record
+has — so a receipt reports `(stream, record)`, the durable reference, and then the extent, second and
+offset as the hint tier of §8.1.1a-10.
+
+A record may span appends (§8.2.3 rule 2), so the primary keeps the bytes of an open record and an
+append is told how many records it *closed*, which can be none. **Both gates of §8.2.3 are built**:
+an append is answered when a quorum of instances has applied it **and** its record has finished, and
+either can arrive first. The block rule of §8.2.4 is enforced where the append lands — a block that
+closes a record and then ends inside another is refused, and refused before anything is written.
+
+#### 17.9.3 What a read costs today, and what it will cost
+
+| Hop | Asks |
+|---|---|
+| FE → DN | which stream, and how it is framed |
+| FE → SN | which extent holds that record, and where its instances are |
+| FE → primary EN | the record |
+
+⚠️ **The read goes to the primary, not to any instance.** §9.1 says any instance will do, and for a
+*sealed* extent that is right — every instance is identical. An unsealed one is not: a quorum of
+three means an instance may be missing an append, and §8.1.4.3's interior holes mean what it is
+missing need not be at the end. The primary is the one that has everything it acknowledged. Since
+nothing seals yet, every extent is unsealed and every read goes to the primary.
+
+⚠️ **And the EN parses the extent from the beginning every time**, because there is no sparse index
+(§9.3) and no seal. So a read is O(extent) rather than O(one granule), which is the placeholder to
+remember when a read rate is quoted.
+
+**What is deliberately not here**: reading by key (`--key` answers `unimplemented`, since keyed
+reads need the key ordering of §9.2), scans, counts, and the sparse index.
+
+#### 17.9.4 The order the rest arrives in
+
+Bob's sequence, 2026-08-17, and each step is a knob turned small rather than a new mechanism:
+
+1. **Done**: an append that creates its object, and a read that gets the record back.
+2. **Next: shrink the extent sealing limit** to something small, so sealing happens constantly — an
+   extent seals, the SN allocates another, and a read finds records in both. That is what makes
+   `first_record` on an extent do real work rather than always being zero.
+3. **Then: shrink the extents-per-stream limit**, so a stream fills and the DN allocates another —
+   driven by the previous stream reporting that it sealed.
+
+The point of the order is that each step turns a configured limit into a constantly-exercised path,
+which is the same trick the small log files play: make the rare case the common one on one box.

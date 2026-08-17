@@ -2,6 +2,7 @@
 //! protocol, the daemon lifecycle, and the placement-rule report.
 
 pub mod config;
+pub mod framing;
 pub mod log;
 pub mod logread;
 pub mod offset;

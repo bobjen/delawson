@@ -11,6 +11,7 @@ mod client;
 use clap::{Parser, Subcommand, ValueEnum};
 use client::{Conn, Stats, Tally};
 use common::config::{ClusterConfig, Messaging, ServiceKind};
+use common::framing::Framing;
 use common::placement;
 use common::random::Rng;
 use common::wire::{Arg, Op, Request, Response, Status};
@@ -194,6 +195,9 @@ enum Cmd {
         path: String,
         #[arg(long, value_enum)]
         flavor: Flavor,
+        /// Where one record ends: nul, lf, crlf, length or fixed:WIDTH.
+        #[arg(long, default_value = "lf")]
+        framing: String,
         #[arg(long)]
         media_class: Option<String>,
         /// Delete the object this many seconds from now.
@@ -262,9 +266,13 @@ enum Cmd {
         src: Vec<String>,
     },
 
-    /// Append a record to an unkeyed object.
+    /// Append a record to an unkeyed object, creating it if it is not there.
     Append {
         path: String,
+        /// The object's framing, used to frame this record and to make the object
+        /// if it does not exist yet.
+        #[arg(long, default_value = "lf")]
+        framing: String,
         #[command(flatten)]
         body: Body,
     },
@@ -554,6 +562,8 @@ fn run(cli: Cli) -> Result<()> {
             let answer = open(&target, timeout, &cluster.messaging)?.call(&request)?;
             match request.op {
                 Op::AppendRecord => receipt(&target, &answer),
+                Op::ReadRecord => record(&target, &answer),
+                Op::ObjectInfo | Op::CreateObject => object(&target, &answer),
                 _ => report(&target, &answer),
             }
         }
@@ -758,6 +768,9 @@ fn create_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result
     if plan.batch == 0 || plan.clients == 0 || plan.depth == 0 {
         return Err(Error::new("--batch, --clients and --depth must all be positive"));
     }
+    // Line-framed, which is what a benchmark of creating objects wants: a framing
+    // is not what it is measuring, and every object needs one.
+    let (kind, width) = Framing::Lf.wire();
     let addr = target.address;
     let shared = Arc::new(messaging.clone());
     let batches = plan.objects.div_ceil(plan.batch as u64);
@@ -784,7 +797,11 @@ fn create_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result
                             Request::new(Op::BatchCreate)
                         };
                         for n in first..first + batch as u64 {
-                            request = request.text(format!("{prefix}{n}")).flag(keyed);
+                            request = request
+                                .text(format!("{prefix}{n}"))
+                                .flag(keyed)
+                                .number(kind)
+                                .number(width);
                         }
                         let id = conn.send(&request)?;
                         sent.insert(id, std::time::Instant::now());
@@ -931,21 +948,116 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
     Ok(asked as f64 / seconds)
 }
 
+/// Frame one record, and refuse data the framing cannot carry.
+///
+/// This is the only place that holds a record *as a record* before it becomes a
+/// byte stream. After this a stray terminator is not a violation anybody can
+/// detect — it is simply two records — so the check belongs here or nowhere.
+///
+/// Framing here also means what the client sends always ends on a record boundary,
+/// which is what keeps a writer clear of the awkward corners around sealing.
+fn frame(framing: Framing, record: &[u8]) -> Result<Vec<u8>> {
+    let mark: &[u8] = match framing {
+        Framing::Nul => &[0],
+        Framing::Lf => b"\n",
+        Framing::CrLf => b"\r\n",
+        Framing::Fixed(width) => {
+            if record.len() != width as usize {
+                return Err(Error::new(format!(
+                    "a fixed:{width} record is {width} bytes, and that one is {}",
+                    record.len()
+                )));
+            }
+            return Ok(record.to_vec());
+        }
+        Framing::Length => {
+            let length = u32::try_from(record.len())
+                .map_err(|_| Error::new("a record longer than a length field can say"))?;
+            let mut framed = length.to_le_bytes().to_vec();
+            framed.extend_from_slice(record);
+            return Ok(framed);
+        }
+    };
+    if record.windows(mark.len()).any(|window| window == mark) {
+        return Err(Error::new(format!(
+            "{framing} records cannot contain their terminator, and that one does"
+        )));
+    }
+    let mut framed = record.to_vec();
+    framed.extend_from_slice(mark);
+    Ok(framed)
+}
+
 /// What an append answers: where the bytes went, once a quorum of instances had
 /// them. Five numbers read as one line rather than five.
 fn receipt(target: &Target, response: &Response) -> Result<()> {
     if let [
-        Arg::Number(sn),
+        Arg::Number(stream),
+        Arg::Number(record),
+        Arg::Number(records),
         Arg::Number(extent),
         Arg::Number(created),
         Arg::Number(offset),
         Arg::Number(length),
     ] = response.args.as_slice()
     {
+        // The durable reference first, since that is the one worth keeping.
+        match records {
+            0 => println!(
+                "{} stream {stream}, no record finished yet, {length} bytes at offset {offset} of extent {extent}",
+                target.identity
+            ),
+            1 => println!(
+                "{} stream {stream} record {record}, {length} bytes at offset {offset} of extent {extent} made in second {created}",
+                target.identity
+            ),
+            _ => println!(
+                "{} stream {stream} records {record} to {}, {length} bytes at offset {offset} of extent {extent} made in second {created}",
+                target.identity,
+                record + records - 1
+            ),
+        }
+        return Ok(());
+    }
+    report(target, response)
+}
+
+/// What an object is, which is what both a lookup and a create answer with. Seven
+/// numbers read as one line.
+fn object(target: &Target, response: &Response) -> Result<()> {
+    if let [
+        Arg::Number(id),
+        Arg::Number(stream),
+        Arg::Number(sn),
+        Arg::Number(created),
+        Arg::Flag(keyed),
+        Arg::Number(kind),
+        Arg::Number(width),
+    ] = response.args.as_slice()
+    {
+        let flavor = if *keyed { "keyed" } else { "unkeyed" };
+        let framing = match Framing::of_wire(*kind, *width) {
+            Ok(framing) => framing.to_string(),
+            Err(e) => e.to_string(),
+        };
         println!(
-            "{} extent {extent} of SN{sn} made in second {created}, {length} bytes at offset {offset}",
+            "{} object {id} {flavor} framed {framing}, stream {stream} on SN{sn}, made in second {created}",
             target.identity
         );
+        return Ok(());
+    }
+    report(target, response)
+}
+
+/// A record, as the bytes it is. Text goes to standard output as text, so a read
+/// can be piped; anything else says how much there was rather than spraying it at
+/// a terminal.
+fn record(target: &Target, response: &Response) -> Result<()> {
+    if let [Arg::Bytes(bytes)] = response.args.as_slice() {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => println!("{text}"),
+            Err(_) => println!("{} {} bytes, not text", target.identity, bytes.len()),
+        }
         return Ok(());
     }
     report(target, response)
@@ -1093,10 +1205,13 @@ fn build(cmd: &Cmd) -> Result<Request> {
         Cmd::Ls { path } => Request::new(Op::List).text(path),
         Cmd::Stat { path } => Request::new(Op::Stat).text(path),
 
-        Cmd::Create { path, flavor, media_class, expiry } => {
+        Cmd::Create { path, flavor, framing, media_class, expiry } => {
+            let (kind, width) = Framing::parse(framing)?.wire();
             let mut request = Request::new(Op::CreateObject)
                 .text(path)
                 .flag(*flavor == Flavor::Keyed)
+                .number(kind)
+                .number(width)
                 .text(media_class.clone().unwrap_or_default());
             if let Some(seconds) = expiry {
                 request = request.number(*seconds);
@@ -1121,8 +1236,14 @@ fn build(cmd: &Cmd) -> Result<Request> {
             request
         }
 
-        Cmd::Append { path, body } => {
-            Request::new(Op::AppendRecord).text(path).bytes(body.bytes()?)
+        Cmd::Append { path, framing, body } => {
+            let framing = Framing::parse(framing)?;
+            let (kind, width) = framing.wire();
+            Request::new(Op::AppendRecord)
+                .text(path)
+                .number(kind)
+                .number(width)
+                .bytes(frame(framing, &body.bytes()?)?)
         }
         Cmd::Insert { path, key, body } => {
             Request::new(Op::InsertRecord).text(path).text(key).bytes(body.bytes()?)
@@ -1142,6 +1263,7 @@ fn build(cmd: &Cmd) -> Result<Request> {
             request.args.push(at.arg());
             request
         }
+
         Cmd::Scan { path, from, to, limit } => Request::new(Op::Scan)
             .text(path)
             .text(from.clone().unwrap_or_default())

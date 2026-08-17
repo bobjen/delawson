@@ -109,13 +109,15 @@ ops! {
     // SN, from a DN: a stream is named by the DN that owns it.
     CreateStream = 0x0501, "create-stream";
     // And from an FE: the extent a stream is currently appendable at, opened if
-    // there is not one already.
+    // there is not one already, and which extent holds a given record.
     OpenExtent = 0x0502, "open-extent";
+    LocateRecord = 0x0503, "locate-record";
 
     // EN. An append arrives from an FE at the primary; the primary broadcasts the
     // same bytes at a fixed offset to the other three instances.
     AppendExtent = 0x0601, "append-extent";
     ApplyAppend = 0x0602, "apply-append";
+    ReadExtent = 0x0603, "read-extent";
 
     // Records.
     AppendRecord = 0x0401, "append";

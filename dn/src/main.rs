@@ -13,9 +13,11 @@
 //! request to be answered when the SN says the streams exist.
 
 use common::config::{DNConfig, ServiceKind};
+use common::framing::Framing;
 use common::logw;
 use common::server::{self, Process, Reply, Service};
 use common::wire::{Arg, Op, Request, Response, Status};
+use common::{Error, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -43,6 +45,9 @@ const SHARDS: usize = 64;
 
 struct Object {
     id: u64,
+    /// Where one record ends and the next begins, declared here and never
+    /// changed: everything that reads or writes this object's records needs it.
+    framing: Framing,
     /// The one stream this object is made of, on the SN that recorded it. Zero
     /// while the name is taken but the stream is not yet named, which is what
     /// stops two creates of one name from making two streams.
@@ -50,6 +55,31 @@ struct Object {
     sn: u32,
     keyed: bool,
     created: u64,
+}
+
+/// One object a create asks for: a name, a flavour, and a framing.
+struct Wanted {
+    name: String,
+    keyed: bool,
+    framing: Framing,
+}
+
+impl Wanted {
+    /// Arguments per object, which is what a batch is cut into.
+    const ARGS: usize = 4;
+
+    fn of(args: &[Arg]) -> Result<Wanted> {
+        match args {
+            [Arg::Text(name), Arg::Flag(keyed), Arg::Number(kind), Arg::Number(width)] => {
+                Ok(Wanted {
+                    name: name.clone(),
+                    keyed: *keyed,
+                    framing: Framing::of_wire(*kind, *width)?,
+                })
+            }
+            _ => Err(Error::new("a create takes a name, a flavour and a framing")),
+        }
+    }
 }
 
 struct DN {
@@ -118,39 +148,40 @@ impl Service for DN {
 }
 
 impl DN {
-    /// `(name, keyed)`, and one stream to go with it.
+    /// `(name, keyed, framing kind, framing width)`, and one stream to go with it.
     fn create(self: &Arc<Self>, process: &Arc<Process>, request: &Request, reply: Reply) {
-        let (name, keyed) = match request.args.as_slice() {
-            [Arg::Text(name), Arg::Flag(keyed), ..] => (name.clone(), *keyed),
-            _ => {
-                return reply.send(Response::error(
-                    Status::BadRequest,
-                    "create takes a name and a flavour",
-                ));
-            }
+        // Only the first few arguments are the object; a create may carry more —
+        // media class, an expiry — that nothing here reads yet.
+        let head = request.args.get(..Wanted::ARGS).unwrap_or_default();
+        let wanted = match Wanted::of(head) {
+            Ok(wanted) => wanted,
+            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
         };
-        let existed = format!("{name} exists already");
-        self.record(process, vec![(name, keyed)], reply, move |made| {
-            if made == 0 { Response::error(Status::BadRequest, existed) } else { Response::ok() }
+        let name = wanted.name.clone();
+        self.record(process, vec![wanted], reply, move |dn, made| {
+            if made == 0 {
+                return Response::error(Status::BadRequest, format!("{name} exists already"));
+            }
+            // The object it just made, in the same shape object-info answers, so an
+            // append that had to create one needs no second lookup to go on with.
+            match dn.look(&name) {
+                Some(args) => Response { id: 0, status: Status::Ok, args },
+                None => Response::error(Status::Internal, format!("{name} went missing")),
+            }
         });
     }
 
     /// A run of `(name, keyed)` pairs, which costs one stream request and one
     /// answer however many objects it holds.
     fn create_many(self: &Arc<Self>, process: &Arc<Process>, request: &Request, reply: Reply) {
-        let mut wanted = Vec::with_capacity(request.args.len() / 2);
-        for pair in request.args.chunks(2) {
-            match pair {
-                [Arg::Text(name), Arg::Flag(keyed)] => wanted.push((name.clone(), *keyed)),
-                _ => {
-                    return reply.send(Response::error(
-                        Status::BadRequest,
-                        "batch-create takes name and flavour pairs",
-                    ));
-                }
+        let mut wanted = Vec::with_capacity(request.args.len() / Wanted::ARGS);
+        for one in request.args.chunks(Wanted::ARGS) {
+            match Wanted::of(one) {
+                Ok(one) => wanted.push(one),
+                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
             }
         }
-        self.record(process, wanted, reply, |made| Response {
+        self.record(process, wanted, reply, |_, made| Response {
             id: 0,
             status: Status::Ok,
             args: vec![Arg::Number(made)],
@@ -166,27 +197,34 @@ impl DN {
     fn record(
         self: &Arc<Self>,
         process: &Arc<Process>,
-        wanted: Vec<(String, bool)>,
+        wanted: Vec<Wanted>,
         mut reply: Reply,
-        say: impl FnOnce(u64) -> Response + Send + 'static,
+        say: impl FnOnce(&DN, u64) -> Response + Send + 'static,
     ) {
         let created = now();
 
         // Whoever inserts the name owns the object; anyone else finds it there.
         let mut mine = Vec::with_capacity(wanted.len());
-        for (name, keyed) in &wanted {
-            let mut shard = self.shards[shard_of(name)].lock().expect("objects");
-            if !shard.contains_key(name.as_str()) {
+        for one in &wanted {
+            let mut shard = self.shards[shard_of(&one.name)].lock().expect("objects");
+            if !shard.contains_key(one.name.as_str()) {
                 let id = self.next_object.fetch_add(1, Ordering::Relaxed);
                 shard.insert(
-                    Box::from(name.as_str()),
-                    Object { id, stream: 0, sn: 0, keyed: *keyed, created },
+                    Box::from(one.name.as_str()),
+                    Object {
+                        id,
+                        framing: one.framing,
+                        stream: 0,
+                        sn: 0,
+                        keyed: one.keyed,
+                        created,
+                    },
                 );
-                mine.push(name.clone());
+                mine.push(one.name.clone());
             }
         }
         if mine.is_empty() {
-            return reply.send(say(0));
+            return reply.send(say(self, 0));
         }
 
         // The first name as well as the range: the name matches this line with
@@ -226,7 +264,7 @@ impl DN {
             // for it: SN does not know names, and should not.
             reply
                 .about(format_args!("{named_first} count {count} streams from {first} on {named}"));
-            reply.send(say(count));
+            reply.send(say(&dn, count));
         });
         if let Err(e) = asked {
             logw!("could not reach an SN", "sn {sn},{e}");
@@ -256,7 +294,7 @@ impl DN {
     /// gets a zero id, so the answer lines up with the question without saying
     /// which was missing twice.
     fn info_many(&self, request: &Request) -> Response {
-        let mut args = Vec::with_capacity(request.args.len() * 4);
+        let mut args = Vec::with_capacity(request.args.len() * 7);
         for asked in &request.args {
             let name = match asked {
                 Arg::Text(name) => name.as_str(),
@@ -272,23 +310,28 @@ impl DN {
                     Arg::Number(0),
                     Arg::Number(0),
                     Arg::Flag(false),
+                    Arg::Number(0),
+                    Arg::Number(0),
                 ]),
             }
         }
         Response { id: 0, status: Status::Ok, args }
     }
 
-    /// What an object is, as five values: id, stream, the SN holding it, the
-    /// second it was made, and its flavour.
+    /// What an object is: id, stream, the SN holding it, the second it was made,
+    /// its flavour, and its framing as a kind and a width.
     fn look(&self, name: &str) -> Option<Vec<Arg>> {
         let shard = self.shards[shard_of(name)].lock().expect("objects");
         let object = shard.get(name)?;
+        let (kind, width) = object.framing.wire();
         Some(vec![
             Arg::Number(object.id),
             Arg::Number(object.stream),
             Arg::Number(object.sn as u64),
             Arg::Number(object.created),
             Arg::Flag(object.keyed),
+            Arg::Number(kind),
+            Arg::Number(width),
         ])
     }
 }

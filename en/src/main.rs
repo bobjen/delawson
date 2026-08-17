@@ -15,6 +15,7 @@
 //! journal of extent metadata per disk, snapshot and log.
 
 use common::config::ENConfig;
+use common::framing::Framing;
 use common::offset::COff;
 use common::server::{self, Process, Reply, Service};
 use common::wire::{Arg, Op, Request, Response, Status};
@@ -23,7 +24,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-const SERVES: &[Op] = &[Op::AppendExtent, Op::ApplyAppend];
+const SERVES: &[Op] = &[Op::AppendExtent, Op::ApplyAppend, Op::ReadExtent];
+
+/// Appends held back per extent, waiting for a record to close.
+type Waiting = HashMap<(u32, u64), Vec<Arc<Pending>>>;
 
 /// An extent instance held here. Its name is the key it is found by — this SN,
 /// this id — and the second, which is part of the name too.
@@ -32,6 +36,13 @@ struct Extent {
     /// Where the next append to this extent will start. Compressed, because what
     /// arrives here is what a writer compressed and what a device will hold.
     end: COff,
+    /// Records completed in this extent, which is what numbers them. Extent-local:
+    /// the SN says what stream-local number the extent's first record has.
+    records: u64,
+    /// The bytes of a record that has begun and not ended. A record may span
+    /// appends, so a block can leave one open — and while one is open the extent
+    /// cannot seal, which is what stops a seal ever having to cut a record.
+    open: Vec<u8>,
 }
 
 /// One append, as it arrived. The offset is the primary's decision, so every
@@ -41,6 +52,15 @@ struct Append {
     extent: usize,
     offset: COff,
     bytes: Vec<u8>,
+}
+
+/// Where an append landed and what it numbered.
+struct Landed {
+    offset: COff,
+    /// The extent-local number of the first record this append completed.
+    first_record: u64,
+    /// Records it completed, which is zero for a block wholly inside one record.
+    records: u64,
 }
 
 /// Which extent an append is for, and what it carries.
@@ -99,22 +119,29 @@ impl Extents {
             }
             return Ok(*place);
         }
-        self.extents.push(Extent { created, end: COff::ZERO });
+        self.extents.push(Extent { created, end: COff::ZERO, records: 0, open: Vec::new() });
         let place = self.extents.len() - 1;
         self.at.insert((sn, id), place);
         Ok(place)
     }
 
-    /// Take the next offset in an extent and put the bytes there. This is the one
-    /// serialized step of an append; everything expensive happens after it.
-    fn take(&mut self, appending: &Appending) -> Result<COff> {
+    /// Take the next offset in an extent, put the bytes there, and count the
+    /// records they complete. This is the one serialized step of an append;
+    /// everything expensive happens after it.
+    fn take(&mut self, appending: &Appending, framing: Framing) -> Result<Landed> {
         let length = COff::of_len(appending.bytes.len())?;
         let place = self.place(appending.sn, appending.extent, appending.created)?;
         let extent = &mut self.extents[place];
+        // Before the bytes are taken, so a block that breaks the record rule
+        // changes nothing.
+        let (closed, open) = framing.advance(&extent.open, appending.bytes)?;
         let offset = extent.end;
         extent.end = offset.plus(length)?;
+        let first_record = extent.records;
+        extent.records += closed;
+        extent.open = open;
         self.appends.push(Append { extent: place, offset, bytes: appending.bytes.to_vec() });
-        Ok(offset)
+        Ok(Landed { offset, first_record, records: closed })
     }
 
     /// Put an append at an offset another instance chose. The offset is given, so
@@ -129,10 +156,21 @@ impl Extents {
         Ok(())
     }
 
-    /// The bytes of an extent, in order. Nothing in a running process reads an
-    /// append back yet — there is no read operation — so for now this is what says
-    /// the appends landed where they were meant to.
-    #[allow(dead_code)]
+    /// One record's content, parsed forward from the start of the extent. There is
+    /// no sparse index yet, so this is the whole extent every time — the index is
+    /// what turns it into one granule read.
+    fn record(&self, sn: u32, id: u64, framing: Framing, record: u64) -> Option<Vec<u8>> {
+        let bytes = self.read(sn, id);
+        framing.records(&bytes).nth(record as usize).map(<[u8]>::to_vec)
+    }
+
+    /// The second an extent here was made in, which is the rest of its name.
+    fn created(&self, sn: u32, id: u64) -> Option<u64> {
+        self.at.get(&(sn, id)).map(|place| self.extents[*place].created)
+    }
+
+    /// The bytes of an extent, in order. Stitched from the appends every time,
+    /// which is what a vector of appends costs and what the journal replaces.
     fn read(&self, sn: u32, id: u64) -> Vec<u8> {
         let Some(place) = self.at.get(&(sn, id)) else { return Vec::new() };
         let mut found: Vec<&Append> =
@@ -145,6 +183,9 @@ impl Extents {
 struct EN {
     config: ENConfig,
     held: Mutex<Extents>,
+    /// Appends whose bytes are in, and whose record is not finished yet. Keyed by
+    /// extent, since a later append to the same extent is what completes it.
+    waiting: Mutex<Waiting>,
     appends: AtomicU64,
     bytes: AtomicU64,
 }
@@ -165,7 +206,8 @@ impl Service for EN {
     }
 
     /// Applying an append is a copy, and issuing the broadcast is a write, so
-    /// neither is worth a queue hop.
+    /// neither is worth a queue hop. A read parses an extent, which is not small,
+    /// so it goes to a worker.
     fn inline(&self, op: Op) -> bool {
         matches!(
             op,
@@ -177,6 +219,7 @@ impl Service for EN {
         match request.op {
             Op::AppendExtent => self.append(process, &request, reply),
             Op::ApplyAppend => reply.send(self.applied(&request)),
+            Op::ReadExtent => reply.send(self.read(&request)),
             _ => reply.send(server::unbuilt(process, SERVES, &request)),
         }
     }
@@ -197,6 +240,7 @@ impl EN {
         EN {
             config,
             held: Mutex::new(Extents::new()),
+            waiting: Mutex::new(HashMap::new()),
             appends: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
         }
@@ -210,20 +254,38 @@ impl EN {
             Ok(parsed) => parsed,
             Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
         };
+        // The framing comes with the append, since the primary is what counts the
+        // records and an instance must not decide that for itself.
+        let (framing, instances) = match middle {
+            [Arg::Number(kind), Arg::Number(width), instances @ ..] => {
+                match Framing::of_wire(*kind, *width) {
+                    Ok(framing) => (framing, instances),
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                }
+            }
+            _ => {
+                return reply.send(Response::error(
+                    Status::BadRequest,
+                    "an append takes a framing and an instance list",
+                ));
+            }
+        };
         let length = appending.bytes.len() as u64;
-        let offset = match self.take(&appending) {
-            Ok(offset) => offset,
+        let landed = match self.take(&appending, framing) {
+            Ok(landed) => landed,
             Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
         };
         reply.about(format_args!(
-            "extent {} of sn {},offset {offset},bytes {length}",
-            appending.extent, appending.sn
+            "extent {} of sn {},offset {},bytes {length},records {}",
+            appending.extent, appending.sn, landed.offset, landed.records
         ));
 
-        // The middle arguments are the instance list. This process is one of them,
-        // and has just applied it, so the rest are who else must hear about it.
+        // This process is one of the instances, and has just applied it, so the
+        // rest are who else must hear about it.
         let mine = process.entry.number();
-        let others: Vec<u32> = middle
+        let others: Vec<u32> = instances
             .iter()
             .filter_map(|arg| match arg {
                 Arg::Number(en) => Some(*en as u32),
@@ -236,16 +298,34 @@ impl EN {
             Arg::Number(appending.sn as u64),
             Arg::Number(appending.extent),
             Arg::Number(appending.created),
-            Arg::Number(offset.number()),
+            Arg::Number(landed.offset.number()),
             Arg::Number(length),
+            Arg::Number(landed.first_record),
+            Arg::Number(landed.records),
         ];
-        let quorum = Arc::new(Quorum::new(others.len(), receipt, reply));
+        // Two gates, and an append passes both or is not durable: a quorum of
+        // instances, and a record that has actually finished.
+        let pending = Arc::new(Pending::new(receipt, reply));
+        match landed.records {
+            0 => self
+                .waiting
+                .lock()
+                .expect("waiting")
+                .entry((appending.sn, appending.extent))
+                .or_default()
+                .push(Arc::clone(&pending)),
+            _ => {
+                pending.records_are_whole();
+                self.finish(appending.sn, appending.extent);
+            }
+        }
+        let quorum = Arc::new(Quorum::new(others.len(), pending));
 
         let apply = Request::new(Op::ApplyAppend)
             .number(appending.sn as u64)
             .number(appending.extent)
             .number(appending.created)
-            .number(offset.number())
+            .number(landed.offset.number())
             .bytes(appending.bytes.to_vec());
         // Issued to all of them before any of them answers: a quorum is straggler
         // tolerance only if the writes go out together.
@@ -261,11 +341,64 @@ impl EN {
         }
     }
 
-    fn take(&self, appending: &Appending) -> Result<COff> {
-        let offset = self.held.lock().expect("extents").take(appending)?;
+    fn take(&self, appending: &Appending, framing: Framing) -> Result<Landed> {
+        let landed = self.held.lock().expect("extents").take(appending, framing)?;
         self.appends.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(appending.bytes.len() as u64, Ordering::Relaxed);
-        Ok(offset)
+        Ok(landed)
+    }
+
+    /// A record closed, so every append still waiting on this extent is waiting on
+    /// nothing: a fragment only ever sits at the end, so anything before the record
+    /// that just closed is inside a whole one.
+    fn finish(&self, sn: u32, extent: u64) {
+        let waiting = self.waiting.lock().expect("waiting").remove(&(sn, extent));
+        for pending in waiting.unwrap_or_default() {
+            pending.records_are_whole();
+        }
+    }
+
+    /// One record of an extent, for a reader that knows which one it wants.
+    fn read(&self, request: &Request) -> Response {
+        let [
+            Arg::Number(sn),
+            Arg::Number(extent),
+            Arg::Number(created),
+            Arg::Number(kind),
+            Arg::Number(width),
+            Arg::Number(record),
+        ] = request.args.as_slice()
+        else {
+            return Response::error(
+                Status::BadRequest,
+                "read-extent takes an SnId, an extent, a second, a framing and a record",
+            );
+        };
+        let framing = match Framing::of_wire(*kind, *width) {
+            Ok(framing) => framing,
+            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+        };
+        let held = self.held.lock().expect("extents");
+        match held.created(*sn as u32, *extent) {
+            None => {
+                Response::error(Status::NotFound, format!("no extent {extent} of sn {sn} here"))
+            }
+            // The second is part of the name, so a reader asking with the wrong one
+            // is asking about an extent that no longer exists rather than this one.
+            Some(second) if second != *created => Response::error(
+                Status::NotFound,
+                format!("extent {extent} of sn {sn} was made in second {second}"),
+            ),
+            Some(_) => match held.record(*sn as u32, *extent, framing, *record) {
+                Some(bytes) => {
+                    Response { id: 0, status: Status::Ok, args: vec![Arg::Bytes(bytes)] }
+                }
+                None => Response::error(
+                    Status::NotFound,
+                    format!("extent {extent} of sn {sn} has no record {record}"),
+                ),
+            },
+        }
     }
 
     /// A secondary's half: the offset came with the request, so there is nothing
@@ -357,47 +490,87 @@ impl Counting {
     }
 }
 
-/// The count, plus the reply it answers when the count settles.
+/// The count, feeding one of the two gates an append has to pass.
 struct Quorum {
     counting: Mutex<Counting>,
-    receipt: Vec<Arg>,
-    reply: Mutex<Option<Reply>>,
+    pending: Arc<Pending>,
 }
 
 impl Quorum {
-    fn new(others: usize, receipt: Vec<Arg>, reply: Reply) -> Quorum {
-        let counting = Counting::new(others);
-        let quorum =
-            Quorum { receipt, counting: Mutex::new(counting), reply: Mutex::new(Some(reply)) };
-        // An append that cannot reach a quorum however well it goes is refused
-        // now rather than after waiting for answers that cannot add up.
+    fn new(others: usize, pending: Arc<Pending>) -> Quorum {
+        let quorum = Quorum { counting: Mutex::new(Counting::new(others)), pending };
+        // An append that cannot reach a quorum however well it goes is refused now
+        // rather than after waiting for answers that cannot add up.
         if !quorum.counting.lock().expect("quorum").possible() {
-            quorum.say(Verdict::Lost);
+            quorum.pending.lost();
         }
         quorum
     }
 
     fn applied(&self, applied: bool) {
-        let verdict = self.counting.lock().expect("quorum").answer(applied);
-        if let Some(verdict) = verdict {
-            self.say(verdict);
+        match self.counting.lock().expect("quorum").answer(applied) {
+            Some(Verdict::Durable) => self.pending.quorum_is_in(),
+            Some(Verdict::Lost) => self.pending.lost(),
+            None => {}
+        }
+    }
+}
+
+/// One append's answer, and the two things it waits for: a quorum of instances,
+/// and a record that has finished. Bytes on three disks are not a record, so an
+/// append that closed none of them is not durable however well the write went.
+struct Pending {
+    gates: Mutex<Gates>,
+    receipt: Vec<Arg>,
+}
+
+struct Gates {
+    quorum: bool,
+    whole: bool,
+    reply: Option<Reply>,
+}
+
+impl Pending {
+    fn new(receipt: Vec<Arg>, reply: Reply) -> Pending {
+        Pending {
+            gates: Mutex::new(Gates { quorum: false, whole: false, reply: Some(reply) }),
+            receipt,
         }
     }
 
-    fn say(&self, verdict: Verdict) {
-        let Some(reply) = self.reply.lock().expect("quorum").take() else { return };
-        match verdict {
-            Verdict::Durable => {
-                reply.send(Response { id: 0, status: Status::Ok, args: self.receipt.clone() })
-            }
-            Verdict::Lost => reply.send(Response::error(
+    fn quorum_is_in(&self) {
+        let mut gates = self.gates.lock().expect("pending");
+        gates.quorum = true;
+        self.settle(&mut gates);
+    }
+
+    fn records_are_whole(&self) {
+        let mut gates = self.gates.lock().expect("pending");
+        gates.whole = true;
+        self.settle(&mut gates);
+    }
+
+    fn settle(&self, gates: &mut Gates) {
+        if !(gates.quorum && gates.whole) {
+            return;
+        }
+        if let Some(reply) = gates.reply.take() {
+            reply.send(Response { id: 0, status: Status::Ok, args: self.receipt.clone() });
+        }
+    }
+
+    /// A quorum that cannot be reached, which no amount of waiting fixes.
+    fn lost(&self) {
+        let mut gates = self.gates.lock().expect("pending");
+        if let Some(reply) = gates.reply.take() {
+            reply.send(Response::error(
                 Status::Internal,
                 format!(
                     "fewer than {} of {} instances applied it",
                     common::QUORUM,
                     common::INSTANCES
                 ),
-            )),
+            ));
         }
     }
 }
@@ -416,29 +589,40 @@ mod tests {
     use super::*;
     use common::testing;
 
+    const LF: Framing = Framing::Lf;
+
     fn appending<'a>(sn: u32, extent: u64, bytes: &'a [u8]) -> Appending<'a> {
         Appending { sn, extent, created: 1_000_000, bytes }
+    }
+
+    /// One whole record, which is what the client always sends.
+    fn line(text: &str) -> Vec<u8> {
+        format!("{text}\n").into_bytes()
+    }
+
+    fn append(en: &EN, extent: u64, bytes: &[u8]) -> Landed {
+        en.take(&appending(0, extent, bytes), LF).expect("an append")
     }
 
     /// Offsets are handed out in order, each one where the last append ended.
     #[test]
     fn offsets_follow_one_another() {
         let en = EN::new(testing::en_config());
-        assert_eq!(en.take(&appending(0, 1, b"hello")).unwrap(), COff::new(0));
-        assert_eq!(en.take(&appending(0, 1, b" there")).unwrap(), COff::new(5));
-        assert_eq!(en.take(&appending(0, 1, b"!")).unwrap(), COff::new(11));
-        assert_eq!(en.held.lock().unwrap().read(0, 1), b"hello there!");
+        assert_eq!(append(&en, 1, &line("hello")).offset, COff::new(0));
+        assert_eq!(append(&en, 1, &line("there")).offset, COff::new(6));
+        assert_eq!(append(&en, 1, &line("!")).offset, COff::new(12));
+        assert_eq!(en.held.lock().unwrap().read(0, 1), b"hello\nthere\n!\n");
     }
 
     /// Two extents are two byte streams, whatever order the appends arrive in.
     #[test]
     fn extents_do_not_share_offsets() {
         let en = EN::new(testing::en_config());
-        assert_eq!(en.take(&appending(0, 1, b"one")).unwrap(), COff::new(0));
-        assert_eq!(en.take(&appending(0, 2, b"two")).unwrap(), COff::new(0));
-        assert_eq!(en.take(&appending(0, 1, b"more")).unwrap(), COff::new(3));
-        assert_eq!(en.held.lock().unwrap().read(0, 1), b"onemore");
-        assert_eq!(en.held.lock().unwrap().read(0, 2), b"two");
+        assert_eq!(append(&en, 1, &line("one")).offset, COff::new(0));
+        assert_eq!(append(&en, 2, &line("two")).offset, COff::new(0));
+        assert_eq!(append(&en, 1, &line("more")).offset, COff::new(4));
+        assert_eq!(en.held.lock().unwrap().read(0, 1), b"one\nmore\n");
+        assert_eq!(en.held.lock().unwrap().read(0, 2), b"two\n");
     }
 
     /// The same extent id from two SNs is two extents: an id is a name only
@@ -446,8 +630,8 @@ mod tests {
     #[test]
     fn an_extent_is_named_by_its_sn_too() {
         let en = EN::new(testing::en_config());
-        assert_eq!(en.take(&appending(0, 1, b"from sn0")).unwrap(), COff::new(0));
-        assert_eq!(en.take(&appending(1, 1, b"from sn1")).unwrap(), COff::new(0));
+        en.take(&appending(0, 1, &line("from sn0")), LF).unwrap();
+        en.take(&appending(1, 1, &line("from sn1")), LF).unwrap();
         assert_eq!(en.held.lock().unwrap().extents.len(), 2);
     }
 
@@ -456,10 +640,46 @@ mod tests {
     #[test]
     fn a_second_that_disagrees_is_refused() {
         let en = EN::new(testing::en_config());
-        en.take(&appending(0, 1, b"first")).unwrap();
-        let later = Appending { sn: 0, extent: 1, created: 1_000_001, bytes: b"second" };
-        assert!(en.take(&later).is_err());
-        assert_eq!(en.held.lock().unwrap().read(0, 1), b"first");
+        append(&en, 1, &line("first"));
+        let later = Appending { sn: 0, extent: 1, created: 1_000_001, bytes: &line("second") };
+        assert!(en.take(&later, LF).is_err());
+        assert_eq!(en.held.lock().unwrap().read(0, 1), b"first\n");
+    }
+
+    /// Records are numbered from zero within an extent, and an append is told which
+    /// ones it closed.
+    #[test]
+    fn an_append_is_told_the_records_it_closed() {
+        let en = EN::new(testing::en_config());
+        let first = append(&en, 1, &line("one"));
+        assert_eq!((first.first_record, first.records), (0, 1));
+        let pair = append(&en, 1, b"two\nthree\n");
+        assert_eq!((pair.first_record, pair.records), (1, 2));
+        assert_eq!(en.held.lock().unwrap().extents[0].records, 3);
+    }
+
+    /// A record may span appends: the block that starts it closes nothing, and the
+    /// block that finishes it gets the number.
+    #[test]
+    fn a_record_spanning_appends_is_numbered_by_the_append_that_closes_it() {
+        let en = EN::new(testing::en_config());
+        let opened = append(&en, 1, b"half a rec");
+        assert_eq!(opened.records, 0, "nothing is closed yet");
+        let closed = append(&en, 1, b"ord\n");
+        assert_eq!((closed.first_record, closed.records), (0, 1));
+        let held = en.held.lock().unwrap();
+        assert_eq!(held.record(0, 1, LF, 0).unwrap(), b"half a record");
+        assert_eq!(held.extents[0].records, 1);
+    }
+
+    /// A block may not close records and then end inside another: that is what
+    /// keeps a seal from ever having to cut one in half.
+    #[test]
+    fn a_block_that_closes_a_record_may_not_end_inside_another() {
+        let en = EN::new(testing::en_config());
+        assert!(en.take(&appending(0, 1, b"one\ntw"), LF).is_err());
+        // And the refusal left the extent alone.
+        assert!(en.held.lock().unwrap().read(0, 1).is_empty());
     }
 
     /// A secondary puts the append where the primary said, and does not choose.
@@ -512,22 +732,52 @@ mod tests {
         assert_eq!(en.applied(&request).status, Status::BadRequest);
     }
 
-    /// The instance list is what is between the name and the bytes, and the bytes
-    /// are not one of it.
+    /// A read asks for one record by number, and gets its content without the
+    /// terminator that found it.
     #[test]
-    fn the_instances_are_the_arguments_between_the_name_and_the_bytes() {
-        let request = Request::new(Op::AppendExtent)
-            .number(0)
-            .number(7)
-            .number(1_000_000)
-            .number(2)
-            .number(3)
-            .number(1)
-            .bytes(b"body".to_vec());
-        let (appending, middle) = Appending::of(&request.args).unwrap();
-        assert_eq!((appending.sn, appending.extent, appending.created), (0, 7, 1_000_000));
-        assert_eq!(appending.bytes, b"body");
-        assert_eq!(middle.len(), 3);
+    fn a_read_returns_one_record() {
+        let en = EN::new(testing::en_config());
+        append(&en, 1, b"one\ntwo\nthree\n");
+        let (kind, width) = LF.wire();
+        let read = |record: u64| {
+            en.read(
+                &Request::new(Op::ReadExtent)
+                    .number(0)
+                    .number(1)
+                    .number(1_000_000)
+                    .number(kind)
+                    .number(width)
+                    .number(record),
+            )
+        };
+        assert_eq!(read(0).args, vec![Arg::Bytes(b"one".to_vec())]);
+        assert_eq!(read(2).args, vec![Arg::Bytes(b"three".to_vec())]);
+        // Past the end is not found rather than empty.
+        assert_eq!(read(3).status, Status::NotFound);
+    }
+
+    /// An extent nobody here holds, and one whose second disagrees, are both
+    /// answered the same way: that extent is not here.
+    #[test]
+    fn a_read_of_the_wrong_extent_is_not_found() {
+        let en = EN::new(testing::en_config());
+        append(&en, 1, &line("only"));
+        let (kind, width) = LF.wire();
+        let read = |extent: u64, created: u64| {
+            en.read(
+                &Request::new(Op::ReadExtent)
+                    .number(0)
+                    .number(extent)
+                    .number(created)
+                    .number(kind)
+                    .number(width)
+                    .number(0),
+            )
+            .status
+        };
+        assert_eq!(read(1, 1_000_000), Status::Ok);
+        assert_eq!(read(2, 1_000_000), Status::NotFound, "no such extent");
+        assert_eq!(read(1, 1_000_001), Status::NotFound, "a rewritten extent is a new one");
     }
 
     /// Three of four, so two of the three secondaries settle it and the third's
