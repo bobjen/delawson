@@ -6670,33 +6670,54 @@ not a surprise.
 #### 9.1.3.3 The first round of discovery is the directory listing
 
 **A query over many objects will usually be preceded by a directory listing from the DN, and that
-listing is the first round of discovery** (Asserted, Bob, 2026-08-17). It can **estimate** the number
-of streams, extents and records in each object — so a caller planning work over a directory learns the
-shape of all of it in one answer, before asking about any object in particular.
+listing is where the first round of discovery would naturally happen** (Asserted, Bob, 2026-08-17) —
+so a caller planning work over a directory could learn the shape of all of it in one answer, before
+asking about any object in particular.
 
-⚠️ **The accuracies differ, and which number a caller may rely on follows from where it lives:**
+**If the numbers are there to give.** The accuracies would differ by where each lives:
 
-| From the DN's listing | Accuracy | Because |
+| From a listing | Accuracy | Because |
 |---|---|---|
 | streams per object | **exact** | the DN allocates them, so it owns the count (§17.12) |
 | extents per stream | **stale** | extents are the SN's, learned lazily (§8.1.3, §4.5) |
-| records per stream | **stale** | same, and for the same reason |
+| records or bytes per stream | **stale** | same, and for the same reason |
 
-**And stale is the right accuracy for what it is used for.** Partitioning work across vertices needs
+**Stale would be the right accuracy for what it is for.** Partitioning work across vertices needs
 sizes to within a factor, not to the byte: a scheduler balancing 10,000 objects does not care that one
-of them has grown by three extents since the summary was written. Demanding exactness here would put
-§13.1's sync loops on the critical path of every job that plans — which is precisely the coupling that
-lazy summaries exist to avoid.
+has grown by three extents since the summary was written. Demanding exactness would put §13.1's sync
+loops on the critical path of every job that plans, which is the coupling lazy summaries exist to
+avoid.
+
+⚠️ **But whether a DN should hold those counts at all is undecided** (Asserted, Bob, 2026-08-17):
+**it is extra metadata, and metadata that changes.** The objection is sharper than it sounds, because
+it is three objections:
+
+- **It costs space per object**, on the one tier whose object count is unbounded (§14.2). Per-object
+  bytes are the scarce thing there in a way they are not anywhere else.
+- **It has to be maintained**, so a growing object eventually dirties its DN summary — which puts
+  metadata writes on the DN in proportion to appends, and keeping the DN out of the write path is
+  most of what §8.1.3 is for.
+- **Stale *and* maintained is the worst pair**: paying to keep something that still cannot be
+  trusted, which invites callers to trust it anyway.
+
+So the question is not "how stale may it be" but "where should such a summary live at all", and the
+promising answer is somewhere that is already stale by construction: **§13.5's metadata snapshots**.
+The billing job (§12.8) already computes byte totals over them daily, so the numbers exist without
+anybody maintaining a live copy, and a planner reading a snapshot gets estimates whose staleness is
+stated rather than implied. A job planning over a directory is exactly the kind of caller that can
+afford to read a snapshot; a point lookup is not, and does not need to (#66).
 
 So the discovery has three rounds and each is cheaper than it looks:
 
-1. **The listing**, once, giving estimates for every object in a directory.
+1. **Estimates for a whole directory**, once, from wherever they live.
 2. **A lookup per object it decides to read**, giving exact counts and the first range of extents
-   (§9.1.3.2) — all of these in flight at once, since the listing said how many to expect.
+   (§9.1.3.2) — all of these in flight at once, since step 1 said how many to expect.
 3. **The ranges**, computed by arithmetic from the exact counts, also all at once.
 
 **Nothing in that chain waits on a number it could have estimated**, which is the property worth
-keeping when any of it is implemented.
+keeping when any of it is implemented. Note that step 1 is the only one whose *home* is in doubt: steps
+2 and 3 are answered by the tiers that own the data, and their counts are exact because they are asked
+of whoever maintains them.
 
 **Two consequences worth noting before it is built:**
 
