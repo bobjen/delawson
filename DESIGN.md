@@ -249,6 +249,7 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | frame → **compress → encrypt** → replicate → seal → erasure-code. Both orderings are forced | §7 |
 | Compression and encryption are **block-granular** at the index granule; the index points at **physical** offsets | §7.1, §9.3 |
 | Keys: **daily master keys in KS only**, daily SN-master keys cached on ENs, extent keys derived. ~1 MB per century | §7.3 |
+| **The EN does the on-disk crypto** — derives and caches a key per extent, encrypts and decrypts stored data, re-encrypts for the wire. Wire encryption is a self-contained layer the rest of the design ignores | §7.3.5, §17.5a |
 | KS is unlocked by **operator secrets plus hardware** — the only step needing people | §7.3.2 |
 | Index granularity is `latency × bandwidth / 2` — **1 MB HDD, 20 KB SSD**, in *physical* bytes | §7.1.1 |
 | Compression improves **HDD** read bandwidth and degrades **NVMe** read bandwidth; it is mandatory regardless | §7.1.2 |
@@ -4563,12 +4564,35 @@ reaching user code (§1.5) — not on separate key material. That is a coherent
 position, but it forecloses customer-supplied keys and weakens any "we cannot read
 your data" claim, so it interacts directly with §5.9.2.
 
-⚠️ **Where each pipeline stage runs is now a security question, not just a
-performance one.** §7 fixes the *order* — compress, then encrypt, then encode — but
-ENs caching keys implies the ENs are doing encryption or decryption, which in turn
-implies plaintext crosses the network to reach them. If instead FE or the client
-encrypted, ENs would need no keys at all. Which machine performs which stage is
-undecided and determines where plaintext exists.
+#### 7.3.5 Settled: the EN does the on-disk crypto, and the wire is a separate layer
+
+An earlier draft left this open — "which machine performs which stage is undecided and
+determines where plaintext exists". It is decided (Asserted, Bob, 2026-08-17):
+
+- **The EN derives and caches the on-disk encryption key for each extent**, from the
+  daily SN-master key it holds and the extent's own name (§7.3.3), and **it does the
+  encryption and decryption of on-disk data.** Nothing above it needs a disk key, ever.
+- **It re-encrypts what it sends over the wire**, so a block leaving an EN is protected
+  by the wire layer rather than by the key it was stored under.
+- **Wire encryption is self-contained and ignorable by the rest of the design**
+  (Asserted, Bob, 2026-08-17). It protects a hop and nothing else depends on it — which
+  is why §17.5a can settle its own questions (per-segment sealing, nonce discipline,
+  batch boundaries) without any of them reaching this section.
+
+**Two keyed layers, doing different jobs**, and the important part is that they meet only
+inside an EN:
+
+| Layer | Key | Protects | Terminates at |
+|---|---|---|---|
+| **On disk** | derived per extent, cached by the EN | data at rest, for as long as it is stored | the EN, both directions |
+| **On the wire** | per connection (§17.5a) | one hop, for the length of that hop | each end of each hop |
+
+⚠️ **So compressed user data is visible at every hop that terminates a wire segment**,
+which is the FE as well as the EN. That is what the earlier warning was about and it has
+not gone away: **compression is not confidentiality.** What is now settled is narrower and
+still worth having — *disk* keys live only on ENs, so a machine that is not an EN cannot
+read stored data even if it holds bytes, and an EN's exposure is bounded to the days and
+SNs whose keys it caches (§7.3.1).
 
 ---
 
@@ -6441,12 +6465,16 @@ And the capability question settles the same way: **the client compresses** (§8
 client has the codec and can decompress what comes back. So the answer is the strong one —
 **the client checks its own CRC** — and it holds all the way down.
 
-**One dividend worth naming, because it is not obvious.** If the client compresses going in and
-decompresses coming out, then on the read path **the FE never holds plaintext either**: it
-authorizes, it finds the blocks, and it passes bytes it cannot read. That removes the security
-asymmetry §9.6.1 weighs — an FE cache of blocks would add no new plaintext location, just as an
-EN cache does not — and it means neither middle tier spends CPU on compression in either
-direction.
+**One dividend, and it is smaller than it first looks.** If the client compresses going in and
+decompresses coming out, then **no tier in the middle spends CPU on compression in either
+direction**, and no tier above an EN ever needs a *disk* key (§7.3.5).
+
+⚠️ **It does not follow that the FE holds nothing readable.** An FE terminates a wire segment,
+so it sees the user's compressed bytes, and **compression is not confidentiality** — anybody
+holding a compressed block can decompress it. So the honest statement is that the read path
+makes the FE hold no more than the write path already does, not that it holds nothing. §9.6.1's
+cache asymmetry is therefore narrower than an earlier version of this section claimed: an FE
+cache of blocks adds no *new* kind of exposure, which is not the same as adding none.
 
 ⚠️ **"Any instance" holds for a sealed extent, and not for an unsealed one — and the reason is
 the watermark, not the data** (Asserted, Bob, 2026-08-17). Below the durable length every instance
