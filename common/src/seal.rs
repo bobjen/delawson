@@ -203,6 +203,7 @@ mod tests {
             compress,
             compress_min: 64,
             compress_sample: 4096,
+            peer_conns: 2,
             key: "000102030405060708090a0b0c0d0e0f".to_string(),
         }
     }
@@ -324,6 +325,7 @@ mod sampling {
             compress: Compress::Lz4,
             compress_min: 64,
             compress_sample: sample,
+            peer_conns: 2,
             key: "000102030405060708090a0b0c0d0e0f".to_string(),
         }
     }

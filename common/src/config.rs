@@ -172,6 +172,11 @@ pub struct Messaging {
     /// Compress this many bytes of a large batch first, and give up on the rest
     /// if that much did not shrink. Zero always compresses the whole batch.
     pub compress_sample: usize,
+    /// Connections a process keeps to each process it talks to. One is a
+    /// bottleneck: the far side reads one connection with one thread, so a
+    /// forwarding tier cannot outrun a single read loop however many workers it
+    /// has.
+    pub peer_conns: usize,
     /// ⚠️ A pre-shared key, in hex, which is a stand-in until KS hands out
     /// message keys. Everything in a cluster shares it, so it is a test key and
     /// nothing else.
@@ -287,6 +292,14 @@ pub struct ClusterConfig {
 }
 
 pub const SCHEMA_VERSION: u32 = 1;
+
+impl ServiceEntry {
+    /// The number in the identity, which is this process's id among its kind:
+    /// the `DnId` a stream is named by, the `SnId` an extent is named by.
+    pub fn number(&self) -> u32 {
+        self.identity.trim_start_matches(|c: char| !c.is_ascii_digit()).parse().unwrap_or(0)
+    }
+}
 
 impl ClusterConfig {
     pub fn load(path: &Path) -> Result<ClusterConfig> {
@@ -554,7 +567,7 @@ mod tests {
         ks = { address = "127.0.0.1:9601", port_base = 9602 }
         failure_domains = { levels = ["rack", "machine"] }
         rings = { members = 1 }
-        messaging = { send = "direct", encrypt = false, compress = "none", compress_min = 256, compress_sample = 4096, key = "0f1e2d3c4b5a69788796a5b4c3d2e1f0" }
+        messaging = { send = "direct", encrypt = false, compress = "none", compress_min = 256, compress_sample = 4096, peer_conns = 2, key = "0f1e2d3c4b5a69788796a5b4c3d2e1f0" }
         timeouts = { request_ms = 1000, shutdown_grace_ms = 1000 }
         logging = { level = "info", size = 1024, full_files = 2, info_files = 2, info_share = 0.1, recount = 16 }
     "#;

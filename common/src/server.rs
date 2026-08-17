@@ -23,6 +23,12 @@
 //! Neither waits for anything, so neither adds latency: both send at the moment
 //! the alternative would have been to block.
 //!
+//! **A request that has to wait on another process does not hold a worker.** A
+//! handler is given a `Reply` it may keep: it asks the process it needs, hands the
+//! `Reply` to the answer, and returns. The waiting is a table entry, not a thread,
+//! which is what makes a forwarding tier cost a forward rather than a thread per
+//! request in flight.
+//!
 //! Where an answer is computed is per message type, and the trade is real:
 //! handing a request to a worker costs a queue hop and a wakeup, while answering
 //! it on the read loop stalls the next read for as long as it takes. A ping is
@@ -35,7 +41,8 @@
 //! that is. Stopping is a request, not a signal, so a process with state to flush
 //! gets the chance; a signal is the fallback.
 
-use crate::config::{ClusterConfig, Messaging, ProcessConfig, SendMode, ServiceEntry};
+use crate::config::{ClusterConfig, Messaging, ProcessConfig, SendMode, ServiceEntry, ServiceKind};
+use crate::peer::Peers;
 use crate::random::Rng;
 use crate::registry::Peer;
 use crate::wire::{
@@ -66,6 +73,10 @@ pub struct Process {
     pub entry: ServiceEntry,
     pub run_dir: PathBuf,
     pub started: Instant,
+    /// Connections to the other processes this one talks to.
+    peers: Peers,
+    /// Where round-robin over a kind has got to.
+    turn: AtomicU64,
     stopping: AtomicBool,
     /// Requests answered, so a client's throughput claim can be checked against
     /// what the server thinks it did.
@@ -77,7 +88,7 @@ pub struct Process {
 /// What a machine type adds to the common lifecycle. A new type needs `serves`
 /// and nothing else; everything below has an answer that is right until that type
 /// has something of its own to say.
-pub trait Service: Send + Sync + 'static {
+pub trait Service: Send + Sync + Sized + 'static {
     /// The operations this machine type is the right place to send. Anything
     /// here that is not built yet answers `unimplemented`; anything else answers
     /// `bad request`, so a misdirected call is distinguishable from an unbuilt
@@ -86,9 +97,25 @@ pub trait Service: Send + Sync + 'static {
         &[]
     }
 
-    /// Everything but the control operations, which are answered here.
-    fn handle(&self, process: &Process, request: &Request) -> Response {
+    /// Everything but the control operations, which are answered here. The
+    /// default is for a type that answers on the spot; override `handle` to
+    /// answer later.
+    fn answer(&self, process: &Process, request: &Request) -> Response {
         unbuilt(process, self.serves(), request)
+    }
+
+    /// Answer, now or later. Whoever takes the `Reply` owes exactly one answer,
+    /// whenever it has one — taking `Arc<Self>` so a handler can carry itself into
+    /// the answer it is waiting for.
+    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Request, reply: Reply) {
+        reply.send(self.answer(process, &request));
+    }
+
+    /// Operations whose answer comes later, from another thread. The connection
+    /// they arrive on is put on a batching sender, since the read loop will not
+    /// be the one to send them.
+    fn defers(&self, _op: Op) -> bool {
+        false
     }
 
     /// Threads answering requests off the read loop. Zero means one per core.
@@ -136,7 +163,13 @@ impl Process {
         std::fs::create_dir_all(&config.data_dir).context(config.data_dir.display())?;
         let run_dir = process_config.parent().unwrap_or(Path::new(".")).to_path_buf();
         crate::log::open(&run_dir.join("logs"), &config.identity, cluster.logging.build()?)?;
+        let peers = Peers::new(
+            cluster.messaging.clone(),
+            Duration::from_millis(cluster.timeouts.request_ms),
+        );
         Ok(Process {
+            peers,
+            turn: AtomicU64::new(0),
             config,
             cluster,
             entry,
@@ -176,6 +209,36 @@ impl Process {
             },
             status => Err(Error::new(format!("KS answered {status} for {identity}"))),
         }
+    }
+
+    /// Ask another process something and say what to do with the answer, holding
+    /// nothing in the meantime. This is what a request being served uses.
+    pub fn ask(
+        &self,
+        identity: &str,
+        request: &Request,
+        then: impl FnOnce(Response) + Send + 'static,
+    ) -> Result<()> {
+        let peer = self.peers.get(identity, || self.peer(identity))?;
+        peer.ask(request, then)
+    }
+
+    /// Ask and wait, for a startup path with nothing else to get on with.
+    pub fn call(&self, identity: &str, request: &Request) -> Result<Response> {
+        let peer = self.peers.get(identity, || self.peer(identity))?;
+        peer.call(request)
+    }
+
+    /// The next process of a kind, taken in turn. Round robin is not placement —
+    /// it spreads without regard to fullness or failure domains — but it is
+    /// honest striping until there is a placement solver to ask.
+    pub fn pick(&self, kind: ServiceKind) -> Result<&str> {
+        let of_kind: Vec<&ServiceEntry> = self.cluster.services_of_kind(kind).collect();
+        if of_kind.is_empty() {
+            return Err(Error::new(format!("no {} in the roster", kind.as_str().to_uppercase())));
+        }
+        let turn = self.turn.fetch_add(1, Ordering::Relaxed) as usize;
+        Ok(&of_kind[turn % of_kind.len()].identity)
     }
 
     pub fn timeout(&self) -> Duration {
@@ -272,6 +335,16 @@ pub fn unbuilt(process: &Process, serves: &[Op], request: &Request) -> Response 
     }
 }
 
+/// This process's resident memory, which is what says whether a benchmark's
+/// objects still fit in cache or in RAM.
+pub fn rss() -> u64 {
+    let pages = std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|statm| statm.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .unwrap_or(0);
+    pages * 4096
+}
+
 fn cores() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
 }
@@ -347,24 +420,52 @@ fn read_loop<S: Service>(
             out.close();
             return Ok(());
         };
-        if service.inline(request.op) {
-            // Nothing more in hand means the next read would block, so send.
-            let settled = !input.more();
-            reply(process, &**service, &out, request, settled);
-            continue;
-        }
-        // A worker cannot see what else has arrived, so it would have to send its
-        // own answer. Hand the connection to a sender instead, once, here — the
-        // read loop is the only thread that switches and nothing is in flight yet.
-        if policy == SendMode::Adaptive && out.batch.get().is_none() {
+        // An answer that will come from another thread cannot be flushed by this
+        // one, so the connection goes onto a sender first — the same reason a
+        // pooled answer does.
+        let deferred = service.defers(request.op);
+        if (deferred || !service.inline(request.op))
+            && policy == SendMode::Adaptive
+            && out.batch.get().is_none()
+        {
             out.hand_to_sender();
-            logn!("switched to a batching sender: an answer left the read loop");
+            logn!("switched to a batching sender: an answer will not come from the read loop");
             process.senders.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if service.inline(request.op) {
+            // Nothing more in hand means the next read would block, so send. A
+            // deferred answer is sent whenever it arrives, which is always a
+            // moment this loop knows nothing about.
+            let settled = deferred || !input.more();
+            answer_here(process, service, &out, request, settled);
+            continue;
         }
         let process = Arc::clone(process);
         let service = Arc::clone(service);
         let out = Arc::clone(&out);
-        pool.run(move || reply(&process, &*service, &out, request, true));
+        pool.run(move || answer_here(&process, &service, &out, request, true));
+    }
+}
+
+/// The right to answer one request, once. It may be carried to another thread and
+/// answered when that thread has something to say, which is how a request waits
+/// without holding a worker.
+pub struct Reply {
+    out: Arc<Out>,
+    id: u32,
+    op: Op,
+    /// Whether the caller knows nothing more is in hand, so a direct writer
+    /// should send what it has.
+    settled: bool,
+}
+
+impl Reply {
+    pub fn send(self, response: Response) {
+        let response = Response { id: self.id, ..response };
+        if let Err(e) = self.out.put(&response, self.settled) {
+            logw!("could not answer {}: {e}", self.op);
+        }
     }
 }
 
@@ -506,23 +607,25 @@ impl Out {
     }
 }
 
-fn reply(process: &Process, service: &impl Service, out: &Out, request: Request, settled: bool) {
-    let response = answer(process, service, &request).to(&request);
+/// Answer one request, or hand the answering to whoever the service asks. Pooled
+/// work sends for itself, since it finishes at a moment the read loop knows
+/// nothing about; inline work leaves that to the read loop, which knows whether
+/// more requests are already in hand.
+fn answer_here<S: Service>(
+    process: &Arc<Process>,
+    service: &Arc<S>,
+    out: &Arc<Out>,
+    request: Request,
+    settled: bool,
+) {
     process.answered.fetch_add(1, Ordering::Relaxed);
-    if let Err(e) = out.put(&response, settled) {
-        logw!("could not answer {}: {e}", request.op);
-    }
-    if request.op == Op::Shutdown {
-        logn!("shutdown requested");
-        process.stop_soon();
-    }
-}
-
-fn answer(process: &Process, service: &impl Service, request: &Request) -> Response {
-    match request.op {
-        Op::Ping => ping(process, request),
-        Op::Status => Response::text(status(process, service)),
-        Op::Histogram => Response::text(
+    let op = request.op;
+    let reply = Reply { out: Arc::clone(out), id: request.id, op, settled };
+    match op {
+        Op::Ping => reply.send(ping(process, &request)),
+        Op::Status => reply.send(Response::text(status(process, &**service))),
+        Op::Shutdown => reply.send(Response::ok()),
+        Op::Histogram => reply.send(Response::text(
             crate::log::histogram()
                 .iter()
                 .map(|(count, stride, where_)| {
@@ -532,9 +635,12 @@ fn answer(process: &Process, service: &impl Service, request: &Request) -> Respo
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
-        ),
-        Op::Shutdown => Response::ok(),
-        _ => service.handle(process, request),
+        )),
+        _ => service.handle(process, request, reply),
+    }
+    if op == Op::Shutdown {
+        logn!("shutdown requested");
+        process.stop_soon();
     }
 }
 
@@ -606,6 +712,7 @@ fn status(process: &Process, service: &impl Service) -> String {
         format!("workers {}", if service.workers() == 0 { cores() } else { service.workers() }),
         format!("uptime_seconds {}", process.started.elapsed().as_secs()),
         format!("answered {}", process.answered.load(Ordering::Relaxed)),
+        format!("rss_bytes {}", rss()),
         format!("send {:?}", process.cluster.messaging.send),
         {
             let (plain, wire) = crate::seal::totals();

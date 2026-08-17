@@ -4,7 +4,7 @@
 //! lifecycle, a registration, and a ping.
 
 use common::config::ENConfig;
-use common::server::{self, Process, Service};
+use common::server::{self, Service};
 use common::wire::Op;
 
 const SERVES: &[Op] = &[];

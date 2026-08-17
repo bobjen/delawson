@@ -15,6 +15,7 @@ use common::placement;
 use common::random::Rng;
 use common::wire::{Arg, Op, Request, Response, Status};
 use common::{Error, Result};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -168,6 +169,44 @@ enum Cmd {
         #[arg(long)]
         seconds: Option<u64>,
     },
+    /// What an object is: id, stream, SN, when it was made, flavour.
+    ObjectInfo { path: String },
+    /// Create many objects, and time it. Paths are `<prefix><n>`.
+    BenchCreate {
+        #[arg(long, default_value_t = 1_000_000)]
+        objects: u64,
+        /// Objects per request. One is a create apiece; more is a batch.
+        #[arg(long, default_value_t = 1000)]
+        batch: usize,
+        #[arg(long, default_value_t = 8)]
+        clients: usize,
+        /// Requests in flight per client.
+        #[arg(long, default_value_t = 8)]
+        depth: usize,
+        #[arg(long, default_value = "/bench/")]
+        prefix: String,
+        #[arg(long, value_enum, default_value_t = Flavor::Unkeyed)]
+        flavor: Flavor,
+    },
+    /// Look objects up at random, and time it. Run after bench-create with the
+    /// same count and prefix.
+    BenchInfo {
+        /// How many objects exist to be looked up.
+        #[arg(long, default_value_t = 1_000_000)]
+        objects: u64,
+        /// Names per request. One is `object-info`; more is `batch-object-info`.
+        #[arg(long, default_value_t = 1)]
+        batch: usize,
+        #[arg(long, default_value_t = 8)]
+        clients: usize,
+        #[arg(long, default_value_t = 8)]
+        depth: usize,
+        #[arg(long, default_value_t = 5)]
+        seconds: u64,
+        #[arg(long, default_value = "/bench/")]
+        prefix: String,
+    },
+
     /// A second name for an object, sharing its bytes.
     Clone { src: String, dst: String },
     /// One object from several, in order.
@@ -427,6 +466,34 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::BenchCreate { objects, batch, clients, depth, prefix, flavor } => {
+            let target = resolve(&cluster, &cli, ServiceKind::Fe)?;
+            let plan = Objects {
+                objects: *objects,
+                batch: *batch,
+                clients: *clients,
+                depth: *depth,
+                prefix: prefix.clone(),
+                keyed: *flavor == Flavor::Keyed,
+                seconds: 0,
+                timeout,
+            };
+            bench_create(&target, &plan, &cluster.messaging)
+        }
+        Cmd::BenchInfo { objects, batch, clients, depth, seconds, prefix } => {
+            let target = resolve(&cluster, &cli, ServiceKind::Fe)?;
+            let plan = Objects {
+                objects: *objects,
+                batch: *batch,
+                clients: *clients,
+                depth: *depth,
+                prefix: prefix.clone(),
+                keyed: false,
+                seconds: *seconds,
+                timeout,
+            };
+            bench_info(&target, &plan, &cluster.messaging)
+        }
         cmd => {
             let request = build(cmd)?;
             let target = resolve(&cluster, &cli, serves(cmd))?;
@@ -573,6 +640,192 @@ fn bench(target: &Target, plan: &Bench, messaging: &Messaging) -> Result<()> {
     Ok(())
 }
 
+struct Objects {
+    objects: u64,
+    batch: usize,
+    clients: usize,
+    depth: usize,
+    prefix: String,
+    keyed: bool,
+    seconds: u64,
+    timeout: Duration,
+}
+
+/// Create `objects` objects, sharing them out among the clients, each keeping
+/// `depth` requests in flight.
+fn bench_create(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<()> {
+    if plan.batch == 0 || plan.clients == 0 || plan.depth == 0 {
+        return Err(Error::new("--batch, --clients and --depth must all be positive"));
+    }
+    let addr = target.address;
+    let shared = Arc::new(messaging.clone());
+    let batches = plan.objects.div_ceil(plan.batch as u64);
+    let start = std::time::Instant::now();
+
+    let threads: Vec<_> = (0..plan.clients)
+        .map(|client| {
+            let (messaging, prefix) = (Arc::clone(&shared), plan.prefix.clone());
+            let (batch, depth, keyed, timeout) = (plan.batch, plan.depth, plan.keyed, plan.timeout);
+            let mine: Vec<u64> = ((client as u64)..batches).step_by(plan.clients).collect();
+            std::thread::spawn(move || -> Result<(u64, Tally)> {
+                let mut conn = Conn::open(addr, timeout, &messaging)?;
+                let mut tally = Tally::new();
+                let mut made = 0;
+                let mut sent: HashMap<u32, std::time::Instant> = HashMap::new();
+                let mut at = 0;
+                loop {
+                    while sent.len() < depth && at < mine.len() {
+                        let first = mine[at] * batch as u64;
+                        at += 1;
+                        let mut request = if batch == 1 {
+                            Request::new(Op::CreateObject)
+                        } else {
+                            Request::new(Op::BatchCreate)
+                        };
+                        for n in first..first + batch as u64 {
+                            request = request.text(format!("{prefix}{n}")).flag(keyed);
+                        }
+                        let id = conn.send(&request)?;
+                        sent.insert(id, std::time::Instant::now());
+                    }
+                    if sent.is_empty() {
+                        break;
+                    }
+                    conn.flush()?;
+                    let answer = conn.recv()?;
+                    if answer.status != Status::Ok {
+                        return Err(Error::new(format!(
+                            "create answered {}: {}",
+                            answer.status,
+                            answer.message().unwrap_or("")
+                        )));
+                    }
+                    match sent.remove(&answer.id) {
+                        Some(at) => tally.add(at.elapsed()),
+                        None => return Err(Error::new("unasked answer")),
+                    }
+                    made += match answer.args.first() {
+                        Some(Arg::Number(made)) => *made,
+                        _ => 1,
+                    };
+                }
+                Ok((made, tally))
+            })
+        })
+        .collect();
+
+    let mut total = Tally::new();
+    let mut made = 0;
+    for thread in threads {
+        let (mine, tally) = thread.join().map_err(|_| Error::new("a client panicked"))??;
+        made += mine;
+        total.merge(&tally);
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    println!(
+        "{} {made} objects in {seconds:.2} s: {:.0} per second, {} per request, \
+         {} clients x {} in flight",
+        target.identity,
+        made as f64 / seconds,
+        plan.batch,
+        plan.clients,
+        plan.depth
+    );
+    println!(
+        "{} per request: average {:.1} us, min {:.1} us, max {:.1} us",
+        target.identity,
+        total.mean().as_secs_f64() * 1e6,
+        total.min.as_secs_f64() * 1e6,
+        total.max.as_secs_f64() * 1e6
+    );
+    Ok(())
+}
+
+/// Look up objects at random for a while. Random because a benchmark that walks
+/// in order measures the cache rather than the index.
+fn bench_info(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<()> {
+    if plan.batch == 0 || plan.clients == 0 || plan.depth == 0 || plan.seconds == 0 {
+        return Err(Error::new("--batch, --clients, --depth and --seconds must all be positive"));
+    }
+    let addr = target.address;
+    let shared = Arc::new(messaging.clone());
+    let end = std::time::Instant::now() + Duration::from_secs(plan.seconds);
+    let start = std::time::Instant::now();
+
+    let threads: Vec<_> = (0..plan.clients)
+        .map(|client| {
+            let (messaging, prefix) = (Arc::clone(&shared), plan.prefix.clone());
+            let (batch, depth, objects, timeout) =
+                (plan.batch, plan.depth, plan.objects, plan.timeout);
+            std::thread::spawn(move || -> Result<(u64, u64, Tally)> {
+                let mut rng = Rng::from_seed(client as u64 + 1);
+                let mut conn = Conn::open(addr, timeout, &messaging)?;
+                let mut tally = Tally::new();
+                let (mut asked, mut found) = (0u64, 0u64);
+                let mut sent: HashMap<u32, std::time::Instant> = HashMap::new();
+                loop {
+                    while sent.len() < depth && std::time::Instant::now() < end {
+                        let mut request = if batch == 1 {
+                            Request::new(Op::ObjectInfo)
+                        } else {
+                            Request::new(Op::BatchInfo)
+                        };
+                        for _ in 0..batch {
+                            request = request.text(format!("{prefix}{}", rng.next() % objects));
+                        }
+                        let id = conn.send(&request)?;
+                        sent.insert(id, std::time::Instant::now());
+                        asked += batch as u64;
+                    }
+                    if sent.is_empty() {
+                        break;
+                    }
+                    conn.flush()?;
+                    let answer = conn.recv()?;
+                    match sent.remove(&answer.id) {
+                        Some(at) => tally.add(at.elapsed()),
+                        None => return Err(Error::new("unasked answer")),
+                    }
+                    // Five values per object, a zero id meaning it was not there.
+                    found += answer
+                        .args
+                        .chunks(5)
+                        .filter(|found| matches!(found.first(), Some(Arg::Number(id)) if *id != 0))
+                        .count() as u64;
+                }
+                Ok((asked, found, tally))
+            })
+        })
+        .collect();
+
+    let mut total = Tally::new();
+    let (mut asked, mut found) = (0, 0);
+    for thread in threads {
+        let (mine, hit, tally) = thread.join().map_err(|_| Error::new("a client panicked"))??;
+        asked += mine;
+        found += hit;
+        total.merge(&tally);
+    }
+    let seconds = start.elapsed().as_secs_f64();
+    println!(
+        "{} {asked} lookups in {seconds:.2} s: {:.0} per second, {found} found, \
+         {} per request, {} clients x {} in flight",
+        target.identity,
+        asked as f64 / seconds,
+        plan.batch,
+        plan.clients,
+        plan.depth
+    );
+    println!(
+        "{} per request: average {:.1} us, min {:.1} us, max {:.1} us",
+        target.identity,
+        total.mean().as_secs_f64() * 1e6,
+        total.min.as_secs_f64() * 1e6,
+        total.max.as_secs_f64() * 1e6
+    );
+    Ok(())
+}
+
 /// Print a response, and fail the process if the service refused.
 fn report(target: &Target, response: &Response) -> Result<()> {
     for arg in &response.args {
@@ -695,6 +948,7 @@ fn build(cmd: &Cmd) -> Result<Request> {
         Cmd::SnMasterKey { sn, day } => Request::new(Op::SnMasterKey).number(*sn).number(*day),
         Cmd::RotateMasterKey => Request::new(Op::RotateMasterKey),
 
+        Cmd::ObjectInfo { path } => Request::new(Op::ObjectInfo).text(path),
         Cmd::Mkdir { path } => Request::new(Op::MakeDirectory).text(path),
         Cmd::Rmdir { path } => Request::new(Op::RemoveDirectory).text(path),
         Cmd::Ls { path } => Request::new(Op::List).text(path),

@@ -9279,6 +9279,74 @@ share every failure domain and the rule stays unenforced — but giving four ENs
 roster is now enough to see it become `enforced at rack`, which is the smallest demonstration that
 the report is measuring the cluster rather than restating the configuration.
 
+### 17.5g Objects: create, look up, and what both cost
+
+**Built: `create`, `batch-create`, `object-info` and `batch-object-info`**, over the path a client
+actually takes. A create is `laws` → FE → DN → SN; a lookup is `laws` → FE → DN. Deliberately naive
+where naivety is honest for now: **every object gets its own stream**, with no inlining of small
+objects and no coalescing of several objects into one stream, both of which would hide what a create
+costs. Nothing is persisted, and nothing is deleted, so no index here has to survive churn.
+
+Who indexes what follows §4.6.3: **DN indexes objects by name and owns the `StreamId`; SN looks a
+stream up by `(DnId, StreamId)`** and allocates neither (Asserted, Bob, 2026-08-16). Both tables are
+sharded by 64 locks, which is what lets sixteen cores create at once.
+
+**Names are taken before streams are named.** A create that loses a race to the same name must not
+leave a stream behind, because nothing deletes streams — so DN inserts the name first, asks the SN for
+a run of streams for the names it actually took, and fills the stream ids in when the SN answers. A
+duplicate create then costs nothing and leaks nothing.
+
+Over 20 million objects on one box:
+
+| | Rate | Note |
+|---|---|---|
+| create, one per request | 142,000 /s | two chained hops each |
+| create, 1,000 per request | **2,564,000 /s** | 20 M objects in 7.8 s |
+| `object-info`, one per request | **263,000 /s** | random names over 20 M |
+| `batch-object-info`, 10 | 1,595,000 /s | |
+| `batch-object-info`, 100 | 3,958,000 /s | |
+| `batch-object-info`, 1,000 | **5,113,000 /s** | |
+
+**Measured, 2026-08-16**, retail, 16 clients x 16 in flight, client and server on the same box. DN
+holds 20 M objects in **2.3 GB**, about 116 bytes each including the name and the table, and SN holds
+20 M streams in 0.85 GB — so the lookups are random over far more than cache, which is the point of
+creating that many.
+
+**Against §1.4.0's bars, this is the same workload**: ObjectInfo over 20 M objects with metadata in
+RAM, 200k unbatched and 2M+ in batches of 1,000. Both are cleared — 263k and 5.1M — but the
+comparison is not yet fair in three ways, all of which make DeLawson's number flattering: there is no
+durable log write, since nothing is persisted; the client shares the box; and an object here is a name
+and a stream reference, not the full metadata record §4.7 budgets. The right reading is that the
+*message and index path* is in the right place, and the write path has not been paid for yet.
+
+Where the cost falls, from each process's own CPU accounting:
+
+| | Lookups/s | FE core per lookup | DN core per lookup |
+|---|---|---|---|
+| one per request | 263,000 | 31 µs | 11 µs |
+| 1,000 per request | 5,106,000 | 0.8 µs | 1.4 µs |
+
+Unbatched, **FE costs three times what DN does**, which says the forwarding tier — not the index — is
+what a small metadata request pays for. Batched, the whole cost collapses by a factor of forty and the
+balance inverts, because a batch amortizes the forward and leaves DN doing the only real work there
+is: 20 million random hash lookups a second across 64 shards.
+
+⚠️ **Three serializations had to be removed to get here**, and each was invisible until the rate was
+high enough to expose it. They are worth stating because they are the same mistake in three costumes:
+
+1. **FE forwarded by blocking a worker.** A request waiting on another process held a thread, so FE
+   could have only as many forwards in flight as it had workers, and adding workers did not help.
+   §17.4's rule — every call asynchronous — turns out to apply to *serving* as much as to sending: a
+   handler now takes a `Reply` it may carry into the answer it is waiting for, and what is in flight
+   is a table entry rather than a thread. Worth 50k to 61k on its own, and the structure everything
+   else needed.
+2. **Each peer request wrote its own syscall**, under one lock, so requests between two processes
+   never coalesced. Giving peer connections the same batching sender the answers already had — one
+   piece, shared, rather than two — took single lookups to 158k.
+3. **One connection between two processes is one read loop on the far side.** However many workers a
+   tier has, it cannot outrun a single thread reading its requests. Processes now keep a fan of
+   connections to each peer, and the last plateau went with it.
+
 ### 17.6 The harness reports what it cannot enforce
 
 One box is one domain at every level, so it satisfies no spreading rule. That is legal — §5.6.7

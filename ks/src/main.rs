@@ -39,7 +39,7 @@ impl Service for Ks {
         self.config.knobs.workers
     }
 
-    fn handle(&self, process: &Process, request: &Request) -> Response {
+    fn answer(&self, process: &Process, request: &Request) -> Response {
         match request.op {
             Op::Register => self.enroll(process, request),
             Op::Lookup => self.lookup(request),

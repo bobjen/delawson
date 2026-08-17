@@ -31,6 +31,8 @@ use crate::seal::{self, Seal};
 use crate::{Context, Error, Result};
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// Refuse a message larger than this rather than allocating what a peer asks for.
 pub const MAX_FRAME_BYTES: usize = 1 << 20;
@@ -94,6 +96,12 @@ ops! {
     SetExpiry = 0x0304, "set-expiry";
     CloneObject = 0x0305, "clone";
     ConcatObjects = 0x0306, "concat";
+    ObjectInfo = 0x0307, "object-info";
+    BatchCreate = 0x0308, "batch-create";
+    BatchInfo = 0x0309, "batch-object-info";
+
+    // SN, from a DN: a stream is named by the DN that owns it.
+    CreateStream = 0x0501, "create-stream";
 
     // Records.
     AppendRecord = 0x0401, "append";
@@ -482,6 +490,70 @@ fn segment_end(plain: &[u8]) -> Result<usize> {
         at = next;
     }
     Ok(at)
+}
+
+/// A batching sender for one direction of one connection: producers append
+/// messages, and a thread of its own writes whatever has piled up, sealing each
+/// batch as one segment. The next batch is whatever arrived while the last one
+/// was in flight, so batch size follows load with no timer and nothing to tune.
+///
+/// Both sides of a process want this — answers to clients and requests to peers —
+/// so it lives here rather than twice.
+pub struct Outbox {
+    filling: Mutex<Vec<u8>>,
+    ready: Condvar,
+    open: AtomicBool,
+}
+
+impl Outbox {
+    /// Start a sender on `wire`, and return the box to append to.
+    pub fn start(wire: Wire) -> Arc<Outbox> {
+        let outbox = Arc::new(Outbox {
+            filling: Mutex::new(Vec::with_capacity(BUF_BYTES)),
+            ready: Condvar::new(),
+            open: AtomicBool::new(true),
+        });
+        let sending = Arc::clone(&outbox);
+        std::thread::spawn(move || sending.run(wire));
+        outbox
+    }
+
+    /// Append one framed message. The lock is held for a copy, never for a write.
+    pub fn put(&self, framed: &[u8]) {
+        let mut filling = self.filling.lock().expect("outbox");
+        let woke = filling.is_empty();
+        filling.extend_from_slice(framed);
+        drop(filling);
+        // Waking is only needed when the sender has nothing else to find.
+        if woke {
+            self.ready.notify_one();
+        }
+    }
+
+    pub fn close(&self) {
+        self.open.store(false, Ordering::SeqCst);
+        self.ready.notify_one();
+    }
+
+    fn run(&self, mut wire: Wire) {
+        let mut batch = Vec::with_capacity(BUF_BYTES);
+        loop {
+            {
+                let mut filling = self.filling.lock().expect("outbox");
+                while filling.is_empty() {
+                    if !self.open.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    filling = self.ready.wait(filling).expect("outbox");
+                }
+                std::mem::swap(&mut *filling, &mut batch);
+            }
+            if wire.send(&mut batch).is_err() {
+                return;
+            }
+            batch.clear();
+        }
+    }
 }
 
 /// Append a message to a plain buffer, to be sealed with whatever else is there.
