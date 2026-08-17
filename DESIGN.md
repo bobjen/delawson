@@ -9630,8 +9630,13 @@ It paid for itself immediately, because the spreads are not all alike:
 ⚠️ **That last row is not noise, it is the placeholder index growing.** Successive trials in one
 process ran 2.88M, 2.56M and 1.67M objects a second, with the slowest request in each going 348 ms,
 727 ms, 1.82 s. In a *fresh* process every trial gives 2.79M to 2.81M — a 0.9% spread — so what
-degrades is the table, not the message path. Pre-sizing the shards so nothing resizes gives 3.9M a
-second and a 67 ms worst case, which confirms it: **a hash table doubling under a lock is a latency
+degrades is the table, not the message path.
+
+**And with the table out of the way, the create path does 3.79M objects a second** — three fresh
+processes gave 3,864,000, 3,760,000 and 3,738,000, a 3.4% spread, with the slowest request 67 to 85 ms
+rather than 348. That is the number worth keeping (Asserted, Bob, 2026-08-16): it says the message path
+— `laws` to FE to DN to SN, encrypted, compressed, logged a line per request — is **not** what the
+2.8M was limited by. It also confirms the diagnosis: **a hash table doubling under a lock is a latency
 cliff, and a create can wait seconds behind one.**
 
 **Not fixed, deliberately** (Asserted, Bob, 2026-08-16): the in-memory table is a stand-in for the
