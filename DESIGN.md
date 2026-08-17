@@ -9359,10 +9359,16 @@ on the way out. It lives in `Reply::send`, which is the single place every answe
 so a machine type gets it without writing anything: five hand-written log sites went away when this
 arrived.
 
-The clock read and the subject are both skipped when the level is above `info`, so a filtered line
-still costs nothing. Holding the subject inline instead of allocating it was tried and **made no
-measurable difference** — the cost is the ~125 bytes of line, not the allocation — so the simpler code
-stays.
+**The clock is read once per batch, not once per request** (Asserted, Bob, 2026-08-16). A batch arrives
+at one moment, so the segment's arrival time serves every message in it — and it is the honest start
+for a duration, being when the bytes reached this process rather than when a thread got round to them.
+A request that waited behind others in its batch says so, which is exactly what a live-site argument
+wants to know.
+
+Two things were tried to make the line cheaper and **neither was measurable**: holding the subject
+inline instead of allocating it, and the clock read itself. What the 19% actually buys is the ~125
+bytes of line, which is why §17.5g.1's remaining lever is the length of the header rather than anything
+around it. The simpler code stays in both cases.
 
 **So each line carries what the argument is conducted in.** The correlator is not a request id — §17.5d
 says why there cannot be one for every line — it is the name, and where the name stops, the stream

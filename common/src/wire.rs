@@ -33,6 +33,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 /// Refuse a message larger than this rather than allocating what a peer asks for.
 pub const MAX_FRAME_BYTES: usize = 1 << 20;
@@ -424,11 +425,20 @@ pub struct Reader {
     seal: Seal,
     open: Vec<u8>,
     at: usize,
+    /// When the segment now being read arrived. A batch arrives at one moment, so
+    /// this is one clock read for however many messages it holds — and it is the
+    /// honest start for a duration, being when the bytes got here rather than
+    /// when a thread got to them.
+    arrived: Instant,
 }
 
 impl Reader {
     pub fn more(&self) -> bool {
         self.at < self.open.len()
+    }
+
+    pub fn arrived(&self) -> Instant {
+        self.arrived
     }
 
     /// The next message, reading and opening a segment if none is in hand.
@@ -451,6 +461,7 @@ impl Reader {
     fn fill(&mut self) -> Result<()> {
         let mut header = [0u8; seal::HEADER];
         self.stream.read_exact(&mut header)?;
+        self.arrived = Instant::now();
         let length = u32::from_le_bytes(header[..4].try_into().expect("length")) as usize;
         if length > MAX_SEGMENT_BYTES + seal::OVERHEAD {
             return Err(Error::new(format!("peer announced a {length}-byte segment")));
@@ -595,6 +606,7 @@ pub fn connect(stream: TcpStream, config: &Messaging) -> Result<Link> {
             seal: Seal::new(config, prefix, 1)?,
             open: Vec::with_capacity(BUF_BYTES),
             at: 0,
+            arrived: Instant::now(),
         },
         wire: Wire { stream: writing, seal: Seal::new(config, prefix, 0)?, sealed: Vec::new() },
         plain: Vec::with_capacity(BUF_BYTES),
@@ -613,6 +625,7 @@ pub fn accept(stream: TcpStream, config: &Messaging) -> Result<(Reader, Wire)> {
             seal: Seal::new(config, prefix, 0)?,
             open: Vec::with_capacity(BUF_BYTES),
             at: 0,
+            arrived: Instant::now(),
         },
         Wire { stream, seal: Seal::new(config, prefix, 1)?, sealed: Vec::new() },
     ))

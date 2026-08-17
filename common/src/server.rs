@@ -433,18 +433,19 @@ fn read_loop<S: Service>(
             process.senders.fetch_add(1, Ordering::Relaxed);
         }
 
+        let arrived = input.arrived();
         if service.inline(request.op) {
             // Nothing more in hand means the next read would block, so send. A
             // deferred answer is sent whenever it arrives, which is always a
             // moment this loop knows nothing about.
             let settled = deferred || !input.more();
-            answer_here(process, service, &out, request, settled);
+            answer_here(process, service, &out, request, settled, arrived);
             continue;
         }
         let process = Arc::clone(process);
         let service = Arc::clone(service);
         let out = Arc::clone(&out);
-        pool.run(move || answer_here(&process, &service, &out, request, true));
+        pool.run(move || answer_here(&process, &service, &out, request, true, arrived));
     }
 }
 
@@ -462,9 +463,8 @@ pub struct Reply {
     /// Whether the caller knows nothing more is in hand, so a direct writer
     /// should send what it has.
     settled: bool,
-    /// When the request was picked up, if anything is going to read the answer's
-    /// line. `None` when the level is above `info`, so a filtered line costs no
-    /// clock read.
+    /// When the batch this request arrived in was read, if anything is going to
+    /// read the answer's line. One clock read serves every request in a batch.
     started: Option<Instant>,
     /// What the line calls this request: by default whatever its first argument
     /// is, which for anything about an object is the name.
@@ -645,18 +645,19 @@ fn answer_here<S: Service>(
     out: &Arc<Out>,
     request: Request,
     settled: bool,
+    arrived: Instant,
 ) {
     process.answered.fetch_add(1, Ordering::Relaxed);
     let op = request.op;
-    // Both of these are for the answer's line, so neither is paid when the level
-    // is above info.
+    // The subject is only for the answer's line, so it is not paid when the level
+    // is above info. The arrival time was read once for the whole batch.
     let logging = crate::log::enabled(crate::log::Level::Info);
     let mut reply = Reply {
         out: Arc::clone(out),
         id: request.id,
         op,
         settled,
-        started: logging.then(Instant::now),
+        started: logging.then_some(arrived),
         about: String::new(),
     };
     if logging {
