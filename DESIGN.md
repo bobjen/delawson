@@ -2541,6 +2541,40 @@ At the 100 B budget there is 2.5× headroom, and the itemized ~60 B (§5.10.4) s
 leaves 1.5×. Worth knowing that shrinking records is not free: past a point it trades
 metadata density for reference width.
 
+#### 4.6.5 Size classes, and why a dedicated stream is the good case
+
+**A DN treats small objects differently from big ones** (Asserted, Bob, 2026-08-17):
+
+| Object | Held as | Described by |
+|---|---|---|
+| **tiny** | inline records | the DN, which holds the bytes (§11) |
+| **small** — one append's worth | **a small range in a particular stream, created by a single append** | **the DN alone** |
+| **large** | its own extents in its own stream | the DN, then its SN |
+
+⚠️ **The reason is garbage, not read performance** (Asserted, Bob, 2026-08-17). Put positively:
+**the good thing about a dedicated stream is that it has no garbage.** When the object goes, the whole
+stream goes with it — every extent is reclaimable at once, with nothing to compact and nothing to
+copy.
+
+A shared stream is the opposite: deleting one small object leaves a hole inside extents that other
+objects still need, so nothing can be reclaimed until either everything in the extent is dead or
+somebody rewrites it. That is §10's compaction work and §8.5's garbage, arriving for a reason that has
+nothing to do with the object being deleted being large. **Sharing is what turns a delete into a
+future rewrite**, and a dedicated stream is what turns it into a free.
+
+**So the trigger is not a size estimate but an observation** — two of them, and both are evidence
+rather than prediction:
+
+- **A big append goes straight to a dedicated stream.** One append that large is proof enough.
+- **A second small append also triggers a dedicated stream.** An object appended to twice is an object
+  that grows, and a growing object in a shared stream is the case that makes garbage later. The
+  one-append object is the one that shares, because it is the one that will never fragment.
+
+**And nothing has to be got right at the time**, which is what makes an observation-based rule safe:
+**extents and streams can be rewritten later to compact things** (Asserted, Bob, 2026-08-17). An
+object that started shared and turned out to be large is tidied by the same machinery that compacts
+anything else, so the cost of guessing wrong is deferred work rather than a wrong structure.
+
 ### 4.7 Working budgets
 
 Every number below is **a guess, to be replaced by measurement**. They are collected
@@ -6700,12 +6734,28 @@ it is three objections:
 - **Stale *and* maintained is the worst pair**: paying to keep something that still cannot be
   trusted, which invites callers to trust it anyway.
 
-So the question is not "how stale may it be" but "where should such a summary live at all", and the
-promising answer is somewhere that is already stale by construction: **§13.5's metadata snapshots**.
-The billing job (§12.8) already computes byte totals over them daily, so the numbers exist without
-anybody maintaining a live copy, and a planner reading a snapshot gets estimates whose staleness is
-stated rather than implied. A job planning over a directory is exactly the kind of caller that can
-afford to read a snapshot; a point lookup is not, and does not need to (#66).
+**Settled: nowhere, and nothing is stored** (Asserted, Bob, 2026-08-17). §13.5's metadata snapshots do
+carry these numbers, and they are **too stale for a job or for `laws dir` to use** — a planner wants
+last minute, not last night.
+
+**So a listing is implemented the way `object-info` is: it walks down the tiers as far as it has to
+go.** No DN-side summary to maintain, no staleness to explain, and the cost is round trips rather
+than metadata — paid by the caller that asked, in proportion to what it asked about.
+
+**And how far it has to go depends on the object's size class** (§4.6.5), which is what makes this
+affordable rather than merely correct:
+
+| Object | Described by | Round trips |
+|---|---|---|
+| tiny, inlined | the **DN alone** — it holds the records | one |
+| small, one append's worth | the **DN alone** — it holds the stream and the range | one |
+| large, owning its stream | the DN, then its SN, whose extent list is the interesting part | two |
+
+**The cheapest objects are the cheapest to describe**, which is the right way round given that §14.1.1
+expects the population to be dominated by tiny ones. **A directory of small objects is answered
+entirely by the DN**, because a small object is a range in a stream and the DN has both — the walk
+stops at the first tier for everything except the objects big enough to have an extent list worth
+sending.
 
 So the discovery has three rounds and each is cheaper than it looks:
 
