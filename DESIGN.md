@@ -111,7 +111,7 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Re-encrypt at the **destination**; instances need not be byte-identical across clusters | §13.4.5.2 |
 | Durability seconds must survive the trip; **`(path, record number)` is the portable name**, not the `DnId` | §4.6.3, §13.4.5.3 |
 | `DnId`/`SnId` are **internal and cluster-local**; the path is the user-visible durable name | §4.6.3 |
-| A hint `(extent, row)` is cluster-local by construction, and fails detectably across clusters | §4.6.3, §8.1.1a-10 |
+| A hint is cluster-local by construction, and fails detectably across clusters — and detectably after a rewrite, since the extent's creation second is part of it | §4.6.3, §8.1.1a-10 |
 | The georep destination gets a **dedicated directory**, so replicas cannot collide with local objects | §13.4.5.4 |
 | So portability is relative to the replication root, and cross-cluster translation is **one prefix substitution** | §13.4.5.4 |
 | Georep directories are **read-only permanently** — never promoted, so no offset-level split brain | §13.4.5.4 |
@@ -290,7 +290,7 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Common extents are the protection **until the EC group can protect itself** | §8.1.4.4 |
 | So **recompression need never be deterministic**: exactly one node performs it | §8.1.4.4 |
 | Prior art returns an offset only with **one** unsealed region (VSAM RBA); parallel writers always change the **name space** | §8.1.1a-9 |
-| Three reference tiers: **durable** (key / record number), **hint** (extent, row), and **none** (object offset) | §8.1.1a-10 |
+| Three reference tiers: **durable** (key / record number), **hint** (`EnId`, extent name, row — a route a caller may hold, good for at least the hint window), and **none** (object offset) | §8.1.1a-10, §10.1 |
 | Hints fail **detectably** because extent identity carries a creation second — Oracle's logical rowid pattern | §8.1.1a-10 |
 | Large objects are built by **parallel partitions, sealed, then concatenated** | §8.6.1 |
 | **Trilemma**: parallel bandwidth, dense stable offsets, monotone time index — pick two | §8.6.2 |
@@ -5007,6 +5007,25 @@ not been decided yet. §8.6 shows the eventually-known object offset is still re
 Row number within an extent **is** stable and can be returned immediately; what makes it a hint rather than a
 name is that §10 may rewrite the extent (Asserted, Bob, 2026-08-15).
 
+**The hint in full is `(EnId, (SnId, ExtentId, creation second), record number)`** (Asserted, Bob,
+2026-08-17) — an instance to ask, the extent's whole name, and the row in it. The EnId is what makes it a
+route rather than a description: holding one, an FE goes **straight to an EN**, skipping the DN and the SN.
+
+Three things follow:
+
+- **It serves both object flavours.** A row within an extent is as well defined for keyed records as for
+  unkeyed ones, so insert-in-the-middle data gets the same hint — which is the point of the middle tier
+  existing at all, since keyed objects have no durable positional address (§3).
+- ⚠️ **It removes the DN and SN hops, not the FE hop.** Authorization lives at the FE (§5.9), so a hint
+  used *by* an FE on a user's behalf preserves it, while a user reaching an EN directly would skip it. That
+  makes "who may hold a hint" a different question from "who may use one", and the first has a much easier
+  answer.
+- **It is what the user is given, not only what the FE keeps** (Asserted, Bob, 2026-08-17). The motivating
+  shape is a job scheduler: **ask once up front, hand the hints to the vertices, and let them use them as
+  the job runs.** So `object-info` has to return enough for a caller to construct hints — extent names,
+  their instances, and their record ranges — rather than only the stream-level answer it gives today
+  (#61).
+
 **What makes the middle tier safe rather than dangerous is already in §4.6.3**: extent identity is
 `(SnId, ExtentId, creation second)`, so a rewritten extent has a **different identity**. A stale hint therefore
 fails **detectably** — a clean "that extent is gone" rather than a silent read of whatever now occupies the slot.
@@ -6362,6 +6381,18 @@ Where it lives is a real trade:
 ⚠️ Undecided. The security asymmetry is worth weighing: an EN cache of ciphertext creates no
 new exposure, while an FE plaintext cache does.
 
+**Two things narrow it** (Asserted, Bob, 2026-08-17). **The FE is a cache** — that is what it is for,
+beyond authorization and coordination. But **an extent is usually read once**, and a cache of
+read-once data is only a cost, so it is *unclear that the FE is the right cache for hot extents*
+specifically. What the FE is unambiguously the right cache for is what §17.13 already does with it:
+**where records live**, which is metadata, is small, and is asked about repeatedly even when the bytes
+behind it are not.
+
+**And for several of the motivating cases there will be another mechanism** — spreading a configuration
+to the vertices of a job is §9.6.2's broadcast, not a cache, and a job that has been handed hints
+(§8.1.1a-10) needs neither. So the hot-object cache question should be settled *after* those exist,
+since they remove much of what would otherwise justify it.
+
 #### 9.6.2 Broadcast, which is the actual fix
 
 Caching reduces the cost per consumer; it does not change the fact that the total is *N* × *S*
@@ -6630,6 +6661,13 @@ compaction is it:
 
 The goal is exact ordering, for a bounded window after write, without a key lookup — the SCN-granularity tier that
 §4.6.3 contrasts with second-granularity timestamps. Current guess: **10 minutes** (Guess).
+
+⚠️ **And it is a promise made to users, not an internal convenience** (Asserted, Bob, 2026-08-17). A hint
+is handed out — to a job scheduler, which hands it to vertices that use it while the job runs — with the
+guarantee that it **holds for at least that window**. So the retention rule below is part of the contract:
+a rewrite that released its inputs early would not merely lose a cache hit, it would break something a
+caller was told it could rely on. The floor is what makes the hint usable by anyone who cannot re-ask
+cheaply.
 
 **Three things make that nearly free.**
 
