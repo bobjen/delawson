@@ -9223,11 +9223,25 @@ the total comes out near the target share. Sampling rather than suppressing mean
 shows what the busy traffic looks like. Counts are halved at each recount, so the answer follows the
 workload rather than being set by whatever happened first.
 
-**A third kind of line: at most one a second, whichever message got there first.** For a place that
-would otherwise say the same thing millions of times, a sample says what is happening and the rest
-says nothing new. It logs at `notice` — being rate-limited already, it is not the chatty kind, so it
-belongs in both logs. ⚠️ It does not count what it skipped: a counter would put every thread onto one
-cache line, which is exactly the cost the rate limit exists to avoid.
+**A third kind of line: at most one a second, whichever message got there first, carrying how many
+times the site said nothing.** For a place that would otherwise say the same thing millions of times,
+a sample says what is happening and the count says how much of it there was:
+
+```
+n,…,line=783,pinged,reply size 0,skipped 2252071
+n,…,line=783,pinged,reply size 0,skipped 2296037
+```
+
+It logs at `notice` — being rate-limited already, it is not the chatty kind. The count is a value, so
+the histogram takes no notice of it, which is right: what varies per line is not what a kind is
+grouped by.
+
+⚠️ **The count is one shared counter, and an earlier version of this section claimed that would be too
+expensive.** It is not: measured with everything else held still, per-thread counters gave 12.83M round
+trips a second against 12.71M for one shared relaxed increment — a difference inside the noise, at 13
+million calls a second on sixteen cores. The per-thread machinery was written, measured, and deleted.
+What had looked like its cost was the per-request `answered` line, which the ping path also goes
+through; attributing a 6x drop to the counter was a guess, and the guess was wrong.
 
 #### 17.5d.1 Many lines in the code, few in the log
 
@@ -9467,8 +9481,9 @@ enough to stop anyone wanting a shell**:
 The histogram row is `000000123,i,file=…,line=…,constant`, sorted by frequency — and it sorts by plain
 text order because the count is zero-padded, which is why it is.
 
-**It is read from both ends** (Asserted, Bob, 2026-08-16). The top says what is happening most, which
-is the obvious use. **The bottom says what happened once, which is the needle in the haystack** — and
+**It is read from both ends** (Asserted, Bob, 2026-08-16). The busy end says what is happening most,
+which is the obvious use. **The rare end says what happened once, which is the needle in the
+haystack** — and
 it finds that needle *without anyone knowing what the needle is*, which no grep can do. So every row
 comes back rather than the busiest few, since truncating to the top would throw away exactly the half
 that finds a rare thing. All three answers take a time range as well, because a rare event is looked
@@ -9478,10 +9493,14 @@ for in the minute it happened.
 nothing truncated and no knob:
 
 ```
-000268456,i,file=common/src/server.rs,line=496,answered
-000000042,n,file=common/src/server.rs,line=433,switched to a batching sender because an answer will not come from the read loop
 000000001,n,file=common/src/server.rs,line=365,registered with KS
+000000042,n,file=common/src/server.rs,line=433,switched to a batching sender because an answer will not come from the read loop
+000268456,i,file=common/src/server.rs,line=496,answered
 ```
+
+**Rarest first, busiest last** (Asserted, Bob, 2026-08-16), because a histogram often runs past a
+screen and what a terminal leaves in front of a reader is the end of it — so the end should be the
+summary, and the rare rows are where someone who scrolled up, or piped it to `head`, is looking.
 
 **Two cheap queries beat one query with a knob.** The row's fields are spelled exactly as the lines
 spell them, so everything after the count and the level is literally a substring of the lines it
@@ -9502,10 +9521,11 @@ successes, did not appear in the histogram at all. They were inside the big row.
 answer its own constant makes them a row of their own:
 
 ```
-000268709,i,file=common/src/server.rs,line=504,answered
-000000048,n,file=common/src/server.rs,line=437,switched to a batching sender because …
-000000002,i,file=common/src/server.rs,line=507,answered with a problem      <- the needle
+000000001,h,file=,line=0,opened
 000000001,n,file=common/src/server.rs,line=369,registered with KS
+000000002,n,file=common/src/server.rs,line=511,answered with a problem      <- the needle
+000000048,n,file=common/src/server.rs,line=439,switched to a batching sender because …
+000268709,i,file=common/src/server.rs,line=506,answered
 ```
 
 and the row leads straight to them:
@@ -9533,6 +9553,34 @@ compressed, `.log` not. **Measured: 74 MB of lines in 9.9 MB of file, 7.5x** (Bo
 than 6x" was right), and `status` reports the ratio a run achieved rather than leaving it a guess.
 28 MB/s of lines becomes 3.7 MB/s on the disk, which turns §17.5g.1's 18 seconds of full log into a
 couple of minutes for the same bytes.
+
+⚠️ **Compression buys retention and not speed**, which had to be measured twice to get right. A first
+comparison showed a ping 13% faster with compressed files and was wrong: turning compression off also
+divided the block by the ratio, so the two arms differed in how *often* they wrote. Holding the block
+equal, compression is neutral — 2.31M round trips a second against 2.28M, inside the noise — and
+nothing waits for the device anyway, since a write lands in the page cache
+(Asserted, Bob, 2026-08-16).
+
+**What the block actually decides is how often a write happens, and that is the lever:**
+
+| Block of text | Writes at 275 MB/s of lines | Bytes per write | Ping |
+|---|---|---|---|
+| 40 KB | ~6,900 /s | 40 KB | 1,930,000 |
+| 280 KB, compressed | ~1,000 /s | 37 KB | 2,240,000 |
+| 280 KB, plain | ~1,000 /s | 280 KB | 2,300,000 |
+
+The two configurations that write a thousand times a second score the same whether they write 37 KB or
+280 KB; the one that writes seven thousand times a second loses **15%** of a ping. So bytes are nearly
+free and syscalls are not — which is why **the block is the same amount of text whether or not it is
+compressed**. `min_write_bytes` is the floor a device wants of a write; the ratio is what makes the
+block big enough that writes are rare.
+
+**Compressing also buys throughput, but only where the log rate is extreme** (Asserted, Bob,
+2026-08-16, and measured): a ping with a line per request runs at 2,205,000 a second with compressed
+files against 1,955,000 with plain ones, **13% faster for writing a seventh of the bytes**. At object
+rates — 200,000 lines a second rather than two million — it is a wash, within noise either way, because
+the CPU of compressing costs about what the I/O saves. So retention is what compression is for; speed
+is a bonus that arrives only at rates where the log is a torrent.
 
 **How much text a block gathers is derived from the disk, not configured** (Asserted, Bob,
 2026-08-16). A device wants a write of at least its break-even, and compression means the text has to

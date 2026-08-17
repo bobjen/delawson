@@ -134,9 +134,12 @@ impl Logs {
     /// count and the level is **literally a substring of the lines it counts** —
     /// a row is what to paste into the next query.
     ///
-    /// **Every row comes back**, because the bottom of the list is half the point:
-    /// a count of one is the rare event someone is looking for, and truncating to
-    /// the busiest rows would throw away exactly that.
+    /// **Every row comes back**, because both ends are the point: a count of one is
+    /// the rare event someone is looking for, and truncating to the busiest rows
+    /// would throw away exactly that.
+    ///
+    /// **Rarest first, busiest last**, because the output scrolls: what a terminal
+    /// leaves on screen is the end of it, and the end should be the summary.
     pub fn histogram(&self, from: &str, to: &str) -> Result<(u64, Vec<String>)> {
         let mut counts: HashMap<String, u64> = HashMap::new();
         let mut key = String::new();
@@ -169,9 +172,9 @@ impl Logs {
         let mut counted: Vec<String> =
             counts.into_iter().map(|(what, count)| format!("{count:09},{what}")).collect();
         // Zero-padded, so the plain order is the frequency order.
-        counted.sort_by(|a, b| b.cmp(a));
+        counted.sort();
         if full {
-            counted.push(format!("stopped counting at {MAX_ROWS} kinds of line"));
+            counted.insert(0, format!("stopped counting at {MAX_ROWS} kinds of line"));
         }
         Ok((seen, counted))
     }
@@ -273,17 +276,18 @@ n,2026-08-17 01:00:01.000000,pid=1,tid=1,file=common/src/server.rs,line=99,liste
         Logs::open(&dir, "dn0", u64::MAX).unwrap()
     }
 
-    /// A row per site, whole, with nothing cut and nothing to choose — and the rare
-    /// one at the bottom, which is the half of the answer that finds a needle.
+    /// A row per site, whole, with nothing cut and nothing to choose — the rare one
+    /// first, since that is the needle, and the busiest last, since that is what a
+    /// scrolling terminal leaves on screen.
     #[test]
-    fn a_row_per_site_including_the_rare_one() {
+    fn a_row_per_site_rarest_first() {
         let (seen, rows) = logs(false).histogram("", "").unwrap();
         assert_eq!(seen, 4);
         assert_eq!(rows.len(), 2, "{rows:?}");
-        assert_eq!(rows[0], "000000003,i,file=dn/src/main.rs,line=10,answered", "{rows:?}");
+        assert_eq!(rows[0], "000000001,n,file=common/src/server.rs,line=99,listening", "{rows:?}");
         assert_eq!(
             rows[rows.len() - 1],
-            "000000001,n,file=common/src/server.rs,line=99,listening",
+            "000000003,i,file=dn/src/main.rs,line=10,answered",
             "{rows:?}"
         );
     }
@@ -304,7 +308,8 @@ n,2026-08-17 01:00:01.000000,pid=1,tid=1,file=common/src/server.rs,line=99,liste
     fn a_row_says_what_to_grep_for() {
         let logs = logs(false);
         let (_, rows) = logs.histogram("", "").unwrap();
-        let site = rows[0].splitn(3, ',').nth(2).expect("count, level, then the rest");
+        let busiest = rows.last().expect("a row");
+        let site = busiest.splitn(3, ',').nth(2).expect("count, level, then the rest");
         let (_, found) = logs.grep(site, "", "", 10).unwrap();
         assert_eq!(found.len(), 3, "{found:?}");
     }

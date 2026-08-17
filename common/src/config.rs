@@ -220,7 +220,8 @@ pub struct Logging {
     pub disk: String,
     /// What a block of lines is expected to compress by, which is what turns the
     /// device's wanted write size into an amount of text to accumulate. A guess,
-    /// and `status` reports what was actually achieved.
+    /// and `status` reports what was actually achieved. It applies with compression
+    /// off as well, because what the block sets is how often a write happens.
     pub compress_ratio: u64,
     /// Bytes per file, before the next one is started.
     pub size: u64,
@@ -244,12 +245,13 @@ impl Logging {
         let disk = media.iter().find(|class| class.name == self.disk).ok_or_else(|| {
             Error::new(format!("logging.disk {:?} is not a media class", self.disk))
         })?;
-        // What the device wants of a write, times what the text shrinks by.
-        let block = if self.compress {
-            disk.min_write_bytes * self.compress_ratio.max(1)
-        } else {
-            disk.min_write_bytes
-        };
+        // What the device wants of a write, times what the text shrinks by —
+        // whether or not it is being compressed. What a block decides is how often
+        // a write happens, and measurement says that is the cost: at 275 MB/s of
+        // lines, writing 40 KB at a time cost 15% of a ping's throughput against
+        // writing ten times less often. Bytes are nearly free by comparison, since
+        // a write lands in the page cache.
+        let block = disk.min_write_bytes * self.compress_ratio.max(1);
         Ok(crate::log::Logging {
             block: block as usize,
             level: crate::log::Level::parse(&self.level).ok_or_else(|| {
