@@ -5985,6 +5985,17 @@ discovered.
 5. **EN**: read that granule from any instance, decrypt, decompress, parse
    forward by framing, stop at the target.
 
+⚠️ **"Any instance" holds for a sealed extent, and not for an unsealed one — and the reason is
+the watermark, not the data** (Asserted, Bob, 2026-08-17). Below the durable length every instance
+has everything, contiguously; **interior holes exist only above it, on every instance including the
+primary** (§8.1.4.3 is about that region). So the bytes are not what differ. What differs is that
+**a secondary may hold a stale durable length**, and would answer a read against the wrong
+watermark — refusing or truncating something that is in fact durable. The primary is the instance
+that knows what the durable length is, so an unsealed extent is read there.
+
+That makes spreading unsealed reads a question of getting the watermark to the secondaries rather
+than of copying data, which is a much cheaper problem than it first looks (#54).
+
 Two B-tree descents, one small log probe, one index search, one granule read —
 but spread over four machine types, so a cold point read costs **four round
 trips** including the authorization hop. Sealed extents are immutable, which makes almost everything above
@@ -10218,11 +10229,10 @@ closes a record and then ends inside another is refused, and refused before anyt
 | FE → SN | which extent holds that record, and where its instances are |
 | FE → primary EN | the record |
 
-⚠️ **The read goes to the primary, not to any instance.** §9.1 says any instance will do, and for a
-*sealed* extent that is right — every instance is identical. An unsealed one is not: a quorum of
-three means an instance may be missing an append, and §8.1.4.3's interior holes mean what it is
-missing need not be at the end. The primary is the one that has everything it acknowledged. Since
-nothing seals yet, every extent is unsealed and every read goes to the primary.
+⚠️ **The read goes to the primary, not to any instance**, and §9.1 says why: not because a
+secondary's bytes differ below the durable length — they do not — but because a secondary may hold a
+**stale durable length** and would answer against the wrong watermark. Since nothing seals yet, every
+extent is unsealed and every read goes to the primary.
 
 ⚠️ **And the EN parses the extent from the beginning every time**, because there is no sparse index
 (§9.3) and no seal. So a read is O(extent) rather than O(one granule), which is the placeholder to

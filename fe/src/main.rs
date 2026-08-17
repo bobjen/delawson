@@ -410,11 +410,12 @@ fn make_object(
 /// Read a record from an instance of the extent holding it.
 ///
 /// ⚠️ **The primary, not any instance.** A sealed extent is identical everywhere and
-/// could be read from whichever instance is nearest or least busy, but an unsealed
-/// one is not: a quorum of three means an instance may be missing an append, and
-/// local coalescing means what it is missing can be an interior hole rather than a
-/// short tail. The primary is the one that has everything it acknowledged. Until
-/// sealing exists, every extent is unsealed.
+/// could be read from whichever instance is nearest or least busy. An unsealed one
+/// differs, but not in its bytes: below the durable length every instance has
+/// everything, and holes exist only above it — on the primary too. What a secondary
+/// may have is a **stale durable length**, so it would answer against the wrong
+/// watermark and refuse something that is durable. The primary is the one that knows
+/// what the watermark is. Until sealing exists, every extent is unsealed.
 fn from_instance(
     process: &Arc<Process>,
     located: &Located,
