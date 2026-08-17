@@ -994,6 +994,7 @@ fn receipt(target: &Target, response: &Response) -> Result<()> {
     if let [
         Arg::Number(stream),
         Arg::Number(record),
+        Arg::Number(object_record),
         Arg::Number(records),
         Arg::Number(extent),
         Arg::Number(created),
@@ -1001,20 +1002,21 @@ fn receipt(target: &Target, response: &Response) -> Result<()> {
         Arg::Number(length),
     ] = response.args.as_slice()
     {
-        // The durable reference first, since that is the one worth keeping.
+        // The record number to read it back by comes first, then the durable
+        // reference it is made of, then where the bytes went.
         match records {
             0 => println!(
                 "{} stream {stream}, no record finished yet, {length} bytes at offset {offset} of extent {extent}",
                 target.identity
             ),
             1 => println!(
-                "{} stream {stream} record {record}, {length} bytes at offset {offset} of extent {extent} made in second {created}",
+                "{} record {object_record} (stream {stream} record {record}), {length} bytes at offset {offset} of extent {extent} made in second {created}",
                 target.identity
             ),
             _ => println!(
-                "{} stream {stream} records {record} to {}, {length} bytes at offset {offset} of extent {extent} made in second {created}",
+                "{} records {object_record} to {} (stream {stream} from record {record}), {length} bytes at offset {offset} of extent {extent} made in second {created}",
                 target.identity,
-                record + records - 1
+                object_record + records - 1
             ),
         }
         return Ok(());
@@ -1033,6 +1035,7 @@ fn object(target: &Target, response: &Response) -> Result<()> {
         Arg::Flag(keyed),
         Arg::Number(kind),
         Arg::Number(width),
+        Arg::Number(first_record),
     ] = response.args.as_slice()
     {
         let flavor = if *keyed { "keyed" } else { "unkeyed" };
@@ -1041,7 +1044,7 @@ fn object(target: &Target, response: &Response) -> Result<()> {
             Err(e) => e.to_string(),
         };
         println!(
-            "{} object {id} {flavor} framed {framing}, stream {stream} on SN{sn}, made in second {created}",
+            "{} object {id} {flavor} framed {framing}, stream {stream} on SN{sn} from record {first_record}, made in second {created}",
             target.identity
         );
         return Ok(());

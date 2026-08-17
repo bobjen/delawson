@@ -175,7 +175,21 @@ impl FE {
         reply: Reply,
         then: impl FnOnce(&Arc<FE>, &Arc<Process>, Located, Reply) + Send + 'static,
     ) {
-        self.resolving(process, path, make, true, reply, then)
+        self.resolving(process, path, None, make, true, reply, then)
+    }
+
+    /// The stream holding a record, rather than the one being appended to. Same
+    /// shape of answer, different question — an object is several streams and the
+    /// DN is what knows which.
+    fn resolve_record(
+        self: &Arc<Self>,
+        process: &Arc<Process>,
+        path: &str,
+        record: u64,
+        reply: Reply,
+        then: impl FnOnce(&Arc<FE>, &Arc<Process>, Located, Reply) + Send + 'static,
+    ) {
+        self.resolving(process, path, Some(record), None, false, reply, then)
     }
 
     /// `again` is the one retry a lost race gets: two appends to a name that does not
@@ -188,6 +202,7 @@ impl FE {
         self: &Arc<Self>,
         process: &Arc<Process>,
         path: &str,
+        record: Option<u64>,
         make: Option<Framing>,
         again: bool,
         reply: Reply,
@@ -204,7 +219,10 @@ impl FE {
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
         let path = path.to_string();
-        let ask = Request::new(Op::ObjectInfo).text(&path);
+        let ask = match record {
+            None => Request::new(Op::ObjectInfo).text(&path),
+            Some(record) => Request::new(Op::LocateStream).text(&path).number(record),
+        };
         let named = dn.clone();
         let asked = process.ask(&dn, &ask, move |answer| {
             // An append may make the object it is appending to, which is one more
@@ -256,6 +274,7 @@ impl FE {
             }
         };
         reply.about(format_args!("{path},bytes {}", body.len()));
+        let named = path.clone();
         self.resolve(process, &path, Some(framing), reply, move |fe, process, located, reply| {
             // The object's own framing wins, and a writer that disagrees about it is
             // writing records the object cannot hold.
@@ -268,7 +287,7 @@ impl FE {
                     ),
                 ));
             }
-            fe.to_extent(process, located, body, reply);
+            fe.to_extent(process, named, located, body, reply);
         });
     }
 
@@ -277,13 +296,14 @@ impl FE {
     fn to_extent(
         self: &Arc<Self>,
         process: &Arc<Process>,
+        path: String,
         located: Located,
         body: Vec<u8>,
         reply: Reply,
     ) {
         let key = (located.dn, located.stream);
         if let Some(open) = self.open.lock().expect("extents").get(&key) {
-            return self.to_primary(process, located, open.clone(), body, TRIES, reply);
+            return self.to_primary(process, path, located, open.clone(), body, TRIES, reply);
         }
         let identity = format!("SN{}", located.sn);
         let ask = Request::new(Op::OpenExtent).number(located.dn as u64).number(located.stream);
@@ -291,6 +311,10 @@ impl FE {
         let onward = Arc::clone(process);
         let named = identity.clone();
         let asked = process.ask(&identity, &ask, move |answer| {
+            // The stream is full: the object needs another, which is the DN's to give.
+            if answer.status == Status::Sealed {
+                return fe.after_stream(&onward, path, located, body, answer, reply);
+            }
             if answer.status != Status::Ok {
                 return reply.send(answer);
             }
@@ -299,7 +323,7 @@ impl FE {
                     .send(Response::error(Status::Internal, "that answer named no extent"));
             };
             fe.open.lock().expect("extents").insert(key, open.clone());
-            fe.to_primary(&onward, located, open, body, TRIES, reply);
+            fe.to_primary(&onward, path, located, open, body, TRIES, reply);
         });
         if let Err(e) = asked {
             logw!("could not reach an SN", "sn {named},{e}");
@@ -314,9 +338,11 @@ impl FE {
     /// answered `Sealed`, and the append belongs in the next one. Several writers can
     /// fill successive extents while one append is being placed, so a retry is not
     /// always the last one needed.
+    #[allow(clippy::too_many_arguments)]
     fn to_primary(
         self: &Arc<Self>,
         process: &Arc<Process>,
+        path: String,
         located: Located,
         open: Open,
         body: Vec<u8>,
@@ -340,7 +366,7 @@ impl FE {
         let onward = Arc::clone(process);
         let asked = process.ask(&identity, &ask, move |answer| {
             if answer.status == Status::Sealed {
-                return fe.after_seal(&onward, located, open, body, tries, answer, reply);
+                return fe.after_seal(&onward, path, located, open, body, tries, answer, reply);
             }
             reply.send(receipt(&located, &open, answer));
         });
@@ -357,6 +383,7 @@ impl FE {
     fn after_seal(
         self: &Arc<Self>,
         process: &Arc<Process>,
+        path: String,
         located: Located,
         open: Open,
         body: Vec<u8>,
@@ -397,6 +424,12 @@ impl FE {
         let onward = Arc::clone(process);
         let named = identity.clone();
         let asked = process.ask(&identity, &ask, move |answer| {
+            // That extent was the stream's last, so the stream is sealed too and the
+            // object needs another. Every place that asks about an extent has to
+            // handle this, which is why it is checked before anything else.
+            if answer.status == Status::Sealed {
+                return fe.after_stream(&onward, path, located, body, answer, reply);
+            }
             if answer.status != Status::Ok {
                 return reply.send(answer);
             }
@@ -404,10 +437,58 @@ impl FE {
                 return reply.send(Response::error(Status::Internal, "that seal opened no extent"));
             };
             fe.open.lock().expect("extents").insert(key, next.clone());
-            fe.to_primary(&onward, located, next, body, tries - 1, reply);
+            fe.to_primary(&onward, path, located, next, body, tries - 1, reply);
         });
         if let Err(e) = asked {
             logw!("could not reach an SN", "sn {named},{e}");
+        }
+    }
+
+    /// The stream is full. The DN gives the object another, carrying on from where
+    /// this one stopped, and the append starts again there — the new stream has no
+    /// extent yet, so it goes round the whole path rather than just the last hop.
+    fn after_stream(
+        self: &Arc<Self>,
+        process: &Arc<Process>,
+        path: String,
+        located: Located,
+        body: Vec<u8>,
+        answer: Response,
+        reply: Reply,
+    ) {
+        let [Arg::Number(records)] = answer.args.as_slice() else {
+            return reply.send(Response::error(
+                Status::Internal,
+                "a full stream said nothing about itself",
+            ));
+        };
+        // Nothing may hand out an extent of a stream that will take no more.
+        self.open.lock().expect("extents").remove(&(located.dn, located.stream));
+
+        let dn = format!("DN{}", located.dn);
+        let ask =
+            Request::new(Op::ExtendObject).text(&path).number(located.stream).number(*records);
+        let fe = Arc::clone(self);
+        let onward = Arc::clone(process);
+        let named = dn.clone();
+        let asked = process.ask(&dn, &ask, move |answer| {
+            if answer.status != Status::Ok {
+                return reply.send(answer);
+            }
+            let Some(next) = Located::of(located.dn, &answer.args) else {
+                return reply
+                    .send(Response::error(Status::Internal, "that extension named no stream"));
+            };
+            if next.stream == located.stream {
+                return reply.send(Response::error(
+                    Status::Internal,
+                    format!("{path} was extended and is still on stream {}", next.stream),
+                ));
+            }
+            fe.to_extent(&onward, path, next, body, reply);
+        });
+        if let Err(e) = asked {
+            logw!("could not reach a DN", "dn {named},{e}");
         }
     }
 
@@ -430,8 +511,11 @@ impl FE {
             }
         };
         reply.about(format_args!("{path},record {record}"));
-        self.resolve(process, &path, None, reply, move |fe, process, located, reply| {
-            fe.locate(process, located, record, reply);
+        self.resolve_record(process, &path, record, reply, move |fe, process, located, reply| {
+            // The DN answered with the stream holding it, so the number the stream
+            // knows it by is what is left after that stream's first.
+            let within = record.saturating_sub(located.first_record);
+            fe.locate(process, located, within, reply);
         });
     }
 
@@ -494,7 +578,7 @@ fn make_object(
         // Somebody else made it first. For a create that is the answer; for an
         // append it is only a reason to look again.
         if answer.status == Status::BadRequest && again {
-            return fe.resolving(&onward, &path, Some(framing), false, reply, then);
+            return fe.resolving(&onward, &path, None, Some(framing), false, reply, then);
         }
         if answer.status != Status::Ok {
             return reply.send(answer);
@@ -565,12 +649,16 @@ fn receipt(located: &Located, open: &Open, answer: Response) -> Response {
     else {
         return Response::error(Status::Internal, "that append answered with no receipt");
     };
+    // The stream-local record number, and then the object-local one, which is the
+    // address a reader gives back.
+    let in_stream = open.first_record + first;
     Response {
         id: 0,
         status: Status::Ok,
         args: vec![
             Arg::Number(located.stream),
-            Arg::Number(open.first_record + first),
+            Arg::Number(in_stream),
+            Arg::Number(located.first_record + in_stream),
             Arg::Number(*records),
             Arg::Number(*extent),
             Arg::Number(*created),
@@ -588,6 +676,9 @@ struct Located {
     stream: u64,
     sn: u32,
     framing: Framing,
+    /// The object-local number of this stream's first record, which is what turns a
+    /// record number the user gave into one the stream knows.
+    first_record: u64,
 }
 
 impl Located {
@@ -600,6 +691,7 @@ impl Located {
             _keyed,
             Arg::Number(kind),
             Arg::Number(width),
+            Arg::Number(first_record),
         ] = args
         else {
             return None;
@@ -609,6 +701,7 @@ impl Located {
             stream: *stream,
             sn: *sn as u32,
             framing: Framing::of_wire(*kind, *width).ok()?,
+            first_record: *first_record,
         })
     }
 }
@@ -674,10 +767,12 @@ mod tests {
             Arg::Flag(false),
             Arg::Number(kind),
             Arg::Number(width),
+            Arg::Number(400),
         ];
         let located = Located::of(3, &args).expect("an object");
         assert_eq!((located.dn, located.stream, located.sn), (3, 17, 0));
         assert_eq!(located.framing, Framing::CrLf);
+        assert_eq!(located.first_record, 400, "where this stream's records start");
         // A framing the DN could not have meant is not an object either.
         assert!(Located::of(3, &args[..5]).is_none());
     }
@@ -686,7 +781,7 @@ mod tests {
     /// the record number it reports is stream-local rather than extent-local.
     #[test]
     fn a_receipt_leads_with_the_durable_reference() {
-        let located = Located { dn: 0, stream: 17, sn: 0, framing: Framing::Lf };
+        let located = Located { dn: 0, stream: 17, sn: 0, framing: Framing::Lf, first_record: 0 };
         let open =
             Open { sn: 0, id: 7, created: 1_000_000, first_record: 40, instances: vec![2, 3] };
         let from_en = Response {
@@ -710,6 +805,8 @@ mod tests {
                 Arg::Number(17),
                 // 40 records in the extents before this one, plus its record 2.
                 Arg::Number(42),
+                // And the same again object-locally, since this stream starts at 0.
+                Arg::Number(42),
                 Arg::Number(1),
                 Arg::Number(7),
                 Arg::Number(1_000_000),
@@ -723,7 +820,7 @@ mod tests {
     /// to it and must not turn it into a receipt.
     #[test]
     fn a_failed_append_is_not_dressed_up_as_a_receipt() {
-        let located = Located { dn: 0, stream: 17, sn: 0, framing: Framing::Lf };
+        let located = Located { dn: 0, stream: 17, sn: 0, framing: Framing::Lf, first_record: 0 };
         let open = Open { sn: 0, id: 7, created: 1_000_000, first_record: 0, instances: vec![2] };
         let refused = Response::error(Status::Internal, "two instances would not apply it");
         assert_eq!(receipt(&located, &open, refused.clone()), refused);

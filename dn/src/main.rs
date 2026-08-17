@@ -28,6 +28,8 @@ const SERVES: &[Op] = &[
     Op::BatchCreate,
     Op::ObjectInfo,
     Op::BatchInfo,
+    Op::LocateStream,
+    Op::ExtendObject,
     Op::MakeDirectory,
     Op::RemoveDirectory,
     Op::List,
@@ -48,13 +50,97 @@ struct Object {
     /// Where one record ends and the next begins, declared here and never
     /// changed: everything that reads or writes this object's records needs it.
     framing: Framing,
-    /// The one stream this object is made of, on the SN that recorded it. Zero
-    /// while the name is taken but the stream is not yet named, which is what
-    /// stops two creates of one name from making two streams.
-    stream: u64,
-    sn: u32,
+    /// The streams this object is made of, in order. Empty while the name is taken
+    /// and the first stream is not named yet, which is what stops two creates of
+    /// one name from making two streams.
+    ///
+    /// A stream fills, so an object grows more of them; the last is the one appends
+    /// go to and the record ranges say which holds what.
+    streams: Vec<Held>,
+    /// An extension is being asked of an SN, so anything else that wants one waits
+    /// rather than asking for a second.
+    extending: bool,
+    /// Requests waiting for this object to have a stream they can use: the first
+    /// stream while it is being made, or the next one while it is being asked for.
+    ///
+    /// ⚠️ **They live here, under the shard's lock, and not in a table of their
+    /// own.** Deciding to wait and then waiting have to be one step: with a lock
+    /// released in between, the work can finish and wake nobody, and the waiter is
+    /// left holding a `Reply` that nothing will ever answer.
+    waiting: Vec<Reply>,
     keyed: bool,
     created: u64,
+}
+
+/// What an `extend-object` request turned out to be: the one doing the work, one
+/// waiting behind it, or one that can be answered on the spot.
+enum Next {
+    Ours(u64),
+    Wait,
+    Say(Response),
+}
+
+/// One of an object's streams, and where its records start.
+#[derive(Clone, Copy)]
+struct Held {
+    id: u64,
+    sn: u32,
+    /// The object-local number of this stream's first record. A stream numbers its
+    /// own records from zero; this is what makes an object's numbering continuous
+    /// across the streams it is made of.
+    first_record: u64,
+    /// Records in it, once it is sealed. None while it is the one being appended to,
+    /// because how far it reaches is not known here.
+    records: Option<u64>,
+}
+
+impl Object {
+    /// Nothing here can be appended to or read yet: the first stream is being made,
+    /// or the next one is being asked for. Waiting is better than being told there is
+    /// no stream, which is true for a moment and useless to hear.
+    fn between_streams(&self) -> bool {
+        self.streams.is_empty() || self.extending
+    }
+
+    /// What this object is, at one of its streams: the last for an append, or the one
+    /// holding a record for a read.
+    fn args(&self, record: Option<u64>) -> Option<Vec<Arg>> {
+        let held = match record {
+            None => self.last()?,
+            Some(record) => self.holding(record)?,
+        };
+        let (kind, width) = self.framing.wire();
+        Some(vec![
+            Arg::Number(self.id),
+            Arg::Number(held.id),
+            Arg::Number(held.sn as u64),
+            Arg::Number(self.created),
+            Arg::Flag(self.keyed),
+            Arg::Number(kind),
+            Arg::Number(width),
+            Arg::Number(held.first_record),
+        ])
+    }
+
+    /// The stream appends go to, which is the last one.
+    fn last(&self) -> Option<Held> {
+        self.streams.last().copied()
+    }
+
+    /// The stream holding an object-local record number: the sealed one whose range
+    /// covers it, or the last, whose reach is not known here.
+    fn holding(&self, record: u64) -> Option<Held> {
+        for held in &self.streams {
+            match held.records {
+                Some(records) if record < held.first_record + records => return Some(*held),
+                Some(_) => continue,
+                // The stream still being appended to: anything past its start is
+                // routed to it, and the SN and EN say whether it is really there.
+                None => return Some(*held),
+            }
+        }
+        None
+    }
 }
 
 /// One object a create asks for: a name, a flavour, and a framing.
@@ -82,19 +168,15 @@ impl Wanted {
     }
 }
 
-/// Requests parked until an object's stream exists, keyed by name.
-type Waiting = HashMap<Box<str>, Vec<Reply>>;
-
 struct DN {
     config: DNConfig,
     shards: Vec<Mutex<HashMap<Box<str>, Object>>>,
-    /// Lookups that arrived while an object was half made: the name is taken and
-    /// its stream is not named yet. Whoever took the name is asking an SN for the
-    /// stream, and these are handed the answer when it arrives rather than being
-    /// told the object has no stream — which is true for a moment and useless to
-    /// hear.
-    waiting: Mutex<Waiting>,
+    /// How many requests are waiting for an object to have a stream, for `status`.
+    parked: AtomicU64,
     objects: AtomicU64,
+    /// Streams handed to objects after their first, which is what a stream sealing
+    /// costs.
+    streams: AtomicU64,
     next_object: AtomicU64,
     next_stream: AtomicU64,
 }
@@ -128,7 +210,14 @@ impl Service for DN {
     fn defers(&self, op: Op) -> bool {
         // A lookup can park behind a create, so its answer need not come from the
         // thread that read it either.
-        matches!(op, Op::CreateObject | Op::BatchCreate | Op::ObjectInfo)
+        matches!(
+            op,
+            Op::CreateObject
+                | Op::BatchCreate
+                | Op::ObjectInfo
+                | Op::LocateStream
+                | Op::ExtendObject
+        )
     }
 
     /// A lookup is a hash and a read, which is not worth a queue hop. Taking
@@ -136,7 +225,14 @@ impl Service for DN {
     fn inline(&self, op: Op) -> bool {
         matches!(
             op,
-            Op::ObjectInfo | Op::BatchInfo | Op::Ping | Op::Status | Op::Shutdown | Op::Sites
+            Op::ObjectInfo
+                | Op::BatchInfo
+                | Op::LocateStream
+                | Op::ExtendObject
+                | Op::Ping
+                | Op::Status
+                | Op::Shutdown
+                | Op::Sites
         )
     }
 
@@ -144,7 +240,15 @@ impl Service for DN {
         match request.op {
             Op::CreateObject => self.create(process, &request, reply),
             Op::BatchCreate => self.create_many(process, &request, reply),
-            Op::ObjectInfo => self.info(&request, reply),
+            Op::ObjectInfo => self.info(&request, None, reply),
+            Op::LocateStream => match request.args.as_slice() {
+                [_, Arg::Number(record), ..] => self.info(&request, Some(*record), reply),
+                _ => reply.send(Response::error(
+                    Status::BadRequest,
+                    "locate-stream takes a name and a record",
+                )),
+            },
+            Op::ExtendObject => self.extend(process, &request, reply),
             Op::BatchInfo => reply.send(self.info_many(&request)),
             _ => reply.send(server::unbuilt(process, SERVES, &request)),
         }
@@ -153,7 +257,8 @@ impl Service for DN {
     fn status(&self, _process: &Process) -> Vec<String> {
         vec![
             format!("objects {}", self.objects.load(Ordering::Relaxed)),
-            format!("waiting_for_a_stream {}", self.waiting.lock().expect("waiting").len()),
+            format!("extra_streams {}", self.streams.load(Ordering::Relaxed)),
+            format!("waiting_for_a_stream {}", self.parked.load(Ordering::Relaxed)),
             format!("self_hosted {}", self.config.self_hosted),
         ]
     }
@@ -226,8 +331,9 @@ impl DN {
                     Object {
                         id,
                         framing: one.framing,
-                        stream: 0,
-                        sn: 0,
+                        streams: Vec::new(),
+                        extending: false,
+                        waiting: Vec::new(),
                         keyed: one.keyed,
                         created,
                     },
@@ -271,8 +377,12 @@ impl DN {
             for (n, name) in mine.iter().enumerate() {
                 let mut shard = dn.shards[shard_of(name)].lock().expect("objects");
                 if let Some(object) = shard.get_mut(name.as_str()) {
-                    object.stream = first + n as u64;
-                    object.sn = sn_number;
+                    object.streams.push(Held {
+                        id: first + n as u64,
+                        sn: sn_number,
+                        first_record: 0,
+                        records: None,
+                    });
                 }
             }
             dn.objects.fetch_add(count, Ordering::Relaxed);
@@ -288,6 +398,141 @@ impl DN {
         }
     }
 
+    /// `(name, sealed stream, records)`: that stream is full, so give the object
+    /// another one carrying on from where it stopped.
+    ///
+    /// **One request does the work.** Several appends find the stream full at once,
+    /// so the first to arrive asks an SN and the rest park behind it — and because
+    /// asking an SN is a round trip, they park rather than hold a worker.
+    fn extend(self: &Arc<Self>, process: &Arc<Process>, request: &Request, reply: Reply) {
+        let (name, sealed, records) = match request.args.as_slice() {
+            [Arg::Text(name), Arg::Number(sealed), Arg::Number(records)] => {
+                (name.clone(), *sealed, *records)
+            }
+            _ => {
+                return reply.send(Response::error(
+                    Status::BadRequest,
+                    "extend-object takes a name, the sealed stream and its record count",
+                ));
+            }
+        };
+
+        // ⚠️ One lock, and everything decided inside it. An earlier version released
+        // the lock before parking — so the extension could finish in the gap and wake
+        // nobody — and called a method that takes the same lock again, which is a
+        // deadlock rather than a slow path.
+        let mut carry = Some(reply);
+        let next = {
+            let mut shard = self.shards[shard_of(&name)].lock().expect("objects");
+            match shard.get_mut(name.as_str()) {
+                None => Next::Say(Response::error(Status::NotFound, format!("no object {name}"))),
+                Some(object) => {
+                    // Whoever names the stream that filled is the one that seals it in
+                    // the list; the rest are late and have nothing to record.
+                    let ours = object.streams.last().is_some_and(|last| last.id == sealed);
+                    if ours {
+                        if let Some(last) = object.streams.last_mut() {
+                            last.records = Some(records);
+                        }
+                    }
+                    if object.extending {
+                        object.waiting.push(carry.take().expect("a reply"));
+                        self.parked.fetch_add(1, Ordering::Relaxed);
+                        Next::Wait
+                    } else if ours {
+                        object.extending = true;
+                        let from = object.streams.last().map_or(0, |last| last.first_record);
+                        Next::Ours(from + records)
+                    } else {
+                        // Somebody else extended past it already, so whatever is last
+                        // now is the answer.
+                        match object.args(None) {
+                            Some(args) => Next::Say(Response { id: 0, status: Status::Ok, args }),
+                            None => Next::Say(Response::error(
+                                Status::Internal,
+                                format!("{name} has no stream"),
+                            )),
+                        }
+                    }
+                }
+            }
+        };
+
+        match (next, carry) {
+            (Next::Wait, _) => {}
+            (Next::Say(answer), Some(reply)) => reply.send(answer),
+            (Next::Ours(first_record), Some(reply)) => {
+                self.next_stream_for(process, name, first_record, reply)
+            }
+            (_, None) => {}
+        }
+    }
+
+    /// Name a stream, have an SN record it, and add it to the object.
+    fn next_stream_for(
+        self: &Arc<Self>,
+        process: &Arc<Process>,
+        name: String,
+        first_record: u64,
+        mut reply: Reply,
+    ) {
+        let created = now();
+        let stream = self.next_stream.fetch_add(1, Ordering::Relaxed);
+        let sn = match process.pick(ServiceKind::Sn) {
+            Ok(sn) => sn.to_string(),
+            Err(e) => return reply.send(self.gave_up(&name, Status::Internal, e.to_string())),
+        };
+        let sn_number = process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0);
+        let ask = Request::new(Op::CreateStream)
+            .number(process.entry.number() as u64)
+            .number(stream)
+            .number(1)
+            .number(created);
+
+        let dn = Arc::clone(self);
+        let named = sn.clone();
+        reply.about(format_args!("{name} stream {stream} on {named} from record {first_record}"));
+        let asked = process.ask(&sn, &ask, move |answer| {
+            if answer.status != Status::Ok {
+                let why = format!("{named} would not make a stream");
+                let failed = dn.gave_up(&name, answer.status, why);
+                dn.wake(std::slice::from_ref(&name), Some(&failed));
+                return reply.send(failed);
+            }
+            {
+                let mut shard = dn.shards[shard_of(&name)].lock().expect("objects");
+                if let Some(object) = shard.get_mut(name.as_str()) {
+                    object.streams.push(Held {
+                        id: stream,
+                        sn: sn_number,
+                        first_record,
+                        records: None,
+                    });
+                    object.extending = false;
+                }
+            }
+            dn.streams.fetch_add(1, Ordering::Relaxed);
+            let answer = match dn.describe(&name, None) {
+                Some(args) => Response { id: 0, status: Status::Ok, args },
+                None => Response::error(Status::Internal, format!("{name} has no stream")),
+            };
+            dn.wake(std::slice::from_ref(&name), None);
+            reply.send(answer);
+        });
+        if let Err(e) = asked {
+            logw!("could not reach an SN", "sn {sn},{e}");
+        }
+    }
+
+    /// An extension that could not be made: stop claiming one is in flight, or
+    /// everything waiting behind it waits for ever.
+    fn gave_up(&self, name: &str, status: Status, why: String) -> Response {
+        if let Some(object) = self.shards[shard_of(name)].lock().expect("objects").get_mut(name) {
+            object.extending = false;
+        }
+        Response::error(status, why)
+    }
+
     /// Release names taken for objects that could not be given a stream.
     fn give_back(&self, names: &[String], status: Status, why: String) -> Response {
         for name in names {
@@ -296,32 +541,34 @@ impl DN {
         Response::error(status, why)
     }
 
-    fn info(&self, request: &Request, reply: Reply) {
+    fn info(&self, request: &Request, record: Option<u64>, reply: Reply) {
         let name = match request.args.first() {
             Some(Arg::Text(name)) => name.as_str(),
             _ => {
                 return reply.send(Response::error(Status::BadRequest, "object-info takes a name"));
             }
         };
-        match self.look(name) {
-            Some(args) => reply.send(Response { id: 0, status: Status::Ok, args }),
-            None if self.taken(name) => {
-                // Half made: park behind whoever is naming its stream.
-                self.waiting
-                    .lock()
-                    .expect("waiting")
-                    .entry(Box::from(name))
-                    .or_default()
-                    .push(reply);
+        // Under one lock: answer, or park. Deciding to wait and then waiting must be
+        // one step, or the work can finish in between and wake nobody.
+        let mut carry = Some(reply);
+        let answer = {
+            let mut shard = self.shards[shard_of(name)].lock().expect("objects");
+            match shard.get_mut(name) {
+                None => Some(Response::error(Status::NotFound, format!("no object {name}"))),
+                Some(object) => match object.args(record) {
+                    Some(args) => Some(Response { id: 0, status: Status::Ok, args }),
+                    None if object.between_streams() => {
+                        object.waiting.push(carry.take().expect("a reply"));
+                        self.parked.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
+                    None => Some(Response::error(Status::NotFound, format!("no object {name}"))),
+                },
             }
-            None => reply.send(Response::error(Status::NotFound, format!("no object {name}"))),
+        };
+        if let (Some(answer), Some(reply)) = (answer, carry) {
+            reply.send(answer);
         }
-    }
-
-    /// Whether the name is taken by an object whose stream is not named yet.
-    fn taken(&self, name: &str) -> bool {
-        let shard = self.shards[shard_of(name)].lock().expect("objects");
-        shard.get(name).is_some_and(|object| object.stream == 0)
     }
 
     /// Answer everything parked on these names, now that their streams exist. A name
@@ -329,18 +576,24 @@ impl DN {
     /// waits for an answer that is never coming.
     fn wake(&self, names: &[String], failed: Option<&Response>) {
         for name in names {
-            let parked = self.waiting.lock().expect("waiting").remove(name.as_str());
-            for reply in parked.unwrap_or_default() {
-                match (failed, self.look(name)) {
-                    (None, Some(args)) => reply.send(Response { id: 0, status: Status::Ok, args }),
-                    (failed, _) => reply.send(match failed {
-                        Some(answer) => answer.clone(),
-                        None => Response::error(
-                            Status::Internal,
-                            format!("{name} was made and then lost"),
-                        ),
-                    }),
+            let (waiters, args) = {
+                let mut shard = self.shards[shard_of(name)].lock().expect("objects");
+                match shard.get_mut(name.as_str()) {
+                    Some(object) => (std::mem::take(&mut object.waiting), object.args(None)),
+                    None => (Vec::new(), None),
                 }
+            };
+            self.parked.fetch_sub(waiters.len() as u64, Ordering::Relaxed);
+            for reply in waiters {
+                reply.send(match (failed, &args) {
+                    (None, Some(args)) => {
+                        Response { id: 0, status: Status::Ok, args: args.clone() }
+                    }
+                    (Some(failed), _) => failed.clone(),
+                    (None, None) => {
+                        Response::error(Status::Internal, format!("{name} was made and then lost"))
+                    }
+                });
             }
         }
     }
@@ -376,23 +629,11 @@ impl DN {
     /// What an object is: id, stream, the SN holding it, the second it was made,
     /// its flavour, and its framing as a kind and a width.
     fn look(&self, name: &str) -> Option<Vec<Arg>> {
-        let shard = self.shards[shard_of(name)].lock().expect("objects");
-        let object = shard.get(name)?;
-        // A name with no stream is an object that is still being made, and saying so
-        // is worse than useless — whoever asked would have to guess how long to wait.
-        if object.stream == 0 {
-            return None;
-        }
-        let (kind, width) = object.framing.wire();
-        Some(vec![
-            Arg::Number(object.id),
-            Arg::Number(object.stream),
-            Arg::Number(object.sn as u64),
-            Arg::Number(object.created),
-            Arg::Flag(object.keyed),
-            Arg::Number(kind),
-            Arg::Number(width),
-        ])
+        self.describe(name, None)
+    }
+
+    fn describe(&self, name: &str, record: Option<u64>) -> Option<Vec<Arg>> {
+        self.shards[shard_of(name)].lock().expect("objects").get(name)?.args(record)
     }
 }
 
@@ -401,8 +642,9 @@ impl DN {
         DN {
             config,
             shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
-            waiting: Mutex::new(HashMap::new()),
+            parked: AtomicU64::new(0),
             objects: AtomicU64::new(0),
+            streams: AtomicU64::new(0),
             next_object: AtomicU64::new(1),
             next_stream: AtomicU64::new(1),
         }
@@ -431,8 +673,9 @@ mod tests {
             Object {
                 id: 1,
                 framing: Framing::Lf,
-                stream: 0,
-                sn: 0,
+                streams: Vec::new(),
+                extending: false,
+                waiting: Vec::new(),
                 keyed: false,
                 created: 1_000_000,
             },
@@ -447,14 +690,26 @@ mod tests {
         let dn = DN::new(testing::dn_config());
         half_made(&dn, "/half");
         assert!(dn.look("/half").is_none(), "nothing to say about it yet");
-        assert!(dn.taken("/half"), "but the name is taken");
-        assert!(!dn.taken("/nothing"), "unlike a name nobody has");
+        let waits = |name: &str| {
+            dn.shards[shard_of(name)]
+                .lock()
+                .unwrap()
+                .get(name)
+                .is_some_and(|object| object.between_streams())
+        };
+        assert!(waits("/half"), "but the name is taken, so a lookup waits");
+        assert!(!waits("/nothing"), "unlike a name nobody has");
 
         // Once the stream is named it describes normally.
-        dn.shards[shard_of("/half")].lock().unwrap().get_mut("/half").unwrap().stream = 7;
+        dn.shards[shard_of("/half")].lock().unwrap().get_mut("/half").unwrap().streams.push(Held {
+            id: 7,
+            sn: 0,
+            first_record: 0,
+            records: None,
+        });
         let args = dn.look("/half").expect("an object");
         assert_eq!(args[1], Arg::Number(7), "its stream");
-        assert!(!dn.taken("/half"), "and it is no longer half made");
+        assert!(!waits("/half"), "and it is no longer half made");
     }
 
     /// A name is taken before its stream is asked for, so two creates of one name
@@ -473,8 +728,9 @@ mod tests {
                     Object {
                         id: dn.next_object.fetch_add(1, Ordering::Relaxed),
                         framing: Framing::Lf,
-                        stream: 0,
-                        sn: 0,
+                        streams: Vec::new(),
+                        extending: false,
+                        waiting: Vec::new(),
                         keyed: false,
                         created: 1_000_000,
                     },
@@ -485,6 +741,37 @@ mod tests {
         };
         assert_eq!(mine(&dn).len(), 1, "the first one takes it");
         assert!(mine(&dn).is_empty(), "the second finds it there");
+    }
+
+    /// An object grows streams, and the record ranges are what make its numbering
+    /// continuous across them. This is the arithmetic the DN answers reads with.
+    #[test]
+    fn an_objects_streams_carry_on_from_one_another() {
+        let mut object = Object {
+            id: 1,
+            framing: Framing::Lf,
+            streams: Vec::new(),
+            extending: false,
+            waiting: Vec::new(),
+            keyed: false,
+            created: 1_000_000,
+        };
+        // Two sealed streams and one still open.
+        object.streams.push(Held { id: 1, sn: 0, first_record: 0, records: Some(10) });
+        object.streams.push(Held { id: 2, sn: 0, first_record: 10, records: Some(5) });
+        object.streams.push(Held { id: 3, sn: 0, first_record: 15, records: None });
+
+        assert_eq!(object.holding(0).unwrap().id, 1);
+        assert_eq!(object.holding(9).unwrap().id, 1);
+        assert_eq!(object.holding(10).unwrap().id, 2);
+        assert_eq!(object.holding(14).unwrap().id, 2);
+        assert_eq!(object.holding(15).unwrap().id, 3);
+        // Past everything sealed goes to the open stream, whose reach is not known
+        // here — the SN and EN say whether the record is really there.
+        assert_eq!(object.holding(1000).unwrap().id, 3);
+        // And an append always goes to the last.
+        assert_eq!(object.last().unwrap().id, 3);
+        assert!(!object.between_streams());
     }
 
     /// A create carries a name, a flavour and a framing, and anything after those is

@@ -263,11 +263,11 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Append blocks are atomic; **accepted / applied / durable**, with 3-of-4 a quorum | §8.1.1 |
 | **Erasure coding forces byte-identical instances**, so an instance must **truncate above the durable watermark** on handover | §8.1.1a |
 | The primary assigns a **logical** offset in a tiny serialized window; compress, encrypt and write happen outside it | §8.1.1a-2 |
-| **Single-writer** appends supply their expected offset and are **exactly-once**; **multi-writer** appends are **at-least-once**. Prior art: **Azure append blobs**, same two modes, same rationale | §8.1.1a-3, §8.1.1a-5 |
-| Logical offsets are **dense** — no padding, no holes — which is what makes the single-writer check, the reorder cache, and cumulative byte totals work | §8.1.1a-6 |
+| **Fixed-offset** appends supply their expected offset and are **exactly-once**; **assigned-offset** appends are **at-least-once**. The difference is duplicate prevention, not writer count — several writers may fix offsets. Prior art: **Azure append blobs**, same two modes, same rationale | §8.1.1a-3, §8.1.1a-5 |
+| Logical offsets are **dense** — no padding, no holes — which is what makes the fixed-offset check, the reorder cache, and cumulative byte totals work | §8.1.1a-6 |
 | **Unkeyed** objects have one unsealed extent, so the **object** logical offset is reportable; **keyed** objects have several, so only an extent-relative offset exists and it does not survive coalescing | §8.1.1a-7 |
 | So compare-and-append is unkeyed-only; keyed objects get idempotency **from the key** | §8.1.1a-7 |
-| An append block is a **byte range**, not a set of records; fragments are single-writer only | §8.1 |
+| An append block is a **byte range**, not a set of records; only a writer fixing its own offsets may leave a fragment | §8.1 |
 | Append blocks bounded at **32 MB logical**, so one always fits a fresh extent | §8.1.1a-2 |
 | No chunk padding: an append that will not fit **seals the extent short** | §8.1.1c |
 | The quorum forces **broadcast, not a daisy chain** | §8.1.2 |
@@ -4050,6 +4050,36 @@ replacing it.
 
 ---
 
+### 6.3 What it means for a *stream* to be sealed
+
+**A stream is sealed if it is not allowed any more appends or concatenates** (Asserted, Bob,
+2026-08-17). That is a statement about permission, not about fullness — and it is the definition to
+keep, because fullness is only one of the reasons it happens.
+
+**The reason it makes sense is the middle of an object.** An unkeyed object is append-only, and §3's
+whole argument is that record numbers must be stable: an insert in the middle renumbers everything
+after it. An object made of several streams therefore has exactly one stream that may take an
+append — the last — and **every stream before it is sealed by construction**, because appending to a
+middle stream would insert records into the middle of the object.
+
+Two things follow, and the second is what the implementation rests on:
+
+- **Sealing is what makes the next stream's numbering safe.** Once a stream is sealed with *R*
+  records starting at object-local record *F*, the stream after it starts at *F* + *R* and that never
+  moves. A stream that could still grow would make every record number above it provisional.
+- **A sealed stream's record count is knowable, and an open one's is not.** So a DN can say which
+  stream holds record *N* for all the sealed ones by arithmetic, and for the last one it can only say
+  "at or past its first record" and let the tiers below answer. That asymmetry is not an
+  implementation shortcut; it is what "sealed" means.
+
+**And concatenation is covered by the same word.** §8.6.1 builds an object by concatenating sealed
+streams, so a stream that is a *source* is unaffected — but a sealed stream may not be a *target*, for
+the same reason it may not take an append: it would renumber what follows.
+
+Why a stream seals in the first place is a separate question with a separate answer: its SN's memory
+is what bounds how many extents it can hold (§14.1), so a stream fills. `extents.per_stream` is that
+limit, and on a test cluster it is set low so a stream sealing is the common path (§17.12).
+
 ## 7. The storage pipeline
 
 Every extent body goes through the same pipeline, and the order is forced:
@@ -4533,14 +4563,16 @@ The unit of write is an **append block**: a byte range applied to the target ext
 range becomes visible or none of it does.
 
 ⚠️ Note "byte range", not "set of records". A block may contain **record fragments** at either end, since with
-a single writer a record may span appends (§8.2.2). So a record becomes complete only when every append
+a writer that fixes its own offsets a record may span appends (§8.2.2). So a record becomes complete only when every append
 carrying part of it is durable, and atomicity is a property of the byte range rather than of the records inside
 it. An earlier draft said "0..n records, all its records become visible or none do", which is true only when
 appends happen to be record-aligned.
 
-**Fragments are a single-writer affair.** Two writers interleaving appends into one extent would split each
-other's records, so **multi-writer appends must be record-aligned** (§8.1.1a-3); only a single writer, which
-controls the whole byte stream, can safely leave a record half-written.
+**Fragments belong to fixed-offset appends.** A record spanning two appends needs those appends to be
+consecutive in the extent, which a writer can only know if it fixed the offsets itself — so
+**assigned-offset appends must be record-aligned** (§8.1.1a-3), since two of them interleaving would split
+each other's records. What makes a fragment safe is not that there is one writer but that the writer knows
+where its bytes landed.
 
 An append returns its **logical offset in the extent** as a locator, plus the record number of the first
 complete record it contains (unkeyed) and the extent it landed in.
@@ -4667,7 +4699,19 @@ sees half an append however many writes it took.
 
 **Durability returns the offset as a locator**, so a writer learns exactly where its data landed.
 
-#### 8.1.1a-3 Single-writer mode gives exactly-once, for free
+#### 8.1.1a-3 Fixed-offset append gives exactly-once, for free
+
+⚠️ **An earlier draft called this "single-writer mode", and that is the wrong name** (Asserted, Bob,
+2026-08-17). What distinguishes the two modes is **whether duplicates are prevented**, not how many writers
+there are: **several writers may append at fixed offsets**, and what they get is not duplicates but
+*mismatch failures* — a writer whose expected offset has been filled by somebody else is told so, and retries
+against the new end. Duplicates are *allowed* in the other mode, not required in this one. So the modes are
+named for who fixes the offset (Asserted, Bob, 2026-08-17):
+
+| Mode | Offset | Duplicates |
+|---|---|---|
+| **Fixed-offset append** | the writer supplies the offset it expects | **prevented** — the offset plus the content is the token |
+| **Assigned-offset append** | the primary assigns it on arrival | possible — a retry gets a fresh offset |
 
 A writer that wants exactly-once **tracks the offset it expects and includes it in the append.** The primary
 then compares:
@@ -4689,25 +4733,27 @@ So the two modes differ in exactly the way GFS's does not offer:
 
 | | Offset | Semantics | Suits |
 |---|---|---|---|
-| **Single-writer** | supplied by the writer | **exactly-once**, with conflict detection | anything relying on stable record numbers (§1.0) |
-| **Multi-writer** | assigned by the primary | **at-least-once** — a retry gets a fresh offset, so duplicates are possible | merge and producer-consumer patterns, as in GFS |
+| **Fixed-offset** | supplied by the writer | **exactly-once**, with conflict detection | anything relying on stable record numbers (§1.0) |
+| **Assigned-offset** | assigned by the primary | **at-least-once** — a retry gets a fresh offset, so duplicates are possible | merge and producer-consumer patterns, as in GFS |
 
-⚠️ Worth being explicit that multi-writer is at-least-once, and for the same reason GFS's is: with no expected
-offset there is nothing to compare a retry against. Users wanting stable external indexes should use
-single-writer mode; multi-writer users must tolerate duplicates exactly as GFS's do.
+⚠️ Worth being explicit that assigned-offset appends are at-least-once, and for the same reason GFS's are:
+with no expected offset there is nothing to compare a retry against. Users wanting stable external indexes
+should fix their offsets; users letting the primary assign them must tolerate duplicates exactly as GFS's
+do — and a writer chooses per append, since the difference is one argument rather than a mode the object
+is in.
 
 #### 8.1.1a-4 The out-of-order cache, and why only one mode needs it
 
-A single writer pipelining several appends may have them arrive out of order, so **an EN receiving an append
+A writer pipelining several fixed-offset appends may have them arrive out of order, so **an EN receiving an append
 from beyond the current end can cache it, ordered by offset, in case the gap fills.** That is what lets a
-single writer keep many appends in flight rather than waiting for each to be placed — which matters, since
+writer keep many fixed-offset appends in flight rather than waiting for each to be placed — which matters, since
 §1.4 makes throughput the priority and a stop-and-wait writer would be latency-bound.
 
-**Multi-writer appends need no such cache**, because offsets are assigned on arrival and gaps never occur.
+**Assigned-offset appends need no such cache**, because the offset is chosen on arrival and gaps never occur.
 
 ⚠️ The cache needs a **bound** and a **timeout**: memory is finite, and a gap left by an append that never
 arrives must not pin cached data indefinitely. Both are undesigned, and together they set how far ahead a
-single writer may pipeline.
+writer may pipeline.
 
 #### 8.1.1a-5 Prior art: Azure append blobs
 
@@ -4723,7 +4769,8 @@ that specified by the client" and otherwise failing 412. Microsoft's stated purp
 > "Clients that use a single writer can use this header to determine whether an `Append Block` operation
 > succeeded, despite a network failure."
 
-Their multi-writer advice matches §8.1.1a-3 too — conditional headers work but hurt throughput, so "for the
+Their advice for many writers matches §8.1.1a-3 too — Azure's word for a fixed offset is a *conditional*
+header, and they note it works but hurts throughput, so "for the
 highest concurrent append throughput, applications should handle redundant appends and delayed appends in the
 application layer", by adding "epochs or sequence numbers in the data". Which is also GFS's advice (§8.1.1a).
 **Two independent designs reached the same split: conditional append for one writer, at-least-once plus
@@ -4754,7 +4801,7 @@ GFS's offsets have holes too, from the padding of §8.1.1c.
 
 | Mechanism | Why density is required |
 |---|---|
-| The single-writer check (§8.1.1a-3) | the writer must **predict** the next offset — impossible if the system may skip |
+| The fixed-offset check (§8.1.1a-3) | the writer must **predict** the next offset — impossible if the system may skip |
 | The out-of-order cache (§8.1.1a-4) | it assumes gaps are *temporary*, from reordering. A permanent hole would never fill and the cache would never drain |
 | Cumulative logical byte totals (§4) | logical offsets must be additive to be searchable |
 
@@ -4937,7 +4984,7 @@ then dies, a client retry could append it a second time, and nothing in the desi
 **Resolved, and more cheaply than Kafka's answer.** §8.1.1a-3 gets exactly-once from the expected offset plus
 a content comparison, so no producer identifier or sequence number is needed — the request already carries
 everything required to recognize its own retry. Kafka needs a token because its producers do not track
-offsets; a DeLawson single-writer does.
+offsets; a DeLawson writer fixing its own does.
 
 What remains open is not exactly-once but **truncation on handover** (§8.1.1a) and the **bound and timeout on
 the out-of-order cache** (§8.1.1a-4).
@@ -5408,11 +5455,11 @@ translation off the read path. Saving space is a weaker motive than it looks: at
 predictable as data gets — an identical terminator every hundred bytes — so compression removes
 most of that before it reaches the physical bytes anyone is billed for (§12.3).
 
-#### 8.2.2 Zero-length appends break the single-writer offset check
+#### 8.2.2 Zero-length appends break the fixed-offset check
 
 ⚠️ `FixedLength` with a declared width of **zero** is degenerate in a way that collides with
 §8.1.1a-3: every record occupies 0 logical bytes, so an append of any size advances the logical
-offset by nothing, and **two appends share an offset**. The single-writer check then cannot tell a
+offset by nothing, and **two appends share an offset**. The fixed-offset check then cannot tell a
 retry from a new append, which is precisely what it exists to do.
 
 **Resolved: the append offset is always determined in a canonical length-stuffed space** (Asserted,
@@ -5427,7 +5474,7 @@ Bob, 2026-08-15), independent of how the append is actually formatted.
 
 The invariant the check actually needs is still worth stating:
 
-> **Every single-writer append must advance the logical offset strictly.**
+> **Every fixed-offset append must advance the logical offset strictly.**
 
 but the only way left to violate it is an append containing **zero records**, permitted by §8.1. That
 is a property of the individual request rather than of the object's declared framing, so it is
@@ -5457,8 +5504,8 @@ a representation, and now so is the physical byte position; only the canonical o
   agreeing is a consistency check, not a coincidence to be relied on.
 
 **An earlier draft suggested using the record number instead, and that does not work.** Appends may contain
-**record fragments** — with a single writer it is reasonable for a record to span appends — so an append
-boundary need not fall on a record boundary. A record number therefore does not identify an append: two
+**record fragments** — a writer that fixes its own offsets may reasonably let a record span appends — so an
+append boundary need not fall on a record boundary. A record number therefore does not identify an append: two
 appends can both begin inside record 5, and distinguishing them needs *(record number, offset within the
 record)*, a two-part token strictly worse than the single logical byte offset.
 
@@ -5471,8 +5518,8 @@ Four rules, all Bob's, 2026-08-17, and they are not the same rule at different s
 
 1. **An extent contains whole records.** Sealing is where this is enforced, and the boundary is the
    extent's, not the append's.
-2. **A record may cross append blocks.** §8.2.2 already relies on this — a single writer controls the
-   whole byte stream, so an append boundary need not fall on a record boundary.
+2. **A record may cross append blocks.** §8.2.2 already relies on this — a writer fixing its own offsets
+   controls where its bytes land, so an append boundary need not fall on a record boundary.
 3. **A terminator framing's data may not contain its terminator**, and **the `laws` client is what
    checks it.** The client is the last place that holds records *as records* before they become a byte
    stream; after that, a stray `\n` in `lf` data is not a violation anybody can detect — it is simply
@@ -5962,8 +6009,8 @@ resolution is that **the three properties people want are a trilemma, not a menu
 
 #### 8.6.1 Concatenation of sealed streams is the mechanism
 
-The way to build a large single-writer object is to **write many partitions in parallel, each single-writer, seal
-them, then concatenate them into one object** (Asserted, Bob, 2026-08-15).
+The way to build a large object with one writer's ordering is to **write many partitions in parallel, each
+with its own writer, seal them, then concatenate them into one object** (Asserted, Bob, 2026-08-15).
 
 This is strictly better than the deferred-offset interface §8.1.1a-9 rejects, and for a reason worth stating:
 **concatenating sealed streams computes the offsets you would have deferred, synchronously, at a moment you
@@ -6032,7 +6079,7 @@ streams a billing catastrophe on SN (§12.2); it is not what DN pays.
 > **Spray per writer, not per request.** A writer picks its stream once and stays on it.
 
 Then DN traffic is one entry per writer, ever. Round-robin per append makes DN's update rate equal the request
-rate and kills it. That stickiness is already forced by single-writer compare-and-append (§8.1.1a-3), so it is not
+rate and kills it. That stickiness is already forced by fixed-offset compare-and-append (§8.1.1a-3), so it is not
 a new constraint. And per §12.1 the enforcement should be **price, not quota**: bill stream count and DN entry
 count and fragment-spraying becomes the expensive way to write — §12.2's lesson applied prospectively instead of
 retroactively.
@@ -8343,7 +8390,7 @@ replicated dataset.
 want a writable version you **copy** — see §13.4.5.5.
 
 That removes a hazard rather than deferring it. A promoted-in-place replica would have to accept appends under
-§8.1.1a-3's single-writer compare-and-append at offsets the old primary may also have used, which is split-brain
+§8.1.1a-3's fixed-offset compare-and-append at offsets the old primary may also have used, which is split-brain
 at the offset level. An always-read-only replica cannot have that problem.
 
 It is also a mechanism that **resists the operator**, in §4.3.4.2's sense: a replica that is structurally
@@ -9288,7 +9335,7 @@ Roughly in order of how much else depends on them.
   compare-and-append is therefore unkeyed-only (§8.1.1a-7);
 - whether to defer the object offset until sealing — no; no system does it, and the
   reasons are structural, not merely conventional (§8.1.1a-9);
-- how zero-width fixed-length rows break the single-writer check — they no longer do,
+- how zero-width fixed-length rows break the fixed-offset check — they no longer do,
   because offsets are assigned in a canonical length-stuffed space (§8.2.2);
 - whether logical offsets survive re-framing during coalescing — they do, for the same
   reason (§8.2.2, §8.2.1);
@@ -10437,7 +10484,7 @@ counts four extents, 320 appends and three seals, the DN counts one object and n
 
 The interleaving is a writer-visible consequence worth stating: record 0 came from client 7. Several
 writers appending to one object get **at-least-once ordering by arrival**, which is §8.1.1a's
-multi-writer mode working as designed, and a reason a writer wanting its own order wants its own
+assigned-offset mode working as designed, and a reason a writer wanting its own order wants its own
 object.
 
 #### 17.11.2 What the SN can and cannot see
@@ -10478,3 +10525,61 @@ Two consequences for what to build, and both are §17.10's rule in new places:
   coordinators independently discovered the same fact.
 - **The FE should cache where a record lives** for reads (#58). A sealed extent is immutable, so its
   record range never changes; §9.1 already says a warm client goes straight to the EN.
+
+### 17.12 A stream seals too, and the DN gives the object another
+
+Built, 2026-08-17, which completes §17.9.4's sequence. `extents.per_stream` is the limit — **3** on the
+single-box cluster, so a stream fills every few kilobytes — and what happens when it does:
+
+| Who | Does |
+|---|---|
+| SN | seals the last extent, finds the stream has all the extents it may have, and answers `Sealed` with what the **stream** came to |
+| FE | drops the extent it cached and asks the DN to extend the object |
+| DN | seals that stream in the object's stream list, names the next one, has an SN record it, and answers with it |
+| FE | starts the append again on the new stream, which has no extent yet |
+
+**An object is a list of streams, each with the object-local record number it starts at.** That is what
+makes an object's numbering continuous across the streams it is made of: a sealed stream's record count is
+known (§6.3), so the next stream starts at first + count and never moves.
+
+**So a read asks a different question of the DN than an append does.** An append asks for the object's
+*last* stream (`object-info`); a read asks which stream holds *its record* (`locate-stream`). Same answer
+shape, and the same number of hops as before — the DN was always in the read path, it just used to have only
+one stream to answer with.
+
+⚠️ **The DN can answer for the sealed streams by arithmetic and cannot for the last one**, so a record at or
+past the last stream's first record is routed there and the SN and EN say whether it is really present. That
+asymmetry is §6.3's definition showing through: a sealed stream's count is a fact, an open one's is not.
+
+**Extending is collapsed the way §17.10 requires**: the first append to find the stream full sets a flag on
+the object and asks an SN, and the rest park behind it and are handed the same stream. Because asking an SN
+is a round trip, they park rather than hold a worker — which is what #56 asked for, arriving here first.
+`extend-object` therefore defers, and so does `object-info`, since it may be parked behind the same work.
+
+#### 17.12.1 What it took to work
+
+400 appends of 44 bytes: **2 streams, 5 extents, 4 sealed extents, 1 sealed stream, and every record
+readable — including 269 and 270, which are the last of one stream and the first of the next.**
+
+Three bugs found on the way, and the shapes are more instructive than the fixes.
+
+**`Sealed` leaked to the client.** Three separate places ask the SN about an extent — opening one, sealing
+one, and retrying after a seal — and each has to handle "the stream is full too". One did not. The lesson is
+not about sealing: **a status every caller must handle wants to be impossible to forget**, and three
+hand-written checks is three chances to miss one.
+
+⚠️ **A self-deadlock, from a method that takes a lock the caller already holds.** The extension path decided
+what to do with the object's shard locked, and one branch called a helper that locks the same shard to
+describe the object. Rust's mutexes are not reentrant, so that branch wedged a worker thread — and under
+eight writers it took them all, one at a time, until the DN answered nothing and every client timed out.
+**It looked like a performance problem and was a liveness one.**
+
+⚠️ **A missed wakeup, from releasing the lock between deciding to wait and waiting.** The same path chose to
+park behind an in-flight extension, released the shard, and *then* put its `Reply` on a queue — so an
+extension that finished in that gap woke nobody, and the request waited for ever. The fix is structural
+rather than careful: **the waiters live in the object, under the shard's lock**, so deciding to wait and
+waiting are one step. A separate table of waiters cannot be made safe by ordering the two operations
+correctly; it can only be made safe by not having the gap.
+
+Both of the second two are §17.10's pattern being got wrong in the same function, and both are invisible to
+a single writer. The run that found them was eight.

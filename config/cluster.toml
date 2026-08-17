@@ -36,6 +36,12 @@ quorum = 3
 # records is not what a real cluster does.
 seal_bytes = 4096
 
+# ⚠️ Also deliberately tiny, for the same reason: a real stream holds as many extents
+# as its SN has memory for, so on one box a stream would never fill and the DN would
+# never have to give an object a second stream. Three extents means it happens every
+# few kilobytes.
+per_stream = 3
+
 [rings]
 members = 1
 

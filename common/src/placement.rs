@@ -156,7 +156,7 @@ mod tests {
         ks = { address = "127.0.0.1:9601", port_base = 9602 }
         failure_domains = { levels = ["datacenter", "rack", "machine"] }
         rings = { members = 5 }
-        extents = { instances = 4, quorum = 3, seal_bytes = 4096 }
+        extents = { instances = 4, quorum = 3, seal_bytes = 4096, per_stream = 8 }
         messaging = { send = "direct", encrypt = false, compress = "none", compress_min = 256, compress_sample = 4096, peer_conns = 2, key = "0f1e2d3c4b5a69788796a5b4c3d2e1f0" }
         timeouts = { request_ms = 1000, shutdown_grace_ms = 1000 }
         logging = { level = "info", compress = false, disk = "hdd", compress_ratio = 6, size = 1048576, full_files = 4, info_files = 8, info_share = 0.1, recount = 4096 }

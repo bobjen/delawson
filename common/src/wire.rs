@@ -116,6 +116,11 @@ ops! {
     // opens the next one in the same breath.
     SealExtent = 0x0504, "seal-extent";
 
+    // DN, about an object's streams: which one holds a record, and another one
+    // when the last has sealed.
+    LocateStream = 0x030a, "locate-stream";
+    ExtendObject = 0x030b, "extend-object";
+
     // EN. An append arrives from an FE at the primary; the primary broadcasts the
     // same bytes at a fixed offset to the other three instances.
     AppendExtent = 0x0601, "append-extent";

@@ -42,6 +42,14 @@ struct Stream {
     /// Records in the sealed extents, which is where the open extent's numbering
     /// starts from.
     sealed_records: u64,
+    /// Sealed: no more appends and no more concatenates, so the object this belongs
+    /// to needs another stream for anything further.
+    ///
+    /// That is what sealed *means*; filling up is only why it happens here. An
+    /// object is append-only, so only its last stream may take an append — every
+    /// stream before it is sealed because appending to the middle of an object would
+    /// renumber everything after it.
+    sealed_stream: bool,
 }
 
 /// An extent that is closed, and what it came to.
@@ -62,7 +70,7 @@ impl Sealed {
 }
 
 /// Where an extent is, under the name this SN gave it.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Extent {
     id: u64,
     /// The second it was made in, which selects its key.
@@ -84,6 +92,27 @@ impl Extent {
             vec![Arg::Number(self.id), Arg::Number(self.created), Arg::Number(self.first_record)];
         args.extend(self.instances.iter().map(|en| Arg::Number(*en as u64)));
         args
+    }
+}
+
+/// A stream that will hold no more extents, and how many records it came to. Not a
+/// failure: whoever asked needs another stream, and the DN is what makes those.
+#[derive(Debug)]
+struct Full {
+    records: u64,
+    /// Set when the stream could not be extended for an ordinary reason instead.
+    why: Option<Error>,
+}
+
+impl Full {
+    fn records(records: u64) -> Full {
+        Full { records, why: None }
+    }
+}
+
+impl From<Error> for Full {
+    fn from(why: Error) -> Full {
+        Full { records: 0, why: Some(why) }
     }
 }
 
@@ -134,6 +163,7 @@ struct SN {
     streams: AtomicU64,
     extents: AtomicU64,
     sealed: AtomicU64,
+    sealed_streams: AtomicU64,
 }
 
 fn shard_of(dn: u32, stream: u64) -> usize {
@@ -180,6 +210,7 @@ impl Service for SN {
             format!("streams {}", self.streams.load(Ordering::Relaxed)),
             format!("extents {}", self.extents.load(Ordering::Relaxed)),
             format!("sealed_extents {}", self.sealed.load(Ordering::Relaxed)),
+            format!("sealed_streams {}", self.sealed_streams.load(Ordering::Relaxed)),
             format!("stream_share {}", self.config.stream_share),
         ]
     }
@@ -194,6 +225,7 @@ impl SN {
             streams: AtomicU64::new(0),
             extents: AtomicU64::new(0),
             sealed: AtomicU64::new(0),
+            sealed_streams: AtomicU64::new(0),
         }
     }
 
@@ -217,7 +249,13 @@ impl SN {
             let mut shard = self.shards[shard_of(dn, id)].lock().expect("streams");
             shard.insert(
                 (dn, id),
-                Stream { created, sealed: Vec::new(), open: None, sealed_records: 0 },
+                Stream {
+                    created,
+                    sealed: Vec::new(),
+                    open: None,
+                    sealed_records: 0,
+                    sealed_stream: false,
+                },
             );
         }
         self.streams.fetch_add(count, Ordering::Relaxed);
@@ -240,7 +278,10 @@ impl SN {
             process.cluster.services_of_kind(ServiceKind::En).map(|en| en.number()).collect();
         match self.open(dn, stream, now(), &ens, process.cluster.extents.instances) {
             Ok(extent) => Response { id: 0, status: Status::Ok, args: extent.args() },
-            Err(e) => Response::error(Status::Internal, e.to_string()),
+            Err(Full { records, why: None }) => {
+                Response { id: 0, status: Status::Sealed, args: vec![Arg::Number(records)] }
+            }
+            Err(Full { why: Some(why), .. }) => Response::error(Status::Internal, why.to_string()),
         }
     }
 
@@ -313,9 +354,15 @@ impl SN {
             now(),
             &ens,
             process.cluster.extents.instances,
+            process.cluster.extents.per_stream,
         ) {
             Ok(extent) => Response { id: 0, status: Status::Ok, args: extent.args() },
-            Err(e) => Response::error(Status::Internal, e.to_string()),
+            // The stream is full, which is the DN's business: it says what the
+            // stream came to so the object's next stream can carry on from there.
+            Err(Full { records, why: None }) => {
+                Response { id: 0, status: Status::Sealed, args: vec![Arg::Number(records)] }
+            }
+            Err(Full { why: Some(why), .. }) => Response::error(Status::Internal, why.to_string()),
         }
     }
 
@@ -333,10 +380,11 @@ impl SN {
         second: u64,
         ens: &[u32],
         instances: usize,
-    ) -> Result<Extent> {
+        per_stream: usize,
+    ) -> std::result::Result<Extent, Full> {
         let mut shard = self.shards[shard_of(dn, stream)].lock().expect("streams");
         let Some(held) = shard.get_mut(&(dn, stream)) else {
-            return Err(Error::new(format!("no stream {stream} from dn {dn}")));
+            return Err(Full::from(Error::new(format!("no stream {stream} from dn {dn}"))));
         };
         // Only whoever names the open extent seals it. Two appends can find the same
         // extent full at once, and the second one has nothing left to do.
@@ -345,8 +393,15 @@ impl SN {
             held.sealed_records = extent.first_record + records;
             held.sealed.push(Sealed { extent, records, length });
             self.sealed.fetch_add(1, Ordering::Relaxed);
+            if held.sealed.len() >= per_stream {
+                held.sealed_stream = true;
+                self.sealed_streams.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        self.appendable(held, second, ens, instances)
+        if held.sealed_stream {
+            return Err(Full::records(held.sealed_records));
+        }
+        self.appendable(held, second, ens, instances).map_err(Full::from)
     }
 
     /// The stream's open extent, naming one if it has none.
@@ -357,12 +412,15 @@ impl SN {
         second: u64,
         ens: &[u32],
         instances: usize,
-    ) -> Result<Extent> {
+    ) -> std::result::Result<Extent, Full> {
         let mut shard = self.shards[shard_of(dn, stream)].lock().expect("streams");
         let Some(held) = shard.get_mut(&(dn, stream)) else {
-            return Err(Error::new(format!("no stream {stream} from dn {dn}")));
+            return Err(Full::from(Error::new(format!("no stream {stream} from dn {dn}"))));
         };
-        self.appendable(held, second, ens, instances)
+        if held.sealed_stream {
+            return Err(Full::records(held.sealed_records));
+        }
+        self.appendable(held, second, ens, instances).map_err(Full::from)
     }
 
     /// The extent this stream can be appended to, named here if there is not one.
@@ -414,6 +472,10 @@ mod tests {
     use super::*;
     use common::testing;
 
+    /// Extents enough that a stream does not seal in the tests that are not about
+    /// a stream sealing.
+    const ROOMY: usize = 1000;
+
     /// A stream, so there is something to open an extent on.
     fn sn_with_stream(dn: u32, stream: u64) -> SN {
         let sn = SN::new(testing::sn_config());
@@ -457,11 +519,11 @@ mod tests {
         assert_eq!(first.first_record, 0);
 
         // Twelve records in it, and 400 bytes.
-        let second = sn.close(0, 7, first.id, 12, 400, 1_000_001, &ens, want).unwrap();
+        let second = sn.close(0, 7, first.id, 12, 400, 1_000_001, &ens, want, ROOMY).unwrap();
         assert_ne!(second.id, first.id, "a fresh extent");
         assert_eq!(second.first_record, 12, "numbering carries on");
 
-        let third = sn.close(0, 7, second.id, 5, 90, 1_000_002, &ens, want).unwrap();
+        let third = sn.close(0, 7, second.id, 5, 90, 1_000_002, &ens, want, ROOMY).unwrap();
         assert_eq!(third.first_record, 17);
         assert_eq!(sn.sealed.load(Ordering::Relaxed), 2);
     }
@@ -475,11 +537,14 @@ mod tests {
         let ens = [0, 1, 2, 3];
         let want = testing::extents().instances;
         let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
-        let second = sn.close(0, 7, first.id, 4, 100, 1_000_001, &ens, want).unwrap();
+        let second = sn.close(0, 7, first.id, 4, 100, 1_000_001, &ens, want, ROOMY).unwrap();
         // A request that saw the seal a moment later, naming the extent that is now
         // sealed, and one naming an extent this stream never had.
-        assert_eq!(sn.close(0, 7, first.id, 4, 100, 1_000_002, &ens, want).unwrap().id, second.id);
-        assert_eq!(sn.close(0, 7, 999, 0, 0, 1_000_003, &ens, want).unwrap().id, second.id);
+        assert_eq!(
+            sn.close(0, 7, first.id, 4, 100, 1_000_002, &ens, want, ROOMY).unwrap().id,
+            second.id
+        );
+        assert_eq!(sn.close(0, 7, 999, 0, 0, 1_000_003, &ens, want, ROOMY).unwrap().id, second.id);
         assert_eq!(sn.sealed.load(Ordering::Relaxed), 1, "sealed once");
         assert_eq!(sn.extents.load(Ordering::Relaxed), 2, "two extents, not four");
     }
@@ -492,10 +557,36 @@ mod tests {
         let ens = [0, 1, 2, 3];
         let want = testing::extents().instances;
         let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
-        let second = sn.close(0, 7, first.id, 4, 100, 1_000_001, &ens, want).unwrap();
-        let repeat = sn.close(0, 7, first.id, 4, 100, 1_000_002, &ens, want).unwrap();
+        let second = sn.close(0, 7, first.id, 4, 100, 1_000_001, &ens, want, ROOMY).unwrap();
+        let repeat = sn.close(0, 7, first.id, 4, 100, 1_000_002, &ens, want, ROOMY).unwrap();
         assert_eq!(repeat.id, second.id, "the extent that is open now");
         assert_eq!(sn.sealed.load(Ordering::Relaxed), 1, "sealed once");
+    }
+
+    /// A stream seals when it has all the extents it is allowed, and then it will
+    /// take no more — which is the object's problem, not this stream's.
+    #[test]
+    fn a_stream_seals_once_it_has_its_extents() {
+        let sn = sn_with_stream(0, 7);
+        let ens = [0, 1, 2, 3];
+        let want = testing::extents().instances;
+        // Room for two extents, so the second seal fills the stream.
+        let two = 2;
+        let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
+        let second = sn.close(0, 7, first.id, 10, 100, 1_000_001, &ens, want, two).unwrap();
+        assert_eq!(second.first_record, 10);
+
+        let full = sn
+            .close(0, 7, second.id, 7, 70, 1_000_002, &ens, want, two)
+            .expect_err("the stream should be full");
+        assert!(full.why.is_none(), "full is not a failure");
+        assert_eq!(full.records, 17, "what the whole stream came to");
+        assert_eq!(sn.sealed_streams.load(Ordering::Relaxed), 1);
+
+        // And it stays sealed: nothing opens another extent on it.
+        let again = sn.open(0, 7, 1_000_003, &ens, want).expect_err("sealed");
+        assert_eq!(again.records, 17);
+        assert!(again.why.is_none());
     }
 
     /// A record in a sealed extent is found there; one past everything sealed goes to
@@ -506,8 +597,8 @@ mod tests {
         let ens = [0, 1, 2, 3];
         let want = testing::extents().instances;
         let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
-        let second = sn.close(0, 7, first.id, 3, 60, 1_000_001, &ens, want).unwrap();
-        let third = sn.close(0, 7, second.id, 2, 40, 1_000_002, &ens, want).unwrap();
+        let second = sn.close(0, 7, first.id, 3, 60, 1_000_001, &ens, want, ROOMY).unwrap();
+        let third = sn.close(0, 7, second.id, 2, 40, 1_000_002, &ens, want, ROOMY).unwrap();
 
         let holds = |record: u64| {
             let answer =
