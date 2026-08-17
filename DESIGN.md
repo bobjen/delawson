@@ -270,7 +270,7 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **Unkeyed** objects have one unsealed extent, so the **object** logical offset is reportable; **keyed** objects have several, so only an extent-relative offset exists and it does not survive coalescing | §8.1.1a-7 |
 | So compare-and-append is unkeyed-only; keyed objects get idempotency **from the key** | §8.1.1a-7 |
 | An append block is a **byte range**, not a set of records; only a writer fixing its own offsets may leave a fragment | §8.1 |
-| Append blocks bounded at **32 MB logical**, so one always fits a fresh extent | §8.1.1a-2 |
+| An append is bounded at **32 MB logical and 32 MB compressed**, equal on purpose so that incompressible data never fails the compressed cap; a *record* may be extent-sized, since it may span appends | §8.1.1a-2, §8.2.4 |
 | No chunk padding: an append that will not fit **seals the extent short** | §8.1.1c |
 | The quorum forces **broadcast, not a daisy chain** | §8.1.2 |
 | **Soft delete** is a deferred decrement: 3-day window, timers in parallel across layers, opt-out per directory | §8.4 |
@@ -4932,12 +4932,26 @@ Note the offset assigned in that window must be a **logical** position, since th
 known. Physical placement is determined afterwards and recorded in the sparse index (§9.3) — which is why §4
 carries logical *and* physical cumulative totals rather than one.
 
-**Append size, record size and extent size are all the same bound: 4 GB logical, and 32 MB compressed on
-first write** (Asserted, Bob, 2026-08-17). One number for three things, and it is forced — an append must
-fit an extent or it could never be placed at all (§8.2.4 needs a block placeable wholly in a fresh extent),
-and a record must fit one too (§8.2.3 rule 1). An earlier draft bounded an append at 32 MB *logical* on the
-grounds that compression does not expand; the compressed cap is the one that decides whether a block fits,
-so that was the wrong measure, and the logical bound is 4 GB like everything else.
+**An append is bounded at 32 MB logical *and* 32 MB compressed** (Asserted, Bob, 2026-08-17, correcting
+his own earlier revision — the original draft of this section had it right). The reason is the case that
+otherwise fails:
+
+> **You do not want appends failing because they exceed the compressed limit, and 32 MB of
+> incompressible logical data does not compress.**
+
+So the two caps are equal on purpose. If the logical bound were 4 GB like a record's, a caller could
+send 4 GB of incompressible bytes that cannot fit a 32 MB compressed cap however the system tries — and
+the failure would arrive *after* the caller had done the work, for a reason the caller could not have
+predicted without knowing its own compression ratio in advance. With both at 32 MB, an append that a
+caller can measure is an append that fits.
+
+⚠️ **And the compressed limit is soft.** It bounds what is accumulated on first write and nothing after
+that (§6.2), so an append at the cap that compresses badly is not refused for missing it by a little —
+which is the other half of not making callers predict ratios.
+
+A **record** is still bounded by an extent rather than by an append (4 GB logical, §8.2.4), because a
+record may span appends. So the three bounds are not one number after all: an append is the smallest of
+them, and it is smallest precisely so that it can never be the thing that fails.
 
 ⚠️ **The append half of that may yet come down, because a message is not an extent** (Asserted, Bob,
 2026-08-17). A frame is capped at 1 MB and a sealed segment at 8 MB, both to stop a peer making the far
@@ -5865,9 +5879,9 @@ same fact seen from the writer's side and the extent's side.
 
 **So a record's maximum size is an extent's maximum size** (Asserted, Bob, 2026-08-17): **4 GB
 logical, and 32 MB compressed on first write.** Rule 1 keeps a whole record in one extent, so the
-record cap cannot be anything else — and since a record may span appends, the cap is not the 32 MB
-logical append bound of §8.1.1a-2 either. A writer may build a record out of many appends, up to what
-an extent holds.
+record cap cannot be anything else — and since a record may span appends, the cap is *not* the 32 MB
+logical append bound of §8.1.1a-2. A writer may build a record out of many appends, up to what an
+extent holds; what it may not do is send one of them larger than 32 MB.
 
 ⚠️ **And the compressed half of that is soft: it bounds the first write, not the extent for ever**
 (Asserted, Bob, 2026-08-17). If later recompression (§8.1.4.4, §10) makes an extent larger than
@@ -6546,6 +6560,93 @@ trips** including the authorization hop. Sealed extents are immutable, which mak
 cacheable at the client: the object's stream list changes only when the object
 grows, and an extent's instance list changes only on repair or re-encoding. A
 warm client goes straight to the EN.
+
+#### 9.1.3 How much one answer may carry, and how a caller asks for the next of it
+
+**`object-info` does not return enough to be useful for bulk reading, and it should not try to
+return everything.** Today it answers with an object and one stream (§17.12); a caller building
+hints (§8.1.1a-10) needs the extents, their instances, and the record range of each. But an
+object can hold 2 × 10^9 extent references (§14.1), so "all of them" is not an answer that can be
+sent.
+
+**So there is a limit on the number of objects plus streams plus extents either `object-info` or
+`batch-object-info` may return, and hitting it succeeds** (Asserted, Bob, 2026-08-17). It does
+not fail and it does not truncate silently: it answers with a **range** and says which range it
+answered. Reading a huge object is then many range requests, which is the same shape as any
+paginated interface and is why **ranges are worth implementing before the limit matters** — a
+limit with no way to ask for the next piece is just a smaller failure.
+
+⚠️ **And there is a real difficulty in the middle of that** (Asserted, Bob, 2026-08-17): **a
+caller with a fixed-size buffer does not know how many rows to ask for**, because it does not
+know the row sizes. Every way of naming an end has the same flaw:
+
+| Ask for | Problem |
+|---|---|
+| *n* rows | *n* rows might be a byte or a gigabyte |
+| up to logical offset *X* | an offset is not a durable reference (§8.1.1a-7), so it may not land where the caller expects |
+| from row *R* to *R* + a logical offset | the start is durable and the end is not, so the caller cannot say where it stopped |
+| from row *R* to *R* + a compressed offset | the same, in the other space |
+
+**The way out is to stop using an offset as a resume point and use it only as a budget.** A
+request names a **durable start and a byte budget** — "from row *R*, at most *N* bytes" — and the
+*answer* says which rows it contains and **what row to ask for next**. Then:
+
+- the start is always a record number, which is stable for ever (§3, §8.1.1a-10's durable tier);
+- the end is a byte count, which the caller chooses to fit the buffer it actually has;
+- the continuation is a row number the system computed, so the caller never has to work out
+  where its last fetch ended — which was the whole difficulty.
+
+That is the ordinary shape of a paginated read, and the reason to spell it out is that the
+tempting version — resume from where the bytes stopped — is the one that breaks, because
+**offsets are the tier of reference that is allowed to move** (§8.1.1a-10). A caller resuming
+from an offset is resuming from a hint; a caller resuming from a row is resuming from a name.
+
+#### 9.1.3.1 Resuming from a row is serial, and consistent read is what makes it parallel
+
+⚠️ **The scheme above works and it is serial**, which for a large object is the whole cost: each
+request waits for the previous answer to learn where to start. A caller reading a terabyte in
+megabyte pages makes a million round trips end to end, and the latency of every one is exposed.
+
+**Consistent read removes the dependency, because it makes the boundaries computable** (Asserted,
+Bob, 2026-08-17). Given a consistent view of an extent, its contents cannot change under the read —
+so chunk *k* is bytes *k*·*N* to (*k*+1)·*N* by arithmetic, and **the caller can issue every request
+back to back without waiting for any answer.** Fixed logical chunks or fixed compressed chunks,
+either way: what matters is that the caller *computes* the boundaries instead of discovering them.
+
+**And it fits comfortably inside the hint window** (§10.1, at least ten minutes), so the extents and
+instances the caller was given stay valid for the length of such a read.
+
+That is a second, independent argument for consistent read. §16's open question values it for
+dropping a ring from 3x RAM to 2x — the largest cost saving identified so far. **This is a latency
+argument rather than a cost one**: it turns a paginated read from serial into parallel. Two unrelated
+reasons for the same feature is a strong position to be in.
+
+**Parallelism across extents is the other axis**, and it needs no new mechanism: different extents
+are on different ENs, so a caller holding the extent list can read them at once. Within one extent,
+consistent read is what unlocks it; across extents, the extent list already does.
+
+⚠️ **`batch-object-info` has the same problem and no such fix.** A caller cannot pre-slice its list
+of names into requests that will each fit an answer, because the answer size per object depends on how
+many streams and extents that object has — which is the thing it is asking about. So issuing a run of
+batch lookups asynchronously is guesswork in a way that reading an extent is not, and the guess is
+unbounded: one object might contribute a hundred thousand extents to the answer.
+
+**That is the same problem a job scheduler has**, one level up: partitioning work across vertices
+needs the object sizes, and the sizes are what the lookups are for. §5.12.2 already names telling a
+job whether its remainder fits as the most useful thing DeLawson could tell a scheduler; this is the
+same gap arriving during *planning* rather than during execution. Nothing here solves it, and it
+should not be left for whoever writes the first scheduler to discover (#65).
+
+**Two consequences worth noting before it is built:**
+
+- **The budget is a logical byte count, and the caller cannot know the compressed size in
+  advance** — so a request naming a logical budget may come back with more or fewer compressed
+  bytes than expected. Whichever space the budget is in, it bounds one of the two and not the
+  other, and which one the caller cares about depends on whether it is buying network or memory.
+- **A range answer is a hint, not a name.** The extents and instances in it are the middle
+  reference tier, valid for at least the hint window (§10.1) — so a caller that pages slowly must
+  expect to re-ask, and one that pages a huge object should expect its early pages to have aged
+  out by the time it finishes.
 
 ### 9.2 Keyed: locating key *K*
 
@@ -9611,7 +9712,10 @@ Roughly in order of how much else depends on them.
 61. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
-    more attainable than when first raised.
+    more attainable than when first raised. **And there is a second, unrelated
+    argument**: §9.1.3.1 shows consistent read is what turns a paginated read of a
+    large object from serial into parallel, since a consistent view makes chunk
+    boundaries computable rather than discoverable.
 62. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, and does the 4/3 default hold for both?
 63. **Where the live counters live** (§5.5.2). §4.5 shows the recursion cannot run
