@@ -8303,6 +8303,79 @@ The same technique works one level up. **Concatenating an unkeyed object to itse
 doubles its stream references**, which exercises the DN-side stream list and its
 paging path (§14.2) at scales no real object would reach during development.
 
+### 15.3 The shape of the suite: unit tests are the bulk
+
+**The bulk of the tests are unit tests, and the whole suite runs in under a minute, because
+it is run before every push** (Asserted, Bob, 2026-08-17). That is the entire reason for the
+time limit: a suite nobody waits for is a suite nobody runs, and a suite nobody runs is not
+protecting anything.
+
+The three kinds are not three flavours of the same thing. They differ in what they cost to
+*keep*, which is what decides how many of each there should be:
+
+| Kind | Breaks when | Costs | How many |
+|---|---|---|---|
+| Unit | its own code changes | almost nothing to keep | as many as possible |
+| End-to-end | *anything* changes | slow to run, and constant maintenance | **one** |
+| Benchmark | anything changes | slow, and maintenance | a few, and discardable |
+
+⚠️ **An end-to-end test's real cost is not that it is slow — it is that it is end-to-end.**
+It touches everything, so everything that changes breaks it, and the maintenance bill
+arrives for ever. A unit test depends on one piece of code and therefore only breaks when
+that piece is modified, which is the one time a test *ought* to break.
+
+So the standing end-to-end budget is **one test that executes every command once**. That
+catches the failure a unit test structurally cannot — a command that does not run at all,
+or a path that nothing wires together — and it stops there. Anything more is bought with
+maintenance that would be better spent on unit tests.
+
+#### 15.3.1 What makes a test a unit test
+
+Four properties, and they are requirements rather than preferences:
+
+- **It reads and writes no disk.** No temporary directories, no config files, no log files.
+- **It is single-threaded.** No cluster, no background threads, no waiting for anything.
+- **It calls the relevant code directly** — not through a request, a process, or a file path.
+- **It depends on almost nothing**, which is what makes it stay passing while the rest of
+  the system is rebuilt around it.
+
+⚠️ **The real code usually has to change to make this possible** (Asserted, Bob,
+2026-08-17). Logic that exists only inside a request handler, or only behind a path to open,
+cannot be called by a unit test — so the code is packaged to be callable, and the test is not
+bent around the code. This is a claim about how the *system* is written, not about tests: work
+that can only be reached through a whole running cluster is work whose shape has not been
+factored yet.
+
+#### 15.3.2 Tests are real code, so they do not repeat themselves
+
+Unit tests need configuration, and they may not read one from disk. **So there is one shared
+routine that builds a default configuration in code**, with the knobs a test cares about
+overridable, and the same for every other setup that more than one test needs.
+
+The duplication rule that applies to the system applies to its tests unchanged: two copies of
+a configuration literal in two test modules is the same defect as two copies of anything else,
+and it has the same symptom — adding one field means editing every copy.
+
+#### 15.3.3 Benchmarks carry their numbers, and are versioned
+
+Benchmarks are the other end-to-end thing, kept for a different reason: **run occasionally, to
+notice that something has regressed.** Two rules follow from their being expensive to keep:
+
+- **The latest numbers live in a comment beside the benchmark that produced them**, so the
+  figure and the thing that measures it cannot drift apart. `DESIGN.md` argues about the
+  numbers; the comment is where the current ones are recorded.
+- **A benchmark is versioned when its numbers move significantly — about 5% or more.** A
+  change that size is either a regression or a new baseline, and either way the old number is
+  no longer what "unchanged" means.
+
+And **a benchmark that has finished the tuning it was written for is often better discarded
+than kept** (Asserted, Bob, 2026-08-17). Its value was the tuning, which has already been
+banked in the code and in this document; what remains is a maintenance cost. Keep the ones
+that guard a number worth guarding.
+
+Every benchmark is subject to §17.5i: **three trials, and report the spread**, because one
+sample cannot say whether a 5% move is a regression or noise.
+
 ---
 
 ## 16. Open questions
