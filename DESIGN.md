@@ -8331,20 +8331,26 @@ maintenance that would be better spent on unit tests.
 
 #### 15.3.1 What makes a test a unit test
 
-Four properties, and they are requirements rather than preferences:
+Three properties, and they are requirements rather than preferences:
 
-- **It reads and writes no disk.** No temporary directories, no config files, no log files.
 - **It is single-threaded.** No cluster, no background threads, no waiting for anything.
-- **It calls the relevant code directly** — not through a request, a process, or a file path.
+- **It calls the relevant code directly** — not through a request, a process, or a running
+  process of any kind.
 - **It depends on almost nothing**, which is what makes it stay passing while the rest of
   the system is rebuilt around it.
 
+**Touching the disk is not what makes a test end-to-end** (Asserted, Bob, 2026-08-17). A test
+of the log writer writes log files, because files are what that code does, and a temporary
+file is a direct call rather than a whole system. The rule that matters is the one above it:
+depend on little, and call the code rather than a cluster. What a unit test may *not* read from
+disk is a **configuration** (§15.3.2) — not because it is a file, but because it is a
+dependency on the deployment instead of on the code.
+
 ⚠️ **The real code usually has to change to make this possible** (Asserted, Bob,
-2026-08-17). Logic that exists only inside a request handler, or only behind a path to open,
-cannot be called by a unit test — so the code is packaged to be callable, and the test is not
-bent around the code. This is a claim about how the *system* is written, not about tests: work
-that can only be reached through a whole running cluster is work whose shape has not been
-factored yet.
+2026-08-17). Logic that exists only inside a request handler cannot be called by a unit test —
+so the code is packaged to be callable, and the test is not bent around the code. This is a
+claim about how the *system* is written, not about tests: work that can only be reached
+through a whole running cluster is work whose shape has not been factored yet.
 
 #### 15.3.2 Tests are real code, so they do not repeat themselves
 
