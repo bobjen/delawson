@@ -5265,6 +5265,63 @@ position from, and what it returns today is a compressed one wearing the wrong n
 has to carry the logical length**, and until it does the receipt is only correct because nothing
 compresses (#48).
 
+### 8.1.7 Sealing when an instance is down
+
+The normal seal is the primary's: it assigns the offsets, so it knows where the extent ends. **When
+instances are down the SN coordinates it instead** (#55), and the algorithm is Bob's, 2026-08-17:
+
+> **Seal at the minimum accepted length over all responses, discarding the smallest response.**
+
+#### 8.1.7.1 Why the second-smallest is the right statistic
+
+Sort the accepted lengths of the four instances, *a* ≤ *b* ≤ *c* ≤ *d*. Discarding the smallest and
+taking the minimum of the rest is **b**, the second-smallest — and *b* is exactly the largest length
+that three instances have, since *b*, *c* and *d* all reach it and only *c* and *d* reach *c*. So
+with every instance answering, **the rule computes the durable length exactly** (Derived; checked
+over every combination of four lengths).
+
+With one instance missing, *b* is computed from three responses and the absent instance's length *m*
+is unknown. Then:
+
+| *m* | True durable length | The rule seals at |
+|---|---|---|
+| ≥ *b* | *b* | *b* — exact |
+| between *a* and *b* | *m* | *b* — too long by *b* − *m* |
+| < *a* | *a* | *b* — too long by *b* − *a* |
+
+**So the rule never seals below the durable length, and may seal above it.** That asymmetry is the
+right way round, and it is the whole reason the rule is shaped this way:
+
+- **Sealing below would discard an append that was acknowledged as durable.** Unacceptable at any
+  price.
+- **Sealing above keeps bytes that were accepted but never promised.** At least one live instance has
+  them, so sealing there is a *commitment to repair up to that length* rather than a claim that it is
+  already there — and §8.1.4.3's hole-filling is the step that already exists to do it.
+
+#### 8.1.7.2 When to stop waiting
+
+Two stopping rules, and they answer different questions:
+
+- **Stop at two responses if the computed length matches a durable length any responder reported.** An
+  instance's reported durable length is a length it knows reached a quorum, so a match is proof rather
+  than inference — three instances had it, and no fourth opinion can improve on proof.
+- **Otherwise wait a very short time — of order 100 ms — after the third response.** The usual cause
+  of failure-mode sealing is one instance being down, so **three responses will nearly always arrive
+  and the fourth is the one that turns an upper bound into the exact answer.** Every byte of overshoot
+  is a byte that has to be repaired to make good, so a little waiting buys a tighter seal.
+
+⚠️ **The grace period has to stay far below a TCP retry**, which is §16's open question 14: the whole
+point of seal-short is that one dead EN must not stall a writer for a timeout. 100 ms is comfortably
+inside that, and it is a knob rather than a constant for exactly that reason.
+
+#### 8.1.7.3 It composes with the record rules for free
+
+The seal point still has to land on a record boundary (§8.2.3 rule 1), so the computed length is
+trimmed back to the last complete record at or below it. **That trim cannot lose anything
+acknowledged**, because §8.2.3's second gate means an append that closed no record was never durable
+in the first place. So failure-mode sealing needs no record surgery and no special answer to the
+writer about half-written records — the rules that removed the split in §8.2.4 remove it here too.
+
 ### 8.2 Record framing
 
 An object declares a framing at creation, and **appends are stored in the format the writer gave
