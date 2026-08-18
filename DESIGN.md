@@ -3753,59 +3753,24 @@ handful of ENs and a handful of peers, not all of them. Expect the same three in
 random stratified neighbourhoods, local indices rather than global ids, and rejection against
 placement rules.
 
-#### 5.12.0 Prior art with a shared author: SCOPE over Cosmos
+#### 5.12.0 The prior art, for when this is designed
 
 **SCOPE is what this layer looked like last time**, and Bob is one of its authors (Cited:
 [SCOPE: Easy and Efficient Parallel Processing of Massive Data Sets](http://www.vldb.org/pvldb/vol1/1454166.pdf),
-Chaiken, Jenkins, Larson, Ramsey, Shakib, Weaver and Zhou, PVLDB 1(2), 2008).
+Chaiken, Jenkins, Larson, Ramsey, Shakib, Weaver and Zhou, PVLDB 1(2), 2008): a declarative language
+over rowsets with **no explicit parallelism**, a small extensible operator set, a cost-based optimizer,
+and a job manager scheduling the resulting graph.
 
-**As a shape for Compute.** A declarative scripting language over rowsets with **no explicit
-parallelism** — *"A script writer can view operators as being entirely serial; mapping the script to an
-efficient parallel execution plan is handled completely by the SCOPE compiler and optimizer"* — with a
-small extensible operator set (extractors, processors, reducers, combiners, outputters), a cost-based
-optimizer, and a Job Manager scheduling the resulting graph. A worked answer to what §5.12 leaves open,
-from the people who then ran it.
+**Noted and not pursued.** ⚠️ **Compute is deliberately out of the picture at present** (Asserted, Bob,
+2026-08-17) — *the store itself is a big enough can of worms* — so this is a pointer to where the
+answer will be found, not the beginning of an answer. The same paper's storage material is used where
+it belongs, in §8.1.4.1.
 
-**And as a citable reference for a distributed store that compresses**, which is rarer than it should
-be. §2.1 of that paper states it plainly:
-
-> *"Append blocks are stored in compressed form with compression and decompression done transparently
-> at the client."*
-
-That matters to this document twice over. It is published prior art for §8.1.4.1's decision that **the
-client compresses** — reached here independently, and today extended to the client being what checks
-the CRC (§9.1.2). And **Cosmos is sparsely documented**, so a peer-reviewed paper saying so is one of
-the few public sources for how a production store of this shape actually handled compression. Where
-this design wants to cite the practice rather than re-derive it, this is the citation.
-
-**Three more of §2.1's sentences describe decisions this document reached again:**
-
-| SCOPE's Cosmos | DeLawson |
-|---|---|
-| *"The data within an extent consist of a sequence of append blocks. The block boundaries are defined by application appends… contain a collection of application-defined records"* | §8.1's append block and §8.2's framing, exactly |
-| *"concurrent writers are serialized by the system"* | §8.1.1a-8's one open extent per object |
-| *"regularly scrubbed to protect against bit rot"* | §13's scrubbing |
-
-**On extent size, the comparison is not the obvious one** (Asserted, Bob, 2026-08-17). Cosmos's extents
-are *"typically a few hundred megabytes"*, and **that limit is logical — as almost everyone's is, since
-almost nobody compresses.** So the like-for-like is against DeLawson's **4 GB logical** cap (§6), which
-is an order of magnitude *larger*. (The paper also calls extents *"the unit of space allocation"*, which
-reads like stored bytes; the author's word settles it, and the phrasing is noted here so nobody
-re-litigates it from the text alone.)
-
-⚠️ **What is genuinely unusual is that DeLawson has a compressed cap at all.** 32 MB compressed is a
-second limit, on a quantity most systems do not have separately, and it exists because the costs it
-bounds — EC recovery (§6.1), compaction, open-extent memory — are costs in *stored* bytes rather than
-in what a writer wrote. A store whose logical and stored sizes coincide needs one cap for both.
-DeLawson needs two because they differ, and #50 is therefore measuring the stored-byte bound rather
-than "the extent size".
-
-**And one difference that cuts against an assumption here.** The paper says *"A unit of computation
+⚠️ **One line of it does bear on a storage assumption, though.** The paper says *"A unit of computation
 generally consumes a small number of collocated extents"* — Cosmos deliberately **collocated** the
-extents a computation would consume. §5.12.3 argues DeLawson needs no affinity because the
-intra-cluster network is flat. Both can be true, a flat network being a stronger assumption than Cosmos
-could make, but a prior system paying for locality is a reason to want §5.12.3's measurement rather
-than to take the assumption on trust.
+extents a computation would consume, where §5.12.3 argues DeLawson needs no affinity because the
+intra-cluster network is flat. Both can be true; a prior system paying for locality is a reason to want
+§5.12.3's measurement rather than to take the assumption on trust.
 
 #### 5.12.1 The security invariant makes the network carry everything
 
@@ -4279,6 +4244,18 @@ device, and §4.3.2.3's requirement that **EC group members have equal physical 
 recompression that changes one member's size has to preserve that, which makes "recompress freely" and
 "members are equal" two constraints that meet. Neither is broken by the soft cap, but both are stated
 elsewhere as though the cap were fixed.
+
+**And the obvious prior-art comparison is not like-for-like** (Asserted, Bob, 2026-08-17). Cosmos's
+extents were *"typically a few hundred megabytes"* (Cited: [SCOPE](http://www.vldb.org/pvldb/vol1/1454166.pdf),
+§2.1), and **that limit is logical, as almost everyone's is, since almost nobody compresses.** So it
+compares against DeLawson's **4 GB logical** cap, which is an order of magnitude larger — not against
+the 32 MB compressed one.
+
+⚠️ **What is unusual is that a compressed cap exists at all.** It is a second limit, on a quantity most
+systems do not have separately, and it exists because the costs it bounds are costs in *stored* bytes:
+EC recovery reads *k* stored fragments, compaction rewrites stored bytes, an open extent occupies
+stored bytes. A store whose logical and stored sizes coincide needs one cap for both. **So what #50 is
+measuring is the stored-byte bound**, and the logical cap can stay where it is.
 
 ⚠️ **So the number is bracketed by two measurements neither of which has been made.** What would
 replace the guess: repair time for one extent as a function of its size on the target media,
@@ -5543,7 +5520,25 @@ CPU and the bytes are, not about reproducibility.
 the codec, so it can decompress what comes back and compare it against the CRC it computed going in.
 **Nothing between the two ever looks inside.**
 
-**Append blocks are compressed by the `delawson` client library** (Asserted, Bob, 2026-08-15). The client
+**Append blocks are compressed by the `delawson` client library** (Asserted, Bob, 2026-08-15).
+
+**And there is published prior art for exactly this, from a store that did it** (Cited:
+[SCOPE](http://www.vldb.org/pvldb/vol1/1454166.pdf), §2.1, Chaiken, Jenkins, Larson, Ramsey, Shakib,
+Weaver and Zhou, PVLDB 1(2), 2008, of which Bob is an author):
+
+> *"Append blocks are stored in compressed form with compression and decompression done transparently
+> at the client."*
+
+Worth citing for two reasons beyond agreement. **A distributed store that compresses is rarer than it
+should be**, so the practice is hard to source at all — and **Cosmos is otherwise sparsely
+documented**, which makes a peer-reviewed sentence about it one of the few public references there is.
+Where this document would otherwise re-derive the practice, it can point at somebody having run it.
+
+The same section describes three more decisions this document reached again independently: *"The data
+within an extent consist of a sequence of append blocks. The block boundaries are defined by
+application appends… contain a collection of application-defined records"* (§8.1, §8.2), *"concurrent
+writers are serialized by the system"* (§8.1.1a-8), and *"regularly scrubbed to protect against bit
+rot"* (§13). The client
 library is DeLawson code, so this is not user code doing it — and it **reduces append size across the
 internet**, which is the one link in the chain nobody controls the cost of.
 
@@ -9824,7 +9819,9 @@ a little latency for a lot of capacity is trading in the right direction for it.
 
 **The project is about the scope of Hadoop** (Asserted, Bob, 2026-08-17): the basics of the store are
 CRUD, directories, concatenate, and keeping the data durable — and then there are user accounts, and
-then there is Compute. That is the measure to keep in mind when reading sections that go into tenths
+then there is Compute. ⚠️ **Compute is deliberately out of the picture at present** (Asserted, Bob,
+2026-08-17), because *the store itself is a big enough can of worms* — so §5.12 is a placeholder to be
+left alone rather than a section to grow. That is the measure to keep in mind when reading sections that go into tenths
 of a percent: the whole is large, and most of it is not built.
 
 ⚠️ **And the current state is early**, whatever the depth of this document suggests: *"we're rapidly
