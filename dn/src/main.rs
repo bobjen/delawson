@@ -662,6 +662,23 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
+
+    /// What one stream costs an object's list here. As with the SN (§4.7 again),
+    /// the design budgets a **4 byte** node-local reference and this inlines the
+    /// record, so an object's stream list is ten times its budget.
+    #[test]
+    fn a_stream_costs_an_object_more_than_a_reference() {
+        let each = size_of::<Held>();
+        assert_eq!(each, 40, "if this moved, §4.7 and issue #9 want to hear about it");
+        for bits in [24u32, 27, 32] {
+            println!(
+                "2^{bits} streams in one object = {:.0} GB",
+                each as f64 * 2f64.powi(bits as i32) / 1e9
+            );
+        }
+    }
+
     use super::*;
     use common::testing;
 

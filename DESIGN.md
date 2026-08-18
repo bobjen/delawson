@@ -2680,6 +2680,29 @@ The SN RAM split deserves its own warning: **it will vary wildly between tenants
 in production**, because it encodes an assumed mix of object sizes (§14.1.1). It has
 to be a soft allocation that rebalances, not a partition fixed at build time.
 
+#### 4.7.1 What the placeholders actually cost
+
+**Measured, 2026-08-17**, and the gap is worth knowing before anyone sizes a test
+against it. The reference width above is **4 bytes**: a stream's extent list and an
+object's stream list hold node-local references, and the ~100 byte record itself
+lives once in a table those references point into.
+
+| List | Budget per entry | Today | 2^32 entries, today |
+|---|---|---|---|
+| An SN stream's extents | 4 B | **80 B** — 64 B inlined plus a 16 B instance list | 344 GB |
+| A DN object's streams | 4 B | **40 B**, inlined | 172 GB |
+
+⚠️ **Both lists inline the whole record where the design says reference**, so they
+cost twenty and ten times the budget. That is a property of §14.6's placeholders and
+not of the design — but it decides what a large-stream or large-object test can reach
+on real hardware, so it is the number to size against until the segmented array and
+the B-tree land. At 4 bytes a 2^32-entry list is 17 GB; at 80 it is a machine's worth
+of RAM per stream.
+
+The SN also pays what the table above cannot show: the instance list is a **separate
+allocation per extent**, so 2^n extents are 2^n allocations, each rounded up and given
+a header. Real RSS is above the computed figure and the packed form has none of it.
+
 ---
 
 ## 5. The physical decomposition: machine types

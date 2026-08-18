@@ -482,6 +482,34 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
+
+    /// What one extent costs a stream's list here, which is what decides how many a
+    /// stream can hold before a box runs out of RAM. §4.7 budgets a **4 byte**
+    /// node-local reference for this list, with the ~100 byte record itself living
+    /// once in a table the streams point into.
+    ///
+    /// ⚠️ **This list inlines the whole record instead**, so it costs twenty times
+    /// the budget. That is a property of the placeholder and not of the design
+    /// (§14.6), and it is the thing that decides what a large-stream test can
+    /// actually reach today.
+    #[test]
+    fn an_extent_costs_a_stream_more_than_a_reference() {
+        // Plus a second allocation per extent for the instance list, which the
+        // allocator rounds up and adds a header to — so the true cost is larger
+        // again, and 2^n of them are 2^n allocations.
+        let each = size_of::<Sealed>() + 4 * size_of::<u32>();
+        assert_eq!(each, 80, "if this moved, §4.7 and issue #9 want to hear about it");
+        for bits in [24u32, 27, 32] {
+            println!(
+                "2^{bits} extents in one stream = {:.0} GB",
+                each as f64 * 2f64.powi(bits as i32) / 1e9
+            );
+        }
+        // Against the design's reference width, the same list is a different object.
+        assert_eq!(each / 4, 20, "twenty times what §4.7 budgets for a reference");
+    }
+
     use super::*;
     use common::testing;
 
