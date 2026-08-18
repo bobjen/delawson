@@ -1360,9 +1360,52 @@ The last two arrive from outside the storage argument, which is why they are eas
 the surface area: the expensive parts are wanted for other reasons, and what "keyed" adds on top of
 them is small.
 
-⚠️ **Updatable sorted indexes are not on §1's ship gate**, and they should be placed deliberately —
-either as a ship requirement, which makes them a large piece of unscheduled work, or as explicitly
-after it, which means the keyed flavour arrives with them rather than before.
+#### 3.0.1 Sorted by one key is the only updatable index
+
+**The original aim was updatable indexes on embeddings, and the conclusion was against it** (Asserted,
+Bob, 2026-08-17): **only sorted-by-a-single-key is updatable.** What that leaves is worth stating
+precisely rather than being inferred:
+
+- **Embedding indexes are generated stale and updated in passes.** They are rebuilt rather than
+  maintained, which is a batch job and not a mutation on the write path.
+- **Locality is approximated by combining sorted indexes.** The **intersection or union of several
+  keyed indexes** gets a long way toward what an embedding index would give, using the one index type
+  that *is* updatable rather than needing a second one that is not.
+- **It is good enough because the consumer iterates.** Several passes of narrowing is **typical of deep
+  thinking**, so approximate locality refined over iterations matches the shape of the work rather than
+  falling short of it.
+
+**The dividend is one updatable index type to build, not two**, and it is the one whose mutation,
+ordering, repair and merging story the rest of the design already needs. An incrementally-updatable
+nearest-neighbour structure has none of that in common with an ordered one: no key order to place by,
+no range to scan, and its own crash-safety and rebalancing problem.
+
+⚠️ **Nothing else in this document mentions embeddings**, and what a pass costs, how stale an index may
+be before it misleads, and whether combining indexes is something the store answers or a job on Compute
+are all unaddressed (#68).
+
+#### 3.0.2 Updatable *secondary* indexes need transactions, so they come after the first release
+
+⚠️ **An appended row spawns updates to the keyed indexes over it, which appears to require
+transactions** (Asserted, Bob, 2026-08-17). That is the line between two things that sound alike:
+
+| | Atomicity needed | Because |
+|---|---|---|
+| **A keyed object**, updated | within one object | the rows *are* the index — index-organized, so one write changes one thing |
+| **A secondary index** over another object | across two objects | appending a row and updating its index entry must not half-happen |
+
+So the first release has **keyed objects and updates to them, and not updatable secondary indexes**
+(Asserted, Bob, 2026-08-17). That keeps the ship gate free of a transaction requirement, and it is a
+real reduction rather than a deferral of difficulty: a keyed object needs no cross-object atomicity at
+all.
+
+**And it gives §16's transaction question a second, independent forcing reason.** It was valued for
+dropping a ring from 3x RAM to 2x, and §9.1.3.1 added parallel pagination. This adds a third: without
+transactions there are no updatable secondary indexes, so the feature that most obviously wants them is
+blocked on the same thing.
+
+⚠️ **Updatable sorted indexes are not on §1's ship gate**, and should be placed deliberately — with the
+split above making that easier, since the part that needs no transactions is the part that could ship.
 
 The asymmetry follows from one fact: **record counts are stable under update
 and tombstoned delete, but not under insert.** An update replaces a record and
@@ -9709,12 +9752,26 @@ sample cannot say whether a 5% move is a regression or noise.
 
 ---
 
-### 15.4 Where this is, and how big it is
+### 15.4 Where this is, how big it is, and who it is for
+
+**There is more than one use case, and shared AI memory is one of them rather than the one**
+(Asserted, Bob, 2026-08-17). Worth stating because §1.0 argues the AI-memory case at length and a
+reader can mistake emphasis for exclusivity:
+
+| Use case | What it wants |
+|---|---|
+| **Shared AI memory** | **size rather than speed** — a slow shared memory, and large |
+| **Models**, stored and retrieved | 50 TB objects, which is what §1.4's large-object work is for |
+| **What Hadoop is used for** | bulk analytics over many objects |
+
+That AI memory wants size and not speed is the part that changes how other sections should be read:
+it is not a latency-critical workload dressed up as a storage one, and a design decision that trades
+a little latency for a lot of capacity is trading in the right direction for it.
 
 **The project is about the scope of Hadoop** (Asserted, Bob, 2026-08-17): the basics of the store are
 CRUD, directories, concatenate, and keeping the data durable — and then there are user accounts, and
-then there is Compute. That is the measure to keep in mind when reading the sections that go into
-tenths of a percent: the whole is large, and most of it is not built.
+then there is Compute. That is the measure to keep in mind when reading sections that go into tenths
+of a percent: the whole is large, and most of it is not built.
 
 ⚠️ **And the current state is early**, whatever the depth of this document suggests: *"we're rapidly
 putting pieces in place and rolling marbles through them, which is a milestone but one far away from
@@ -9927,10 +9984,12 @@ Roughly in order of how much else depends on them.
 61. **Transactions and long consistent reads** (§5.7). Getting them would drop the
     ring from 3× RAM to 2×, the single largest cost saving identified so far. §5.8
     makes the required read duration much shorter than ten minutes, so this looks
-    more attainable than when first raised. **And there is a second, unrelated
-    argument**: §9.1.3.1 shows consistent read is what turns a paginated read of a
+    more attainable than when first raised. **And there are two more, unrelated
+    arguments**: §9.1.3.1 shows consistent read is what turns a paginated read of a
     large object from serial into parallel, since a consistent view makes chunk
-    boundaries computable rather than discoverable.
+    boundaries computable rather than discoverable; and §3.0.2 finds that **updatable
+    secondary indexes need transactions**, since an appended row spawns index updates
+    that must not half-happen. Three unrelated reasons for one feature.
 62. **Raft ring sizes and slack** (§5.6.1): how many members for an SN ring, for a
     DN ring, for KS. ⚠️ **A working figure exists** (Asserted, Bob, 2026-08-17): **seven members, and
     nine if seven cannot deliver no-long-downtime** — chosen for availability under failover (question
