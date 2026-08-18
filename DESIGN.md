@@ -23,14 +23,18 @@ confirmed. Where the two conflict, the arithmetic wins and the label gets update
 fraction of bound. A throughput number without its ceiling is as much a liability as an unlabelled
 constant, because it cannot distinguish good from merely better than the alternative.
 
-**Section numbers are keys, so this document is only ever grown at the end of a section.** Cross
-references say §4.6.6.1, which means inserting a section renumbers its siblings and silently
-invalidates every reference to them — so new material is appended within its parent rather than
-placed where it reads best. That is append-at-end beating insert-in-the-middle, in the document
-about append-at-end beating insert-in-the-middle. Stable names alongside the numbers would let
-order become a property of the table of contents instead; issue #67 carries it, together with the
-index of named invariants and terms that would make a document this size navigable as the graph
-it is.
+**Section numbers are the keys, and this document is only ever grown at the end of a section.**
+Cross references say §4.6.6.1, so inserting a section would renumber its siblings and silently
+invalidate every reference to them. Appending within a parent instead keeps every existing number
+correct — which is append-at-end beating insert-in-the-middle, in the document about append-at-end
+beating insert-in-the-middle.
+
+**That is the right trade and not a workaround** (Asserted, Bob, 2026-08-17). It is the discipline
+that makes a number a stable key, and its only cost is that reading order cannot be curated —
+which costs nothing here, because a document this size is navigated by searching for the thing you
+need, not read front to back. Named anchors would buy rearrangement, and rearrangement is not
+wanted. What is wanted is §67's index of named invariants and terms, and numbers serve as its
+targets perfectly well.
 
 The distinction matters because this document is long and will be read by people who cannot
 re-derive it from scratch. An unlabelled number is a liability: in a year nobody can tell whether
