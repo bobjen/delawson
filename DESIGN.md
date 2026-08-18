@@ -2902,30 +2902,40 @@ later edits as well as hold at creation.
 | Check, when creating an alias at *P* pointing at *D* | Cost |
 |---|---|
 | **(a)** No ancestor of *P* is itself aliased | walk up from *P*, O(depth) reads of a per-directory count of inbound aliases |
-| **(b)** *D*'s subtree contains no alias | O(1), against a per-directory count of aliases beneath it |
+| **(b)** *D*'s subtree contains no alias | O(1), against a per-directory **bit** meaning "an alias is somewhere beneath me" |
 
 (b) is the rule as stated. ⚠️ **(a) is what keeps it true afterwards** — without it, someone
 adds an alias *inside* an already-aliased subtree and (b)'s guarantee for the older alias
-quietly stops holding. (a) needs no maintenance at all: the inbound count lives in the
-directory being pointed at, and depth is small.
+quietly stops holding. (a) needs no maintenance at all: it reads a bit in each
+directory on the way up, and depth is small.
 
-**The beneath-count is where the cost would be**, and it has a trick. Adding an alias
-increments the count on every ancestor of its parent, which writes to the root on every alias
-creation — a way to DOS the root. But **the count is only ever read as zero-or-not**, so 1 → 2
-changes no answer: the walk up may **stop at the first nonzero ancestor** and leave the exact
-value to GC (Asserted, Bob, 2026-08-17). Since every ancestor of a nonzero directory is also
-nonzero, the eager walk only ever climbs through zeros — and the root is written once, for the
-first alias in the cluster.
+**"Beneath me" is a boolean, greedily set and lazily cleared** (Asserted, Bob, 2026-08-17) —
+not a count. Nothing ever asks *how many* aliases are beneath a directory; (b) asks only
+whether there are any. So:
 
-⚠️ **Removing an alias is the dangerous direction, and it is §4.6.6.2's asymmetry again.** A
-count left too high refuses an alias that would have been legal; a count driven too low permits
-an alias into a tree that has one, which is the cycle this section exists to prevent. So
-decrement is not eager: the count falls only when a sweep has recomputed it. A user who deletes
-an alias and immediately tries to alias that tree is told no until GC catches up, which is the
-correct way to be wrong.
+- **Setting** walks up from the new alias's parent and **stops at the first ancestor already
+  set**, because every ancestor of a set directory is set. The walk therefore only ever climbs
+  through clear bits, and **the root is written once — for the first alias in the cluster**,
+  not on every creation. Which is what stops alias creation from being a way to DOS the root.
+- **Clearing** is done only by a sweep that has established there is no alias beneath.
+
+⚠️ **The two errors are not symmetric, which is §4.6.6.2's rule again.** A bit left set refuses
+an alias that would have been legal; a bit cleared wrongly permits an alias into a tree that
+has one, which is the cycle this section exists to prevent. Greedy-set-lazy-clear puts every
+error on the safe side, and a boolean cannot drift the dangerous way at all: it is never
+lowered except by proof, where a count can be driven low by one missed decrement.
+
+**Why this is a bit and §4.6.6's refcounts are numbers** is worth being explicit about, since
+they look like the same problem. It is **how urgent the zero is**. Reaching zero references
+must free storage promptly, and making every delete wait for a sweep would leave a cluster's
+worth of space uncollected — so that one pays for a real count. Nobody is waiting to alias a
+tree they just cleared, so this one does not.
+
+So a directory carries **two bits' worth of alias state**: aliases beneath me, and aliases
+pointing at me. Neither is a number.
 
 **Moving a directory is a create and a delete of the same shape.** Moving a subtree that
-contains aliases increments its new ancestors eagerly, by the same stop-at-nonzero walk, and
+contains aliases sets its new ancestors eagerly, by the same stop-at-the-first-set walk, and
 leaves the old chain to the sweep — and a move that would place an aliased directory under
 another aliased directory is refused by check (a).
 
