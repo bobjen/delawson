@@ -2712,12 +2712,12 @@ That also means **the SN is never told how many objects use a stream.** It is to
 the stream, once, when the DN's count reaches zero. Which is the right division — the DN owns
 who refers to what, and the SN owns what the stream is.
 
-⚠️ **Open: a stream referenced from two DN rings has no single place for its count.** Objects
+**A stream referenced from two DN rings would have no single place for its count** — objects
 lumped into a common stream (§11) are naturally co-located, but a clone into another part of
-the directory tree may not be, and then no one ring can hold the total. Either the count is
-per-ring and the stream dies when all of them are zero — which is a distributed termination
-problem — or a cross-ring clone is forbidden from sharing and copies instead. Undecided;
-§16 carries it.
+the directory tree may not be, and then no one ring holds the total. Rather than make the
+count distributed, **a cross-ring clone copies** (Asserted, Bob, 2026-08-17), so the situation
+never arises. §5.1.1.2 explains why that is affordable: aliases cover the case that made
+cross-ring sharing attractive.
 
 ##### 4.6.6.2 Counts get scrubbed
 
@@ -2854,6 +2854,96 @@ resolution and rename are addressed by the key choice in §5.5.4, but listing a
 directory with a billion entries, permissions, and quotas are not. Billing
 (§12) also attaches naturally to directories and accounts rather than to bare
 objects.
+
+#### 5.1.1 Aliases: another tenant's directory inside your tree
+
+**A DN has aliases** (Asserted, Bob, 2026-08-17). Given the privilege to do it, you can attach
+another tenant's directory into your own tree, and it appears as if it were yours. What it is
+not is a copy or a transfer of ownership:
+
+- **The data has one official owner**, who is the only party that may write or delete it.
+- **An alias is read-only**, always, however the aliasing tenant's own permissions read.
+
+That asymmetry is what makes aliases cheap, and several hard questions fall out of it rather
+than having to be answered:
+
+| Question | Answer, because an alias is a read-only view |
+|---|---|
+| Does an alias pin storage? | **No.** It is not a counted reference (§4.6.6), so it cannot appear in any refcount |
+| What happens when the owner deletes? | **The alias dangles**, which is the owner's right — deletion is theirs |
+| Who pays? | **The owner.** Nothing aliased counts against the reader's quota |
+| Whose ACL governs a read? | The **owner's**, checked at the target; the alias only says the reader may look |
+
+⚠️ **An alias is the one directory reference that needs a name bigger than a ring.** §4.6's
+rule is that nothing in the data plane carries a cluster-wide name — every reference is
+node-local, an index into a population its holder knows. An alias breaks that by construction,
+because it points at a directory another ring owns. So it is not a `StreamId` or an object
+reference; it is a distinct kind of entry carrying a global target, and the DN has to treat it
+as one.
+
+It leaves open **what a reader sees during the owner's writes**, since an alias reads live
+data rather than a snapshot. Cycles are handled by §5.1.1.1.
+
+##### 5.1.1.1 No alias may point into a tree that contains aliases
+
+A tree with aliases in it is a graph, so listing, recursive delete, quota walks, the §4.6.6.2
+scrub and §71's sweep all have to cope with cycles — unless cycles are impossible. **They are
+forbidden by construction** (Asserted, Bob, 2026-08-17): *an alias may not point at a directory
+whose subtree contains an alias.*
+
+**That is enough, and here is why.** Under the rule, an aliased directory's subtree contains no
+aliases, so the only things reachable from an alias target are ordinary directories and
+objects: reachability from a target is exactly its subtree, and a subtree of a tree has no
+cycle. There is no traversal to bound and no visited set to carry.
+
+**Enforcing it takes two checks, not one**, because the rule is a property that has to survive
+later edits as well as hold at creation.
+
+| Check, when creating an alias at *P* pointing at *D* | Cost |
+|---|---|
+| **(a)** No ancestor of *P* is itself aliased | walk up from *P*, O(depth) reads of a per-directory count of inbound aliases |
+| **(b)** *D*'s subtree contains no alias | O(1), against a per-directory count of aliases beneath it |
+
+(b) is the rule as stated. ⚠️ **(a) is what keeps it true afterwards** — without it, someone
+adds an alias *inside* an already-aliased subtree and (b)'s guarantee for the older alias
+quietly stops holding. (a) needs no maintenance at all: the inbound count lives in the
+directory being pointed at, and depth is small.
+
+**The beneath-count is where the cost would be**, and it has a trick. Adding an alias
+increments the count on every ancestor of its parent, which writes to the root on every alias
+creation — a way to DOS the root. But **the count is only ever read as zero-or-not**, so 1 → 2
+changes no answer: the walk up may **stop at the first nonzero ancestor** and leave the exact
+value to GC (Asserted, Bob, 2026-08-17). Since every ancestor of a nonzero directory is also
+nonzero, the eager walk only ever climbs through zeros — and the root is written once, for the
+first alias in the cluster.
+
+⚠️ **Removing an alias is the dangerous direction, and it is §4.6.6.2's asymmetry again.** A
+count left too high refuses an alias that would have been legal; a count driven too low permits
+an alias into a tree that has one, which is the cycle this section exists to prevent. So
+decrement is not eager: the count falls only when a sweep has recomputed it. A user who deletes
+an alias and immediately tries to alias that tree is told no until GC catches up, which is the
+correct way to be wrong.
+
+**Moving a directory is a create and a delete of the same shape.** Moving a subtree that
+contains aliases increments its new ancestors eagerly, by the same stop-at-nonzero walk, and
+leaves the old chain to the sweep — and a move that would place an aliased directory under
+another aliased directory is refused by check (a).
+
+##### 5.1.1.2 Aliases are why a cross-ring clone may copy
+
+§4.6.6.1 left open what to do about a stream referenced from two DN rings, which has no single
+place to keep its count of referring objects. **Settled: a cross-ring clone copies rather than
+shares** (Asserted, Bob, 2026-08-17).
+
+That looks expensive — §4.6.1 says clone's whole point is costing metadata rather than data,
+and copying gives that up. It is affordable because **aliases take the common case away.** The
+usual reason to want another ring's data in your tree is to *read* it, and an alias does that
+for nothing. What is left for a copying clone is the case where you genuinely want your own
+writable, independently-owned duplicate — and for that, copying is not a workaround but the
+correct semantics.
+
+So the sharing rule ends up simple: **share inside a ring, copy across one, alias when reading
+is all you wanted.**
 
 ### 5.2 SNs — Stream Nodes
 
@@ -10051,12 +10141,9 @@ Roughly in order of how much else depends on them.
    have to migrate, which is reassignment arriving from workload drift rather than
    failure.
 5. **Shared-extent and shared-stream consequences** (§4.6.1): copy-on-write
-   compaction, and billing attribution between a clone and its original. ⚠️ **Plus one
-   that §4.6.6.1 raised and did not settle**: a stream's count of referring objects lives
-   in the DN that holds those objects, so **a stream referenced from two DN rings has no
-   single place for its count**. Either the count is per-ring and the stream dies when all
-   are zero — a distributed termination problem — or a cross-ring clone copies rather than
-   shares. The second is much simpler and gives up the thing §4.6.1 says sharing is for.
+   compaction, and billing attribution between a clone and its original. The cross-ring
+   version of the same question is **closed**: a cross-ring clone copies rather than shares
+   (§5.1.1.2), because aliases cover the case that made cross-ring sharing attractive.
 6. **The DN-side stream-list entry has no budget** (§14.1.2). Sizings currently use
    the 200 B stream record as a loose upper bound; a real figure would shrink every
    stream-list number severalfold.
