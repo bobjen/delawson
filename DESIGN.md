@@ -2744,6 +2744,43 @@ two agreeing passes, or the clock of §13.3 rather than an immediate free.
 reference once and ask something about it. One traversal, several consumers, is the shape to
 build — issue #71.
 
+##### 4.6.6.3 How lazy each of these may be
+
+Three things here are deliberately deferred — the scrub above, §5.1.1.1's alias bit, and
+reclamation at zero references — and they do **not** get the same latitude.
+
+| Deferred thing | May lag by | What the lag costs |
+|---|---|---|
+| §5.1.1.1's alias bit | **a day, easily** | an alias refused that would have been legal |
+| A refcount scrub | a day | nothing, while counts are only too high |
+| **Reclamation at zero references** | ⚠️ **not a day** | real storage, unbilled |
+
+**Reclamation may be lazy but it cannot be very lazy** (Asserted, Bob, 2026-08-17): *"I could
+see waiting a day before aliasing a higher directory, but not waiting a day for garbage to stop
+being billed."*
+
+**This is §12.1's principle, not a separate rule.** Billing must track actual cost within
+slack, in *both* directions — and unreclaimed garbage is cost without billing, which is the
+direction §12.1 says makes the service go broke. Deleted bytes still on disk are the purest
+form of the divergence: the customer's meter stops on its own, because billing walks forward
+from live objects (§4.6.6) and a gone object stops appearing, while the disk stays full.
+§8.4.1's retention window is the case where the two *do* track, which is precisely why the
+customer pays for it.
+
+⚠️ **Short-lived data with soft delete opted out is where the ratio blows up**, and it is the
+case that sets the requirement. Steady-state garbage is *churn rate × reclamation lag*, which
+bears no relation to how much live data the tenant has: a workload writing and deleting a
+petabyte a day carries a petabyte of garbage at a one-day lag while being billed for almost
+nothing. So the promptness requirement is set by **the shortest-lived data the system accepts,
+not by average behaviour**. And a tenant who opted out of the retention window asked not to
+have their deleted data stored; keeping it a day anyway makes the opt-out a fiction.
+
+**So the budget derives rather than being invented**: reclamation must be prompt enough to hold
+garbage inside §12.1's slack, which on a high-churn opted-out workload means near-prompt and on
+an archive means almost anything. Stating it as "reclaim within N hours" would set the wrong
+variable — the number that matters is how far cost has drifted from billing, and time is only
+one of its inputs.
+
 ### 4.7 Working budgets
 
 Every number below is **a guess, to be replaced by measurement**. They are collected
