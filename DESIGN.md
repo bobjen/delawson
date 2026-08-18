@@ -2647,6 +2647,99 @@ rather than prediction:
 object that started shared and turned out to be large is tidied by the same machinery that compacts
 anything else, so the cost of guessing wrong is deferred work rather than a wrong structure.
 
+#### 4.6.6 The reverse edge is a count, not a list
+
+Reclamation needs to know when the last reference to an extent or a stream goes away, which
+raises the question of whether the target should track **who** refers to it or merely **how
+many** do. **It keeps a count** (Decided, Bob and reasoning here, 2026-08-17).
+
+⚠️ **A count costs nothing per reference, and a list costs everything.** The count lives in
+the *record* — 2 to 4 bytes of §4.7's 100-byte extent record — while a list of referrers is a
+second structure the size of the forward one, doubling the largest thing the system stores.
+The forward references stay 4 bytes either way, so this is not a trade between two widths; it
+is a trade between a field and a whole index.
+
+The two counts are not the same size, for §4.6.1's reason: an extent's is almost always 1 and
+fits 16 bits, with saturation refusing further sharing rather than wrapping, while a common
+stream carries one reference per tiny object lumped into it and needs 32.
+
+**What actually asks a reverse question, and what it really needs:**
+
+| Use case | Needs | Why a list is not the answer |
+|---|---|---|
+| Deletion and GC | the count | decrement, reclaim at zero — §4.6.1 |
+| Compacting a shared extent | nothing | copy-on-write, driven *forward* from the referrer that triggered it |
+| Billing a shared extent | the count | computed forward per object, divided by the count; the other referrers are never named |
+| Checking invariants | the count | a forward mark-and-sweep recomputes every count, so **counts are auditable and repairable** — a list is one more thing that can be wrong |
+| Debugging "what stream is this extent in?" | — | the metadata snapshot answers it for anything over a day old, and under a day the writer is still there |
+| Authorizing a direct `(EnId, extent, record)` hint | — | **put the stream in the hint** |
+| ⚠️ Reporting what a permanent loss destroyed | genuinely reverse | see below |
+| Impact of a planned decommission | genuinely reverse | same shape, and nobody minds if it takes an hour |
+
+**The general rule underneath most of those rows: wanting a reverse lookup usually means
+context was thrown away that could have been carried.** The hint is the clean example — it
+names an extent directly, so authorizing it appears to need extent → object, until you put the
+stream in the hint and the question disappears.
+
+The one row that is real is **reporting a permanent loss** — when a quorum is gone for good,
+every affected user is owed a list of what they lost, which is extent → stream → object for
+millions of extents at once and wants to be current rather than a day stale. That is answered
+by a **sweep, not an index**: the event is rare, §14.1 keeps this data in RAM, and one pass
+over a stream table is minutes. Paying for a permanently maintained structure to make a rare
+batch question fast is the wrong trade. Issue #71 tracks building the sweep.
+
+**And for object → stream there is a second, harder argument.** §13.1.7 fixes the loop
+inventory at exactly one sync loop per tier boundary. `stream → extent` lives inside one SN
+ring and is atomic under Raft, so a reverse edge there would at least be *maintainable*; but
+`object → stream` crosses DN → SN, so a stream holding the objects that reference it would be
+cross-tier state that drifts, needing reconciliation by the very loop §13.1.6 already runs to
+find orphan streams. That loop works off counts. Giving it a list to reconcile as well would
+be a second copy of its own job.
+
+##### 4.6.6.1 Each count lives with the references it counts
+
+**An extent's count of referring streams lives in the SN, and a stream's count of referring
+objects lives in the DN** (Asserted, Bob, 2026-08-17) — in the DN's own record for that
+stream, not in the SN's. Each count sits in the same tier as the references it is counting,
+which is what makes it maintainable: a reference and the count of it change under one ring's
+Raft, so they cannot disagree across a message that was lost.
+
+That also means **the SN is never told how many objects use a stream.** It is told to delete
+the stream, once, when the DN's count reaches zero. Which is the right division — the DN owns
+who refers to what, and the SN owns what the stream is.
+
+⚠️ **Open: a stream referenced from two DN rings has no single place for its count.** Objects
+lumped into a common stream (§11) are naturally co-located, but a clone into another part of
+the directory tree may not be, and then no one ring can hold the total. Either the count is
+per-ring and the stream dies when all of them are zero — which is a distributed termination
+problem — or a cross-ring clone is forbidden from sharing and copies instead. Undecided;
+§16 carries it.
+
+##### 4.6.6.2 Counts get scrubbed
+
+**A count is a cache of a truth held by the referrer** (§13.1.7), so it can be wrong, and
+periodically it is recomputed and repaired (Asserted, Bob, 2026-08-17). This is the payoff of
+choosing a count over a list: the truth is still there in the forward references, so a scrub
+is a mark-and-sweep that can restore it. A list, once wrong, has no such recovery — you would
+be reconstructing it from the same pass anyway.
+
+⚠️ **The two ways a count can be wrong are not equally bad, and the scrub must not treat them
+alike.**
+
+| Error | Consequence | How the scrub may act |
+|---|---|---|
+| count too **high** | space leaks, and §13.1.6's leverage makes a leaked count expensive | correct it freely — the worst case is that reclamation happens |
+| count too **low** | **live data is freed** | never act on this alone |
+
+A scrub that computes a lower number than the record holds has not proved the record wrong; it
+may have missed a reference that moved during the pass. So lowering a count has to be
+conservative — an epoch or generation that makes "unchanged for the whole pass" checkable, or
+two agreeing passes, or the clock of §13.3 rather than an immediate free.
+
+**And the scrub is the same walk as the loss sweep of §4.6.6.** Both visit every forward
+reference once and ask something about it. One traversal, several consumers, is the shape to
+build — issue #71.
+
 ### 4.7 Working budgets
 
 Every number below is **a guess, to be replaced by measurement**. They are collected
@@ -9954,7 +10047,12 @@ Roughly in order of how much else depends on them.
    have to migrate, which is reassignment arriving from workload drift rather than
    failure.
 5. **Shared-extent and shared-stream consequences** (§4.6.1): copy-on-write
-   compaction, and billing attribution between a clone and its original.
+   compaction, and billing attribution between a clone and its original. ⚠️ **Plus one
+   that §4.6.6.1 raised and did not settle**: a stream's count of referring objects lives
+   in the DN that holds those objects, so **a stream referenced from two DN rings has no
+   single place for its count**. Either the count is per-ring and the stream dies when all
+   are zero — a distributed termination problem — or a cross-ring clone copies rather than
+   shares. The second is much simpler and gives up the thing §4.6.1 says sharing is for.
 6. **The DN-side stream-list entry has no budget** (§14.1.2). Sizings currently use
    the 200 B stream record as a loose upper bound; a real figure would shrink every
    stream-list number severalfold.
