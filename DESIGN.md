@@ -3753,6 +3753,60 @@ handful of ENs and a handful of peers, not all of them. Expect the same three in
 random stratified neighbourhoods, local indices rather than global ids, and rejection against
 placement rules.
 
+#### 5.12.0 Prior art with a shared author: SCOPE over Cosmos
+
+**SCOPE is what this layer looked like last time**, and Bob is one of its authors (Cited:
+[SCOPE: Easy and Efficient Parallel Processing of Massive Data Sets](http://www.vldb.org/pvldb/vol1/1454166.pdf),
+Chaiken, Jenkins, Larson, Ramsey, Shakib, Weaver and Zhou, PVLDB 1(2), 2008).
+
+**As a shape for Compute.** A declarative scripting language over rowsets with **no explicit
+parallelism** — *"A script writer can view operators as being entirely serial; mapping the script to an
+efficient parallel execution plan is handled completely by the SCOPE compiler and optimizer"* — with a
+small extensible operator set (extractors, processors, reducers, combiners, outputters), a cost-based
+optimizer, and a Job Manager scheduling the resulting graph. A worked answer to what §5.12 leaves open,
+from the people who then ran it.
+
+**And as a citable reference for a distributed store that compresses**, which is rarer than it should
+be. §2.1 of that paper states it plainly:
+
+> *"Append blocks are stored in compressed form with compression and decompression done transparently
+> at the client."*
+
+That matters to this document twice over. It is published prior art for §8.1.4.1's decision that **the
+client compresses** — reached here independently, and today extended to the client being what checks
+the CRC (§9.1.2). And **Cosmos is sparsely documented**, so a peer-reviewed paper saying so is one of
+the few public sources for how a production store of this shape actually handled compression. Where
+this design wants to cite the practice rather than re-derive it, this is the citation.
+
+**Three more of §2.1's sentences describe decisions this document reached again:**
+
+| SCOPE's Cosmos | DeLawson |
+|---|---|
+| *"The data within an extent consist of a sequence of append blocks. The block boundaries are defined by application appends… contain a collection of application-defined records"* | §8.1's append block and §8.2's framing, exactly |
+| *"concurrent writers are serialized by the system"* | §8.1.1a-8's one open extent per object |
+| *"regularly scrubbed to protect against bit rot"* | §13's scrubbing |
+
+**On extent size, the comparison is not the obvious one** (Asserted, Bob, 2026-08-17). Cosmos's extents
+are *"typically a few hundred megabytes"*, and **that limit is logical — as almost everyone's is, since
+almost nobody compresses.** So the like-for-like is against DeLawson's **4 GB logical** cap (§6), which
+is an order of magnitude *larger*. (The paper also calls extents *"the unit of space allocation"*, which
+reads like stored bytes; the author's word settles it, and the phrasing is noted here so nobody
+re-litigates it from the text alone.)
+
+⚠️ **What is genuinely unusual is that DeLawson has a compressed cap at all.** 32 MB compressed is a
+second limit, on a quantity most systems do not have separately, and it exists because the costs it
+bounds — EC recovery (§6.1), compaction, open-extent memory — are costs in *stored* bytes rather than
+in what a writer wrote. A store whose logical and stored sizes coincide needs one cap for both.
+DeLawson needs two because they differ, and #50 is therefore measuring the stored-byte bound rather
+than "the extent size".
+
+**And one difference that cuts against an assumption here.** The paper says *"A unit of computation
+generally consumes a small number of collocated extents"* — Cosmos deliberately **collocated** the
+extents a computation would consume. §5.12.3 argues DeLawson needs no affinity because the
+intra-cluster network is flat. Both can be true, a flat network being a stronger assumption than Cosmos
+could make, but a prior system paying for locality is a reason to want §5.12.3's measurement rather
+than to take the assumption on trust.
+
 #### 5.12.1 The security invariant makes the network carry everything
 
 Cosmos and Dryad placed **computation close to its data** — the talk is explicit that the
