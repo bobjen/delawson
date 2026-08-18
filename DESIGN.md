@@ -2699,10 +2699,14 @@ be a second copy of its own job.
 ##### 4.6.6.1 Each count lives with the references it counts
 
 **An extent's count of referring streams lives in the SN, and a stream's count of referring
-objects lives in the DN** (Asserted, Bob, 2026-08-17) — in the DN's own record for that
-stream, not in the SN's. Each count sits in the same tier as the references it is counting,
-which is what makes it maintainable: a reference and the count of it change under one ring's
-Raft, so they cannot disagree across a message that was lost.
+objects lives in the DN** (Asserted, Bob, 2026-08-17). The second means the DN holds a record
+of its own **keyed by `StreamId`** — a thing the DN has that is not an object and not a copy
+of the SN's stream, existing so that the many objects lumped into one common stream (§11) have
+somewhere to be counted. An object's stream list points at it, and it points at the stream.
+
+Each count therefore sits in the same tier as the references it counts, which is what makes it
+maintainable: a reference and the count of it change under one ring's Raft, so they cannot
+disagree across a message that was lost.
 
 That also means **the SN is never told how many objects use a stream.** It is told to delete
 the stream, once, when the DN's count reaches zero. Which is the right division — the DN owns
