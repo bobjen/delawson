@@ -10032,6 +10032,90 @@ exclusive acquisition**, which no amount of cheapness on the shared side helps w
   reading one back is a lookup into bytes rather than building an object graph. The lookup tables are
   what make that navigable, and they are the thing that has to be rebuilt on load — not the extents.
 
+#### 14.6.5 The SN's extent array, indexed by `ExtentId`
+
+**Designed by Bob on 2026-08-17**, with the ordering notes below worked out here. This is the concrete
+form of §14.6.2's "the id is the index", and it exists because `ExtentId` is **permanent** — never
+reused, so deletes leave holes and a naive array grows with the highest id ever issued rather than with
+the extents that are actually there.
+
+**A record has a normal fixed size**, plus a flag and a pointer to an extra block for the **unusual**
+cases. There are many ways to be unusual and the total is kept small; being **beyond the end of the
+array** is one of them, budgeted at about **1/20th of extents**.
+
+| Piece | What it is |
+|---|---|
+| the **array** | mostly compact, indexed by `ExtentId`, rebuilt compact at startup |
+| a **squatter** | a live extent whose id is past the end, placed in a hole and flagged as owning a different id |
+| the **hash table** | `ExtentId` → slot, for exactly the squatters |
+| the **free list** | slots a create may claim |
+| the **recycle list** | slots that are finished with but may still be under a reader's eye |
+
+**Lookup compares the id against the bound.** Below it, index the array directly — and the flag is
+tested only to notice that a *dead* id has landed on a slot belonging to someone else. Above it, probe
+the hash table. §14.6.3's point holds: the comparison was needed anyway to reject an id beyond the
+highest ever handed out, so a correctly-mapped extent pays nothing for the scheme.
+
+⚠️ **Internal references are always the final `ExtentId`, never the squat slot.** This is the decision
+the rest depends on. Nothing anywhere points at where a squatter physically sits — the hash entry is the
+only thing that does — so relocating one is a copy and a hash edit, with no reference anywhere to chase.
+The alternative, letting internal references name slots directly, saves a probe on 1/20th of lookups and
+buys an obligation to rewrite every stream's extent list on every move.
+
+##### 14.6.5.1 Growth hands each new slot to whoever owns it
+
+**The array is grown before it is needed**, not when a create finds the free list empty. Growth walks
+the newly covered ids and does one of two things with each:
+
+- the id is **in the hash table** — so the extent that really owns it is squatting somewhere. Copy it
+  into its own slot at last, and put **the slot it vacated** on the recycle list.
+- the id is **not** — put **the new slot** on the recycle list.
+
+**So growing by K ids yields exactly K recycled slots either way**, which makes the growth lead easy to
+size: allocation rate times the gap between write-lock windows, plus slack.
+
+**Reclamation is the O(1) part.** The recycle list becomes claimable by attaching its head to the tail of
+the free list, under the write lock — **one splice, however many slots are pending**. This is §14.6.3's
+deleted-list argument with its cost made explicit: exclusivity is the proof that no reader holds a slot,
+and the proof is bought once for the whole batch rather than per slot. Which is why cleanup does not
+have to be aggressive: **being lazy costs memory and never costs work**, and an SN's space is expected
+to fluctuate daily and weekly anyway.
+
+⚠️ **The stale hash entry retires with the slot, not at the copy.** A reader reads the bound and then
+dispatches on it. If growth copies the squatter, publishes the new bound, and drops the hash entry
+straight away, a reader still holding the *old* bound probes the hash afterwards, misses, and concludes
+the extent does not exist. Deferring the drop to the same write-lock window that splices the slot fixes
+it with no new mechanism, and the alternative — making a reader re-read the bound on a miss — is more
+moving parts for the same guarantee.
+
+Two properties worth having in mind while reading the above:
+
+- **An extent is copied at most once per run.** Its final slot never changes once the array covers its
+  id, so there is no chain of relocations and the lifetime cost is bounded by one pass over the array.
+- **Growth converts the oldest squatters first**, since it covers the lowest ids past the old bound and
+  those were issued earliest. Squatter lifetime is therefore FIFO and bounded by growth cadence.
+
+⚠️ Growth is **O(K) record copies**, not a pointer publish, so it wants to stay incremental — a segment
+at a time rather than a doubling — which is what §14.6.1 already wanted for its own reason.
+
+##### 14.6.5.2 What this buys, and why no runtime shrink is needed
+
+**Resident size tracks the live extent count rather than the highest `ExtentId` ever issued**, which was
+the entire problem. New extents fill holes, freed slots return to circulation, and the array grows only
+when the holes run out — so the machinery for shrinking an array in place, and the reader-coordination
+it would need, is never written.
+
+**Restart re-compacts**, and the startup path is the compaction. ⚠️ **But compactness should not depend
+on restart timing**: an SN restarted at its weekly peak stays inflated for a week, and it is the one that
+most needed compacting. The startup path already builds the compact array from the on-disk list, so it
+should be callable without restarting — a recompaction on the same batched exclusive pass as everything
+else in §14.6.3.
+
+**The hash table is used by the outside, and the inside mostly avoids it**: a user presenting an original
+`ExtentId` for a squatting extent pays a probe, while internal work goes through the array. At the 1/20
+budget that is one lookup in twenty, against roughly 16 bytes per entry — under 1% of the array's memory
+for the table itself.
+
 ---
 
 ## 15. Testing at scale
