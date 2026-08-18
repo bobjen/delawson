@@ -3327,109 +3327,55 @@ asserts only "placement succeeded" passes straight through it.
 If they share a code path, a load spike permanently degrades the independence of everything written during it,
 and per §1.1.1 that is discovered during the disaster.
 
-#### 5.6.11 Affinity: placing corresponding partitions together, and at what granularity
+#### 5.6.11 Affinity was considered and rejected
 
-**Not designed, and worth capturing because the shape is already clear** (Asserted, Bob, 2026-08-17).
-The motive is not "make reads faster" in general; it is a specific and common construction:
+**Decided against** (Asserted, Bob, 2026-08-17). Recorded at length because it is a reasonable idea
+with real prior art, so it will be proposed again.
 
-> A keyed index, or a large concatenated object, **built by many vertices each writing its own
-> partition**, concatenated together, with an index of partition locations, where a reader reads
-> individual partitions — hash-partitioned, embedding-partitioned, or otherwise.
+**What it would have been.** A keyed index or a large concatenated object is built by many vertices
+each writing its own partition; the partitions are concatenated, with an index of partition locations,
+and a reader reads individual partitions. Affinity would place the corresponding extents of related
+objects together so that a vertex — or a join — found its inputs in one place. The instances of any one
+extent could go anywhere; what would be constrained is that *the others match*.
 
-For that, **the instances of any one extent can be placed however placement likes; what matters is that
-the corresponding extents of the *other* objects are affinitized the same way.** Partition *k* of
-several objects wants to be reachable together, because that is what one vertex reads.
-
-**Prior art exists and is close.** The nearest is **CoHadoop** (Cited:
+**It has been built before.** The nearest is **CoHadoop** (Cited:
 [CoHadoop: Flexible Data Placement and Its Exploitation in Hadoop](http://www.vldb.org/pvldb/vol4/p575-eltabakh.pdf),
 Eltabakh, Tian, Özcan, Gemulla, Krettek and McPherson, PVLDB 4(9), 2011), which adds a file-level
-**locator** to HDFS and changes block placement so that files sharing a locator are colocated,
-best-effort, with a locator table held in the namenode. That is this idea, at file granularity, with
-the placement policy taught one new attribute. The same effect is standard in MPP databases by another
-route — Teradata, Greenplum and Vertica co-locate tables hash-distributed on the same key so joins are
-local — and Spanner reaches it declaratively by interleaving child rows in the parent's storage. So the
-question is not whether it works but **at what granularity to buy it.**
+**locator** to HDFS and colocates the blocks of files sharing one, best-effort, with a locator table in
+the namenode. MPP databases get the same effect by hash-distributing tables on a shared key so joins
+are local; Spanner gets it declaratively by interleaving child rows in the parent's storage.
 
-⚠️ **And that is the real decision** (Asserted, Bob, 2026-08-17):
+**Three reasons against, and they are independent:**
 
-| Affinity at | Buys | Costs |
-|---|---|---|
-| **disk or EN** — tight | perfect locality: a vertex reads one machine | **hotspots**, from the writing vertices and again from the reading ones — one machine serves all of partition *k* |
-| **the first level of network** — loose | the fast network, and many machines to spread across inside it | a hop, and a weaker guarantee |
+1. ⚠️ **Erasure coding will purposely break it.** EC needs the cells of a stripe far apart, and the
+   natural grouping — extents of one stream, §13.5.1's easy case — is exactly the set affinity wants
+   together. So affinity is undone deliberately by a mechanism that has to run, which means paying for
+   it twice: once to establish and once to lose.
+2. **It buys nothing if the network is flat.** §5.12.1 makes the intra-cluster network carry everything
+   anyway, and for the case that matters most — a vertex free to choose which extents it reads —
+   locality is already free by partitioning *from* the placement (§5.12.0). Affinity would only serve
+   the stages whose input set is fixed in advance, and those are the stages that must gather across the
+   network regardless.
+3. ⚠️ **It ties data to spots that were good places for data months or years ago, causing hotspots.**
+   This is the general one: **an affinity group is a persistent constraint derived from a transient
+   condition.** The cluster it was right for is not the cluster that exists later — machines are added,
+   filled, removed — while free-space-weighted placement is continuously rebalancing against exactly
+   that drift. Affinity fights it, with stale information, for ever.
 
-**Loose wins for the reason tight loses**: a partition is what a *whole vertex* reads and writes, so
-tight affinity concentrates a vertex's entire load on one machine, and every vertex does it at once.
-Spreading within a network level keeps the bandwidth and drops the concentration.
+**And three more that fell out while working it through**, kept because they generalise: a cross-object
+affinity group can attract **unbounded** data to one spot, and a loose granularity does not help since
+it spreads a fixed amount of data rather than capping how much arrives; affinity must be honoured **at
+repair** or it decays at the rate disks fail, making repair a second component that has to understand
+it, and EC grouping a third; and it **correlates loss across objects**, so a domain failure takes the
+same partition of everything rather than a scattering.
 
-**And the first network level is a failure domain in its own right** (Asserted, Bob, 2026-08-17):
-**a network partition does sometimes fail atomically**, so that boundary belongs in §5.6's hierarchy
-whether or not affinity is ever built. The hierarchy already has a rack level; what this adds is the
-reason — it is not only a power and cooling domain, it is a connectivity domain, and those can differ
-in a given building.
+**What replaces it.** For reading, nothing is needed: partition the extents by where their instances
+already are, and place the vertices to match (§5.12.0). For gathering, the network — which is what
+§5.12.1 already assumes and §5.12.3 already stakes the design on.
 
-⚠️ **And the scope of an affinity group is the part that can be fatal** (Asserted, Bob, 2026-08-17).
-The two versions are not variations of one feature; they have different worst cases:
-
-| Affinity | Buys | Worst case |
-|---|---|---|
-| **within one object** — its own corresponding extents together | a vertex reads its partition locally | **bounded by construction**: an object's partitions spread across the cluster, so no one place can be overwhelmed by it |
-| **across several objects** — their partition *k* together | **joins of those objects stop crossing the network**, which is the real prize | ⚠️ **unbounded**: arbitrarily many objects can claim the same spot, so arbitrarily much data lands there |
-
-**Unbounded is fatal even at loose affinity.** A network level is a few racks; if enough objects
-affinitize their partition *k* there, that domain fills, and nothing about a loose granularity prevents
-it — loose spreads a *fixed* amount of data over more machines, it does not cap how much arrives. So
-cross-object affinity cannot be offered as a free-standing request; it needs a bound, and the shapes are
-familiar: a quota on data per group, best-effort placement that silently declines (CoHadoop's answer),
-or rebalancing that breaks affinity when a domain fills.
-
-**Within-object affinity has no such problem**, which makes it the version to build first if either is
-built: it is where the CPU-to-data locality argument already lives, and it cannot overwhelm a region.
-
-**Two smaller cautions.** Affinity is a *constraint on placement*, which already answers to free space,
-failure domains and repair — so it competes, and the loose version competes less. And it **correlates
-loss across objects**: losing a domain takes out the same partition of everything affinitized there
-rather than a scattering. Per extent durability is unchanged, since instances still spread; what changes
-is the shape of what a computation loses.
-
-**And affinity is not only a creation-time decision** (Asserted, Bob, 2026-08-17): **it applies when
-replacing missing instances too.** A repair that places a replacement wherever there is room is a repair
-that dissolves affinity a little, and repair runs for ever — so affinity that is only honoured at
-creation decays to nothing at a rate set by disk failures. Whatever records an affinity group has to be
-consulted by §13.4's repair, which is a second reader of it and a second thing to keep correct.
-
-#### 5.6.11.1 ⚠️ Affinity and erasure coding pull in opposite directions
-
-**Affinity strongly dislikes erasure coding** (Asserted, Bob, 2026-08-17), and the collision is exact
-rather than approximate:
-
-- **Affinity wants** the extents that a computation reads together — partitions written by many vertices
-  and concatenated into one stream — **near each other.**
-- **Erasure coding wants** the cells of a parity-protected stripe **far apart**, so that one failure
-  cannot take two pieces of the same row.
-- And **the natural grouping is the affinitized set.** §13.5.1 says grouping extents within a single
-  stream is the easy case; for an affinitized stream that easy case is precisely the forbidden one,
-  because those extents are the ones sitting together.
-
-So a design that does both naively produces stripes whose cells share a failure domain, which is not a
-performance problem but a durability one: the parity is there and cannot help.
-
-**Three ways out, and they are not equally good:**
-
-1. **Group across affinity groups deliberately.** An EC group takes at most one cell from each affinity
-   domain. Correct, and it gives up §13.5.1's easy grouping exactly where affinity applies — the
-   grouper now needs the affinity map, which is a third reader of it.
-2. **Make affinity a property of the hot phase only, and let EC dissolve it.** Affinitized data stays
-   replicated while it is being computed over; when it goes cold and is encoded, the cells spread and
-   the locality is gone. This fits the design's existing shape — §8.1.4.4 encodes at seal, §8.5.3 keeps
-   short-lived data replicated — and it costs a job that re-reads *old* data its locality, which may be
-   exactly the right trade if jobs mostly read recent data.
-3. **Do not affinitize data that will be encoded.** The blunt version of 2, decided per object rather
-   than per lifecycle stage.
-
-**Two is the one to try first**, because it needs no new machinery: it is a rule about *when* affinity
-applies rather than a change to how placement or grouping work. What it needs is evidence about the
-access pattern — whether jobs re-read cold data enough to miss the locality — and that is a
-measurement nobody has (#69).
+**The general rule worth keeping** even though the feature is not: **a placement constraint derived
+from a transient condition becomes a hotspot.** Anything that pins data relative to a decision made
+earlier is competing with the balancer, and losing slowly.
 
 ### 5.7 Ring composition: consensus membership is not RAM membership
 
@@ -3891,7 +3837,8 @@ hint and what #61 wants `object-info` to expose. A scheduler partitioning by loc
 caller as a job holding hints, asking the same question.
 
 Where a vertex's input set *is* fixed in advance — a join on a partitioning key, a sort where a vertex
-owns a range — that does not apply, and affinity is wanted after all. §5.6.11 is what that looks like.
+owns a range — that does not apply, and affinity would be the alternative. It was considered and
+rejected (§5.6.11); those stages cross the network.
 
 #### 5.12.1 The security invariant makes the network carry everything
 
@@ -3961,12 +3908,12 @@ nobody has designed.
 
 #### 5.12.3 No affinity, because the network is flat
 
-⚠️ **Two things narrow this claim, and neither was here when it was written.** A vertex free to choose
-*which* extents it reads is local by construction — partition the extents by instance location and
-place the vertices to match (§5.12.0) — so a flat network is not what makes reading work. And where
-affinity genuinely is wanted, §5.6.11 argues it belongs at the first network level rather than at a
-disk or a machine. So what a flat network is load-bearing for is the stages with a fixed-beforehand
-input set: joins on a partitioning key, sorts where a vertex owns a range, anything that gathers.
+⚠️ **Narrower than it reads, and now settled.** A vertex free to choose *which* extents it reads is
+local by construction — partition the extents by instance location and place the vertices to match
+(§5.12.0) — so a flat network is not what makes reading work. Affinity, the alternative, was considered
+and **rejected** (§5.6.11). So what a flat network is load-bearing for is the stages with a
+fixed-beforehand input set: joins on a partitioning key, sorts where a vertex owns a range, anything
+that gathers.
 
 Cosmos built placement affinity for joins — affinitized extents mapped to the same racks, so a
 vertex "joining two affinitized streams could join them by their affinitized keys without reading
