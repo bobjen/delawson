@@ -3327,6 +3327,70 @@ asserts only "placement succeeded" passes straight through it.
 If they share a code path, a load spike permanently degrades the independence of everything written during it,
 and per §1.1.1 that is discovered during the disaster.
 
+#### 5.6.11 Affinity: placing corresponding partitions together, and at what granularity
+
+**Not designed, and worth capturing because the shape is already clear** (Asserted, Bob, 2026-08-17).
+The motive is not "make reads faster" in general; it is a specific and common construction:
+
+> A keyed index, or a large concatenated object, **built by many vertices each writing its own
+> partition**, concatenated together, with an index of partition locations, where a reader reads
+> individual partitions — hash-partitioned, embedding-partitioned, or otherwise.
+
+For that, **the instances of any one extent can be placed however placement likes; what matters is that
+the corresponding extents of the *other* objects are affinitized the same way.** Partition *k* of
+several objects wants to be reachable together, because that is what one vertex reads.
+
+**Prior art exists and is close.** The nearest is **CoHadoop** (Cited:
+[CoHadoop: Flexible Data Placement and Its Exploitation in Hadoop](http://www.vldb.org/pvldb/vol4/p575-eltabakh.pdf),
+Eltabakh, Tian, Özcan, Gemulla, Krettek and McPherson, PVLDB 4(9), 2011), which adds a file-level
+**locator** to HDFS and changes block placement so that files sharing a locator are colocated,
+best-effort, with a locator table held in the namenode. That is this idea, at file granularity, with
+the placement policy taught one new attribute. The same effect is standard in MPP databases by another
+route — Teradata, Greenplum and Vertica co-locate tables hash-distributed on the same key so joins are
+local — and Spanner reaches it declaratively by interleaving child rows in the parent's storage. So the
+question is not whether it works but **at what granularity to buy it.**
+
+⚠️ **And that is the real decision** (Asserted, Bob, 2026-08-17):
+
+| Affinity at | Buys | Costs |
+|---|---|---|
+| **disk or EN** — tight | perfect locality: a vertex reads one machine | **hotspots**, from the writing vertices and again from the reading ones — one machine serves all of partition *k* |
+| **the first level of network** — loose | the fast network, and many machines to spread across inside it | a hop, and a weaker guarantee |
+
+**Loose wins for the reason tight loses**: a partition is what a *whole vertex* reads and writes, so
+tight affinity concentrates a vertex's entire load on one machine, and every vertex does it at once.
+Spreading within a network level keeps the bandwidth and drops the concentration.
+
+**And the first network level is a failure domain in its own right** (Asserted, Bob, 2026-08-17):
+**a network partition does sometimes fail atomically**, so that boundary belongs in §5.6's hierarchy
+whether or not affinity is ever built. The hierarchy already has a rack level; what this adds is the
+reason — it is not only a power and cooling domain, it is a connectivity domain, and those can differ
+in a given building.
+
+⚠️ **And the scope of an affinity group is the part that can be fatal** (Asserted, Bob, 2026-08-17).
+The two versions are not variations of one feature; they have different worst cases:
+
+| Affinity | Buys | Worst case |
+|---|---|---|
+| **within one object** — its own corresponding extents together | a vertex reads its partition locally | **bounded by construction**: an object's partitions spread across the cluster, so no one place can be overwhelmed by it |
+| **across several objects** — their partition *k* together | **joins of those objects stop crossing the network**, which is the real prize | ⚠️ **unbounded**: arbitrarily many objects can claim the same spot, so arbitrarily much data lands there |
+
+**Unbounded is fatal even at loose affinity.** A network level is a few racks; if enough objects
+affinitize their partition *k* there, that domain fills, and nothing about a loose granularity prevents
+it — loose spreads a *fixed* amount of data over more machines, it does not cap how much arrives. So
+cross-object affinity cannot be offered as a free-standing request; it needs a bound, and the shapes are
+familiar: a quota on data per group, best-effort placement that silently declines (CoHadoop's answer),
+or rebalancing that breaks affinity when a domain fills.
+
+**Within-object affinity has no such problem**, which makes it the version to build first if either is
+built: it is where the CPU-to-data locality argument already lives, and it cannot overwhelm a region.
+
+**Two smaller cautions.** Affinity is a *constraint on placement*, which already answers to free space,
+failure domains and repair — so it competes, and the loose version competes less. And it **correlates
+loss across objects**: losing a domain takes out the same partition of everything affinitized there
+rather than a scattering. Per extent durability is unchanged, since instances still spread; what changes
+is the shape of what a computation loses.
+
 ### 5.7 Ring composition: consensus membership is not RAM membership
 
 Raft tolerates *n* failures with 2n+1 members. Materializing the served B-tree
@@ -3766,11 +3830,28 @@ and a job manager scheduling the resulting graph.
 answer will be found, not the beginning of an answer. The same paper's storage material is used where
 it belongs, in §8.1.4.1.
 
-⚠️ **One line of it does bear on a storage assumption, though.** The paper says *"A unit of computation
-generally consumes a small number of collocated extents"* — Cosmos deliberately **collocated** the
-extents a computation would consume, where §5.12.3 argues DeLawson needs no affinity because the
-intra-cluster network is flat. Both can be true; a prior system paying for locality is a reason to want
-§5.12.3's measurement rather than to take the assumption on trust.
+⚠️ **One line of it bears on a storage assumption, and there is an answer.** The paper says *"A unit of
+computation generally consumes a small number of collocated extents"* — Cosmos deliberately
+**collocated** the extents a computation would consume, where §5.12.3 argues DeLawson needs no
+affinity. Both can hold, because **the order of the two decisions can be reversed** (Asserted, Bob,
+2026-08-17):
+
+> **You could co-locate compute to storage if a vertex is free to read any set of extents — partition
+> the extents by instance location, then place vertices near each shared location. That does not work
+> if a vertex has to read a set of extents fixed beforehand.**
+
+Collocating extents *for* a computation constrains placement, and placement has other masters — free
+space, failure domains, repair (§5.6, §13.4). **Choosing the partitioning *from* the placement
+constrains nothing**: the store places extents for its own reasons, the scheduler reads where they
+landed, and every vertex gets a local set by construction.
+
+**So this is a requirement on the store rather than a Compute decision to make now**, and the store can
+already meet it: **instance locations have to be visible**, which is exactly the `EnId` in §8.1.1a-10's
+hint and what #61 wants `object-info` to expose. A scheduler partitioning by location is the same
+caller as a job holding hints, asking the same question.
+
+Where a vertex's input set *is* fixed in advance — a join on a partitioning key, a sort where a vertex
+owns a range — that does not apply, and affinity is wanted after all. §5.6.11 is what that looks like.
 
 #### 5.12.1 The security invariant makes the network carry everything
 
@@ -3839,6 +3920,13 @@ but a way to know, and to report, whether a job's remainder will fit. That is a 
 nobody has designed.
 
 #### 5.12.3 No affinity, because the network is flat
+
+⚠️ **Two things narrow this claim, and neither was here when it was written.** A vertex free to choose
+*which* extents it reads is local by construction — partition the extents by instance location and
+place the vertices to match (§5.12.0) — so a flat network is not what makes reading work. And where
+affinity genuinely is wanted, §5.6.11 argues it belongs at the first network level rather than at a
+disk or a machine. So what a flat network is load-bearing for is the stages with a fixed-beforehand
+input set: joins on a partitioning key, sorts where a vertex owns a range, anything that gathers.
 
 Cosmos built placement affinity for joins — affinitized extents mapped to the same racks, so a
 vertex "joining two affinitized streams could join them by their affinitized keys without reading
