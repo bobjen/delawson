@@ -23,6 +23,15 @@ confirmed. Where the two conflict, the arithmetic wins and the label gets update
 fraction of bound. A throughput number without its ceiling is as much a liability as an unlabelled
 constant, because it cannot distinguish good from merely better than the alternative.
 
+**Section numbers are keys, so this document is only ever grown at the end of a section.** Cross
+references say §4.6.6.1, which means inserting a section renumbers its siblings and silently
+invalidates every reference to them — so new material is appended within its parent rather than
+placed where it reads best. That is append-at-end beating insert-in-the-middle, in the document
+about append-at-end beating insert-in-the-middle. Stable names alongside the numbers would let
+order become a property of the table of contents instead; issue #67 carries it, together with the
+index of named invariants and terms that would make a document this size navigable as the graph
+it is.
+
 The distinction matters because this document is long and will be read by people who cannot
 re-derive it from scratch. An unlabelled number is a liability: in a year nobody can tell whether
 it was computed or assumed.
@@ -2261,6 +2270,32 @@ sorted array cannot give.
 
 So an SN loads a stream's extent list from disk into a B-tree on assignment, and
 serves from the tree.
+
+#### 4.4.0 A DN's tree cannot be in memory, and keyed objects have no on-disk index yet
+
+⚠️ **The table above says "B-tree in memory" and that is only true of the SN** (Asserted, Bob,
+2026-08-17). The asymmetry is already in §5.1: SN state is bounded per stream by construction,
+so an SN can afford to rebuild its tree from a list on assignment and hold it. **DN state is
+disk-backed and grows with the object count, which nothing bounds** — so a DN cannot build its
+index on the fly, and **its B-tree has to be on disk too**.
+
+**Which exposes a gap: keyed objects have no on-disk index designed in** (Asserted, Bob,
+2026-08-17). §10 makes a keyed object B-tree-*shaped* by splitting extents on key subranges, and
+§4.4 gives the SN a tree over extent *position* — but nothing yet maps a **user key** to the
+extent holding it. For a keyed object of millions of extents that map is itself large, paged,
+and ordered: an index, on disk, with a root small enough to cache.
+
+⚠️ **And it cannot be built on top of a keyed object, because it is what a keyed object is made
+of.** Storing a keyed object's index in another keyed object needs that one's index, and so on.
+This is §3.0's argument arriving a second time from a different direction: keyed objects are in
+the core because the things they need cannot be layered over them. The index has to be
+**intrinsic** — interior levels living in the object's own extents, with the root in its
+metadata — and that is a piece of §3 that is currently missing rather than deferred.
+
+**The requirement is general, which is why it is worth naming here rather than in §10.** A DN's
+directory, a keyed object's key index, and §4.6.6.2's sweeps all want the same structure: an
+ordered, paged, on-disk index whose interior nodes are stored in the same medium as its leaves.
+Issue #73 tracks designing it once.
 
 Because SNs and DNs are Raft rings (§5), the two forms fall into the standard
 consensus arrangement, and the relationship between them is not a new problem:
