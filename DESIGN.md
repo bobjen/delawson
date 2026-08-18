@@ -3391,6 +3391,46 @@ loss across objects**: losing a domain takes out the same partition of everythin
 rather than a scattering. Per extent durability is unchanged, since instances still spread; what changes
 is the shape of what a computation loses.
 
+**And affinity is not only a creation-time decision** (Asserted, Bob, 2026-08-17): **it applies when
+replacing missing instances too.** A repair that places a replacement wherever there is room is a repair
+that dissolves affinity a little, and repair runs for ever — so affinity that is only honoured at
+creation decays to nothing at a rate set by disk failures. Whatever records an affinity group has to be
+consulted by §13.4's repair, which is a second reader of it and a second thing to keep correct.
+
+#### 5.6.11.1 ⚠️ Affinity and erasure coding pull in opposite directions
+
+**Affinity strongly dislikes erasure coding** (Asserted, Bob, 2026-08-17), and the collision is exact
+rather than approximate:
+
+- **Affinity wants** the extents that a computation reads together — partitions written by many vertices
+  and concatenated into one stream — **near each other.**
+- **Erasure coding wants** the cells of a parity-protected stripe **far apart**, so that one failure
+  cannot take two pieces of the same row.
+- And **the natural grouping is the affinitized set.** §13.5.1 says grouping extents within a single
+  stream is the easy case; for an affinitized stream that easy case is precisely the forbidden one,
+  because those extents are the ones sitting together.
+
+So a design that does both naively produces stripes whose cells share a failure domain, which is not a
+performance problem but a durability one: the parity is there and cannot help.
+
+**Three ways out, and they are not equally good:**
+
+1. **Group across affinity groups deliberately.** An EC group takes at most one cell from each affinity
+   domain. Correct, and it gives up §13.5.1's easy grouping exactly where affinity applies — the
+   grouper now needs the affinity map, which is a third reader of it.
+2. **Make affinity a property of the hot phase only, and let EC dissolve it.** Affinitized data stays
+   replicated while it is being computed over; when it goes cold and is encoded, the cells spread and
+   the locality is gone. This fits the design's existing shape — §8.1.4.4 encodes at seal, §8.5.3 keeps
+   short-lived data replicated — and it costs a job that re-reads *old* data its locality, which may be
+   exactly the right trade if jobs mostly read recent data.
+3. **Do not affinitize data that will be encoded.** The blunt version of 2, decided per object rather
+   than per lifecycle stage.
+
+**Two is the one to try first**, because it needs no new machinery: it is a rule about *when* affinity
+applies rather than a change to how placement or grouping work. What it needs is evidence about the
+access pattern — whether jobs re-read cold data enough to miss the locality — and that is a
+measurement nobody has (#69).
+
 ### 5.7 Ring composition: consensus membership is not RAM membership
 
 Raft tolerates *n* failures with 2n+1 members. Materializing the served B-tree
