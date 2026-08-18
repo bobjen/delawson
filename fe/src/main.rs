@@ -19,6 +19,7 @@
 //! remembered costs one ask and nothing else, so an FE holding it is still an FE
 //! that holds no state.
 
+use common::block::Holds;
 use common::config::{FEConfig, ServiceKind};
 use common::framing::Framing;
 use common::logw;
@@ -122,9 +123,10 @@ struct Wanting {
     path: String,
     located: Located,
     body: Vec<u8>,
-    /// The caller's CRC of the block, if it sent one. Carried, never invented and
-    /// never dropped: it is the caller's guarantee and no tier here may weaken it.
-    crc: Option<u64>,
+    /// What the writer said the block holds: logical size, records, whether one is
+    /// left open, and the CRC. Carried, never invented and never recomputed — below
+    /// the client the bytes are compressed and none of it could be worked out again.
+    holds: Holds,
     tries: u32,
     reply: Reply,
 }
@@ -357,28 +359,32 @@ impl FE {
     /// An append: resolve the name — making the object if it is not there — find the
     /// extent, and hand the bytes to its primary.
     fn append(self: &Arc<Self>, process: &Arc<Process>, request: &Request, mut reply: Reply) {
-        let (path, framing, crc, body) = match request.args.as_slice() {
-            [
-                Arg::Text(path),
-                Arg::Number(kind),
-                Arg::Number(width),
-                Arg::Flag(has_crc),
-                Arg::Number(crc),
-                Arg::Bytes(body),
-            ] => match Framing::of_wire(*kind, *width) {
-                Ok(framing) => (path.clone(), framing, has_crc.then_some(*crc), body.clone()),
-                Err(e) => {
-                    return reply.send(Response::error(Status::BadRequest, e.to_string()));
+        let (path, framing, holds, body) = match request.args.as_slice() {
+            [Arg::Text(path), Arg::Number(kind), Arg::Number(width), rest @ ..] => {
+                let framing = match Framing::of_wire(*kind, *width) {
+                    Ok(framing) => framing,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+                match Holds::of_args(rest) {
+                    Ok((holds, [Arg::Bytes(body)])) => (path.clone(), framing, holds, body.clone()),
+                    _ => {
+                        return reply.send(Response::error(
+                            Status::BadRequest,
+                            "append takes a name, a framing, what the block holds, and bytes",
+                        ));
+                    }
                 }
-            },
+            }
             _ => {
                 return reply.send(Response::error(
                     Status::BadRequest,
-                    "append takes a name, a framing, a CRC and bytes",
+                    "append takes a name, a framing, what the block holds, and bytes",
                 ));
             }
         };
-        reply.about(format_args!("{path},bytes {}", body.len()));
+        reply.about(format_args!("{path},bytes {},logical {}", body.len(), holds.logical));
         let named = path.clone();
         self.resolve(process, &path, Some(framing), reply, move |fe, process, located, reply| {
             // The object's own framing wins, and a writer that disagrees about it is
@@ -392,7 +398,7 @@ impl FE {
                     ),
                 ));
             }
-            let wanting = Wanting { path: named, located, body, crc, tries: TRIES, reply };
+            let wanting = Wanting { path: named, located, body, holds, tries: TRIES, reply };
             fe.somewhere(process, wanting, None);
         });
     }
@@ -521,15 +527,14 @@ impl FE {
     /// with them: the primary is what counts the records and what broadcasts to the
     /// others, and the SN is not in this path to be asked again.
     fn to_primary(self: &Arc<Self>, process: &Arc<Process>, wanting: Wanting, open: Open) {
-        let Wanting { path, located, body, crc, tries, reply } = wanting;
+        let Wanting { path, located, body, holds, tries, reply } = wanting;
         let identity = format!("EN{}", open.instances[0]);
         // One shape, built and read in `common`, so neither side counts positions.
         let ask = AppendBlock {
             sn: open.sn,
             extent: open.id,
             created: open.created,
-            framing: located.framing,
-            crc,
+            holds,
             instances: open.instances.clone(),
             offset: None,
             bytes: body.clone(),
@@ -540,7 +545,7 @@ impl FE {
         let onward = Arc::clone(process);
         let asked = process.ask(&identity, &ask, move |answer| {
             if answer.status == Status::Sealed {
-                let wanting = Wanting { path, located, body, crc, tries, reply };
+                let wanting = Wanting { path, located, body, holds, tries, reply };
                 return fe.after_seal(&onward, wanting, open, answer);
             }
             reply.send(receipt(&located, &open, answer));
@@ -591,7 +596,7 @@ impl FE {
                 "a full stream said nothing about itself",
             ));
         };
-        let Wanting { path, located, body, crc, tries, reply } = wanting;
+        let Wanting { path, located, body, holds, tries, reply } = wanting;
         // Nothing may hand out an extent of a stream that will take no more, and what
         // is remembered about it is no use to an append either.
         self.streams.lock().expect("streams").remove(&(located.dn, located.stream));
@@ -616,7 +621,7 @@ impl FE {
                     format!("{path} was extended and is still on stream {}", next.stream),
                 ));
             }
-            let wanting = Wanting { path, located: next, body, crc, tries, reply };
+            let wanting = Wanting { path, located: next, body, holds, tries, reply };
             fe.somewhere(&onward, wanting, None);
         });
         if let Err(e) = asked {
@@ -626,6 +631,12 @@ impl FE {
 
     /// A read: resolve the name, find the extent holding the record, read it from an
     /// instance.
+    ///
+    /// ⚠️ **Three numbering spaces meet on this path.** A caller counts records from
+    /// the start of the object, a stream counts from its own first, and an extent
+    /// counts from its own. The FE is the only party that knows all three, so every
+    /// conversion happens here — a bug in one of them shows up as a read that works
+    /// until the first seal and then does not.
     fn read(self: &Arc<Self>, process: &Arc<Process>, request: &Request, mut reply: Reply) {
         let (path, record) = match request.args.as_slice() {
             [Arg::Text(path), Arg::Number(record)] => (path.clone(), *record),
@@ -782,20 +793,39 @@ fn from_instance(
     reply: Reply,
 ) {
     let identity = format!("EN{}", open.instances[0]);
-    let (kind, width) = located.framing.wire();
-    // The record number the extent knows is its own, counted from its first.
+    // The record number the extent knows is its own, counted from its first — and no
+    // framing goes with it, because the EN will not be looking inside.
     let within = record.saturating_sub(open.first_record);
+    // ⚠️ And the answer comes back in the extent's numbering, which is not the
+    // caller's. Three numbering spaces meet here — object, stream, extent — and the
+    // FE is the only party that knows all three, so it is the one that converts.
+    let base = located.first_record + open.first_record;
     let ask = Request::new(Op::ReadExtent)
         .number(open.sn as u64)
         .number(open.id)
         .number(open.created)
-        .number(kind)
-        .number(width)
         .number(within);
     let named = identity.clone();
-    if let Err(e) = process.ask(&identity, &ask, move |answer| reply.send(answer)) {
+    // The block comes back whole and is passed on whole: the reader decompresses it,
+    // checks the CRC against what it wrote, and takes the record it wanted. Doing
+    // that here would mean holding plaintext and spending CPU for no reason.
+    let asked = process.ask(&identity, &ask, move |answer| {
+        reply.send(in_the_callers_numbering(answer, base));
+    });
+    if let Err(e) = asked {
         logw!("could not reach an EN", "en {named},{e}");
     }
+}
+
+/// Put a block's first record into the numbering the caller asked in. An EN counts
+/// from the start of its extent; a caller counts from the start of the object.
+fn in_the_callers_numbering(mut answer: Response, base: u64) -> Response {
+    if answer.status == Status::Ok
+        && let Some(Arg::Number(first)) = answer.args.get_mut(1)
+    {
+        *first += base;
+    }
+    answer
 }
 
 /// What an append tells the writer. The durable reference comes first — a stream

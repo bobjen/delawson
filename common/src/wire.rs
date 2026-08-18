@@ -316,42 +316,36 @@ impl Response {
 ///
 /// ⚠️ **This exists because the argument order was a contract neither side could
 /// test.** Two processes each counting positions in a list pass their own unit tests
-/// while disagreeing with each other — and reordering it once produced a primary that
-/// would have read the framing out of an instance number. One shape, built and read
-/// here, is what makes that a compile error instead.
+/// while disagreeing with each other. One shape, built and read here, makes that a
+/// compile error instead.
+///
+/// **The framing is not in it.** A block arrives compressed (§8.1.4.1), so nothing
+/// below the writer can see a record in it — which is why what it *holds* travels
+/// alongside as numbers rather than being worked out from the bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendBlock {
     pub sn: u32,
     pub extent: u64,
     /// The second the extent was created in, which is part of its name.
     pub created: u64,
-    pub framing: crate::framing::Framing,
-    /// The caller's CRC of these bytes, if the caller gave one. It is the user's
-    /// guarantee rather than the system's, so it travels with the block and is not
-    /// something a tier may invent.
-    pub crc: Option<u64>,
-    /// Instances of the extent, primary first. Empty on the way to a secondary, which
-    /// has nothing to broadcast to.
+    /// What the writer says these bytes contain.
+    pub holds: crate::block::Holds,
+    /// Instances of the extent, primary first. Empty on the way to a secondary,
+    /// which has nothing to broadcast to.
     pub instances: Vec<u32>,
     /// The offset the primary chose, on the way to a secondary. None on the way in,
     /// since choosing it is the primary's job.
     pub offset: Option<u64>,
+    /// The block as stored: compressed, unless compressing it did not help.
     pub bytes: Vec<u8>,
 }
 
 impl AppendBlock {
     pub fn request(&self, op: Op) -> Request {
-        let (kind, width) = self.framing.wire();
-        let mut request = Request::new(op)
-            .number(self.sn as u64)
-            .number(self.extent)
-            .number(self.created)
-            .number(kind)
-            .number(width)
-            .flag(self.crc.is_some())
-            .number(self.crc.unwrap_or(0))
-            .flag(self.offset.is_some())
-            .number(self.offset.unwrap_or(0));
+        let mut request =
+            Request::new(op).number(self.sn as u64).number(self.extent).number(self.created);
+        request.args.extend(self.holds.args());
+        request = request.flag(self.offset.is_some()).number(self.offset.unwrap_or(0));
         for en in &self.instances {
             request = request.number(*en as u64);
         }
@@ -359,20 +353,14 @@ impl AppendBlock {
     }
 
     pub fn of(request: &Request) -> Result<AppendBlock> {
-        let [
-            Arg::Number(sn),
-            Arg::Number(extent),
-            Arg::Number(created),
-            Arg::Number(kind),
-            Arg::Number(width),
-            Arg::Flag(has_crc),
-            Arg::Number(crc),
-            Arg::Flag(has_offset),
-            Arg::Number(offset),
-            instances @ ..,
-        ] = request.args.as_slice()
+        let [Arg::Number(sn), Arg::Number(extent), Arg::Number(created), rest @ ..] =
+            request.args.as_slice()
         else {
             return Err(Error::new("an append does not have the shape of one"));
+        };
+        let (holds, rest) = crate::block::Holds::of_args(rest)?;
+        let [Arg::Flag(has_offset), Arg::Number(offset), instances @ ..] = rest else {
+            return Err(Error::new("an append says whether it has an offset"));
         };
         let Some((Arg::Bytes(bytes), instances)) = instances.split_last() else {
             return Err(Error::new("an append carries bytes last"));
@@ -381,8 +369,7 @@ impl AppendBlock {
             sn: *sn as u32,
             extent: *extent,
             created: *created,
-            framing: crate::framing::Framing::of_wire(*kind, *width)?,
-            crc: has_crc.then_some(*crc),
+            holds,
             instances: instances
                 .iter()
                 .map(|arg| match arg {
@@ -783,11 +770,15 @@ mod tests {
             sn: 3,
             extent: 17,
             created: 1_000_000,
-            framing: crate::framing::Framing::CrLf,
-            crc: Some(0xae8b_1486_0a79_9888),
+            holds: crate::block::Holds {
+                logical: 10,
+                records: 2,
+                open_record: false,
+                crc: Some(0xae8b_1486_0a79_9888),
+            },
             instances: vec![2, 3, 0, 1],
             offset: None,
-            bytes: b"one\r\ntwo\r\n".to_vec(),
+            bytes: b"squeezed".to_vec(),
         };
         assert_eq!(AppendBlock::of(&block.request(Op::AppendExtent)).unwrap(), block);
 
@@ -796,9 +787,11 @@ mod tests {
         assert_eq!(AppendBlock::of(&onward.request(Op::ApplyAppend)).unwrap(), onward);
 
         // And no CRC, which is the caller's choice and not a tier's to invent.
-        let bare = AppendBlock { crc: None, ..block };
+        let holds = crate::block::Holds { crc: None, ..block.holds };
+        let bare = AppendBlock { holds, ..block };
         let read = AppendBlock::of(&bare.request(Op::AppendExtent)).unwrap();
-        assert_eq!(read.crc, None);
+        assert_eq!(read.holds.crc, None);
+        assert_eq!(read.holds.logical, 10, "what it holds survives either way");
     }
 
     #[test]
@@ -809,8 +802,9 @@ mod tests {
             .number(0)
             .number(1)
             .number(2)
-            .number(2)
-            .number(0)
+            .number(10)
+            .number(1)
+            .flag(false)
             .flag(false)
             .number(0)
             .flag(false)

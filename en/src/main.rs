@@ -20,9 +20,9 @@
 //! is not evidence about what a durable append costs. What replaces it is a
 //! journal of extent metadata per disk, snapshot and log.
 
+use common::block::Holds;
 use common::config::ENConfig;
-use common::framing::Framing;
-use common::offset::COff;
+use common::offset::{COff, LOff};
 use common::server::{self, Process, Reply, Service};
 use common::wire::{AppendBlock, Arg, Op, Request, Response, Status};
 use common::{Error, Result, logw};
@@ -39,19 +39,22 @@ type Waiting = HashMap<(u32, u64), Vec<Arc<Pending>>>;
 /// this id — and the second, which is part of the name too.
 struct Extent {
     created: u64,
-    /// Closed: no more appends, however much room is left. What is here is what the
-    /// extent came to, for ever.
+    /// Closed: no more appends, however much room is left.
     sealed: bool,
-    /// Where the next append to this extent will start. Compressed, because what
-    /// arrives here is what a writer compressed and what a device will hold.
+    /// Where the next append starts, in stored bytes — what the device holds, and
+    /// what the seal limit is against.
     end: COff,
+    /// And where it starts in the writer's numbering. The two differ by whatever
+    /// compression achieved, which is why they are different types.
+    logical_end: LOff,
     /// Records completed in this extent, which is what numbers them. Extent-local:
     /// the SN says what stream-local number the extent's first record has.
     records: u64,
-    /// The bytes of a record that has begun and not ended. A record may span
-    /// appends, so a block can leave one open — and while one is open the extent
-    /// cannot seal, which is what stops a seal ever having to cut a record.
-    open: Vec<u8>,
+    /// Whether a record has begun and not ended. **A flag, not the bytes** — the
+    /// bytes are inside a compressed block this tier cannot open, and the writer
+    /// carries them. All that is needed here is whether the extent may seal, which
+    /// it may not while one is open.
+    open_record: bool,
 }
 
 /// One append, as it arrived. The offset is the primary's decision, so every
@@ -59,15 +62,25 @@ struct Extent {
 struct Append {
     /// Which extent, as an index into the extent table.
     extent: usize,
-    offset: COff,
-    /// The caller's CRC of these bytes, if the caller gave one. It is the user's own
-    /// guarantee, so nothing here invents one and nothing here drops one.
-    ///
-    /// Nothing in a running process reads it back yet: what will is a read that
-    /// returns whole blocks, since whoever decompresses one is who checks it.
+    /// Where in the extent's stored bytes it sits. Nothing in a running process
+    /// reads it back yet — a reader asks for a block by record, not by offset —
+    /// and what will is the device write and the journal that describes it.
     #[allow(dead_code)]
-    crc: Option<u64>,
+    offset: COff,
+    /// The extent-local number of the first record this block completed — which is
+    /// how a read finds the block holding a record **without parsing anything**.
+    /// The counts came from the writer; the arithmetic is this tier's.
+    first_record: u64,
+    /// What the writer said about these bytes: logical size, records, whether one
+    /// is left open, and the CRC. None of it is recoverable from the bytes here.
+    holds: Holds,
     bytes: Vec<u8>,
+}
+
+impl Append {
+    fn covers(&self, record: u64) -> bool {
+        record >= self.first_record && record < self.first_record + self.holds.records
+    }
 }
 
 /// What became of an append: a place in the extent, or an extent that is closed.
@@ -86,6 +99,9 @@ enum Took {
 /// Where an append landed and what it numbered.
 struct Landed {
     offset: COff,
+    /// And where it landed in the writer's numbering, which is the locator a writer
+    /// is owed: a writer knows what it wrote, not what that compressed to.
+    logical: LOff,
     /// The extent-local number of the first record this append completed.
     first_record: u64,
     /// Records it completed, which is zero for a block wholly inside one record.
@@ -126,79 +142,93 @@ impl Extents {
             created,
             sealed: false,
             end: COff::ZERO,
+            logical_end: LOff::ZERO,
             records: 0,
-            open: Vec::new(),
+            open_record: false,
         });
         let place = self.extents.len() - 1;
         self.at.insert((sn, id), place);
         Ok(place)
     }
 
-    /// Take the next offset in an extent, put the bytes there, and count the
-    /// records they complete. This is the one serialized step of an append;
-    /// everything expensive happens after it.
+    /// Take the next offset in an extent and put the bytes there. This is the one
+    /// serialized step of an append; everything expensive happens after it.
     ///
-    /// Or seal, if the extent is full: a block goes wholly into this extent or
-    /// wholly into the next one, never split, so a block that will not fit gets an
-    /// extent that is closed instead of a place in it.
+    /// **Nothing is parsed.** The block is compressed and its records are invisible
+    /// here, so what it holds arrives with it and this is arithmetic on numbers the
+    /// writer supplied.
     fn take(&mut self, appending: &AppendBlock, cap: COff) -> Result<Took> {
-        let length = COff::of_len(appending.bytes.len())?;
+        let stored = COff::of_len(appending.bytes.len())?;
+        let logical = LOff::of_len(appending.holds.logical as usize)?;
         let place = self.place(appending.sn, appending.extent, appending.created)?;
         let extent = &mut self.extents[place];
 
         // A record already open must finish here, since an extent holds whole
-        // records — so an extent with one cannot seal, whatever the cap says. The
-        // client never leaves one open, so this is for a writer using the protocol
-        // directly.
-        let sealable = extent.open.is_empty();
-        if extent.sealed || (sealable && extent.end.plus(length)? > cap) {
-            // Whether this block is the one that closed it, so a counter of sealed
-            // extents counts extents and not refusals.
+        // records — so an extent with one cannot seal, whatever the cap says.
+        let sealable = !extent.open_record;
+        // Full by stored bytes, or out of logical positions — which is the 4 GB
+        // logical cap enforcing itself through the type rather than by a constant.
+        let full = extent.end.plus(stored)? > cap || extent.logical_end.plus(logical).is_err();
+        if extent.sealed || (sealable && full) {
             let closing = !extent.sealed;
             extent.sealed = true;
             return Ok(Took::Sealed { records: extent.records, length: extent.end, closing });
         }
 
-        // Before the bytes are taken, so a block that breaks the record rule
-        // changes nothing.
-        let (closed, open) = appending.framing.advance(&extent.open, &appending.bytes)?;
         let offset = extent.end;
-        extent.end = offset.plus(length)?;
+        let logical_offset = extent.logical_end;
+        extent.end = offset.plus(stored)?;
+        extent.logical_end = extent.logical_end.plus(logical)?;
         let first_record = extent.records;
-        extent.records += closed;
-        extent.open = open;
+        extent.records += appending.holds.records;
+        extent.open_record = appending.holds.open_record;
         self.appends.push(Append {
             extent: place,
             offset,
-            crc: appending.crc,
+            first_record,
+            holds: appending.holds,
             bytes: appending.bytes.clone(),
         });
-        Ok(Took::Landed(Landed { offset, first_record, records: closed }))
+        Ok(Took::Landed(Landed {
+            offset,
+            logical: logical_offset,
+            first_record,
+            records: appending.holds.records,
+        }))
     }
 
-    /// Put an append at an offset another instance chose. The offset is given, so
-    /// this must not assign one — but the extent's end still moves, since an
-    /// instance that never learns the end cannot become primary.
+    /// Put an append where another instance said. The offset is given, so this must
+    /// not assign one — but the ends and counts still move, since an instance that
+    /// never learns them cannot become primary.
     fn apply(&mut self, appending: &AppendBlock, offset: COff) -> Result<()> {
-        let length = COff::of_len(appending.bytes.len())?;
+        let stored = COff::of_len(appending.bytes.len())?;
+        let logical = LOff::of_len(appending.holds.logical as usize)?;
         let place = self.place(appending.sn, appending.extent, appending.created)?;
         let extent = &mut self.extents[place];
-        extent.end = extent.end.max(offset.plus(length)?);
+        let first_record = extent.records;
+        extent.end = extent.end.max(offset.plus(stored)?);
+        extent.logical_end = extent.logical_end.plus(logical)?;
+        extent.records += appending.holds.records;
+        extent.open_record = appending.holds.open_record;
         self.appends.push(Append {
             extent: place,
             offset,
-            crc: appending.crc,
+            first_record,
+            holds: appending.holds,
             bytes: appending.bytes.clone(),
         });
         Ok(())
     }
 
-    /// One record's content, parsed forward from the start of the extent. There is
-    /// no sparse index yet, so this is the whole extent every time — the index is
-    /// what turns it into one granule read.
-    fn record(&self, sn: u32, id: u64, framing: Framing, record: u64) -> Option<Vec<u8>> {
-        let bytes = self.read(sn, id);
-        framing.records(&bytes).nth(record as usize).map(<[u8]>::to_vec)
+    /// The block holding a record, whole.
+    ///
+    /// ⚠️ **Whole, even though the caller asked for one record.** A block is
+    /// compressed, so cutting a record out of it means decompressing — CPU this tier
+    /// does not have, for a job belonging to whoever compressed it. Finding *which*
+    /// block is arithmetic on record counts, and that this tier can do.
+    fn block(&self, sn: u32, id: u64, record: u64) -> Option<&Append> {
+        let place = self.at.get(&(sn, id))?;
+        self.appends.iter().find(|append| append.extent == *place && append.covers(record))
     }
 
     /// The second an extent here was made in, which is the rest of its name.
@@ -206,8 +236,10 @@ impl Extents {
         self.at.get(&(sn, id)).map(|place| self.extents[*place].created)
     }
 
-    /// The bytes of an extent, in order. Stitched from the appends every time,
-    /// which is what a vector of appends costs and what the journal replaces.
+    /// Everything stored for an extent, in order. No read path wants this — a
+    /// reader asks for a block — but a test does, to say the blocks landed where
+    /// they were meant to.
+    #[cfg(test)]
     fn read(&self, sn: u32, id: u64) -> Vec<u8> {
         let Some(place) = self.at.get(&(sn, id)) else { return Vec::new() };
         let mut found: Vec<&Append> =
@@ -326,7 +358,7 @@ impl EN {
         };
         reply.about(format_args!(
             "extent {} of sn {},offset {},bytes {length},records {}",
-            appending.extent, appending.sn, landed.offset, landed.records
+            appending.extent, appending.sn, landed.logical, landed.records
         ));
 
         // This process is one of the instances, and has just applied it, so the
@@ -335,12 +367,15 @@ impl EN {
         let others: Vec<u32> =
             appending.instances.iter().copied().filter(|en| *en != mine).collect();
 
+        // ⚠️ The **logical** offset and length, which is what a writer is owed: it
+        // knows what it wrote, not what that compressed to. The stored position is
+        // this tier's business and stays here.
         let receipt = vec![
             Arg::Number(appending.sn as u64),
             Arg::Number(appending.extent),
             Arg::Number(appending.created),
-            Arg::Number(landed.offset.number()),
-            Arg::Number(length),
+            Arg::Number(landed.logical.number()),
+            Arg::Number(appending.holds.logical),
             Arg::Number(landed.first_record),
             Arg::Number(landed.records),
         ];
@@ -390,7 +425,7 @@ impl EN {
         if let Took::Landed(_) = &took {
             self.appends.fetch_add(1, Ordering::Relaxed);
             self.bytes.fetch_add(appending.bytes.len() as u64, Ordering::Relaxed);
-            if appending.crc.is_some() {
+            if appending.holds.crc.is_some() {
                 self.checksummed.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -404,49 +439,6 @@ impl EN {
         let waiting = self.waiting.lock().expect("waiting").remove(&(sn, extent));
         for pending in waiting.unwrap_or_default() {
             pending.records_are_whole();
-        }
-    }
-
-    /// One record of an extent, for a reader that knows which one it wants.
-    fn read(&self, request: &Request) -> Response {
-        let [
-            Arg::Number(sn),
-            Arg::Number(extent),
-            Arg::Number(created),
-            Arg::Number(kind),
-            Arg::Number(width),
-            Arg::Number(record),
-        ] = request.args.as_slice()
-        else {
-            return Response::error(
-                Status::BadRequest,
-                "read-extent takes an SnId, an extent, a second, a framing and a record",
-            );
-        };
-        let framing = match Framing::of_wire(*kind, *width) {
-            Ok(framing) => framing,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
-        };
-        let held = self.held.lock().expect("extents");
-        match held.created(*sn as u32, *extent) {
-            None => {
-                Response::error(Status::NotFound, format!("no extent {extent} of sn {sn} here"))
-            }
-            // The second is part of the name, so a reader asking with the wrong one
-            // is asking about an extent that no longer exists rather than this one.
-            Some(second) if second != *created => Response::error(
-                Status::NotFound,
-                format!("extent {extent} of sn {sn} was made in second {second}"),
-            ),
-            Some(_) => match held.record(*sn as u32, *extent, framing, *record) {
-                Some(bytes) => {
-                    Response { id: 0, status: Status::Ok, args: vec![Arg::Bytes(bytes)] }
-                }
-                None => Response::error(
-                    Status::NotFound,
-                    format!("extent {extent} of sn {sn} has no record {record}"),
-                ),
-            },
         }
     }
 
@@ -472,6 +464,53 @@ impl EN {
         self.appends.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(appending.bytes.len() as u64, Ordering::Relaxed);
         Response::ok()
+    }
+
+    /// The block holding a record, whole, with what the writer said about it.
+    ///
+    /// A reader gets bytes it must decompress, check against the CRC, and parse —
+    /// all of which it can do and none of which this tier can (§9.1). What comes
+    /// back beside the bytes is what makes that possible: the logical size, the
+    /// record the block starts at, how many it holds, and the CRC.
+    fn read(&self, request: &Request) -> Response {
+        let [Arg::Number(sn), Arg::Number(extent), Arg::Number(created), Arg::Number(record)] =
+            request.args.as_slice()
+        else {
+            return Response::error(
+                Status::BadRequest,
+                "read-extent takes an SnId, an extent, a second and a record",
+            );
+        };
+        let held = self.held.lock().expect("extents");
+        match held.created(*sn as u32, *extent) {
+            None => {
+                Response::error(Status::NotFound, format!("no extent {extent} of sn {sn} here"))
+            }
+            // The second is part of the name, so a reader asking with the wrong one
+            // is asking about an extent that no longer exists rather than this one.
+            Some(second) if second != *created => Response::error(
+                Status::NotFound,
+                format!("extent {extent} of sn {sn} was made in second {second}"),
+            ),
+            Some(_) => match held.block(*sn as u32, *extent, *record) {
+                Some(block) => Response {
+                    id: 0,
+                    status: Status::Ok,
+                    args: vec![
+                        Arg::Number(block.holds.logical),
+                        Arg::Number(block.first_record),
+                        Arg::Number(block.holds.records),
+                        Arg::Flag(block.holds.crc.is_some()),
+                        Arg::Number(block.holds.crc.unwrap_or(0)),
+                        Arg::Bytes(block.bytes.clone()),
+                    ],
+                },
+                None => Response::error(
+                    Status::NotFound,
+                    format!("extent {extent} of sn {sn} has no record {record}"),
+                ),
+            },
+        }
     }
 }
 
@@ -640,39 +679,43 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::framing::Framing;
     use common::testing;
 
-    const LF: Framing = Framing::Lf;
+    /// Room enough that nothing seals, for the tests not about sealing.
+    const ROOM: COff = COff::new(1 << 20);
 
-    fn appending(sn: u32, extent: u64, bytes: &[u8]) -> AppendBlock {
+    /// One whole record, framed as the client would frame it.
+    fn line(text: &str) -> Vec<u8> {
+        format!("{text}\n").into_bytes()
+    }
+
+    /// A block as a client would present it: measured before compressing, and here
+    /// stored uncompressed, which is what a client does when compressing did not
+    /// help. What the EN does is the same either way — it never looks inside.
+    fn block(sn: u32, extent: u64, bytes: &[u8]) -> AppendBlock {
+        let holds = Holds::of(Framing::Lf, b"", bytes, Some(common::crc::of(bytes)))
+            .expect("a well-formed block");
         AppendBlock {
             sn,
             extent,
             created: 1_000_000,
-            framing: LF,
-            crc: None,
+            holds,
             instances: Vec::new(),
             offset: None,
             bytes: bytes.to_vec(),
         }
     }
 
-    /// One whole record, which is what the client always sends.
-    fn line(text: &str) -> Vec<u8> {
-        format!("{text}\n").into_bytes()
-    }
-
-    /// Room enough that nothing seals, for the tests that are not about sealing.
-    const ROOM: COff = COff::new(1 << 20);
-
     fn append(en: &EN, extent: u64, bytes: &[u8]) -> Landed {
-        match en.take(&appending(0, extent, bytes), ROOM).expect("an append") {
+        match en.take(&block(0, extent, bytes), ROOM).expect("an append") {
             Took::Landed(landed) => landed,
             Took::Sealed { .. } => panic!("that should have fitted"),
         }
     }
 
-    /// Offsets are handed out in order, each one where the last append ended.
+    /// Offsets are handed out in order, each one where the last block ended — and
+    /// they count *stored* bytes, which is what a device holds.
     #[test]
     fn offsets_follow_one_another() {
         let en = EN::new(testing::en_config());
@@ -690,7 +733,6 @@ mod tests {
         assert_eq!(append(&en, 2, &line("two")).offset, COff::new(0));
         assert_eq!(append(&en, 1, &line("more")).offset, COff::new(4));
         assert_eq!(en.held.lock().unwrap().read(0, 1), b"one\nmore\n");
-        assert_eq!(en.held.lock().unwrap().read(0, 2), b"two\n");
     }
 
     /// The same extent id from two SNs is two extents: an id is a name only
@@ -698,8 +740,8 @@ mod tests {
     #[test]
     fn an_extent_is_named_by_its_sn_too() {
         let en = EN::new(testing::en_config());
-        en.take(&appending(0, 1, &line("from sn0")), ROOM).unwrap();
-        en.take(&appending(1, 1, &line("from sn1")), ROOM).unwrap();
+        en.take(&block(0, 1, &line("from sn0")), ROOM).unwrap();
+        en.take(&block(1, 1, &line("from sn1")), ROOM).unwrap();
         assert_eq!(en.held.lock().unwrap().extents.len(), 2);
     }
 
@@ -709,13 +751,13 @@ mod tests {
     fn a_second_that_disagrees_is_refused() {
         let en = EN::new(testing::en_config());
         append(&en, 1, &line("first"));
-        let later = AppendBlock { created: 1_000_001, ..appending(0, 1, &line("second")) };
+        let later = AppendBlock { created: 1_000_001, ..block(0, 1, &line("second")) };
         assert!(en.take(&later, ROOM).is_err());
         assert_eq!(en.held.lock().unwrap().read(0, 1), b"first\n");
     }
 
-    /// Records are numbered from zero within an extent, and an append is told which
-    /// ones it closed.
+    /// Records are numbered from zero within an extent, from the counts the writer
+    /// supplied — nothing here parses a block to find them.
     #[test]
     fn an_append_is_told_the_records_it_closed() {
         let en = EN::new(testing::en_config());
@@ -726,28 +768,101 @@ mod tests {
         assert_eq!(en.held.lock().unwrap().extents[0].records, 3);
     }
 
-    /// A record may span appends: the block that starts it closes nothing, and the
-    /// block that finishes it gets the number.
+    /// A record spanning blocks: the first closes nothing and says a record is open,
+    /// the second closes it. The EN tracks the flag, never the bytes.
     #[test]
-    fn a_record_spanning_appends_is_numbered_by_the_append_that_closes_it() {
+    fn a_record_spanning_blocks_is_a_flag_here_and_bytes_at_the_writer() {
         let en = EN::new(testing::en_config());
-        let opened = append(&en, 1, b"half a rec");
-        assert_eq!(opened.records, 0, "nothing is closed yet");
-        let closed = append(&en, 1, b"ord\n");
-        assert_eq!((closed.first_record, closed.records), (0, 1));
-        let held = en.held.lock().unwrap();
-        assert_eq!(held.record(0, 1, LF, 0).unwrap(), b"half a record");
-        assert_eq!(held.extents[0].records, 1);
+        let opened = Holds::of(Framing::Lf, b"", b"half a rec", None).unwrap();
+        let first = AppendBlock { holds: opened, ..block(0, 1, b"half a rec") };
+        assert!(matches!(en.take(&first, ROOM), Ok(Took::Landed(_))));
+        assert!(en.held.lock().unwrap().extents[0].open_record, "one is open");
+
+        // The writer carried the opening bytes and measures the rest against them.
+        let closed = Holds::of(Framing::Lf, b"half a rec", b"ord\n", None).unwrap();
+        let second = AppendBlock { holds: closed, ..block(0, 1, b"ord\n") };
+        match en.take(&second, ROOM) {
+            Ok(Took::Landed(landed)) => assert_eq!(landed.records, 1),
+            _ => panic!("the record should close"),
+        }
+        assert!(!en.held.lock().unwrap().extents[0].open_record);
     }
 
-    /// A block may not close records and then end inside another: that is what
-    /// keeps a seal from ever having to cut one in half.
+    /// An extent with a record still open cannot seal, however full it is.
     #[test]
-    fn a_block_that_closes_a_record_may_not_end_inside_another() {
+    fn an_open_record_keeps_an_extent_from_sealing() {
         let en = EN::new(testing::en_config());
-        assert!(en.take(&appending(0, 1, b"one\ntw"), ROOM).is_err());
-        // And the refusal left the extent alone.
-        assert!(en.held.lock().unwrap().read(0, 1).is_empty());
+        let cap = COff::new(4);
+        let opened = Holds::of(Framing::Lf, b"", b"half", None).unwrap();
+        let first = AppendBlock { holds: opened, ..block(0, 1, b"half") };
+        assert!(matches!(en.take(&first, cap), Ok(Took::Landed(_))));
+
+        let closed = Holds::of(Framing::Lf, b"half", b" and half\n", None).unwrap();
+        let second = AppendBlock { holds: closed, ..block(0, 1, b" and half\n") };
+        assert!(
+            matches!(en.take(&second, cap), Ok(Took::Landed(_))),
+            "it must be allowed to finish"
+        );
+        // Now that nothing is open, the next block finds it full.
+        assert!(matches!(en.take(&block(0, 1, b"x\n"), cap), Ok(Took::Sealed { .. })));
+    }
+
+    /// An extent that has no room for the next block is closed rather than stretched,
+    /// and the answer says what it came to.
+    #[test]
+    fn a_full_extent_seals_instead_of_taking_the_block() {
+        let en = EN::new(testing::en_config());
+        let cap = COff::new(10);
+        assert!(matches!(en.take(&block(0, 1, b"one\n"), cap), Ok(Took::Landed(_))));
+        assert!(matches!(en.take(&block(0, 1, b"two\n"), cap), Ok(Took::Landed(_))));
+        match en.take(&block(0, 1, b"three\n"), cap) {
+            Ok(Took::Sealed { records, length, .. }) => {
+                assert_eq!(records, 2, "what the extent came to");
+                assert_eq!(length, COff::new(8));
+            }
+            other => panic!("should have sealed, not {:?}", other.is_ok()),
+        }
+        // And it stays sealed: the block that found it full does not land later.
+        assert!(matches!(en.take(&block(0, 1, b"x\n"), cap), Ok(Took::Sealed { .. })));
+    }
+
+    /// A compressed block is stored as it arrives and handed back the same way. The
+    /// EN never decompresses, so what it holds is not what the records are.
+    #[test]
+    fn a_compressed_block_is_stored_and_returned_untouched() {
+        let en = EN::new(testing::en_config());
+        let records = (0..40).flat_map(|n| line(&format!("record {n}"))).collect::<Vec<u8>>();
+        let holds = Holds::of(Framing::Lf, b"", &records, Some(common::crc::of(&records))).unwrap();
+        let stored = common::block::squeeze(common::config::Compress::Lz4, &records)
+            .expect("that should compress");
+        assert!(stored.len() < records.len());
+
+        let compressed = AppendBlock { holds, bytes: stored.clone(), ..block(0, 1, b"") };
+        assert!(matches!(en.take(&compressed, ROOM), Ok(Took::Landed(_))));
+
+        // Stored bytes are the compressed ones; the logical size is what the writer
+        // said, and the two are different numbers for the same block.
+        let held = en.held.lock().unwrap();
+        assert_eq!(held.extents[0].end, COff::of_len(stored.len()).unwrap());
+        assert_eq!(held.extents[0].logical_end, LOff::of_len(records.len()).unwrap());
+        assert_eq!(held.read(0, 1), stored, "handed back as it arrived");
+    }
+
+    /// A read finds the block holding a record by arithmetic on the counts, and
+    /// returns the whole thing.
+    #[test]
+    fn a_read_returns_the_block_holding_the_record() {
+        let en = EN::new(testing::en_config());
+        append(&en, 1, b"one\ntwo\n");
+        append(&en, 1, b"three\nfour\nfive\n");
+        let held = en.held.lock().unwrap();
+        assert_eq!(held.block(0, 1, 0).unwrap().bytes, b"one\ntwo\n");
+        assert_eq!(held.block(0, 1, 1).unwrap().bytes, b"one\ntwo\n");
+        assert_eq!(held.block(0, 1, 2).unwrap().bytes, b"three\nfour\nfive\n");
+        assert_eq!(held.block(0, 1, 4).unwrap().bytes, b"three\nfour\nfive\n");
+        assert!(held.block(0, 1, 5).is_none(), "past the end");
+        // And the block says where it starts, so a reader can index into it.
+        assert_eq!(held.block(0, 1, 4).unwrap().first_record, 2);
     }
 
     /// A secondary puts the append where the primary said, and does not choose.
@@ -755,26 +870,12 @@ mod tests {
     fn an_applied_append_keeps_the_offset_it_was_given() {
         let en = EN::new(testing::en_config());
         let request =
-            AppendBlock { offset: Some(64), ..appending(0, 1, b"late") }.request(Op::ApplyAppend);
+            AppendBlock { offset: Some(64), ..block(0, 1, &line("late")) }.request(Op::ApplyAppend);
         assert_eq!(en.applied(&request).status, Status::Ok);
         let held = en.held.lock().unwrap();
         assert_eq!(held.appends[0].offset, COff::new(64));
-        // The end moves past it, or this instance could not take over as primary
-        // and hand out the next offset.
-        assert_eq!(held.extents[0].end, COff::new(68));
-    }
-
-    /// Out of order, the end is the furthest any append reached rather than the
-    /// last one to arrive.
-    #[test]
-    fn applying_out_of_order_leaves_the_end_furthest_on() {
-        let en = EN::new(testing::en_config());
-        for offset in [100u64, 10] {
-            let request = AppendBlock { offset: Some(offset), ..appending(0, 1, &[0u8; 4]) }
-                .request(Op::ApplyAppend);
-            assert_eq!(en.applied(&request).status, Status::Ok);
-        }
-        assert_eq!(en.held.lock().unwrap().extents[0].end, COff::new(104));
+        // The end moves past it, or this instance could not take over as primary.
+        assert_eq!(held.extents[0].end, COff::new(69));
     }
 
     #[test]
@@ -784,123 +885,29 @@ mod tests {
         assert_eq!(en.applied(&request).status, Status::BadRequest);
     }
 
-    /// A secondary is told where the primary put it, so an apply without an offset is
-    /// asking this instance to decide something that is not its to decide.
+    /// A secondary is told where the primary put it, so an apply without an offset
+    /// asks this instance to decide something that is not its to decide.
     #[test]
     fn an_applied_append_needs_an_offset() {
         let en = EN::new(testing::en_config());
-        let request = appending(0, 1, b"x\n").request(Op::ApplyAppend);
+        let request = block(0, 1, &line("x")).request(Op::ApplyAppend);
         assert_eq!(en.applied(&request).status, Status::BadRequest);
     }
 
-    /// A caller's CRC is stored with the block and not checked here: an EN holds what
-    /// the writer compressed and never decompresses it, so the logical bytes the CRC
-    /// covers do not exist on this machine.
+    /// A caller's CRC is stored with the block and not checked here: an EN holds
+    /// what the writer compressed and never decompresses it.
     #[test]
     fn a_crc_is_kept_and_not_judged() {
         let en = EN::new(testing::en_config());
-        let block = line("checksummed");
-        let with = AppendBlock { crc: Some(common::crc::of(&block)), ..appending(0, 1, &block) };
-        assert!(matches!(en.take(&with, ROOM), Ok(Took::Landed(_))));
-
-        // A wrong one is stored just the same, because this tier cannot tell and must
-        // not pretend to: the bytes it holds are not the bytes the CRC is over.
-        let wrong = AppendBlock { crc: Some(0), ..appending(0, 1, &line("also fine")) };
+        append(&en, 1, &line("checksummed"));
+        let mut wrong = block(0, 1, &line("also fine"));
+        wrong.holds.crc = Some(0);
         assert!(matches!(en.take(&wrong, ROOM), Ok(Took::Landed(_))));
 
         let held = en.held.lock().unwrap();
-        assert_eq!(held.appends[0].crc, Some(common::crc::of(&block)));
-        assert_eq!(held.appends[1].crc, Some(0));
+        assert_eq!(held.appends[0].holds.crc, Some(common::crc::of(&line("checksummed"))));
+        assert_eq!(held.appends[1].holds.crc, Some(0), "kept, wrong or not");
         assert_eq!(en.checksummed.load(Ordering::Relaxed), 2);
-    }
-
-    /// A read asks for one record by number, and gets its content without the
-    /// terminator that found it.
-    #[test]
-    fn a_read_returns_one_record() {
-        let en = EN::new(testing::en_config());
-        append(&en, 1, b"one\ntwo\nthree\n");
-        let (kind, width) = LF.wire();
-        let read = |record: u64| {
-            en.read(
-                &Request::new(Op::ReadExtent)
-                    .number(0)
-                    .number(1)
-                    .number(1_000_000)
-                    .number(kind)
-                    .number(width)
-                    .number(record),
-            )
-        };
-        assert_eq!(read(0).args, vec![Arg::Bytes(b"one".to_vec())]);
-        assert_eq!(read(2).args, vec![Arg::Bytes(b"three".to_vec())]);
-        // Past the end is not found rather than empty.
-        assert_eq!(read(3).status, Status::NotFound);
-    }
-
-    /// An extent nobody here holds, and one whose second disagrees, are both
-    /// answered the same way: that extent is not here.
-    #[test]
-    fn a_read_of_the_wrong_extent_is_not_found() {
-        let en = EN::new(testing::en_config());
-        append(&en, 1, &line("only"));
-        let (kind, width) = LF.wire();
-        let read = |extent: u64, created: u64| {
-            en.read(
-                &Request::new(Op::ReadExtent)
-                    .number(0)
-                    .number(extent)
-                    .number(created)
-                    .number(kind)
-                    .number(width)
-                    .number(0),
-            )
-            .status
-        };
-        assert_eq!(read(1, 1_000_000), Status::Ok);
-        assert_eq!(read(2, 1_000_000), Status::NotFound, "no such extent");
-        assert_eq!(read(1, 1_000_001), Status::NotFound, "a rewritten extent is a new one");
-    }
-
-    /// An extent that has no room for the next block is closed rather than stretched,
-    /// and the answer says what it came to.
-    #[test]
-    fn a_full_extent_seals_instead_of_taking_the_block() {
-        let en = EN::new(testing::en_config());
-        let cap = COff::new(10);
-        let took = |en: &EN, bytes: &'static [u8]| en.take(&appending(0, 1, bytes), cap);
-        // "one\n" and "two\n" fit in ten bytes; "three\n" does not.
-        assert!(matches!(took(&en, b"one\n"), Ok(Took::Landed(_))));
-        assert!(matches!(took(&en, b"two\n"), Ok(Took::Landed(_))));
-        match took(&en, b"three\n") {
-            Ok(Took::Sealed { records, length, .. }) => {
-                assert_eq!(records, 2, "what the extent came to");
-                assert_eq!(length, COff::new(8));
-            }
-            other => panic!("should have sealed, not {:?}", other.is_ok()),
-        }
-        // And it stays sealed: the block that found it full does not land later.
-        assert!(matches!(took(&en, b"x\n"), Ok(Took::Sealed { .. })));
-        // What was in it is still readable.
-        assert_eq!(en.held.lock().unwrap().record(0, 1, LF, 1).unwrap(), b"two");
-    }
-
-    /// An extent with a record still open cannot seal, however full it is: an extent
-    /// holds whole records, so the open one has to finish here.
-    #[test]
-    fn an_open_record_keeps_an_extent_from_sealing() {
-        let en = EN::new(testing::en_config());
-        let cap = COff::new(4);
-        // A block with no boundary in it, which leaves a record open.
-        assert!(matches!(en.take(&appending(0, 1, b"half"), cap), Ok(Took::Landed(_))));
-        // Past the cap, and it still has to be taken, because the record is open.
-        match en.take(&appending(0, 1, b" and half\n"), cap) {
-            Ok(Took::Landed(landed)) => assert_eq!(landed.records, 1),
-            _ => panic!("an open record must be allowed to finish"),
-        }
-        assert_eq!(en.held.lock().unwrap().record(0, 1, LF, 0).unwrap(), b"half and half");
-        // Now that nothing is open, the next block finds it full.
-        assert!(matches!(en.take(&appending(0, 1, b"x\n"), cap), Ok(Took::Sealed { .. })));
     }
 
     /// Three of four, so two of the three secondaries settle it and the third's
@@ -924,8 +931,8 @@ mod tests {
         assert_eq!(counting.answer(true), Some(Verdict::Durable));
     }
 
-    /// Two failures, and three of four is out of reach: say so rather than wait
-    /// for an answer that cannot add up.
+    /// Two failures, and three of four is out of reach: say so rather than wait for
+    /// an answer that cannot add up.
     #[test]
     fn two_failures_lose_the_append() {
         let quorum = testing::extents().quorum;
@@ -934,8 +941,8 @@ mod tests {
         assert_eq!(counting.answer(false), Some(Verdict::Lost));
     }
 
-    /// An append that could only be sent to one other instance can never reach
-    /// three of four, and that is known before any answer arrives.
+    /// An append that could only be sent to one other instance can never reach three
+    /// of four, and that is known before any answer arrives.
     #[test]
     fn too_few_instances_to_ask_is_hopeless_from_the_start() {
         assert!(!Counting::new(1, 3).possible());

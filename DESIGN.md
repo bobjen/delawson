@@ -11761,3 +11761,60 @@ message two processes each parse by counting positions — the exact contract th
 once. So `common::wire::AppendBlock` is now built and read in one place and used by both the FE and the
 EN, which turns that class of mistake into a compile error. Its round trip is a unit test; the positions
 are nobody's business.
+
+### 17.16 The client compresses, and the tiers below stop understanding records
+
+Built, 2026-08-17. `laws append` frames the record, computes its CRC, **compresses out of place**,
+re-checks the buffer against the CRC, and sends the stored bytes. `laws read` gets the **whole block**
+back, decompresses it, checks the CRC, and takes the record out. Nothing in between looks inside.
+
+**Measured here, by content:**
+
+| 50 records of 901 logical bytes | Stored | Ratio |
+|---|---|---|
+| highly repetitive | 2,150 | **21x** |
+| random | 45,050 | **1.00x** — stored as it stands, not larger |
+| 50 short records of ~68 bytes | 3,090 for ~3,400 | ~1.1x |
+
+**Measured, 2026-08-17.** The middle row is the one worth having: a block that does not compress is
+stored uncompressed rather than bigger, so incompressible data pays nothing. And the last row is the
+finding — **per-append compression of small records buys almost nothing**, because 68 bytes is too
+little for a compressor to find anything in. That is an argument for §8.1.4.4's coalescing rather than
+against compression: the win is there for a block of many records, and a single small append is not
+one.
+
+#### 17.16.1 What compression took away from the tiers below
+
+⚠️ **An EN can no longer see a record**, and that turned out to be most of the change:
+
+| Before | After |
+|---|---|
+| the EN parsed the block by framing to count records | **the writer counts, and the counts travel with the block** |
+| the EN enforced §8.2.4's block rule | **the client enforces it** — the EN cannot see a boundary to check |
+| the EN kept the bytes of an open record | it keeps **a flag**; the writer holds the bytes |
+| a read returned one record | a read returns **the whole block** holding it (#63) |
+| `read-extent` took a framing | it does not: the framing has left the wire below the client |
+
+So the EN became a tier that deals in bytes, offsets and counts, and that is a simplification rather
+than a loss — it is what §9.1 already said the division should be. **What it costs is that the EN now
+trusts the writer** about what a block contains. A writer that lies corrupts its own object and no
+other, which is the same bargain the CRC already makes.
+
+**And the logical/compressed distinction became real, which fixed #48.** A receipt now reports the
+**logical** offset and length — what the writer wrote — while the extent's stored end is a separate
+number the tier keeps to itself. Two appends of 301 logical bytes landed at logical offsets 0 and 301
+while occupying 13 and 301 stored bytes. Before compression those numbers were equal and the receipt
+was wrong in a way nothing could detect.
+
+#### 17.16.2 A bug that only appears after the first seal
+
+**Three numbering spaces meet on the read path** — a caller counts records from the start of the
+object, a stream counts from its own first, and an extent counts from its own — and the FE is the only
+party that knows all three. The first version of this returned the block's first record in the
+*extent's* numbering to a client counting in the *object's*.
+
+⚠️ **Everything worked until the first seal**, because until then all three origins are zero. Then 139
+of 200 reads failed. The lesson is not about numbering: **a conversion between two spaces that agree at
+zero is untested by anything that never leaves the first extent**, and the single-box cluster's tiny
+seal limit is what made it show up at all. Had the limit been the design's 32 MB, this would have
+shipped.

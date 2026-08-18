@@ -1,6 +1,7 @@
 //! Everything more than one DeLawson process needs: configuration, the wire
 //! protocol, the daemon lifecycle, and the placement-rule report.
 
+pub mod block;
 pub mod config;
 pub mod crc;
 pub mod framing;

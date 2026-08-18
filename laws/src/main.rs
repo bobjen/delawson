@@ -10,6 +10,8 @@ mod client;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use client::{Conn, Stats, Tally};
+use common::block::{Holds, expand, squeeze};
+use common::config::Compress;
 use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
 use common::placement;
@@ -306,6 +308,10 @@ enum Cmd {
     /// Read one record.
     Read {
         path: String,
+        /// The object's framing, needed to find the record inside the block that
+        /// comes back — nothing below the client parses one.
+        #[arg(long, default_value = "lf")]
+        framing: String,
         #[command(flatten)]
         at: At,
     },
@@ -565,10 +571,18 @@ fn run(cli: Cli) -> Result<()> {
             let request = build(cmd)?;
             let target = resolve(&cluster, &cli, serves(cmd))?;
             let answer = open(&target, timeout, &cluster.messaging)?.call(&request)?;
-            match request.op {
-                Op::AppendRecord => receipt(&target, &answer),
-                Op::ReadRecord => record(&target, &answer),
-                Op::ObjectInfo | Op::CreateObject => object(&target, &answer),
+            match (cmd, request.op) {
+                (_, Op::AppendRecord) => receipt(&target, &answer),
+                // The client asked for a record and gets the block holding it, so it
+                // needs its own question back to find the record in it.
+                (Cmd::Read { framing, at, .. }, Op::ReadRecord) => {
+                    let want = match at.arg() {
+                        Arg::Number(record) => record,
+                        _ => 0,
+                    };
+                    record(&target, Framing::parse(framing)?, want, &answer)
+                }
+                (_, Op::ObjectInfo | Op::CreateObject) => object(&target, &answer),
                 _ => report(&target, &answer),
             }
         }
@@ -1015,7 +1029,7 @@ fn receipt(target: &Target, response: &Response) -> Result<()> {
                 target.identity
             ),
             1 => println!(
-                "{} record {object_record} (stream {stream} record {record}), {length} bytes at offset {offset} of extent {extent} made in second {created}",
+                "{} record {object_record} (stream {stream} record {record}), {length} logical bytes at logical offset {offset} of extent {extent} made in second {created}",
                 target.identity
             ),
             _ => println!(
@@ -1057,18 +1071,42 @@ fn object(target: &Target, response: &Response) -> Result<()> {
     report(target, response)
 }
 
-/// A record, as the bytes it is. Text goes to standard output as text, so a read
-/// can be piped; anything else says how much there was rather than spraying it at
-/// a terminal.
-fn record(target: &Target, response: &Response) -> Result<()> {
-    if let [Arg::Bytes(bytes)] = response.args.as_slice() {
-        match std::str::from_utf8(bytes) {
-            Ok(text) => println!("{text}"),
-            Err(_) => println!("{} {} bytes, not text", target.identity, bytes.len()),
-        }
-        return Ok(());
+/// A record, out of the block that holds it.
+///
+/// **This is the far end of the chain the client started when it appended.** It
+/// compressed the block and computed the CRC going in; here it decompresses, checks
+/// the CRC against what it promised, parses by the framing, and takes the record it
+/// wanted. Nothing in between ever looked inside, and nothing in between could have
+/// checked this.
+fn record(target: &Target, framing: Framing, want: u64, response: &Response) -> Result<()> {
+    let [
+        Arg::Number(logical),
+        Arg::Number(first_record),
+        Arg::Number(_records),
+        Arg::Flag(has_crc),
+        Arg::Number(crc),
+        Arg::Bytes(stored),
+    ] = response.args.as_slice()
+    else {
+        return report(target, response);
+    };
+
+    let block = expand(Compress::Lz4, stored, *logical)?;
+    if *has_crc && *crc != common::crc::of(&block) {
+        return Err(Error::new(format!(
+            "{} bytes came back and do not match the CRC they were written with",
+            block.len()
+        )));
     }
-    report(target, response)
+    let within = want.saturating_sub(*first_record);
+    let Some(found) = framing.records(&block).nth(within as usize) else {
+        return Err(Error::new(format!("that block does not hold record {want}")));
+    };
+    match std::str::from_utf8(found) {
+        Ok(text) => println!("{text}"),
+        Err(_) => println!("{} {} bytes, not text", target.identity, found.len()),
+    }
+    Ok(())
 }
 
 /// Print a response, and fail the process if the service refused.
@@ -1248,17 +1286,28 @@ fn build(cmd: &Cmd) -> Result<Request> {
             let framing = Framing::parse(framing)?;
             let (kind, width) = framing.wire();
             let block = frame(framing, &body.bytes()?)?;
-            // Over the framed block, which is the logical form — not what the wire
-            // will compress it to, since that is the system's representation of the
-            // data rather than the data.
+            // Over the framed block, which is the logical form — not what it will be
+            // compressed to, since that is the system's representation of the data
+            // rather than the data.
             let checksum = crc.then(|| common::crc::of(&block));
-            Request::new(Op::AppendRecord)
-                .text(path)
-                .number(kind)
-                .number(width)
-                .flag(checksum.is_some())
-                .number(checksum.unwrap_or(0))
-                .bytes(block)
+            let holds = Holds::of(framing, b"", &block, checksum)?;
+
+            // Compressed here and nowhere below: the client is as far upstream as
+            // compression goes, so the bytes are smaller across the internet and no
+            // tier in the middle spends CPU on them.
+            let stored = squeeze(Compress::Lz4, &block).unwrap_or_else(|| block.clone());
+            // ⚠️ And **not in place**, so the original survives to be checked. A
+            // corruption before or during compression shows up here as a mismatch
+            // rather than as durable wrong data.
+            if let Some(promised) = checksum
+                && promised != common::crc::of(&block)
+            {
+                return Err(Error::new("this buffer changed while it was being compressed"));
+            }
+
+            let mut request = Request::new(Op::AppendRecord).text(path).number(kind).number(width);
+            request.args.extend(holds.args());
+            request.bytes(stored)
         }
         Cmd::Insert { path, key, body } => {
             Request::new(Op::InsertRecord).text(path).text(key).bytes(body.bytes()?)
@@ -1273,7 +1322,7 @@ fn build(cmd: &Cmd) -> Result<Request> {
             request.args.push(at.arg());
             request
         }
-        Cmd::Read { path, at } => {
+        Cmd::Read { path, at, .. } => {
             let mut request = Request::new(Op::ReadRecord).text(path);
             request.args.push(at.arg());
             request
