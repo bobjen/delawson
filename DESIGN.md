@@ -7942,6 +7942,43 @@ share an EC fate.
 
 ## 12. Billing and metering
 
+### 12.0 DeLawson ships a cost model, not a price list
+
+**The operator sets the coefficients** (Asserted, Bob, 2026-08-19):
+
+> "Part of my purpose of choosing billing that makes it easy to lower bills arbitrarily close to
+> costs, and making it open source, is that I want DeLawson to get used. If a cluster operator
+> wants to make a higher profit, they set the coefficients — they can multiply their costs all by
+> X if they want to. They can even overcharge some things but not others. Business decision on
+> their part, and it is always a business in some sense, because actual clusters do cost money to
+> run."
+
+So what this section designs is **metering**, and a table of coefficients over it. The dollar
+figures worked through in §12.7 are calibration and sanity checks against the market — they are
+not the product, and nothing in the code should treat them as more than defaults. "It is always a
+business in some sense" covers the internal case too: an organization running its own cluster is
+doing chargeback rather than sales, and it turns the same knob.
+
+**Everything downstream reads differently once that is clear:**
+
+- ⚠️ **The 2× slack of §12.4.1 is the error an operator cannot tune away.** Multiplying every
+  coefficient by X changes the level and not the shape, so a dimension whose *shape* is wrong
+  stays wrong at every price. That is what the design owes: not the right price, but a set of
+  dimensions no coefficient has to apologise for.
+- **Being able to drive a bill close to cost is the adoption lever of §12.1.0**, made operational.
+  The floor stays a real constraint — clusters cost money — but the design's job is to leave as
+  little unavoidable margin between price and cost as it can, and let the operator decide how much
+  to add back.
+- **Charging above cost on some dimensions and not others is intended, not abuse.** It is how an
+  operator discourages a workload their hardware is bad at, and it is a faster instrument than
+  §12.4.2's refusals for anything that is merely expensive rather than pathological.
+
+⚠️ **The risk this creates is that an operator can set a coefficient to zero**, which reintroduces
+§12.1's ADLS Gen1 failure inside their own cluster — the free dimension is the one users find. The
+code should make that possible and not easy: **ship non-zero defaults for every metered dimension,
+and say something when a dimension is metered but priced at zero.** An operator choosing to eat a
+cost is fine; an operator not noticing they have is the failure mode.
+
 ### 12.1 The governing principle
 
 > **Billing must be proportional to actual cost, within some slack.** Bill too little and
