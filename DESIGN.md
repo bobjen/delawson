@@ -8211,6 +8211,33 @@ The "sums to" matters. Collapsing every *individual* item under 1% would let twe
 half-percent charges vanish into a tenth of the bill — the threshold has to apply to the
 remainder as a whole, not item by item.
 
+#### 12.3.2 Prior art: ADLS Gen1 priced per GB and never mentioned compression
+
+The other shipped precedent is weaker but points the same way. **ADLS Gen1 priced per GB and
+its overview never mentions compression at all** (Asserted, Bob, 2026-08-19, from
+[the archived product overview](https://learn.microsoft.com/en-us/previous-versions/azure/data-lake-store/data-lake-store-overview)
+— which is retired and may disappear, so it is copied into `delawson-notes/reference/`).
+The page has no consistency guarantee, no durability figure, no block size and no quota
+either; the silence is broad.
+
+**But §5.12.0's SCOPE paper says Cosmos stores data compressed.** So the store compressed and
+the price list did not say so — and the inference, reasoned here rather than stated anywhere,
+is that **it billed logical bytes and kept the compression win.** A provider billing
+compressed bytes has to explain compression to the customer, because the customer cannot
+otherwise predict the bill; one billing logical bytes never has to mention it.
+
+**That makes two of two precedents default to logical**, since §12.3.1's BigQuery offers both
+and defaults to logical as well. DeLawson billing compressed bytes is therefore the unusual
+choice, and §12.9's fifth question — whether the billed figure is reported back, and at what
+granularity — is the live one rather than a detail.
+
+⚠️ **And it exposes a hazard that logical pricing is simply immune to.** Under compressed
+billing the customer's bill moves when *we* change something: a better codec, a different
+compaction schedule, a re-encoding. §10 already records that compaction is a billing event and
+that "the schedule directly determines a customer's bill" — under logical billing that sentence
+does not exist. Whatever is chosen, the customer must not be able to attribute a bill increase
+to a provider decision they did not ask for and cannot see.
+
 #### 12.6.1 It adapts to the workload, which makes it diagnostic
 
 The point is that the same rule produces a one-line bill for ordinary use and an itemized
