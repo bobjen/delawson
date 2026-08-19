@@ -8213,23 +8213,28 @@ remainder as a whole, not item by item.
 
 #### 12.3.2 Prior art: ADLS Gen1 priced per GB and never mentioned compression
 
-The other shipped precedent is weaker but points the same way. **ADLS Gen1 priced per GB and
-its overview never mentions compression at all** (Asserted, Bob, 2026-08-19, from
-[the archived product overview](https://learn.microsoft.com/en-us/previous-versions/azure/data-lake-store/data-lake-store-overview)
-— which is retired and may disappear, so it is copied into `delawson-notes/reference/`).
-The page has no consistency guarantee, no durability figure, no block size and no quota
-either; the silence is broad.
+The other shipped precedent points the same way, and it is worth being careful about how
+much of it is known. Three steps, of decreasing solidity:
 
-**But §5.12.0's SCOPE paper says Cosmos stores data compressed.** So the store compressed and
-the price list did not say so — and the inference, reasoned here rather than stated anywhere,
-is that **it billed logical bytes and kept the compression win.** A provider billing
-compressed bytes has to explain compression to the customer, because the customer cannot
-otherwise predict the bill; one billing logical bytes never has to mention it.
+| | Standing |
+|---|---|
+| ADLS Gen1's overview **never mentions compression** | **Cited** — [the archived page](https://learn.microsoft.com/en-us/previous-versions/azure/data-lake-store/data-lake-store-overview), copied into `delawson-notes/reference/` because it is retired and may disappear |
+| **Azure lists prices in GB**, and ADLS Gen1 presumably billed the customer the same way | **Guess**, Bob, 2026-08-19 — the general Azure pricing convention, not a recollection of that product's price list |
+| So it billed **logical** bytes and kept the compression win | reasoned here, from the two above |
 
-**That makes two of two precedents default to logical**, since §12.3.1's BigQuery offers both
-and defaults to logical as well. DeLawson billing compressed bytes is therefore the unusual
-choice, and §12.9's fifth question — whether the billed figure is reported back, and at what
-granularity — is the live one rather than a detail.
+⚠️ **And the unit is the weaker half of the evidence, not the stronger.** A store billing
+compressed bytes would also quote a price per GB — "per GB" says nothing about *which* GB. What
+carries the argument is the **silence**: §5.12.0's SCOPE paper says Cosmos stores data
+compressed, so a product that compresses, charges by the GB, and never mentions compression is
+almost certainly not charging for the compressed byte. A provider billing compressed bytes has
+to explain compression, because the customer cannot otherwise predict the bill; one billing
+logical never has to bring it up.
+
+The page's silence is broad, which weakens the inference a little further — it also says nothing
+about consistency, durability, block size or quotas. But **two of two precedents default to
+logical**, since §12.3.1's BigQuery offers both and defaults that way too. So DeLawson billing
+compressed bytes is the unusual choice, and §12.9's fifth question — whether the billed figure
+is reported back, and at what granularity — is live rather than a detail.
 
 ⚠️ **And it exposes a hazard that logical pricing is simply immune to.** Under compressed
 billing the customer's bill moves when *we* change something: a better codec, a different
