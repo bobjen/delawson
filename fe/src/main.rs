@@ -657,8 +657,8 @@ impl FE {
         self.resolve_record(process, &path, record, reply, move |fe, process, located, reply| {
             // The DN answered with the stream holding it, so the number the stream
             // knows it by is what is left after that stream's first.
-            let within = record.saturating_sub(located.first_record);
-            fe.locate(process, located, within, reply);
+            let in_stream = within(record, located.first_record);
+            fe.locate(process, located, in_stream, reply);
         });
     }
 
@@ -789,22 +789,22 @@ fn from_instance(
     process: &Arc<Process>,
     located: &Located,
     open: &Open,
-    record: u64,
+    in_stream: u64,
     reply: Reply,
 ) {
     let identity = format!("EN{}", open.instances[0]);
     // The record number the extent knows is its own, counted from its first — and no
     // framing goes with it, because the EN will not be looking inside.
-    let within = record.saturating_sub(open.first_record);
+    let in_extent = within(in_stream, open.first_record);
     // ⚠️ And the answer comes back in the extent's numbering, which is not the
     // caller's. Three numbering spaces meet here — object, stream, extent — and the
     // FE is the only party that knows all three, so it is the one that converts.
-    let base = located.first_record + open.first_record;
+    let base = origin(located.first_record, open.first_record);
     let ask = Request::new(Op::ReadExtent)
         .number(open.sn as u64)
         .number(open.id)
         .number(open.created)
-        .number(within);
+        .number(in_extent);
     let named = identity.clone();
     // The block comes back whole and is passed on whole: the reader decompresses it,
     // checks the CRC against what it wrote, and takes the record it wanted. Doing
@@ -815,6 +815,22 @@ fn from_instance(
     if let Err(e) = asked {
         logw!("could not reach an EN", "en {named},{e}");
     }
+}
+
+/// A record number one space inward: an object's into its stream's, or a stream's into
+/// its extent's. Both are the same subtraction, of that container's first record.
+fn within(record: u64, first: u64) -> u64 {
+    record.saturating_sub(first)
+}
+
+/// And what puts an extent's answer back into the caller's numbering — the two origins
+/// crossed on the way in, added together.
+///
+/// ⚠️ **`within` twice and `origin` are only correct as a set.** Both first-records are
+/// zero until an object outgrows its first extent, so a version that drops either one
+/// passes everything that never leaves that extent and then fails most reads.
+fn origin(stream_first: u64, extent_first: u64) -> u64 {
+    stream_first + extent_first
 }
 
 /// Put a block's first record into the numbering the caller asked in. An EN counts
@@ -924,6 +940,35 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    /// A caller's record number goes in through two origins and an answer comes back
+    /// out through their sum, so the two directions have to agree.
+    ///
+    /// ⚠️ This is the bug that survived until the first seal: both origins are zero
+    /// while an object fits one extent, so dropping either one is invisible until it
+    /// does not.
+    #[test]
+    fn a_record_number_survives_the_trip_through_three_spaces() {
+        use super::{in_the_callers_numbering, origin, within};
+        use common::wire::{Arg, Response, Status};
+
+        let (stream_first, extent_first) = (700, 40);
+        for asked in [740, 741, 800, 12_345] {
+            let in_extent = within(within(asked, stream_first), extent_first);
+            assert_eq!(in_extent + origin(stream_first, extent_first), asked, "record {asked}");
+        }
+
+        // And the answer really is rewritten, in the second argument and nowhere else.
+        let answer = Response {
+            id: 0,
+            status: Status::Ok,
+            args: vec![Arg::Number(9), Arg::Number(0), Arg::Number(3)],
+        };
+        let told = in_the_callers_numbering(answer, origin(stream_first, extent_first));
+        assert_eq!(told.args[0], Arg::Number(9), "the logical size is not a record number");
+        assert_eq!(told.args[1], Arg::Number(740), "the extent's first record, made the caller's");
+        assert_eq!(told.args[2], Arg::Number(3), "nor is the count");
+    }
+
     use super::*;
     use common::testing;
 
