@@ -4225,6 +4225,136 @@ requirement on the API and on §13.3's loops, not a defect: for objects this lar
 alternative, and §9.4's scan design already walks streams in order rather than needing them
 simultaneously.
 
+#### 5.11.3 A range is a ring
+
+**A DN range gets its own Raft snapshot and log, and therefore its own ring** (Asserted, Bob,
+2026-08-19) — one ring per range, except transiently while splitting or merging. That keeps a
+ring's data contiguous, and it is what lets a range split when both its neighbours are busy,
+because the split creates a *third* ring in the middle rather than pushing work sideways.
+
+⚠️ **The consequence to absorb first: a machine is no longer the owner of a key span — a ring
+is.** A physical DN hosts members of many rings, placed wherever there is capacity, so "which DN
+owns this range" stops having a single answer. An earlier draft of this section concluded that a
+DN must therefore support multiple noncontiguous ranges; with a ring per range the question
+dissolves instead, because nothing about a range's identity refers to a machine.
+
+**And moving a range becomes a membership change**, which is a thing §13 already does. The planned
+handover between old and new owner is Raft's own leadership change, so it needs no term number of
+its own — Raft has one. Replacing a failed member and rebalancing a range away from a hot machine
+become the same operation.
+
+##### 5.11.3.1 A name may not encode a placement decision
+
+**References to a stream are `(range, StreamId)` and never `(DN, StreamId)`** (Asserted, Bob,
+2026-08-17). `StreamId`s are only unique within a range, so the lookup is a mapping rather than an
+array — and naming the machine would bake in a placement that rebalancing changes. This is §4.6's
+rule again: every reference is an index into a population its holder knows, never a machine
+address.
+
+**Inside an SN, though, the reference is the array slot** (Asserted, Bob, 2026-08-17), with
+`(range, StreamId)` interned to it — exactly §14.6.5's arrangement for extents, where an external
+name reaches an internal index through a hash and everything internal uses the index. The payoff
+is the same: **a range split rekeys hash entries and touches no stream record**.
+
+##### 5.11.3.2 Splitting is cheap, merging is not, and both move the smaller side
+
+**A split gives every stream to exactly one child range**, so ids need not change: it is a rekey
+plus, with a ring per range, populating the new ring with the subrange's state.
+
+⚠️ **A merge unions two id spaces that can collide, so it must renumber** — and a `StreamId` is
+named by the DN's objects, making merge a bulk reference rewrite where split is a rename of keys.
+Splits and merges are always within one DN's neighbourhood (Asserted, Bob, 2026-08-17), so both
+sides are reachable, but the asymmetry is real and it decides how each should be built.
+
+**Both operations should move the smaller side.** A split creates the new ring for the smaller
+piece and leaves the bulk in place; a merge renumbers the smaller participant. That bounds the
+work by the smaller of the two in both directions.
+
+**⚠️ Merging is certainly needed, and the case that needs it is the cheap one** (Asserted, Bob,
+2026-08-17). The workload is a conveyor: there is usually a hot spot that **grows in alphabetical
+order, moving along with the alphabetic end**, and a month or a year later that data is deleted
+from the trailing end. So the ranges wanting merging are the emptied ones —
+
+| Case | Renumbering cost |
+|---|---|
+| the range is **empty** | **none** — no streams, so no collisions. It is a *deletion*: drop it and give its span to a neighbour |
+| the range is **near-empty** | renumber only the smaller side — the streams actually present, not the span |
+
+which means **the expensive general merge, two full ranges unioning two full id spaces, may never
+need building.** What is load-bearing is *noticing* that a range has emptied.
+
+**The transient is the part to design.** While splitting or merging, a range is not exactly one
+ring. Raft supplies the clean shape: populate and catch up the new ring while the old one still
+serves, then cut over at a known index, so there is a single instant at which the old ring stops
+answering for that span. ⚠️ The alternative — both answering for a window — is where read-your-
+writes questions live, and §16 item 11 already flags the interaction with in-flight writes.
+
+##### 5.11.3.3 What sets the size band, and why the ends are measured differently
+
+| End | Set by |
+|---|---|
+| **minimum** | **concatenate locality** — concatenating extents inside an SN is cheap, and across ranges it becomes the DN concatenating multiple streams, so it is cheaper to talk to one SN. **Plus per-ring overhead**, now that a range is a ring: a leader, heartbeats, a snapshot and log, and state-machine RAM on every member |
+| **maximum** | **what one ring member can hold** — the same shape as §14.1's per-SN bound, and it bounds §4.4.0's per-range index too |
+
+**Finding the DN is a B-tree walk over ranges, which lets ranges be pretty small** (Asserted, Bob,
+2026-08-17) — but note that argument *relaxes* the minimum rather than setting it. Two things set
+it, and **the larger binds**; both want measuring rather than guessing.
+
+**A DN may map one range to several SNs, though it should prefer one** (Asserted, Bob, 2026-08-17),
+because a single object lives in a single range and can be large enough that its streams must span
+SNs — which §5.2 already requires of a maximal object.
+
+**And the split point is deferred** (Asserted, Bob, 2026-08-17). Splitting at the alphabetic end
+minimizes the number of splits, but risks a small range if the pattern does not hold; a size band
+wider than 2× permits splitting in the middle and 3× permits the 2/3 mark, avoiding ranges that are
+too small from the start. **Derived:** if a range splits at *M* and no piece may fall below *m*, the
+most asymmetric split allowed is **f ≤ 1 − m/M** — 1/2 at a ratio of 2, 2/3 at 3. So the band width
+is not an independent knob; it *is* the split policy. ⚠️ And the ratio only means something once both
+ends are expressed in one unit, which they are not yet: one is locality, the other capacity.
+
+Two things not yet decided that would settle it: **split points preferring tenant or directory
+boundaries** — since what the minimum defends is not size but not cutting through objects that get
+concatenated together, and §5.1.2's virtual directories are a ready supply of such cuts — and
+**choosing the split point from observation**, since a range knows where its own recent inserts
+landed and can split at its right edge only when they were overwhelmingly there.
+
+##### 5.11.3.4 A stream may be referenced from several ranges, and the counts are two-level
+
+**Concatenate lets an object reference streams in any SN holding that tenant's data, so a stream may
+be referenced from multiple ranges** (Asserted, Bob, 2026-08-17). Rather than copy to avoid that —
+which would make user concatenate cost storage sometimes and not others, for space that need not be
+spent — **the SN's stream knows it is referenced by several ranges, and the DN/SN sync of §13.1 is on
+the range-stream reference rather than on the stream.** A range knows which DN it belongs to, and the
+handoff when ranges rebalance touches nothing about the stream.
+
+**Which amends §4.6.6.1's counts into two levels**, and the arrangement is better than what that
+section settled on:
+
+| Reference | Counted in | Why it is safe there |
+|---|---|---|
+| object → stream | **the range** | same ring as the objects doing the referencing |
+| range → stream | **the SN** | one place that sees zero, and the tier that must delete the stream anyway |
+
+⚠️ **This is not the distributed termination §4.6.6.1 feared.** Each range independently decides it
+no longer references a stream and says so once; the **SN aggregates**. There is a single point that
+observes zero, so nothing has to agree with anything, and it survives rebalancing because a
+range-stream reference does not care which DN the range currently sits on. §13.1.7's drifting
+cross-tier reference is therefore **`range → stream`**, not `object → stream`.
+
+**A tenant reading another tenant's aliased stream (§5.1.1) copies if it concatenates that into an
+object it owns** (Asserted, Bob, 2026-08-17), so sharing never crosses a tenant boundary.
+
+**And a stream holds one tenant's data, which the DN can assure** (Asserted, Bob, 2026-08-17).
+Multi-tenant streams would answer the zillion-tenants-with-one-tiny-object abuse, but §12.4.3's base
+tenant charge answers it too and costs nothing: single-tenancy is what makes §7.3.3's key derivation,
+§12's attribution and the plain statement "this stream belongs to a tenant" all simple, and pricing
+gives them up for nothing.
+
+⚠️ **One thing this makes load-bearing:** finding the ring that serves a key needs a directory from
+ranges to rings, and that directory cannot itself be range-partitioned without recursing. It points
+at §5.5's bootstrap root — already §16 item 1 — which is now on the path of every DN lookup rather
+than only of startup.
+
 ---
 
 ### 5.12 Compute: undesigned, but the network already binds
@@ -10731,7 +10861,8 @@ Roughly in order of how much else depends on them.
 5. **Shared-extent and shared-stream consequences** (§4.6.1): copy-on-write
    compaction, and billing attribution between a clone and its original. The cross-ring
    version of the same question is **closed**: a cross-ring clone copies rather than shares
-   (§5.1.1.2), because aliases cover the case that made cross-ring sharing attractive.
+   (§5.1.1.2), because aliases cover the case that made cross-ring sharing attractive — and
+   where sharing is wanted anyway, §5.11.3.4's two-level count handles it.
 6. **The DN-side stream-list entry has no budget** (§14.1.2). Sizings currently use
    the 200 B stream record as a loose upper bound; a real figure would shrink every
    stream-list number severalfold.
