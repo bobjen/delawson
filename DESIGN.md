@@ -2847,7 +2847,7 @@ each increment produces numbers obsolete by the next revision.
 | Placement slack | 4/3 | §5.6.1 |
 | Fan-out per machine | ~20,000 | §5.10 |
 | Compression ratio, when assumed | 4× | §12, §14.2 |
-| Billing slack — how far a billed dimension may sit from true cost | **2×** | §12.1, §12.3 |
+| Billing slack — how far a billed dimension may sit from true cost | **2×** | §12.1, §12.3 — **now derived** in §12.4.1: it is the count of dimensions in an additive bill |
 
 The SN RAM split deserves its own warning: **it will vary wildly between tenants and
 in production**, because it encodes an assumed mix of object sizes (§14.1.1). It has
@@ -8187,70 +8187,6 @@ accounting, no cooldown rules, and nothing that depends on whether a customer re
 pricing page. The dual model is worth knowing about as a demonstration that physical billing
 is commercially viable — customers accept it — rather than as a pattern to copy.
 
-### 12.4 The rule that follows
-
-> **Every scarce resource must be a billed dimension, or users will arbitrage the free
-> one.**
-
-| Resource | Cost driver | Must be billed as |
-|---|---|---|
-| EN disk | physical bytes × instances × time | **bytes stored** |
-| SN RAM | stream records + extent **references** (§12.6.2) | **stream count and extent-reference count** |
-| DN storage | object records (§14.2) | **object count** |
-| Network and CPU | appends, reads, syncs | **operations** |
-
-⚠️ **§1.2's "95% of cost is disk" must not be read as licence to bill only for disk.** That
-figure is an *outcome* of a healthy workload, not an invariant. Bill only for bytes and the
-workload shifts until metadata dominates cost — at which point 95% is simply false. The
-cost model is a prediction conditional on the billing being right, not a justification for
-simplifying it.
-
-The slack in §12.1 is what makes this tractable: dimensions need not be exact, only close
-enough that no arbitrage is worth chasing. **The default slack is 2×** (§4.7). Being 30× out
-on one workload is fatal, because that is the one users will find — and §12.3 shows the same
-2× test is what forces physical billing and per-extent durability metering.
-
-### 12.5 What the design already makes visible
-
-- **Compression works for the customer, not just the fleet.** Ratio divides the bill, which
-  is why compression must precede encryption (§7) and why shrinking compression blocks for
-  index density is not a free trade (§7.1).
-- **Sealing and EC cut the bill ~2.7×** (4 replicas → 8+4), so the latency between sealing
-  and successful encoding is money. That needs an explicit target and a decision about who
-  absorbs the cost of the gap.
-- **Compaction reclaims billable bytes**, so the compaction schedule sets part of the bill —
-  as does the DN→SN sync cadence, since each missed delete leaks an orphan stream pinning
-  ~1.74 PB (§13.1.8).
-- **Lumping tiny objects into common streams** (§11) is what makes the small-object case
-  billable at all: without it every tiny object would carry a full stream's metadata cost,
-  which is precisely the ADLS Gen1 failure reappearing from the object side rather than the
-  stream side.
-- **Metering must be per-object over time** — bytes × instances × duration, plus the counts
-  above — surviving failures and double-counting nothing during repair, re-encoding, and
-  compaction, where old and new bases briefly coexist.
-- **The billed quantity is a lazy summary.** By §4.5, physical byte totals change anywhere
-  in the tree and so are maintained lazily by the background loops of §13.3 — the exact,
-  synchronous summary is the unkeyed record count, which nobody is billed for. Billing
-  therefore reads an eventually-consistent figure. Tolerable for metering integrated over a
-  month; it means a customer's *instantaneous* usage query is either stale or must be
-  answered by summing live extent totals on the SNs on demand.
-
-### 12.6 A complex model, presented simply
-
-Closing every arbitrage means many billed dimensions (§12.4), and many dimensions mean a
-bill nobody wants to read. Those are separable problems: **the model is complex, the
-presentation need not be.**
-
-A bill is a **sum of charges**. A summary shows **the top few charges plus "everything
-else"**, and collapses the tail only when that tail is below **1% of the total**. Precisely:
-
-> Sort the charges descending and show the **smallest prefix whose complement sums to under
-> 1%**.
-
-The "sums to" matters. Collapsing every *individual* item under 1% would let twenty
-half-percent charges vanish into a tenth of the bill — the threshold has to apply to the
-remainder as a whole, not item by item.
-
 #### 12.3.2 Prior art: ADLS Gen1 priced per GB and never mentioned compression
 
 The other shipped precedent points the same way, and it is worth being careful about how
@@ -8339,6 +8275,106 @@ logical pricing was there to protect.
 What stays outside their control is only what the store does *afterwards* — §8.1.4.4's
 coalescing, §10's recompression and re-encoding. That is a far smaller surface than "the
 compressed size", and it is what §12.9 should actually be asking about.
+
+### 12.4 The rule that follows
+
+> **Every scarce resource must be a billed dimension, or users will arbitrage the free
+> one.**
+
+| Resource | Cost driver | Must be billed as |
+|---|---|---|
+| EN disk | physical bytes × instances × time | **bytes stored** |
+| SN RAM | stream records + extent **references** (§12.6.2) | **stream count and extent-reference count** |
+| DN storage | object records (§14.2) | **object count** |
+| Network and CPU | appends, reads, syncs | **operations** |
+
+⚠️ **§1.2's "95% of cost is disk" must not be read as licence to bill only for disk.** That
+figure is an *outcome* of a healthy workload, not an invariant. Bill only for bytes and the
+workload shifts until metadata dominates cost — at which point 95% is simply false. The
+cost model is a prediction conditional on the billing being right, not a justification for
+simplifying it.
+
+The slack in §12.1 is what makes this tractable: dimensions need not be exact, only close
+enough that no arbitrage is worth chasing. **The default slack is 2×** (§4.7). Being 30× out
+on one workload is fatal, because that is the one users will find — and §12.3 shows the same
+2× test is what forces physical billing and per-extent durability metering.
+
+#### 12.4.1 Where the 2× comes from: it is the price of an additive bill
+
+**The 2× is derived, not chosen** (Asserted, Bob, 2026-08-19), and knowing the derivation says
+when it applies:
+
+> "If you bill reads by both seek and scan, you can add `A*seeks + B*scans` to get a bill and
+> have A and B so pure-seek and pure-scan is profitable. But that causes double billing at the
+> middle where `A*seeks = B*scans`. The 2× slack lets you give a simpler bill (pure addition).
+> The 2× is soft."
+
+**The arithmetic.** A read consumes two things that can each saturate a device first — seeks and
+scanned bytes — so what a workload really costs is set by whichever binds: `cost ≈ max(seeks/S,
+bytes/B)` in units of a whole device. Pick the coefficients so that a pure-seek workload and a
+pure-scan workload each pay for the device they occupy, and the bill is `seeks/S + bytes/B`. At
+the extremes bill and cost agree exactly. **At the crossover, where the two terms are equal, cost
+is ½ and the bill is 1 — an overbill of exactly 2×.** **Derived.**
+
+**So the 2× buys pure addition.** A customer can be handed `A × seeks + B × scans`, see which term
+dominates, and act on it. The exact bill would be `max(A × seeks, B × scans)` per request, summed
+— which is not much harder to compute but is much harder to explain, cannot be decomposed into
+"what did I pay for", and behaves strangely when a customer's mix changes within a billing period.
+
+⚠️ **And it generalizes in a way worth knowing before adding a billed dimension: with an additive
+bill over *n* dimensions that can each bind, the worst case is *n*×, not 2×.** The 2 is the count
+of dimensions in the formula, not a property of seeks or of bytes. So a third billed dimension in
+the same sum widens the required slack to 3×, which is a real argument for keeping the number of
+dimensions in any one formula small — and it answers §12.9's sixth question, which asks whether 2×
+is right for every dimension: the figure belongs to the *formula*, not to the dimension.
+
+**What makes it soft** is that `max` is only the right cost model when the two resources do not
+contend. Seek time and transfer time genuinely add on a spinning disk, where they share one head,
+so there the additive bill is nearly exact and the slack is nearly 1×. On a device where IOPS and
+bandwidth are closer to independent, `max` is the better model and the full 2× applies. Which
+makes the slack a **per-media-class** figure rather than a constant, and something §3's media
+tables could eventually carry a measured value for.
+
+### 12.5 What the design already makes visible
+
+- **Compression works for the customer, not just the fleet.** Ratio divides the bill, which
+  is why compression must precede encryption (§7) and why shrinking compression blocks for
+  index density is not a free trade (§7.1).
+- **Sealing and EC cut the bill ~2.7×** (4 replicas → 8+4), so the latency between sealing
+  and successful encoding is money. That needs an explicit target and a decision about who
+  absorbs the cost of the gap.
+- **Compaction reclaims billable bytes**, so the compaction schedule sets part of the bill —
+  as does the DN→SN sync cadence, since each missed delete leaks an orphan stream pinning
+  ~1.74 PB (§13.1.8).
+- **Lumping tiny objects into common streams** (§11) is what makes the small-object case
+  billable at all: without it every tiny object would carry a full stream's metadata cost,
+  which is precisely the ADLS Gen1 failure reappearing from the object side rather than the
+  stream side.
+- **Metering must be per-object over time** — bytes × instances × duration, plus the counts
+  above — surviving failures and double-counting nothing during repair, re-encoding, and
+  compaction, where old and new bases briefly coexist.
+- **The billed quantity is a lazy summary.** By §4.5, physical byte totals change anywhere
+  in the tree and so are maintained lazily by the background loops of §13.3 — the exact,
+  synchronous summary is the unkeyed record count, which nobody is billed for. Billing
+  therefore reads an eventually-consistent figure. Tolerable for metering integrated over a
+  month; it means a customer's *instantaneous* usage query is either stale or must be
+  answered by summing live extent totals on the SNs on demand.
+
+### 12.6 A complex model, presented simply
+
+Closing every arbitrage means many billed dimensions (§12.4), and many dimensions mean a
+bill nobody wants to read. Those are separable problems: **the model is complex, the
+presentation need not be.**
+
+A bill is a **sum of charges**. A summary shows **the top few charges plus "everything
+else"**, and collapses the tail only when that tail is below **1% of the total**. Precisely:
+
+> Sort the charges descending and show the **smallest prefix whose complement sums to under
+> 1%**.
+
+The "sums to" matters. Collapsing every *individual* item under 1% would let twenty
+half-percent charges vanish into a tenth of the bill — the threshold has to apply to the
+remainder as a whole, not item by item.
 
 #### 12.6.1 It adapts to the workload, which makes it diagnostic
 
