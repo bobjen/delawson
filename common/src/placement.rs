@@ -165,10 +165,10 @@ mod tests {
     /// Four ENs, with the domain components each `en` closure supplies.
     fn four_ens(domain: impl Fn(usize) -> String) -> ClusterConfig {
         let mut toml = HEADER.to_string();
-        for i in 0..4 {
+        for en in 0..4 {
             toml.push_str(&format!(
-                "[[service]]\nidentity = \"EN{i}\"\nkind = \"en\"\ndomain = {}\n",
-                domain(i)
+                "[[service]]\nidentity = \"EN{en}\"\nkind = \"en\"\ndomain = {}\n",
+                domain(en)
             ));
         }
         ClusterConfig::parse(&toml).expect("test config parses")

@@ -159,8 +159,8 @@ impl Stats {
         }
         samples.sort();
         let at = |fraction: f64| {
-            let i = (fraction * samples.len() as f64) as usize;
-            samples[i.min(samples.len() - 1)]
+            let nth = (fraction * samples.len() as f64) as usize;
+            samples[nth.min(samples.len() - 1)]
         };
         let total: Duration = samples.iter().sum();
         Some(Stats {
