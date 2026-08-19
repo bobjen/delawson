@@ -7957,6 +7957,46 @@ something the design can meter.
 incentive invited, piling into enormous numbers of extremely tiny streams. Nothing about
 that behaviour was unreasonable; it was the cheapest way to use the product as priced.
 
+#### 12.1.0 The two bounds are not symmetric: the floor is a constraint, the ceiling is a lever
+
+The principle above reads as two equal bounds. **It is not** (Asserted, Bob, 2026-08-19):
+
+> "If DeLawson can store the same data in less space and pass the savings on to customers, using
+> less space makes DeLawson more likely to get used. DeLawson billing just has to assure the
+> cluster owner doesn't go broke in the process."
+
+So the **floor** — do not go broke — is the constraint to satisfy, and the **ceiling** is not a
+constraint at all but the **lever**: efficiency is meant to arrive at the customer as a smaller
+bill, because that is what makes the store worth choosing. Every byte not stored is a byte not
+charged for.
+
+⚠️ **Which settles the logical-versus-compressed question that §12.3.3 leaves open, and settles
+it the other way from the precedents.** Under logical billing the savings *cannot* reach the
+customer: compression, coalescing and erasure coding would all improve the owner's margin and
+nothing else, and the customer would see the same bill a non-compressing competitor charges and
+have no reason to prefer this store. **Billing physical bytes is the mechanism by which "store
+it in less space" becomes a benefit the customer can see.** It is a competitive requirement, not
+an accounting preference.
+
+**And physical billing tracks cost by construction, which is what protects the floor.** §12.3.3's
+table shows revenue per physical byte swinging 13.5× under logical pricing, entirely on
+properties of the data the price list never mentions. Bill the physical byte and that swing is
+zero: an incompressible tenant occupies more and pays more, a compressible one occupies less and
+pays less, with no need to guess a compression ratio in advance. The 2× slack is spent on things
+that genuinely vary rather than on hedging against the data.
+
+**It also prices every efficiency decision the design already makes.** Compression (§8.1.4.1),
+coalescing (§8.1.4.4), erasure coding versus replication, and the storage class of §74 all change
+the physical footprint — so under physical billing each becomes a customer-visible, priced choice.
+A tenant asking for four instances pays roughly three times one accepting 12+4, which is roughly
+the truth.
+
+⚠️ **What is left of the floor risk is therefore not storage at all.** Physical billing
+self-corrects on bytes, so the places an owner can still go broke are the dimensions it does not
+capture: metadata, operations, and the transient double footprint during compaction. §12.1's own
+cautionary tale is exactly one of those — ADLS Gen1 did not bill metadata — so that is where the
+attention belongs, not on the byte.
+
 #### 12.1.1 Compute prices must vary, and the slack rule binds on the average
 
 **Compute pricing will break the 1x-2x rule in both directions — lower when capacity risks going unused, higher at
