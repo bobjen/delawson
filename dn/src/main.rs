@@ -628,10 +628,15 @@ impl DN {
 
     /// What an object is: id, stream, the SN holding it, the second it was made,
     /// its flavour, and its framing as a kind and a width.
+    ///
+    /// ⚠️ **Takes the name's shard lock**, so a caller already holding one deadlocks
+    /// against itself. Anything working under a shard lock builds its own answer
+    /// from the object it already has.
     fn look(&self, name: &str) -> Option<Vec<Arg>> {
         self.describe(name, None)
     }
 
+    /// ⚠️ **Takes the name's shard lock** — see `look`.
     fn describe(&self, name: &str, record: Option<u64>) -> Option<Vec<Arg>> {
         self.shards[shard_of(name)].lock().expect("objects").get(name)?.args(record)
     }
