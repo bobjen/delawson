@@ -8375,6 +8375,42 @@ same move again, which is why extent sizing arithmetic works at all.
 from a price list, and an invoice is slow feedback that arrives once a month at somebody who did
 not write the code. A refusal arrives at the caller, in the failing request, with the limit named.
 
+#### 12.4.3 A base charge that dominates the pathology is the other way to avoid a dimension
+
+§12.4.2 removes a pathology by refusing it. **The other move is to absorb it: set a floor charge
+high enough that the pathological case is already paid for** (Asserted, Bob, 2026-08-19) —
+*"making sure base tenant cost is greater than the cost of a single object… then you don't have
+to charge separately for the constraint that streams can't combine multiple tenants."*
+
+**The constraint in question is §11's**: a stream holds one tenant's data (§5.1.2 and #75), which
+means a tenant storing one tiny object still occupies a stream, an extent, and instances of that
+extent. Under per-byte billing that tenant pays nearly nothing and costs a fixed amount, which is
+§12.2's whole argument arriving at the smallest possible scale.
+
+**And the exposure is exactly one object's worth, which is why a flat charge closes it.** Lumping
+(§11, §4.6.5) puts a tenant's *later* small objects into common streams they already own, so
+single-tenancy only bites at the **first** object. The floor is therefore per tenant, not per
+object — a number that a base charge can dominate outright, where a per-object overhead could not.
+
+**What that number is made of is metadata, not bytes**: an object record, a stream record, an
+extent record and its instances — order a kilobyte of the RAM-resident state §14.1 budgets, which
+§12.7 prices far above disk. So the base charge is computed from §14's budgets rather than from
+the customer's data, and in absolute terms it is small.
+
+**Three techniques, then, for keeping a bill short**, and only the first costs slack:
+
+| | Costs |
+|---|---|
+| add a billed dimension | ⚠️ another 1× of slack (§12.4.1) |
+| refuse the pathology (§12.4.2) | a compatibility commitment, and a check designed in from the start |
+| **a base charge that exceeds it** | ⚠️ a higher entry price for everyone |
+
+⚠️ **That last cost pulls against §12.1.0's adoption argument** — the whole point of passing
+savings on is being easier to choose, and a floor charge is the one price a prospective user meets
+first. The mitigation is that it only has to exceed *one object's* cost rather than anything
+proportional, so it can be small enough not to deter, and it is worth checking that it stays that
+way rather than becoming a general-purpose revenue floor.
+
 ### 12.5 What the design already makes visible
 
 - **Compression works for the customer, not just the fleet.** Ratio divides the bill, which
