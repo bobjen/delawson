@@ -8335,6 +8335,46 @@ bandwidth are closer to independent, `max` is the better model and the full 2× 
 makes the slack a **per-media-class** figure rather than a constant, and something §3's media
 tables could eventually carry a measured value for.
 
+#### 12.4.2 Refusing a pathology is cheaper than billing it
+
+**A third way to keep the bill simple: raise an error for pathological usage, so that pathology
+never needs a dimension of its own** (Asserted, Bob, 2026-08-19) — for example disallowing more
+than five iterations of `A' = A + B` concatenation.
+
+**This is the dual of §12.4.1 and it is strictly cheaper.** Each dimension added to an additive
+bill costs another 1× of slack; a limit costs none, because it removes the case rather than
+pricing it. So for any pathology that is **rare, identifiable, and cheap to check at the moment
+of the operation**, a limit beats a dimension outright.
+
+**And some pathologies cannot be billed at all.** Repeated derivation is the example: each
+`A' = A + B` roughly doubles what the object references, so *n* customer operations can produce
+2^*n* of something. No linear price tracks an exponential, so there is no coefficient that makes
+the bill both fair at *n* = 1 and survivable at *n* = 60. A limit is not the cheap option there,
+it is the only one.
+
+⚠️ **The design already uses this technique elsewhere without naming it.** §5.1.1.1 forbids an
+alias pointing into a tree that contains aliases — so cycles are impossible rather than detected,
+and no traversal anywhere needs a visited set or a depth bound. Same shape: refuse the pathology
+once, at one place, and every later mechanism gets to assume it away. §6's size limits are the
+same move again, which is why extent sizing arithmetic works at all.
+
+**What it costs, and it is not nothing:**
+
+- ⚠️ **A limit is a compatibility commitment.** Raising one later is easy; lowering it breaks
+  users. So it has to be generous enough never to catch legitimate use and tight enough to
+  exclude the pathology — and if those two ranges are not clearly separated, a limit is the
+  wrong instrument and the thing really does need metering.
+- **It should be a feature parameter** (§13.2.5), so it can be moved without a deploy, and any
+  limit a full ring must agree on is read by the primary and sent.
+- ⚠️ **The check has to be designed in, not added later.** "More than five iterations" is only
+  answerable if an object carries its **derivation depth** — a small counter that a concatenate
+  sets to `max(depth(A), depth(B)) + 1`. One byte in the object record, and it is unrecoverable
+  retroactively: an object made before the counter existed has no depth to compare.
+
+**The error is also the better teacher.** §12.1's ADLS Gen1 story is a lesson in how users learn
+from a price list, and an invoice is slow feedback that arrives once a month at somebody who did
+not write the code. A refusal arrives at the caller, in the failing request, with the limit named.
+
 ### 12.5 What the design already makes visible
 
 - **Compression works for the customer, not just the fleet.** Ratio divides the bill, which
