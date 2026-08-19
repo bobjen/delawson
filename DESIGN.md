@@ -2926,10 +2926,10 @@ disk and cached — which is exactly the keyed object of §3. **It is therefore
 stored in DeLawson keyed objects, with a bootstrap root outside.** See §5.5.
 
 ⚠️ The directory hierarchy brings semantics only partly designed: path
-resolution and rename are addressed by the key choice in §5.5.4, but listing a
-directory with a billion entries, permissions, and quotas are not. Billing
-(§12) also attaches naturally to directories and accounts rather than to bare
-objects.
+resolution and rename are addressed by the key choice in §5.5.4, and listing a
+directory with a billion entries by the virtual directories of §5.1.2, but
+permissions and quotas are not. Billing (§12) also attaches naturally to
+directories and accounts rather than to bare objects.
 
 #### 5.1.1 Aliases: another tenant's directory inside your tree
 
@@ -3030,6 +3030,146 @@ correct semantics.
 
 So the sharing rule ends up simple: **share inside a ring, copy across one, alias when reading
 is all you wanted.**
+
+#### 5.1.2 Virtual directories
+
+**User directories vary from empty to many millions of children, and that does not scale**
+(Asserted, Bob, 2026-08-17). Nothing about a user's naming has to be balanced, so a directory is
+the wrong unit for anything the DN has to size — statistics, pagination, splitting, placement. A
+**virtual directory** is the unit that is: a bounded piece of the name space that the DN
+maintains, sized by the data rather than by the user.
+
+Two forms were considered, and **the prefix form is chosen** (Asserted, Bob, 2026-08-17):
+
+| Form | A virtual directory is | Boundaries |
+|---|---|---|
+| start-to-end | an arbitrary lexicographic range | chosen — they can sit anywhere |
+| **prefix** | a prefix of the name space, **not required to end at a `/`** | drawn from a fixed lattice |
+
+So `a/b/c/dingo` might fall in the virtual directory `a/b/c/di`. Its advantage is being **purely
+nested** within the directory structure: splitting a prefix *P* yields the predetermined children
+*P*+*c*, so any two virtual directories are either nested or disjoint. There is no policy decision
+at split time, no way for repeated splitting and merging to leave boundaries in awkward places, and
+combining several of them to describe an actual directory is a sum rather than a reconciliation.
+
+⚠️ **The scale varies by at least 256x**, because splitting at a byte boundary multiplies the
+count by the alphabet — likely 16 to 65536 children (Asserted, Bob, 2026-08-17). Reasoned here: the
+radix is a free parameter and only *bytes* make 256 natural. Any **fixed** radix keeps boundaries
+predetermined, so splitting on a nibble would give 16x variance for one more level of depth. Worth
+measuring the real byte distribution per depth before fixing it, since path names use perhaps 40 of
+the 256 values and use them very unevenly.
+
+⚠️ **And skew, not variance, is the failure mode.** The 256x figure assumes the discriminating byte
+discriminates. Real sibling names share long prefixes — `part-000000001`, `2026-08-17T…` — so a
+split at the next position can leave almost everything in one child. **A virtual directory's prefix
+must therefore be allowed to be any length**, so a split jumps straight to the first position where
+names actually differ. That is a radix tree with path compression rather than a fixed-depth trie,
+and it is a requirement rather than an optimization: Bob's billion-children case is exactly the
+generated-name shape that defeats the uncompressed version.
+
+##### 5.1.2.1 Splitting and merging rename nothing
+
+**Virtual directories split and merge** (Asserted, Bob, 2026-08-17): insert a billion children into
+a user directory and they split as the children arrive; delete them all and they merge back. So
+boundaries do move — the value of the prefix form is not that they are fixed.
+
+**What the prefix form gives instead is that a virtual directory's name is derived, not allocated.**
+Its name *is* its prefix. So a split and a merge rename nothing and renumber nothing, and no stale
+name is left behind for anyone to hold. The contrast that makes this concrete is the range merge of
+§5.11: two ranges have to renumber `StreamId`s when they merge, precisely because those ids were
+handed out independently by each side. A virtual directory's contents are named by user keys, so
+there is no id space to reconcile — children collapse into their parent and that is the whole
+operation.
+
+⚠️ **The cycle needs hysteresis.** Split at *N* and merge below *N*/2 or lower; splitting and
+merging at one threshold makes a workload hovering there thrash, and Bob's insert-a-billion-then-
+delete-them-all pattern crosses it twice.
+
+##### 5.1.2.2 A directory is derived, not stored
+
+**The virtual directory tree may be coarser than the user directory tree** (Asserted, Bob,
+2026-08-17). One virtual directory may span many actual directories; the requirement is not
+containment but that **the user directory tree can be derived from it**.
+
+That is what makes the pathological shape affordable. A tree of `a/a/a/a/a`, `a/a/a/a/b`,
+`a/a/a/b/a` … is millions of directories with two children each, and giving each of them a record
+is precisely the scaling problem this section exists to avoid. Deriving them costs nothing, because
+**the tree structure is already in the names**: the `/`s say what the directories are.
+
+So the rule is: **a directory needs a stored record only when it carries something not derivable
+from its children's names.** In practice that is an annotation, or anything the directory holds in
+its own right — permissions, quota, owner, timestamps.
+
+**Listing then becomes a prefix scan that skips whole subtrees**, which is exactly S3's `prefix`
+plus `delimiter=/` — public prior art for both the semantics and the fact that they scale, from a
+store that also has no real directories. ⚠️ **It puts a hard requirement on the on-disk index of
+§4.4.0**: listing the children of `a/a/a/` must not scan every descendant, which for two children
+and a billion descendants is catastrophic. The index needs **seek-to-successor-of-a-prefix** —
+having seen `a/a/a/a/`, jump past everything beneath it to the next distinct child. That constrains
+the node format, so it belongs to that index's design rather than to whoever writes listing.
+
+##### 5.1.2.3 Annotations are hidden children, and the marker is `_`
+
+**A user's annotation of a directory has to be preserved** (Asserted, Bob, 2026-08-17) — a
+directory marked for georep, or aliased (§5.1.1), and others in future. Deleting such a directory
+because it became empty loses information the user put there.
+
+⚠️ **And an annotated directory has to be a virtual-directory boundary, because annotations are
+inherited.** Georep or an alias applies to everything beneath, so a virtual directory straddling
+that path would hold children with two different answers. The prefix form satisfies this by
+construction — every directory path is itself a prefix, so forcing a cut there selects a member of
+the lattice rather than inventing one. A start-end scheme would need a separate list of forced
+boundaries maintained beside the data. Annotating a directory therefore *splits* its virtual
+directory, and un-annotating merely permits a later merge; neither renames anything.
+
+**The annotations are stored as hidden children** (Asserted, Bob, 2026-08-17), which is close to
+forced: once directories are derived rather than stored, there is nowhere else to put them. One
+mechanism — a name and a record — and three things follow for free:
+
+- **emptiness solves itself**, since the directory has a child;
+- **deletion solves itself**, since removing the last annotation correctly ends the directory;
+- **a new kind of annotation costs a name, not a schema change** — quota, retention and ACLs later
+  are more children rather than more fields.
+
+**The marker is `_`** (Asserted, Bob, 2026-08-17). It has to be **printable**, because a user
+asking to see hidden things must be able to read the names back and type them; and `.` is already
+overused. There is no standard here — the Unix leading `.` is a convention in `ls` and the shells
+rather than anything a filesystem enforces, and the Hadoop ecosystem hides `_` and `.` when
+enumerating inputs — so the choice is between conventions, not against one.
+
+⚠️ **Hidden must mean omitted from a default listing, never absent.** This is what makes `_`
+*preserve* Hadoop's semantics rather than collide with them (Asserted, Bob, 2026-08-17): `_SUCCESS`
+and `_temporary` are already invisible as data to the tools that write them, so hiding them here
+gives them the treatment they already expect. But those tools then **test for `_SUCCESS` by exact
+name** to check job completion, so a point lookup, a `stat`, and an explicit show-hidden listing
+must all still find it.
+
+| Design | A user writing `_SUCCESS` |
+|---|---|
+| a **reserved** prefix | ⚠️ refused — Spark cannot write it, outright breakage |
+| **hidden but writable** | legal, hidden by default, found by name — and Hadoop's intent is preserved |
+
+**DeLawson's own annotations therefore need a reserved sub-prefix rather than a list of reserved
+names.** Reserving exactly `_georep`, `_alias` and so on means the reserved set grows with every
+annotation kind added, and each addition breaks whichever user already used that name. Reserving
+one component — `_delawson/…` — is fixed forever and leaves the rest of the `_` space to users.
+
+**Which repairs the objection to Hadoop's version rather than repeating it.** The complaint against
+`_` and `.` in Hadoop is that a *display* convention was given *semantic* force, so a user's
+legitimate `.config` silently disappears from a read. Keeping `_` presentational, with the
+semantics confined to a narrower reserved sub-prefix, means nothing a user writes ever changes
+meaning — only whether it shows up by default.
+
+**So the emptiness test is "no children at all", not "no visible children".** A directory holding
+only `_SUCCESS` must not be reclaimed. ⚠️ What remains open is the truly empty case: whether
+`make-directory` on its own leaves anything behind, or whether a directory exists exactly when
+something is under it. The DN serves `MakeDirectory` and `RemoveDirectory`, so the operations exist
+and the semantics have to be chosen rather than discovered.
+
+**One thing this buys elsewhere.** §5.11's range splits want to fall at tenant or directory
+boundaries, so that a split does not cut through a set of objects that get concatenated together.
+Virtual directory boundaries are a ready-made supply of cuts already aligned with the name
+hierarchy, so a range split that lands on one costs nothing extra.
 
 ### 5.2 SNs — Stream Nodes
 
