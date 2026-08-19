@@ -8243,6 +8243,63 @@ that "the schedule directly determines a customer's bill" — under logical bill
 does not exist. Whatever is chosen, the customer must not be able to attribute a bill increase
 to a provider decision they did not ask for and cannot see.
 
+#### 12.3.3 What logical pricing costs a store that compresses
+
+**Azure Data Lake Storage charges $0.01 per GB per month for cool data** — **Cited**, read off
+[the pricing page](https://azure.microsoft.com/en-us/pricing/details/storage/data-lake/) by Bob
+on 2026-08-19. Prices there are tiered by volume across Hot, Cool, Cold, Archive and Premium,
+with separate transaction charges per 10,000 operations, and the page covers **Gen2**. ⚠️ Its
+figures are rendered by JavaScript and come back as placeholders to an automated fetch, so this
+is a number a person has to re-read rather than one a script can check.
+
+**Turn the crank on it.** At $0.01 per *logical* GB per month, revenue per **physical** GB
+depends entirely on properties of the customer's data that the price list never mentions.
+**Derived:**
+
+| The customer's data | Physical bytes per logical GB | Revenue per physical GB/month |
+|---|---|---|
+| compresses 6×, stored in triplicate | ⅙ × 3 = **0.50** | **$0.020** |
+| incompressible, stored in triplicate | 1 × 3 = **3.00** | **$0.0033** |
+| compresses 6×, 12+4 erasure coded | ⅙ × 1.33 = **0.22** | **$0.045** |
+| incompressible, 12+4 erasure coded | **1.33** | **$0.0075** |
+
+⚠️ **Compression alone spreads revenue per physical byte 6×, and the whole table spreads it
+13.5× — against §12.1's slack budget of 2×.** The direction is that the customer whose data
+compresses pays six times as much per unit of resource actually consumed. Erasure coding makes
+it worse rather than better, because it shrinks the physical footprint the logical price is
+spread over.
+
+**So the customer's rational move is to compress before storing** (Asserted, Bob, 2026-08-19):
+*"Customers hopefully learn through the network that they need to build their own compression
+layer for anything stored there."* Doing so moves them from the first row of that table to the
+second, at a sixth of the price per byte they actually occupy.
+
+**Which is §12.1's ADLS Gen1 metadata lesson a second time.** There, not billing metadata taught
+users to pile into tiny streams; here, billing logical bytes on a store that compresses teaches
+them to compress client-side. Both times the users behave reasonably and the price list is the
+thing at fault.
+
+##### 12.3.3.1 DeLawson is already at the endpoint, which answers §12.9's fifth question
+
+**§8.1.4.1 has the client compressing.** So DeLawson arrived, by another route, exactly where
+logical pricing drives a customer — and two things follow.
+
+**First, there is no internal compression win to keep.** A logical price list flatters a provider
+who compresses privately and pockets the difference; DeLawson gave that up when it moved
+compression to the client. Pricing as though the win existed would be pricing something the
+design does not have.
+
+**Second, and more useful: the main objection to billing compressed bytes dissolves.** §12.9's
+fifth question worries that the billed figure is "compressed size, which the customer cannot
+directly control". ⚠️ **But when the client compresses, the customer computed that number** — it
+travels in the append, and §17.16 measured the client checking it against the CRC. A customer who
+chose the codec and measured the result can predict the bill exactly, which is the property
+logical pricing was there to protect.
+
+What stays outside their control is only what the store does *afterwards* — §8.1.4.4's
+coalescing, §10's recompression and re-encoding. That is a far smaller surface than "the
+compressed size", and it is what §12.9 should actually be asking about.
+
 #### 12.6.1 It adapts to the workload, which makes it diagnostic
 
 The point is that the same rule produces a one-line bill for ordinary use and an itemized
