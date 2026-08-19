@@ -2747,16 +2747,19 @@ Each count therefore sits in the same tier as the references it counts, which is
 maintainable: a reference and the count of it change under one ring's Raft, so they cannot
 disagree across a message that was lost.
 
-That also means **the SN is never told how many objects use a stream.** It is told to delete
-the stream, once, when the DN's count reaches zero. Which is the right division — the DN owns
-who refers to what, and the SN owns what the stream is.
+⚠️ **§5.11.3.4 refines this into two levels, and improves it.** Once a range is a ring, the
+`StreamId` record lives in the **range** and counts that range's objects, while the **SN** counts
+how many *ranges* reference the stream. So the SN is told a count after all — of ranges, not of
+objects — and it is the single place that observes zero, which is the tier that has to delete the
+stream anyway.
 
-**A stream referenced from two DN rings would have no single place for its count** — objects
-lumped into a common stream (§11) are naturally co-located, but a clone into another part of
-the directory tree may not be, and then no one ring holds the total. Rather than make the
-count distributed, **a cross-ring clone copies** (Asserted, Bob, 2026-08-17), so the situation
-never arises. §5.1.1.2 explains why that is affordable: aliases cover the case that made
-cross-ring sharing attractive.
+**A stream referenced from two DN rings would otherwise have no single place for its count** —
+objects lumped into a common stream (§11) are naturally co-located, but a clone into another part
+of the directory tree may not be. Two answers, at different levels. **A cross-ring clone copies**
+(Asserted, Bob, 2026-08-17), so the case does not arise for clones, and §5.1.1.2 explains why that
+is affordable: aliases cover what made cross-ring sharing attractive. **And where sharing is
+wanted anyway — concatenate — the two-level count handles it**, with the SN aggregating range
+references so that nothing has to track objects across rings.
 
 ##### 4.6.6.2 Counts get scrubbed
 
@@ -9228,7 +9231,7 @@ tier boundary there is a message that can be lost.
 
 | Reference | Crosses a tier? | Can drift? | Sync loop |
 |---|---|---|---|
-| object → stream | DN → SN | **yes** | DN → SN |
+| **range** → stream (§5.11.3.4) | DN → SN | **yes** | DN → SN |
 | stream → extent | inside one SN ring | no — atomic under Raft | none needed |
 | extent → instance | SN → EN | **yes** | SN → EN |
 
