@@ -525,6 +525,17 @@ loses quorum, and checks the evicted machine is refused
 expelled. What makes the safe version possible is that quorums of successive configurations intersect,
 so a quorum of any known configuration contains someone who knows about the eviction.
 
+**`THE-UNLOCK-PATH-DOES-NOT-NEED-KS`** — nothing required to deliver the unlock key may depend on what
+KS's locked half holds. Wire keys in particular come from configuration or from KS's signed half, never
+from the master-key hierarchy.
+*Argued* §7.3.2.8, §5.5.1.1 · *Enforced* **code, by accident of where the key lives**: `Messaging::key()`
+reads it from configuration · *Checked* not yet, and it wants one — the violating change looks like a
+cleanup
+*Breaks* a locked KS cannot accept the connection that unlocks it, which is §5.5.1.1's circle
+reintroduced. ⚠️ **The danger is that the violation is attractive**: deriving wire keys from KS's own
+hierarchy is tidier and retires a shared secret from a config file, and it would make an orbital cluster
+unrecoverable (#91).
+
 **`UNLOCKING-KEY-IS-GENERATED`** — the unlocking key is generated, never chosen, and the operator
 secrets of §7.3.2 are shares of it rather than passwords.
 *Argued* §7.3.2.3 · *Enforced* design only · *Checked* not yet — and it is the kind of rule that is
@@ -773,7 +784,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **hint** | §8.1.1a-10 | `HINT-BOUND-BY-CAPABILITY`, `CAPABILITY-IS-MEMBERSHIP-ONLY`, `EXTENT-IDENTITY-UNIQUE`, `RETAIN-REWRITE-INPUTS-FOR-THE-HINT-WINDOW` |
 | **instance** | §4.3 | `INSTANCES-BYTE-IDENTICAL`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `QUORUM-OVERLAPS`, `ONE-MEDIA-CLASS-PER-EXTENT`, `EC-GROUP-EQUAL-LENGTH` |
 | **key** (record key) | §3 | `RECORD-NUMBER-STABLE` (by contrast — keyed objects have no positional address), `UPDATE-DELETE-PRESERVE-COUNTS` |
-| **key** (cryptographic) | §7.3 | `KEY-AND-SALT-COVER-ONE-PLAINTEXT`, `KEYS-NEVER-WHERE-USER-CODE-RUNS`, `DISK-KEYS-ONLY-ON-ENS`, `EXTENT-KEY-FROM-CREATING-SN`, `NO-TWO-SEGMENTS-SHARE-A-NONCE`, `MASTER-KEYS-ARE-NEVER-PRUNED`, `UNLOCKING-KEY-IS-GENERATED`, `SHARDS-ARE-NOT-STORED-WITH-THE-HARDWARE` |
+| **key** (cryptographic) | §7.3 | `KEY-AND-SALT-COVER-ONE-PLAINTEXT`, `KEYS-NEVER-WHERE-USER-CODE-RUNS`, `DISK-KEYS-ONLY-ON-ENS`, `EXTENT-KEY-FROM-CREATING-SN`, `NO-TWO-SEGMENTS-SHARE-A-NONCE`, `MASTER-KEYS-ARE-NEVER-PRUNED`, `UNLOCKING-KEY-IS-GENERATED`, `SHARDS-ARE-NOT-STORED-WITH-THE-HARDWARE`, `THE-UNLOCK-PATH-DOES-NOT-NEED-KS` |
 | **tombstone** | §8.3 | `A-TOMBSTONE-KEEPS-ITS-WIDTH`, `UPDATE-DELETE-PRESERVE-COUNTS` |
 | **stream flag** | §4.1.1 | `A-CAPABILITY-RESTORES-CHEAPLY-AND-WITHDRAWS-SLOWLY`, `THE-OFFICIAL-FLAG-STAYS-PERMISSIVE-UNTIL-CLEANUP-ENDS`, `A-NAME-IS-NOT-A-NEGATION`, `RARE-AND-TRANSIENT-FIELDS-GO-OUT-OF-LINE` |
 | **count** | §8.1.6.2 | `ONE-PAST-THE-END-IS-REPRESENTABLE`, `EVERY-SPACE-RESERVES-A-SENTINEL`, `UNKEYED-COUNT-EXACT`, `UPDATE-DELETE-PRESERVE-COUNTS` |

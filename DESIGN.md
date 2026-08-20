@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-142 things *not* decided.
+143 things *not* decided.
 
 **Priorities and framing**
 
@@ -257,6 +257,11 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | KS's state splits: keys **encrypted** behind the ceremony, topology **signed** and readable at once | §5.5.6.3 |
 | Because the threat to topology is **integrity, not disclosure** — a forged domain map is a placement attack | §5.5.6.3 |
 | **KS is on the change path, not the data path**, so a running cluster serves through a KS outage | §5.5.6.3 |
+| ⚠️ **"Secure guarded" does not transfer to orbit**: physical attack gets much harder, and a local ceremony becomes impossible | §7.3.2.8 |
+| So the ceremony moves to Earth and the key is **told** to a quorum member — the verifier is what makes that safe | §7.3.2.8 |
+| Because **possession of the key is the authorization**, so the satellite needs no PKI and no trust root | §7.3.2.8 |
+| ⚠️ Therefore **wire keys must never come from KS's locked half**, or a locked KS cannot accept the connection that unlocks it | §7.3.2.8, #91 |
+| Latency is irrelevant on that path — §1.0.5's *cluster diameter is free, ring diameter is not*, one level out | §7.3.2.8 |
 | Rings have 2n+1 voters but only **3 materialized members** — 3× RAM, not 7× | §5.7 |
 | **Many rings per machine**; rings are a concurrency unit, not a capacity unit | §5.8 |
 | **32-bit node ids**, bounded fan-out ~20,000, local indices in the data plane | §5.10 |
@@ -6206,6 +6211,83 @@ Three things narrow it without closing it, and none is cryptographic:
 - **An absence threshold.** A member gone longer than some period, or whose attestation changed, goes
   to the ceremony rather than being re-keyed automatically. That prices the attack in availability
   instead of closing it, and it is a policy knob rather than a mechanism.
+
+##### 7.3.2.8 Unlocking from a different planet, which the verifier makes possible
+
+**KS assumes secure guarded machines, and a likely deployment is satellites** (Asserted, Bob,
+2026-08-19) — §1.0.5's torus swarm and §1.0.5.1's StarMind are both orbital. ⚠️ **What "secure
+guarded" means there is not known**, and the honest answer is that the term does not transfer: some of
+what it usually buys gets much stronger and some of it disappears.
+
+| | On the ground | In orbit |
+|---|---|---|
+| Physical access by an adversary | the thing guards exist to stop | **far harder, and highly detectable** — a rendezvous is observable, which §7.3.2.7's attack needs to be not |
+| Physical access by an **owner** | routine | **impossible**, so no ceremony can be performed locally |
+| A compromised machine | can be inspected, or destroyed | neither, and it cannot be recovered |
+| Bit flips | rare enough to ignore here | radiation, which matters below |
+
+**So the threat model inverts rather than worsening**: the attack §7.3.2.7 could not close becomes very
+hard, and the ceremony that closes everything else becomes impossible to perform where the machines are.
+
+##### The consequence, and it is a good one
+
+**The verifier of §7.3.2.3 lets the ceremony happen somewhere else entirely** (Asserted, Bob,
+2026-08-19): keep a known secure guarded machine on Earth, assemble the unlock key there, open a
+connection to a known quorum member in orbit, and **tell it the key.**
+
+⚠️ **What makes that safe is that the secret is self-authenticating.** The satellite does not have to
+decide whether to trust the caller, and therefore needs no PKI, no certificate chain and no notion of
+which Earth machines are legitimate:
+
+> **Possession of the unlock key *is* the authorization.** The verifier turns "do I trust this
+> connection" into "is this the right key", which is a strictly easier question and one the member can
+> answer alone.
+
+That is the whole reason §7.3.2.3 is worth more than fail-fast convenience. Without a verifier, remote
+unlock would need the satellite to authenticate the unlocker — which needs a trust root, which is the
+problem being solved.
+
+##### Two requirements it imposes, one already met and one not
+
+⚠️ **The unlock path must work while KS is locked, so it may not depend on anything KS's locked half
+holds.** That is §5.5.1.1's acyclicity argument moved one level outward, and it is **currently
+satisfied**: the wire key comes from configuration (`messaging.key`), not from the master-key hierarchy,
+so a locked KS can accept an encrypted connection.
+
+**That property is worth protecting explicitly, because the natural-looking improvement destroys it.**
+Deriving wire keys from KS's own hierarchy would be tidier, would remove a shared secret from a config
+file — and would make a locked KS unable to accept the connection that unlocks it. **It is exactly the
+circle §5.5.1.1 exists to break, and it would be reintroduced as a cleanup.**
+
+⚠️ **Forward secrecy is not met, and this cannot be used in anger until it is.** Today
+`messaging.key` is one symmetric key in a configuration file, so **a recorded session plus that file
+yields the unlock key** — and an interplanetary link is the easiest thing in this design to record. The
+unlock connection needs a per-connection ephemeral exchange, which the wire layer does not have (#91).
+
+##### Where the crown jewel goes, and why the distance does not matter
+
+**The guarded machine moves from the data to the ceremony**, which is a concentration of risk and a
+reduction in count: one guarded place instead of every KS site. **§7.3.2.5's k-of-n keeps it
+transient** — the Earth machine need not *hold* the key, only assemble it while k custodians present
+shards, so the crown jewel exists for the duration of an unlock and not as a standing target.
+
+**And the latency is irrelevant on this path**, which is what makes the scheme work at any distance.
+§1.0.5 already has the rule: *cluster diameter is free; ring diameter is not.* The ladder of §7.3.2.1
+splits along exactly that line:
+
+| Rung | Where it happens | Speed needed |
+|---|---|---|
+| a member returns; quorum lost but the key is live | **in orbit, within the ring** | fast — it is the ring re-keying itself |
+| every member restarted; the organization gone | **from Earth** | none — a light-minute either way is nothing against a human ceremony |
+
+So an 8-minute round trip at 1 AU costs nothing where it lands, and the fast rungs never leave the
+constellation.
+
+⚠️ **One orbital hazard is specific to the verifier**: radiation bit flips. A corrupted verifier
+**rejects a correct key**, turning a recoverable outage into an apparently unrecoverable one — and it
+is stored in the ring's snapshot and log, which is where a rare corruption would sit unnoticed for
+years. It wants redundancy of its own, and checking it against a copy is not the same as checking a key
+against it (§16.143).
 
 #### 7.3.3 What the extent entry must record
 
@@ -13178,6 +13260,15 @@ Roughly in order of how much else depends on them.
      behaviour, what else was on the box, page-cache and allocator state, or the object population's
      layout in memory (#88, and #87 for the run that failed partway). Worth pinning down because it
      sets the resolution of every measurement here.
+
+143. **What protects the unlock verifier from a bit flip** (§7.3.2.8, §7.3.2.3). A corrupted verifier
+     **rejects a correct key**, turning a recoverable outage into an apparently unrecoverable one — the worst
+     direction for a check to fail in. It lives in the KS ring's snapshot and log, which is where a rare
+     corruption sits unnoticed for years, and an orbital deployment makes bit flips a design input rather
+     than a curiosity. ⚠️ Checking it against a copy is not the same operation as checking a key against
+     it, so replication of the verifier needs its own answer: several copies and a vote, an error-correcting
+     encoding, or accepting a key that matches *any* stored copy — which trades a false rejection for a
+     weaker check.
 
 **Closed** since earlier drafts:
 
