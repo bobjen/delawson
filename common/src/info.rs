@@ -249,6 +249,136 @@ impl StreamRow {
     }
 }
 
+/// One extent of a stream, and everything a caller needs to build a hint from it
+/// (§8.1.1a-10, #61).
+///
+/// ⚠️ **There is no `sealed` flag, deliberately.** Whether an extent is sealed is
+/// exactly whether its record count is known — an open extent reaches further with
+/// every append, so the SN cannot say — and carrying the same fact twice invites the
+/// two copies to disagree. §18.1's rule: do not make a dimension out of something
+/// another dimension already determines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtentRow {
+    /// The SN that created it, which with the id and the second is its whole name
+    /// (§4.6.3) — and the second is what makes a stale hint fail loudly.
+    pub sn: u32,
+    pub id: u64,
+    pub created: u64,
+    /// Its first record. **Stream-local from the SN, object-local once the FE has
+    /// converted it** (§17.16.2 is what happens when that is skipped).
+    pub first_record: u64,
+    /// Records in it, or `UNKNOWN` while it is the one being appended to — which is
+    /// also what says it is not sealed.
+    pub records: u64,
+    /// Compressed bytes, or `UNKNOWN` while it is open.
+    pub length: u64,
+    /// The ENs holding it, **primary first**, which is what makes a hint a route
+    /// rather than a description. Length-prefixed on the wire because erasure coding
+    /// will give a sealed extent a different number of them than an open one has
+    /// (§4.3.2).
+    pub instances: Vec<u32>,
+}
+
+impl ExtentRow {
+    pub fn sealed(&self) -> bool {
+        self.records != UNKNOWN
+    }
+
+    pub fn args(&self) -> Vec<Arg> {
+        let mut args = vec![
+            Arg::Number(self.sn as u64),
+            Arg::Number(self.id),
+            Arg::Number(self.created),
+            Arg::Number(self.first_record),
+            Arg::Number(self.records),
+            Arg::Number(self.length),
+            Arg::Number(self.instances.len() as u64),
+        ];
+        args.extend(self.instances.iter().map(|en| Arg::Number(*en as u64)));
+        args
+    }
+
+    pub fn of_args(args: &[Arg]) -> Result<(ExtentRow, &[Arg])> {
+        let [
+            Arg::Number(sn),
+            Arg::Number(id),
+            Arg::Number(created),
+            Arg::Number(first_record),
+            Arg::Number(records),
+            Arg::Number(length),
+            Arg::Number(count),
+            rest @ ..,
+        ] = args
+        else {
+            return Err(Error::new("that answer's extents are not extents"));
+        };
+        let count = *count as usize;
+        if rest.len() < count {
+            return Err(Error::new(format!(
+                "an extent says it has {count} instances and carries {}",
+                rest.len()
+            )));
+        }
+        let (given, rest) = rest.split_at(count);
+        let mut instances = Vec::with_capacity(count);
+        for one in given {
+            match one {
+                Arg::Number(en) => instances.push(*en as u32),
+                _ => return Err(Error::new("an instance list is numbers")),
+            }
+        }
+        Ok((
+            ExtentRow {
+                sn: *sn as u32,
+                id: *id,
+                created: *created,
+                first_record: *first_record,
+                records: *records,
+                length: *length,
+                instances,
+            },
+            rest,
+        ))
+    }
+
+    pub fn some_of_args(args: &[Arg], given: u64) -> Result<(Vec<ExtentRow>, &[Arg])> {
+        let mut rows = Vec::with_capacity(given as usize);
+        let mut rest = args;
+        for _ in 0..given {
+            let (row, after) = ExtentRow::of_args(rest)?;
+            rows.push(row);
+            rest = after;
+        }
+        Ok((rows, rest))
+    }
+}
+
+/// What an SN says about a run of one stream's extents: complete in counts, partial
+/// in detail (§9.1.3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtentRun {
+    /// Extents the stream has, whether or not they are all here.
+    pub extents: u64,
+    /// Rows that follow.
+    pub given: u64,
+    /// The **stream-local** record to ask from next, or `UNKNOWN` when nothing
+    /// follows.
+    pub next: u64,
+}
+
+impl ExtentRun {
+    pub fn args(&self) -> Vec<Arg> {
+        vec![Arg::Number(self.extents), Arg::Number(self.given), Arg::Number(self.next)]
+    }
+
+    pub fn of_args(args: &[Arg]) -> Result<(ExtentRun, &[Arg])> {
+        let [Arg::Number(extents), Arg::Number(given), Arg::Number(next), rest @ ..] = args else {
+            return Err(Error::new("that answer did not say what run of extents it was"));
+        };
+        Ok((ExtentRun { extents: *extents, given: *given, next: *next }, rest))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +497,71 @@ mod tests {
         args.extend(stream(1, 0, 10).args());
         let (back, rest) = Shape::of_args(&args).expect("a shape");
         assert!(StreamRow::some_of_args(rest, back.given).is_err(), "three promised, one given");
+    }
+
+    fn extent(id: u64, first_record: u64, records: u64) -> ExtentRow {
+        ExtentRow {
+            sn: 2,
+            id,
+            created: 1_000_000,
+            first_record,
+            records,
+            length: if records == UNKNOWN { UNKNOWN } else { records * 10 },
+            instances: vec![3, 1, 0, 2],
+        }
+    }
+
+    /// A run of extents, with the instance list length-prefixed so a sealed extent
+    /// may later carry a different number than an open one.
+    #[test]
+    fn a_run_of_extents_survives_the_wire() {
+        let run = ExtentRun { extents: 5, given: 2, next: 90 };
+        let rows = vec![extent(1, 0, 40), extent(2, 40, 50)];
+        let mut args = run.args();
+        for row in &rows {
+            args.extend(row.args());
+        }
+        let (back, rest) = ExtentRun::of_args(&args).expect("a run");
+        assert_eq!(back, run);
+        let (given, rest) = ExtentRow::some_of_args(rest, back.given).expect("extents");
+        assert_eq!(given, rows);
+        assert!(rest.is_empty());
+        assert_eq!(given[0].instances, vec![3, 1, 0, 2], "primary first, in order");
+    }
+
+    /// Instance lists of different lengths in one answer, which is what erasure
+    /// coding will produce once a sealed extent has fragments instead of copies.
+    #[test]
+    fn extents_may_carry_different_numbers_of_instances() {
+        let mut wide = extent(1, 0, 40);
+        wide.instances = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
+        let narrow = ExtentRow { instances: vec![9], ..extent(2, 40, 50) };
+        let mut args = Vec::new();
+        args.extend(wide.args());
+        args.extend(narrow.args());
+        let (rows, rest) = ExtentRow::some_of_args(&args, 2).expect("extents");
+        assert_eq!(rows[0].instances.len(), 9);
+        assert_eq!(rows[1].instances.len(), 1);
+        assert!(rest.is_empty());
+    }
+
+    /// ⚠️ Sealed is not a field: it is whether the record count is known. Carrying it
+    /// twice would let the two copies disagree.
+    #[test]
+    fn sealed_is_whether_the_count_is_known() {
+        assert!(extent(1, 0, 40).sealed());
+        assert!(!extent(2, 40, UNKNOWN).sealed(), "the one being appended to");
+        assert!(extent(3, 90, 0).sealed(), "and a sealed extent holding nothing is sealed");
+    }
+
+    /// A row claiming more instances than it carries is refused rather than read
+    /// short, which is the length-prefix equivalent of a ragged answer.
+    #[test]
+    fn an_extent_lying_about_its_instances_is_refused() {
+        let mut args = extent(1, 0, 40).args();
+        args[6] = Arg::Number(99);
+        assert!(ExtentRow::of_args(&args).is_err());
+        assert!(ExtentRow::of_args(&args[..6]).is_err(), "and a short row too");
     }
 
     /// And the counts survive being complete while the detail is partial, which is

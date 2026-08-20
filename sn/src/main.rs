@@ -14,6 +14,7 @@
 //! to cope with reuse — an index that has to survive churn is a later problem.
 
 use common::config::{SNConfig, ServiceKind};
+use common::info::{ExtentRow, ExtentRun, UNKNOWN};
 use common::server::{self, Process, Reply, Service};
 use common::wire::{Arg, Op, Request, Response, Status};
 use common::{Error, Result};
@@ -22,7 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SERVES: &[Op] = &[Op::CreateStream, Op::OpenExtent, Op::LocateRecord, Op::SealExtent];
+const SERVES: &[Op] =
+    &[Op::CreateStream, Op::OpenExtent, Op::LocateRecord, Op::SealExtent, Op::ListExtents];
 
 /// Locks over the stream table. Enough that sixteen cores rarely collide,
 /// few enough to walk when something wants a total.
@@ -33,6 +35,18 @@ struct Stream {
     /// creation timestamp of its own at all is an open question.
     #[allow(dead_code)]
     created: u64,
+    /// The SN that created this stream's extents, which is part of their name
+    /// (§4.6.3) and what §7.3.3 requires key derivation to use — **the creating SN,
+    /// never the serving one**, because a reassigned stream keeps its old extents'
+    /// keys.
+    ///
+    /// ⚠️ **Held per stream rather than per extent, on §4.1.2's rule.** The two differ
+    /// only after a reassignment, which does not exist yet, so per-extent storage
+    /// would spend 4 bytes on every one of §14.1's 1.7 × 10^9 extent records — **6.8 GB
+    /// of an SN's memory** — for a fact that is almost always the stream's own. When
+    /// reassignment arrives, the exceptions want an override out of line, not a field
+    /// inline on the rule.
+    creator: u32,
     /// This stream's sealed extents, oldest first, each with the record count it
     /// came to. In record order, because a stream only ever appends — which is what
     /// makes finding the extent holding a record a search rather than a scan.
@@ -167,6 +181,13 @@ impl Naming {
 
 struct SN {
     config: SNConfig,
+    /// This SN's own number, which every extent it creates records as its creator.
+    ///
+    /// ⚠️ **Held here rather than threaded through**, because §8.1.6.1 flags `close`'s
+    /// parameter list as the worst run of same-typed arguments in the code and passing
+    /// this down would have made it one longer. An SN's identity is a property of the
+    /// SN, not an argument to its methods.
+    mine: u32,
     shards: Vec<Mutex<HashMap<(u32, u64), Stream>>>,
     naming: Naming,
     streams: AtomicU64,
@@ -209,6 +230,7 @@ impl Service for SN {
             Op::CreateStream => self.create(request),
             Op::OpenExtent => self.open_extent(process, request),
             Op::LocateRecord => self.locate(request),
+            Op::ListExtents => self.list(request),
             Op::SealExtent => self.seal(process, request),
             _ => server::unbuilt(process, SERVES, request),
         }
@@ -226,9 +248,10 @@ impl Service for SN {
 }
 
 impl SN {
-    fn new(config: SNConfig) -> SN {
+    fn new(config: SNConfig, mine: u32) -> SN {
         SN {
             config,
+            mine,
             shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
             naming: Naming::new(),
             streams: AtomicU64::new(0),
@@ -260,6 +283,7 @@ impl SN {
                 (dn, id),
                 Stream {
                     created,
+                    creator: self.mine,
                     sealed: Vec::new(),
                     open: None,
                     sealed_records: 0,
@@ -335,6 +359,95 @@ impl SN {
                 format!("stream {stream} has no extent holding record {record}"),
             ),
         }
+    }
+
+    /// `(DnId, StreamId, from record, limit)`: a run of this stream's extents, in
+    /// record order, starting at the one holding `from`.
+    ///
+    /// **Complete in counts and partial in detail** (§9.1.3.2): the extent total is
+    /// this SN's own, so it costs nothing and is always right, while the rows stop at
+    /// the limit and `next` says where to carry on.
+    ///
+    /// ⚠️ **Record numbers here are stream-local**, which is what the SN knows. The FE
+    /// converts them to the caller's numbering, because it is the only party that knows
+    /// all three spaces (§17.16.2).
+    fn list(&self, request: &Request) -> Response {
+        let (dn, stream, from, limit) = match request.args.as_slice() {
+            [Arg::Number(dn), Arg::Number(stream), Arg::Number(from), Arg::Number(limit)] => {
+                (*dn as u32, *stream, *from, *limit)
+            }
+            _ => {
+                return Response::error(
+                    Status::BadRequest,
+                    "list-extents takes a DnId, a StreamId, a record and a limit",
+                );
+            }
+        };
+        let shard = self.shards[shard_of(dn, stream)].lock().expect("streams");
+        let Some(held) = shard.get(&(dn, stream)) else {
+            return Response::error(Status::NotFound, format!("no stream {stream} from dn {dn}"));
+        };
+
+        // The sealed extents are in record order, so the first to describe is the last
+        // one starting at or before `from` — the same rule locate uses to pick one.
+        let first = held
+            .sealed
+            .iter()
+            .rposition(|sealed| sealed.extent.first_record <= from)
+            .map_or(0, |at| if from == 0 { 0 } else { at });
+        let total = held.sealed.len() as u64 + u64::from(held.open.is_some());
+
+        let mut rows: Vec<ExtentRow> = held
+            .sealed
+            .iter()
+            .skip(first)
+            .take(limit as usize)
+            .map(|sealed| ExtentRow {
+                sn: held.creator,
+                id: sealed.extent.id,
+                created: sealed.extent.created,
+                first_record: sealed.extent.first_record,
+                records: sealed.records,
+                length: sealed.length,
+                instances: sealed.extent.instances.clone(),
+            })
+            .collect();
+
+        // Then the one still open, if there is room and it starts at or after `from`.
+        // ⚠️ Its records and length are UNKNOWN rather than zero: how far it reaches is
+        // not knowable here, and a sealed extent holding nothing would be a real zero
+        // (§8.1.6.3).
+        let sealed_seen = first + rows.len();
+        if rows.len() < limit as usize
+            && sealed_seen == held.sealed.len()
+            && let Some(open) = &held.open
+        {
+            rows.push(ExtentRow {
+                sn: held.creator,
+                id: open.id,
+                created: open.created,
+                first_record: open.first_record,
+                records: UNKNOWN,
+                length: UNKNOWN,
+                instances: open.instances.clone(),
+            });
+        }
+
+        // Where to carry on: the first record of the next extent not described.
+        let after = first + rows.len();
+        let next = match held.sealed.get(after) {
+            Some(sealed) => sealed.extent.first_record,
+            None if after < total as usize => {
+                held.open.as_ref().map_or(UNKNOWN, |open| open.first_record)
+            }
+            None => UNKNOWN,
+        };
+
+        let mut args = ExtentRun { extents: total, given: rows.len() as u64, next }.args();
+        for row in rows {
+            args.extend(row.args());
+        }
+        Response { id: 0, status: Status::Ok, args }
     }
 
     /// `(DnId, StreamId, sealed extent, records, length)`: record what an extent
@@ -472,8 +585,9 @@ impl SN {
 }
 
 fn main() {
-    let result =
-        server::main(|process| Ok(SN::new(SNConfig::load(&process.config.service_config)?)));
+    let result = server::main(|process| {
+        Ok(SN::new(SNConfig::load(&process.config.service_config)?, process.entry.number()))
+    });
     if let Err(e) = result {
         eprintln!("sn: {e}");
         std::process::exit(1);
@@ -519,7 +633,7 @@ mod tests {
 
     /// A stream, so there is something to open an extent on.
     fn sn_with_stream(dn: u32, stream: u64) -> SN {
-        let sn = SN::new(testing::sn_config());
+        let sn = SN::new(testing::sn_config(), 0);
         let made = sn.create(
             &Request::new(Op::CreateStream)
                 .number(dn as u64)
@@ -545,7 +659,7 @@ mod tests {
 
     #[test]
     fn an_extent_on_a_stream_that_does_not_exist_is_refused() {
-        let sn = SN::new(testing::sn_config());
+        let sn = SN::new(testing::sn_config(), 0);
         assert!(sn.open(0, 7, 1_000_000, &[0, 1, 2, 3], 4).is_err());
     }
 

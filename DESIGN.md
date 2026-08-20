@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-143 things *not* decided.
+145 things *not* decided.
 
 **Priorities and framing**
 
@@ -362,7 +362,18 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | A bare offset **snaps forward** to the next record boundary, so independently computed chunk boundaries are a **partition** — the Hadoop split rule | §9.1.3.4 |
 | **Record + logical offset** is the only way to address the **interior of a record**, which a store for very large objects needs | §9.1.3.4 |
 | A hint carries an unforgeable **capability** attesting `extent ∈ object` — asserting the pairing, or indexing extents by id, both fail | §9.1.3.5, §4.6.6 |
-| The capability attests **membership only, never authorization**, so ACLs stay current and a quoted hint grants nothing | §9.1.3.5 |
+| The certificate **carries the authorization** — `(tenant, extent, write?)` — so no ACL is read at use time and both hops go | §9.1.3.5 |
+| The **directory is used to mint it, not to check it**; that answers #81, since the ACL is not fetched at all | §9.1.3.5, §5.9.1a |
+| ⚠️ Cost: a stale certificate authorizes for up to the hint window, and a quoted hint is no longer harmless | §9.1.3.5 |
+| Which is tolerable on the assumption of **no security boundary inside a tenant** — an assumption, and load-bearing | §9.1.3.5, §16.145 |
+| Because tenant-binding is what lets a scheduler **mint once and hand hints to many vertices** | §9.1.3.5, §8.1.1a-10 |
+| Bounded because revocation stops **minting** at once, so nothing new can be obtained | §9.1.3.5 |
+| **Stale certificates are accepted**, so removing a permission has a delay of the certificate lifetime | §9.1.3.5.2 |
+| Which makes that lifetime a **security** parameter as well as a performance one, and §16.86 gains a second input | §9.1.3.5.2, §16.86 |
+| ⚠️ A **broadcast** revocation is the third point on the curve, at the cost of an FE that must fail closed | §9.1.3.5.2, §9.6.2 |
+| **Write is a plaintext flag that selects the signing key** — forging it changes which key is checked, so it fails | §9.1.3.5.3 |
+| Which gives **two lifetimes**: long for reads where the DN load is, short for writes where the danger is | §9.1.3.5.3 |
+| And scopes the **authority to grant** a write, since a holder of only the read key cannot mint one | §9.1.3.5.3, §7.3.1 |
 | The hint stays **plaintext with the capability appended**, so an operator can act on a hint a user quoted | §9.1.3.5 |
 | A budget is in **records, logical bytes or compressed bytes** — one named, all three reported; **one block always returns**, even past it | §9.1.3.6 |
 | `object-info` is **extended, not replaced**, and bounded by **one entry limit** over objects + streams + extents (default **10,000**) | §9.1.3.7 |
@@ -4512,9 +4523,11 @@ does not arise: a reader can always be told the two things that governed the ans
 - ⚠️ **Where the ACL is fetched from is still §16.129 / #81**, and unaffected by any of the above. That
   question is about *hops*, not about *granularity*.
 - ⚠️ **Whether a capability may ever attest authorization** rather than only membership. §9.1.3.5 was
-  careful to make it membership-only precisely so that ACL changes take effect immediately; a
-  share-with-an-outsider capability would give that up deliberately, for a bounded window, and it should
-  be a separate mechanism with its own name rather than a flag on the existing one (§16.135).
+  since revised: the certificate **does** carry authorization (`(tenant, extent, write?)`), so a
+  bounded revocation lag is already accepted there. ⚠️ **That makes the question narrower rather than
+  moot** — what a share adds is a bearer who is *not* the named tenant, which is the property §9.1.3.5
+  keeps by binding the tenant. So it is still a separate mechanism, and §16.135 is about whether the
+  bearer may be someone with no standing at all.
 - **Whether a tenant needs any representation at all** beyond being a path with a quota and a bill
   attached. Nothing above requires one, which is a hint that "tenant" is a billing concept rather than a
   security concept — but §12's quota accounting may want it, and that has not been checked.
@@ -8988,16 +9001,118 @@ Whoever first resolved object → stream → extent did the full walk anyway; it
 attesting that this extent is in this object, and a later FE **verifies the capability instead of
 repeating the walk.**
 
-**The capability attests membership only — never authorization** (Decided, Bob and reasoning here,
-2026-08-19). This is the decision that makes the rest safe, and it buys three things at once:
+⚠️ **The certificate carries the authorization, and an earlier draft of this section had it backwards**
+(Asserted, Bob, 2026-08-19). It said the capability attests *membership only, never authorization*, so
+that the FE would still evaluate the object's ACL and nothing could go stale. **What that costs is the
+hop the hint exists to remove**, and Bob's version does not pay it:
 
-- **No revocation lag.** The FE still evaluates the object's ACL on every request, as it always did,
-  so access decisions are always current. The usual objection to capabilities does not arise.
-- **Nothing to go stale silently.** A *structural* fact holds until the extent is rewritten, at which
-  point its creation second changes (§4.6.3) and the read fails loudly. So the expiry can simply be
-  the hint window (§10.1) that already exists, rather than a new security parameter.
-- **A hint is safe to quote.** Pasting one into a bug report grants nobody anything, because the
-  reader must still pass the object's ACL.
+> **The signature covers `(tenant, extent, write?)`, and it means: this tenant may read — or write —
+> this extent.** The FE checks that the certificate matches the current tenant and the current extent,
+> and that is the whole check.
+
+**So the directory is used when *constructing* the signature, not when evaluating it.** The FE evaluates
+the directory's policy (§5.9.1a) once, at mint time, to decide whether to issue; at use time nothing is
+resolved and no policy is read. That is what makes it two hops saved rather than one — and it answers
+§16.129 / #81, which asked where the ACL is fetched from precisely because that decides whether a hint
+saves the DN round trip or only the SN one. **It is not fetched at all.**
+
+⚠️ **It cannot be transplanted, which is why binding the extent is enough.** A draft of this paragraph
+worried that a certificate for one extent could be presented alongside a request naming a different
+object, and concluded the *directory* had to be in the signature too. That was a misreading: the extent
+is in the signature, so the certificate authorizes exactly that extent, and there is no second path for
+the FE to consult and be misled by.
+
+##### What it costs, stated plainly
+
+**A stale certificate authorizes reads — and writes, if it carries that right — for a while after a
+policy change** (Asserted, Bob, 2026-08-19). That is the ordinary capability trade, and the draft's
+whole argument was an attempt to avoid it that cost more than it saved.
+
+| | Bounded by |
+|---|---|
+| how long a revoked tenant keeps access | the certificate's **expiry**, which is the hint window (§10.1) |
+| how much it keeps access to | **only extents it already holds certificates for** |
+
+**The second row is what makes the lag tolerable.** Revocation stops the *minting* at once, so a revoked
+tenant cannot obtain a certificate for anything new — and §10.1's window is ten minutes, not a session.
+
+**A hint is no longer harmless to quote, and that matters less than it first appears** (Asserted, Bob,
+2026-08-19): *"I don't see how to avoid stale certificates without forcing a trip to DN... I don't know
+of a use case where there is a security boundary between a tenant and itself, so the security aspect
+isn't bothering me so far."*
+
+Possession plus being the named tenant is access — but it is useless to a *different* tenant, so what
+leaks stays inside the boundary that already had it.
+
+⚠️ **That is an assumption rather than a fact, and it is worth naming because the model can express its
+opposite.** §5.9.1a attaches policy to the **directory**, and a directory's ACL names principals — so a
+tenant whose principals have different grants (`/a` but not `/b`) *does* have an internal boundary, and a
+certificate binding only the tenant would cross it.
+
+**And the assumption is load-bearing rather than merely comfortable**, which is the reason to write it
+down:
+
+| Certificate binds | §8.1.1a-10's scheduler case | Intra-tenant policy |
+|---|---|---|
+| the **tenant** | **works** — mint once up front, hand the hints to every vertex | not enforced |
+| the **principal** | breaks, or forces the vertices to share one principal | enforced |
+
+§8.1.1a-10's whole motivating shape is *ask once, hand the hints to the vertices, let them use them as
+the job runs.* **Tenant-binding is what makes that possible**, so narrowing to a principal would cost the
+feature the certificate exists for. The two are not independent choices, and if a use case for an
+intra-tenant boundary appears, that is the price (§16.145).
+
+**What survives is the operator's side of §7.3.2.8**, and it survives because it never rested on the
+membership-only claim: the prefix is plaintext, so an operator reading a hint from a bug report can see
+which extent it names and go look **with their own authority**. That came from the readability decision,
+not from what the certificate asserts.
+
+##### 9.1.3.5.2 Stale certificates are accepted, which makes the lifetime a security parameter
+
+**Settled** (Decided, Bob, 2026-08-19): *"I don't see how to avoid stale certificates without forcing a
+trip to DN to see the current state of directories, so I do accept stale certificates, which means
+removing permissions has a delay of however long certificates last."*
+
+⚠️ **So one constant now answers to two unrelated requirements**, and §0's discipline says that is worth
+flagging rather than leaving for whoever tunes it:
+
+| The certificate's lifetime *L* bounds | Wants *L* |
+|---|---|
+| how often a caller must go back to the DN to re-mint | **long** — that trip is the one the certificate exists to avoid |
+| how long a removed permission keeps working | **short** — it is the revocation delay, exactly |
+
+**The trade is quantifiable, which is the useful part**: the DN load a hint saves is proportional to
+1/*L*, and the revocation delay is *L*. There is no value that is good at both, so the number is a
+policy choice and not a tuning one — and §16.86 already asks what the hint window should be, from a
+completely different direction (how far a follower may lag). **It now has a second input pulling the
+other way**, and the two need reconciling before either is fixed.
+
+⚠️ **And the two need not be the same number.** A hint stops being *useful* when its extent is rewritten;
+a certificate stops being *safe* when policy changes. Setting the certificate's expiry shorter than the
+hint window is possible — the route stays valid while the authorization is re-minted — and it costs
+exactly the DN trips that shortening *L* implies. So decoupling them buys nothing by itself; it only
+makes the trade explicit in two places instead of one.
+
+##### The option Bob's framing leaves out: push the revocation
+
+**A delay of *L* is what waiting for expiry costs. It is not the only way to revoke.** §9.6.2 already
+wants a **broadcast tree** for getting one fact to many consumers quickly, and "forget certificates for
+this tenant, or this directory" is that shape of fact.
+
+| | Revocation delay |
+|---|---|
+| wait for expiry | always *L* |
+| broadcast, expiry as the backstop | ~a broadcast, and *L* only if the broadcast fails |
+
+⚠️ **What it costs is the property that makes an FE cheap.** §17.14's reasoning is that what an FE
+remembers can be lost without harm — *"losing what is remembered costs asks, not correctness."* **A
+revocation list breaks that**: an FE that has lost one would honour a certificate it should refuse. So a
+restarted FE would have to **fail closed** — rejecting certificates until it has re-synced — which is
+the ordinary certificate-revocation problem and its ordinary cost.
+
+**So this stays an option rather than a decision.** It is worth having written down because the choice
+is not between "accept *L*" and "pay a DN trip per read": there is a third point on the curve, it reuses
+machinery the design already wants, and its price is a specific and well-understood loss (#94).
 
 **The hint stays readable, with the capability appended** (Asserted, Bob, 2026-08-19), which is a
 requirement rather than an encoding preference: **an operator debugging a complaint must be able to
@@ -9028,6 +9143,64 @@ which is the hop being saved.
 **What it costs to verify is nothing worth measuring.** §7.2.1 puts AEGIS at ~20 GB/s per core, so a
 26-byte tag is noise against the request it authorizes — the same argument that licensed checking an
 auth code on every read off disk (§9.1.1).
+
+##### 9.1.3.5.3 Write: a plaintext flag that selects the key
+
+**Settled** (Decided, Bob, 2026-08-19): *"Write can be handled by including a plaintext flag of whether
+write is allowed, and that flag can choose which signature key to check with."*
+
+That is better than either of the two obvious answers — a flag inside the signed message, or two
+separate keys — because it is both, and the flag is what makes the two keys usable without a lookup.
+
+⚠️ **And the flag being plaintext is not a weakness, which is the neat part.** Forging it defeats itself:
+
+| An attacker with | Flips the flag to | The verifier then | Result |
+|---|---|---|---|
+| a **read** certificate | write | checks against the **write** key | the tag was made with the read key, so it **fails** |
+| a **write** certificate | read | checks against the **read** key | likewise **fails** |
+
+**So the flag needs no protection from the MAC to be unforgeable in effect** — changing it changes which
+key is checked, and the signature was made under exactly one of them. Covering it in the MAC anyway is
+free and worth doing as defence against an implementation that verifies with the wrong key, but it is not
+what makes the scheme sound.
+
+**One certificate suffices**, provided the rule is stated as *the operation sets the minimum authority*
+rather than *the flag sets the operation*:
+
+- a **write** request needs a certificate whose flag says write, verified under the write key;
+- a **read** request accepts either, since a write certificate implies the read.
+
+Without that, a tenant with write access would need two certificates for one extent.
+
+##### Two keys means two lifetimes, which §9.1.3.5.2 wanted
+
+⚠️ **This is the dividend, and it was not the motivation.** §9.1.3.5.2 makes the certificate lifetime a
+security parameter, with revocation delay pulling it short and DN load pulling it long — one number, no
+good value. **Two keys make it two numbers**, rotated independently:
+
+| | Wants a lifetime |
+|---|---|
+| **read** certificates — common, and a stale one leaks a read | **longer**, because that is where the DN load is |
+| **write** certificates — rarer, and a stale one writes to an extent policy says it may not | **shorter**, and it costs little because there are fewer |
+
+**So the trade can be made twice, differently**, and the dangerous half can be made safe without paying
+for it on the common path. Rotating the write key invalidates only write certificates.
+
+**And it scopes the authority to grant**, which is §7.3.1's blast-radius reasoning one level up: a
+component holding only the read key cannot mint a write certificate whatever bug it has. That was the
+argument for two keys before the flag made them cheap to use.
+
+##### The primitive is still unchosen
+
+⚠️ **What signs it is not settled and should not be guessed here** (#93). The requirement is statable:
+an unforgeable tag over a short message, verifiable by any FE from a key it already holds, cheap on every
+hint read (§7.2.1 makes that easy), and versioned so it can change — which §9.1.3.5's 2-byte key version
+already allows for.
+
+**§7.2.4's key-and-salt restriction is already handled**, and two keys make it easier rather than harder:
+the certificate carries a `(FE id, monotone counter)` salt whether or not the primitive needs a nonce, and
+the salt space is now per-key. A deterministic MAC over distinct messages would not have needed one;
+carrying it anyway is what §8.1.6.3's *reserve it whether or not you use it* buys.
 
 **Three failures, and they are distinguishable**, which settles #61's fourth question:
 
@@ -13009,7 +13182,8 @@ Roughly in order of how much else depends on them.
 85. **Whether 4-instance collapses at the EN level or the disk level on one machine** (§5.6.8). Four
     instances on four disks of one machine protect against the commonest failure there is; collapsing to one
     gives that up. The difference is 4x in space.
-86. **The hint window's real value** (§10.1). 10 minutes is a guess; it should be derived from how far a
+86. **The hint window's real value** (§10.1; and now §9.1.3.5.2). 10 minutes is a guess; it should be
+    derived from how far a
     tail-following consumer may lag before falling back to a key lookup.
 87. **The SSD seek/scan break-even** (§7.1.1). It spans 4 KB to 320 KB across defensible assumptions —
     the widest uncertainty in the document, and it sets index density, compression block size, and the
@@ -13209,14 +13383,14 @@ Roughly in order of how much else depends on them.
      request cheap, but neither the answer nor whether the operation is resumable is chosen. Unkeyed objects
      do not have the problem, since they have one open extent.
 
-135. **Whether a capability may ever attest authorization, not only membership** (§5.9.1a, §9.1.3.5).
-     §9.1.3.5 made the hint capability membership-only so that ACL changes take effect at once, which is
-     what removed the revocation problem. Sharing an object with an outside party wants the opposite
-     trade — a bounded window during which a bearer may read without being in any ACL — and that is S3's
-     presigned URL. It should be a **separate mechanism with its own name** rather than a flag on the
-     hint capability, or the property that makes hints safe to paste into a bug report is lost. What is
-     open is whether DeLawson wants the feature at all, and if so who may issue one and how issuance is
-     audited.
+135. **Whether a certificate may name a bearer with no standing** (§5.9.1a, §9.1.3.5). ⚠️ **Narrowed by
+     §9.1.3.5's revision**: the hint certificate now carries authorization for `(tenant, extent)`, so a
+     bounded revocation lag is already accepted and "may a capability authorize" is answered yes. What
+     remains is the harder half — sharing with an **outside party**, who is not the named tenant and has
+     no ACL entry anywhere. That is S3's presigned URL, and it gives up the one thing tenant-binding
+     still buys: a leaked certificate is useless to anyone else. So it wants a separate mechanism with
+     its own name, and what is open is whether DeLawson wants the feature at all, who may issue one, and
+     how issuance is audited.
 136. **Whether a tenant needs any representation beyond a path** (§5.9.1a, §12). Nothing in
      authorization requires one once policy attaches to directories, which suggests "tenant" is a
      billing concept rather than a security one. But §12.8.3's quota accounting and §12.6.3's shared-cost
@@ -13286,6 +13460,24 @@ Roughly in order of how much else depends on them.
      it, so replication of the verifier needs its own answer: several copies and a vote, an error-correcting
      encoding, or accepting a key that matches *any* stored copy — which trades a false rejection for a
      weaker check.
+
+144. **Which primitive signs a hint certificate** (§9.1.3.5.3, #93). The requirement is statable and the
+     choice is not: an unforgeable tag over a short message, verifiable by any FE from a key it already
+     holds, cheap on every hint read (§7.2.1 makes that easy), and versioned so it can change. ⚠️ Bob
+     notes not knowing what the signing key would be nor what protocols are available. Two things that
+     *were* part of this entry are now settled: §7.2.4's key-and-salt restriction is handled by the salt
+     the certificate carries regardless, and read against write is **two keys selected by a plaintext
+     flag** (§9.1.3.5.3). What is left is only the primitive — and the two-key form narrows it, since
+     whatever is chosen has to be cheap to hold twice.
+
+145. **Whether anything needs a security boundary within one tenant** (§9.1.3.5, §5.9.1a). The hint
+     certificate binds the **tenant**, on Bob's judgement that no use case has an adversary inside one —
+     which is an assumption, not a property of the model: §5.9.1a's directory ACLs name principals, so a
+     tenant whose principals have different grants has an internal boundary the certificate would not
+     enforce. ⚠️ **And it is load-bearing**: §8.1.1a-10's motivating case is a scheduler minting hints
+     once and handing them to many vertices, which works because the binding is coarse. Narrowing to a
+     principal enforces intra-tenant policy and costs that. So this stays open as *the price of the first
+     use case that needs it*, and the answer will be to narrow the binding rather than to patch around it.
 
 **Closed** since earlier drafts:
 
@@ -13404,8 +13596,9 @@ Roughly in order of how much else depends on them.
 - whether putting the stream in a hint makes it authorizable — **no**, and §4.6.6 said so wrongly:
   an asserted pairing is only as good as the caller, and `stream → object` is still the DN's
   (§9.1.3.5, §4.6.6);
-- what binds a hint to its object — an unforgeable **capability** attesting membership only, verified
-  at the FE, with the ACL still evaluated fresh on every request (§9.1.3.5);
+- what binds a hint to an extent — an unforgeable **certificate** over `(tenant, extent, write?)`,
+  verified at the FE, with the directory's policy read when it is **minted** rather than when it is used
+  (§9.1.3.5);
 - whether a hint may be opaque — **no**; it stays plaintext with the capability appended, so an
   operator can act on a hint quoted in a bug report (§9.1.3.5);
 - which space a range budget is in — the caller picks one of **records, logical bytes or compressed

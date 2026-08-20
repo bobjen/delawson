@@ -115,6 +115,10 @@ ops! {
     // Sealing is reported to the SN, which records what the extent came to and
     // opens the next one in the same breath.
     SealExtent = 0x0504, "seal-extent";
+    // And a run of a stream's extents, for a caller building hints (§9.1.3.7). The
+    // plural of locate-record, and the first thing to ask an SN that is not about
+    // finding one place to read or write.
+    ListExtents = 0x0505, "list-extents";
 
     // DN, about an object's streams: which one holds a record, and another one
     // when the last has sealed.

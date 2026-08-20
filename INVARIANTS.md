@@ -587,12 +587,16 @@ device. A cache hit is exempt.
 *Breaks* media corruption stops being localized to an instance, and a read cannot be retried against
 another instance with the bad copy repaired invisibly.
 
-**`CAPABILITY-IS-MEMBERSHIP-ONLY`** — a hint's capability attests that an extent is inside an object,
-and never that the bearer may read it.
-*Argued* §9.1.3.5 · *Enforced* design only (#78) · *Checked* unit test: a valid capability must not
-survive an ACL that denies
-*Breaks* three things at once — ACL changes acquire a revocation lag, a hint pasted into a bug report
-becomes a grant, and the expiry stops being merely the hint window.
+**`A-CERTIFICATE-NAMES-ITS-TENANT-AND-ITS-EXTENT`** — a hint certificate is signed over
+`(tenant, extent, write?)`, so it authorizes exactly that extent for exactly that tenant and cannot be
+transplanted to either another extent or another tenant.
+*Argued* §9.1.3.5 · *Enforced* design only (#78, #93) · *Checked* not yet; the tests that matter present
+a valid certificate as the wrong tenant, and against a different extent
+*Breaks* the certificate becomes a bearer token. ⚠️ **An earlier version of this entry was
+`CAPABILITY-IS-MEMBERSHIP-ONLY`**, on the theory that attesting membership rather than authorization
+avoided a revocation lag — but that keeps the ACL read on the use path and so keeps the hop the hint
+exists to remove. The lag is accepted instead, bounded by the expiry and by revocation stopping the
+*minting* at once, so nothing new can be obtained.
 
 **`HINT-BOUND-BY-CAPABILITY`** — an extent presented with an object is believed only if a capability
 proves the pairing.
@@ -772,7 +776,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 |---|---|---|
 | **append block** | §8.1 | `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `RECORD-FITS-ONE-EXTENT`, `EXTENT-SEALS-BETWEEN-RECORDS`, `APPLIED-IS-A-PREFIX`, `ONE-BLOCK-ALWAYS-RETURNS` |
 | **applied** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE` |
-| **capability** | §9.1.3.5 | `CAPABILITY-IS-MEMBERSHIP-ONLY`, `HINT-BOUND-BY-CAPABILITY`, `KEY-AND-SALT-COVER-ONE-PLAINTEXT` |
+| **capability** | §9.1.3.5 | `A-CERTIFICATE-NAMES-ITS-TENANT-AND-ITS-EXTENT`, `HINT-BOUND-BY-CAPABILITY`, `KEY-AND-SALT-COVER-ONE-PLAINTEXT` |
 | **directory** | §5.1 | `POLICY-ATTACHES-TO-A-DIRECTORY`, `ALIAS-READS-INTERSECT` |
 | ⚠️ **compressed position** | §8.1.6 | `KEY-AND-SALT-COVER-ONE-PLAINTEXT`, `EC-GROUP-EQUAL-LENGTH`, `SPACES-ARE-TYPES-WHEN-A-MIX-UP-IS-SILENT`. *The same space §4.5 and §8.1.1a-2 call **physical**.* |
 | **creation second** | §4.6.3 | `EXTENT-IDENTITY-UNIQUE`, `EXTENT-KEY-FROM-CREATING-SN`, `HINT-BOUND-BY-CAPABILITY` |
