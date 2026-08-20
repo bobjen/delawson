@@ -270,6 +270,14 @@ pub struct ExtentRow {
     /// Records in it, or `UNKNOWN` while it is the one being appended to — which is
     /// also what says it is not sealed.
     pub records: u64,
+    /// Logical bytes, or `UNKNOWN` while it is open.
+    ///
+    /// ⚠️ **All three of §9.1.3.6's measures are here on purpose.** A caller budgeting
+    /// in logical bytes cannot plan from a compressed length, and one that wants to
+    /// bound a range *inside* an extent needs that extent's base in the space it means
+    /// to bound (§9.1.3.5.4). Two of three would silently make one of the three
+    /// budgets unplannable.
+    pub logical: u64,
     /// Compressed bytes, or `UNKNOWN` while it is open.
     pub length: u64,
     /// The ENs holding it, **primary first**, which is what makes a hint a route
@@ -291,6 +299,7 @@ impl ExtentRow {
             Arg::Number(self.created),
             Arg::Number(self.first_record),
             Arg::Number(self.records),
+            Arg::Number(self.logical),
             Arg::Number(self.length),
             Arg::Number(self.instances.len() as u64),
         ];
@@ -305,6 +314,7 @@ impl ExtentRow {
             Arg::Number(created),
             Arg::Number(first_record),
             Arg::Number(records),
+            Arg::Number(logical),
             Arg::Number(length),
             Arg::Number(count),
             rest @ ..,
@@ -334,6 +344,7 @@ impl ExtentRow {
                 created: *created,
                 first_record: *first_record,
                 records: *records,
+                logical: *logical,
                 length: *length,
                 instances,
             },
@@ -506,6 +517,7 @@ mod tests {
             created: 1_000_000,
             first_record,
             records,
+            logical: if records == UNKNOWN { UNKNOWN } else { records * 100 },
             length: if records == UNKNOWN { UNKNOWN } else { records * 10 },
             instances: vec![3, 1, 0, 2],
         }
@@ -559,9 +571,9 @@ mod tests {
     #[test]
     fn an_extent_lying_about_its_instances_is_refused() {
         let mut args = extent(1, 0, 40).args();
-        args[6] = Arg::Number(99);
+        args[7] = Arg::Number(99);
         assert!(ExtentRow::of_args(&args).is_err());
-        assert!(ExtentRow::of_args(&args[..6]).is_err(), "and a short row too");
+        assert!(ExtentRow::of_args(&args[..7]).is_err(), "and a short row too");
     }
 
     /// And the counts survive being complete while the detail is partial, which is

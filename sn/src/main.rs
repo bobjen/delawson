@@ -408,6 +408,9 @@ impl SN {
                 created: sealed.extent.created,
                 first_record: sealed.extent.first_record,
                 records: sealed.records,
+                // ⚠️ UNKNOWN because nothing records it yet — the SN keeps a compressed
+                // length and not a logical one (#94).
+                logical: UNKNOWN,
                 length: sealed.length,
                 instances: sealed.extent.instances.clone(),
             })
@@ -428,6 +431,7 @@ impl SN {
                 created: open.created,
                 first_record: open.first_record,
                 records: UNKNOWN,
+                logical: UNKNOWN,
                 length: UNKNOWN,
                 instances: open.instances.clone(),
             });

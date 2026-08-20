@@ -382,6 +382,12 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Which gives **two lifetimes**: long for reads where the DN load is, short for writes where the danger is | §9.1.3.5.3 |
 | And scopes the **authority to grant** a write, since a holder of only the read key cannot mint one | §9.1.3.5.3, §7.3.1 |
 | The hint stays **plaintext with the capability appended**, so an operator can act on a hint a user quoted | §9.1.3.5 |
+| The signed form is **closed**: every field is in the answer, in the request, or ambient — else the request cannot be built | §9.1.3.5.4 |
+| ⚠️ So it carries **identity, never a derived position** — signing a record number would put §17.16.2's three spaces inside the signature | §9.1.3.5.4 |
+| A **128-bit tag** (16 bytes) and a **256-bit key**, by §7.2.1's own high-value-low-volume rule | §9.1.3.5.4 |
+| ⚠️ Certificates are **~a quarter of a full answer**, which is why asking for them is an opt-in bit | §9.1.3.5.4, §9.1.3.11 |
+| A position **may** be signed if its space is pinned by an identity in the same signature — so an **extent** offset could be | §9.1.3.5.4 |
+| The birthday bound does not apply, since the attacker needs **one particular** extent — so 8 bytes would be sound | §9.1.3.5.4 |
 | A budget is in **records, logical bytes or compressed bytes** — one named, all three reported; **one block always returns**, even past it | §9.1.3.6 |
 | `object-info` is **extended, not replaced**, and bounded by **one entry limit** over objects + streams + extents (default **10,000**) | §9.1.3.7 |
 | **HDFS scans** its block list to find an offset — 2 × 10^9 blocks at 256 PB, the same number §14.1 reaches | §9.1.3.8 |
@@ -9350,14 +9356,110 @@ encrypted handle would make the user's own bug report unactionable.
 
 | Part | Contents | Form |
 |---|---|---|
-| **the hint** | `StreamId`, `(SnId, ExtentId, creation second)`, the extent's first object-local record, the row | **plaintext**, versioned, printable |
-| **the capability** | **salt**, expiry second, key version, MAC | appended suffix |
+| **the hint** | `StreamId`, `(SnId, ExtentId, creation second)`, the extent's first record, the row | **plaintext**, versioned, printable |
+| **the certificate** | write flag, **salt**, expiry second, key version, tag | appended suffix |
 
-The MAC is taken over the plaintext prefix **plus the object's path**, and the path is therefore not
-in the hint: the request carries it already (§9.1.3.4), so the FE recomputes rather than compares.
-That keeps the capability to about **34 bytes** — an 8-byte salt, an 8-byte expiry, a 2-byte key
-version and a 16-byte tag — and gives a rename the right behaviour for free, since a renamed object
-no longer verifies and the hint falls back to the ordinary walk.
+##### 9.1.3.5.4 The signed form is closed, and contains identity only
+
+**A certificate is verified from other plaintext in the read request, so that plaintext has to be in the
+`object-info` answer too — or the request cannot be constructed** (Asserted, Bob, 2026-08-19).
+
+⚠️ **That is a closure requirement, and it determines the field list rather than leaving it to taste.**
+Every signed field must be obtainable at *mint* and again at *verify*, from something the caller was
+given and hands back:
+
+| Signed | At mint, from | At verify, from |
+|---|---|---|
+| the **tenant** | the request being authorized | the connection's credentials — **ambient**, so it is in neither the answer nor the request |
+| the **extent name** `(SnId, ExtentId, creation second)` | the SN's `ExtentRow` | the read request, which the caller built from that row |
+| the **write flag** | the grant being exercised | the certificate's own plaintext, and it selects the key (§9.1.3.5.3) |
+| the **salt**, **expiry**, **key version** | the mint | the certificate's own plaintext |
+
+**Which closes**: `ExtentRow` already carries the extent name (§17.21's shape), and everything else is
+either ambient or inside the certificate. Nothing signed is missing from either end.
+
+##### ⚠️ And two things must *not* be signed
+
+**The first record must not be**, and the reason is §17.16.2's bug class rather than anything about
+certificates:
+
+> A record number exists in **three numbering spaces** — object-local, stream-local, extent-local — and
+> the FE converts between them. **Signing one of them puts the conversion inside the signed form**, so a
+> mint and a verify that disagree about which space produce a valid certificate that fails to verify, or
+> worse.
+
+**It is not needed either.** The extent name *is* the identity; the first record is arithmetic a caller
+does with it, and a caller that lies about it gets wrong record numbers back and harms only itself. So it
+stays in the plaintext hint, where it is useful, and out of the signature, where it is a hazard.
+
+**Nor the stream id.** `(SnId, ExtentId, creation second)` is already globally unique (§4.6.3), so adding
+the stream is one more field that must match for no gain — and one more thing to disagree about.
+
+**The rule that falls out needs stating carefully, because the blunt version is wrong** — and Bob's next
+observation is what sharpens it:
+
+> **A signed form may carry a position only in the coordinate space of an identity it also carries.**
+
+**The extent's first record fails that test**, which is why it comes out: after the FE's conversion it is
+*object-local*, and the object is not in the signature — so nothing in the signed form pins which space
+the number is in. ⚠️ **And it cannot be fixed by signing the extent-local version, because that is always
+zero.** The quantity is inherently cross-space, which is exactly why it was the wrong thing to sign.
+
+##### Which says what a finer-grained certificate would look like
+
+**If authorization is ever wanted for an offset rather than a whole extent, it would be an *extent*
+offset** (Asserted, Bob, 2026-08-19), *"since the hint is by extent"*. That passes the rule cleanly:
+
+| A signed position, measured in | The space is pinned by | Sound? |
+|---|---|---|
+| **extent**-local records or bytes | the extent name, already in the signature | **yes** |
+| **stream**-local | the stream, which is not in the signature | no |
+| **object**-local | the object, which is not in the signature | no |
+
+**So the extension is available without disturbing anything**: a certificate could bound a range inside
+the extent it already names, in any of §9.1.3.6's three spaces, and remain closed and unambiguous. That
+is not a feature being added here — only a door being left unlocked, and the rule above is what keeps it
+so.
+
+⚠️ **And it puts a requirement on `object-info`**: a caller can only construct such a hint if it was told
+the extent's **base offsets** in the space it wants to bound. §17.21's `ExtentRow` must therefore carry
+all three. **It now does** — and the SN answers `UNKNOWN` for the logical one, because nothing records
+it yet (#94).
+
+##### Sizes: a 16-byte tag, and a 256-bit key
+
+**Yes, 16 bytes — a 128-bit tag.** And the two numbers should differ, which is the part worth being
+explicit about:
+
+| | Choice | Why |
+|---|---|---|
+| the **tag** | **128-bit**, 16 bytes | already absurd overkill: forgery is an *online* attack, rate-limited by the FE and detectable on every failure, so 2^-128 per attempt is not the binding constraint |
+| the **key** | **256-bit** | §7.2.1's own rule. It reserves 256-bit for KS *"because the master keys are the most important secrets in the system and the volume protected by them is negligible, so the stronger primitive costs nothing"* — and a cluster-wide daily key held by every FE is the **widest key in the system** protecting a few dozen bytes per certificate. Both halves of that argument apply exactly |
+
+⚠️ **The tag is where the answer size goes, and it is a lot.** At §9.1.3.7's 10,000-entry limit the
+certificates are 34 B × 10,000 ≈ **340 KB of a 1.4 MB answer — about a quarter of it.** Which is
+precisely why §9.1.3.11 makes `Detail::Capabilities` an opt-in bit: **a caller planning work needs the
+extents and their record ranges, and not the routes**, so it should not pay for routes it will not use.
+
+**Truncating the tag to 8 bytes is defensible, and the reason the obvious objection does not apply is
+worth recording** (Asserted, Bob, 2026-08-19): *"I was going to object to 8-bit being reasonable due to
+the birthday attack, but that doesn't apply here — it's for a particular extent not a group of
+extents."*
+
+**That is the right distinction.** A birthday bound would bite if a collision were *useful*: an attacker
+who found any two messages sharing a tag could substitute one for the other. Here the attacker wants a
+certificate for **one specific extent** — the one it means to read — so it cannot accept whichever extent
+it happens to collide with. The attack is targeted guessing at 2^-b per attempt, not 2^-b/2, and every
+attempt is an online verification the FE rate-limits and can count.
+
+| | Work |
+|---|---|
+| birthday, if a collision were useful | 2^32 at an 8-byte tag |
+| **targeted guessing, which is the real attack** | **2^64**, online and detectable |
+
+**So the choice is a straight trade rather than a security question**: 8 bytes saves about 6% of a full
+answer, and 16 bytes buys margin in a parameter where margin is cheap. Left at 16 with the reasoning
+recorded, so the saving is available if answer size ever binds.
 
 **The salt is §7.2.4's rule, not a belt-and-braces measure.** One key and one salt may cover one
 plaintext, and a cluster-wide daily key (§16.130) is the widest key in the system — so the mint
