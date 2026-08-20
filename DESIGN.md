@@ -36,6 +36,13 @@ need, not read front to back. Named anchors would buy rearrangement, and rearran
 wanted. What is wanted is §67's index of named invariants and terms, and numbers serve as its
 targets perfectly well.
 
+**That index now exists, as `INVARIANTS.md`** — the named invariants with what enforces each and what
+would catch it being false, plus a term index pointing back the other way. It is a separate file
+because it is *derived*: this document argues, and the catalogue collects. Two rules keep them
+honest — an invariant's `Argued` list is ordered with **the canonical section first**, and the
+catalogue admits only properties that could be falsified by an observation, so decisions, parameters
+and derivations stay here in §0.1 where they belong.
+
 The distinction matters because this document is long and will be read by people who cannot
 re-derive it from scratch. An unlabelled number is a liability: in a year nobody can tell whether
 it was computed or assumed.
