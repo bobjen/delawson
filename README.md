@@ -24,7 +24,7 @@ scripts/start-laws              # build debug, start every process in the roster
 laws --to KS0 ping              # "KS0 is alive"
 laws registry                   # what KS knows: identity -> machine, port
 laws placement                  # which spreading rules this cluster can enforce
-scripts/bench-laws --clients 8  # start retail, measure ping, stop
+scripts/bench-laws --clients 8  # start release, measure ping, stop
 scripts/stop-laws               # stop everything, either flavour
 
 laws create /bob/notes --flavor keyed   # laws -> FE -> DN -> SN

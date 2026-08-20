@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-141 things *not* decided.
+142 things *not* decided.
 
 **Priorities and framing**
 
@@ -172,7 +172,9 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **AEGIS-128X2**, ~20 GB/s per core: encryption is 0.63 of a core at line rate where compression would be ~21 | §7.2.1 |
 | The **AEAD tag is the checksum**, so every block is self-verifying before EC uses it as a repair source | §7.2.1 |
 | Everything is encrypted **on the wire and on disk**; KS uses 256-bit | §7.2, §7.2.1 |
-| Targets: **200k QPS** small metadata requests, **2M+ batched**, **per box** — both already reached, so a floor | §1.4.0 |
+| Targets: **200k QPS** small metadata requests, **2M+ batched**, **per box** — both reached, the unbatched one **only just** | §1.4.0, §17.19.1 |
+| ⚠️ **Between-session variance is ~23% where a three-trial spread is 0.6%**, so cross-session comparisons are worth ±25% | §17.19.2 |
+| So a before/after must run **both arms in one session**, or a regression the size of the noise is invisible | §17.19.2 |
 | The 10× gap says **nine tenths of the unbatched cost is messaging**; the ping ceiling is >64M QPS | §1.4.0 |
 | Those figures are **end-to-end** — durable log write per message, encryption, compression, Nagle off | §1.4.0.1 |
 | **Batching subsumes io_uring** on the network path: batching gave all the gains, io_uring was a regression | §1.4.0.1 |
@@ -12917,6 +12919,15 @@ Roughly in order of how much else depends on them.
      "the fix is structural rather than careful" and §8.1.6's "make the compiler catch it" are two — so the
      section would have occupants the moment it existed.
 
+142. **Why the same lookup benchmark differs 23% between sessions** (§17.19.2). Three trials back to back
+     spread 0.6%; the same measurement four days apart differs by 23%, on one box, against builds proven
+     equivalent, with the hit/miss defect explaining only 3% of it. Until something explains the rest, no
+     cross-session performance comparison in this document is worth more than ±25% — which is wide enough
+     to hide most of what §16's performance questions are asking about. The object count differed (17 M
+     against 20 M, favouring the *newer* run), so the candidates are outside the code: CPU frequency
+     behaviour, what else was on the box, page-cache and allocator state, or the object population's
+     layout in memory. Worth pinning down because it sets the resolution of every measurement here.
+
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
@@ -13200,7 +13211,7 @@ left: the message path is short enough that an allocation is a large fraction of
 
 ### 17.5 The first measurements: a ping to KS0
 
-Loopback TCP, this box (16 cores, client and server both on it), retail build, `bench-laws`, ping
+Loopback TCP, this box (16 cores, client and server both on it), release build, `bench-laws`, ping
 answered on the connection's read loop. A ping asks for a reply of a stated size, filled with random
 bytes, so **message size is a knob rather than a constant** — zeros would let compression and a
 page-sharing kernel cheat, and a per-reply generator would measure the generator, so one random
@@ -13319,7 +13330,7 @@ u32 length | u64 counter | AEGIS-128X2( u8 form | [u32 length | message]... )
 
 #### 17.5b What encryption and compression cost
 
-Retail, loopback, this box. "Round trips" is per second; "wire" is how much smaller the sealed
+Release build, loopback, this box. "Round trips" is per second; "wire" is how much smaller the sealed
 bytes were than the plain ones, which KS counts.
 
 | Shape | Plain | Encrypted | Encrypted + lz4 | Wire, with lz4 |
@@ -13560,7 +13571,7 @@ Over 20 million objects on one box:
 | `batch-object-info`, 100 | 3,958,000 /s | |
 | `batch-object-info`, 1,000 | **5,113,000 /s** | |
 
-**Measured, 2026-08-16**, retail, 16 clients x 16 in flight, client and server on the same box. DN
+**Measured, 2026-08-16**, release build, 16 clients x 16 in flight, client and server on the same box. DN
 holds 20 M objects in **2.3 GB**, about 116 bytes each including the name and the table, and SN holds
 20 M streams in 0.85 GB — so the lookups are random over far more than cache, which is the point of
 creating that many.
@@ -14504,3 +14515,82 @@ asymmetry decides which way to err.
 **Measured, on the single-box cluster**: 1,600 records appended across 2 streams and 5 extents,
 scanned in 5 requests, every record number contiguous and matching its contents — including across
 both the extent seals and the stream seal, which is the conversion §17.16.2 records getting wrong.
+
+### 17.19 The lookup benchmark was measuring misses, and that is the smaller finding
+
+Bob asked for `object-info` to be re-benchmarked before #79 grows what it returns. It did not need
+re-running — §17.5g's numbers were undisturbed, since `dn` and the FE's forwarding path were untouched
+by §17.18 — but *checking* that turned up three defects in the benchmark itself.
+
+⚠️ **`bench-info` had never once hit an object.** `bench-create` puts the trial number in the path,
+because a second trial reusing the first's names creates nothing and measures the refusing; `bench-info`
+did not, so it looked up `/bench/0` while the objects were at `/bench/1/0`. **Every lookup in every run
+ever recorded missed**, and the `--prefix` help text describing the shared naming was what both halves
+were meant to implement and only one did.
+
+⚠️ **And the hit counter double-counted, which is why the miss was invisible.** It chopped the answer
+into pieces of five arguments, and the row had grown to **eight** when §17.12 added the stream's first
+record — so it reported two objects per object. The two bugs concealed each other: names never matched,
+so nothing was found, and the counter would have exaggerated anything that was.
+
+**Both are one mistake with two faces, and it is §17.13.3's.** Four places counted the positions of that
+answer independently — the DN built it, the FE read it for a stream, `laws` read it to print, and the
+benchmark chopped it to count — and two of them were wrong. The row now lives in `common` as `Described`
+(§17.18 did the same for the range shapes), so the count comes from parsing rather than from an assumed
+width, and the name comes from one function both halves of the benchmark call.
+
+#### 17.19.1 What it cost the numbers: about 3%, and in the reassuring direction
+
+**Re-measured, 2026-08-20**, release build, 17 M objects, 16 clients × 16 in flight, 3 trials:
+
+| | Rate | Spread |
+|---|---|---|
+| unbatched, **hitting** | **203,900 /s** | 0.6% |
+| unbatched, missing — what was being measured before | 197,100 /s | 2.0% |
+| unbatched, missing, **pre-§17.18 client** | 199,500 /s | 0.6% |
+| batched 1,000, hitting | **4,269,000 /s** | 0.5% |
+
+Three things follow, and the first is the one worth being relieved about:
+
+- **A hit is ~3% *faster* than a miss**, because a miss formats an error message while a hit fills a
+  fixed row. So §17.5g's figures were very slightly **pessimistic**, not flattering — the defect did not
+  inflate the claim.
+- **§17.18 cost nothing.** The pre-session client and the current one measure the same miss rate to
+  within 1.2%, inside the trial spread. Worth checking rather than asserting, since §17.18 rewrote the
+  FE's read path and put a new field on every lookup.
+- ⚠️ **The unbatched number now sits ~2% above §1.4.0's 200k bar rather than 30% above it.** That is a
+  materially different claim, and §1.4.0's "both are cleared" should be read as *just* cleared for the
+  unbatched case.
+
+#### 17.19.2 The real finding: between-session variance dwarfs within-session spread
+
+⚠️ **§17.5g measured 263,000 /s and the same benchmark measures 203,900 /s today**, on the same box,
+against a build proven equivalent, with the hit/miss difference accounting for only 3% of it. So a **23%
+gap between sessions** sits alongside a **0.6% spread within one**.
+
+| | Spread |
+|---|---|
+| three trials in one session | **0.6%** |
+| the same measurement four days apart | **23%** |
+
+**That says §17.5i's rule is measuring the wrong thing.** "Measure three times" was adopted because one
+number is not a measurement and the spread says whether a difference means anything — but three trials
+back to back share everything that varies slowly: page-cache state, CPU frequency, whatever else is on
+the box, the object population's layout. **A 0.6% spread invites confidence that the 23% shows is not
+there.**
+
+Two consequences, and neither is about this benchmark in particular:
+
+- **A quoted figure needs its session recorded**, which §0 already requires for numbers and §17.5g did
+  do. What it also needs is that **comparisons across sessions be treated as ±25% until something
+  explains the difference** — so §16's performance questions cannot be settled by a 20% improvement
+  measured on a different day.
+- ⚠️ **#79's benchmark must run both arms in one session.** Its whole purpose is to test §9.1.3.7's
+  claim that asking for no extents costs what it costs today; a before-and-after separated by days
+  cannot see a 20% regression, let alone attribute it. The zero-extent and extents-requested arms have
+  to be measured back to back against one running cluster, and the *baseline arm re-run at the same
+  time* rather than quoted from here.
+
+⚠️ **What causes the 23% is not established** and should not be guessed at in this document; #86 holds
+it. The object count differed (17 M against 20 M, which should favour today's run), so the likely
+candidates are outside the code.

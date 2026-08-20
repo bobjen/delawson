@@ -16,7 +16,9 @@
 
 use common::config::{DNConfig, ServiceKind};
 use common::framing::Framing;
+use common::info::Described;
 use common::logw;
+use common::range::Want;
 use common::server::{self, Process, Reply, Service};
 use common::wire::{Arg, Op, Request, Response, Status};
 use common::{Error, Result};
@@ -46,6 +48,30 @@ const SERVES: &[Op] = &[
 ];
 
 const SHARDS: usize = 64;
+
+/// Which `Detail` bits this build actually answers.
+///
+/// ⚠️ **Zero, and that is the honest value.** `object-info` returns the object and one stream, which
+/// is what §9.1.3.7 wants extended and what #79 will extend it to. Until then a caller asking for
+/// more is told so by name rather than being handed an answer that quietly omits what it asked for —
+/// §17's rule that a well-formed request for something unbuilt is `unimplemented`, not `ok`.
+const ANSWERS: u64 = 0;
+
+/// What a lookup wants, and a refusal naming the parts of it this build cannot supply.
+///
+/// **A request with no want field is `Want::plain()`**, which is exactly today's answer — so every
+/// caller that predates the field keeps working and keeps costing what it cost (§9.1.3.11).
+fn wanted(args: &[Arg]) -> Result<Want> {
+    let want = match args {
+        [] => Want::plain(),
+        _ => Want::of_args(args)?.0,
+    };
+    let beyond = want.beyond(ANSWERS);
+    if !beyond.is_empty() {
+        return Err(Error::new(format!("object-info cannot yet return {}", beyond.join(", "))));
+    }
+    Ok(want)
+}
 
 struct Object {
     id: u64,
@@ -111,17 +137,18 @@ impl Object {
             None => self.last()?,
             Some(record) => self.holding(record)?,
         };
-        let (kind, width) = self.framing.wire();
-        Some(vec![
-            Arg::Number(self.id),
-            Arg::Number(held.id),
-            Arg::Number(held.sn as u64),
-            Arg::Number(self.created),
-            Arg::Flag(self.keyed),
-            Arg::Number(kind),
-            Arg::Number(width),
-            Arg::Number(held.first_record),
-        ])
+        Some(
+            Described {
+                id: self.id,
+                stream: held.id,
+                sn: held.sn,
+                created: self.created,
+                keyed: self.keyed,
+                framing: self.framing,
+                first_record: held.first_record,
+            }
+            .args(),
+        )
     }
 
     /// The stream appends go to, which is the last one.
@@ -542,12 +569,18 @@ impl DN {
     }
 
     fn info(&self, request: &Request, record: Option<u64>, reply: Reply) {
-        let name = match request.args.first() {
-            Some(Arg::Text(name)) => name.as_str(),
+        let (name, rest) = match request.args.as_slice() {
+            [Arg::Text(name), rest @ ..] => (name.as_str(), rest),
             _ => {
                 return reply.send(Response::error(Status::BadRequest, "object-info takes a name"));
             }
         };
+        // `locate-stream` puts a record number where a want field would be, and it asks for
+        // nothing beyond the stream holding it, so it is not read here.
+        let rest = if record.is_some() { &rest[1..] } else { rest };
+        if let Err(e) = wanted(rest) {
+            return reply.send(Response::error(Status::Unimplemented, e.to_string()));
+        }
         // Under one lock: answer, or park. Deciding to wait and then waiting must be
         // one step, or the work can finish in between and wake nobody.
         let mut carry = Some(reply);
@@ -602,8 +635,15 @@ impl DN {
     /// gets a zero id, so the answer lines up with the question without saying
     /// which was missing twice.
     fn info_many(&self, request: &Request) -> Response {
-        let mut args = Vec::with_capacity(request.args.len() * 7);
-        for asked in &request.args {
+        // The names, then one want field for all of them — a batch asks the same question about
+        // every name, so carrying it per name would repeat it a thousand times (§9.1.3.11).
+        let names = request.args.iter().position(|arg| !matches!(arg, Arg::Text(_)));
+        let (names, rest) = request.args.split_at(names.unwrap_or(request.args.len()));
+        if let Err(e) = wanted(rest) {
+            return Response::error(Status::Unimplemented, e.to_string());
+        }
+        let mut args = Vec::with_capacity(names.len() * Described::ARGS);
+        for asked in names {
             let name = match asked {
                 Arg::Text(name) => name.as_str(),
                 _ => {
@@ -612,15 +652,7 @@ impl DN {
             };
             match self.look(name) {
                 Some(found) => args.extend(found),
-                None => args.extend([
-                    Arg::Number(0),
-                    Arg::Number(0),
-                    Arg::Number(0),
-                    Arg::Number(0),
-                    Arg::Flag(false),
-                    Arg::Number(0),
-                    Arg::Number(0),
-                ]),
+                None => args.extend(Described::missing()),
             }
         }
         Response { id: 0, status: Status::Ok, args }

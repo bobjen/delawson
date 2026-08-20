@@ -7,17 +7,17 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-flavor=debug
+profile=debug
 run_dir=$root/run
 config_dir=$root/config
 ready_wait=10   # seconds to wait for a process to announce itself
 
 usage() {
     cat <<'EOF'
-usage: start-laws [--debug | --retail] [--run-dir DIR] [--config DIR] [--no-build]
+usage: start-laws [--debug | --release] [--run-dir DIR] [--config DIR] [--no-build]
 
   --debug     build and run the debug binaries (default)
-  --retail    build and run the optimized binaries; measure with these
+  --release   build and run the optimized binaries; measure with these
   --run-dir   where the per-process directories go (default: run/)
   --config    where the checked-in configuration lives (default: config/)
   --no-build  use the binaries already built
@@ -27,8 +27,8 @@ EOF
 build=yes
 while (($#)); do
     case $1 in
-        --debug) flavor=debug ;;
-        --retail|--release) flavor=retail ;;
+        --debug) profile=debug ;;
+        --release|--retail) profile=release ;;
         --run-dir) run_dir=$2; shift ;;
         --config) config_dir=$2; shift ;;
         --no-build) build=no ;;
@@ -40,7 +40,7 @@ done
 
 target=debug
 cargo_args=()
-if [[ $flavor == retail ]]; then
+if [[ $profile == release ]]; then
     target=release
     cargo_args+=(--release)
 fi
@@ -69,6 +69,8 @@ done
 mkdir -p "$run_dir"
 # The build directory, not the word: stop-laws needs a path that exists.
 echo "$target" > "$run_dir/build"
+# Clear the name this file used to have, so a run directory from an older checkout
+# does not leave a stale one behind.
 rm -f "$run_dir/flavor"
 
 # KS's address is fixed; every other process is handed a port from the base up.
@@ -131,7 +133,7 @@ EOF
             exit 1
         fi
     done
-    echo "started $identity ($kind, $flavor) on $listen as pid $pid"
+    echo "started $identity ($kind, $profile) on $listen as pid $pid"
     started+=("$identity")
 done < <("$laws" --config "$cluster" services)
 

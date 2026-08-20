@@ -8,7 +8,7 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-flavor=--retail
+profile=--release
 clients=8
 depth=64
 warmup=2
@@ -19,7 +19,7 @@ usage() {
     cat <<'EOF'
 usage: bench-laws [--debug] [--clients N] [--depth N] [--warmup SECONDS] [--seconds N] [--to IDENTITY]
 
-  --debug     measure the debug build (the default is retail, which is what to quote)
+  --debug     measure the debug build (the default is release, which is what to quote)
   --clients   parallel clients, one connection and thread each (default: 8)
   --depth     independent requests in flight per connection (default: 64)
   --warmup    unmeasured seconds first (default: 2)
@@ -30,8 +30,8 @@ EOF
 
 while (($#)); do
     case $1 in
-        --debug) flavor=--debug ;;
-        --retail) flavor=--retail ;;
+        --debug) profile=--debug ;;
+        --release|--retail) profile=--release ;;
         --clients) clients=$2; shift ;;
         --depth) depth=$2; shift ;;
         --warmup) warmup=$2; shift ;;
@@ -44,9 +44,9 @@ while (($#)); do
 done
 
 target=release
-[[ $flavor == --debug ]] && target=debug
+[[ $profile == --debug ]] && target=debug
 
-"$root/scripts/start-laws" "$flavor" > /dev/null
+"$root/scripts/start-laws" "$profile" > /dev/null
 trap '"$root/scripts/stop-laws" > /dev/null' EXIT
 
 laws=$root/target/$target/laws

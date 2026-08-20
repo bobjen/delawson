@@ -14,9 +14,10 @@ use common::block::{Holds, expand, squeeze};
 use common::config::Compress;
 use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
+use common::info::Described;
 use common::placement;
 use common::random::Rng;
-use common::range::{Budget, Covered, Piece, Range, Start};
+use common::range::{Budget, Covered, Detail, Piece, Range, Start, Want};
 use common::wire::{Arg, Op, Request, Response, Status};
 use common::{Error, Result};
 use std::collections::HashMap;
@@ -45,6 +46,40 @@ struct Cli {
 
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// The `Detail` bits, as a command-line choice. Mirrors `common::range::Detail` rather than
+/// replacing it — the bit values are the wire contract and live there.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Want1 {
+    Streams,
+    Extents,
+    Instances,
+    Capabilities,
+    Counts,
+    Flags,
+}
+
+impl Want1 {
+    fn detail(self) -> Detail {
+        match self {
+            Want1::Streams => Detail::Streams,
+            Want1::Extents => Detail::Extents,
+            Want1::Instances => Detail::Instances,
+            Want1::Capabilities => Detail::Capabilities,
+            Want1::Counts => Detail::Counts,
+            Want1::Flags => Detail::Flags,
+        }
+    }
+}
+
+/// What a run of `--want` choices comes to, with implications applied.
+fn asking(want: &[Want1], limit: u64, from: u64) -> Want {
+    let mut asked = Want { detail: 0, limit, from: Start::Record(from) };
+    for one in want {
+        asked = asked.with(one.detail());
+    }
+    asked
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -218,7 +253,23 @@ enum Cmd {
         seconds: Option<u64>,
     },
     /// What an object is: id, stream, SN, when it was made, flavour.
-    ObjectInfo { path: String },
+    ///
+    /// Naming no `--want` asks for exactly what this asked for before the flag existed, and
+    /// costs exactly that (§9.1.3.11).
+    ObjectInfo {
+        path: String,
+        /// Extra detail to return. Repeatable. Asking for something that implies another —
+        /// instances imply extents — brings the other along.
+        #[arg(long, value_enum)]
+        want: Vec<Want1>,
+        /// The most entries an answer may carry, over objects plus streams plus extents. Zero
+        /// means the cluster's configured default.
+        #[arg(long, default_value_t = 0)]
+        limit: u64,
+        /// Describe from this record onward, for an object too large to describe at once.
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+    },
     /// Create many objects, and time it. Paths are `<prefix><n>`.
     BenchCreate {
         #[arg(long, default_value_t = 1_000_000)]
@@ -258,6 +309,11 @@ enum Cmd {
         prefix: String,
         #[arg(long, default_value_t = 3)]
         trials: usize,
+        /// Which `bench-create` trial's objects to look up. Creating puts the trial
+        /// number in the path so each trial has fresh names; reading does not need
+        /// fresh names, so it picks one.
+        #[arg(long, default_value_t = 1)]
+        trial: usize,
     },
 
     /// A second name for an object, sharing its bytes.
@@ -595,7 +651,7 @@ fn run(cli: Cli) -> Result<()> {
             };
             bench_create(&target, &plan, &cluster.messaging)
         }
-        Cmd::BenchInfo { objects, batch, clients, depth, seconds, prefix, trials } => {
+        Cmd::BenchInfo { objects, batch, clients, depth, seconds, prefix, trials, trial } => {
             let target = resolve(&cluster, &cli, ServiceKind::Fe)?;
             let plan = Objects {
                 objects: *objects,
@@ -608,7 +664,7 @@ fn run(cli: Cli) -> Result<()> {
                 trials: *trials,
                 timeout,
             };
-            bench_info(&target, &plan, &cluster.messaging)
+            bench_info(&target, &plan, &cluster.messaging, *trial)
         }
         Cmd::Scan { path, framing, from, before, budget, rounds } => {
             let target = resolve(&cluster, &cli, ServiceKind::Fe)?;
@@ -829,13 +885,23 @@ struct Objects {
 
 /// Create `objects` objects, sharing them out among the clients, each keeping
 /// `depth` requests in flight.
+/// The prefix one trial's objects live under.
+///
+/// ⚠️ **Both halves of the benchmark must use this, and for a while only one did.**
+/// `bench-create` puts the trial number in the path, because a second trial reusing
+/// the first's names creates nothing and measures the refusing. `bench-info` did not,
+/// so it looked up `/bench/0` while the objects were at `/bench/1/0` — **every lookup
+/// missed, in every run ever recorded** (§17.5g's correction). A miss is cheaper than
+/// a hit, so the rate it reported was of the wrong operation.
+fn trial_prefix(prefix: &str, trial: usize) -> String {
+    format!("{prefix}{trial}/")
+}
+
 fn bench_create(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<()> {
     let mut trial = 0;
     trials(&target.identity, plan.trials, || {
         trial += 1;
-        // Each trial needs names nobody has taken, or the second one creates
-        // nothing and measures the refusing.
-        let mine = Objects { prefix: format!("{}{trial}/", plan.prefix), ..plan.clone() };
+        let mine = Objects { prefix: trial_prefix(&plan.prefix, trial), ..plan.clone() };
         create_once(target, &mine, messaging)
     })
 }
@@ -937,8 +1003,11 @@ fn create_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result
 
 /// Look up objects at random for a while. Random because a benchmark that walks
 /// in order measures the cache rather than the index.
-fn bench_info(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<()> {
-    trials(&target.identity, plan.trials, || info_once(target, plan, messaging))
+fn bench_info(target: &Target, plan: &Objects, messaging: &Messaging, trial: usize) -> Result<()> {
+    // Every trial reads the same objects — looking up is not destructive, so unlike
+    // creating there is no reason for each trial to want its own names.
+    let mine = Objects { prefix: trial_prefix(&plan.prefix, trial), ..plan.clone() };
+    trials(&target.identity, plan.trials, || info_once(target, &mine, messaging))
 }
 
 fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f64> {
@@ -984,12 +1053,19 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
                         Some(at) => tally.add(at.elapsed()),
                         None => return Err(Error::new("unasked answer")),
                     }
-                    // Five values per object, a zero id meaning it was not there.
-                    found += answer
-                        .args
-                        .chunks(5)
-                        .filter(|found| matches!(found.first(), Some(Arg::Number(id)) if *id != 0))
-                        .count() as u64;
+                    // ⚠️ Counted by parsing the rows, not by chopping the args into
+                    // pieces of an assumed width. The assumed width was five and the
+                    // row is eight, so this counted every object twice (§17.5g).
+                    //
+                    // A miss answers `not found` with a message rather than with rows,
+                    // and that is not a failure — it is what looking up a name nobody
+                    // took looks like, and it is worth measuring on purpose.
+                    if answer.status == Status::Ok {
+                        found += Described::all_of_args(&answer.args)?
+                            .iter()
+                            .filter(|row| row.is_some())
+                            .count() as u64;
+                    }
                 }
                 Ok((asked, found, tally))
             })
@@ -1103,29 +1179,15 @@ fn receipt(target: &Target, response: &Response) -> Result<()> {
 /// What an object is, which is what both a lookup and a create answer with. Seven
 /// numbers read as one line.
 fn object(target: &Target, response: &Response) -> Result<()> {
-    if let [
-        Arg::Number(id),
-        Arg::Number(stream),
-        Arg::Number(sn),
-        Arg::Number(created),
-        Arg::Flag(keyed),
-        Arg::Number(kind),
-        Arg::Number(width),
-        Arg::Number(first_record),
-    ] = response.args.as_slice()
-    {
-        let flavor = if *keyed { "keyed" } else { "unkeyed" };
-        let framing = match Framing::of_wire(*kind, *width) {
-            Ok(framing) => framing.to_string(),
-            Err(e) => e.to_string(),
-        };
-        println!(
-            "{} object {id} {flavor} framed {framing}, stream {stream} on SN{sn} from record {first_record}, made in second {created}",
-            target.identity
-        );
-        return Ok(());
-    }
-    report(target, response)
+    let Ok((Some(it), [])) = Described::of_args(&response.args) else {
+        return report(target, response);
+    };
+    let flavor = if it.keyed { "keyed" } else { "unkeyed" };
+    println!(
+        "{} object {} {flavor} framed {}, stream {} on SN{} from record {}, made in second {}",
+        target.identity, it.id, it.framing, it.stream, it.sn, it.first_record, it.created
+    );
+    Ok(())
 }
 
 /// A record, out of the block that holds it.
@@ -1430,7 +1492,16 @@ fn build(cmd: &Cmd) -> Result<Request> {
         Cmd::LogLines { from, to, limit, which } => {
             Request::new(Op::LogLines).text(which).text(from).text(to).number(*limit as u64)
         }
-        Cmd::ObjectInfo { path } => Request::new(Op::ObjectInfo).text(path),
+        Cmd::ObjectInfo { path, want, limit, from } => {
+            let mut request = Request::new(Op::ObjectInfo).text(path);
+            // Sent only when something was asked for, so the common case is byte-for-byte the
+            // request that predates the field — which is what keeps §17.5g's baseline honest.
+            let asked = asking(want, *limit, *from);
+            if asked != Want::plain() {
+                request.args.extend(asked.args());
+            }
+            request
+        }
         Cmd::Mkdir { path } => Request::new(Op::MakeDirectory).text(path),
         Cmd::Rmdir { path } => Request::new(Op::RemoveDirectory).text(path),
         Cmd::Ls { path } => Request::new(Op::List).text(path),
@@ -1546,5 +1617,46 @@ fn name(cmd: &Cmd) -> &'static str {
         Cmd::Placement => "placement",
         Cmd::MediaClasses => "media-classes",
         _ => "that command",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⚠️ **The plain request must stay byte-identical to what it was before `--want` existed**,
+    /// because §17.5g's 263k/s is the baseline #79 will be measured against. If naming no detail
+    /// started sending four extra arguments, the comparison would be against a different request
+    /// and the regression would be invisible.
+    #[test]
+    fn asking_for_nothing_is_the_request_that_predates_the_field() {
+        assert_eq!(asking(&[], 0, 0), Want::plain());
+        let bare = Cmd::ObjectInfo { path: "/x".into(), want: Vec::new(), limit: 0, from: 0 };
+        let request = build(&bare).expect("a request");
+        assert_eq!(request.args.len(), 1, "the name and nothing else");
+        assert_eq!(request.args[0], Arg::Text("/x".into()));
+    }
+
+    /// And anything actually asked for does travel, in the four arguments `Want` defines.
+    #[test]
+    fn asking_for_something_sends_the_want_field() {
+        let asked =
+            Cmd::ObjectInfo { path: "/x".into(), want: vec![Want1::Instances], limit: 7, from: 3 };
+        let request = build(&asked).expect("a request");
+        assert_eq!(request.args.len(), 5, "the name plus a want");
+        let (want, rest) = Want::of_args(&request.args[1..]).expect("a want");
+        assert!(rest.is_empty());
+        assert!(want.wants(Detail::Instances) && want.wants(Detail::Extents));
+        assert_eq!((want.limit, want.from), (7, Start::Record(3)));
+    }
+
+    /// A limit or a start without any detail is not detail, so it must not make a plain lookup
+    /// look like one asking for something unbuilt.
+    #[test]
+    fn a_limit_alone_asks_for_no_detail() {
+        let asked = asking(&[], 500, 0);
+        assert_eq!(asked.detail, 0);
+        assert!(asked.beyond(0).is_empty(), "so nothing is beyond what is built");
+        assert_ne!(asked, Want::plain(), "but it still travels, since the limit is meant");
     }
 }

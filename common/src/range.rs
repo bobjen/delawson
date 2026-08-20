@@ -44,6 +44,13 @@ pub enum Start {
     Logical(u64),
 }
 
+/// The beginning of the object, which is where a caller that names no start means.
+impl Default for Start {
+    fn default() -> Start {
+        Start::Record(0)
+    }
+}
+
 impl Start {
     /// The record this start is at or after, which is what locates the extent.
     pub fn record(self) -> Option<u64> {
@@ -234,6 +241,162 @@ impl Covered {
     }
 }
 
+/// Which bits mean what in a [`Want`]'s flag field.
+///
+/// ⚠️ **A bit rather than an argument, and that is the whole point** (Asserted, Bob, 2026-08-19).
+/// Each of these would otherwise be a required boolean argument, and §17.13.3 records what a
+/// growing argument list costs: adding one **changes the shape**, so every reader shifts by a
+/// position and two processes disagree about which field is which. Adding a *bit* changes nothing —
+/// arity is fixed, old readers see a value they do not recognize in a field they already skip, and
+/// the encoding cost stays one number however many flags exist.
+///
+/// That last point is not decoration at `object-info`'s rates (§17.5g measures 263k/s unbatched and
+/// 5.1M/s batched): six booleans would be six `Arg`s per request, and a batch of a thousand carries
+/// the request once and the names a thousand times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum Detail {
+    /// The object's streams — ids, their SNs, and where each one's records start.
+    Streams = 1 << 0,
+    /// The extents of the streams returned. Implies [`Detail::Streams`], since an extent's record
+    /// numbers mean nothing without the stream that contains it.
+    Extents = 1 << 1,
+    /// Which ENs hold each extent, primary first. Implies [`Detail::Extents`], and it is the field
+    /// that makes a hint a route rather than a description (§8.1.1a-10).
+    Instances = 1 << 2,
+    /// The capability proving each extent belongs to this object (§9.1.3.5). Implies
+    /// [`Detail::Extents`], and costs a MAC per entry, so it is opt-in for a reason.
+    Capabilities = 1 << 3,
+    /// The exact counts — streams per object, extents per stream, records per stream (§9.1.3.2).
+    /// What lets a caller compute every remaining request by arithmetic.
+    Counts = 1 << 4,
+    /// The capability flags of the object and its streams (§4.1.1).
+    Flags = 1 << 5,
+}
+
+impl Detail {
+    pub const ALL: &'static [Detail] = &[
+        Detail::Streams,
+        Detail::Extents,
+        Detail::Instances,
+        Detail::Capabilities,
+        Detail::Counts,
+        Detail::Flags,
+    ];
+
+    pub fn bit(self) -> u64 {
+        self as u64
+    }
+
+    /// What asking for this also requires. A caller that asks for instances without extents is not
+    /// making a mistake worth refusing — it is asking for something that only makes sense with the
+    /// extents, so the extents come too (§9.1.3.11).
+    fn implies(self) -> u64 {
+        match self {
+            Detail::Streams | Detail::Counts | Detail::Flags => 0,
+            Detail::Extents => Detail::Streams.bit(),
+            Detail::Instances | Detail::Capabilities => {
+                Detail::Extents.bit() | Detail::Streams.bit()
+            }
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Detail::Streams => "streams",
+            Detail::Extents => "extents",
+            Detail::Instances => "instances",
+            Detail::Capabilities => "capabilities",
+            Detail::Counts => "counts",
+            Detail::Flags => "flags",
+        }
+    }
+}
+
+/// How much an `object-info` or `batch-object-info` wants back.
+///
+/// **The zero value is today's answer** (§9.1.3.11), which is what makes the field safe to add: a
+/// caller that names nothing gets the object and its first stream, exactly as before, and pays
+/// exactly what it paid before. That is §13.2.5.1's rule — a new thing defaults to the old
+/// behaviour — arriving in a request rather than in a configuration file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Want {
+    /// The [`Detail`] bits, normalized so that implications hold.
+    pub detail: u64,
+    /// The most entries — objects plus streams plus extents — this answer may carry. Zero means
+    /// the configured default (§9.1.3.7), and a value above it is capped rather than refused.
+    pub limit: u64,
+    /// Which record to describe from, for an object too large to describe at once.
+    pub from: Start,
+}
+
+impl Want {
+    /// Nothing beyond the object and its first stream: what every caller asked for before this
+    /// field existed.
+    pub fn plain() -> Want {
+        Want { detail: 0, limit: 0, from: Start::Record(0) }
+    }
+
+    pub fn with(mut self, detail: Detail) -> Want {
+        self.detail |= detail.bit() | detail.implies();
+        self
+    }
+
+    pub fn wants(&self, detail: Detail) -> bool {
+        self.detail & detail.bit() != 0
+    }
+
+    /// Every bit asked for that this build does not answer, by name, so a refusal can say which.
+    pub fn beyond(&self, built: u64) -> Vec<&'static str> {
+        Detail::ALL
+            .iter()
+            .filter(|detail| self.wants(**detail) && built & detail.bit() == 0)
+            .map(|detail| detail.as_str())
+            .collect()
+    }
+
+    /// Four arguments: the flag field, the limit, and the start as a kind and a number.
+    pub fn args(&self) -> Vec<Arg> {
+        let (kind, at) = match self.from {
+            Start::Record(record) => (0, record),
+            Start::RecordThen(record, _) => (1, record),
+            Start::Logical(offset) => (2, offset),
+        };
+        vec![Arg::Number(self.detail), Arg::Number(self.limit), Arg::Number(kind), Arg::Number(at)]
+    }
+
+    /// And back. ⚠️ **A bit nothing here defines is not an error**, which is the forward
+    /// compatibility the bitfield exists for: a newer caller may ask for something this build has
+    /// never heard of, and `beyond` is what turns that into an honest refusal naming the rest.
+    pub fn of_args(args: &[Arg]) -> Result<(Want, &[Arg])> {
+        let [
+            Arg::Number(detail),
+            Arg::Number(limit),
+            Arg::Number(kind),
+            Arg::Number(at),
+            rest @ ..,
+        ] = args
+        else {
+            return Err(Error::new("a want takes a detail field, a limit and a start"));
+        };
+        let from = match kind {
+            0 => Start::Record(*at),
+            1 => Start::RecordThen(*at, 0),
+            2 => Start::Logical(*at),
+            other => return Err(Error::new(format!("no range start of kind {other}"))),
+        };
+        // Normalized on the way in, so nothing downstream has to remember the implications.
+        let mut want = Want { detail: 0, limit: *limit, from };
+        want.detail = *detail;
+        for one in Detail::ALL {
+            if want.wants(*one) {
+                want.detail |= one.implies();
+            }
+        }
+        Ok((want, rest))
+    }
+}
+
 /// One block on its way back, and everything needed to make sense of it.
 ///
 /// ⚠️ **The bytes are useless without the other four**, which is why they travel as
@@ -388,6 +551,79 @@ mod tests {
         let (back, rest) = Covered::of_args(&args).expect("an answer");
         assert_eq!(back, covered);
         assert!(rest.is_empty());
+    }
+
+    /// The zero value is what every caller asked for before the field existed, which is what makes
+    /// the field safe to add at all.
+    #[test]
+    fn wanting_nothing_is_the_old_answer() {
+        let plain = Want::plain();
+        assert_eq!(plain.detail, 0);
+        for detail in Detail::ALL {
+            assert!(!plain.wants(*detail), "{}", detail.as_str());
+        }
+        // And it survives the wire as itself.
+        let args = plain.args();
+        let (back, rest) = Want::of_args(&args).expect("a want");
+        assert_eq!(back, plain);
+        assert!(rest.is_empty());
+    }
+
+    /// Asking for something that only makes sense with its container brings the container. A
+    /// caller wanting instances is not making a mistake worth refusing.
+    #[test]
+    fn a_detail_brings_what_it_needs() {
+        for asked in [Detail::Instances, Detail::Capabilities] {
+            let want = Want::plain().with(asked);
+            assert!(want.wants(asked));
+            assert!(want.wants(Detail::Extents), "{} needs extents", asked.as_str());
+            assert!(want.wants(Detail::Streams), "{} needs streams", asked.as_str());
+        }
+        // Extents bring streams; counts and flags stand alone.
+        assert!(Want::plain().with(Detail::Extents).wants(Detail::Streams));
+        assert!(!Want::plain().with(Detail::Counts).wants(Detail::Streams));
+        assert!(!Want::plain().with(Detail::Flags).wants(Detail::Extents));
+    }
+
+    /// ⚠️ Normalization happens on the way in too, so a caller that set a bit without its
+    /// implications does not produce an answer nobody can interpret.
+    #[test]
+    fn implications_are_restored_off_the_wire() {
+        let raw = vec![
+            Arg::Number(Detail::Instances.bit()),
+            Arg::Number(0),
+            Arg::Number(0),
+            Arg::Number(0),
+        ];
+        let (want, _) = Want::of_args(&raw).expect("a want");
+        assert!(want.wants(Detail::Extents) && want.wants(Detail::Streams));
+    }
+
+    /// A bit this build does not know is not an error — that is the forward compatibility the
+    /// field exists for — and `beyond` is what turns it into a refusal that says which.
+    #[test]
+    fn an_unknown_bit_is_reported_rather_than_refused() {
+        let raw = vec![Arg::Number(1 << 40), Arg::Number(0), Arg::Number(0), Arg::Number(0)];
+        let (want, _) = Want::of_args(&raw).expect("an unknown bit parses");
+        assert_eq!(want.beyond(0), Vec::<&str>::new(), "nothing named, so nothing to report");
+
+        // And what it does report is only what was asked for and is not built.
+        let asked = Want::plain().with(Detail::Capabilities).with(Detail::Counts);
+        let built = Detail::Streams.bit() | Detail::Extents.bit();
+        assert_eq!(asked.beyond(built), vec!["capabilities", "counts"]);
+        assert!(asked.beyond(u64::MAX).is_empty(), "everything built, nothing beyond");
+    }
+
+    /// The limit and the start survive the wire, since they are what an object too large to
+    /// describe at once is paged with.
+    #[test]
+    fn a_limit_and_a_start_survive_the_wire() {
+        let want = Want { detail: Detail::Extents.bit(), limit: 500, from: Start::Record(9_000) };
+        let args = want.args();
+        let (back, _) = Want::of_args(&args).expect("a want");
+        assert_eq!(back.limit, 500);
+        assert_eq!(back.from, Start::Record(9_000));
+        assert!(Want::of_args(&args[..3]).is_err(), "and a short one is refused");
     }
 
     /// Blocks are counted in as they arrive, in all three spaces at once — the

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stop everything start-laws started, debug or retail, in reverse cold-start
+# Stop everything start-laws started, debug or release, in reverse cold-start
 # order.
 #
 # Stopping is a request first: a process that has state to flush gets the chance,

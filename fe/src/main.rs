@@ -22,6 +22,7 @@
 use common::block::Holds;
 use common::config::{FEConfig, ServiceKind};
 use common::framing::Framing;
+use common::info::Described;
 use common::logw;
 use common::range::{Budget, Covered, Piece, Range, Start};
 use common::server::{self, Process, Reply, Service};
@@ -941,25 +942,14 @@ struct Located {
 
 impl Located {
     fn of(dn: u32, args: &[Arg]) -> Option<Located> {
-        let [
-            _id,
-            Arg::Number(stream),
-            Arg::Number(sn),
-            _created,
-            _keyed,
-            Arg::Number(kind),
-            Arg::Number(width),
-            Arg::Number(first_record),
-        ] = args
-        else {
-            return None;
-        };
-        Some(Located {
+        let (described, rest) = Described::of_args(args).ok()?;
+        let described = described?;
+        rest.is_empty().then_some(Located {
             dn,
-            stream: *stream,
-            sn: *sn as u32,
-            framing: Framing::of_wire(*kind, *width).ok()?,
-            first_record: *first_record,
+            stream: described.stream,
+            sn: described.sn,
+            framing: described.framing,
+            first_record: described.first_record,
         })
     }
 }
