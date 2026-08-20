@@ -961,6 +961,9 @@ impl DN {
         let mut args = Vec::with_capacity(names.len() * Described::ARGS);
         let mut spent = 0;
         let mut given = 0;
+        // Whether the last name given was described completely. Only the last one can be partial:
+        // an earlier one stopping short would have spent the whole limit.
+        let mut whole = true;
         for asked in names {
             let name = match asked {
                 Arg::Text(name) => name.as_str(),
@@ -972,29 +975,34 @@ impl DN {
             // they were asked for. ⚠️ Measured first so the answer never overruns the limit — the
             // §17.22.2 bug was spending a cap and then spending it again.
             let piece = self.piece(name, &want, limit.saturating_sub(spent));
-            let cost = piece.as_ref().map_or(1, |(entries, _)| *entries);
+            let cost = piece.as_ref().map_or(1, |piece| piece.entries);
             if given > 0 && spent + cost > limit {
                 break;
             }
             match piece {
-                Some((entries, mut of)) => {
-                    spent += entries;
-                    args.append(&mut of);
+                Some(mut piece) => {
+                    spent += piece.entries;
+                    whole = piece.whole;
+                    args.append(&mut piece.args);
                 }
                 None => {
                     spent += 1;
+                    whole = true;
                     args.extend(Described::missing());
                 }
             }
             given += 1;
         }
 
-        let covered = Batch {
-            asked: names.len() as u64,
-            given,
-            entries: spent,
-            next: if given as usize == names.len() { UNKNOWN } else { given },
+        // Where to resume. ⚠️ A name given only in part leaves the answer incomplete even when
+        // every name was reached, so the continuation is *that* name rather than the one after it —
+        // §17.22.2's bug was a truncated answer claiming nothing followed (§17.23.4).
+        let next = match (given as usize == names.len(), whole) {
+            (true, true) => UNKNOWN,
+            (_, true) => given,
+            (_, false) => given - 1,
         };
+        let covered = Batch { asked: names.len() as u64, given, entries: spent, next };
         let mut out = covered.args();
         out.append(&mut args);
         Response { id: 0, status: Status::Ok, args: out }
@@ -1003,17 +1011,17 @@ impl DN {
     /// One name's worth of a batch answer, and what it costs in entries.
     ///
     /// ⚠️ **Takes the name's shard lock** — see `look`.
-    fn piece(&self, name: &str, want: &Want, room: u64) -> Option<(u64, Vec<Arg>)> {
+    fn piece(&self, name: &str, want: &Want, room: u64) -> Option<Piece> {
         let shard = self.shards[shard_of(name)].lock().expect("objects");
         let object = shard.get(name)?;
         if want.detail == 0 {
-            return object.args(None).map(|args| (1, args));
+            return object.args(None).map(|args| Piece { entries: 1, whole: true, args });
         }
         // Room is what the limit has left, and an object costs at least its own entry, so a name
         // reached with no room to spare still gets its row and no streams.
         let levelled = detailed(object, want, room.max(1))?;
-        let entries = levelled.shape.entries;
-        Some((entries, levelled.args(HashMap::new())))
+        let (entries, whole) = (levelled.shape.entries, !levelled.shape.more());
+        Some(Piece { entries, whole, args: levelled.args(HashMap::new()) })
     }
 
     /// What an object is: id, stream, the SN holding it, the second it was made,
@@ -1044,6 +1052,14 @@ impl DN {
             next_stream: AtomicU64::new(1),
         }
     }
+}
+
+/// One name's worth of a batch answer: what it cost, whether it is all of that
+/// name, and the arguments themselves.
+struct Piece {
+    entries: u64,
+    whole: bool,
+    args: Vec<Arg>,
 }
 
 fn main() {
@@ -1418,7 +1434,21 @@ mod tests {
         let answer = batch_of(&dn, &["/n0", "/n1", "/n2"], Some(want));
         let (covered, _) = Batch::of_args(&answer.args).expect("a batch header");
         assert_eq!(covered.given, 1, "one name, whatever it cost");
-        assert_eq!(covered.next, 1, "and the caller carries on from the next");
+        // ⚠️ Not 1. That name got its object row and none of its streams, so the caller has to come
+        // back to *it* — resuming at name 1 would drop the rest of name 0 without saying so.
+        assert_eq!(covered.next, 0, "and the caller carries on from the name still owed to it");
+    }
+
+    /// A batch that reached every name and described each one whole says nothing follows, and that
+    /// is the only case that may say so (§17.23.4).
+    #[test]
+    fn a_finished_batch_is_the_only_one_that_says_nothing_follows() {
+        let dn = with_objects(2);
+        let want = Want { limit: 100, ..Want::plain().with(Detail::Streams) };
+        let answer = batch_of(&dn, &["/n0", "/n1"], Some(want));
+        let (covered, _) = Batch::of_args(&answer.args).expect("a batch header");
+        assert_eq!((covered.asked, covered.given), (2, 2));
+        assert_eq!(covered.next, UNKNOWN, "every name, every stream");
     }
 
     /// A batch cannot fan out for extents yet, and says which level it cannot give rather than

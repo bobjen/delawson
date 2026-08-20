@@ -1024,11 +1024,13 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
             let (messaging, prefix) = (Arc::clone(&shared), plan.prefix.clone());
             let (batch, depth, objects, timeout) =
                 (plan.batch, plan.depth, plan.objects, plan.timeout);
-            std::thread::spawn(move || -> Result<(u64, u64, Tally)> {
+            std::thread::spawn(move || -> Result<(u64, u64, u64, Tally)> {
                 let mut rng = Rng::from_seed(client as u64 + 1);
                 let mut conn = Conn::open(addr, timeout, &messaging)?;
                 let mut tally = Tally::new();
-                let (mut asked, mut found) = (0u64, 0u64);
+                // Three counts, not two: names asked, names the server *looked at*, and objects
+                // that existed. A miss is not a truncation and the report must not confuse them.
+                let (mut asked, mut given, mut found) = (0u64, 0u64, 0u64);
                 let mut sent: HashMap<u32, std::time::Instant> = HashMap::new();
                 loop {
                     while sent.len() < depth && std::time::Instant::now() < end {
@@ -1053,6 +1055,11 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
                         Some(at) => tally.add(at.elapsed()),
                         None => return Err(Error::new("unasked answer")),
                     }
+                    // ⚠️ Before the status check. A single lookup that missed still *looked at* the
+                    // name, and counting it only on `Ok` made every miss look like a truncation.
+                    if batch == 1 {
+                        given += 1;
+                    }
                     // ⚠️ Counted by parsing the rows, not by chopping the args into
                     // pieces of an assumed width. The assumed width was five and the
                     // row is eight, so this counted every object twice (§17.5g).
@@ -1066,7 +1073,9 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
                         let rows = if batch == 1 {
                             &answer.args[..]
                         } else {
-                            Batch::of_args(&answer.args)?.1
+                            let (covered, rows) = Batch::of_args(&answer.args)?;
+                            given += covered.given;
+                            rows
                         };
                         found += Described::all_of_args(rows)?
                             .iter()
@@ -1074,22 +1083,24 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
                             .count() as u64;
                     }
                 }
-                Ok((asked, found, tally))
+                Ok((asked, given, found, tally))
             })
         })
         .collect();
 
     let mut total = Tally::new();
-    let (mut asked, mut found) = (0, 0);
+    let (mut asked, mut given, mut found) = (0, 0, 0);
     for thread in threads {
-        let (mine, hit, tally) = thread.join().map_err(|_| Error::new("a client panicked"))??;
+        let (mine, seen, hit, tally) =
+            thread.join().map_err(|_| Error::new("a client panicked"))??;
         asked += mine;
+        given += seen;
         found += hit;
         total.merge(&tally);
     }
     let seconds = start.elapsed().as_secs_f64();
     println!(
-        "{} {asked} lookups in {seconds:.2} s: {:.0} per second, {found} found, \
+        "{} {asked} lookups in {seconds:.2} s: {:.0} per second, {given} answered, {found} found, \
          {} per request, {} clients x {} in flight",
         target.identity,
         asked as f64 / seconds,
@@ -1097,6 +1108,18 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
         plan.clients,
         plan.depth
     );
+    // ⚠️ The rate above counts names *asked*. When the entry limit truncates each batch the rest
+    // are never looked at, so the rate measures the truncation instead (§17.23.3, #97). A name that
+    // was looked at and did not exist is a miss, which is a different thing and not a warning.
+    if given < asked {
+        println!(
+            "{} the entry limit answered only {given} of {asked} names ({:.1}%), so the rate above \
+             counts asking rather than answering — raise info_entries above --batch {}",
+            target.identity,
+            100.0 * given as f64 / asked.max(1) as f64,
+            plan.batch
+        );
+    }
     println!(
         "{} per request: average {:.1} us, min {:.1} us, max {:.1} us",
         target.identity,

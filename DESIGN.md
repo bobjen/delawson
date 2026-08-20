@@ -16010,21 +16010,61 @@ that can return nothing is a limit that can make forward progress impossible.
 the single case. Asking a batch for extents is `Unimplemented` rather than silently ignored, because
 §9.1.3.12's fan-out is what makes extents affordable in a batch and it is not built (#96).
 
-#### 17.23.3 ⚠️ The benchmark now measures truncation, not lookup
+#### 17.23.3 ⚠️ The benchmark was measuring truncation, not lookup
 
-Live on a release cluster with `info_entries = 6`:
+**With the test cluster's `info_entries = 6`, `bench-info --batch 100` reported 2,464,449/s** — and the
+answer covered six of every hundred names. **That 6.0% is 6/100**: the limit doing its job, and the rate
+measuring the 94% it declined to do.
+
+**The benchmark now counts three things, because two was not enough:**
 
 | | |
 |---|---|
-| `bench-create --objects 2000 --batch 100` | 210,758/s |
-| `bench-info --batch 100` | 2,464,449/s, **295,770 found of 4,929,500** |
-| `bench-info --batch 1` | 43,978/s, 87,963 found |
+| **asked** | names put on the wire |
+| **answered** | names the server *looked at* — from `Batch.given`, or one per reply for a single lookup |
+| **found** | names that named an object |
 
-**That 6.0% is exactly 6/100** — the limit truncating every batch of 100 to six names. The limit is working
-as designed and the number is nonetheless a trap twice over:
+⚠️ **A miss is not a truncation**, and conflating them was the first thing this got wrong: counting a
+single lookup as answered only on `Ok` made every miss look like the limit truncating, reporting 0.2%
+answered when the true figure was 100%. `bench-info` now warns only when `answered < asked`, and names the
+knob to raise (#97).
 
-- **`bench-info` counts names *asked*, not names *answered*.** The rate is 2.5M/s of *asking*, which is a
-  57× "speedup" over `--batch 1` bought almost entirely by not doing the work (#97).
-- **Any batch benchmark is meaningless unless the limit exceeds the batch size**, which now includes #79's
-  re-measurement and #88's cross-session variance work. §17.19.2 already required both arms in one session
-  for the ±25% reason; they also need a limit large enough to reach the object.
+**And the test cluster's limit went to the design default of 10,000** (§9.1.3.7). Six was chosen to
+exercise truncation, but a config-level limit poisons every measurement taken against that cluster, while
+a **request-level** `--limit` exercises the same path on demand — `object-info --limit 1` still answers
+*"0 streams described, 1 entry, ask from record 0"*.
+
+**The honest baseline, release build, 2,000 objects, one stream each:**
+
+| | |
+|---|---|
+| `bench-info --batch 100` | **4,296,330 names/s**, spread 1.5% |
+| `bench-info --batch 1` | **123,081/s**, spread 1.6% |
+| the same batch at `info_entries = 6` | 5,703,769/s — *faster*, by answering 6% of it |
+
+That last row is the point: **the truncated configuration looked 33% better.** A benchmark that counts
+requests rather than work done rewards declining the work, which is worth remembering for #79's
+re-measurement and #88's variance hunt.
+
+#### 17.23.4 A partly-given name is a continuation, not a completed one
+
+⚠️ **Found while closing #80, and it is §17.22.2's bug again one level up.** The batch header said *"nothing
+follows"* whenever it had reached every name asked about — but a name is not necessarily *finished* just
+because it was *reached*. A name given its object row and none of its streams, because the limit ran out
+inside it, left the answer incomplete while the header claimed otherwise.
+
+**So the continuation distinguishes three cases**, and only the first may say nothing follows:
+
+| | `next` |
+|---|---|
+| every name reached, each described whole | nothing follows |
+| stopped before the end of the list | the **next** name's index |
+| ⚠️ reached the end but the last name is partial | **that** name's index, not the one after it |
+
+**A caller resuming at the third case re-asks that name**, and its own `Shape.next` says which
+object-local record to resume from — which is how #80 specified it: *"the continuation is the next name,
+with an extent range only in the mid-object case."*
+
+**Only the last name given can be partial.** An earlier one stopping short would have spent the whole limit
+and ended the loop, so `whole` is a single flag over the loop rather than a per-name field on the wire.
+That is §18's decompose-the-state rule paying off: one bit, not one per name.
