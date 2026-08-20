@@ -379,6 +379,11 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | An id mix-up is **loud as an address and silent as a map key**, which is most places | §8.1.6.1 |
 | **Wrap values; group parameters.** A run of same-typed arguments wants a struct, as `AppendBlock` was | §8.1.6.1, §17.13.3 |
 | ⚠️ `ROff` does **not** catch §17.16.2's three record spaces, and a partial fix that looks total is the risk | §8.1.6.1 |
+| An index and a count sharing a type make the max count **2^64 − 1**, or **2^64 − 2** with a sentinel | §8.1.6.2 |
+| Because **one past the end** must be representable, which §9.1.3's `next` computes on every answer | §8.1.6.2 |
+| ⚠️ So §6's **4 GB** logical cap is one byte outside the `u32` enforcing it — the code is right, the doc is round (#89) | §8.1.6.2 |
+| ⚠️ And `records = 0` already means *unknown* for an open extent, colliding with a real zero (#90) | §8.1.6.2 |
+| Which is the best argument for the newtypes: the type owns the **sentinel** and the **boundary arithmetic**, at `u64`'s size | §8.1.6.2 |
 | Because **double negatives read as emphasis of the negative** — a default of the language faculty, seen in novel languages | §4.1.1.0 |
 | Withdrawing a capability is **deferred**, but the **official flag stays permissive** until cleanup completes | §4.1.1.1 |
 | So the reliance rule is **unrepresentable to get wrong**: nothing can see a half-established restriction | §4.1.1.1 |
@@ -7401,6 +7406,78 @@ matters more than it might seem, because the danger of a partial fix is the conf
 `ROff` everywhere would make the read path *look* type-safe while the conversion that actually broke
 remained a matter of getting the arithmetic right.
 
+#### 8.1.6.2 One type for an index and a count costs one value, and a sentinel costs another
+
+**Because the same type serves as an index and as a count, the maximum count is not 2^64** (Asserted,
+Bob, 2026-08-19): it is **2^64 − 1**, or **2^64 − 2** if 2^64 − 1 means *no value given*. The same
+applies to every other space.
+
+The arithmetic, once, because it is easy to be off by one about being off by one:
+
+| | With no sentinel | With `MAX` meaning none |
+|---|---|---|
+| largest **count** | 2^64 − 1 | 2^64 − 2 |
+| largest valid **index** | 2^64 − 2 | 2^64 − 3 |
+| what **one past the end** is | 2^64 − 1, which is the count | 2^64 − 2 |
+
+**One past the end is why the count loses a value even without a sentinel.** It is not a curiosity:
+§9.1.3's `next` is *the record to ask for after this answer*, which after the last record is one past
+the end, and `first_record + records` is computed all over the read path. A count of exactly 2^64 would
+make that expression unrepresentable at the top of the range.
+
+⚠️ **For capacity this is immaterial and for the contract it is not.** Nobody will store 2^64 records.
+But §0's rule is that an unlabelled number is a liability, and "64-bit record number" (§3) invites the
+reading that the limit is 2^64 — which is wrong, and wrong in the direction that only shows up at the
+boundary, where nothing is ever tested.
+
+##### ⚠️ It exposes a cap this document states in a form the type cannot hold
+
+**§6 says an extent seals at "4 GB logical", and `LOff` is 32 bits.** 4 GB is 2^32; the largest value a
+`u32` holds is 2^32 − 1. So the cap as written is exactly one byte outside the type that enforces it.
+
+**The code is right and the document is round.** The EN's check is
+`extent.logical_end.plus(logical).is_err()`, with the comment that this is "the 4 GB logical cap
+enforcing itself through the type rather than by a constant" — so what is enforced is
+**logical_end ≤ 2^32 − 1**, a cap of 4 GiB *minus one byte*. The section boasting that the type enforces
+the cap is the section stating a cap the type cannot represent, which is a pleasing kind of wrong.
+
+Two ways out, and the choice is not obvious: **restate the cap as 2^32 − 1** and accept an unlovely
+number in §6, or **widen `LOff`** and let 4 GB be exactly 4 GB. §14.1.3's argument that a compressed
+length is four bytes inside §4.7's budget is about `COff`, not `LOff`, so widening is not free either
+(#89).
+
+##### ⚠️ And a sentinel already exists, spelled as zero, where it collides
+
+Today an extent still being appended to reports **`records = 0`** to mean *count unknown* — the SN says
+"the record count is zero unless the extent is sealed", and the FE reads it back as
+`self.records > 0 && …`. **That is the sentinel Bob is proposing, chosen at the wrong end of the
+range**, and zero is a value a count can legitimately take:
+
+| An extent with `records == 0` | Is |
+|---|---|
+| still open | count unknown |
+| sealed holding nothing | a real count of zero |
+
+The second is excluded today by other means — the FE treats `records == 0 && length == 0` as *this
+block will not fit an extent of its own* and refuses — so nothing is currently broken. **But the
+encoding cannot distinguish them**, so the exclusion is a property of the surrounding code rather than
+of the value, and it has to keep being true.
+
+##### Which is the strongest argument for the newtypes so far
+
+Put together, this is a better case for `ROff` and friends than catching mix-ups was:
+
+- **The type owns the sentinel.** `ROff::NONE` is `MAX`, `is_none()` asks, and nothing has to remember
+  that zero is special — because it stops being special.
+- **The type owns the boundary arithmetic.** `LOff::plus` already returns an error rather than wrapping,
+  with the comment that running out of positions "is the extent being full, which is a reason to seal it
+  and not a reason to wrap". One-past-the-end and the sentinel are exactly the same kind of rule, and
+  they belong in the same place.
+- **And it costs no memory, which `Option` would.** `Option<u64>` is 16 bytes where a sentinel is 8, and
+  §4.7 budgets ~100 bytes for an extent record — so the niche-free encoding matters against a budget
+  §14.1.2 says decides how many machines an object needs. A newtype gives `Option`-like ergonomics at
+  `u64`'s size.
+
 **The first row is the one to do, because the bug is not hypothetical.** §17.16.2 records it: three
 numbering spaces meet on the read path, all three are zero until an object outgrows its first extent,
 and **139 of 200 reads failed** the moment one did. §17.18 and §17.19 then found the same *class* of
@@ -12963,6 +13040,8 @@ Roughly in order of how much else depends on them.
      reason about and what the continuation is expressed in; bytes are what actually has to be bounded, and
      the two differ by whether an extent has 4 instances or 15 fragments after erasure coding (§4.3.2). The
      10,000 default is derived from a byte target, which is a hint that the byte form is the real one.
+     §8.1.6.2 adds a wrinkle either way: whichever unit it is in, the limit is an index-and-count sharing one
+     type, so its maximum is one or two below the type's.
 133. **What the short extents from truncation-sealing cost an SN** (§7.2.4, §8.1.7.4, §14.1; #56, #83). Sealing on
      truncation is what turns the IV rule into an invariant, and it makes primary stability a driver of
      **extent count** — which is what bounds an SN's memory. Nothing yet says how often a handover
