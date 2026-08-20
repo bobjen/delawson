@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-147 things *not* decided.
+148 things *not* decided.
 
 **Priorities and framing**
 
@@ -165,6 +165,13 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **No per-object ACL**: unbounded per-object metadata (§14.2), and S3 and GCS both shipped object ACLs and **deprecated** them for unauditability | §5.9.1a |
 | If policy needs a grouping the tree does not express, **the tree is wrong** — cheap here, since a directory is derived and renames move nothing | §5.9.1a, §5.1.2.2 |
 | **No deny rules**: composition is an alias AND the owner's ACL, and intersection is monotone, so any deny is a smaller grant | §5.9.1a, §5.1.1 |
+| **Ownership is a tree; reachability is a graph** — everything structural runs on the tree | §5.1.1.1a |
+| So **alias cycles are allowed**, bounded by keeping the aliases on the path and checking before recursing | §5.1.1.1a |
+| Every object has a **canonical path**, the alias-free one; scrub and billing use only those | §5.1.1.1a |
+| **Writable aliases** are allowed, and delete comes with write — so an alias's **grant** protects the target | §5.1.1.1a, §5.1.1.3 |
+| The split is **Unix's hard-link against symlink**, and the canonical path is POSIX's `realpath` | §5.1.1.1b |
+| Accounting on the owning tree is **AFS's volume quota**; **Tahoe-LAFS** shows the cost of cycles in the *reference* graph | §5.1.1.1b |
+| The one different idea — a **per-viewer mount table** — forbids nesting, so it duplicates per worker | §5.1.1.1b |
 | No-deny rests on **monotonicity**, not on how many policies compose — §5.1.1.1a unbounds the chain | §5.9.1a, §5.1.1.1a |
 | Sharing one object is an **event with an expiry**, not durable state — a capability, not an ACL | §5.9.1a, §9.1.3.5 |
 | The real boundary is **signed executables**, not absence of keys — which makes code signing load-bearing | §1.5 |
@@ -3424,6 +3431,65 @@ special handling for moves — all of which the new rules delete.**
 
 **A cycle also leaks nothing**, which removes the last worry: an alias is not a counted reference, so a
 loop of them holds no storage and keeps nothing alive.
+
+##### 5.1.1.1b Prior art: the split is Unix's, and the accounting is AFS's
+
+**§5.1.1.1a's design is the mainstream answer**, worth establishing because the rule set looks permissive
+next to what it replaced.
+
+⚠️ **The tree/graph split is exactly Unix's hard-link/symlink split**, and Unix drew the line in the same
+place for the same reason:
+
+| | Counted? | Cycles | DeLawson's equivalent |
+|---|---|---|---|
+| **hard link** | yes, an inode refcount | **impossible** — forbidden to directories, precisely because they would make the namespace a graph and break `..`, `fsck` and recursive delete | a shared **stream or extent** (§4.6.1), counted by §4.6.6 |
+| **symlink** | **no** | **allowed**, bounded at resolution | an **alias** |
+
+**So "ownership is a tree, reachability is a graph" is the rule Unix already lives by** — and forbidding
+hard links to directories was the same instinct §5.1.1.1 had, correctly applied to *references* and
+wrongly extended to *views*. **The canonical path also has a standard name**: POSIX `realpath()` is
+exactly "resolve every symlink and give me the alias-free path".
+
+##### Accounting: AFS charged the volume, not the mount point
+
+**AFS mounts volumes into a namespace and charges quota to the volume**, so mounting one elsewhere does
+not move who pays. That is §5.1.1.1a's canonical-path billing in different words, from a system that ran
+at scale for decades — a volume is the owning tree, a mount point is the alias.
+
+⚠️ **The sharper comparison is Tahoe-LAFS, because it shows what DeLawson avoided.** Tahoe's directories
+are capabilities embeddable in one another, so its cycles are in the **reference** graph — and refcounts
+cannot collect a cycle, so Tahoe uses **leases with expiry** instead. **DeLawson keeps refcounts precisely
+because its cycles are confined to the view graph**, which is what "an alias is not a counted reference"
+buys. The load-bearing consequence of the decomposition, demonstrated by a system that paid the other way.
+
+##### The one genuinely different idea, and why it does not fit
+
+**A per-viewer mount table**: Plan 9 builds a namespace per process from binds, and HDFS's ViewFs does the
+same with a client-side mount table mapping paths to namenodes. **Cycles become impossible by
+construction**, because each viewer's table is flat and finite rather than nested.
+
+⚠️ **It fails the requirement directly.** A flat table means each worker names the shared foundation
+itself — `/shared → gorilla:/`, `/foundation → other:/` — so **every worker's table repeats every
+entry**, which is *"that shouldn't be duplicated per worker"* exactly. **Nesting is what stops the
+duplication and a flat table is what forbids nesting**; they cannot both be had.
+
+**Two more that do not transfer**, recorded so nobody re-derives them:
+
+- **Content-addressed pinning** (git submodules): a cycle would need something containing the hash of a
+  thing containing its own hash, so cycles are impossible. It works because a submodule names an
+  *immutable version*, and an alias is a live view.
+- **No hierarchy at all** (S3, GCS): cross-account access is policy plus roles, with no mounts to alias.
+  A data point about necessity rather than an option, since §5.1 has a real hierarchy.
+
+##### Two things worth borrowing
+
+- **A depth cap *underneath* the path set.** Unix has `ELOOP` **as well as** visited sets in tools,
+  because a tool that forgets its set should still terminate. It costs nothing when the set works and
+  turns a hang into an error when a traversal is written wrongly — §17.12.1's structural instinct applied
+  to a backstop.
+- ⚠️ **`realpath` as a user-visible operation.** If canonical paths decide who is charged and what the
+  scrub examines, then *"what is the canonical path of this"* is a question with consequences. POSIX
+  exposes it; DeLawson probably should (§16.148).
 
 ##### 5.1.1.2 Aliases are why a cross-ring clone may copy
 
@@ -13660,6 +13726,13 @@ Roughly in order of how much else depends on them.
      own quota. Note what canonical-paths-only still counts: several streams referencing one extent and
      several objects referencing one stream (§4.6.1) are genuine references and are divided by §12.6.3. It is
      only the alias that is not one.
+
+148. **Whether `realpath` is a user-visible operation** (§5.1.1.1b, §5.1.1.1a). Canonical paths now decide
+     who is billed and what the scrub examines, so *"what is the canonical path of this"* becomes a question
+     with consequences — and POSIX exposes exactly that. ⚠️ Against it: a canonical path names a directory in
+     **another tenant's** tree, so answering reveals structure the owner may not have shared. The likely
+     resolution is a scoped answer — the canonical path as far as your own grants reach, and told that it
+     continues — but that is a guess, and the leak is the reason to settle it before building it.
 
 **Closed** since earlier drafts:
 
