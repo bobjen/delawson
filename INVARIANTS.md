@@ -378,9 +378,9 @@ one stream in a thousand and held inline is paid for by all of them. The failure
 than a bug: fields drift from rare to common while still costing an indirection, and nothing notices
 without the count.
 
-**`A-PROMISE-FLAG-LOOSENS-CHEAPLY-AND-TIGHTENS-SLOWLY`** — turning a stream promise off is O(1) and
-costs only the omissions. Turning one on is O(1) to *enforce* and needs a background pass to become
-*valid*.
+**`A-CAPABILITY-RESTORES-CHEAPLY-AND-WITHDRAWS-SLOWLY`** — restoring a stream capability is O(1) and
+costs only the omissions. Withdrawing one starts refusing operations at O(1) and needs a background pass
+before the official flag may flip.
 *Argued* §4.1.1.1 · *Enforced* design only · *Checked* not yet
 *Breaks* the two directions get treated alike. Making loosening hard is pointless — the store loses
 nothing by it — while making tightening instant is unsound, because existing data may already violate
@@ -393,19 +393,29 @@ natural implementation folds the log into the base and writes out the survivors,
 *Checked* not yet — and this wants a test rather than a comment, because the violating implementation is
 the obvious one
 *Breaks* every offset above the deleted record moves, so the exact prefix sum
-`OMISSIONS-NEED-THE-ALWAYS-STATE` guards is wrong, and every external index built on an offset is silently
+`THE-OFFICIAL-FLAG-STAYS-PERMISSIVE-UNTIL-CLEANUP-ENDS` guards is wrong, and every external index built on an offset is silently
 invalidated. Note this is the byte-space twin of `UPDATE-DELETE-PRESERVE-COUNTS`: one keeps the number,
 the other keeps the width.
 
-**`OMISSIONS-NEED-THE-ALWAYS-STATE`** — machinery may be skipped on the strength of a promise flag only
-at **`always`**, never at **`henceforth`**.
-*Argued* §4.1.1.1, §9.1.3.9 · *Enforced* design only · *Checked* not yet — and the test that matters
-sets a flag on a stream that already violates it, then confirms nothing is skipped until the pass has run
-*Breaks* the omission is taken while old data still violates the promise: a log probe skipped over
+**`THE-OFFICIAL-FLAG-STAYS-PERMISSIVE-UNTIL-CLEANUP-ENDS`** — a capability flag such as `deletable`
+reads permissive for the whole of a withdrawal, and flips only when the cleanup pass has finished.
+*Argued* §4.1.1.1 · *Enforced* design only · *Checked* not yet — the test sets a withdrawal in motion on a
+stream that already violates the restriction and confirms the flag still reads permissive
+*Breaks* an omission gets taken while old data still violates the restriction: a log probe skipped over
 existing tombstones returns deleted records, and an exact prefix sum trusted before recomputation is
-simply wrong. ⚠️ An earlier version of this entry said the flag was one-way, which was wrong in both
-directions — loosening is cheap, and tightening is the deferred one. Oracle's optimizer may likewise only
-rely on a `VALIDATE`d constraint, never a `NOVALIDATE` one.
+simply wrong. ⚠️ **The point of the invariant is that it makes that unrepresentable** rather than
+forbidden — nothing can observe a half-established restriction, so nothing has to remember not to trust
+one. Enforcement reads the per-purpose flag in the extra structure instead, which is optimistic on
+purpose. Two earlier drafts got this wrong in opposite ways: one made the flag one-way, the other made it
+three-valued and relied on readers checking the state.
+
+**`A-FLAG-NAME-IS-NOT-A-NEGATION`** — no flag is named `un-`, `no-` or `-disallowed`. Capabilities are
+named positively and negated at the point of use.
+*Argued* §4.1.1.0 · *Enforced* by review · *Checked* greppable, and cheap to check
+*Breaks* every reader hits a double negative at each negation, and double negatives are read as
+**emphasis of the negative** rather than as a positive — apparently a default of the language faculty,
+since it recurs in novel languages. So the wrong reading is fluent and the mistake is silent. `sealed`
+passes the rule: it is a restriction but not morphologically a negation, so `!sealed` is unambiguous.
 
 **`UPDATE-DELETE-PRESERVE-COUNTS`** — update and delete never change any cumulative record count and
 never reopen a sealed extent.
@@ -714,7 +724,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **key** (record key) | §3 | `RECORD-NUMBER-STABLE` (by contrast — keyed objects have no positional address), `UPDATE-DELETE-PRESERVE-COUNTS` |
 | **key** (cryptographic) | §7.3 | `KEY-AND-SALT-COVER-ONE-PLAINTEXT`, `KEYS-NEVER-WHERE-USER-CODE-RUNS`, `DISK-KEYS-ONLY-ON-ENS`, `EXTENT-KEY-FROM-CREATING-SN`, `NO-TWO-SEGMENTS-SHARE-A-NONCE`, `MASTER-KEYS-ARE-NEVER-PRUNED`, `UNLOCKING-KEY-IS-GENERATED`, `SHARDS-ARE-NOT-STORED-WITH-THE-HARDWARE` |
 | **tombstone** | §8.3 | `A-TOMBSTONE-KEEPS-ITS-WIDTH`, `UPDATE-DELETE-PRESERVE-COUNTS` |
-| **stream flag** | §4.1.1 | `A-PROMISE-FLAG-LOOSENS-CHEAPLY-AND-TIGHTENS-SLOWLY`, `OMISSIONS-NEED-THE-ALWAYS-STATE`, `A-TOMBSTONE-KEEPS-ITS-WIDTH`, `RARE-AND-TRANSIENT-FIELDS-GO-OUT-OF-LINE` |
+| **stream flag** | §4.1.1 | `A-CAPABILITY-RESTORES-CHEAPLY-AND-WITHDRAWS-SLOWLY`, `THE-OFFICIAL-FLAG-STAYS-PERMISSIVE-UNTIL-CLEANUP-ENDS`, `A-FLAG-NAME-IS-NOT-A-NEGATION`, `RARE-AND-TRANSIENT-FIELDS-GO-OUT-OF-LINE` |
 | ⚠️ **logical offset** | §8.1.6, §8.2.2 | `LOGICAL-OFFSETS-DENSE`, `CANONICAL-OFFSET-SPACE`, `FIXED-OFFSET-ADVANCES`, `OFFSET-SNAPS-FORWARD`, `EXTENT-OFFSET-WRITE-ONCE`, `ONE-UNSEALED-EXTENT-UNKEYED`. *Measured in canonical length-stuffed bytes, not in the stored framing.* |
 | **media class** | §7.4 | `ONE-MEDIA-CLASS-PER-EXTENT` |
 | **object** | §3 | `READ-NAMES-THE-OBJECT`, `RECORD-NUMBER-STABLE`, `HINT-BOUND-BY-CAPABILITY`, `CAPABILITY-IS-MEMBERSHIP-ONLY`, `ZERO-REFERENCES-IS-A-BUG`, `ONE-UNSEALED-EXTENT-UNKEYED` |
@@ -729,7 +739,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **reference** | §4.6 | `NO-CLUSTER-NAMES-IN-DATA-PLANE`, `REVERSE-EDGE-IS-A-COUNT`, `COUNTS-ARE-RECOMPUTABLE`, `ZERO-REFERENCES-IS-A-BUG`, `POSITION-FACTS-IN-REFERRER`, `REVENUE-INVARIANT-UNDER-REGROUPING` |
 | **seal** (extent) | §6 | `EXTENT-SEALS-BETWEEN-RECORDS`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATION-SEALS`, `SEALED-EXTENT-IMMUTABLE`, `RECORD-NUMBERS-DENSE`, `UNAPPENDABLE-EXTENT-SEALS`, `SEAL-CLOSES-TOP-DOWN`, `REQUESTED-SEAL-DISCARDS-NOTHING`, `SEAL-REQUESTS-ARE-IDEMPOTENT` |
 | **seal** (wire segment) | §17.5a | `NO-TWO-SEGMENTS-SHARE-A-NONCE`. ⚠️ *An unrelated sense of the word; `common/src/seal.rs` is this one.* |
-| **stream** | §4.1 | `STREAM-IDENTITY-OWNED`, `SN-NOT-IN-WRITE-PATH`, `ONE-REQUEST-IN-FLIGHT-PER-STREAM`, `EXTENT-KEY-FROM-CREATING-SN`, `READ-NAMES-THE-OBJECT`, `OMISSIONS-NEED-THE-ALWAYS-STATE` |
+| **stream** | §4.1 | `STREAM-IDENTITY-OWNED`, `SN-NOT-IN-WRITE-PATH`, `ONE-REQUEST-IN-FLIGHT-PER-STREAM`, `EXTENT-KEY-FROM-CREATING-SN`, `READ-NAMES-THE-OBJECT`, `THE-OFFICIAL-FLAG-STAYS-PERMISSIVE-UNTIL-CLEANUP-ENDS` |
 | **summary** | §4.5 | `TAIL-ONLY-SUMMARIES-EXACT`, `UNKEYED-COUNT-EXACT`, `COUNTS-ARE-RECOMPUTABLE` |
 | **watermark** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `SEAL-NEVER-BELOW-DURABLE`, `INCOMPLETE-RECORD-NOT-DURABLE` |
 

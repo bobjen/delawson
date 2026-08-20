@@ -361,21 +361,25 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | `object-info` is **extended, not replaced**, and bounded by **one entry limit** over objects + streams + extents (default **10,000**) | §9.1.3.7 |
 | **HDFS scans** its block list to find an offset — 2 × 10^9 blocks at 256 PB, the same number §14.1 reaches | §9.1.3.8 |
 | Which is §4.5's rule with the counterfactual attached: locating by **record** is a descent, locating by **byte** is a walk | §9.1.3.8, §4.5 |
-| **Streams carry flags**, and "updates disallowed" is one — a *declared* guarantee, not an observed one | §9.1.3.9 |
+| **Streams carry flags**, and `updatable` is one — a *declared* guarantee, not an observed one | §9.1.3.9 |
 | With it, and **tombstones retaining their original logical length**, the logical prefix sum is tail-only and may be exact | §9.1.3.9 |
 | So the byte space behaves as the number space already does: a dead record keeps its **number and its width** | §9.1.3.9, §3 |
 | Preserving a width **costs no space** — a logical offset is a name (§8.2.2), so compaction still reclaims the bytes | §9.1.3.9 |
 | The snap rule ignores liveness, or a delete would move a partition boundary | §9.1.3.9, §9.1.3.4 |
-| A promise flag is **three states, not a boolean**: `off`, `henceforth` (O(1)), `always` (after a pass) | §4.1.1.1 |
-| Named for the **scope of the promise**, because Oracle's `ENABLE NOVALIDATE` buries that under a double negative | §4.1.1.1 |
-| Which is **Bob's own Oracle feature**, so the pattern is first-hand rather than matched from the literature | §4.1.1.1 |
-| **"Deletes disallowed"** is a second promise flag: no *record* deletes, while dropping the whole stream stays possible | §9.1.3.10 |
+| Flags are named for the **capability**, never its absence: `deletable`, not `undeletable` | §4.1.1.0 |
+| Because **double negatives read as emphasis of the negative** — a default of the language faculty, seen in novel languages | §4.1.1.0 |
+| Withdrawing a capability is **deferred**, but the **official flag stays permissive** until cleanup completes | §4.1.1.1 |
+| So the reliance rule is **unrepresentable to get wrong**: nothing can see a half-established restriction | §4.1.1.1 |
+| **Enforcement is optimistic and reliance is conservative** — two views that want opposite biases | §4.1.1.1 |
+| `off`/`henceforth`/`always` is **vocabulary for a transition**, not values in a record | §4.1.1.1 |
+| The pattern is Oracle's `ENABLE NOVALIDATE`, which is **Bob's own feature** — so it is first-hand rather than matched from the literature | §4.1.1.1 |
+| **`deletable`** is a second capability flag: withdrawing it bars *record* deletes, while dropping the whole stream stays possible | §9.1.3.10 |
 | It buys **no log to probe** on every read, no deletion-driven compaction, and no churn against the repair reserve | §9.1.3.10 |
 | ⚠️ Its cleanup pass is a compaction, and compaction must **preserve tombstone widths** — the two passes' natural implementations break each other | §9.1.3.10, §9.1.3.9 |
 | Stream metadata has a **normal size plus a flag and extra structure** for the rare and the transient | §4.1.2 |
 | Which makes the promise flags nearly free: only the middle state needs a cursor, and it is **transient by construction** | §4.1.2 |
 | **Count the streams with extra structure** — if most have it, the normal size is wrong | §4.1.2 |
-| **Loosening is cheap, tightening is deferred** — and an omission needs `always`, never `henceforth` | §4.1.1.1 |
+| **Restoring a capability is cheap, withdrawing it is deferred** | §4.1.1.1 |
 | Large objects are built by **parallel partitions, sealed, then concatenated** | §8.6.1 |
 | **Trilemma**: parallel bandwidth, dense stable offsets, monotone time index — pick two | §8.6.2 |
 | The recursion to DN **attenuates** by fan-out; the rule is **spray per writer, not per request** | §8.6.4 |
@@ -1561,35 +1565,69 @@ turned off:
 |---|---|---|---|
 | **state** | something that has happened | no, but only because the event cannot un-happen | `sealed` (§6.3) |
 | **policy** | what the system should do | **yes** — a policy is meant to be changed | storage class (#74), soft-delete opt-out (§8.4), expiry (§8.5) |
-| **promise** | what will *never* happen to this stream | ⚠️ **no** — see below | `updates disallowed` (§9.1.3.9), `deletes disallowed` (§9.1.3.10) |
+| **capability** | whether something may ever happen to this stream | **yes**, and asymmetrically — see §4.1.1.1 | `updatable` (§9.1.3.9), `deletable` (§9.1.3.10) |
 
-**A promise flag is the interesting kind, and it is new with those two.** What it buys is not a
-behaviour but an **omission**: because the thing can never happen, machinery that would have coped with
-it can be skipped, and readers can rely on properties that would otherwise be unprovable.
+**A capability flag is the interesting kind, and it is new with those two.** What *withdrawing* one buys
+is not a behaviour but an **omission**: because the thing can never happen, machinery that would have
+coped with it can be skipped, and readers can rely on properties that would otherwise be unprovable.
 
-##### 4.1.1.1 A promise is three states, not a boolean, and the asymmetry is which way is cheap
+##### 4.1.1.0 Flags are named for the capability, never for its absence
 
-⚠️ **An earlier draft of this section said a promise flag must be one-way — settable and never
-clearable. That is wrong in both directions** (Asserted, Bob, 2026-08-19).
+**Base flags are positive: `deletable`, not `undeletable`** (Asserted, Bob, 2026-08-19). The rule is
+about the reader's parser rather than about tidiness:
 
-> **Not-allowed to allowed is cheap.** Tightening is the slow one, and it is *deferred*: start enforcing
-> the rule, run a lazy cleanup pass over what is already there, and only then is the rule valid of
-> everything.
+> ⚠️ **Double negatives are read as emphasis of the negative, not as a positive.** It appears to be a
+> feature of the built-in human language machinery — it shows up frequently in **novel** languages,
+> which is the strong evidence, since a pattern that reappears in creoles is a default of the language
+> faculty rather than a learned quirk of any one tongue.
 
-So a promise flag has **three states**, and what may be relied on differs in each:
+So `!undeletable` does not read as *deletable*; it reads as *really not deletable*. A codebase with
+negative flag names is asking every reader to fight their native parser at every negation, and the
+mistakes are silent because the wrong reading is fluent.
 
-| State | Enforced on new writes? | True of existing data? | Cost to enter |
-|---|---|---|---|
-| **`off`** | no | — | — |
-| **`henceforth`** | **yes** | not yet known | **O(1)** — flip it |
-| **`always`** | yes | **yes** | a background pass over the stream |
+**The rule states precisely as: a flag name must not itself be a negation** — no `un-`, no `no-`, no
+`-disallowed`. That is narrower than "positive" and it is what actually matters, which is why `sealed`
+passes: it is not morphologically a negation, so `!sealed` reads unambiguously even though the concept
+is a restriction.
 
-⚠️ **The names are deliberately not Oracle's** (Asserted, Bob, 2026-08-19: "enable-novalidate, which
-isn't a good name"). `ENABLE NOVALIDATE` buries the useful fact under a double negative bolted onto an
-enable, and the useful fact is **the scope of the promise** — which data it covers. `henceforth` and
-`always` say that outright, sort by increasing strength, and make the reliance rule self-evident: an
-omission needs `always`. A stream reads as *updates disallowed: henceforth*, and later as *updates
-disallowed: always*.
+⚠️ **And it is why this document's prose and the code's identifiers differ deliberately.** The sections
+below argue about *updates being disallowed*, because that is the property being reasoned about; the
+flag is `updatable`, because that is what will be read in a condition. Keeping both is better than
+forcing either to serve the other.
+
+##### 4.1.1.1 Withdrawing a capability is deferred, and the official flag stays permissive throughout
+
+⚠️ **An earlier draft said a capability flag must be one-way — withdrawable and never restorable. That
+is wrong in both directions** (Asserted, Bob, 2026-08-19).
+
+> **Restoring a capability is cheap.** Withdrawing it is the slow one, and it is *deferred*: start
+> refusing new operations, run a lazy cleanup pass over what is already there, and only then does the
+> restriction hold of everything.
+
+**But that is a description of a transition, not a three-valued flag** (Asserted, Bob, 2026-08-19), and
+the distinction is what makes it safe. There will be many such flags and this will be done many times,
+so the mechanism has to be uniform and cheap to read:
+
+| | Says | Consulted by |
+|---|---|---|
+| the **official flag** — `deletable` | **still permissive** for the whole transition, flipping only when cleanup completes | **anything relying on the restriction** |
+| a **per-purpose flag** in the extra structure (§4.1.2) | new deletes are being refused, and how far cleanup has reached | **enforcement**, and the pass itself |
+
+⚠️ **So the reliance rule needs no discipline: it is unrepresentable to get wrong.** A reader consulting
+`deletable` and finding it false may take every omission, unconditionally, because the flag does not
+advertise the restriction until it is true of all the data. Nothing ever has to remember not to trust a
+half-established promise, because nothing can see one.
+
+**That splits two views that were being conflated**, and they want opposite biases:
+
+| View | Bias | Why |
+|---|---|---|
+| **enforcement** | **optimistic** — refuse new operations at once | every operation refused now is one the cleanup pass will not have to clean |
+| **reliance** | **conservative** — assume the capability remains | an omission taken too early reads over data that still violates the restriction |
+
+**`off` / `henceforth` / `always` remain the vocabulary for describing where a transition has got to**,
+and they are used that way throughout the sections below — but they are not flag values. The flag is
+`deletable`; `henceforth` is a sentence about a stream, not a state in its record.
 
 **Cited: this is Oracle's constraint state machine**, and the correspondence is exact rather than
 loose. Oracle separates `ENABLE`/`DISABLE` from `VALIDATE`/`NOVALIDATE`, and the standard migration is
@@ -8826,8 +8864,8 @@ was worth examining rather than dismissing.
 
 #### 9.1.3.9 A stream flag buys exact offsets, provided a tombstone keeps its width
 
-**Streams will carry a number of flags, and "updates disallowed" can be one of them** (Asserted, Bob,
-2026-08-19). That is what makes §9.1.3.8's subclass a *declared* property rather than an observed one,
+**Streams will carry a number of flags, and `updatable` can be one of them** (Asserted, Bob,
+2026-08-19) — withdrawn, so that updates are refused. That is what makes §9.1.3.8's subclass a *declared* property rather than an observed one,
 which matters: a reader can be told the guarantee holds, instead of the store having to notice that no
 update has happened yet and hope none does.
 
@@ -8868,7 +8906,9 @@ invariant rather than a remembered one.
 
 Two consequences that are easy to get wrong:
 
-- ⚠️ **The exact sum may only be trusted at `always`**, never at `henceforth` (§4.1.1.1). Setting the flag is O(1) and binds new writes at once, but an object updated in the past
+- ⚠️ **The exact sum may only be trusted once `updatable` is actually false** (§4.1.1.1). The flag stays
+  true for the whole transition, so this needs no care: while the recomputation pass runs, nothing says
+  the sums are exact. Setting the flag is O(1) and binds new writes at once, but an object updated in the past
   has a prefix sum that is already wrong — so the background pass that recomputes it is what makes the
   guarantee true, exactly as Oracle's optimizer may only rely on a validated constraint. Loosening the
   flag again is cheap for the store and expensive for whoever built an index on the offsets.
@@ -8893,26 +8933,26 @@ lets a stream be referenced from more than one place, so **a shared stream with 
 all of its referrers, and a shared stream without it cannot be used by an object that wants the
 guarantee** (§16.139).
 
-#### 9.1.3.10 "Deletes disallowed", and the compliance claim it encodes
+#### 9.1.3.10 Withdrawing `deletable`, and the compliance claim it encodes
 
-**"Deletes disallowed" is another such flag** (Asserted, Bob, 2026-08-19), and what motivates it is a
-compliance observation rather than a performance one:
+**`deletable` is another such capability** (Asserted, Bob, 2026-08-19), and what motivates withdrawing
+it is a compliance observation rather than a performance one:
 
 > **GDPR requires deletes of user data, but a stream with no user data will never have a GDPR delete,
 > and can be marked as knowing that.**
 
-⚠️ **What it must mean, precisely, or it is a compliance hazard rather than a feature.** The flag
-forbids **record-level** deletion within the stream. It does **not** make the stream undeletable —
-dropping the whole object or stream stays possible, and must, or a flag meant to be irrelevant to
-erasure law would create the exact problem it claims not to have.
+⚠️ **What it must mean, precisely, or it is a compliance hazard rather than a feature.** Withdrawing
+`deletable` bars **record-level** deletion within the stream. It does **not** make the stream itself
+undeletable — dropping the whole object or stream stays possible, and must, or a flag meant to be
+irrelevant to erasure law would create the exact problem it claims not to have.
 
-| | Allowed under the flag? |
+| | Allowed with `deletable` withdrawn? |
 |---|---|
 | tombstone one record (§8.3) | **no** |
 | delete the whole object or stream (§8.4) | **yes** |
 | expiry firing on the whole object (§8.5) | **yes** |
 
-**What the promise buys is omission** (§4.1.1), and the list is longer than it looks, because
+**What the withdrawal buys is omission** (§4.1.1), and the list is longer than it looks, because
 record deletion is what several mechanisms exist to cope with:
 
 - **No tombstones, so no log.** §4.2's extents are base plus a lazily-created log; a stream taking
@@ -8926,7 +8966,7 @@ record deletion is what several mechanisms exist to cope with:
 - **The soft-delete machinery does not apply** at record level — §8.4's deferred decrement, the
   three-day window, §8.4.1b's hard-delete brake all exist to make record deletion safe.
 
-⚠️ **And with both flags at `always`, hints get much longer-lived**, which is the dividend worth noticing.
+⚠️ **And with both capabilities withdrawn, hints get much longer-lived**, which is the dividend worth noticing.
 §8.1.1a-10 makes hint lifetime "a compaction-policy number", since a hint dies when its extent is
 rewritten. A stream that never updates and never deletes is rewritten only for tiering, so **its hints
 outlive §10.1's ten-minute window by a wide margin** — moving §8.1.1a-10's middle reference tier close
@@ -8937,14 +8977,14 @@ to the durable one, for exactly the objects least likely to change.
 §4.1.1.1's three states are not an abstraction over these two flags; each has a concrete pass, and they
 are different work:
 
-| Flag | Entering `henceforth` | The pass that reaches `always` |
+| Withdrawing | Refusing new operations begins | The pass that lets the official flag flip |
 |---|---|---|
-| **updates disallowed** | refuse new updates | **recompute** the logical prefix sums, which past updates may have shifted |
-| **deletes disallowed** | refuse new deletes | **compact away** the existing tombstones and logs, after which there is no log to probe |
+| **`updatable`** | refuse new updates | **recompute** the logical prefix sums, which past updates may have shifted |
+| **`deletable`** | refuse new deletes | **compact away** the existing tombstones and logs, after which there is no log to probe |
 
 **So "lazy cleanup" is literal for deletes and figurative for updates** — one removes data that violates
 the promise, the other recomputes a summary the violations invalidated. Both are background passes over
-the stream, and neither blocks the O(1) transition into `henceforth`.
+the stream, and neither blocks the O(1) start of refusing new operations.
 
 ⚠️ **Which means the deletes pass has an interaction worth flagging: it is a compaction, and compaction
 must preserve tombstone widths** (§9.1.3.9). Compacting away a tombstone's *bytes* is the point;
@@ -8953,10 +8993,10 @@ two passes therefore have to agree, and the natural implementation of each break
 
 ##### Getting the claim wrong
 
-The flag asserts a fact about the **data** — that it holds nothing anyone may demand the erasure of —
-and that is a judgement by whoever creates the stream, which the store cannot check. If it turns out
-wrong, the remedy is cheap by §4.1.1.1: **loosen the flag and delete the record.** Nothing has to be
-rebuilt, because loosening costs only the omissions.
+Withdrawing `deletable` asserts a fact about the **data** — that it holds nothing anyone may demand the
+erasure of — and that is a judgement by whoever creates the stream, which the store cannot check. If it
+turns out wrong, the remedy is cheap by §4.1.1.1: **restore `deletable` and delete the record.** Nothing
+has to be rebuilt, because restoring a capability costs only the omissions.
 
 **So the default is off, and setting it is a deliberate act.** It is right for derived data, telemetry,
 indexes and aggregates — the things that are regenerable and hold nobody's personal data — and wrong by
@@ -12759,7 +12799,7 @@ Roughly in order of how much else depends on them.
      way a bug elsewhere is not. If it is declined, §7.3.2.7's attack is an accepted risk whose controls
      are physical security, attestation and audit — none of them cryptographic.
 
-139. **Where the "updates disallowed" flag is declared, and what a shared stream does about it**
+139. **Where the `updatable` flag is declared, and what a shared stream does about it**
      (§9.1.3.9, §5.11.3.4). ✅ **The substance is settled**: streams carry flags, one of them disallows
      updates, and with tombstones retaining their original logical length the prefix sum is tail-only and
      may be exact — so a bare object offset becomes a descent rather than HDFS's walk (§9.1.3.8). What is
@@ -12769,7 +12809,7 @@ Roughly in order of how much else depends on them.
      every referrer, and one without it cannot serve an object that wants the guarantee. Also open, and
      more likely to be got wrong: **§10's compaction must preserve the widths of tombstoned records**, and
      the natural implementation closes the gaps instead — which is sharpest where §9.1.3.10's
-     deletes-disallowed cleanup pass *is* a compaction, so the two flags' validation passes have to agree
+     `deletable` cleanup pass *is* a compaction, so the two flags' cleanup passes have to agree
      and each one's obvious implementation violates the other.
 
 140. **Which tier holds a stream's promise flags, and how the two are reconciled** (§4.1.2, §9.1.3.9,
