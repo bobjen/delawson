@@ -15,7 +15,7 @@ use common::config::Compress;
 use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
 use common::info::{Batch, Described, ExtentRow, Shape, StreamRow, UNKNOWN};
-use common::placement;
+use common::placement::{self, Expansion};
 use common::random::Rng;
 use common::range::{Budget, Covered, Detail, Piece, Range, Start, Want};
 use common::wire::{Arg, Op, Request, Response, Status};
@@ -709,9 +709,11 @@ fn run(cli: Cli) -> Result<()> {
                     };
                     record(&target, Framing::parse(framing)?, want, &answer)
                 }
-                (_, Op::ObjectInfo | Op::CreateObject) => object(&target, &answer),
+                (_, Op::ObjectInfo | Op::CreateObject) => {
+                    object(&target, &answer, cluster.extents.expansion())
+                }
                 (Cmd::BatchObjectInfo { paths, want, .. }, Op::BatchInfo) => {
-                    batch(&target, paths, !want.is_empty(), &answer)
+                    batch(&target, paths, !want.is_empty(), &answer, cluster.extents.expansion())
                 }
                 _ => report(&target, &answer),
             }
@@ -1225,11 +1227,11 @@ fn receipt(target: &Target, response: &Response) -> Result<()> {
 
 /// What an object is, which is what both a lookup and a create answer with. Seven
 /// numbers read as one line.
-fn object(target: &Target, response: &Response) -> Result<()> {
+fn object(target: &Target, response: &Response, expansion: Expansion) -> Result<()> {
     // A plain answer is the row alone; a levelled one leads with its shape, so which
     // it is comes from whether the row parses at the front (§9.1.3.2).
     if let Ok((Some(it), [])) = Described::of_args(&response.args) {
-        return say(target, &it, None, &[]);
+        return say(target, &it, None, &[], expansion);
     }
     let Ok((shape, rest)) = Shape::of_args(&response.args) else {
         return report(target, response);
@@ -1251,7 +1253,7 @@ fn object(target: &Target, response: &Response) -> Result<()> {
     if !rest.is_empty() {
         return report(target, response);
     }
-    say(target, &it, Some(shape), &streams)
+    say(target, &it, Some(shape), &streams, expansion)
 }
 
 /// Several objects, in the order asked about, then what the answer did not cover.
@@ -1260,7 +1262,13 @@ fn object(target: &Target, response: &Response) -> Result<()> {
 /// what was asked for and carries no names at all (§17.23), so printing them side by side
 /// is the only way to see which object each row is — and getting that wrong silently is
 /// exactly the failure §17.12 warned about.
-fn batch(target: &Target, paths: &[String], levelled: bool, response: &Response) -> Result<()> {
+fn batch(
+    target: &Target,
+    paths: &[String],
+    levelled: bool,
+    response: &Response,
+    expansion: Expansion,
+) -> Result<()> {
     let (covered, rows) = match Batch::of_args(&response.args) {
         Ok(read) => read,
         Err(_) => return report(target, response),
@@ -1274,8 +1282,15 @@ fn batch(target: &Target, paths: &[String], levelled: bool, response: &Response)
     };
     for (n, piece) in pieces.iter().enumerate() {
         let name = paths.get(n).map(String::as_str).unwrap_or("?");
+        // ⚠️ A name nobody has is answered, not skipped, and it says so rather than printing
+        // its row of zeros — which is what it did until this line, and a batch of a thousand
+        // names with a typo in one was fifteen lines of unreadable numbers.
+        if absent(piece) {
+            println!("{name}: {} no object", target.identity);
+            continue;
+        }
         print!("{name}: ");
-        object(target, &Response { id: 0, status: Status::Ok, args: piece.to_vec() })?;
+        object(target, &Response { id: 0, status: Status::Ok, args: piece.to_vec() }, expansion)?;
     }
     let e = if covered.entries == 1 { "y" } else { "ies" };
     match covered.next {
@@ -1295,12 +1310,27 @@ fn batch(target: &Target, paths: &[String], levelled: bool, response: &Response)
     Ok(())
 }
 
+/// Whether a batch answer's slot is a name nobody has. The object row is the zeros
+/// `Described::missing` writes, whether or not a shape came first.
+fn absent(piece: &[Arg]) -> bool {
+    let row = match Shape::of_args(piece) {
+        Ok((_, rest)) => rest,
+        Err(_) => piece,
+    };
+    matches!(Described::of_args(row), Ok((None, _)))
+}
+
 /// An object, and whatever detail came with it.
+/// `expansion` is the storage class's ratio, which is how a physical size is arrived at — 4/1
+/// for four copies, 4/3 for 3+1 erasure coding. ⚠️ **Never the length of an extent's instance
+/// list**: that is what happens to be up right now, and billing charges the class
+/// (`BILLING-CHARGES-THE-CLASS-NOT-THE-COPIES`).
 fn say(
     target: &Target,
     it: &Described,
     shape: Option<Shape>,
     streams: &[(StreamRow, Vec<ExtentRow>)],
+    expansion: Expansion,
 ) -> Result<()> {
     let flavor = if it.keyed { "keyed" } else { "unkeyed" };
     println!(
@@ -1314,13 +1344,25 @@ fn say(
             UNKNOWN => "still growing".to_string(),
             n => format!("{n} records"),
         };
-        let of = match row.extents {
+        let of = match row.totals.extents {
             UNKNOWN => String::new(),
             n => format!(", {n} extents"),
         };
+        // The sizes, which is what a listing is for. ⚠️ Marked *so far* when the stream is
+        // still growing, because then they are a point in time rather than a total
+        // (§17.25.1) — a listing that cannot tell the difference is a listing that quietly
+        // under-reports every object still being written.
+        let asof = if row.records == UNKNOWN { " so far" } else { "" };
+        let sizes = match (row.totals.logical, row.totals.compressed) {
+            (UNKNOWN, _) | (_, UNKNOWN) => String::new(),
+            (logical, compressed) => format!(
+                ", {logical} bytes{asof}, {compressed} stored, {} billed",
+                row.totals.physical(expansion)
+            ),
+        };
         println!(
-            "  stream {} on SN{} from record {}, {records}{of}",
-            row.stream, row.sn, row.first_record
+            "  stream {} on SN{} from record {}, made in second {}, {records}{of}{sizes}",
+            row.stream, row.sn, row.first_record, row.created
         );
         for extent in extents {
             let held = match extent.records {

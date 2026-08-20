@@ -14,6 +14,7 @@
 //! asks KS where its peers are — so no process's address is checked in, and no
 //! two copies of one address can disagree.
 
+use crate::placement::Expansion;
 use crate::{Context, Error, Result};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -283,6 +284,15 @@ pub struct Extents {
     /// needs another. A real stream holds as many as its SN has memory for; a test
     /// cluster sets it low so that a stream sealing is the common path.
     pub per_stream: usize,
+    /// Bytes of device a stored byte costs, which is what billing charges for
+    /// (§17.25.3). Absent means plain replication, so `instances`.
+    ///
+    /// ⚠️ **A double, and the first parameter here that is one** (Asserted, Bob,
+    /// 2026-08-20). Erasure coding's factors are not whole numbers — 4/3, 7/3, 6/5 — and
+    /// the next scheme need not even be a ratio, so this is the number itself rather than
+    /// anything to be divided later (§18.2).
+    #[serde(default)]
+    pub expansion: Option<f64>,
 }
 
 impl Extents {
@@ -299,7 +309,23 @@ impl Extents {
         self.discard() + 1
     }
 
+    /// What a stored byte costs on the device. ⚠️ Configured where it is not simply the
+    /// copy count, which is every scheme except plain replication.
+    pub fn expansion(&self) -> Expansion {
+        match self.expansion {
+            Some(factor) => Expansion::of(factor),
+            None => Expansion::copies(self.instances as u32),
+        }
+    }
+
     fn validate(&self) -> Result<()> {
+        if let Some(factor) = self.expansion
+            && !(factor.is_finite() && factor >= 1.0)
+        {
+            return Err(Error::new(format!(
+                "an expansion of {factor} would store less than was written"
+            )));
+        }
         if self.per_stream == 0 {
             return Err(Error::new(
                 "extents.per_stream of zero leaves a stream nowhere to put an extent",
@@ -675,6 +701,55 @@ fn read_toml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
 }
 
 #[cfg(test)]
+mod expansion_tests {
+    use super::*;
+
+    /// ⚠️ **A parameter can be a double**, and this is the proof — TOML has floats and serde
+    /// wants nothing extra. It is also the first one, so it is worth a test that fails
+    /// loudly if the config layer ever grows a rule against them (§18.2).
+    #[test]
+    fn a_parameter_can_be_a_fraction() {
+        let extents: Extents = toml::from_str(
+            "instances = 4\nquorum = 3\nseal_bytes = 4096\nper_stream = 8\nexpansion = 1.3333",
+        )
+        .expect("a double parses");
+        assert_eq!(extents.expansion, Some(1.3333));
+        // ⚠️ 3,999,900 rather than 4,000,000, and the shortfall is the *written* figure's
+        // four decimal places, not the double's 53 bits. Anyone wanting 3 data plus 1 parity
+        // exactly should say so and let the code divide, which is what `coded` is for.
+        assert_eq!(extents.expansion().bytes(3_000_000), 3_999_900);
+        // Writing it as a division gets much closer, though ⚠️ **not exact either**: 4/3 has
+        // no binary representation, so `4.0 / 3.0` is a shade under it and only the round-up
+        // lands this on a whole number. A factor a shade *over* would charge one byte more.
+        // That is the price of a double, taken deliberately (§18.2).
+        assert_eq!(Expansion::coded(3, 1).bytes(3_000_000), 4_000_000);
+        assert!(Expansion::coded(3, 1).factor() < 4.0 / 3.0 + f64::EPSILON);
+    }
+
+    /// Absent means plain replication, so the copy count.
+    #[test]
+    fn no_expansion_means_the_copies() {
+        let extents: Extents =
+            toml::from_str("instances = 4\nquorum = 3\nseal_bytes = 4096\nper_stream = 8")
+                .expect("it parses without one");
+        assert_eq!(extents.expansion().bytes(1_000), 4_000);
+    }
+
+    /// ⚠️ Storing less than was written is not a storage class.
+    #[test]
+    fn an_expansion_below_one_is_refused() {
+        let extents = Extents {
+            instances: 4,
+            quorum: 3,
+            seal_bytes: 4096,
+            per_stream: 8,
+            expansion: Some(0.5),
+        };
+        assert!(extents.validate().is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -774,7 +849,8 @@ mod tests {
     #[test]
     fn a_quorum_that_does_not_overlap_itself_is_refused() {
         let extents = |instances, quorum| {
-            Extents { instances, quorum, seal_bytes: 4096, per_stream: 8 }.validate()
+            Extents { instances, quorum, seal_bytes: 4096, per_stream: 8, expansion: None }
+                .validate()
         };
         assert!(extents(4, 3).is_ok(), "the shipped shape");
         assert!(extents(3, 3).is_ok(), "every instance, which is its own quorum");
@@ -791,15 +867,17 @@ mod tests {
     /// what a position can name could never be reached.
     #[test]
     fn a_seal_limit_has_to_be_reachable() {
-        let capped =
-            |seal_bytes| Extents { instances: 4, quorum: 3, seal_bytes, per_stream: 8 }.validate();
+        let capped = |seal_bytes| {
+            Extents { instances: 4, quorum: 3, seal_bytes, per_stream: 8, expansion: None }
+                .validate()
+        };
         assert!(capped(64).is_ok());
         assert!(capped(32 << 20).is_ok());
         assert!(capped(0).is_err());
         assert!(capped(u32::MAX as u64 + 1).is_err());
         // And a stream that can hold no extents can hold nothing at all.
         assert!(
-            Extents { instances: 4, quorum: 3, seal_bytes: 4096, per_stream: 0 }
+            Extents { instances: 4, quorum: 3, seal_bytes: 4096, per_stream: 0, expansion: None }
                 .validate()
                 .is_err()
         );
@@ -810,7 +888,8 @@ mod tests {
     #[test]
     fn what_a_seal_discards_follows_from_the_two_numbers() {
         let shape = |instances, quorum| {
-            let extents = Extents { instances, quorum, seal_bytes: 4096, per_stream: 8 };
+            let extents =
+                Extents { instances, quorum, seal_bytes: 4096, per_stream: 8, expansion: None };
             (extents.discard(), extents.least_heard())
         };
         // Four of three discards one, so "the minimum, discarding the smallest".

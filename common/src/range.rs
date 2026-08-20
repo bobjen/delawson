@@ -16,6 +16,7 @@
 //!   for ever — back-pressure that is really a livelock.
 
 use crate::offset::{COff, LOff};
+use crate::placement::Expansion;
 use crate::wire::Arg;
 use crate::{Error, Result};
 
@@ -173,6 +174,82 @@ impl Range {
             other => return Err(Error::new(format!("no budget measured in kind {other}"))),
         };
         Ok((Range { start, budget }, rest))
+    }
+}
+
+/// What an extent came to when it filled: the three measures the writing tier knows
+/// (§9.1.3.6).
+///
+/// ⚠️ **A shape rather than three numbers in a row, deliberately** (#94). §8.1.6 exists
+/// because a logical length and a compressed one are easy to confuse in append code, and a
+/// seal report carrying both as bare arguments is exactly that situation — the wrong order
+/// is a silent mis-billing rather than a compile error. §17.13.3's rule applies: the shape
+/// lives here so no two processes count argument positions independently.
+///
+/// **There is no physical length here, and there is not one stored anywhere** (Asserted,
+/// Bob, 2026-08-20). Physical bytes are what billing reads, and they are *calculated* from
+/// the compressed length and the storage class — never measured and never kept. A stored
+/// copy would be a fourth number that drifts the moment a storage class changes, and the
+/// class is what the expansion factor belongs to. See §17.25.3.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Filled {
+    pub records: u64,
+    /// ⚠️ **An `LOff`, and the next field a `COff`** — the type discipline #94 asked for, and
+    /// the reason this is a shape at all. It also costs nothing: both spaces are 32-bit, so
+    /// all three measures together are the 16 bytes the two of them used to take, and
+    /// `Sealed` did not grow by a byte on §14.1's 1.7 × 10^9 extents. Storing them as `u64`
+    /// would have been **13.6 GB of an SN's memory** for range that neither space has.
+    pub logical: LOff,
+    pub compressed: COff,
+}
+
+impl Filled {
+    pub const ARGS: usize = 3;
+
+    pub fn args(&self) -> Vec<Arg> {
+        vec![
+            Arg::Number(self.records),
+            Arg::Number(self.logical.number()),
+            Arg::Number(self.compressed.number()),
+        ]
+    }
+
+    pub fn of_args(args: &[Arg]) -> Result<(Filled, &[Arg])> {
+        let [Arg::Number(records), Arg::Number(logical), Arg::Number(compressed), rest @ ..] = args
+        else {
+            return Err(Error::new(
+                "a seal report takes a record count, a logical length and a compressed length",
+            ));
+        };
+        let filled = Filled {
+            records: *records,
+            logical: LOff::of_number(*logical)?,
+            compressed: COff::of_number(*compressed)?,
+        };
+        Ok((filled, rest))
+    }
+
+    /// Whether the extent took nothing at all — a block that would not fit an extent even
+    /// empty, rather than an extent worth replacing.
+    pub fn empty(&self) -> bool {
+        self.records == 0 && self.compressed == COff::ZERO
+    }
+
+    /// Bytes the user is charged for, which is what billing reads.
+    ///
+    /// ⚠️ **Calculated, never stored.** `expansion` is the storage class's ratio — 4/1 for
+    /// four copies, 4/3 or 7/3 or 6/5 for erasure coding — so this was never a multiply, and
+    /// `Expansion` is where that lives (§17.25.3).
+    ///
+    /// ⚠️ **`expansion` is the class's intended ratio, never a count of the instances that
+    /// happen to exist** (Asserted, Bob, 2026-08-20). An extent meant to have four copies
+    /// bills as four whether three or five are up right now, and the reason is not only
+    /// fairness: it means **billing runs off a snapshot of SN metadata alone**, while ENs
+    /// are offline and without asking any of them. Reading the live instance list would put
+    /// every EN on the billing path and make the bill depend on the repair queue
+    /// (`BILLING-CHARGES-THE-CLASS-NOT-THE-COPIES`).
+    pub fn physical(&self, expansion: Expansion) -> u64 {
+        expansion.bytes(self.compressed.number())
     }
 }
 

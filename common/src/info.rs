@@ -12,6 +12,7 @@
 //! One shape, built and read here, makes that a compile error instead.
 
 use crate::framing::Framing;
+use crate::placement::Expansion;
 use crate::wire::Arg;
 use crate::{Error, Result};
 
@@ -185,6 +186,54 @@ impl Shape {
     }
 }
 
+/// What a stream has come to: the sizes a user asks for and none of the addressing.
+///
+/// ⚠️ **Sums, so `u64` — unlike `Filled`, whose measures are one extent's and fit 32 bits.**
+/// A stream is many extents, so its logical total passes 4 GB in the second one.
+///
+/// **Exact for a sealed stream and as-of for a growing one** (Asserted, Bob, 2026-08-20).
+/// That asymmetry is deliberate: a sealed stream never changes, so one refresh is correct
+/// for ever, while a growing one is only ever a point in time. `records` is the exception —
+/// it stays `UNKNOWN` while a stream grows rather than going stale, because §4.5's exact
+/// count is what addressing runs on and a *stale record count is a wrong read*, where a
+/// stale byte count is only a slightly wrong listing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Totals {
+    pub extents: u64,
+    pub logical: u64,
+    pub compressed: u64,
+}
+
+impl Totals {
+    pub const ARGS: usize = 3;
+
+    /// Nothing known yet: a stream nobody has asked an SN about.
+    pub fn unknown() -> Totals {
+        Totals { extents: UNKNOWN, logical: UNKNOWN, compressed: UNKNOWN }
+    }
+
+    pub fn args(&self) -> Vec<Arg> {
+        vec![Arg::Number(self.extents), Arg::Number(self.logical), Arg::Number(self.compressed)]
+    }
+
+    pub fn of_args(args: &[Arg]) -> Result<(Totals, &[Arg])> {
+        let [Arg::Number(extents), Arg::Number(logical), Arg::Number(compressed), rest @ ..] = args
+        else {
+            return Err(Error::new("that answer's totals are not totals"));
+        };
+        Ok((Totals { extents: *extents, logical: *logical, compressed: *compressed }, rest))
+    }
+
+    /// Bytes the user is charged for. ⚠️ See `Filled::physical`: `expansion` is the storage
+    /// class's ratio, never a count of the copies that happen to exist.
+    pub fn physical(&self, expansion: Expansion) -> u64 {
+        match self.compressed {
+            UNKNOWN => UNKNOWN,
+            compressed => expansion.bytes(compressed),
+        }
+    }
+}
+
 /// One of an object's streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamRow {
@@ -195,8 +244,11 @@ pub struct StreamRow {
     /// Records in it once sealed, and **`UNKNOWN` while it is the one being appended
     /// to** — how far that one reaches is not the DN's to say (§6.3).
     pub records: u64,
-    /// Extents in it, or `UNKNOWN` when no SN was asked.
-    pub extents: u64,
+    /// The second the stream was made. The DN's own, so always exact.
+    pub created: u64,
+    /// What it has come to. `extents` is here rather than in the row proper because the
+    /// three travel together and mean the same thing about staleness.
+    pub totals: Totals,
     /// Extent rows that follow this one. ⚠️ **The answer is interleaved** — a stream then
     /// its extents, repeated — so a reader never attributes extents to a stream by
     /// position, which is §17.19's defect.
@@ -204,17 +256,19 @@ pub struct StreamRow {
 }
 
 impl StreamRow {
-    pub const ARGS: usize = 6;
+    pub const ARGS: usize = 5 + Totals::ARGS;
 
     pub fn args(&self) -> Vec<Arg> {
-        vec![
+        let mut args = vec![
             Arg::Number(self.stream),
             Arg::Number(self.sn as u64),
             Arg::Number(self.first_record),
             Arg::Number(self.records),
-            Arg::Number(self.extents),
-            Arg::Number(self.given),
-        ]
+            Arg::Number(self.created),
+        ];
+        args.extend(self.totals.args());
+        args.push(Arg::Number(self.given));
+        args
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(StreamRow, &[Arg])> {
@@ -223,12 +277,15 @@ impl StreamRow {
             Arg::Number(sn),
             Arg::Number(first_record),
             Arg::Number(records),
-            Arg::Number(extents),
-            Arg::Number(given),
+            Arg::Number(created),
             rest @ ..,
         ] = args
         else {
             return Err(Error::new("that answer's streams are not streams"));
+        };
+        let (totals, rest) = Totals::of_args(rest)?;
+        let [Arg::Number(given), rest @ ..] = rest else {
+            return Err(Error::new("that stream did not say how many extents follow"));
         };
         Ok((
             StreamRow {
@@ -236,7 +293,8 @@ impl StreamRow {
                 sn: *sn as u32,
                 first_record: *first_record,
                 records: *records,
-                extents: *extents,
+                created: *created,
+                totals,
                 given: *given,
             },
             rest,
@@ -516,8 +574,9 @@ pub struct ExtentRun {
     /// answer says what it is answering instead of relying on the order matching the
     /// question — §17.19's defect was exactly that assumption.
     pub stream: u64,
-    /// Extents the stream has, whether or not they are all here.
-    pub extents: u64,
+    /// What the stream has come to, which the SN is the authority for and the DN caches
+    /// (§17.25.1). Includes the extent count, whether or not the rows are all here.
+    pub totals: Totals,
     /// Rows that follow.
     pub given: u64,
     /// The **stream-local** record to ask from next, or `UNKNOWN` when nothing
@@ -527,26 +586,22 @@ pub struct ExtentRun {
 
 impl ExtentRun {
     pub fn args(&self) -> Vec<Arg> {
-        vec![
-            Arg::Number(self.stream),
-            Arg::Number(self.extents),
-            Arg::Number(self.given),
-            Arg::Number(self.next),
-        ]
+        let mut args = vec![Arg::Number(self.stream)];
+        args.extend(self.totals.args());
+        args.push(Arg::Number(self.given));
+        args.push(Arg::Number(self.next));
+        args
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(ExtentRun, &[Arg])> {
-        let [
-            Arg::Number(stream),
-            Arg::Number(extents),
-            Arg::Number(given),
-            Arg::Number(next),
-            rest @ ..,
-        ] = args
-        else {
+        let [Arg::Number(stream), rest @ ..] = args else {
+            return Err(Error::new("that run of extents does not say which stream"));
+        };
+        let (totals, rest) = Totals::of_args(rest)?;
+        let [Arg::Number(given), Arg::Number(next), rest @ ..] = rest else {
             return Err(Error::new("that answer did not say what run of extents it was"));
         };
-        Ok((ExtentRun { stream: *stream, extents: *extents, given: *given, next: *next }, rest))
+        Ok((ExtentRun { stream: *stream, totals, given: *given, next: *next }, rest))
     }
 
     /// Every run in a batch answer, each followed by its own rows.
@@ -635,7 +690,15 @@ mod tests {
     }
 
     fn stream(stream: u64, first_record: u64, records: u64) -> StreamRow {
-        StreamRow { stream, sn: 0, first_record, records, extents: UNKNOWN, given: 0 }
+        StreamRow {
+            stream,
+            sn: 0,
+            first_record,
+            records,
+            created: 1_000_000,
+            totals: Totals::unknown(),
+            given: 0,
+        }
     }
 
     /// The header says how many rows follow, so a reader never guesses — and the
@@ -699,7 +762,8 @@ mod tests {
     /// may later carry a different number than an open one.
     #[test]
     fn a_run_of_extents_survives_the_wire() {
-        let run = ExtentRun { stream: 7, extents: 5, given: 2, next: 90 };
+        let totals = Totals { extents: 5, logical: 900, compressed: 300 };
+        let run = ExtentRun { stream: 7, totals, given: 2, next: 90 };
         let rows = vec![extent(1, 0, 40), extent(2, 40, 50)];
         let mut args = run.args();
         for row in &rows {

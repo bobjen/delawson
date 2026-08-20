@@ -16,7 +16,9 @@
 
 use common::config::{DNConfig, ServiceKind};
 use common::framing::Framing;
-use common::info::{Batch, Described, ExtentRow, ExtentRun, Listing, Shape, StreamRow, UNKNOWN};
+use common::info::{
+    Batch, Described, ExtentRow, ExtentRun, Listing, Shape, StreamRow, Totals, UNKNOWN,
+};
 use common::logw;
 use common::range::{Detail, Want};
 use common::server::{self, Process, Reply, Service};
@@ -136,8 +138,11 @@ fn detailed(object: &Object, want: &Want, limit: u64) -> Option<Levelled> {
                 first_record: held.first_record,
                 // ⚠️ UNKNOWN, not zero: how far the stream being appended to reaches is
                 // not the DN's to say (§6.3), and a sealed stream may hold nothing.
-                records: held.records.unwrap_or(UNKNOWN),
-                extents: UNKNOWN,
+                records: held.records,
+                created: held.created,
+                // What the DN last learned. Exact once the stream is sealed, a point in
+                // time before that, and UNKNOWN until any SN has been asked (§17.25.1).
+                totals: held.totals(),
                 given: 0,
             });
         }
@@ -189,7 +194,8 @@ impl Levelled {
         for mut row in self.rows {
             match extents.remove(&row.stream) {
                 Some((run, rows)) => {
-                    row.extents = run.extents;
+                    // Straight from the SN, which is more recent than anything cached.
+                    row.totals = run.totals;
                     row.given = rows.len() as u64;
                     out.extend(row.args());
                     for extent in rows {
@@ -241,18 +247,90 @@ enum Next {
     Say(Response),
 }
 
-/// One of an object's streams, and where its records start.
+/// One of an object's streams: where its records start, and what it has come to.
+///
+/// ⚠️ **The DN's largest structure, so every field here is paid 10^12 times** in §13.1.3's
+/// worst case. Adding the sizes took it from **40 to 56 bytes**, and four new fields cost
+/// the space of two only because `records` stopped being an `Option<u64>` — a sentinel in a
+/// space that already reserves one is 8 bytes where the discriminant was 8 plus padding
+/// (`EVERY-SPACE-RESERVES-A-SENTINEL`, §8.1.6.3). The layout is exact: six `u64` and two
+/// `u32`, no padding.
 #[derive(Clone, Copy)]
 struct Held {
     id: u64,
-    sn: u32,
     /// The object-local number of this stream's first record. A stream numbers its
     /// own records from zero; this is what makes an object's numbering continuous
     /// across the streams it is made of.
     first_record: u64,
-    /// Records in it, once it is sealed. None while it is the one being appended to,
-    /// because how far it reaches is not known here.
-    records: Option<u64>,
+    /// Records in it once sealed, and **`UNKNOWN` while it is the one being appended to**.
+    ///
+    /// ⚠️ **This one does not go stale, unlike the sizes below.** §4.5's exact record count
+    /// is what addressing runs on, so a stale record count is a *wrong read*, while a stale
+    /// byte count is a slightly wrong listing (§17.25.1).
+    records: u64,
+    /// The second this stream was handed to the object. The DN's own, so always exact —
+    /// which is what a directory listing wants and what nothing else could supply as
+    /// cheaply.
+    created: u64,
+    /// Bytes the writer wrote and bytes stored, summed over the stream's extents.
+    ///
+    /// ⚠️ **Exact for a sealed stream, as-of for a growing one, `UNKNOWN` until an SN has
+    /// been asked** (Asserted, Bob, 2026-08-20). A sealed stream cannot change, so one
+    /// refresh is right for ever; a growing one is only ever a point in time, and that is
+    /// good enough for the listing these exist for.
+    logical: u64,
+    compressed: u64,
+    sn: u32,
+    /// Extents in it. `UNKNOWN` is not representable in 32 bits alongside a real count, so
+    /// this uses `u32::MAX` and the accessor is what reads it (§8.1.6.2).
+    extents: u32,
+}
+
+impl Held {
+    /// A stream just handed out: nothing has come to anything yet.
+    fn new(id: u64, sn: u32, first_record: u64, created: u64) -> Held {
+        Held {
+            id,
+            first_record,
+            records: UNKNOWN,
+            created,
+            logical: UNKNOWN,
+            compressed: UNKNOWN,
+            sn,
+            extents: u32::MAX,
+        }
+    }
+
+    /// What this stream has come to, in the shape the wire carries.
+    fn totals(&self) -> Totals {
+        Totals {
+            extents: match self.extents {
+                u32::MAX => UNKNOWN,
+                extents => extents as u64,
+            },
+            logical: self.logical,
+            compressed: self.compressed,
+        }
+    }
+
+    /// What an SN said the stream has come to. ⚠️ **Only ever moves forward**: an answer
+    /// that crossed a newer one in flight must not walk the numbers back, and a sealed
+    /// stream's totals are final whatever arrives afterwards.
+    fn learned(&mut self, totals: Totals) {
+        if totals.extents != UNKNOWN {
+            let seen = totals.extents.min(u32::MAX as u64 - 1) as u32;
+            if self.extents == u32::MAX || seen > self.extents {
+                self.extents = seen;
+            }
+        }
+        for (mine, seen) in
+            [(&mut self.logical, totals.logical), (&mut self.compressed, totals.compressed)]
+        {
+            if seen != UNKNOWN && (*mine == UNKNOWN || seen > *mine) {
+                *mine = seen;
+            }
+        }
+    }
 }
 
 impl Object {
@@ -294,11 +372,11 @@ impl Object {
     fn holding(&self, record: u64) -> Option<Held> {
         for held in &self.streams {
             match held.records {
-                Some(records) if record < held.first_record + records => return Some(*held),
-                Some(_) => continue,
                 // The stream still being appended to: anything past its start is
                 // routed to it, and the SN and EN say whether it is really there.
-                None => return Some(*held),
+                UNKNOWN => return Some(*held),
+                records if record < held.first_record + records => return Some(*held),
+                _ => continue,
             }
         }
         None
@@ -310,7 +388,7 @@ impl Object {
 /// ⚠️ **Refusals are kept and the whole answer fails**, rather than being dropped so that the answer
 /// silently lacks extents the caller asked for. §17's rule: a well-formed request for something that
 /// did not work says so.
-fn arrived(gather: &Arc<Mutex<Gather>>, answer: Response) {
+fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Response) {
     let ready = {
         let mut held = gather.lock().expect("gather");
         held.left -= 1;
@@ -343,12 +421,19 @@ fn arrived(gather: &Arc<Mutex<Gather>>, answer: Response) {
     // DN converts — it is the tier that holds each stream's first record (§17.16.2 is what happens
     // when a conversion like this is skipped).
     let mut runs = std::mem::take(&mut held.runs);
+    // ⚠️ **Write back what the SNs said before answering.** This is the only path by which a
+    // stream's cached sizes ever stop being UNKNOWN (§17.25.1), so skipping it would leave
+    // every listing blank while the numbers sat in a response on their way out the door.
+    // A sealed stream's totals are final, so once written they are right for ever; a growing
+    // one's are a point in time, which is what `Held::learned` refusing to go backwards is
+    // for — two answers can cross in flight.
+    dn.remember(&held.name, &runs);
     let mut extents = 0;
     let mut given = 0;
     let mut converted: HashMap<u64, (ExtentRun, Vec<ExtentRow>)> = HashMap::new();
     for row in &held.rows {
         let Some((run, rows)) = runs.remove(&row.stream) else { continue };
-        extents += if run.extents == UNKNOWN { 0 } else { run.extents };
+        extents += if run.totals.extents == UNKNOWN { 0 } else { run.totals.extents };
         given += rows.len() as u64;
         // Stream-local to object-local, by adding where this stream starts in the object.
         let moved = rows
@@ -366,7 +451,7 @@ fn arrived(gather: &Arc<Mutex<Gather>>, answer: Response) {
     // continuation stand. Without this an answer that truncated extents reported `nothing more`.
     let cut = held.rows.iter().find_map(|row| {
         let (run, rows) = converted.get(&row.stream)?;
-        let short = run.extents != UNKNOWN && (rows.len() as u64) < run.extents;
+        let short = run.totals.extents != UNKNOWN && (rows.len() as u64) < run.totals.extents;
         // ⚠️ `then`, not `then_some`: `then_some` evaluates its argument **eagerly**, so it
         // computed `UNKNOWN + first_record` — `u64::MAX` plus a record number — and
         // overflowed. It reads like a guard and is not one (§17.22.1).
@@ -401,6 +486,10 @@ struct Gather {
     head: Vec<Arg>,
     rows: Vec<StreamRow>,
     shape: Shape,
+    /// The object the asks were about, so what the SNs said can be written back to the
+    /// streams' cached sizes (§17.25.1). Only the name: the object itself must not be held
+    /// across a round trip, since it can change while the SNs are answering.
+    name: String,
 }
 
 /// One object a create asks for: a name, a flavour, and a framing.
@@ -637,12 +726,8 @@ impl DN {
             for (n, name) in mine.iter().enumerate() {
                 let mut shard = dn.shards[shard_of(name)].lock().expect("objects");
                 if let Some(object) = shard.get_mut(name.as_str()) {
-                    object.streams.push(Held {
-                        id: first + n as u64,
-                        sn: sn_number,
-                        first_record: 0,
-                        records: None,
-                    });
+                    let made = object.created;
+                    object.streams.push(Held::new(first + n as u64, sn_number, 0, made));
                 }
             }
             dn.objects.fetch_add(count, Ordering::Relaxed);
@@ -691,7 +776,7 @@ impl DN {
                     // the list; the rest are late and have nothing to record.
                     let ours = object.streams.last().is_some_and(|last| last.id == sealed);
                     if let Some(last) = object.streams.last_mut().filter(|_| ours) {
-                        last.records = Some(records);
+                        last.records = records;
                     }
                     if object.extending {
                         object.waiting.push(carry.take().expect("a reply"));
@@ -760,12 +845,7 @@ impl DN {
             {
                 let mut shard = dn.shards[shard_of(&name)].lock().expect("objects");
                 if let Some(object) = shard.get_mut(name.as_str()) {
-                    object.streams.push(Held {
-                        id: stream,
-                        sn: sn_number,
-                        first_record,
-                        records: None,
-                    });
+                    object.streams.push(Held::new(stream, sn_number, first_record, now()));
                     object.extending = false;
                 }
             }
@@ -846,7 +926,7 @@ impl DN {
             Ok(Answering::Plain(args)) => reply.send(Response { id: 0, status: Status::Ok, args }),
             // Extents were asked for, so the SNs holding those streams have to be asked.
             Ok(Answering::Levelled(levelled)) if want.wants(Detail::Extents) => {
-                self.spread(process, levelled, limit, reply)
+                self.spread(process, name, levelled, limit, reply)
             }
             Ok(Answering::Levelled(levelled)) => reply.send(Response {
                 id: 0,
@@ -866,6 +946,7 @@ impl DN {
     fn spread(
         self: &Arc<Self>,
         process: &Arc<Process>,
+        name: &str,
         levelled: Levelled,
         limit: u64,
         reply: Reply,
@@ -896,8 +977,10 @@ impl DN {
             head: levelled.head,
             rows: levelled.rows,
             shape: levelled.shape,
+            name: name.to_string(),
         }));
 
+        let dn = Arc::clone(self);
         for (sn, at) in by_sn {
             let identity = format!("SN{sn}");
             let ask = {
@@ -907,12 +990,33 @@ impl DN {
             };
             let waiting = Arc::clone(&gather);
             let named = identity.clone();
-            if let Err(e) = process.ask(&identity, &ask, move |answer| arrived(&waiting, answer)) {
+            let mine = Arc::clone(&dn);
+            if let Err(e) =
+                process.ask(&identity, &ask, move |answer| arrived(&mine, &waiting, answer))
+            {
                 logw!("could not reach an SN", "sn {named},{e}");
                 arrived(
+                    self,
                     &gather,
                     Response::error(Status::Internal, format!("could not reach {named}")),
                 );
+            }
+        }
+    }
+
+    /// What the SNs said a stream has come to, kept against the next question about it
+    /// (§17.25.1). Takes the name's shard lock, so nothing may hold it.
+    fn remember(&self, name: &str, runs: &HashMap<u64, (ExtentRun, Vec<ExtentRow>)>) {
+        if runs.is_empty() {
+            return;
+        }
+        let mut shard = self.shards[shard_of(name)].lock().expect("objects");
+        // Gone while the SNs answered: a deleted object is not a lost update worth caring
+        // about, since the streams it named are going away too.
+        let Some(object) = shard.get_mut(name) else { return };
+        for held in &mut object.streams {
+            if let Some((run, _)) = runs.get(&held.id) {
+                held.learned(run.totals);
             }
         }
     }
@@ -1090,6 +1194,12 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    /// A stream in a test object. `records` is `None` for the one still being appended to,
+    /// which is what the sentinel means on the real thing.
+    fn held(id: u64, sn: u32, first_record: u64, records: Option<u64>) -> Held {
+        Held { records: records.unwrap_or(UNKNOWN), ..Held::new(id, sn, first_record, 1_000_000) }
+    }
+
     use std::mem::size_of;
 
     /// What one stream costs an object's list here. As with the SN (§4.7 again),
@@ -1098,7 +1208,12 @@ mod tests {
     #[test]
     fn a_stream_costs_an_object_more_than_a_reference() {
         let each = size_of::<Held>();
-        assert_eq!(each, 40, "if this moved, §4.7 and issue #9 want to hear about it");
+        assert_eq!(each, 56, "if this moved, §4.7 and issue #9 want to hear about it");
+        // ⚠️ **40 before the sizes went in** (§17.25.1): a creation second, an extent count,
+        // a logical length and a compressed one, for the space of two — because `records`
+        // stopped being an `Option<u64>` at the same time and a sentinel in a space that
+        // already reserves one costs nothing where a discriminant cost 8 plus padding.
+        assert_eq!(each, 6 * size_of::<u64>() + 2 * size_of::<u32>(), "and no padding");
         for bits in [24u32, 27, 32] {
             println!(
                 "2^{bits} streams in one object = {:.0} GB",
@@ -1148,12 +1263,13 @@ mod tests {
         assert!(!waits("/nothing"), "unlike a name nobody has");
 
         // Once the stream is named it describes normally.
-        dn.shards[shard_of("/half")].lock().unwrap().get_mut("/half").unwrap().streams.push(Held {
-            id: 7,
-            sn: 0,
-            first_record: 0,
-            records: None,
-        });
+        dn.shards[shard_of("/half")]
+            .lock()
+            .unwrap()
+            .get_mut("/half")
+            .unwrap()
+            .streams
+            .push(held(7, 0, 0, None));
         let args = dn.look("/half").expect("an object");
         assert_eq!(args[1], Arg::Number(7), "its stream");
         assert!(!waits("/half"), "and it is no longer half made");
@@ -1204,9 +1320,9 @@ mod tests {
             created: 1_000_000,
         };
         // Two sealed streams and one still open.
-        object.streams.push(Held { id: 1, sn: 0, first_record: 0, records: Some(10) });
-        object.streams.push(Held { id: 2, sn: 0, first_record: 10, records: Some(5) });
-        object.streams.push(Held { id: 3, sn: 0, first_record: 15, records: None });
+        object.streams.push(held(1, 0, 0, Some(10)));
+        object.streams.push(held(2, 0, 10, Some(5)));
+        object.streams.push(held(3, 0, 15, None));
 
         assert_eq!(object.holding(0).unwrap().id, 1);
         assert_eq!(object.holding(9).unwrap().id, 1);
@@ -1232,9 +1348,9 @@ mod tests {
             keyed: false,
             created: 1_000_000,
         };
-        object.streams.push(Held { id: 1, sn: 0, first_record: 0, records: Some(100) });
-        object.streams.push(Held { id: 2, sn: 1, first_record: 100, records: Some(50) });
-        object.streams.push(Held { id: 3, sn: 2, first_record: 150, records: None });
+        object.streams.push(held(1, 0, 0, Some(100)));
+        object.streams.push(held(2, 1, 100, Some(50)));
+        object.streams.push(held(3, 2, 150, None));
         object
     }
 
@@ -1359,7 +1475,7 @@ mod tests {
                 Object {
                     id: n + 1,
                     framing: Framing::Lf,
-                    streams: vec![Held { id: n + 1, sn: 0, first_record: 0, records: None }],
+                    streams: vec![held(n + 1, 0, 0, None)],
                     extending: false,
                     waiting: Vec::new(),
                     keyed: false,

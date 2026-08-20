@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-151 things *not* decided.
+152 things *not* decided.
 
 **Priorities and framing**
 
@@ -13957,6 +13957,14 @@ Roughly in order of how much else depends on them.
      caller-side assembly — a caller sending D requests costs the FE tier D too, so it is more messages
      and not fewer. Locality is a routing property, not a fan-out one.
 
+152. **What a shared stream's sizes mean for one object** (§17.25.1, §11). §11 lumps small objects
+     into common streams, and a stream's totals are then the *stream's*, not any one object's — so a
+     listing would report the same size for every object in the lump, wildly wrong for all of them.
+     Per-object accounting inside a shared stream is a different thing to store and nobody has asked
+     for it yet; the large-object case, which is what the system is for, is exactly served by the
+     per-stream figures. ⚠️ Note the creation date does not have this problem: an object already
+     carries its own.
+
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
@@ -16197,3 +16205,155 @@ thing §1.4.0 built batching for is gone at the scale the system is for.
 **And that reframes §16.149.** Caller-side assembly does not fix this: the caller sending D requests
 costs D to the FE tier as well, so it is more messages, not fewer — better latency, worse load. What
 fixes it is **locality**, which is a routing property and not a fan-out one. §16.151.
+
+### 17.25 A stream's sizes, and why a physical one is never stored
+
+**Asked for by Bob, 2026-08-20**, for `batch-object-info` and for the `dir` that does not exist
+yet: *"users like seeing when their objects were created and how big they are."*
+
+#### 17.25.0 #94 first, because the logical length was not being carried
+
+**The SN recorded a compressed length and no logical one**, so `list-extents` answered
+`logical: UNKNOWN` for every extent and one of §9.1.3.6's three budgets could not be planned. The
+number was already on the write path — the EN accumulates `logical_end` per extent — and the seal
+report simply did not carry it.
+
+**It is a shape now, not a third bare number** (`range::Filled`), which is what #94 asked for:
+§8.1.6 exists because a logical length and a compressed one are easy to confuse, and three numbers
+in a row in a seal message is precisely that. ⚠️ **And the types caught it immediately** — the first
+build after `Filled` became `{ records, LOff, COff }` failed in two services on exactly the
+substitution §8.1.6 was written about.
+
+> **The type discipline also made it free.** Both spaces are 32-bit, so all three measures are the
+> 16 bytes the two of them took, and `Sealed` did not grow by a byte. Storing them as `u64` would
+> have cost **13.6 GB of an SN's memory** at §14.1's 1.7 × 10^9 extents — which the size test caught
+> on the first attempt.
+
+#### 17.25.1 What the DN keeps, and what it is allowed to be wrong about
+
+`Held` — the DN's per-stream record, and its largest structure — gained a creation second, an extent
+count, a logical length and a compressed one.
+
+| | |
+|---|---|
+| `created` | the DN's own, so **always exact**. It hands out the stream. |
+| `records` | exact once sealed, **`UNKNOWN` while growing** |
+| `extents`, `logical`, `compressed` | exact once sealed, **as-of while growing**, `UNKNOWN` until an SN has been asked |
+
+⚠️ **Why `records` alone does not go stale.** §4.5's exact record count is what addressing runs on,
+so a stale record count is a **wrong read**; a stale byte count is a slightly wrong listing. The
+asymmetry is the point, not a compromise.
+
+**40 bytes to 56, and four fields for the space of two**, because `records` stopped being an
+`Option<u64>` in the same change: a sentinel in a space that already reserves one costs 8 bytes where
+a discriminant cost 8 plus padding (`EVERY-SPACE-RESERVES-A-SENTINEL` paying for itself in a place
+that was not the reason for it). Six `u64` and two `u32`, no padding — and the size test says so
+rather than just asserting 56.
+
+**The SN is the authority** and the DN caches: only the SN owns the extent list, so the totals come
+back on a `list-extents` answer and are written to `Held` before the answer goes out. A sealed
+stream cannot change, so **one refresh is right for ever**; `Held::learned` refuses to move a number
+backwards, because two answers can cross in flight.
+
+##### ⚠️ Two limits found by running it
+
+| | |
+|---|---|
+| **the staleness floor is one extent** | the SN sums *sealed* extents only. The open extent's size lives at the EN, so an object still inside its first extent reports **0 bytes** — measured: 60 records read as `0 bytes so far`, and 4,094 appeared only when the extent sealed. §17.25.4 has the home for it. |
+| **the cache only refreshes when somebody asks for extents** | so a listing that never asks reports `UNKNOWN` for ever, and the feature that motivated the storage does not benefit from it. §17.25.4. |
+| **a shared stream's totals are not one object's size** | §11 lumps small objects into common streams, and then every object referencing that stream would report the *stream's* size as its own. §16.152. |
+
+#### 17.25.2 Physical length is calculated, never stored
+
+⚠️ **Bob, twice, and both halves matter** (2026-08-20): physical bytes are *"what they look for for
+billing"*, and they *"should be calculated from compressed length and storage class, not actual"*.
+
+**So there is no fourth number anywhere** — not on the wire, not in `Held`, not at the SN. A stored
+physical length is a derived value that goes wrong the moment a storage class changes, and the class
+is what the factor belongs to.
+
+##### And the class's intent, not the copies that exist
+
+> *"If the extent is supposed to have 4 instances, it doesn't matter if it has 3 or 5 at the moment,
+> the user gets billed for 4."*
+
+**The second reason is the stronger one**: *"you can always get a snapshot of the SN's metadata but
+some ENs are offline."* Reading the live instance list would put **every EN on the billing path** and
+make a bill depend on the repair queue. Charging the class means billing runs off SN metadata alone
+— a whole tier off the path, and a figure that is consistent in time because one snapshot produces it
+(`BILLING-CHARGES-THE-CLASS-NOT-THE-COPIES`).
+
+#### 17.25.3 A double, because the next scheme need not be a ratio
+
+**Erasure coding's factors are not whole numbers**: 3 data plus 1 parity is 4/3, 3 plus 4 is 7/3,
+5 plus 1 is 6/5. An integer multiplier was wrong before it was written.
+
+⚠️ **And a `f64` rather than a rational, on Bob's call**: *"we don't have any fibonacci-like things
+yet but it's easy to imagine them showing up."* A ratio of two integers is exact for every scheme
+that exists and assumes the next one is also a ratio — an assumption with nothing behind it. The
+double costs nothing worth having: 53 bits of mantissa is exact on byte counts to 9 PB, and past
+that the relative error is around 10^-16 against a bill nobody computes to the byte.
+
+**It is honestly inexact and the tests say so.** `4.0 / 3.0` is a shade under 4/3, and only the
+round-up lands a three-megabyte stream on 4,000,000 — a factor a shade *over* would charge one byte
+more. Rounding **up**, because a fragment that is not a whole one still occupies a whole one, and
+because a bill that rounds down is a bill nobody is paying.
+
+**Measured end to end**: an object with two extents, one sealed, reported *"2 extents, 4094 bytes so
+far, 4094 stored, 16376 billed"* — 4,094 × 4 copies. The same line came back from the DN's cache
+with no SN asked, which is what makes it affordable in a listing.
+
+### 18.2 A parameter may be a fraction, and a fraction beats a percentage
+
+**Yes, a parameter can be a double** (asked by Bob, 2026-08-20). Nothing in the config layer stood
+in the way — TOML has floats and serde wants nothing extra — but `extents.expansion` is the first
+one, so there is a test whose whole job is to fail loudly if that ever stops being true.
+
+**And when a parameter is a proportion, it is a fraction in [0, 1], not a percentage** (Asserted,
+Bob):
+
+> *"I don't like percentile parameters because you end up multiplying by 100.0 in one place and
+> dividing by 100.0 in another when you could have just multiplied by a probability once."*
+
+⚠️ **The two conversions are the defect, not the notation.** They are written in different places by
+different people, so nothing checks that both exist, and the failure mode is silent: a value 100×
+out is often still a plausible-looking number. A fraction multiplies once, at the point of use, and
+there is no second place to get wrong.
+
+**It also composes.** A fraction of a fraction is a multiply; a percentage of a percentage needs a
+divide nobody remembers. `0.99` reads as a probability and can be used as one — in a comparison, as
+a weight, as a rate — while `99` has to be told what it is every time.
+
+**A configured number is written as it will be used.** ⚠️ Which is why `expansion = 1.3333` is a
+worse way to say 3-data-plus-1-parity than letting the code compute `4.0 / 3.0` — the written form
+carries four decimal places of precision and the divide carries fifteen. **Say the thing that is
+known; let the code do the arithmetic.** Neither is exact (§17.25.3), and that is fine; one is
+needlessly less exact than the other.
+
+#### 17.25.4 The sync loops are where the refresh belongs
+
+⚠️ **A seal-time refresh was the wrong answer** (Asserted, Bob, 2026-08-20): *"there will be a DN/SN
+sync occasionally (once a day? once a week?), which is an opportunity to report the current lengths
+of unsealed and recently-sealed streams."*
+
+**§13.1's loops already carry exactly this traffic, and both of §17.25.1's limits have a home in
+them:**
+
+| Limit | Loop | Cadence |
+|---|---|---|
+| the DN's cached sizes only refresh when somebody asks for extents | **DN → SN**, which already enumerates every stream a DN references (§13.1.3) | a day to a month |
+| the SN cannot see the open extent's size, so a small object reads as 0 bytes | **SN → EN, instance state**, the only loop that talks to the tier holding the bytes | ~1 hour |
+
+> **Neither needs a new mechanism, and that is the point.** A seal-time round trip would sit on the
+> path an append is blocked behind (§17.22's `extend-object`), and it would cover **only** sealed
+> streams — while the sync covers the unsealed ones, which is where staleness actually lives.
+
+**And it costs nothing measurable.** §13.1.3 prices the DN → SN sweep at 156 MB daily for
+7.8 × 10^6 distinct streams; three more numbers per stream is 24 bytes on a record that sweep already
+carries, against a loop whose own justification is a 10^13 leverage ratio on leaked streams. The
+sizes ride along.
+
+⚠️ **Which fixes the staleness contract as a cadence rather than an accident.** §17.25.1 says the
+sizes are "as-of" for a growing stream; the sync says as-of *what*: the last sweep. A growing
+stream's listed size is a day old, a sealed one's is exact, and nothing has to be asked at the moment
+a listing is rendered — which is the only way a `dir` over a million objects can be cheap.

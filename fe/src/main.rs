@@ -25,7 +25,7 @@ use common::config::{FEConfig, ServiceKind};
 use common::framing::Framing;
 use common::info::{Batch, Described, Shape, UNKNOWN};
 use common::logw;
-use common::range::{Budget, Covered, Detail, Piece, Range, Start, Want};
+use common::range::{Budget, Covered, Detail, Filled, Piece, Range, Start, Want};
 use common::routing;
 use common::server::{self, Process, Reply, Service};
 use common::wire::{AppendBlock, Arg, Op, Request, Response, Status};
@@ -414,7 +414,7 @@ impl FE {
         self: &Arc<Self>,
         process: &Arc<Process>,
         wanting: Wanting,
-        sealed: Option<(u64, u64, u64)>,
+        sealed: Option<(u64, Filled)>,
     ) {
         let key = (wanting.located.dn, wanting.located.stream);
         // ⚠️ Deciding and waiting under one lock. With the lock released in between,
@@ -423,7 +423,7 @@ impl FE {
         let (plan, open) = {
             let mut streams = self.streams.lock().expect("streams");
             let stream = streams.entry(key).or_default();
-            let plan = stream.plan(sealed.map(|(id, records, _)| (id, records)));
+            let plan = stream.plan(sealed.map(|(id, came_to)| (id, came_to.records)));
             if plan == Plan::Join {
                 stream
                     .getting
@@ -560,14 +560,14 @@ impl FE {
         open: Open,
         answer: Response,
     ) {
-        let [Arg::Number(records), Arg::Number(length)] = answer.args.as_slice() else {
+        let Ok((came_to, [])) = Filled::of_args(&answer.args) else {
             return wanting
                 .reply
                 .send(Response::error(Status::Internal, "a seal said nothing about the extent"));
         };
         // An extent that sealed with nothing in it is one this block could not fit
         // even empty, which is the block's fault and not worth another extent.
-        if *records == 0 && *length == 0 {
+        if came_to.empty() {
             return wanting.reply.send(Response::error(
                 Status::BadRequest,
                 format!("{} bytes will not fit an extent of its own", wanting.body.len()),
@@ -580,7 +580,7 @@ impl FE {
             ));
         }
         wanting.tries -= 1;
-        self.somewhere(process, wanting, Some((open.id, *records, *length)));
+        self.somewhere(process, wanting, Some((open.id, came_to)));
     }
 
     /// The stream is full. The DN gives the object another, carrying on from where
@@ -735,16 +735,16 @@ impl FE {
 
 /// What to ask the SN for the next extent: open one, or report the one that filled
 /// and get its replacement in the same round trip.
-fn wanting_extent(key: (u32, u64), sealed: Option<(u64, u64, u64)>) -> Request {
+fn wanting_extent(key: (u32, u64), sealed: Option<(u64, Filled)>) -> Request {
     let (dn, stream) = key;
     match sealed {
         None => Request::new(Op::OpenExtent).number(dn as u64).number(stream),
-        Some((id, records, length)) => Request::new(Op::SealExtent)
-            .number(dn as u64)
-            .number(stream)
-            .number(id)
-            .number(records)
-            .number(length),
+        Some((id, came_to)) => {
+            let mut request =
+                Request::new(Op::SealExtent).number(dn as u64).number(stream).number(id);
+            request.args.extend(came_to.args());
+            request
+        }
     }
 }
 
@@ -1392,7 +1392,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::info::StreamRow;
+    use common::info::{StreamRow, Totals};
 
     fn dns(count: usize) -> Vec<String> {
         (0..count).map(|n| format!("DN{n}")).collect()
@@ -1486,7 +1486,8 @@ mod tests {
                     sn: 0,
                     first_record: 0,
                     records: 3,
-                    extents: UNKNOWN,
+                    created: 1_000_000,
+                    totals: Totals::unknown(),
                     given: 0,
                 }
                 .args(),

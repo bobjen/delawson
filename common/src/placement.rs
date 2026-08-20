@@ -12,6 +12,59 @@ use std::collections::BTreeSet;
 
 pub const EXTENT_INSTANCES: usize = 4;
 
+/// How many bytes of device a stored byte actually costs (Asserted, Bob, 2026-08-20).
+///
+/// ⚠️ **Not an integer multiplier.** Plain replication is a whole number — four copies is
+/// 4.0 — but erasure coding is not: 3 data plus 1 parity is 4/3, 3 plus 4 is 7/3, 5 plus 1
+/// is 6/5. A design that stored the factor as a count of copies would have to be unpicked
+/// the day the first EC class arrives.
+///
+/// ⚠️ **And a `f64` rather than a rational**, on Bob's call: *"we don't have any
+/// fibonacci-like things yet but it's easy to imagine them showing up."* A ratio of two
+/// integers is exact for every scheme that exists today and assumes the next one is also a
+/// ratio, which is an assumption with nothing behind it. A double costs nothing here —
+/// 53 bits of mantissa is exact on byte counts to 9 PB and the relative error past that is
+/// around 10^-16, against a bill nobody computes to the byte — and it does not have to be
+/// revisited.
+///
+/// This is a property of the **storage class**, and it is what billing reads. ⚠️ It is
+/// never derived from how many instances happen to exist right now
+/// (`BILLING-CHARGES-THE-CLASS-NOT-THE-COPIES`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Expansion(f64);
+
+impl Expansion {
+    /// Plain replication: every copy is the whole thing.
+    pub fn copies(instances: u32) -> Expansion {
+        Expansion(instances.max(1) as f64)
+    }
+
+    /// Erasure coding of `data` fragments plus `parity`, so 3 and 1 is 4/3.
+    pub fn coded(data: u32, parity: u32) -> Expansion {
+        let data = data.max(1) as f64;
+        Expansion((data + parity as f64) / data)
+    }
+
+    /// Whatever the class says it costs. Below 1.0 is not a storage class but a mistake, and
+    /// a bill that rounds down is worse than a loud one.
+    pub fn of(factor: f64) -> Expansion {
+        Expansion(if factor.is_finite() && factor >= 1.0 { factor } else { 1.0 })
+    }
+
+    pub fn factor(&self) -> f64 {
+        self.0
+    }
+
+    /// Bytes of device that many stored bytes cost.
+    ///
+    /// **Rounded up**, because a fragment that is not a whole one still occupies a whole one
+    /// — and because a bill that rounds down is a bill somebody is not paying.
+    pub fn bytes(&self, stored: u64) -> u64 {
+        let want = (stored as f64 * self.0).ceil();
+        if want >= u64::MAX as f64 { u64::MAX } else { want as u64 }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Spread {
     /// Distinct failure domains: reliability and availability.

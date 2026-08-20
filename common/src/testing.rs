@@ -55,7 +55,7 @@ pub fn cluster() -> ClusterConfig {
 /// Four instances and a quorum of three, which is the shipped shape.
 pub fn extents() -> Extents {
     // Small enough that a test can seal an extent with a few short records.
-    Extents { instances: 4, quorum: 3, seal_bytes: 64, per_stream: 3 }
+    Extents { instances: 4, quorum: 3, seal_bytes: 64, per_stream: 3, expansion: None }
 }
 
 /// A roster entry in the one domain a single box has.

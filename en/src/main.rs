@@ -23,7 +23,7 @@
 use common::block::Holds;
 use common::config::ENConfig;
 use common::offset::{COff, LOff};
-use common::range::{Budget, Covered, Piece, Range};
+use common::range::{Budget, Covered, Filled, Piece, Range};
 use common::server::{self, Process, Reply, Service};
 use common::wire::{AppendBlock, Arg, Op, Request, Response, Status};
 use common::{Error, Result, logw};
@@ -91,8 +91,9 @@ enum Took {
     /// the block that found it full, as against the ones arriving afterwards, so a
     /// count of sealed extents counts extents and not refusals.
     Sealed {
-        records: u64,
-        length: COff,
+        /// All three measures, because the SN records all three and a seal is the only
+        /// moment the EN is asked what the extent came to (#94, §9.1.3.6).
+        came_to: Filled,
         closing: bool,
     },
 }
@@ -208,7 +209,12 @@ impl Extents {
         if extent.sealed || (sealable && full) {
             let closing = !extent.sealed;
             extent.sealed = true;
-            return Ok(Took::Sealed { records: extent.records, length: extent.end, closing });
+            let came_to = Filled {
+                records: extent.records,
+                logical: extent.logical_end,
+                compressed: extent.end,
+            };
+            return Ok(Took::Sealed { came_to, closing });
         }
 
         let offset = extent.end;
@@ -551,18 +557,22 @@ impl EN {
             Ok(Took::Landed(landed)) => landed,
             // Sealed: what the extent came to, so whoever asked can tell the SN and
             // come back with the next extent.
-            Ok(Took::Sealed { records, length, closing }) => {
+            Ok(Took::Sealed { came_to, closing }) => {
                 if closing {
                     self.sealed.fetch_add(1, Ordering::Relaxed);
                 }
                 reply.about(format_args!(
-                    "extent {} of sn {},records {records},bytes {length}",
-                    appending.extent, appending.sn
+                    "extent {} of sn {},records {},logical {},bytes {}",
+                    appending.extent,
+                    appending.sn,
+                    came_to.records,
+                    came_to.logical,
+                    came_to.compressed
                 ));
                 return reply.send(Response {
                     id: 0,
                     status: Status::Sealed,
-                    args: vec![Arg::Number(records), Arg::Number(length.number())],
+                    args: came_to.args(),
                 });
             }
             Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
@@ -1067,9 +1077,12 @@ mod tests {
         assert!(matches!(en.take(&block(0, 1, b"one\n"), cap), Ok(Took::Landed(_))));
         assert!(matches!(en.take(&block(0, 1, b"two\n"), cap), Ok(Took::Landed(_))));
         match en.take(&block(0, 1, b"three\n"), cap) {
-            Ok(Took::Sealed { records, length, .. }) => {
-                assert_eq!(records, 2, "what the extent came to");
-                assert_eq!(length, COff::new(8));
+            Ok(Took::Sealed { came_to, .. }) => {
+                assert_eq!(came_to.records, 2, "what the extent came to");
+                assert_eq!(came_to.compressed, COff::new(8), "in stored bytes");
+                // ⚠️ And the logical length, which the SN had no way to learn before #94:
+                // the same eight bytes here, because nothing was compressed.
+                assert_eq!(came_to.logical, LOff::new(8), "and in the bytes the writer wrote");
             }
             other => panic!("should have sealed, not {:?}", other.is_ok()),
         }

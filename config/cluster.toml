@@ -29,6 +29,12 @@ levels = ["region", "datacenter", "rack", "machine", "disk"]
 instances = 4
 quorum = 3
 
+# Bytes of device a stored byte costs, which is what billing charges for. Absent means
+# plain replication, so `instances`. ⚠️ Set it to exercise erasure coding's arithmetic
+# before erasure coding exists: 3 data plus 1 parity is 1.3333..., 3 plus 4 is 2.3333...
+# A fraction rather than a percentage, on purpose (§18.2).
+# expansion = 1.33333333
+
 # ⚠️ Deliberately tiny. The design's figure is 32 MB compressed, and on one box that
 # would mean nothing ever seals — so sealing, the SN opening the next extent, and a
 # read spanning both would all be untested paths. Small here makes the rare case the

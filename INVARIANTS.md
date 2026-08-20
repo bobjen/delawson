@@ -775,6 +775,32 @@ among tenants.
 test** — it is arithmetic over the sharing rule
 *Breaks* sharing becomes an exploit: colluding tenants cut their combined bill.
 
+**`BILLING-CHARGES-THE-CLASS-NOT-THE-COPIES`** — a physical size is the compressed size times
+the storage class's expansion factor, never a count of the instances that exist right now.
+*Argued* §17.25.2 · *Enforced* `placement::Expansion` is the only way to a physical number,
+and nothing derives one from an extent's instance list · *Checked* unit test
+*Breaks* two things at once. A bill starts depending on the repair queue, so a user pays less
+while their data is at risk and more while it is being fixed. And **every EN joins the billing
+path**, where charging the class needs only a snapshot of SN metadata — which is what makes
+billing runnable while ENs are offline, and consistent in time because one snapshot produces
+it.
+
+**`A-PHYSICAL-LENGTH-IS-NEVER-STORED`** — logical and compressed lengths are recorded;
+physical is computed from compressed and the class every time it is asked for.
+*Argued* §17.25.2, §17.25.3 · *Enforced* no field for it on the wire, in `Held`, or at the SN
+· *Checked* not yet
+*Breaks* a stored copy is right until a storage class changes and wrong silently afterwards,
+and re-deriving it is then a migration rather than a multiply. See
+[[BILLING-CHARGES-THE-CLASS-NOT-THE-COPIES]] for what it is computed *from*.
+
+**`A-SEALED-SUMMARY-IS-FINAL`** — a sealed stream's sizes are exact and never change, so one
+refresh is correct for ever; a growing stream's are a point in time.
+*Argued* §17.25.1 · *Enforced* `Held::learned` never moves a number backwards, and the SN sums
+sealed extents only · *Checked* not yet
+*Breaks* the whole reason a stale cache is acceptable here. ⚠️ Note the exception: `records`
+does not go stale, it stays `UNKNOWN`, because §4.5's exact count is what addressing runs on
+and a stale record count is a wrong read rather than a wrong listing.
+
 ## Concurrency and liveness
 
 ⚠️ These four are the ones that actually failed. §17.12.1 is the evidence, and all of them are
@@ -835,6 +861,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **creation second** | §4.6.3 | `EXTENT-IDENTITY-UNIQUE`, `EXTENT-KEY-FROM-CREATING-SN`, `HINT-BOUND-BY-CAPABILITY` |
 | **durable** | §8.1.1 | `DURABLE-IS-QUORUM-WATERMARK`, `INCOMPLETE-RECORD-NOT-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `SEAL-NEVER-BELOW-DURABLE` |
 | **erasure-coding group** | §4.3.2.3 | `EC-NEVER-SPLITS-AN-EXTENT`, `EC-GROUP-EQUAL-LENGTH`, `INSTANCES-BYTE-IDENTICAL`, `AEAD-TAG-IS-THE-CHECKSUM`, `ONE-MEDIA-CLASS-PER-EXTENT` |
+| **billing** | §12 | `BILLING-CHARGES-THE-CLASS-NOT-THE-COPIES`, `A-PHYSICAL-LENGTH-IS-NEVER-STORED`, `ZERO-REFERENCES-IS-A-BUG` |
 | **extent** | §4.2 | `EXTENT-IDENTITY-UNIQUE`, `EXTENT-HOLDS-WHOLE-RECORDS`, `EXTENT-OFFSET-WRITE-ONCE`, `EXTENT-SEALS-BETWEEN-RECORDS`, `SEALED-EXTENT-IMMUTABLE`, `ONE-UNSEALED-EXTENT-UNKEYED`, `RECORD-FITS-ONE-EXTENT`, `ONE-MEDIA-CLASS-PER-EXTENT`, `EC-NEVER-SPLITS-AN-EXTENT` |
 | **extent identity** | §4.6.3 | `EXTENT-IDENTITY-UNIQUE`, `EXTENT-OFFSET-WRITE-ONCE`, `EXTENT-KEY-FROM-CREATING-SN`, `HINT-BOUND-BY-CAPABILITY` |
 | **framing** | §8.2 | `FRAMING-IS-A-REPRESENTATION`, `TERMINATOR-NOT-IN-DATA`, `EXTENT-HOLDS-WHOLE-RECORDS`, `CANONICAL-OFFSET-SPACE` |
@@ -855,6 +882,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **primary** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `TRUNCATION-SEALS` |
 | **quorum** | §8.1.1 | `QUORUM-OVERLAPS`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `UNAPPENDABLE-EXTENT-SEALS`, `SELF-SEAL-MARK-IS-DURABLE` |
 | **batch** | §9.1.3.7 | `A-BATCH-ANSWER-IS-A-PREFIX`, `A-NAME-COSTS-AT-LEAST-ONE-ENTRY`, `A-NAME-HAS-ONE-OWNER` |
+| **stream summary** | §17.25.1 | `A-SEALED-SUMMARY-IS-FINAL`, `A-PHYSICAL-LENGTH-IS-NEVER-STORED`, `TAIL-ONLY-SUMMARIES-EXACT` |
 | **record** | §8.2 | `EXTENT-HOLDS-WHOLE-RECORDS`, `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `INCOMPLETE-RECORD-NOT-DURABLE`, `RECORD-FITS-ONE-EXTENT`, `TERMINATOR-NOT-IN-DATA`, `OFFSET-SNAPS-FORWARD`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `EXTENT-SEALS-BETWEEN-RECORDS`, `RANGE-ENDS-ON-A-RECORD-BOUNDARY` |
 | **record number** | §3 | `RECORD-NUMBER-STABLE`, `RECORD-NUMBERS-DENSE`, `UNKEYED-COUNT-EXACT`, `UPDATE-DELETE-PRESERVE-COUNTS`, `PATH-IS-THE-PORTABLE-NAME`, `SPACES-ARE-TYPES-WHEN-A-MIX-UP-IS-SILENT` |
 | **reference** | §4.6 | `NO-CLUSTER-NAMES-IN-DATA-PLANE`, `REVERSE-EDGE-IS-A-COUNT`, `COUNTS-ARE-RECOMPUTABLE`, `ZERO-REFERENCES-IS-A-BUG`, `POSITION-FACTS-IN-REFERRER`, `REVENUE-INVARIANT-UNDER-REGROUPING` |
