@@ -411,6 +411,36 @@ user code runs.
 **signed executables**, which makes code signing load-bearing and unspecified (#23)
 *Breaks* the single security invariant of the design.
 
+**`MASTER-KEYS-ARE-NEVER-PRUNED`** — the key store is append-only. Every day's master key is retained
+for as long as any extent created that day exists.
+*Argued* §7.3.2.4, §7.3.3 · *Enforced* design only · *Checked* not yet
+*Breaks* a pruned key is every byte written that day, gone permanently — deleted silently, irreversibly,
+and at a moment nobody is watching. §7.3's ~1 MB per century is what makes this free, so there is never
+a reason to weigh it.
+
+**`RE-KEYING-NEEDS-A-COMMITTED-MEMBERSHIP`** — a member is handed the unlocking key only on the strength
+of a membership already committed, and never on one member's unconfirmed view.
+*Argued* §7.3.2.2 · *Enforced* design only · *Checked* not yet; the test that matters evicts a member,
+loses quorum, and checks the evicted machine is refused
+*Breaks* a survivor whose log predates an **eviction** hands the key to exactly the machine the ring
+expelled. What makes the safe version possible is that quorums of successive configurations intersect,
+so a quorum of any known configuration contains someone who knows about the eviction.
+
+**`UNLOCKING-KEY-IS-GENERATED`** — the unlocking key is generated, never chosen, and the operator
+secrets of §7.3.2 are shares of it rather than passwords.
+*Argued* §7.3.2.3 · *Enforced* design only · *Checked* not yet — and it is the kind of rule that is
+broken by a convenience later, so it wants a check rather than a comment
+*Breaks* §7.3.2.3's verifier, stored in the clear so a wrong key fails loudly, becomes an **offline
+brute-force oracle** against anything a human composed. Harmless against 256 random bits; the whole
+attack against a passphrase.
+
+**`SHARDS-ARE-NOT-STORED-WITH-THE-HARDWARE`** — the k-of-n shards of the unlocking key live apart from
+the machines, in separate places and under separate credentials.
+*Argued* §7.3.2.5 · *Enforced* nothing can enforce it — it is operational, and listed here **because**
+no code will ever check it · *Checked* by audit only
+*Breaks* the distinction between "recoverable by its owners after a catastrophe" and "recoverable by
+whoever takes the disks". §7.3.2.5 wants the first and the cryptography cannot tell them apart.
+
 **`DISK-KEYS-ONLY-ON-ENS`** — no tier above an EN ever holds a key for data at rest.
 *Argued* §7.3.5, §7.3.6 · *Enforced* design only · *Checked* not yet
 *Breaks* the blast radius argument of §7.3.1. Note what it does *not* claim: every tier sees some
@@ -633,13 +663,13 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **hint** | §8.1.1a-10 | `HINT-BOUND-BY-CAPABILITY`, `CAPABILITY-IS-MEMBERSHIP-ONLY`, `EXTENT-IDENTITY-UNIQUE`, `RETAIN-REWRITE-INPUTS-FOR-THE-HINT-WINDOW` |
 | **instance** | §4.3 | `INSTANCES-BYTE-IDENTICAL`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `QUORUM-OVERLAPS`, `ONE-MEDIA-CLASS-PER-EXTENT`, `EC-GROUP-EQUAL-LENGTH` |
 | **key** (record key) | §3 | `RECORD-NUMBER-STABLE` (by contrast — keyed objects have no positional address), `UPDATE-DELETE-PRESERVE-COUNTS` |
-| **key** (cryptographic) | §7.3 | `KEY-AND-SALT-COVER-ONE-PLAINTEXT`, `KEYS-NEVER-WHERE-USER-CODE-RUNS`, `DISK-KEYS-ONLY-ON-ENS`, `EXTENT-KEY-FROM-CREATING-SN`, `NO-TWO-SEGMENTS-SHARE-A-NONCE` |
+| **key** (cryptographic) | §7.3 | `KEY-AND-SALT-COVER-ONE-PLAINTEXT`, `KEYS-NEVER-WHERE-USER-CODE-RUNS`, `DISK-KEYS-ONLY-ON-ENS`, `EXTENT-KEY-FROM-CREATING-SN`, `NO-TWO-SEGMENTS-SHARE-A-NONCE`, `MASTER-KEYS-ARE-NEVER-PRUNED`, `UNLOCKING-KEY-IS-GENERATED`, `SHARDS-ARE-NOT-STORED-WITH-THE-HARDWARE` |
 | ⚠️ **logical offset** | §8.1.6, §8.2.2 | `LOGICAL-OFFSETS-DENSE`, `CANONICAL-OFFSET-SPACE`, `FIXED-OFFSET-ADVANCES`, `OFFSET-SNAPS-FORWARD`, `EXTENT-OFFSET-WRITE-ONCE`, `ONE-UNSEALED-EXTENT-UNKEYED`. *Measured in canonical length-stuffed bytes, not in the stored framing.* |
 | **media class** | §7.4 | `ONE-MEDIA-CLASS-PER-EXTENT` |
 | **object** | §3 | `READ-NAMES-THE-OBJECT`, `RECORD-NUMBER-STABLE`, `HINT-BOUND-BY-CAPABILITY`, `CAPABILITY-IS-MEMBERSHIP-ONLY`, `ZERO-REFERENCES-IS-A-BUG`, `ONE-UNSEALED-EXTENT-UNKEYED` |
 | **path** | §4.6.3 | `PATH-IS-THE-PORTABLE-NAME`, `HINT-BOUND-BY-CAPABILITY`, `READ-NAMES-THE-OBJECT`, `POLICY-ATTACHES-TO-A-DIRECTORY` |
 | **failure domain** | §5.6 | `NESTED-NOT-ORTHOGONAL-DOMAINS`, `TOPOLOGY-IS-SIGNED-NOT-SECRET`, `SOLVER-TIMEOUT-DEFERS-NEVER-DROPS` |
-| **ring** | §5.7 | `MEMBERSHIP-IS-NOT-LEADERSHIP`, `TOPOLOGY-IS-SIGNED-NOT-SECRET` |
+| **ring** | §5.7 | `MEMBERSHIP-IS-NOT-LEADERSHIP`, `TOPOLOGY-IS-SIGNED-NOT-SECRET`, `RE-KEYING-NEEDS-A-COMMITTED-MEMBERSHIP` |
 | **placement** | §5.6 | `PLACEMENT-NEVER-REVISITED`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `NESTED-NOT-ORTHOGONAL-DOMAINS`, `SOLVER-TIMEOUT-DEFERS-NEVER-DROPS`, `UNENFORCEABLE-RULE-NOT-ENFORCED`, `NO-DATA-MOVEMENT-EXCEPT-RANGE-SPLIT` |
 | **primary** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `TRUNCATION-SEALS` |
 | **quorum** | §8.1.1 | `QUORUM-OVERLAPS`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `UNAPPENDABLE-EXTENT-SEALS`, `SELF-SEAL-MARK-IS-DURABLE` |

@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-136 things *not* decided.
+137 things *not* decided.
 
 **Priorities and framing**
 
@@ -287,6 +287,14 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **The EN does the on-disk crypto** — derives and caches a key per extent, encrypts and decrypts stored data, re-encrypts for the wire. Wire encryption is a self-contained layer the rest of the design ignores | §7.3.5, §17.5a |
 | **Every tier sees some user data** — a DN compares user keys, an FE cuts records out of blocks — so the trust boundary is **DeLawson code against user code**, not tier against tier. Disk keys live only on ENs | §7.3.6, §1.5 |
 | KS is unlocked by **operator secrets plus hardware** — the only step needing people | §7.3.2 |
+| KS has a **ring**, so unlocking is a ladder: the boundary needing people is **the key being in no memory**, not quorum loss | §7.3.2.1 |
+| A ring that lost quorum **heals itself**: membership is already committed, and quorums of successive configurations **intersect** | §7.3.2.2 |
+| So a lone survivor must not act — its view may predate an **eviction** — but a quorum of its known configuration may | §7.3.2.2 |
+| The ring stores a **verifier** for the unlocking key, so a wrong key fails loudly instead of producing garbage | §7.3.2.3 |
+| Which is safe **only because the key is generated, never chosen** — a commitment to a passphrase is a brute-force oracle | §7.3.2.3 |
+| The key store is **append-only and never prunes**: pruning a key deletes a day's data irreversibly | §7.3.2.4 |
+| Ultimate recovery is **k-of-n shards** — surviving n−k losses and resisting k−1 colluders are the same knob, pulled opposite ways | §7.3.2.5 |
+| And **shards are never stored with the hardware**, which is the only thing separating owner-recovery from thief-recovery | §7.3.2.5 |
 | Index granularity is `latency × bandwidth / 2` — **1 MB HDD, 20 KB SSD**, in *physical* bytes | §7.1.1 |
 | Compression improves **HDD** read bandwidth and degrades **NVMe** read bandwidth; it is mandatory regardless | §7.1.2 |
 | **An extent has exactly one media class**, because compression block size is durable and EC needs identical bytes | §7.4.2 |
@@ -5740,11 +5748,158 @@ Consequences worth being explicit about:
   the hardware devices are present. There is no fully automatic recovery from a
   total KS outage, by design. This is a security choice being paid for in
   availability, and it should be an owned decision rather than a discovered one.
+  ⚠️ **But "total" is narrower than it reads, and §7.3.2.1 is the ladder.** The
+  boundary is whether *any live process still holds the key*, not whether the ring
+  has quorum — a ring that lost quorum heals itself without people, because
+  membership is already committed and quorums of successive configurations
+  intersect (§7.3.2.2). The ceremony is for the case where every member restarted.
 - **There are two independent roots, and only one needs people.** §5.5.1's bootstrap root
   anchors the *object* hierarchy and lives in DN0's Raft state, so it needs no ceremony; the KS
   unlocking key anchors the *key* hierarchy and does. Since ring state is itself encrypted,
   KS must come up first — §5.5.1.1 gives the full cold-start order, which is acyclic precisely
   because KS is keyed by humans rather than by KS.
+
+##### 7.3.2.1 A ladder of failure scales, and the boundary is memory rather than quorum
+
+**KS has a ring** (Asserted, Bob, 2026-08-19), which turns "cold start requires human action" from one
+blunt statement into four cases with very different costs. Each rung's price is proportional to how
+rare it is, which is §1.1.1's shape — disasters, not steady state — applied to the key hierarchy.
+
+| Scale | Recovered by | People? |
+|---|---|---|
+| **a member** returns, quorum live | **the ring unlocks it directly**: membership is a committed fact, so the quorum already attests that machine belongs | **no** |
+| **quorum lost**, but some live process still holds the key | wait for a quorum of the last-known membership to assemble, then re-key them | **no** — see §7.3.2.2 |
+| **every member restarted**, so the key is in no memory anywhere | present the unlocking key to a member, which **confirms it is the right one** | yes, whoever holds the key |
+| **the organization gone**, hardware intact | reconstruct the unlocking key from **k of n shards** | yes, k custodians |
+
+**The first rung is what makes ordinary operation automatic**, and it works because the ring already
+knows something an outsider would have to be told: **membership is a committed fact** (§5.5.6.1), so a
+returning member's right to be re-keyed is established by the quorum rather than by a human vouching
+for it.
+
+⚠️ **What that implies is worth stating rather than inferring: after the ceremony, the unlocking key —
+or something equivalent — is live in KS members' memory.** It has to be, or a quorum could not hand a
+returning member what it needs. That is the cost of rung one, and it is also what sets the real
+boundary further down the ladder: **the ceremony is needed when the key is in no memory anywhere**, not
+when quorum is lost.
+
+##### 7.3.2.2 Losing quorum need not need people, and the reason is that quorums intersect
+
+⚠️ **An earlier draft of this section put the ceremony at quorum loss, and that is wrong** (Asserted,
+Bob, 2026-08-19, correcting it). **A still-up member has its own list of what machines are in the ring,
+so it can refuse to hand out the key until a quorum of those machines is up, and then hand it out.**
+
+The draft's mistake was conflating two different things a quorum is needed for:
+
+| | Needs a live quorum? |
+|---|---|
+| **Committing a new membership change** — admitting a machine that was not a member | **yes** |
+| **Acting on a membership already committed** — re-keying a machine the log already says belongs | **no.** Any surviving member has that in its log |
+
+So the attestation a returning member needs **already happened**, before the outage. Nothing new has to
+be decided, and a survivor is applying an old committed decision rather than making a fresh one.
+
+**But a lone survivor must still not act alone, and the reason is staleness rather than authority.** Its
+log may predate a committed change — most sharply, an *eviction*: if the ring removed a machine because
+it was compromised, a member with a stale log still lists it, and handing the key out on that view
+hands it to exactly the machine the ring expelled.
+
+**Waiting for a quorum of the last-known membership fixes that, by the property Raft is built on:**
+
+> **Quorums of successive configurations intersect.** So any quorum assembled from a known
+> configuration necessarily contains at least one member that knows about any change committed after
+> that configuration.
+
+Which means the assembled group can elect a leader, discover the current committed membership — the
+most up-to-date log wins, which is ordinary leader election — and *then* re-key whoever actually
+belongs. The stale view is corrected before it is acted on, rather than being trusted or refused.
+
+**So the ladder's second rung is automatic**, and that materially improves the availability posture: a
+KS ring can lose quorum and still heal itself with no human, provided one process stayed up. The
+ceremony is for the case where that is not true.
+
+⚠️ **Two things this needs, and the second is a real gap:**
+
+- **A survivor holding the key must refuse everything while it waits**, and the wait is unbounded. That
+  is correct — it makes nothing worse — but it must be *observable* that KS is waiting-and-savable
+  rather than broken, or an operator will start the ceremony unnecessarily, or worse, rebuild.
+- ⚠️ **This is only as strong as machine authentication.** "A quorum of those machines is up" is
+  meaningless if an attacker can stand up four processes claiming to be four members. So a machine's
+  identity has to be cryptographically established, and the credential that does it cannot be behind
+  the key it is trying to obtain. §5.5.6.3's signed topology is the right half of KS for it to live in,
+  but nothing yet says what a machine's identity actually is (§16.137).
+
+##### 7.3.2.3 The ring stores a verifier, so a wrong key fails loudly
+
+**An authentication for the unlocking key is stored in the ring's snapshot and log** (Asserted, Bob,
+2026-08-19), so anyone with the key can tell it to a member and the member can confirm it is the right
+one. Without this, a wrong key is indistinguishable from a right one until something downstream
+produces garbage — and "downstream" here is every extent in the cluster.
+
+⚠️ **The verifier is safe only because the unlocking key is generated rather than chosen**, and this is
+the one place the scheme could be got dangerously wrong. A commitment to a secret, stored where it can
+be read, is an **offline brute-force oracle**: an attacker holding a KS disk can test candidates without
+touching the cluster.
+
+| Verifier commits to | Then it is |
+|---|---|
+| a high-entropy **generated** key | harmless — there is no candidate set to search |
+| a human-chosen passphrase | **a brute-force oracle**, and worse than having no verifier at all |
+
+So the rule is narrow and absolute: **the unlocking key is generated, never chosen**, and §7.3.2's
+operator-entered secrets are *shares of a generated key* rather than passwords. A slow KDF in the
+verifier is worth having as defence in depth, but it is not what makes this safe.
+
+##### 7.3.2.4 Every day's master key is recoverable, because a lost key is lost data
+
+**All daily master keys are on disk encrypted, so a whole-ring outage loses neither the current nor any
+past key** (Asserted, Bob, 2026-08-19). The emphasis on *past* is the load-bearing half, and §7.3.3 says
+why: an extent's key derives from the master key of **the day it was created**, so a master key that
+cannot be recovered is every byte written that day, gone permanently.
+
+**So the key store is append-only and never prunes**, which is a durability invariant rather than a
+retention policy: pruning a key deletes data, silently and irreversibly, at a moment nobody is
+watching. §7.3's sizing makes it free — one random key per day is **~1 MB per century** — so there is
+never a reason to consider it.
+
+##### 7.3.2.5 The last rung must be possible, and that is a feature and a threat at once
+
+**If everyone suddenly dies and someone else gains access to all the KS hardware, it should be possible
+for them to unlock it** (Asserted, Bob, 2026-08-19) — shards buried under eleven mountains, fetch at
+least six. Difficult on purpose, and *possible* on purpose.
+
+**k-of-n does two jobs at once**, which is why it beats a full backup of the key:
+
+| | What it buys | Bounded by |
+|---|---|---|
+| losing **n − k** shards | survives the disaster | how large k is |
+| needing **k** custodians to agree | no one person can be coerced, and no one person can defect | how small k is |
+
+Those pull opposite ways, so k and n trade in the same shape as §4.3.3's "what disaster size do we
+design for" — and 6-of-11 survives five losses while resisting five colluders.
+
+⚠️ **The property is simultaneously the capability an attacker wants.** "Whoever holds the hardware can
+eventually unlock it" is exactly what an adversary who has stolen the hardware would like to be true.
+What keeps it a feature is that the hardware is **not sufficient** — k shards from k separated places
+are needed too. Which makes one operational rule load-bearing, and it is the easy one to violate by
+convenience:
+
+> **Shards are never stored with the hardware**, nor all in one jurisdiction, nor all reachable with
+> one person's credentials.
+
+That is the whole difference between "recoverable by its owners after a catastrophe" and "recoverable
+by whoever takes the disks", and nothing in the cryptography enforces it.
+
+##### 7.3.2.6 A dividend from §5.5.6.3: recovery starts before the custodians arrive
+
+§5.5.6.3 splits KS's state into a **locked** half (master keys) and an **unlocked** half (topology and
+registry, signed rather than encrypted). That was decided so a human ceremony could not gate automated
+recovery, and it pays off exactly here: on the bottom two rungs, **a KS ring can come up far enough to
+serve the machine list and ring membership while the key custodians are still travelling.**
+
+So the slowest rung overlaps with useful work — rings can re-form and the cluster can establish what
+exists — and only operations that genuinely need plaintext wait. With one undivided encrypted store,
+every recovery step would queue behind a journey.
 
 #### 7.3.3 What the extent entry must record
 
@@ -12145,6 +12300,14 @@ Roughly in order of how much else depends on them.
      billing concept rather than a security one. But §12.8.3's quota accounting and §12.6.3's shared-cost
      division both talk about tenants as if they were entities, and whether a path with a quota and a
      bill attached is enough has not been checked against them.
+
+137. **What a machine's identity actually is** (§7.3.2.2, §5.5.6.3, §1.5). §7.3.2.2's automatic recovery
+     from quorum loss rests on "a quorum of those machines is up", which is meaningless if an attacker can
+     stand up processes claiming to be members. So machine identity has to be cryptographically
+     established — and the credential cannot be behind the key it is trying to obtain, which rules out
+     the encrypted half of KS's own state. §5.5.6.3's signed half is the right home, and §1.5's code
+     signing is adjacent and equally unspecified (#23), but nothing says whether identity is a per-machine
+     keypair, hardware-backed attestation, or something issued at provisioning.
 
 **Closed** since earlier drafts:
 
