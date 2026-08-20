@@ -84,13 +84,17 @@ out-of-order cache, and cumulative byte totals.
 
 **`SPACES-ARE-TYPES-WHEN-A-MIX-UP-IS-SILENT`** — two same-typed quantities that mean different things
 get different types whenever confusing them would produce a wrong answer rather than an error.
-*Argued* §8.1.6.1, §8.1.6 · *Enforced* **code** for logical against compressed (`LOff`, `COff`); the
-three record spaces are still bare `u64` (#86) · *Checked* `the_two_spaces_do_not_mix` in
+*Argued* §8.1.6.1, §8.1.6 · *Enforced* **code** for logical against compressed (`LOff`, `COff`); record
+counts, ids and seconds are still bare integers (#86) · *Checked* `the_two_spaces_do_not_mix` in
 `common/src/offset.rs` is the shape of the check — a test that would stop compiling if the types merged
-*Breaks* silently, and §17.16.2 is the incident: object, stream and extent record numbers are all zero
-until an object outgrows its first extent, so dropping a conversion passes every test that never leaves
-it and then fails 139 of 200 reads. ⚠️ **The sharpest form of the criterion**: wrap them when the two
-coincide in exactly the cases a test would naturally cover, since that is when nothing catches it.
+*Breaks* silently. ⚠️ **The sharpest form of the criterion**: wrap them when the two coincide in exactly
+the cases a test would naturally cover, since that is when nothing catches it.
+⚠️ **Rust charges more for this than C++ does** — no implicit conversion, so every operation needs an
+impl or a `.get()` — so it is applied where the benefit is clear and not to every named quantity. And it
+is **not** the fix for a signature with a run of same-typed parameters: that wants a struct, as
+§17.13.3's `AppendBlock` was. Nor does it reach §17.16.2's object-against-stream-against-extent record
+numbers, which a single `ROff` would make one type; that stays covered by a test, and a partial fix that
+looks total is the risk worth naming.
 
 **`CANONICAL-OFFSET-SPACE`** — append offsets are assigned in a canonical length-stuffed space, so a
 logical offset is invariant under re-framing.

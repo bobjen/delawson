@@ -375,7 +375,10 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Positive naming costs a negation at the **enforcement** site, so name for the **more frequent reading** | §13.2.5.1 |
 | The **`LOff`/`COff` trick generalizes**: wrap same-typed values when a mix-up would be **silent** | §8.1.6.1 |
 | And the sharpest test of silent is that the two **coincide in the cases a test would cover** | §8.1.6.1 |
-| First: **object / stream / extent record numbers**, which §17.16.2 already failed 139 reads over | §8.1.6.1, §17.16.2 |
+| ⚠️ But **Rust charges more than C++** for it, so it is for clear benefits: `ROff`, `ObjectId`, `StreamId`, `ExtentId`, `Second` | §8.1.6.1 |
+| An id mix-up is **loud as an address and silent as a map key**, which is most places | §8.1.6.1 |
+| **Wrap values; group parameters.** A run of same-typed arguments wants a struct, as `AppendBlock` was | §8.1.6.1, §17.13.3 |
+| ⚠️ `ROff` does **not** catch §17.16.2's three record spaces, and a partial fix that looks total is the risk | §8.1.6.1 |
 | Because **double negatives read as emphasis of the negative** — a default of the language faculty, seen in novel languages | §4.1.1.0 |
 | Withdrawing a capability is **deferred**, but the **official flag stays permissive** until cleanup completes | §4.1.1.1 |
 | So the reliance rule is **unrepresentable to get wrong**: nothing can see a half-established restriction | §4.1.1.1 |
@@ -7330,13 +7333,73 @@ sharper than "these are different things":
 `LOff` and `COff` are equal while nothing compresses, which was every test written before compression
 existed. That is not a fact about offsets; it is the shape of the hazard.
 
-| Candidate | Type today | Coincide when | A mix-up is | Verdict |
-|---|---|---|---|---|
-| **object / stream / extent record numbers** | `u64` | **before the first seal**, when all three origins are zero | **silent** — §17.16.2 is the incident report | **yes, first** |
-| **second / day** for key derivation (§7.3.3) | `u64` | never numerically, but a *derived* key looks valid either way | **silent, and unrecoverable** — a wrong key is lost data (§7.3.2.4) | **yes** |
-| **entries / bytes** for the answer limit (§9.1.3.7, §16.132) | `u64` | while entries are uniform | silent | yes, once the limit exists |
-| `DnId` / `SnId` / `EnId` | `u32` | in small clusters, where the three id spaces overlap | **loud** — the request goes to the wrong machine type and is refused | low priority |
-| `StreamId` / `ExtentId` / object id | `u64` | early, while all are small | mostly loud, since the target lookup fails | low priority |
+⚠️ **And the criterion has to be applied strictly, because Rust charges more for this than C++ does**
+(Asserted, Bob, 2026-08-19). There is no implicit conversion to lean on, so a wrapped value needs an
+impl or a `.get()` at every arithmetic operation, comparison, format and wire crossing — where a C++
+strong typedef can stay largely transparent. **So the technique is for cases with a clear benefit, not
+for every quantity that has a name.**
+
+| Candidate | Type today | A mix-up is | Verdict |
+|---|---|---|---|
+| **`ROff`** — a record number or count, beside `LOff` and `COff` | `u64` | **silent**: §9.1.3.6's three measures are records, logical bytes and compressed bytes, and only two of them have types | **yes** |
+| **`ObjectId`, `StreamId`, `ExtentId`** | `u64` | **silent** — see the correction below | **yes** |
+| **`Second`** (and a day) for key derivation (§7.3.3) | `u64` | **silent and unrecoverable** — a *derived* key looks valid either way, and §7.3.2.4 makes a key you cannot reproduce that day's data gone | **yes** |
+| **entries / bytes** for the answer limit (§9.1.3.7, §16.132) | `u64` | silent while entries are uniform | once the limit exists |
+| `DnId` / `SnId` / `EnId` | `u32` | mixed: loud as an address, silent as a map key | lower |
+
+**`ROff` is the cheapest of these and the most obviously missing**, because `common/src/offset.rs`
+already generates `LOff` and `COff` from one macro and §9.1.3.6 names *three* measures. Two have types
+and the third is a bare `u64` — so `Covered { records, logical, compressed }` mixes typed and untyped
+fields, and `Budget::met` compares a count against a byte total by writing the comparison correctly
+rather than by being unable to write it wrongly. **The evidence that the type is wanted is that a test
+was written instead**: `a_budget_is_met_only_in_its_own_space` exists precisely because 500 logical
+bytes must not satisfy a 500-compressed-byte budget, which a type would refuse to compile.
+
+##### ⚠️ Correcting the claim that id mix-ups fail loudly
+
+An earlier version of this section rated the id types low priority on the grounds that a swap fails
+loudly. **That is true only while an id is being used as an address, and false where it is a map key**,
+which is most places:
+
+| | Swapping two ids |
+|---|---|
+| `format!("SN{n}")` to pick a peer | **loud** — the request goes to a machine that refuses it |
+| `self.at.get(&(sn, id))` in the EN | **silent** — the lookup simply misses, and the EN then creates a fresh extent for what it thinks is a new name |
+
+`EN::place(sn: u32, id: u64, created: u64)` is the example: the last two are adjacent, same-typed, and
+swapping them uses a timestamp as an extent id. The map misses, a second extent appears, and nothing
+says anything. So the correction reverses the priority — **ids belong on the list**, as Bob's had them.
+
+##### A run of same-typed parameters wants a struct, not five newtypes
+
+⚠️ **The worst hazard in the code today is not solved by typing values at all.** `SN::close` takes
+`dn: u32` and then **five consecutive `u64`s** — `stream, id, records, length, second`. Every swap
+among them compiles, and several would be silent.
+
+**§17.13.3 already solved this shape once, and the answer was a struct**: `AppendBlock` exists because
+"two processes each counting positions in a list pass their own unit tests while disagreeing with each
+other". A parameter list is the same failure with the compiler in the room. So:
+
+> **Wrap the *values* when two spaces could be confused; group the *parameters* when a signature has a
+> run of them.** They are different fixes for different mistakes, and the second is cheaper per unit of
+> risk removed.
+
+##### ⚠️ `ROff` does not catch §17.16.2's bug, and it must not be thought to
+
+The highest-severity mix-up in this system's history is object-local against stream-local against
+extent-local record numbers — §17.16.2, where all three origins are zero until an object outgrows its
+first extent and **139 of 200 reads failed** the moment one did.
+
+**`ROff` makes all three the same type.** Distinguishing them needs a per-container type —
+`ObjectRecord`, `StreamRecord`, `ExtentRecord` — and that is a far more invasive change, because a
+record number appears in `Described`, `Located`, `Open`, `Held`, `Extent`, `Append` and `Landed`, each
+in a different space. Under Bob's cost rule that is not obviously worth it.
+
+**So the honest position: this work does not address §17.16.2, and that bug stays covered by a test** —
+`a_record_number_survives_the_trip_through_three_spaces`, plus any read that crosses a seal. Saying so
+matters more than it might seem, because the danger of a partial fix is the confidence it creates:
+`ROff` everywhere would make the read path *look* type-safe while the conversion that actually broke
+remained a matter of getting the arithmetic right.
 
 **The first row is the one to do, because the bug is not hypothetical.** §17.16.2 records it: three
 numbering spaces meet on the read path, all three are zero until an object outgrows its first extent,
