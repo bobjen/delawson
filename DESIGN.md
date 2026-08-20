@@ -398,6 +398,10 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Worth most is the **practice**; then that all pairs cost only **log n** cases; the tool is third | §18.1.3 |
 | And the logarithm needs **complicated** test cases — one-thing-at-a-time suites pay the quadratic instead | §18.1.3 |
 | The two knots here are the **append interface** (2,560 combinations, ~15 rows) and **stream properties** | §18.1.3 |
+| ⚠️ **Lots of ways the tool fails to fit** — the practice survives them, the tool does not | §18.1.5 |
+| **Nested dimensions** are worse than excluded ones: out-of-scope values are *meaningless*, not disallowed | §18.1.5 |
+| When the knot grows, **add the feature to several random existing cases**, not regenerate | §18.1.5 |
+| Because a suite that has been **run** is worth more than the array it came from — §5.6.9's persisted solver answer | §18.1.5, §5.6.9 |
 | ⚠️ And the **term index is a first cut at which invariants interact**, so the pairs worth covering are already computed | §18.1.4, #92 |
 | An index and a count sharing a type make the max count **2^64 − 1**, or **2^64 − 2** with a sentinel | §8.1.6.2 |
 | Because **one past the end** must be representable, which §9.1.3's `next` computes on every answer | §8.1.6.2 |
@@ -15162,3 +15166,79 @@ interact:
 invariants. That is a much smaller set, it is already computed, and it is the natural input to a
 covering-array generator — which makes the term index a testing artefact as well as a navigational one
 (#92).
+
+#### 18.1.5 Where the tool does not fit, which is often
+
+⚠️ **There are lots of ways a covering array can fail to be appropriate** (Asserted, Bob, 2026-08-19),
+and the practice of §18.1.3 survives all of them while the tool does not. Two failures are worth
+writing down because they are the ones this design will meet.
+
+##### It handles nested dimensions badly
+
+**A covering array wants a flat set of dimensions, each with a fixed list of values.** Nesting breaks
+that: dimension B exists, or means anything, only when A takes a particular value. This design is full
+of it:
+
+| Nested thing | Exists only when |
+|---|---|
+| a framing's **width** | the framing is `FixedLength` (§8.2) |
+| the **cleanup cursor** | a capability flag is mid-withdrawal (§4.1.2) |
+| **EC parameters** — the code, the group shape | the storage class is erasure-coded rather than 4-instance (§4.3) |
+| an extent's **log** and everything about it | something has updated or deleted from it (§4.2) |
+| the **offset** in a range start | the start is `RecordThen` and not `Record` (§9.1.3.4) |
+
+⚠️ **And nesting is worse than exclusion, which is the part that surprises.** §18.1.2's disallowed
+combinations can be excluded, and jenny handles that. A nested dimension's out-of-scope combinations are
+not disallowed but **meaningless** — a width when the framing is `lf` is not wrong, it is nothing — and
+there is no value to put there that carries the right meaning. Two ways out, both lossy:
+
+- **Flatten into the parent**, so `framing` becomes `lf, crlf, nul, length, fixed:1, fixed:8, fixed:4096`.
+  Correct, and it inflates the parent's level count — which raises the *floor* on rows, since that is set
+  by the two largest level counts (§18.1.3).
+- **One array per branch**, which keeps the level counts small and **loses every pair that crosses
+  branches.**
+
+The last row of that table is in code written this session: `Range::args` pads the unused second number
+with zero, because the wire is flat while the meaning is nested. That padding is the same problem in a
+different place, and it is why `Start` is a kind plus two numbers rather than a variable-width thing.
+
+##### And the knot keeps growing after the suite is written
+
+**Once a suite has been generated and run, features and dimensions keep arriving.** Regenerating is the
+obvious response and it is the wrong one, because a generated suite that has been *run* is worth more
+than the array it came from:
+
+| Regenerating loses | Because |
+|---|---|
+| known-good status | every case becomes unvalidated again |
+| the reason a case exists | a case that once caught a bug is gone, along with whatever comment said so |
+| any readable diff | the whole suite changes, so nothing can be reviewed |
+
+**The practice instead: add the new feature to several random existing cases, and add new cases only
+when forced** (Asserted, Bob, 2026-08-19) — *"rather than rerunning the tool or using the options in the
+tool to extend the test suite."*
+
+⚠️ **That is an admission worth noting, since it comes from the tool's author**: even the tool's own
+extend mode loses to hand-editing here, because the value being protected is the suite's stability
+rather than its optimality.
+
+**Why *random* matters**: the existing cases already spread the other dimensions well, so a handful of
+random hosts covers most pairs involving the new feature. Adding it always to the same few, or to
+adjacent ones, would correlate the new dimension with whatever those cases happen to hold — and the
+pairs it then misses are not random but systematic.
+
+**And "forced" means an exclusion no existing case can host** (§18.1.2). If the new feature is
+incompatible with what every existing case does, there is nowhere to put it and a new case is the only
+option. That is the one time the suite has to grow.
+
+⚠️ **Stated honestly: this trades guaranteed pair coverage for suite stability**, and it is a judgement
+rather than a theorem. What it buys is that the suite keeps its history; what it costs is that coverage
+becomes probabilistic at the edges.
+
+##### The same shape as a decision already made
+
+**§5.6.9 settled that placement is a solver whose answer is persisted, so the steady state is
+verification rather than re-solving** — and re-running the solver would cause churn for no benefit
+(§5.6.7 adds that this is why oscillation causes none). **A covering array is a solver output with
+exactly that property.** Generate once, persist, maintain by hand, and never re-solve. Fifth instance of
+the pattern in this design, and the first outside the running system.
