@@ -390,6 +390,21 @@ counter (`common/src/seal.rs`) · *Checked* unit test
 *Breaks* `KEY-AND-SALT-COVER-ONE-PLAINTEXT` on the wire. Worth citing as the pattern: this is the one
 place the discipline is already stated as an invariant and enforced by construction.
 
+**`POLICY-ATTACHES-TO-A-DIRECTORY`** — an object's policy is its nearest ancestor directory's. There
+is no per-object ACL and no per-tenant one.
+*Argued* §5.9.1a · *Enforced* design only — authorization does not exist yet · *Checked* not yet
+*Breaks* per-object policy puts unbounded metadata on the one tier with no ceiling (§14.2), and makes
+"who can read what" unanswerable — the failure that made S3 and GCS deprecate object ACLs. Note a
+tenant is **not** a unit here: aliases mean an object is reachable under two tenants at once.
+
+**`ALIAS-READS-INTERSECT`** — a read through an alias must satisfy the alias's grant **and** the
+owner's ACL, checked at the target.
+*Argued* §5.1.1, §5.9.1a · *Enforced* design only · *Checked* not yet — and the test that matters
+grants through an alias and then narrows the owner's ACL
+*Breaks* an alias becomes a way to escape the owner's policy, which would make aliases a privilege
+escalation rather than a view. It is also what makes deny rules unnecessary: intersection is monotone,
+so every restriction is expressible as a smaller grant.
+
 **`KEYS-NEVER-WHERE-USER-CODE-RUNS`** — user code runs only on Compute, and keys never exist where
 user code runs.
 *Argued* §1.5 · *Enforced* design only · *Checked* not yet — and §16 notes the real boundary is
@@ -592,6 +607,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **append block** | §8.1 | `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `RECORD-FITS-ONE-EXTENT`, `EXTENT-SEALS-BETWEEN-RECORDS`, `APPLIED-IS-A-PREFIX`, `ONE-BLOCK-ALWAYS-RETURNS` |
 | **applied** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE` |
 | **capability** | §9.1.3.5 | `CAPABILITY-IS-MEMBERSHIP-ONLY`, `HINT-BOUND-BY-CAPABILITY`, `KEY-AND-SALT-COVER-ONE-PLAINTEXT` |
+| **directory** | §5.1 | `POLICY-ATTACHES-TO-A-DIRECTORY`, `ALIAS-READS-INTERSECT` |
 | ⚠️ **compressed position** | §8.1.6 | `KEY-AND-SALT-COVER-ONE-PLAINTEXT`, `EC-GROUP-EQUAL-LENGTH`. *The same space §4.5 and §8.1.1a-2 call **physical**.* |
 | **creation second** | §4.6.3 | `EXTENT-IDENTITY-UNIQUE`, `EXTENT-KEY-FROM-CREATING-SN`, `HINT-BOUND-BY-CAPABILITY` |
 | **durable** | §8.1.1 | `DURABLE-IS-QUORUM-WATERMARK`, `INCOMPLETE-RECORD-NOT-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `SEAL-NEVER-BELOW-DURABLE` |
@@ -606,7 +622,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | ⚠️ **logical offset** | §8.1.6, §8.2.2 | `LOGICAL-OFFSETS-DENSE`, `CANONICAL-OFFSET-SPACE`, `FIXED-OFFSET-ADVANCES`, `OFFSET-SNAPS-FORWARD`, `EXTENT-OFFSET-WRITE-ONCE`, `ONE-UNSEALED-EXTENT-UNKEYED`. *Measured in canonical length-stuffed bytes, not in the stored framing.* |
 | **media class** | §7.4 | `ONE-MEDIA-CLASS-PER-EXTENT` |
 | **object** | §3 | `READ-NAMES-THE-OBJECT`, `RECORD-NUMBER-STABLE`, `HINT-BOUND-BY-CAPABILITY`, `CAPABILITY-IS-MEMBERSHIP-ONLY`, `ZERO-REFERENCES-IS-A-BUG`, `ONE-UNSEALED-EXTENT-UNKEYED` |
-| **path** | §4.6.3 | `PATH-IS-THE-PORTABLE-NAME`, `HINT-BOUND-BY-CAPABILITY`, `READ-NAMES-THE-OBJECT` |
+| **path** | §4.6.3 | `PATH-IS-THE-PORTABLE-NAME`, `HINT-BOUND-BY-CAPABILITY`, `READ-NAMES-THE-OBJECT`, `POLICY-ATTACHES-TO-A-DIRECTORY` |
 | **placement** | §5.6 | `PLACEMENT-NEVER-REVISITED`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `NESTED-NOT-ORTHOGONAL-DOMAINS`, `SOLVER-TIMEOUT-DEFERS-NEVER-DROPS`, `UNENFORCEABLE-RULE-NOT-ENFORCED`, `NO-DATA-MOVEMENT-EXCEPT-RANGE-SPLIT` |
 | **primary** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `TRUNCATION-SEALS` |
 | **quorum** | §8.1.1 | `QUORUM-OVERLAPS`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `UNAPPENDABLE-EXTENT-SEALS`, `SELF-SEAL-MARK-IS-DURABLE` |

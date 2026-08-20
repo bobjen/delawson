@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-134 things *not* decided.
+136 things *not* decided.
 
 **Priorities and framing**
 
@@ -160,6 +160,13 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | In orbit the scarce resources are **launch mass and heat rejection**, so §1.2's basis changes and §12.1's rule does not | §1.0.5.1 |
 | Every append records its **durability second**, so time-range queries work indefinitely — distinct from the minutes-long SCN snapshot horizon | §9.7 |
 | **User code only on Compute; keys never where user code runs** | §1.5 |
+| **A tenant is not a domain; a path is** — aliases falsify the tenant partition, so authorization attaches to the **directory** | §5.9.1a |
+| Which is the unit §8.4.3 already uses for expiry, soft-delete opt-out and storage class — a fourth unit would have to justify itself | §5.9.1a, §8.4.3 |
+| **No per-object ACL**: unbounded per-object metadata (§14.2), and S3 and GCS both shipped object ACLs and **deprecated** them for unauditability | §5.9.1a |
+| If policy needs a grouping the tree does not express, **the tree is wrong** — cheap here, since a directory is derived and renames move nothing | §5.9.1a, §5.1.2.2 |
+| **No deny rules**: composition is an alias AND the owner's ACL, and intersection is monotone, so any deny is a smaller grant | §5.9.1a, §5.1.1 |
+| Composition depth is **capped at two** by §5.1.1.1's cycle rule, so a reader can always be told what governed the answer | §5.9.1a |
+| Sharing one object is an **event with an expiry**, not durable state — a capability, not an ACL | §5.9.1a, §9.1.3.5 |
 | The real boundary is **signed executables**, not absence of keys — which makes code signing load-bearing | §1.5 |
 | **Extent decryption happens on the EN**; end-to-end encryption is a user-side option, not a product | §5.9.2, §7.2.3 |
 | **AEGIS-128X2**, ~20 GB/s per core: encryption is 0.63 of a core at line rate where compression would be ~21 | §7.2.1 |
@@ -4019,6 +4026,98 @@ isolation *on* the Compute machine would fix the bandwidth problem, but the
 invariant as stated is machine-level and excludes it. Either the invariant relaxes
 to a hardware-isolation boundary, or the decryption tier's bandwidth has to scale
 with Compute's input rate. This needs deciding before Compute is built, not after.
+
+#### 5.9.1a What authorization attaches to: the directory, not the tenant and not the object
+
+⚠️ **"Each tenant is their own domain" was the working model and aliases falsify it** (Asserted, Bob,
+2026-08-19): an object under an alias is readable by its owning tenant *and* by whoever the alias was
+granted to, so the tenant is not a partition of anything.
+
+**The replacement is one sentence: a tenant is not a domain, a path is — and a tenant root is just a
+distinguished path.** Everything below follows from that, and most of it was already decided for other
+reasons.
+
+**The unit of policy is the directory**, and this is a consistency argument rather than a new choice.
+§8.4.3 and §16.27 already make the directory the unit for **expiry grouping**, **soft-delete opt-out**
+and **default storage class**. Three policies already ride it; authorization riding the same unit costs
+nothing new to explain, and a fourth unit would have to justify itself.
+
+An object's policy is its nearest ancestor directory's, which is the POSIX and ADLS inheritance rule.
+
+##### Per-object authorization: the industry shipped it and retreated
+
+**There is no per-object ACL** (Asserted, Bob, 2026-08-19, and the prior art agrees emphatically).
+Two independent arguments, and the second is unusually strong evidence:
+
+- **Cost, on the one tier whose count is unbounded.** §14.2 makes DN object count the thing with no
+  ceiling, and §9.1.3.3 already refused to store per-object *counts* on exactly that ground — "it costs
+  space per object, on the one tier whose object count is unbounded". An ACL body per object is a much
+  larger version of the same mistake. An ACL *reference* is affordable (§5.1 has one); a distinct
+  policy per object is what is being refused.
+- **Cited: S3 and GCS both shipped per-object ACLs and then deprecated them.** AWS made "bucket owner
+  enforced" the default, which **disables object ACLs entirely**; GCS calls object-level ACLs legacy
+  and recommends uniform bucket-level access. That is a natural experiment run twice at enormous scale,
+  and both ran it backwards. The failure mode was not cost but **unauditability**: nobody can answer
+  "who can read what" when the answer is scattered across 10^12 objects, and the well-known public-data
+  incidents were per-object ACL confusion rather than deliberate grants.
+
+**And a general principle falls out**, which is the useful part when a case seems to demand per-object
+policy:
+
+> If policy needs a grouping the directory tree does not express, **the tree is wrong, not the policy
+> model.**
+
+That is affordable advice here in a way it would not be elsewhere, because §5.1.2.2 makes a directory
+*derived rather than stored* and §5.11.3.1 makes splitting and merging rename nothing — so
+restructuring to match a policy boundary is cheap. Where it is not cheap, §5.1.2's virtual directories
+express a grouping without moving anything.
+
+##### The three cases that look like they need per-object, and what serves them
+
+|Case | Better answer |
+|---|---|
+| **Share one object with an outside party** | a **time-bounded capability** (§9.1.3.5's machinery, attesting authorization instead of membership). Revocable by expiry, auditable as an issuance, and **zero per-object metadata** — this is S3 presigned URLs, and DeLawson already has the shape |
+| **Quarantine one object** found to hold something it should not | **move it.** A rename into a quarantine directory is cheap (§5.11.3.1) and uses the unit that already exists |
+| **Per-record entitlements** — medical or per-subject data | not an authorization problem at this layer. Either an object per entitlement class, or the user encrypts before sending and pays for it in physical bytes (§7.2.3) |
+
+**The first row is the one worth noticing**, because it says the per-object case is real and the ACL is
+the wrong mechanism for it: a share is an *event with an expiry*, and an ACL is *durable state*.
+Modelling an event as state is what produced the auditability problem above.
+
+##### Negative authorization: not needed, and the reason is structural
+
+**There are no deny rules** (Asserted, Bob and reasoning here, 2026-08-19). The question is not taste,
+it is whether policy composes from independent sources:
+
+| | Needs deny? | Because |
+|---|---|---|
+| **AWS IAM** | **yes** | policies arrive from many places at once, so a guardrail is only enforceable if it can override a grant made elsewhere |
+| **Kubernetes RBAC** | **no**, by choice | "purely additive" was chosen for comprehensibility |
+| **POSIX ACLs** | no | a mask narrows; nothing denies |
+| **DeLawson** | **no** | see below |
+
+**DeLawson's composition is already an intersection, and intersection needs no deny.** §5.1.1 settles
+that a read through an alias is governed by **the owner's ACL, checked at the target**, with the alias
+only saying the reader may look. That is an **AND** of two gates, and AND is monotone: narrowing either
+side narrows the result, so any restriction expressible as a deny is expressible as a smaller grant.
+Deny earns its keep only where composition is a union.
+
+⚠️ **And the composition depth is capped at two, by a rule made for another purpose.** §5.1.1.1 forbids
+an alias pointing into a tree that contains aliases — written to prevent cycles — which incidentally
+means at most two policies ever bear on one read. So the comprehensibility objection to composed policy
+does not arise: a reader can always be told the two things that governed the answer.
+
+##### What this leaves open
+
+- ⚠️ **Where the ACL is fetched from is still §16.129 / #81**, and unaffected by any of the above. That
+  question is about *hops*, not about *granularity*.
+- ⚠️ **Whether a capability may ever attest authorization** rather than only membership. §9.1.3.5 was
+  careful to make it membership-only precisely so that ACL changes take effect immediately; a
+  share-with-an-outsider capability would give that up deliberately, for a bounded window, and it should
+  be a separate mechanism with its own name rather than a flag on the existing one (§16.135).
+- **Whether a tenant needs any representation at all** beyond being a path with a quota and a bill
+  attached. Nothing above requires one, which is a hint that "tenant" is a billing concept rather than a
+  security concept — but §12's quota accounting may want it, and that has not been checked.
 
 #### 5.9.2 Where decryption happens: on the EN
 
@@ -11897,6 +11996,20 @@ Roughly in order of how much else depends on them.
      was done and what to ask for next — looks right, and idempotence is what makes retrying the whole
      request cheap, but neither the answer nor whether the operation is resumable is chosen. Unkeyed objects
      do not have the problem, since they have one open extent.
+
+135. **Whether a capability may ever attest authorization, not only membership** (§5.9.1a, §9.1.3.5).
+     §9.1.3.5 made the hint capability membership-only so that ACL changes take effect at once, which is
+     what removed the revocation problem. Sharing an object with an outside party wants the opposite
+     trade — a bounded window during which a bearer may read without being in any ACL — and that is S3's
+     presigned URL. It should be a **separate mechanism with its own name** rather than a flag on the
+     hint capability, or the property that makes hints safe to paste into a bug report is lost. What is
+     open is whether DeLawson wants the feature at all, and if so who may issue one and how issuance is
+     audited.
+136. **Whether a tenant needs any representation beyond a path** (§5.9.1a, §12). Nothing in
+     authorization requires one once policy attaches to directories, which suggests "tenant" is a
+     billing concept rather than a security one. But §12.8.3's quota accounting and §12.6.3's shared-cost
+     division both talk about tenants as if they were entities, and whether a path with a quota and a
+     bill attached is enough has not been checked against them.
 
 **Closed** since earlier drafts:
 
