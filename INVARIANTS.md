@@ -409,13 +409,25 @@ one. Enforcement reads the per-purpose flag in the extra structure instead, whic
 purpose. Two earlier drafts got this wrong in opposite ways: one made the flag one-way, the other made it
 three-valued and relied on readers checking the state.
 
-**`A-FLAG-NAME-IS-NOT-A-NEGATION`** — no flag is named `un-`, `no-` or `-disallowed`. Capabilities are
-named positively and negated at the point of use.
-*Argued* §4.1.1.0 · *Enforced* by review · *Checked* greppable, and cheap to check
+**`A-NAME-IS-NOT-A-NEGATION`** — no name is `un-`, `no-` or `-disallowed`. Capabilities are named
+positively and negated at the point of use. Applies to all names, not only flags.
+*Argued* §4.1.1.0, §13.2.5.1 · *Enforced* by review · *Checked* greppable, and cheap to check
 *Breaks* every reader hits a double negative at each negation, and double negatives are read as
 **emphasis of the negative** rather than as a positive — apparently a default of the language faculty,
 since it recurs in novel languages. So the wrong reading is fluent and the mistake is silent. `sealed`
-passes the rule: it is a restriction but not morphologically a negation, so `!sealed` is unambiguous.
+passes: a restriction, but not morphologically a negation, so `!sealed` is unambiguous.
+⚠️ **A strong default, not an absolute.** It is the bottom of *make the logic simple → reduce negation
+depth → name positively*, and it can fight the level above it: a positive name costs a negation wherever
+the restriction is *enforced*. Break the tie by which reading occurs more often (§13.2.5.1).
+
+**`A-ROLLOUT-PARAMETER-DEFAULTS-TO-THE-OLD-BEHAVIOUR`** — a new feature's parameter defaults to what the
+fleet did before it, which is `false` for an additive feature and **`true`** for a restrictive one.
+*Argued* §13.2.5.1, §13.2.5 · *Enforced* design only; §13.2.5 says none of this is needed until
+something is persisted · *Checked* not yet
+*Breaks* a not-yet-upgraded configuration supplies no value, so the default is what the old fleet gets —
+and a restrictive feature defaulting to *active* is a gate that does nothing on the deployment it exists
+to protect. ⚠️ "Checked in off" is this rule for the additive case only, and reading the proxy as the
+rule is what put it in conflict with `A-NAME-IS-NOT-A-NEGATION`.
 
 **`UPDATE-DELETE-PRESERVE-COUNTS`** — update and delete never change any cumulative record count and
 never reopen a sealed extent.
@@ -724,7 +736,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **key** (record key) | §3 | `RECORD-NUMBER-STABLE` (by contrast — keyed objects have no positional address), `UPDATE-DELETE-PRESERVE-COUNTS` |
 | **key** (cryptographic) | §7.3 | `KEY-AND-SALT-COVER-ONE-PLAINTEXT`, `KEYS-NEVER-WHERE-USER-CODE-RUNS`, `DISK-KEYS-ONLY-ON-ENS`, `EXTENT-KEY-FROM-CREATING-SN`, `NO-TWO-SEGMENTS-SHARE-A-NONCE`, `MASTER-KEYS-ARE-NEVER-PRUNED`, `UNLOCKING-KEY-IS-GENERATED`, `SHARDS-ARE-NOT-STORED-WITH-THE-HARDWARE` |
 | **tombstone** | §8.3 | `A-TOMBSTONE-KEEPS-ITS-WIDTH`, `UPDATE-DELETE-PRESERVE-COUNTS` |
-| **stream flag** | §4.1.1 | `A-CAPABILITY-RESTORES-CHEAPLY-AND-WITHDRAWS-SLOWLY`, `THE-OFFICIAL-FLAG-STAYS-PERMISSIVE-UNTIL-CLEANUP-ENDS`, `A-FLAG-NAME-IS-NOT-A-NEGATION`, `RARE-AND-TRANSIENT-FIELDS-GO-OUT-OF-LINE` |
+| **stream flag** | §4.1.1 | `A-CAPABILITY-RESTORES-CHEAPLY-AND-WITHDRAWS-SLOWLY`, `THE-OFFICIAL-FLAG-STAYS-PERMISSIVE-UNTIL-CLEANUP-ENDS`, `A-NAME-IS-NOT-A-NEGATION`, `RARE-AND-TRANSIENT-FIELDS-GO-OUT-OF-LINE` |
 | ⚠️ **logical offset** | §8.1.6, §8.2.2 | `LOGICAL-OFFSETS-DENSE`, `CANONICAL-OFFSET-SPACE`, `FIXED-OFFSET-ADVANCES`, `OFFSET-SNAPS-FORWARD`, `EXTENT-OFFSET-WRITE-ONCE`, `ONE-UNSEALED-EXTENT-UNKEYED`. *Measured in canonical length-stuffed bytes, not in the stored framing.* |
 | **media class** | §7.4 | `ONE-MEDIA-CLASS-PER-EXTENT` |
 | **object** | §3 | `READ-NAMES-THE-OBJECT`, `RECORD-NUMBER-STABLE`, `HINT-BOUND-BY-CAPABILITY`, `CAPABILITY-IS-MEMBERSHIP-ONLY`, `ZERO-REFERENCES-IS-A-BUG`, `ONE-UNSEALED-EXTENT-UNKEYED` |

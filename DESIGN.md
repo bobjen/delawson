@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-140 things *not* decided.
+141 things *not* decided.
 
 **Priorities and framing**
 
@@ -366,7 +366,11 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | So the byte space behaves as the number space already does: a dead record keeps its **number and its width** | §9.1.3.9, §3 |
 | Preserving a width **costs no space** — a logical offset is a name (§8.2.2), so compaction still reclaims the bytes | §9.1.3.9 |
 | The snap rule ignores liveness, or a delete would move a partition boundary | §9.1.3.9, §9.1.3.4 |
-| Flags are named for the **capability**, never its absence: `deletable`, not `undeletable` | §4.1.1.0 |
+| **Make the logic simple** → **reduce negation depth** → **name positively**; the last applies to all names, not just flags | §13.2.5.1, §4.1.1.0 |
+| So flags are named for the **capability**, never its absence: `deletable`, not `undeletable` | §4.1.1.0 |
+| A rollout parameter **defaults to the old behaviour** — "checked in off" is that rule for an *additive* feature only | §13.2.5.1 |
+| So a *restrictive* feature's parameter is `deletes_allowed`, defaulting **true**: positive name, old behaviour, no thesaurus | §13.2.5.1 |
+| Positive naming costs a negation at the **enforcement** site, so name for the **more frequent reading** | §13.2.5.1 |
 | Because **double negatives read as emphasis of the negative** — a default of the language faculty, seen in novel languages | §4.1.1.0 |
 | Withdrawing a capability is **deferred**, but the **official flag stays permissive** until cleanup completes | §4.1.1.1 |
 | So the reliance rule is **unrepresentable to get wrong**: nothing can see a half-established restriction | §4.1.1.1 |
@@ -1573,8 +1577,10 @@ coped with it can be skipped, and readers can rely on properties that would othe
 
 ##### 4.1.1.0 Flags are named for the capability, never for its absence
 
-**Base flags are positive: `deletable`, not `undeletable`** (Asserted, Bob, 2026-08-19). The rule is
-about the reader's parser rather than about tidiness:
+**Base flags are positive: `deletable`, not `undeletable`** (Asserted, Bob, 2026-08-19). ⚠️ **And this
+is the bottom of a hierarchy rather than a rule of its own** (§13.2.5.1): *make the logic simple* →
+*reduce the depth of negations* → *name things positively*. It therefore **applies to all names, not
+only to flags.** The reason is capacity rather than taste:
 
 > ⚠️ **Double negatives are read as emphasis of the negative, not as a positive.** It appears to be a
 > feature of the built-in human language machinery — it shows up frequently in **novel** languages,
@@ -1585,10 +1591,15 @@ So `!undeletable` does not read as *deletable*; it reads as *really not deletabl
 negative flag names is asking every reader to fight their native parser at every negation, and the
 mistakes are silent because the wrong reading is fluent.
 
-**The rule states precisely as: a flag name must not itself be a negation** — no `un-`, no `no-`, no
+**The rule states precisely as: a name must not itself be a negation** — no `un-`, no `no-`, no
 `-disallowed`. That is narrower than "positive" and it is what actually matters, which is why `sealed`
 passes: it is not morphologically a negation, so `!sealed` reads unambiguously even though the concept
 is a restriction.
+
+⚠️ **It is a strong default rather than an absolute**, and §13.2.5.1 works through the case that tests
+it: a positive name costs a negation at the site that *enforces* the restriction, so the tie is broken
+by which reading happens more often. For a capability that is *may I?*, which is why the positive name
+wins here on the general rule rather than in spite of it.
 
 ⚠️ **And it is why this document's prose and the code's identifiers differ deliberately.** The sections
 below argue about *updates being disallowed*, because that is the property being reasoned about; the
@@ -11008,6 +11019,84 @@ upgrade path still runs a version that needs it.** So "the next version or later
 tidiness before release, and a constraint set by the upgrade graph afterwards — the two are the same
 rule at different stages, and the second one is not negotiable by whoever is tidying up.
 
+##### 13.2.5.1 "Checked in off" is a proxy; the rule is "defaults to the old behaviour"
+
+⚠️ **This section and §4.1.1.0's naming rule conflict, and it is a real conflict rather than a
+confusion** (Asserted, Bob, 2026-08-19): *"if the feature is disallowing something, that conflicts with
+the positive-name rule, and I end up going to the thesaurus to try to find a positive name for
+disallowing whatever it is, or flipping a coin on which rule to obey."*
+
+**First, the rule §4.1.1.0 belongs to, because it is larger than flag names** (Asserted, Bob,
+2026-08-19):
+
+> **Make the logic simple** → **reduce the depth of negations** → **name things positively.**
+
+Each is an instance of the one above it, the naming rule **applies to all names and not only to
+flags**, and the reason is capacity rather than taste: humans misread double negatives and are
+hopeless at triple and quadruple ones. ⚠️ **That rule has no home of its own in this document**, which
+is a gap — it is a coding standard, and there is no section for those (§16.141).
+
+##### What does not work: renaming the gate after its machinery
+
+An earlier draft of this subsection claimed the conflict dissolved if the gate were named for the
+mechanism it switches on — `stream_capability_flags` rather than `disallow_deletes` — since machinery
+is always a positive noun. **That is available and it is not free**, so it is recorded as a technique
+rather than a resolution:
+
+| | Says |
+|---|---|
+| `disallow_deletes` | exactly which behaviour changes |
+| `stream_capability_flags` | that a mechanism exists |
+
+**The second is vaguer, and vagueness has a cost paid at the worst moment** — by whoever is looking for
+the switch that will stop deletes being refused, while it is happening. Trading specificity for
+positivity is sometimes right and never free.
+
+##### What does work: the rollout rule was stated as a proxy
+
+**"Checked in disabled" is not the requirement; it is what the requirement looks like for an *additive*
+feature.** The requirement is:
+
+> **A new feature's parameter defaults to the behaviour that was there before it.**
+
+That is what §13.2.5's two arguments actually need — a not-yet-upgraded configuration supplies no
+value, so the default is what the old fleet gets, and it must be the old behaviour. **"Off" is merely
+what that means when the feature adds something.** For a feature that *takes something away*, the old
+behaviour is the permissive one:
+
+| Feature | Parameter | Default | Ends at |
+|---|---|---|---|
+| a truncation seals the extent (§7.2.4) — **additive** | `seal_on_truncate` | **false** | true |
+| streams may bar record deletes (§9.1.3.10) — **restrictive** | `deletes_allowed` | **true** | false |
+
+Both are named positively, both default to the old behaviour, and **neither needed a thesaurus.** The
+bind came from reading "off" as the rule instead of as an example of it.
+
+##### The residual conflict is real, and it is between the two halves of the naming rule
+
+⚠️ **Naming positively can *increase* negation depth at the point of use**, which is the general rule
+fighting its own special case:
+
+| | At the enforcement site | At the query site |
+|---|---|---|
+| `disallow_deletes` | `if disallow_deletes` — **depth 0** | `if !disallow_deletes` — depth 1 |
+| `deletes_allowed` | `if !deletes_allowed` — depth 1 | `if deletes_allowed` — **depth 0** |
+
+So there is no naming that is shallow everywhere, and the arbitration follows from the top of the
+hierarchy rather than from the naming rule:
+
+> **Name for the reading that occurs most often**, since that is what minimizes total negation depth.
+
+For a capability, the common question is *may I?* rather than *must I refuse?* — enforcement happens in
+one place and queries happen everywhere — so the positive name wins on the general rule, not despite
+it. **Where that is not true of some particular flag, the general rule says to name it the other way**,
+and §4.1.1.0's prohibition on `un-` and `-disallowed` is a strong default rather than an absolute.
+
+⚠️ **And where a name genuinely cannot be made shallow, the negation depth is a signal about the
+logic rather than about the name.** Two or more negations meeting in one expression usually means a
+predicate is missing: give the compound condition a positive name of its own and the depth collapses.
+That is the top rule doing the work the bottom one could not.
+
 ### 13.3 Background loops
 
 Everything the write path is not allowed to do synchronously has to happen
@@ -12819,6 +12908,14 @@ Roughly in order of how much else depends on them.
      loop inventory at one per tier boundary, so this needs to ride the existing loop rather than wanting
      a new one. Whether the cursor is purely SN-side, and what a reader is told while the two disagree,
      are both open.
+
+141. **Where the coding rules live** (§13.2.5.1, §4.1.1.0). *Make the logic simple → reduce the depth of
+     negations → name things positively* is a coding standard, it applies across the whole codebase, and it
+     currently sits inside a subsection about deployment parameters because that is where the conflict
+     surfaced. §15.3 covers the test strategy and §17 covers what is built; neither is a home for rules
+     about how code should read. There is probably more than one such rule already implicit — §17.12.1's
+     "the fix is structural rather than careful" and §8.1.6's "make the compiler catch it" are two — so the
+     section would have occupants the moment it existed.
 
 **Closed** since earlier drafts:
 
