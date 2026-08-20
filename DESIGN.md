@@ -15792,3 +15792,85 @@ verification rather than re-solving** — and re-running the solver would cause 
 (§5.6.7 adds that this is why oscillation causes none). **A covering array is a solver output with
 exactly that property.** Generate once, persist, maintain by hand, and never re-solve. Fifth instance of
 the pattern in this design, and the first outside the running system.
+
+### 17.22 The DN fans out, and one ask per SN rather than one per stream
+
+#79's second half: `object-info` answers `Detail::Extents` and `Detail::Instances` by asking the SNs.
+
+⚠️ **The DN drives it, not the FE, and an earlier draft of this plan had that wrong.** The reason given
+for the FE was that only it knows all three numbering spaces (§17.16.2) — **which is false**. The FE
+knows them because it is *told*; the **DN holds the object→stream map natively**, so it can convert
+stream-local extent records to object-local itself. And since it also holds every stream of every object
+in a batch, it is the tier that can group by SN before asking.
+
+**So `Op::ObjectInfo` stays purely forwarded and the FE needed no changes at all** — which is the other
+sign the DN was the right place.
+
+#### 17.22.1 One ask per SN, because §1.4.0 says where the cost is
+
+⚠️ **`list-extents` takes several streams, not one** (Asserted, Bob, 2026-08-19): *"a DN asking about
+several SN streams should use the batch SN stream info... to make BatchObjectInfo truly batch."*
+
+**One ask per stream would put the fan-out exactly where §1.4.0 measures the cost.** That section finds
+nine tenths of an unbatched request's cost is messaging, and a `batch-object-info` over a thousand names
+can hold a thousand streams — so a per-stream ask would turn one batched request into a thousand
+unbatched ones, one tier down.
+
+**The limit is shared across the whole ask**, since §9.1.3.7's limit is one number over the answer. A
+stream reached after it runs out is **still answered** — `given` zero, and `next` where it was asked to
+start — so a caller learns the count and the resume point rather than inferring that it was skipped.
+
+**And the answer is interleaved**: a stream row, then the extents it says follow, repeated. Two blocks
+would make a reader attribute extents to streams **by position**, which is §17.19's defect exactly. Each
+`ExtentRun` also names its stream, so nothing depends on the SNs answering in the order asked.
+
+#### 17.22.2 Three bugs, and a live run found all three
+
+**The unit tests passed throughout.** Every one of these needed a cluster.
+
+⚠️ **The limit was spent twice.** The DN charged the object and its stream rows against the cap, then
+passed the **whole** cap again to the SNs — so a configured limit of 3 produced an answer of 6 entries.
+Fixed by sending what the stream rows did not spend. The tell was in the output: *"6 entries"* under a
+limit of three, printed right next to itself.
+
+⚠️ **A truncated answer said "nothing more".** `Shape.next` was computed from the *stream* level, so an
+answer that described every stream reported no continuation — even when a stream's extents had been cut
+short. The continuation has to come from whichever level actually truncated: the first stream, in record
+order, whose run says extents remain. Without it a caller stops one page early and silently.
+
+⚠️ **And `then_some` is not a guard.** This line panicked with *attempt to add with overflow*:
+
+```
+(short && run.next != UNKNOWN).then_some(run.next + row.first_record)
+```
+
+**`then_some` evaluates its argument eagerly**, so `UNKNOWN + first_record` — `u64::MAX` plus a record
+number — was computed whatever the condition said. It reads like a guard and is not one; `then` with a
+closure is.
+
+**Two things worth taking from that third one.** §8.1.6.3's sentinel at `MAX` made the mistake **loud** —
+an overflow panic rather than a continuation of 1,114 that would have sent a caller to the wrong record
+— which is the reservation earning its keep on its first outing. **And it is an argument for #86's
+newtype**: `ROff` would own this arithmetic and return an error on a `NONE` operand, so the guard would
+not be something to remember. §8.1.6.2 claimed the type should own the boundary arithmetic; this is what
+it looks like when it does not.
+
+⚠️ **Also worth noting how the panic presented**: the callback thread died holding the `Reply`, so the
+client saw a **timeout** rather than an error. Nothing in the DN's own log said anything — the counters
+showed the request simply never answered — and the panic was in `stderr.log`. A worker that dies holding
+a reply is indistinguishable from a slow one, which is a monitoring gap rather than a bug (#95).
+
+#### 17.22.3 What it answers now
+
+Measured on the single-box cluster, 1,501 records over two streams and five extents, `info_entries = 6`:
+
+| | |
+|---|---|
+| first page | the object, both streams, and **three** extents of stream 1 — six entries, and *"ask from record 1115"* |
+| resuming there | stream 2 and **both** its extents, at object-local records 1,115 and 1,456 — four entries, *"nothing more"* |
+
+**The conversion is the part worth checking**, and it holds: stream 2's extents are stream-local 0 and
+341, reported as 1,115 and 1,456. The open extent reports its counts as unknown rather than zero, and
+every extent carries the whole name — `(SnId, ExtentId, creation second)` — plus its instances, which is
+what #61 asked for. **What is still missing from a usable hint is the capability** (#78), waiting on
+#82's key.

@@ -14,7 +14,7 @@ use common::block::{Holds, expand, squeeze};
 use common::config::Compress;
 use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
-use common::info::{Described, Shape, StreamRow, UNKNOWN};
+use common::info::{Described, ExtentRow, Shape, StreamRow, UNKNOWN};
 use common::placement;
 use common::random::Rng;
 use common::range::{Budget, Covered, Detail, Piece, Range, Start, Want};
@@ -1190,30 +1190,61 @@ fn object(target: &Target, response: &Response) -> Result<()> {
     let Ok((Some(it), rest)) = Described::of_args(rest) else {
         return report(target, response);
     };
-    let Ok((streams, [])) = StreamRow::some_of_args(rest, shape.given) else {
+    // Interleaved: a stream, then the extents it says follow, repeated (§17.22).
+    let mut rest = rest;
+    let mut streams = Vec::new();
+    for _ in 0..shape.given {
+        let Ok((row, after)) = StreamRow::of_args(rest) else { return report(target, response) };
+        let Ok((extents, after)) = ExtentRow::some_of_args(after, row.given) else {
+            return report(target, response);
+        };
+        streams.push((row, extents));
+        rest = after;
+    }
+    if !rest.is_empty() {
         return report(target, response);
-    };
+    }
     say(target, &it, Some(shape), &streams)
 }
 
 /// An object, and whatever detail came with it.
-fn say(target: &Target, it: &Described, shape: Option<Shape>, streams: &[StreamRow]) -> Result<()> {
+fn say(
+    target: &Target,
+    it: &Described,
+    shape: Option<Shape>,
+    streams: &[(StreamRow, Vec<ExtentRow>)],
+) -> Result<()> {
     let flavor = if it.keyed { "keyed" } else { "unkeyed" };
     println!(
         "{} object {} {flavor} framed {}, stream {} on SN{} from record {}, made in second {}",
         target.identity, it.id, it.framing, it.stream, it.sn, it.first_record, it.created
     );
     let Some(shape) = shape else { return Ok(()) };
-    for row in streams {
+    for (row, extents) in streams {
         // UNKNOWN is "nobody asked" or "not knowable here", never a count of zero.
         let records = match row.records {
             UNKNOWN => "still growing".to_string(),
             n => format!("{n} records"),
         };
+        let of = match row.extents {
+            UNKNOWN => String::new(),
+            n => format!(", {n} extents"),
+        };
         println!(
-            "  stream {} on SN{} from record {}, {records}",
+            "  stream {} on SN{} from record {}, {records}{of}",
             row.stream, row.sn, row.first_record
         );
+        for extent in extents {
+            let held = match extent.records {
+                UNKNOWN => "still growing".to_string(),
+                n => format!("{n} records, {} stored", extent.length),
+            };
+            // The whole name, since that is what a hint is built from (§8.1.1a-10).
+            println!(
+                "    extent {} of SN{} made in second {}, from record {}, {held}, on {:?}",
+                extent.id, extent.sn, extent.created, extent.first_record, extent.instances
+            );
+        }
     }
     // What it did not tell you, which is what makes a partial answer usable.
     let of = match shape.streams {

@@ -14,7 +14,7 @@
 //! to cope with reuse — an index that has to survive churn is a later problem.
 
 use common::config::{SNConfig, ServiceKind};
-use common::info::{ExtentRow, ExtentRun, UNKNOWN};
+use common::info::{ExtentRow, ExtentRun, Listing, UNKNOWN};
 use common::server::{self, Process, Reply, Service};
 use common::wire::{Arg, Op, Request, Response, Status};
 use common::{Error, Result};
@@ -361,47 +361,61 @@ impl SN {
         }
     }
 
-    /// `(DnId, StreamId, from record, limit)`: a run of this stream's extents, in
-    /// record order, starting at the one holding `from`.
+    /// `list-extents`: runs of extents for **several** streams in one ask (§9.1.3.7).
     ///
-    /// **Complete in counts and partial in detail** (§9.1.3.2): the extent total is
-    /// this SN's own, so it costs nothing and is always right, while the rows stop at
-    /// the limit and `next` says where to carry on.
+    /// **Complete in counts and partial in detail** (§9.1.3.2): each stream's extent
+    /// total is this SN's own, so it costs nothing and is always right, while the rows
+    /// stop at the limit and `next` says where to carry on.
     ///
-    /// ⚠️ **Record numbers here are stream-local**, which is what the SN knows. The FE
-    /// converts them to the caller's numbering, because it is the only party that knows
-    /// all three spaces (§17.16.2).
+    /// ⚠️ **The limit is shared across the whole ask**, spent on the streams in the
+    /// order given. A stream reached after it runs out is still answered — with
+    /// `given` zero and `next` where it was asked to start — so a caller learns the
+    /// count and where to resume rather than being left to infer that it was skipped.
+    ///
+    /// ⚠️ **Record numbers here are stream-local**, which is what an SN knows. The DN
+    /// converts them to the object's numbering, because it is the tier that holds each
+    /// stream's first record (§17.22).
     fn list(&self, request: &Request) -> Response {
-        let (dn, stream, from, limit) = match request.args.as_slice() {
-            [Arg::Number(dn), Arg::Number(stream), Arg::Number(from), Arg::Number(limit)] => {
-                (*dn as u32, *stream, *from, *limit)
-            }
-            _ => {
+        let asked = match Listing::of_args(&request.args) {
+            Ok(asked) => asked,
+            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+        };
+        let mut args = Vec::new();
+        let mut room = asked.limit;
+        for (stream, from) in &asked.at {
+            let shard = self.shards[shard_of(asked.dn, *stream)].lock().expect("streams");
+            let Some(held) = shard.get(&(asked.dn, *stream)) else {
                 return Response::error(
-                    Status::BadRequest,
-                    "list-extents takes a DnId, a StreamId, a record and a limit",
+                    Status::NotFound,
+                    format!("no stream {stream} from dn {}", asked.dn),
                 );
+            };
+            let (run, rows) = Self::run_of(held, *stream, *from, room);
+            room = room.saturating_sub(rows.len() as u64);
+            args.extend(run.args());
+            for row in rows {
+                args.extend(row.args());
             }
-        };
-        let shard = self.shards[shard_of(dn, stream)].lock().expect("streams");
-        let Some(held) = shard.get(&(dn, stream)) else {
-            return Response::error(Status::NotFound, format!("no stream {stream} from dn {dn}"));
-        };
+        }
+        Response { id: 0, status: Status::Ok, args }
+    }
 
+    /// One stream's run, up to `room` rows.
+    fn run_of(held: &Stream, stream: u64, from: u64, room: u64) -> (ExtentRun, Vec<ExtentRow>) {
         // The sealed extents are in record order, so the first to describe is the last
         // one starting at or before `from` — the same rule locate uses to pick one.
-        let first = held
-            .sealed
-            .iter()
-            .rposition(|sealed| sealed.extent.first_record <= from)
-            .map_or(0, |at| if from == 0 { 0 } else { at });
+        let first = if from == 0 {
+            0
+        } else {
+            held.sealed.iter().rposition(|sealed| sealed.extent.first_record <= from).unwrap_or(0)
+        };
         let total = held.sealed.len() as u64 + u64::from(held.open.is_some());
 
         let mut rows: Vec<ExtentRow> = held
             .sealed
             .iter()
             .skip(first)
-            .take(limit as usize)
+            .take(room as usize)
             .map(|sealed| ExtentRow {
                 sn: held.creator,
                 id: sealed.extent.id,
@@ -416,12 +430,11 @@ impl SN {
             })
             .collect();
 
-        // Then the one still open, if there is room and it starts at or after `from`.
-        // ⚠️ Its records and length are UNKNOWN rather than zero: how far it reaches is
-        // not knowable here, and a sealed extent holding nothing would be a real zero
-        // (§8.1.6.3).
+        // Then the one still open, if there is room and everything sealed is described.
+        // ⚠️ Its counts are UNKNOWN rather than zero: how far it reaches is not knowable
+        // here, and a sealed extent holding nothing would be a real zero (§8.1.6.3).
         let sealed_seen = first + rows.len();
-        if rows.len() < limit as usize
+        if (rows.len() as u64) < room
             && sealed_seen == held.sealed.len()
             && let Some(open) = &held.open
         {
@@ -446,12 +459,7 @@ impl SN {
             }
             None => UNKNOWN,
         };
-
-        let mut args = ExtentRun { extents: total, given: rows.len() as u64, next }.args();
-        for row in rows {
-            args.extend(row.args());
-        }
-        Response { id: 0, status: Status::Ok, args }
+        (ExtentRun { stream, extents: total, given: rows.len() as u64, next }, rows)
     }
 
     /// `(DnId, StreamId, sealed extent, records, length)`: record what an extent

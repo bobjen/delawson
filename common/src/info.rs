@@ -197,10 +197,14 @@ pub struct StreamRow {
     pub records: u64,
     /// Extents in it, or `UNKNOWN` when no SN was asked.
     pub extents: u64,
+    /// Extent rows that follow this one. ⚠️ **The answer is interleaved** — a stream then
+    /// its extents, repeated — so a reader never attributes extents to a stream by
+    /// position, which is §17.19's defect.
+    pub given: u64,
 }
 
 impl StreamRow {
-    pub const ARGS: usize = 5;
+    pub const ARGS: usize = 6;
 
     pub fn args(&self) -> Vec<Arg> {
         vec![
@@ -209,6 +213,7 @@ impl StreamRow {
             Arg::Number(self.first_record),
             Arg::Number(self.records),
             Arg::Number(self.extents),
+            Arg::Number(self.given),
         ]
     }
 
@@ -219,6 +224,7 @@ impl StreamRow {
             Arg::Number(first_record),
             Arg::Number(records),
             Arg::Number(extents),
+            Arg::Number(given),
             rest @ ..,
         ] = args
         else {
@@ -231,6 +237,7 @@ impl StreamRow {
                 first_record: *first_record,
                 records: *records,
                 extents: *extents,
+                given: *given,
             },
             rest,
         ))
@@ -364,10 +371,67 @@ impl ExtentRow {
     }
 }
 
+/// Several streams to describe in one ask, which is what makes `batch-object-info`
+/// batch all the way down.
+///
+/// ⚠️ **One ask per stream would defeat the point.** §1.4.0 measures nine tenths of an
+/// unbatched request's cost as messaging, and a batch of a thousand objects can hold a
+/// thousand streams — so asking per stream would put the DN's fan-out exactly where
+/// §1.4.0 says the cost is. The limit is **shared across the whole ask**, because
+/// §9.1.3.7's limit is one number over the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    pub dn: u32,
+    /// Entries the whole answer may carry, over every stream in it.
+    pub limit: u64,
+    /// `(StreamId, first stream-local record to describe from)`, in order.
+    pub at: Vec<(u64, u64)>,
+}
+
+impl Listing {
+    pub fn args(&self) -> Vec<Arg> {
+        let mut args = vec![
+            Arg::Number(self.dn as u64),
+            Arg::Number(self.limit),
+            Arg::Number(self.at.len() as u64),
+        ];
+        for (stream, from) in &self.at {
+            args.push(Arg::Number(*stream));
+            args.push(Arg::Number(*from));
+        }
+        args
+    }
+
+    pub fn of_args(args: &[Arg]) -> Result<Listing> {
+        let [Arg::Number(dn), Arg::Number(limit), Arg::Number(count), rest @ ..] = args else {
+            return Err(Error::new("list-extents takes a DnId, a limit and a run of streams"));
+        };
+        let count = *count as usize;
+        if rest.len() != count * 2 {
+            return Err(Error::new(format!(
+                "list-extents says it names {count} streams and carries {}",
+                rest.len() / 2
+            )));
+        }
+        let mut at = Vec::with_capacity(count);
+        for pair in rest.chunks(2) {
+            match pair {
+                [Arg::Number(stream), Arg::Number(from)] => at.push((*stream, *from)),
+                _ => return Err(Error::new("a stream and a record are numbers")),
+            }
+        }
+        Ok(Listing { dn: *dn as u32, limit: *limit, at })
+    }
+}
+
 /// What an SN says about a run of one stream's extents: complete in counts, partial
 /// in detail (§9.1.3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtentRun {
+    /// Which stream this run is about. ⚠️ **Named rather than positional**, so a batch
+    /// answer says what it is answering instead of relying on the order matching the
+    /// question — §17.19's defect was exactly that assumption.
+    pub stream: u64,
     /// Extents the stream has, whether or not they are all here.
     pub extents: u64,
     /// Rows that follow.
@@ -379,14 +443,38 @@ pub struct ExtentRun {
 
 impl ExtentRun {
     pub fn args(&self) -> Vec<Arg> {
-        vec![Arg::Number(self.extents), Arg::Number(self.given), Arg::Number(self.next)]
+        vec![
+            Arg::Number(self.stream),
+            Arg::Number(self.extents),
+            Arg::Number(self.given),
+            Arg::Number(self.next),
+        ]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(ExtentRun, &[Arg])> {
-        let [Arg::Number(extents), Arg::Number(given), Arg::Number(next), rest @ ..] = args else {
+        let [
+            Arg::Number(stream),
+            Arg::Number(extents),
+            Arg::Number(given),
+            Arg::Number(next),
+            rest @ ..,
+        ] = args
+        else {
             return Err(Error::new("that answer did not say what run of extents it was"));
         };
-        Ok((ExtentRun { extents: *extents, given: *given, next: *next }, rest))
+        Ok((ExtentRun { stream: *stream, extents: *extents, given: *given, next: *next }, rest))
+    }
+
+    /// Every run in a batch answer, each followed by its own rows.
+    pub fn all_of_args(mut args: &[Arg]) -> Result<Vec<(ExtentRun, Vec<ExtentRow>)>> {
+        let mut runs = Vec::new();
+        while !args.is_empty() {
+            let (run, rest) = ExtentRun::of_args(args)?;
+            let (rows, rest) = ExtentRow::some_of_args(rest, run.given)?;
+            runs.push((run, rows));
+            args = rest;
+        }
+        Ok(runs)
     }
 }
 
@@ -463,7 +551,7 @@ mod tests {
     }
 
     fn stream(stream: u64, first_record: u64, records: u64) -> StreamRow {
-        StreamRow { stream, sn: 0, first_record, records, extents: UNKNOWN }
+        StreamRow { stream, sn: 0, first_record, records, extents: UNKNOWN, given: 0 }
     }
 
     /// The header says how many rows follow, so a reader never guesses — and the
@@ -527,7 +615,7 @@ mod tests {
     /// may later carry a different number than an open one.
     #[test]
     fn a_run_of_extents_survives_the_wire() {
-        let run = ExtentRun { extents: 5, given: 2, next: 90 };
+        let run = ExtentRun { stream: 7, extents: 5, given: 2, next: 90 };
         let rows = vec![extent(1, 0, 40), extent(2, 40, 50)];
         let mut args = run.args();
         for row in &rows {
