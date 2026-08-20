@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-139 things *not* decided.
+140 things *not* decided.
 
 **Priorities and framing**
 
@@ -366,12 +366,16 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | So the byte space behaves as the number space already does: a dead record keeps its **number and its width** | §9.1.3.9, §3 |
 | Preserving a width **costs no space** — a logical offset is a name (§8.2.2), so compaction still reclaims the bytes | §9.1.3.9 |
 | The snap rule ignores liveness, or a delete would move a partition boundary | §9.1.3.9, §9.1.3.4 |
-| A promise flag is **three states, not a boolean**: off, enforcing (O(1)), valid (after a pass) — Oracle's `ENABLE NOVALIDATE` | §4.1.1.1 |
+| A promise flag is **three states, not a boolean**: `off`, `henceforth` (O(1)), `always` (after a pass) | §4.1.1.1 |
+| Named for the **scope of the promise**, because Oracle's `ENABLE NOVALIDATE` buries that under a double negative | §4.1.1.1 |
 | Which is **Bob's own Oracle feature**, so the pattern is first-hand rather than matched from the literature | §4.1.1.1 |
 | **"Deletes disallowed"** is a second promise flag: no *record* deletes, while dropping the whole stream stays possible | §9.1.3.10 |
 | It buys **no log to probe** on every read, no deletion-driven compaction, and no churn against the repair reserve | §9.1.3.10 |
 | ⚠️ Its cleanup pass is a compaction, and compaction must **preserve tombstone widths** — the two passes' natural implementations break each other | §9.1.3.10, §9.1.3.9 |
-| **Loosening is cheap, tightening is deferred** — and an omission may only be taken on a *valid* flag, never an *enforcing* one | §4.1.1.1 |
+| Stream metadata has a **normal size plus a flag and extra structure** for the rare and the transient | §4.1.2 |
+| Which makes the promise flags nearly free: only the middle state needs a cursor, and it is **transient by construction** | §4.1.2 |
+| **Count the streams with extra structure** — if most have it, the normal size is wrong | §4.1.2 |
+| **Loosening is cheap, tightening is deferred** — and an omission needs `always`, never `henceforth` | §4.1.1.1 |
 | Large objects are built by **parallel partitions, sealed, then concatenated** | §8.6.1 |
 | **Trilemma**: parallel bandwidth, dense stable offsets, monotone time index — pick two | §8.6.2 |
 | The recursion to DN **attenuates** by fan-out; the rule is **spray per writer, not per request** | §8.6.4 |
@@ -1576,9 +1580,16 @@ So a promise flag has **three states**, and what may be relied on differs in eac
 
 | State | Enforced on new writes? | True of existing data? | Cost to enter |
 |---|---|---|---|
-| **off** | no | — | — |
-| **enforcing** | **yes** | not yet known | **O(1)** — flip it |
-| **valid** | yes | **yes** | a background pass over the stream |
+| **`off`** | no | — | — |
+| **`henceforth`** | **yes** | not yet known | **O(1)** — flip it |
+| **`always`** | yes | **yes** | a background pass over the stream |
+
+⚠️ **The names are deliberately not Oracle's** (Asserted, Bob, 2026-08-19: "enable-novalidate, which
+isn't a good name"). `ENABLE NOVALIDATE` buries the useful fact under a double negative bolted onto an
+enable, and the useful fact is **the scope of the promise** — which data it covers. `henceforth` and
+`always` say that outright, sort by increasing strength, and make the reliance rule self-evident: an
+omission needs `always`. A stream reads as *updates disallowed: henceforth*, and later as *updates
+disallowed: always*.
 
 **Cited: this is Oracle's constraint state machine**, and the correspondence is exact rather than
 loose. Oracle separates `ENABLE`/`DISABLE` from `VALIDATE`/`NOVALIDATE`, and the standard migration is
@@ -1594,17 +1605,17 @@ it, which is why the three states and the reliance rule transfer as cleanly as t
 differ, the difference is likely to be real rather than a misreading of someone else's design.
 
 **Which is why the middle state has to be visible rather than internal.** The whole value of a promise
-is what other machinery is allowed to skip on the strength of it, and in the enforcing state that
-machinery must **not** skip anything:
+is what other machinery is allowed to skip on the strength of it, and at `henceforth` that machinery
+must **not** skip anything:
 
-| Omission | Safe in *enforcing*? | Safe in *valid*? |
+| Omission | Safe at `henceforth`? | Safe at `always`? |
 |---|---|---|
 | skip the log probe on read (§9.1 step 3) | **no** — old tombstones may still be there | yes |
 | trust an exact logical prefix sum (§9.1.3.9) | **no** — past updates may have shifted it | yes |
 | treat hints as long-lived (§8.1.1a-10) | partly — no *new* rewrites from this cause | yes |
 
 **And the loosening direction really is cheap**, which is what makes the whole thing tolerable to
-operate: dropping back to *off* is a flag write plus abandoning the omissions, with no pass and no
+operate: dropping back to `off` is a flag write plus abandoning the omissions, with no pass and no
 cleanup. The escape from a promise made wrongly is therefore not "delete the stream" as an earlier
 draft had it — it is simply to stop promising.
 
@@ -1612,6 +1623,84 @@ draft had it — it is simply to stop promising.
 exact stops being valid, and the store cannot rebuild it or even enumerate who holds one. So loosening
 is cheap *mechanically* and expensive *contractually*, and those are different budgets — which is an
 argument for the state being visible to readers, not for making the transition hard.
+
+#### 4.1.2 A normal size, and a flag pointing at extra structure for the unusual
+
+**Stream metadata has a normal size, plus a flag and extra structure for unusual cases** (Asserted,
+Bob, 2026-08-19). The `henceforth` state and its cleanup progress live in the extra structure.
+
+**Why a fixed normal size is the requirement and not a preference is §14.1.2's argument**: record size
+decides *how many machines a given object needs*, because doubling the record doubles the fleet for the
+same data. So the arithmetic is brutal and one-directional:
+
+> A field needed by one stream in a thousand, held inline, is paid for by **all** of them. At §4.7's
+> ~200 B stream record, sixteen bytes of rarely-used field is an 8% fleet tax on the metadata tier.
+
+**So the rule is a two-line test**, and it admits exactly two kinds of field:
+
+| Out of line if the field is | Example |
+|---|---|
+| **rare** — absent in the overwhelming majority | georeplication source (§13.4.5), a per-stream storage-class override differing from the object's (#74) |
+| **transient** — present only during a transition | the `henceforth` state's **cleanup cursor**, and how far the pass has reached |
+
+##### The transient case is the elegant one, and it makes the flags nearly free
+
+⚠️ **Notice what the three states of §4.1.1.1 cost in the steady state: almost nothing.** `off` and
+`always` are *the two ends*, and each is fully described by a couple of bits. Only the middle state
+needs a cursor, a start time, and progress — and the middle state **exists only while a background pass
+runs**.
+
+| State | Needs extra structure? |
+|---|---|
+| `off` | no — a bit |
+| `always` | no — a bit |
+| `henceforth` | **yes** — the cursor, freed when the pass completes and the state becomes `always` |
+
+**So the whole promise-flag feature costs a few bits per stream at rest**, and the machinery for
+transitions costs nothing at all when nobody is transitioning. That is exactly the shape §14.1.2
+demands, and it is a better outcome than either alternative — inlining the cursor would tax every
+stream for a state almost none is in, and keeping it in a side table indexed by stream would cost a
+lookup on a path that has to be cheap.
+
+##### Prior art, and the vocabulary worth borrowing
+
+**This is the resident-versus-non-resident split**, and several systems have converged on it:
+
+| System | Shape |
+|---|---|
+| **Unix inodes** | direct block pointers inline, indirect blocks for large files |
+| **NTFS** | small attributes **resident** in the MFT record, large ones spilled to extents — the closest analogue, and the clearest vocabulary |
+| **Oracle** | a row that outgrows its block gets a pointer to a continuation piece |
+| **ext4** | inline data for tiny files, extents otherwise |
+
+None of them is novel and that is the point: the pattern is well understood, so what matters here is
+the *policy* for what goes out of line rather than the mechanism for spilling it.
+
+##### An escape hatch invites drift, so count it
+
+⚠️ **The failure mode is not a bug but an erosion.** Once extra structure exists, every new rare field
+goes into it and nobody re-examines whether the normal record is still the right size — or, worse,
+fields drift out of *rare* into common while still being paid for out of line, one indirection at a
+time.
+
+**The check is cheap and should exist from the start: count the streams that have extra structure.**
+
+- If that count is a small fraction, the split is doing its job.
+- ⚠️ **If most streams have it, the normal size is wrong** — and the answer is to inline whatever became
+  common, not to add another level.
+
+That is a measurement rather than a rule, which is the right kind of guard for a policy that decays
+slowly. §14.1.2's warning against re-baselining applies: the budget is there to be spent deliberately,
+so the count is what makes "deliberately" checkable.
+
+##### Where it lives is not settled
+
+⚠️ Stream metadata exists in two places — the DN's stream-list entry and the SN's stream record — and
+they want different things. **Declaration is the object's, so the DN's** (§9.1.3.9); **enforcement and
+the cleanup pass are the SN's**, because the SN owns the extents whose tombstones get compacted and
+whose lengths get summed. So the cursor plausibly belongs to the SN while the flag belongs to both,
+which is one fact in two places and therefore something §13.1's sync loops have to reconcile
+(§16.140).
 
 ### 4.2 Extents: base plus log
 
@@ -8779,8 +8868,7 @@ invariant rather than a remembered one.
 
 Two consequences that are easy to get wrong:
 
-- ⚠️ **The exact sum may only be trusted in the flag's *valid* state**, not merely its *enforcing* one
-  (§4.1.1.1). Setting the flag is O(1) and binds new writes at once, but an object updated in the past
+- ⚠️ **The exact sum may only be trusted at `always`**, never at `henceforth` (§4.1.1.1). Setting the flag is O(1) and binds new writes at once, but an object updated in the past
   has a prefix sum that is already wrong — so the background pass that recomputes it is what makes the
   guarantee true, exactly as Oracle's optimizer may only rely on a validated constraint. Loosening the
   flag again is cheap for the store and expensive for whoever built an index on the offsets.
@@ -8838,7 +8926,7 @@ record deletion is what several mechanisms exist to cope with:
 - **The soft-delete machinery does not apply** at record level — §8.4's deferred decrement, the
   three-day window, §8.4.1b's hard-delete brake all exist to make record deletion safe.
 
-⚠️ **And with both flags valid, hints get much longer-lived**, which is the dividend worth noticing.
+⚠️ **And with both flags at `always`, hints get much longer-lived**, which is the dividend worth noticing.
 §8.1.1a-10 makes hint lifetime "a compaction-policy number", since a hint dies when its extent is
 rewritten. A stream that never updates and never deletes is rewritten only for tiering, so **its hints
 outlive §10.1's ten-minute window by a wide margin** — moving §8.1.1a-10's middle reference tier close
@@ -8849,14 +8937,14 @@ to the durable one, for exactly the objects least likely to change.
 §4.1.1.1's three states are not an abstraction over these two flags; each has a concrete pass, and they
 are different work:
 
-| Flag | Entering *enforcing* | The pass that reaches *valid* |
+| Flag | Entering `henceforth` | The pass that reaches `always` |
 |---|---|---|
 | **updates disallowed** | refuse new updates | **recompute** the logical prefix sums, which past updates may have shifted |
 | **deletes disallowed** | refuse new deletes | **compact away** the existing tombstones and logs, after which there is no log to probe |
 
 **So "lazy cleanup" is literal for deletes and figurative for updates** — one removes data that violates
 the promise, the other recomputes a summary the violations invalidated. Both are background passes over
-the stream, and neither blocks the O(1) transition into enforcing.
+the stream, and neither blocks the O(1) transition into `henceforth`.
 
 ⚠️ **Which means the deletes pass has an interaction worth flagging: it is a compaction, and compaction
 must preserve tombstone widths** (§9.1.3.9). Compacting away a tombstone's *bytes* is the point;
@@ -12683,6 +12771,14 @@ Roughly in order of how much else depends on them.
      the natural implementation closes the gaps instead — which is sharpest where §9.1.3.10's
      deletes-disallowed cleanup pass *is* a compaction, so the two flags' validation passes have to agree
      and each one's obvious implementation violates the other.
+
+140. **Which tier holds a stream's promise flags, and how the two are reconciled** (§4.1.2, §9.1.3.9,
+     §13.1). Declaration is the object's business, so the DN's; enforcement and the cleanup pass are the
+     SN's, since the SN owns the extents whose tombstones are compacted and whose lengths are summed. That
+     puts one fact in two places, which §13.1.3's DN→SN loop then has to reconcile — and §13.1.7 fixes the
+     loop inventory at one per tier boundary, so this needs to ride the existing loop rather than wanting
+     a new one. Whether the cursor is purely SN-side, and what a reader is told while the two disagree,
+     are both open.
 
 **Closed** since earlier drafts:
 
