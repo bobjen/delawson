@@ -459,6 +459,21 @@ wire (`an_open_extent_is_read_out_of_the_sns_answer`)
 *Breaks* the placement decision is destroyed by a tidy-up, and the steady state stops being
 verification because there is nothing left to verify against.
 
+**`MEMBERSHIP-IS-NOT-LEADERSHIP`** — KS holds who may vote in a ring; the ring holds who is primary
+now. Nothing outside a ring is authoritative about its leader.
+*Argued* §5.5.6.2 · *Enforced* design only · *Checked* not yet
+*Breaks* failover has to write to a single distinguished component and every caller has to read from
+it, so the thing that must beat a timeout (§16.12) depends on the thing that must be most careful. A
+stale leadership cache must cost only a redirect.
+
+**`TOPOLOGY-IS-SIGNED-NOT-SECRET`** — the machine list, ring membership and failure-domain hierarchy
+are authenticated and readable without the unlock ceremony; only master keys are encrypted under it.
+*Argued* §5.5.6.3 · *Enforced* design only · *Checked* not yet
+*Breaks* both ways, which is why it is one invariant. Encrypting topology puts a human ceremony in
+front of automated recovery. Failing to *sign* it allows a placement attack: a forged domain map lands
+four instances in one domain while every rule appears satisfied, and §5.6.8 computes achieved
+durability from placements, so nothing downstream notices.
+
 **`PLACEMENT-NEVER-REVISITED`** — placement is decided at write time and never reconsidered.
 *Argued* §5.6.7, §5.6.9 · *Enforced* design only · *Checked* not yet
 *Breaks* toggling a rule across a threshold causes churn, and `NO-DATA-MOVEMENT-EXCEPT-RANGE-SPLIT`
@@ -623,6 +638,8 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **media class** | §7.4 | `ONE-MEDIA-CLASS-PER-EXTENT` |
 | **object** | §3 | `READ-NAMES-THE-OBJECT`, `RECORD-NUMBER-STABLE`, `HINT-BOUND-BY-CAPABILITY`, `CAPABILITY-IS-MEMBERSHIP-ONLY`, `ZERO-REFERENCES-IS-A-BUG`, `ONE-UNSEALED-EXTENT-UNKEYED` |
 | **path** | §4.6.3 | `PATH-IS-THE-PORTABLE-NAME`, `HINT-BOUND-BY-CAPABILITY`, `READ-NAMES-THE-OBJECT`, `POLICY-ATTACHES-TO-A-DIRECTORY` |
+| **failure domain** | §5.6 | `NESTED-NOT-ORTHOGONAL-DOMAINS`, `TOPOLOGY-IS-SIGNED-NOT-SECRET`, `SOLVER-TIMEOUT-DEFERS-NEVER-DROPS` |
+| **ring** | §5.7 | `MEMBERSHIP-IS-NOT-LEADERSHIP`, `TOPOLOGY-IS-SIGNED-NOT-SECRET` |
 | **placement** | §5.6 | `PLACEMENT-NEVER-REVISITED`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `NESTED-NOT-ORTHOGONAL-DOMAINS`, `SOLVER-TIMEOUT-DEFERS-NEVER-DROPS`, `UNENFORCEABLE-RULE-NOT-ENFORCED`, `NO-DATA-MOVEMENT-EXCEPT-RANGE-SPLIT` |
 | **primary** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `TRUNCATION-SEALS` |
 | **quorum** | §8.1.1 | `QUORUM-OVERLAPS`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `UNAPPENDABLE-EXTENT-SEALS`, `SELF-SEAL-MARK-IS-DURABLE` |

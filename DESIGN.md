@@ -247,6 +247,14 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **DN**, **SN**, **EN**, plus **FE**, **KS**, Compute, and the `delawson` client | §5, §5.9 |
 | **Metadata is made reliable by consensus; bulk data by placement** | §5 |
 | The **DN tier is self-hosted** in DeLawson keyed objects; the bootstrap root lives in **DN0's Raft state** | §5.5, §5.5.1 |
+| **Two roots, not one**: the **object-locator** root is DN0's Raft state; the **topology** root is **KS** | §5.5.6 |
+| KS owns tenant ids and ranges, the machine list, and **ring membership** — because a ring's membership cannot live in that ring | §5.5.6.1 |
+| And because DN0's state is encrypted, so KS is up first: the fact naming DN0's members cannot be inside DN0 | §5.5.6.1 |
+| **Leadership is not membership**: the ring holds who is primary, callers cache it, and a stale cache costs a **redirect** | §5.5.6.2 |
+| Putting leadership in KS is the one arrangement that cannot work — failover must beat a timeout | §5.5.6.2, §16.12 |
+| KS's state splits: keys **encrypted** behind the ceremony, topology **signed** and readable at once | §5.5.6.3 |
+| Because the threat to topology is **integrity, not disclosure** — a forged domain map is a placement attack | §5.5.6.3 |
+| **KS is on the change path, not the data path**, so a running cluster serves through a KS outage | §5.5.6.3 |
 | Rings have 2n+1 voters but only **3 materialized members** — 3× RAM, not 7× | §5.7 |
 | **Many rings per machine**; rings are a concurrency unit, not a capacity unit | §5.8 |
 | **32-bit node ids**, bounded fan-out ~20,000, local indices in the data plane | §5.10 |
@@ -3500,6 +3508,127 @@ argument above stands on its own merits and is unaffected.
   data" problem of §14.2: true in logical bytes, much less true in physical ones.
 - **Billing metadata becomes measurable** rather than estimated, because it is
   physical bytes in real objects (§12).
+
+#### 5.5.6 There are two roots, and only one of them is the bootstrap root
+
+⚠️ **§5.5.1, §16.1 and §16.2 have been conflating two different root facts**, and separating them
+settles both of Bob's expectations at once (Asserted, Bob, 2026-08-19):
+
+| Root | Answers | Lives in |
+|---|---|---|
+| the **object-locator root** — §5.5.1's bootstrap root | *where is the partition map object* | **DN0's Raft state**, as §5.5.1 has it |
+| the **topology root** | *what machines exist, what rings they form, what failure domains they sit in, what tenants exist and which ranges they own* | **KS** |
+
+**KS owns the topology root** (Asserted, Bob, 2026-08-19): tenant ids and ranges, the official list of
+machines, and the membership of every ring. §16.2 guessed the bootstrap root would hold the
+failure-domain hierarchy; it cannot, and the reason is a circularity rather than a preference.
+
+##### 5.5.6.1 Ring membership cannot live in a ring, and that decides it
+
+**A Raft ring keeps its own membership in its log** — configuration changes are log entries — so a
+*running* ring knows who its voters are. But two moments are not covered by that, and both are
+ordinary:
+
+- **Forming a ring** needs an initial configuration from somewhere outside it. There is no log to read
+  before there is a ring.
+- **A member that has lost its disk** needs to be told which ring it belongs to before it can catch up.
+
+⚠️ **And §5.5.1.1's cold start makes DN0 unavailable for this by construction.** DN0's Raft state is
+encrypted, KS holds the key, so KS comes up first — step 1 before step 2. Anything DN0 holds is
+therefore unreadable at the moment ring membership is needed, **including DN0's own membership.** So
+the fact that says which machines form DN0 cannot be inside DN0.
+
+**KS is the only component that is both earlier than every ring and durable outside DeLawson**, which
+is the same property §5.5.1.1 already relies on to break the key circle. It needs no new component for
+the same reason the bootstrap root needed none — and it is already the registrar (§17.7, #36), so it
+already knows which processes are alive and where. The official list is the durable half of something
+it half-does.
+
+**Derived, and small.** Nothing here is a capacity question:
+
+| | At 100,000 nodes |
+|---|---|
+| Machines — id, address, failure-domain path, media classes at ~64 B | **~6 MB** |
+| Rings — ~10 per machine (§5.8.1), 7 members at 4 B | **~4 MB** |
+| Master keys | ~1 MB per century (§7.3) |
+| Tenants and ranges | the largest term, and still megabytes per million tenants |
+
+##### 5.5.6.2 Three tiers of freshness, and the primary is in the fastest
+
+**Something else caches who the current primary of each ring is** (Asserted, Bob, 2026-08-19), and the
+split is the point rather than an optimization:
+
+| Fact | Changes | Home |
+|---|---|---|
+| **membership** — who may vote | on decommission and repair: minutes to months | **KS**, authoritative |
+| **leadership** — who is primary now | on failover, which §16.12 requires to complete **faster than a timeout** | **the ring itself**, in its own consensus state |
+| **cached leadership** | whenever the cache is wrong | **whoever is talking to the ring** |
+
+⚠️ **Putting leadership in KS would be the one arrangement that cannot work.** Failover must beat a
+timeout (§16.12 makes ring size the lever for exactly this), and routing every failover through a write
+to a single distinguished component — then every subsequent read through a hop to it — makes the thing
+that must be fastest depend on the thing that must be most careful.
+
+**A stale leadership cache costs a redirect, and that is the whole cost.** This is the fourth instance
+of a pattern already load-bearing three times over, which is the strongest argument for it:
+
+| | Authoritative and slow | Operational and fast |
+|---|---|---|
+| §5.7 | consensus membership | RAM membership |
+| §5.6.9 | the persisted placement decision | verification |
+| §17.13 | the SN's extent list | the FE's remembered open extent — "losing it costs asks, not correctness" |
+| here | KS's membership | the ring's leadership, cached by callers |
+
+**Cited**: this is the ordinary Raft client contract — a follower answers "not the leader" with a hint,
+and the client retries — and the same shape as Bigtable's and HBase's client-side location caches.
+
+**Topology reads want caching for the same reason.** §5.6 needs the failure-domain hierarchy on every
+placement decision, and §5.6.10 budgets ~22 group placements per second per SN; across a thousand SNs
+that would be tens of thousands of reads per second aimed at one component. Since topology changes
+almost never, every tier caches it, and **a topology epoch number is what lets a cache notice it is
+stale** — carried on messages that already flow, rather than polled.
+
+##### 5.5.6.3 The unlock ceremony must not gate topology, so KS's state splits in two
+
+⚠️ **This is the real cost of the decision, and it has a clean answer.** §7.3.2 has KS unlocked by
+operator secrets plus hardware — the only step needing humans. If topology also lives in KS, then after
+a power event **nobody could enumerate the machines until a human arrived**, which would put a ceremony
+in front of automated recovery.
+
+**The resolution is that topology is not a secret.** Machine lists, ring membership, tenant ids and
+ranges are operational facts, not confidential ones — so:
+
+| Half of KS's state | Protected how | Available |
+|---|---|---|
+| **master keys** | encrypted under the human-and-hardware key (§7.3.2) | after the ceremony |
+| **topology and registry** | **signed, not encrypted** | as soon as the process starts |
+
+⚠️ **Signed rather than merely plaintext, because the threat is integrity and not disclosure.** A
+forged machine list or failure-domain hierarchy is a placement attack: it would let an attacker make
+four instances land in one domain while every rule appeared satisfied (§5.6.8 makes achieved durability
+a per-group property computed from placements, so nothing downstream would notice). Confidentiality
+buys nothing here; authentication is the whole requirement.
+
+**What this buys is an availability posture worth stating plainly: KS is on the change path, not the
+data path.** With KS down, no new keys are issued, no process registers, and no topology changes — but
+ENs already cache the SN-master keys they need (§7.3.1) and no read or write consults KS, so a running
+cluster keeps serving. That is the right thing for a component that needs a human to start.
+
+##### 5.5.6.4 What would move it
+
+Bob's expectation is that these may move if they are too much for KS or find better homes. Nothing
+above suggests capacity is the problem — the state is megabytes and the request rate is low once
+everything caches. **Two things would change the answer:**
+
+- ⚠️ **If KS turns out to need a Raft ring of its own** (and §5.5.1.1's step 1 says "KS ring", so it
+  probably does), then it has consensus storage and the topology root is simply distinguished content
+  in it — exactly the argument §5.5.1 makes for the bootstrap root living in DN0's. That is not a move,
+  it is the same answer with the mechanism named.
+- **If tenant ranges turn out to be hot**, they belong with the thing that resolves names rather than
+  with the thing that holds keys. #75 is already reconsidering how a DN range is named across split and
+  move, and if a range becomes a frequently-consulted mapping it is a level-1 fact (§5.5.1's partition
+  map) rather than a topology fact. The test is whether it changes with data or with the machine
+  inventory.
 
 ### 5.6 Failure domains and placement
 
@@ -11534,11 +11663,17 @@ Roughly in order of how much else depends on them.
 1. **The bootstrap root**: what exactly it holds, and how it is made durable and
    strongly consistent *outside* DeLawson (§5.5.1, §5.5.3). It must anchor the
    key hierarchy as well as the object hierarchy.
+   ⚠️ **Partly answered by separating two roots that this entry conflated** (§5.5.6): the
+   *object-locator* root stays in DN0's Raft state, and the *topology* root — machines, ring
+   membership, tenant ids and ranges — is KS's, because a ring's membership cannot live in that
+   ring and DN0's state is unreadable until KS has already come up. What remains open here is
+   the object-locator root's exact content and how DN0's Raft state is operated.
 2. **Ring reassignment, fan-out mutability, and cluster topology** (§13, §5.10.3).
    How a stream moves from a failed ring to a fresh one that may not be able to
    reach its ENs; whether fan-out sets are mutable; and where the failure-domain
-   hierarchy that §5.6 depends on is stored — plausibly the bootstrap root, since
-   placement decisions cannot be made without it.
+   hierarchy that §5.6 depends on is stored — ⚠️ **not the bootstrap root, as this entry
+   guessed: it is KS's topology root** (§5.5.6), cached everywhere and invalidated by a topology
+   epoch. Reassignment and fan-out mutability remain open.
 3. **Fan-out policy and EN sizing together** (§5.10.1). G, the sharing factor, is
    what gives repair and balance room to move, and EN capacity is what makes G
    affordable. One decision, not two.
