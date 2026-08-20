@@ -395,7 +395,9 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | And once by **removing** a dimension: a budget names one measure of three, never two | §18.1.1, §9.1.3.6 |
 | For an **implication**, **normalize rather than validate** — then no illegal combination exists to test | §18.1.2 |
 | An **exclusion** cannot be normalized away, and that is the kind wanting a negative test | §18.1.2 |
-| **`jenny`** covers pairs over almost-independent dimensions and negative-tests the disallowed ones | §18.1.3 |
+| Worth most is the **practice**; then that all pairs cost only **log n** cases; the tool is third | §18.1.3 |
+| And the logarithm needs **complicated** test cases — one-thing-at-a-time suites pay the quadratic instead | §18.1.3 |
+| The two knots here are the **append interface** (2,560 combinations, ~15 rows) and **stream properties** | §18.1.3 |
 | ⚠️ And the **term index is a first cut at which invariants interact**, so the pairs worth covering are already computed | §18.1.4, #92 |
 | An index and a count sharing a type make the max count **2^64 − 1**, or **2^64 − 2** with a sentinel | §8.1.6.2 |
 | Because **one past the end** must be representable, which §9.1.3's `next` computes on every answer | §8.1.6.2 |
@@ -15070,19 +15072,69 @@ checked for.
 — cannot be normalized away, and there the combination has to be refused and tested. The distinction is
 whether the dependency says *and also* or *not both*.
 
-#### 18.1.3 Prior art, and a tool: jenny
+#### 18.1.3 The practice first, then the surprising arithmetic, then the tool
 
-**Cited: `jenny` generates n-way covering arrays over almost-independent dimensions, and can list,
-avoid and negative-test the disallowed combinations** ([tool](https://github.com/bobjen/jenny),
-[description](https://burtleburtle.net/bob/math/jenny.html)). ⚠️ **Provenance, as with §4.1.1.1's
-`ENABLE NOVALIDATE`: it is Bob's own**, so the analogy is first-hand rather than matched from the
-literature.
+**Ordered by how much each is worth** (Asserted, Bob, 2026-08-19), because the ranking is not obvious
+and the tool is the least of the three:
 
-**Why a covering array is the right instrument once the state is decomposed**: with the dimensions
-separated, the bugs that remain are *interactions*, and covering all **pairs** is a small fraction of
-covering all combinations while catching most interaction defects. The disallowed-combination handling
-is what makes it usable on a real system, where the dimensions are almost-independent rather than
-independent — and negative-testing those combinations is the part that is easy to skip by hand.
+**1. The practice: break things into almost-independent dimensions with a small feature list each.**
+This is the valuable part, and it pays whether or not anything is generated from it. A knot of
+conditions nobody has separated cannot be reasoned about, tested systematically, or even counted; the
+same knot as eight dimensions of two or three values each can be. **Most of the benefit is in the
+decomposition, not in what is done with it afterwards.**
+
+**2. The arithmetic, which is genuinely surprising.** All *pairs* over n dimensions can be covered in a
+number of test cases that grows only **logarithmically** in n — not with the number of pairs, which is
+quadratic. The floor is set by the largest two level counts rather than by n at all: with every
+dimension binary, four rows is the minimum and a dozen or so covers dozens of dimensions.
+
+> ⚠️ **And it works only because each test case is *complicated*.** One row that sets every dimension at
+> once covers a value-pair for **every** pair of dimensions simultaneously. A suite of simple tests that
+> each vary one thing needs a number of cases proportional to the *pairs*, which is the quadratic figure
+> the whole result avoids.
+
+**That cuts against the instinct to keep every test minimal**, and it does not contradict §15.3's "unit
+tests are the bulk" so much as add a second kind beside it: many small tests that each pin one
+behaviour, plus a few deliberately tangled ones that exist to cover combinations. The two are
+complementary, and only the second kind gets the logarithm.
+
+**3. The tool, which is *sometimes* useful** (Asserted, Bob, 2026-08-19) — **particularly where there is
+a big knot of loosely connected things.** `jenny` generates n-way covering arrays over
+almost-independent dimensions and can list, avoid and negative-test the disallowed combinations
+([tool](https://github.com/bobjen/jenny), [description](https://burtleburtle.net/bob/math/jenny.html)).
+⚠️ **Provenance, as with §4.1.1.1's `ENABLE NOVALIDATE`: it is Bob's own.** The
+disallowed-combination handling is what makes it usable on a real system, where dimensions are
+almost-independent rather than independent — and negative-testing those combinations is the part
+easiest to skip by hand.
+
+##### The two knots in this design
+
+**Bob names them: the append interface, and the properties of streams** (Asserted, Bob, 2026-08-19).
+Both are loosely-connected conditions that accumulated rather than being designed as a set.
+
+**The append interface**, from §8.1 and §8.2: the framing (five values), fixed-offset against
+assigned-offset, whether a record spans appends, whether the block ends on a boundary or holds none,
+whether a CRC came with it, whether compressing helped, whether the extent is full, whether a record is
+open, whether the extent is sealed, whether this is the first append to it. **Ten dimensions, one with
+five values and the rest binary:**
+
+| | |
+|---|---|
+| the full cross product | 5 × 2^9 = **2,560** |
+| all pairs | of order **ten to twenty** rows |
+
+**Derived**, and it is the ratio rather than the exact figure that matters: two orders of magnitude, for
+a suite that catches every two-condition interaction. §17.12.1's `Sealed`-status leak was exactly that
+kind of defect — one caller of three failing to handle a state.
+
+**The properties of streams** are the newer knot and the one this session grew: `sealed` (§6.3),
+`updatable` and `deletable` with three states each (§4.1.1.1), a storage class (#74), a soft-delete
+opt-out, a declared expiry, whether extra structure is present (§4.1.2), whether the stream is shared
+(§5.11.3.4), and whether it is an object's first or last. **That is a cross product in the thousands and
+a pair-covering suite in the tens.**
+
+⚠️ **It is also the knot most likely to grow**, since §4.1.1 exists precisely to be added to — which is
+the argument for decomposing it now rather than after the next three flags arrive.
 
 #### 18.1.4 Where DeLawson has an m × n problem it has not decomposed
 
