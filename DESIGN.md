@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-138 things *not* decided.
+139 things *not* decided.
 
 **Priorities and framing**
 
@@ -359,6 +359,9 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | The hint stays **plaintext with the capability appended**, so an operator can act on a hint a user quoted | §9.1.3.5 |
 | A budget is in **records, logical bytes or compressed bytes** — one named, all three reported; **one block always returns**, even past it | §9.1.3.6 |
 | `object-info` is **extended, not replaced**, and bounded by **one entry limit** over objects + streams + extents (default **10,000**) | §9.1.3.7 |
+| **HDFS scans** its block list to find an offset — 2 × 10^9 blocks at 256 PB, the same number §14.1 reaches | §9.1.3.8 |
+| Which is §4.5's rule with the counterfactual attached: locating by **record** is a descent, locating by **byte** is a walk | §9.1.3.8, §4.5 |
+| An **unkeyed object never updated** has a tail-only logical prefix sum, so bare-offset addressing *could* be exact for it | §9.1.3.8 |
 | Large objects are built by **parallel partitions, sealed, then concatenated** | §8.6.1 |
 | **Trilemma**: parallel bandwidth, dense stable offsets, monotone time index — pick two | §8.6.2 |
 | The recursion to DN **attenuates** by fan-out; the rule is **spray per writer, not per request** | §8.6.4 |
@@ -8592,6 +8595,67 @@ the answer lines up positionally with the request (§17.12). Once an answer may 
 no longer enough — it has to say **how many of the names it covered**, and a caller reading it the
 old way would silently attribute one object's metadata to a different name.
 
+#### 9.1.3.8 Prior art: HDFS supports 256 PB files and scans to find an offset
+
+**HDFS supports files up to about 256 PB, and reportedly finds the block containing a byte offset by
+scanning the block list from the beginning** (Bob, 2026-08-19, from public reports).
+
+⚠️ **Cited with a caveat**: the behaviour is widely reported and matches the data structures HDFS is
+known to use — a NameNode `INodeFile` holds a flat array of blocks, and `getBlockLocations(src, offset,
+length)` walks it accumulating sizes until the running total passes the offset. The **client** then
+caches the returned list and binary-searches it locally, so the scan is per metadata call rather than
+per read. That reading is from memory and has not been checked against the source here; **#85 is the
+obligation to discharge it**, and it should be discharged before anything is built on the details. The *shape* is what matters and the shape is not in doubt.
+
+**The arithmetic is the point, and it is the same number DeLawson reaches:**
+
+| | |
+|---|---|
+| 256 PB at HDFS's 128 MB default block | **2 × 10^9 blocks** |
+| §14.1's limit on extent references in one object | **2 × 10^9** |
+
+**Not a coincidence.** Both are what you get when a per-object metadata array grows until linear
+anything becomes intolerable, and both tiers arrive there from opposite directions — HDFS from a large
+fixed block size, DeLawson from a small one (§6's 32 MB) and a much larger object.
+
+**Why HDFS has to scan is instructive, because it is an absence rather than a mistake.** Blocks are
+nominally fixed-size, so offset ÷ block size would be arithmetic — but append and `concat` can leave a
+file with non-uniform blocks, so the general case cannot use it. And there is no maintained prefix sum
+over block sizes to descend instead. **With neither arithmetic nor an index, a scan is what is left.**
+
+**This is §4.5's rule with the counterfactual attached**, and it is worth having the counterfactual:
+
+> §4.5 makes the *addressing* summary the one that gets to be exact, and says "that is not luck, it is
+> why the count-based scheme of §3 works at all". HDFS is what the other choice looks like.
+
+DeLawson locates by **record number**, which §4.5 keeps exact and synchronous to the root, so §9.1's
+descent is a B-tree lookup (§4.4) rather than a walk. That is the whole difference, and HDFS is
+evidence that the alternative is not merely theoretically worse — it shipped, at a scale where it
+matters, and the cost is real.
+
+⚠️ **And it lands squarely on the one thing DeLawson has *not* solved.** §9.1.3.4 admits that a descent
+on byte counts is not an index lookup here either, because §4.5 keeps byte totals lazily. So **for
+offset addressing, HDFS's problem is DeLawson's problem** — and §9.1.3.4's answer is to avoid the
+question rather than to solve it: address by record, or supply the container and let the caller
+contribute the prefix sum the store declines to maintain.
+
+**But there is a subclass where it could be solved, and HDFS is what makes it worth naming.** §4.5 keeps
+logical bytes lazy because they can change anywhere — an update rewrites a record to a different length,
+which shifts every offset above it. **An object that has never been updated has no such case**, so its
+logical prefix sum is tail-only, and by §4.5's own rule a tail-only summary may be exact to the root:
+
+| Object | Logical prefix sum | So a bare offset is |
+|---|---|---|
+| unkeyed, **never updated** | **tail-only, so it may be exact** | a B-tree descent |
+| unkeyed, updated | changes mid-object | lazy — scan or bracket-and-walk |
+| keyed | changes anywhere (§8.1.1a-7) | never exact |
+
+⚠️ **The first row is probably the common case for the motivating workload** — §1.0's shared AI memory
+is append-only by construction, and so is every log-shaped object. So the pathology HDFS lives with may
+be avoidable for most objects, at the cost of maintaining one more exact summary and a flag saying
+whether it is still trustworthy. Whether that is worth it is undecided (§16.139); what HDFS supplies is
+the evidence that the case is worth examining rather than dismissing.
+
 ### 9.2 Keyed: locating key *K*
 
 Identical in shape, with `first_key` comparisons replacing starting record
@@ -12388,6 +12452,16 @@ Roughly in order of how much else depends on them.
      puts subtle machinery in the component that must never be wrong, where a bug is unrecoverable in a
      way a bug elsewhere is not. If it is declined, §7.3.2.7's attack is an accepted risk whose controls
      are physical security, attestation and audit — none of them cryptographic.
+
+139. **Whether to maintain an exact logical prefix sum for never-updated objects** (§9.1.3.8, §4.5,
+     §9.1.3.4). §4.5 keeps logical bytes lazy because an update rewrites a record to a different length
+     and shifts every offset above it — but an object that has never been updated has no such case, so
+     its prefix sum is tail-only and may by §4.5's own rule be exact to the root. That would make a bare
+     object offset a B-tree descent instead of the walk HDFS is reported to do (§9.1.3.8), and §1.0's
+     motivating workload is append-only, so the subclass is probably the common one. Against it: one more
+     exact summary to maintain, plus a flag saying whether it is still trustworthy, plus the question of
+     what happens to the flag on the first update — recompute lazily, or abandon exactness for that object
+     for ever. Its motivating example depends on #85.
 
 **Closed** since earlier drafts:
 
