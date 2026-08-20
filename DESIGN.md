@@ -316,6 +316,9 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Hints fail **detectably** because extent identity carries a creation second — Oracle's logical rowid pattern | §8.1.1a-10 |
 | One key and one salt may cover **one** plaintext, so **within an extent an offset is written at most once, ever** | §7.2.4 |
 | Therefore **a truncation seals the extent** — chosen over an IV epoch, which would need agreement in the write path and could be silently missed | §7.2.4, §8.1.1a |
+| An instance may **mark itself broken and request a seal**; ***I* − *Q* + 1** of them force one, because the extent is then unappendable | §8.1.7.4 |
+| A single instance may trigger one — sealing is universally safe, so the cost is **metadata churn**, damped at the SN | §8.1.7.4 |
+| The mark is **durable and one-way**, and a marked instance fails every append **it sees** — so nobody counts, and the threshold is a consequence rather than a detector | §8.1.7.4.1 |
 | **Every read names the object**, whatever else it names: the ACL is the object's, and no reverse edge recovers it | §9.1.3.4, §4.6.6 |
 | A range start is the **object**, optionally **how far the caller already resolved**, and a **position**; a stale narrowing falls back to the object | §9.1.3.4 |
 | A bare offset **snaps forward** to the next record boundary, so independently computed chunk boundaries are a **partition** — the Hadoop split rule | §9.1.3.4 |
@@ -6631,6 +6634,98 @@ acknowledged**, because §8.2.3's second gate means an append that closed no rec
 in the first place. So failure-mode sealing needs no record surgery and no special answer to the
 writer about half-written records — the rules that removed the split in §8.2.4 remove it here too.
 
+#### 8.1.7.4 An instance may mark itself broken and ask for a seal, and *I* − *Q* + 1 of them force one
+
+**An instance of an extent can mark itself broken and request a seal** (Asserted, Bob, 2026-08-19).
+This is the other direction from §8.1.7: there, something outside notices instances are down and
+coordinates a seal; here, an instance that knows something nobody else can — a device error, an
+unreadable journal — says so.
+
+**And *I* − *Q* + 1 of them make the seal compulsory, by arithmetic.** An append needs *Q* instances
+to apply it, so with *B* broken the healthy count is *I* − *B* and appends are impossible exactly when
+
+> *I* − *B* < *Q*, that is **when *B* ≥ *I* − *Q* + 1**.
+
+At four instances and a quorum of three that is **two**: two broken instances leave two healthy, and
+two can never be three. **Derived.** So at that point the extent is not merely degraded, it is
+*unappendable*, and leaving it open is a lie — every subsequent append would fail after waiting for a
+quorum that cannot form.
+
+⚠️ **That is the same *I* − *Q* + 1 as §8.1.7.1's order statistic, and not by coincidence.** *I* − *Q*
+is how many instances may be lost while a quorum survives; the +1 is one too many. §8.1.7.1 counts up
+to it to find the durable length, and this counts to it to find that there is no more length to come.
+Two uses of one threshold, which is a hint that it is the real quantity and the two rules are one
+mechanism seen from either end.
+
+**Whether a *single* instance may trigger a seal: yes, and it costs metadata rather than correctness**
+(Asserted, Bob, 2026-08-19, and nothing here contradicts it). The reason no contradiction appears is
+that sealing is already the universally safe response — §6 permits sealing at any size, §8.1.1c makes
+sealing short free rather than wasteful, and §7.2.4 has just made it the answer to truncation as well.
+Three things argue for allowing it:
+
+- **It is information nobody else has.** An instance that has read a bad block knows it before any
+  sync loop could infer it, and the alternative is waiting for the fact to be rediscovered from
+  outside.
+- **It shortens a fragile window.** An extent with one broken instance is one failure away from
+  unappendable. Sealing converts it into something repair can work on — EC grouping and
+  re-replication both want sealed extents.
+- **It composes with everything already decided.** The seal length comes from §8.1.7's order
+  statistic, and instances holding more than that truncate — which seals, per §7.2.4. A broken
+  instance's own reported length is safe to include: reported low it is likely among the *I* − *Q*
+  discarded, and reported high it seals above the durable length, which §8.1.7.1 shows is the
+  tolerable direction.
+
+⚠️ **The cost is churn, and its blast radius is every extent that instance holds.** A flapping EN
+that seals on each wobble produces short extents across all of them, and extent count is what bounds
+an SN's memory (§14.1) — so this lands in §16.133's budget alongside handover, from a second
+direction. **The SN is the natural place to damp it**, because it already records every seal
+(§8.1.7), so a threshold or a rate limit there needs no new participant. What must not happen is an
+EN deciding unilaterally *and* unboundedly.
+
+**One thing it must do besides asking**: an instance that has marked itself broken stops counting
+toward the quorum for new appends immediately, or the primary keeps waiting on it. Requesting the
+seal and withdrawing from the quorum are the same act, and separating them would leave appends
+stalling against an instance that has already said it cannot help.
+
+##### 8.1.7.4.1 Nobody counts: the threshold describes what happens rather than causing it
+
+**If an instance durably marks itself as requesting a seal, and thereafter fails any further append
+it sees, then *I* − *Q* + 1 such instances prevent a quorum for any further append** (Asserted, Bob,
+2026-08-19). That is the mechanism, and it is better than the rule it replaces.
+
+**"Appends it sees" is the exact obligation, and the exactness is what makes it cheap.** A marked
+instance does not have to prevent appends, observe them, or know they happened — it answers *no* to
+what arrives at it and nothing else. It has no duty toward an append it never receives, which is
+just as well, since an instance that has declared itself broken is the last thing that should be
+required to notice something.
+
+⚠️ **The arithmetic above stops being something anything implements.** Read as a rule, *B* ≥
+*I* − *Q* + 1 needs an observer: something has to learn how many instances are broken, decide the
+threshold is met, and act — which is a detector with a staleness window, a race against instances
+marking themselves concurrently, and a question about who runs it. Read as a *consequence*, none of
+that exists. Each instance refuses appends locally, and appends stop reaching quorum **because they
+cannot**, not because anyone noticed. The threshold is then a description of when appends start
+failing, and §8.1.7's ordinary coordinated seal — which is already what happens when appends fail —
+takes it from there.
+
+**That is the same shape as three other things already decided**, which is why it is worth naming: the
+quorum intersection needs no reconciliation protocol (§8.1.1), placement needs no rebalancer because
+the answer is persisted (§5.6.9), and the waiters need no ordering discipline because they live under
+the lock (§17.12.1). In each case a rule that would have needed an enforcer became a consequence of
+where a fact is kept.
+
+**Durably is load-bearing, and it is the one part that costs something.** A mark held only in memory
+is cleared by a restart, and an instance that comes back accepting appends would take offsets its
+peers have long since moved past — writing different bytes where the extent already has some, which
+is exactly the §7.2.4 hazard the rest of this section exists to prevent. So the mark belongs in the
+EN's per-disk extent journal (§8.1.5), beside the extent metadata that already has to survive a
+restart to be interpretable at all.
+
+⚠️ **And it is a one-way door.** Nothing clears the mark, because there is no safe way back: an
+instance that resumed appending after being skipped would have a hole it cannot fill and a durable
+length its peers disagree with. Repair is the way back, and repair works on a *sealed* extent — which
+is what the mark brings about.
+
 ### 8.2 Record framing
 
 An object declares a framing at creation, and **appends are stored in the format the writer gave
@@ -11679,12 +11774,15 @@ Roughly in order of how much else depends on them.
      reason about and what the continuation is expressed in; bytes are what actually has to be bounded, and
      the two differ by whether an extent has 4 instances or 15 fragments after erasure coding (§4.3.2). The
      10,000 default is derived from a byte target, which is a hint that the byte form is the real one.
-133. **What the short extents from truncation-sealing cost an SN** (§7.2.4, §14.1; #56, #83). Sealing on
+133. **What the short extents from truncation-sealing cost an SN** (§7.2.4, §8.1.7.4, §14.1; #56, #83). Sealing on
      truncation is what turns the IV rule into an invariant, and it makes primary stability a driver of
      **extent count** — which is what bounds an SN's memory. Nothing yet says how often a handover
      happens, so nothing bounds the growth. #56 has to settle handover regardless; what is new is that
      handover frequency now lands in a second budget, and a flapping primary is a metadata cost and not
-     only an availability one.
+     only an availability one. §8.1.7.4 arrives at the same budget from a second direction: a single
+     instance may request a seal, so a flapping EN can produce short extents across every extent it
+     holds. The SN records every seal and is therefore where both are damped, but the threshold or rate
+     limit is unchosen.
 
 **Closed** since earlier drafts:
 
@@ -13179,3 +13277,50 @@ of 200 reads failed. The lesson is not about numbering: **a conversion between t
 zero is untested by anything that never leaves the first extent**, and the single-box cluster's tiny
 seal limit is what made it show up at all. Had the limit been the design's 32 MB, this would have
 shipped.
+### 17.17 An offset is written once, and the check is a refusal rather than a repair
+
+§7.2.4's rule went into the EN, and what it took is instructive about where the rule actually bites.
+
+**The primary was already safe by accident.** `take` hands out `extent.end` and moves it forward, so
+an offset is used once as long as nothing moves `end` backwards — and nothing did, because truncation
+did not exist. **The secondary was not.** `apply` took the offset the primary chose and did
+`end = end.max(offset + stored)`, which accepts a block at *any* offset, including one already
+written, and silently kept both. That is the catastrophic case of §7.2.4 sitting in the one path where
+the offset arrives from another machine rather than being chosen locally.
+
+**So the check lives on `apply`, and it distinguishes three cases** rather than two:
+
+| At that offset | Answer | Why |
+|---|---|---|
+| nothing | store it | the ordinary case |
+| **the same bytes** | **ok, stored once** | an append this instance already has, arriving again. The primary is owed the same answer it got the first time, and nothing changed |
+| anything else | **refuse** | two plaintexts under one key and IV |
+
+⚠️ **The middle row is the one worth having thought about.** Without it the retry that §8.1.1a-3 makes
+harmless would start failing, because a retry *is* an overlap — so a check that only asked "is this
+offset free" would have turned exactly-once into an error. The distinction is bytes, not offsets.
+
+**And truncation is one operation with sealing, not two.** `truncate` discards everything at or above
+a compressed offset and seals, and the two cannot be called separately, for §17.12.1's reason: a rule
+that depends on remembering to do the second thing is a rule that will be broken. It refuses three
+ways, and each refusal is a different invariant checking this one:
+
+- **a cut inside a block** — §8.2.4 makes splitting an append impossible, and a durable watermark is a
+  block boundary by construction, so a cut that is not one did not come from a watermark;
+- **a cut that would leave a record open** — §8.2.3 keeps whole records in an extent, and
+  `INCOMPLETE-RECORD-NOT-DURABLE` means a watermark never lands mid-record, so this too says the
+  caller is confused rather than sealing something invalid;
+- **a cut past everything held** — the same confusion in the other direction.
+
+**Sealing is unconditional, including when nothing was discarded**, and the reason is a whole-extent
+argument rather than a per-instance one. A handover seals the extent at one agreed length (§8.1.7), so
+an instance that happens to hold nothing above it is still part of a sealed extent. Sealing only the
+instances that lost bytes would leave the others appendable, and a new primary taking its end from one
+of *those* would hand out an offset another instance has already written — which is the original bug
+wearing a different hat.
+
+⚠️ **Nothing calls `truncate` from the wire yet, because primary handover is unspecified** (§16.32,
+#55). The primitive is deliberately ahead of its caller: the invariant it carries is most of the reason
+handover cannot be written casually, so it should exist before the protocol rather than after. What is
+enforced today is the `apply` refusal, which is on a live path, plus seven tests naming the two
+invariants they check.

@@ -96,6 +96,41 @@ enum Took {
     },
 }
 
+/// What an extent already holds at an offset, which is what decides whether an
+/// append aimed there is a retry or a violation.
+enum Covering {
+    /// Nothing is stored there.
+    Free,
+    /// The same bytes at the same offset — an append that already landed, arriving
+    /// again. It changes nothing, so it is answered ok and not stored twice.
+    Same,
+    /// Something else is there, and the offset it starts at.
+    Taken(COff),
+}
+
+/// What an apply did. A retry must be answered ok without storing the bytes or
+/// moving any count a second time.
+enum Applied {
+    Stored,
+    Already,
+}
+
+/// What a truncation discarded, and what the extent came to.
+///
+/// ⚠️ **Nothing calls it from the wire yet**, because the caller is primary
+/// handover and that protocol is unspecified (§16.32, #55). The primitive is here
+/// ahead of it deliberately: the invariant it carries is the reason handover cannot
+/// be written casually, so the operation that enforces it should exist before the
+/// protocol that needs it, not after.
+#[allow(dead_code)]
+struct Truncated {
+    /// Blocks dropped. Zero is ordinary: an instance may have nothing above the
+    /// watermark and is still sealed, because the *extent* is what sealed.
+    discarded: usize,
+    records: u64,
+    length: COff,
+}
+
 /// Where an append landed and what it numbered.
 struct Landed {
     offset: COff,
@@ -197,13 +232,61 @@ impl Extents {
         }))
     }
 
+    /// What is already stored across a byte range of an extent.
+    ///
+    /// ⚠️ **This is the `EXTENT-OFFSET-WRITE-ONCE` check (§7.2.4), and it is a
+    /// crypto check rather than a tidiness one.** The block IV is derived from the
+    /// offset, so two different plaintexts at one offset are two plaintexts under
+    /// one key and one IV — which leaks their XOR and, with AEGIS, hands over tag
+    /// forgery under that extent's key. Storing them is not a mess to clean up
+    /// later; it is unrecoverable the moment both are written.
+    ///
+    /// A scan of this extent's blocks, which is what the placeholder can do — the
+    /// journal that replaces these vectors indexes by offset.
+    fn covering(&self, place: usize, offset: COff, stored: COff, bytes: &[u8]) -> Result<Covering> {
+        let end = offset.plus(stored)?;
+        for append in self.appends.iter().filter(|append| append.extent == place) {
+            let past = append.offset.plus(COff::of_len(append.bytes.len())?)?;
+            // Disjoint: ends at or before it starts, or starts at or after it ends.
+            if end <= append.offset || offset >= past {
+                continue;
+            }
+            // The same bytes at the same offset is the one benign overlap: an
+            // instance being told twice about an append it already has.
+            if append.offset == offset && append.bytes == bytes {
+                return Ok(Covering::Same);
+            }
+            return Ok(Covering::Taken(append.offset));
+        }
+        Ok(Covering::Free)
+    }
+
     /// Put an append where another instance said. The offset is given, so this must
     /// not assign one — but the ends and counts still move, since an instance that
     /// never learns them cannot become primary.
-    fn apply(&mut self, appending: &AppendBlock, offset: COff) -> Result<()> {
+    fn apply(&mut self, appending: &AppendBlock, offset: COff) -> Result<Applied> {
         let stored = COff::of_len(appending.bytes.len())?;
         let logical = LOff::of_len(appending.holds.logical as usize)?;
         let place = self.place(appending.sn, appending.extent, appending.created)?;
+        // ⚠️ Both checks before anything moves, because a rejected apply must leave
+        // the extent exactly as it was.
+        if self.extents[place].sealed {
+            return Err(Error::new(format!(
+                "extent {} of sn {} is sealed, so nothing more goes in it",
+                appending.extent, appending.sn
+            )));
+        }
+        match self.covering(place, offset, stored, &appending.bytes)? {
+            Covering::Same => return Ok(Applied::Already),
+            Covering::Taken(at) => {
+                return Err(Error::new(format!(
+                    "extent {} of sn {} already holds other bytes at compressed offset {at}, \
+                     and an offset is written at most once",
+                    appending.extent, appending.sn
+                )));
+            }
+            Covering::Free => {}
+        }
         let extent = &mut self.extents[place];
         let first_record = extent.records;
         extent.end = extent.end.max(offset.plus(stored)?);
@@ -217,7 +300,88 @@ impl Extents {
             holds: appending.holds,
             bytes: appending.bytes.clone(),
         });
-        Ok(())
+        Ok(Applied::Stored)
+    }
+
+    /// Discard everything at or above a compressed offset, and **seal**.
+    ///
+    /// ⚠️ **The sealing is not a tidy-up afterwards; it is why this is one method**
+    /// (§7.2.4, `TRUNCATION-SEALS`). Truncating frees offsets, and an extent that
+    /// stayed appendable would hand those offsets to different bytes under the same
+    /// key and IV. Separating the two operations would make it possible to truncate
+    /// and forget, so they are not separable here — the same reasoning as §17.12.1's
+    /// waiters, where the fix was structural rather than careful.
+    ///
+    /// **Sealing is unconditional, even when nothing was discarded.** A handover
+    /// seals the *extent* at one agreed length (§8.1.7), so an instance that happens
+    /// to hold nothing above that length is still part of a sealed extent. Sealing
+    /// only the instances that discarded would leave the others appendable, and a
+    /// new primary computing its end from one of those would hand out an offset
+    /// another instance has already written.
+    #[allow(dead_code)]
+    fn truncate(&mut self, sn: u32, id: u64, above: COff) -> Result<Truncated> {
+        let Some(&place) = self.at.get(&(sn, id)) else {
+            return Err(Error::new(format!("no extent {id} of sn {sn} here")));
+        };
+
+        // One walk over this extent's blocks: what survives, what goes, and whether
+        // the cut lands where a block ends.
+        let mut boundary = above == COff::ZERO;
+        let mut records = 0u64;
+        let mut logical = LOff::ZERO;
+        let mut length = COff::ZERO;
+        let mut discarded = 0usize;
+        let mut last: Option<(COff, bool)> = None;
+        for append in self.appends.iter().filter(|append| append.extent == place) {
+            let past = append.offset.plus(COff::of_len(append.bytes.len())?)?;
+            if past == above {
+                boundary = true;
+            }
+            if append.offset >= above {
+                discarded += 1;
+                continue;
+            }
+            // ⚠️ A cut inside a block would split an append, which §8.2.4 spends a
+            // section making impossible. A durable watermark is a block boundary by
+            // construction, so a cut that is not one did not come from a watermark
+            // and the caller is confused about what it is truncating to.
+            if past > above {
+                return Err(Error::new(format!(
+                    "compressed offset {above} is inside the block at {}, and a block is never split",
+                    append.offset
+                )));
+            }
+            records += append.holds.records;
+            logical = logical.plus(LOff::of_len(append.holds.logical as usize)?)?;
+            length = length.max(past);
+            if last.is_none_or(|(at, _)| append.offset >= at) {
+                last = Some((append.offset, append.holds.open_record));
+            }
+        }
+        if !boundary {
+            return Err(Error::new(format!(
+                "compressed offset {above} is past everything extent {id} of sn {sn} holds"
+            )));
+        }
+        // ⚠️ An extent holds whole records (§8.2.3), so it may not seal with one
+        // open — and a durable watermark never lands mid-record, because an append
+        // that closed no record is not durable until a later one closes it
+        // (`INCOMPLETE-RECORD-NOT-DURABLE`). So this is unreachable from a real
+        // watermark, and refusing says so rather than sealing something invalid.
+        if last.is_some_and(|(_, open)| open) {
+            return Err(Error::new(format!(
+                "truncating extent {id} of sn {sn} to {above} would seal it with a record open"
+            )));
+        }
+
+        self.appends.retain(|append| append.extent != place || append.offset < above);
+        let extent = &mut self.extents[place];
+        extent.sealed = true;
+        extent.end = length;
+        extent.logical_end = logical;
+        extent.records = records;
+        extent.open_record = false;
+        Ok(Truncated { discarded, records, length })
     }
 
     /// The block holding a record, whole.
@@ -458,8 +622,13 @@ impl EN {
             Ok(offset) => offset,
             Err(e) => return Response::error(Status::BadRequest, e.to_string()),
         };
-        if let Err(e) = self.held.lock().expect("extents").apply(&appending, offset) {
-            return Response::error(Status::BadRequest, e.to_string());
+        match self.held.lock().expect("extents").apply(&appending, offset) {
+            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            // A retry of an append this instance already has. Ok, because the
+            // primary is owed the same answer it would have got the first time —
+            // and counted nowhere, because nothing was stored.
+            Ok(Applied::Already) => return Response::ok(),
+            Ok(Applied::Stored) => {}
         }
         self.appends.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(appending.bytes.len() as u64, Ordering::Relaxed);
@@ -947,5 +1116,132 @@ mod tests {
     fn too_few_instances_to_ask_is_hopeless_from_the_start() {
         assert!(!Counting::new(1, 3).possible());
         assert!(Counting::new(2, 3).possible());
+    }
+
+    // `EXTENT-OFFSET-WRITE-ONCE` and `TRUNCATION-SEALS` (§7.2.4). These are the
+    // crypto invariants, so the tests are about what is *refused*: the block IV
+    // comes from the offset, and two plaintexts at one offset under one key leak
+    // their XOR whatever anybody does about it afterwards.
+
+    /// A secondary told to put different bytes where it already has some refuses.
+    /// Nothing above this tier can be trusted to have got the offset right, and the
+    /// damage is not repairable once both are written.
+    #[test]
+    fn an_offset_holds_one_plaintext_and_refuses_a_second() {
+        let en = EN::new(testing::en_config());
+        let mut held = en.held.lock().unwrap();
+        assert!(matches!(held.apply(&block(0, 1, b"first\n"), COff::ZERO), Ok(Applied::Stored)));
+
+        let clash = held.apply(&block(0, 1, b"other\n"), COff::ZERO);
+        assert!(clash.is_err(), "different bytes at a written offset");
+        // Overlapping partway is the same violation, and so is straddling the start.
+        assert!(held.apply(&block(0, 1, b"xx\n"), COff::new(3)).is_err());
+        assert_eq!(held.read(0, 1), b"first\n", "and the refusal changed nothing");
+    }
+
+    /// The one benign overlap: the same bytes at the same offset, which is an append
+    /// this instance already has arriving again. It is answered ok and stored once,
+    /// because a retry must look to the primary like the first attempt did.
+    #[test]
+    fn the_same_bytes_at_the_same_offset_are_a_retry_not_a_clash() {
+        let en = EN::new(testing::en_config());
+        let mut held = en.held.lock().unwrap();
+        let same = block(0, 1, b"once\n");
+        assert!(matches!(held.apply(&same, COff::ZERO), Ok(Applied::Stored)));
+        assert!(matches!(held.apply(&same, COff::ZERO), Ok(Applied::Already)));
+        assert_eq!(held.read(0, 1), b"once\n", "stored once, not twice");
+        assert_eq!(held.extents[0].records, 1, "and counted once");
+    }
+
+    /// Truncating and sealing are one operation, so an offset a truncation freed can
+    /// never be handed to different bytes. This is the whole point of #83.
+    #[test]
+    fn a_truncation_seals_so_a_freed_offset_is_never_reused() {
+        let en = EN::new(testing::en_config());
+        append(&en, 1, &line("keep"));
+        append(&en, 1, &line("drop"));
+        let mut held = en.held.lock().unwrap();
+        assert_eq!(held.extents[0].end, COff::new(10));
+
+        let cut = held.truncate(0, 1, COff::new(5)).expect("a boundary");
+        assert_eq!((cut.discarded, cut.records, cut.length), (1, 1, COff::new(5)));
+        assert_eq!(held.read(0, 1), b"keep\n", "the discarded block is gone");
+        assert!(held.extents[0].sealed, "and the extent is sealed");
+        assert_eq!(held.extents[0].records, 1, "counts rebuilt from what survived");
+        assert_eq!(held.extents[0].logical_end, LOff::new(5));
+
+        // The freed offset 5 is not handed out again, by either path.
+        assert!(held.apply(&block(0, 1, &line("reuse")), COff::new(5)).is_err());
+        drop(held);
+        assert!(matches!(en.take(&block(0, 1, &line("reuse")), ROOM), Ok(Took::Sealed { .. })));
+    }
+
+    /// Sealing happens even when the instance had nothing above the watermark: a
+    /// handover seals the extent, not just the instances that lost bytes. An
+    /// instance left appendable is one a new primary could get an offset from.
+    #[test]
+    fn a_truncation_that_discards_nothing_still_seals() {
+        let en = EN::new(testing::en_config());
+        append(&en, 1, &line("all of it"));
+        let mut held = en.held.lock().unwrap();
+        let cut = held.truncate(0, 1, COff::new(10)).expect("the end is a boundary");
+        assert_eq!(cut.discarded, 0);
+        assert!(held.extents[0].sealed);
+        assert_eq!(held.read(0, 1), b"all of it\n", "and kept everything");
+    }
+
+    /// A cut inside a block would split an append, which §8.2.4 makes impossible —
+    /// and a durable watermark is always a block boundary, so a cut that is not one
+    /// did not come from a watermark.
+    #[test]
+    fn a_truncation_must_land_where_a_block_ends() {
+        let en = EN::new(testing::en_config());
+        append(&en, 1, &line("first"));
+        append(&en, 1, &line("second"));
+        let mut held = en.held.lock().unwrap();
+        assert!(held.truncate(0, 1, COff::new(3)).is_err(), "inside the first block");
+        assert!(held.truncate(0, 1, COff::new(9)).is_err(), "inside the second");
+        assert!(held.truncate(0, 1, COff::new(99)).is_err(), "past everything");
+        assert!(!held.extents[0].sealed, "and a refused truncation seals nothing");
+        assert_eq!(held.read(0, 1), b"first\nsecond\n");
+
+        // Zero is always a boundary: discarding the lot is a truncation too.
+        assert_eq!(held.truncate(0, 1, COff::ZERO).expect("the start").discarded, 2);
+        assert_eq!(held.extents[0].records, 0);
+        assert!(held.read(0, 1).is_empty());
+    }
+
+    /// An extent holds whole records, so it may not seal with one open. A durable
+    /// watermark never lands mid-record — an append closing no record is not durable
+    /// until a later one closes it — so this says the caller is confused rather than
+    /// sealing something invalid.
+    #[test]
+    fn a_truncation_that_would_leave_a_record_open_is_refused() {
+        let en = EN::new(testing::en_config());
+        let opened = Holds::of(Framing::Lf, b"", b"half a rec", None).unwrap();
+        en.take(&AppendBlock { holds: opened, ..block(0, 1, b"half a rec") }, ROOM).unwrap();
+        let closed = Holds::of(Framing::Lf, b"half a rec", b"ord\n", None).unwrap();
+        en.take(&AppendBlock { holds: closed, ..block(0, 1, b"ord\n") }, ROOM).unwrap();
+
+        let mut held = en.held.lock().unwrap();
+        // Cutting between the two blocks is a block boundary and a record's middle.
+        assert!(held.truncate(0, 1, COff::new(10)).is_err());
+        assert!(!held.extents[0].sealed);
+        // Keeping both is fine, because the record closed.
+        assert!(held.truncate(0, 1, COff::new(14)).is_ok());
+    }
+
+    /// A sealed extent takes nothing more by either path. `take` already answered
+    /// `Sealed`; `apply` used to accept, which would have let a secondary keep
+    /// growing an extent the primary had closed.
+    #[test]
+    fn a_sealed_extent_refuses_an_apply_as_well_as_an_append() {
+        let en = EN::new(testing::en_config());
+        let cap = COff::new(6);
+        en.take(&block(0, 1, &line("full")), cap).unwrap();
+        assert!(matches!(en.take(&block(0, 1, &line("x")), cap), Ok(Took::Sealed { .. })));
+        let mut held = en.held.lock().unwrap();
+        assert!(held.extents[0].sealed);
+        assert!(held.apply(&block(0, 1, &line("x")), COff::new(5)).is_err());
     }
 }

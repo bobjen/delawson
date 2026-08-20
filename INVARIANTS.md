@@ -220,8 +220,11 @@ sweep, exactly rather than probabilistically, using the AEAD tag
 garbage rather than a detectable error.
 
 **`EXTENT-OFFSET-WRITE-ONCE`** — within one extent identity, an offset is written at most once, ever.
-*Argued* §7.2.4 · *Enforced* design only; the seal-on-truncate trigger is #83 · *Checked* unit test
-per extent, and **model check wanted** with handover interleaved — this is where it can be violated
+*Argued* §7.2.4, §17.17 · *Enforced* **code**: the primary was already safe, since `take` only moves
+`end` forward; the secondary was not, and `apply` now refuses different bytes at a written offset
+(#83) · *Checked* unit tests exist (`an_offset_holds_one_plaintext_and_refuses_a_second`,
+`the_same_bytes_at_the_same_offset_are_a_retry_not_a_clash`); **model check wanted** with handover
+interleaved, which is the case no test reaches
 *Breaks* the per-block IV repeats over different plaintext under one key: the XOR of the ciphertexts
 is the XOR of the plaintexts, and AEGIS's nonce-misuse profile additionally yields tag forgery under
 that extent key. Also makes `FIXED-OFFSET-ADVANCES`'s content comparison unsound, since it presumes
@@ -229,8 +232,10 @@ an offset has one history.
 
 **`TRUNCATION-SEALS`** — anything that truncates an extent seals it, rather than letting later
 appends reuse the vacated offsets.
-*Argued* §7.2.4 · *Enforced* design only (#83) · *Checked* unit test: a handover mid-burst must
-produce a sealed short extent
+*Argued* §7.2.4, §17.17 · *Enforced* **code**: `Extents::truncate` does both and they cannot be
+called separately, which is the point. ⚠️ Its wire caller does not exist, because handover is
+unspecified (§16.32, #55) · *Checked* four unit tests, including that a truncation discarding nothing
+still seals and that a refused truncation seals nothing
 *Breaks* `EXTENT-OFFSET-WRITE-ONCE`. Chosen over an IV epoch because an epoch needs agreement across
 instances in the write path — which §8.1.3 exists to avoid — and a missed bump fails **silently**.
 
@@ -247,6 +252,25 @@ stays the same.
 test
 *Breaks* the object logical offset stops being well defined, since the prior sum is no longer fixed
 — which is why compare-and-append is unkeyed-only.
+
+**`SELF-SEAL-MARK-IS-DURABLE`** — an instance that marks itself as requesting a seal records that
+durably, and thereafter fails every further append **it sees**. Nothing clears the mark.
+*Argued* §8.1.7.4.1 · *Enforced* design only; the mark belongs in the EN's per-disk extent journal
+(§8.1.5) · *Checked* not yet — and the test that matters is a restart, not an append
+*Breaks* a restart clears the mark, the instance resumes accepting appends, and it writes different
+bytes at offsets its peers have moved past — `EXTENT-OFFSET-WRITE-ONCE` exactly. The obligation is
+local on purpose: refusing what arrives, never observing what does not.
+
+**`UNAPPENDABLE-EXTENT-SEALS`** — once *I* − *Q* + 1 instances have marked themselves, no further
+append can reach a quorum, so the extent seals.
+*Argued* §8.1.7.4, §8.1.7.4.1 · *Enforced* design only · *Checked* the arithmetic is a unit test;
+the protocol is **model check wanted** alongside §8.1.7
+*Breaks* an extent stays open while being unappendable, so every append fails only after waiting for
+a quorum that cannot form.
+⚠️ **Nothing implements this one.** It is a *consequence* of `SELF-SEAL-MARK-IS-DURABLE` plus the
+quorum, not a threshold anybody detects — read as a rule it would need an observer, with a staleness
+window and a race. Listed because it must hold, not because there is code to point at. Note
+*I* − *Q* + 1 is `SEAL-NEVER-BELOW-DURABLE`'s order statistic counted from the other end.
 
 **`ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`** — an append whose offset the primary assigns must end on
 a record boundary. Only a writer that fixed its own offsets may leave a fragment.
@@ -544,11 +568,11 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **path** | §4.6.3 | `PATH-IS-THE-PORTABLE-NAME`, `HINT-BOUND-BY-CAPABILITY`, `READ-NAMES-THE-OBJECT` |
 | **placement** | §5.6 | `PLACEMENT-NEVER-REVISITED`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `NESTED-NOT-ORTHOGONAL-DOMAINS`, `SOLVER-TIMEOUT-DEFERS-NEVER-DROPS`, `UNENFORCEABLE-RULE-NOT-ENFORCED`, `NO-DATA-MOVEMENT-EXCEPT-RANGE-SPLIT` |
 | **primary** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `TRUNCATION-SEALS` |
-| **quorum** | §8.1.1 | `QUORUM-OVERLAPS`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER` |
+| **quorum** | §8.1.1 | `QUORUM-OVERLAPS`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `UNAPPENDABLE-EXTENT-SEALS`, `SELF-SEAL-MARK-IS-DURABLE` |
 | **record** | §8.2 | `EXTENT-HOLDS-WHOLE-RECORDS`, `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `INCOMPLETE-RECORD-NOT-DURABLE`, `RECORD-FITS-ONE-EXTENT`, `TERMINATOR-NOT-IN-DATA`, `OFFSET-SNAPS-FORWARD`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `EXTENT-SEALS-BETWEEN-RECORDS` |
 | **record number** | §3 | `RECORD-NUMBER-STABLE`, `RECORD-NUMBERS-DENSE`, `UNKEYED-COUNT-EXACT`, `UPDATE-DELETE-PRESERVE-COUNTS`, `PATH-IS-THE-PORTABLE-NAME` |
 | **reference** | §4.6 | `NO-CLUSTER-NAMES-IN-DATA-PLANE`, `REVERSE-EDGE-IS-A-COUNT`, `COUNTS-ARE-RECOMPUTABLE`, `ZERO-REFERENCES-IS-A-BUG`, `POSITION-FACTS-IN-REFERRER`, `REVENUE-INVARIANT-UNDER-REGROUPING` |
-| **seal** (extent) | §6 | `EXTENT-SEALS-BETWEEN-RECORDS`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATION-SEALS`, `SEALED-EXTENT-IMMUTABLE`, `RECORD-NUMBERS-DENSE` |
+| **seal** (extent) | §6 | `EXTENT-SEALS-BETWEEN-RECORDS`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATION-SEALS`, `SEALED-EXTENT-IMMUTABLE`, `RECORD-NUMBERS-DENSE`, `UNAPPENDABLE-EXTENT-SEALS` |
 | **seal** (wire segment) | §17.5a | `NO-TWO-SEGMENTS-SHARE-A-NONCE`. ⚠️ *An unrelated sense of the word; `common/src/seal.rs` is this one.* |
 | **stream** | §4.1 | `STREAM-IDENTITY-OWNED`, `SN-NOT-IN-WRITE-PATH`, `ONE-REQUEST-IN-FLIGHT-PER-STREAM`, `EXTENT-KEY-FROM-CREATING-SN`, `READ-NAMES-THE-OBJECT` |
 | **summary** | §4.5 | `TAIL-ONLY-SUMMARIES-EXACT`, `UNKEYED-COUNT-EXACT`, `COUNTS-ARE-RECOMPUTABLE` |
