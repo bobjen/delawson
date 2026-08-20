@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-152 things *not* decided.
+153 things *not* decided.
 
 **Priorities and framing**
 
@@ -3232,10 +3232,16 @@ lives once in a table those references point into.
 | List | Budget per entry | Today | 2^32 entries, today |
 |---|---|---|---|
 | An SN stream's extents | 4 B | **80 B** — 64 B inlined plus a 16 B instance list | 344 GB |
-| A DN object's streams | 4 B | **40 B**, inlined | 172 GB |
+| A DN object's streams | 4 B | **56 B**, inlined | 241 GB |
+
+⚠️ **40 B until 2026-08-20**, when the DN's stream record took a creation second and a
+stream's sizes (§17.25.1). Four fields for the space of two, since `records` stopped being an
+`Option<u64>` in the same change — but it is still 16 bytes on a list this table exists to
+warn about, and **it moved the 2^32 figure from 172 GB to 241 GB.** The size test is what
+sent this edit here (#9).
 
 ⚠️ **Both lists inline the whole record where the design says reference**, so they
-cost twenty and ten times the budget. That is a property of §14.6's placeholders and
+cost twenty and fourteen times the budget. That is a property of §14.6's placeholders and
 not of the design — but it decides what a large-stream or large-object test can reach
 on real hardware, so it is the number to size against until the segmented array and
 the B-tree land. At 4 bytes a 2^32-entry list is 17 GB; at 80 it is a machine's worth
@@ -13957,13 +13963,26 @@ Roughly in order of how much else depends on them.
      caller-side assembly — a caller sending D requests costs the FE tier D too, so it is more messages
      and not fewer. Locality is a routing property, not a fan-out one.
 
-152. **What a shared stream's sizes mean for one object** (§17.25.1, §11). §11 lumps small objects
+152. **What a shared stream's sizes mean for one object** (§17.25.1, §11). ⚠️ **Answered by
+     §17.25.5**: nothing, and the case is load-bearing rather than an edge. Kept here because the
+     storage shape that fixes it is still open, under §16.153. §11 lumps small objects
      into common streams, and a stream's totals are then the *stream's*, not any one object's — so a
      listing would report the same size for every object in the lump, wildly wrong for all of them.
      Per-object accounting inside a shared stream is a different thing to store and nobody has asked
      for it yet; the large-object case, which is what the system is for, is exactly served by the
      per-stream figures. ⚠️ Note the creation date does not have this problem: an object already
      carries its own.
+
+153. **What the small-object regimes need from the metadata, and whether the tax is billed**
+     (§17.25.5, §11, §12.2). Bob has settled the shape: the first append's seal flag decides the
+     regime, once and for life — sealed means inline or a common-stream range by size, unsealed means
+     a dedicated stream. The EN packs tiny appends regardless, and the SN rewrites small sealed
+     objects, so a missing flag costs metadata and never data. Two things are open. **Where an inline
+     object's size and creation second live**, since it has no stream to hang them on and the DN
+     knows them exactly. And ⚠️ **whether the metadata tax is actually charged**: §12.2 prices a
+     minimal stream at 300 B of SN RAM, 1.5 MB disk-equivalent, break-even at ~375 KB — and measures
+     the 1 KB case as underbilled 375×, so today the tax falls on the operator. A flag whose omission
+     costs the user nothing is a flag nobody sets.
 
 **Closed** since earlier drafts:
 
@@ -16357,3 +16376,121 @@ sizes ride along.
 sizes are "as-of" for a growing stream; the sync says as-of *what*: the last sweep. A growing
 stream's listed size is a day old, a sealed one's is exact, and nothing has to be asked at the moment
 a listing is rendered — which is the only way a `dir` over a million objects can be cheap.
+
+#### 17.25.5 ⚠️ §11's regimes break most of this, and they are expected rather than hypothetical
+
+**Bob, 2026-08-20**, on the four regimes of §11 as they will actually arrive:
+
+> *"Extremely small seal-after-append single-append objects will get inlined in the DN metadata, and
+> larger but still small ones will become a range offset in a common per-tenant SN stream. Append will
+> have a seal-after-append flag, and there will be a simplified user interface for giving an append
+> that creates and seals its own object. A second append to an open object triggers a dedicated SN
+> stream for that object even if the first append went to a common stream."*
+
+**§16.152 asked whether a shared stream's sizes mean anything for one object. This answers it: no, and
+it is not an edge case** — §11 calls lumping "the load-bearing case", the one that keeps stream counts
+proportional to bytes rather than to object count. So everything §17.25.1 stores is, for the regimes
+below, either absent or wrong.
+
+##### What each regime does to a per-stream size
+
+| Regime | What breaks |
+|---|---|
+| **Inline** | ⚠️ **there is no stream at all**, so there is no `Held` and nowhere for `created` or the sizes to live. And the sizes are *exact and free* here — the DN holds the records — so this regime wants them on the **object** record, not the stream one. |
+| **Lumped** | ⚠️ the object is a **range within** a shared stream, so the stream's totals overstate the object's size by the lumping factor — §13.1.3's expected case lumps ~128,000 objects into one stream, so a listing would report every one of them as **128,000× its true size**. |
+| **Packed** | the same, one tier down: a shared *extent* with a directory of its occupants |
+| **Dedicated** | the only regime §17.25.1 is actually correct for |
+
+> **So a size is a property of an object's *range*, not of the stream that range sits in.** That is the
+> shape the storage has to take, and `Held` as it stands cannot express it.
+
+##### And a third numbering space, which §17.16.2 has already been paid for once
+
+A lumped object's records sit at some **stream-local** offset that is not zero, while `Held` carries
+only `first_record`, the *object-local* number of the stream's first record — an encoding that assumes
+stream-local zero **is** the object's start. §17.16.2 is what happened the last time a conversion like
+that was skipped: 139 of 200 reads returned the wrong record, and it was invisible until the first
+seal because all three origins are zero while an object fits one extent. ⚠️ **A lumped object makes
+them differ from the first record written**, so the same bug would present immediately and everywhere
+rather than rarely.
+
+##### The one thing that gets *easier*
+
+**A seal-after-append object is exact from the moment it exists.** §17.25.4's staleness and #100's
+"a small object reads as 0 bytes until its first extent seals" both come from an object being open —
+and the two regimes where a small object's size matters most are precisely the two that **seal at
+creation**. So that gap narrows to objects that are *medium* (too big to lump, small enough to sit in
+one extent) and still being written, where *"so far"* is an honest thing to say.
+
+**And the flag is what makes the regimes decidable at all.** A DN cannot choose to inline or to lump
+unless it knows at append time that nothing more is coming — the decision is not reversible after the
+bytes have gone somewhere. So `seal-after-append` is not a convenience on the append path; it is the
+input the placement decision runs on, which is why the single-call create-append-seal interface and
+the small-object regimes are one feature and not two (§16.153).
+
+##### The regime is decided once, at the first append, by the seal flag alone
+
+⚠️ **An earlier draft of this section read promotion as a fork — span both streams, or move the first
+append. Neither** (Asserted, Bob, 2026-08-20):
+
+> *"Let's have inlining and range-of-common-stream both be only when the first append seals the
+> object. Then the rule of a dedicated stream on second append becomes a rule of dedicated stream if
+> the first append does not seal the object."*
+
+**So there is no promotion at all.** The decision is made at the first append, from one bit, and never
+revisited:
+
+| First append | Regime |
+|---|---|
+| **seals the object** | inline, or a range in a common stream, by size |
+| **does not seal it** | a dedicated stream |
+
+> **An object is therefore in exactly one regime for life, and the shared-range encoding never
+> coexists with a multi-stream object.** That is what the fork was really about, and it is settled in
+> the direction that keeps every case simple rather than the one that avoids a copy.
+
+##### Which unifies the numbering, rather than adding a space to it
+
+§17.25.5 above worried that a lumped object needs a stream-local base alongside `Held.first_record`'s
+object-local one. It does — but **never both at once**, and that collapses:
+
+| Regime | Conversion |
+|---|---|
+| dedicated, stream *i* | `object_local = stream_local + first_record[i]`, and the stream's own records start at 0 |
+| lumped | `object_local = stream_local − base`, and the object has exactly one stream, so its own records start at 0 |
+
+**One signed offset does both**, positive for a dedicated stream and negative for a lumped range. Not
+a third numbering space after all: the same conversion with a sign, which is §18.1's rule paying out —
+the two states were never independent, so `m + n` is one field rather than two.
+
+##### Three safety nets, so the flag is an optimization and not a correctness requirement
+
+**A user who does not set the flag must not lose data or waste disk**, and three things arrange that
+(Asserted, Bob, 2026-08-20):
+
+| | |
+|---|---|
+| **the EN packs tiny appends into a common extent regardless**, *"if the data gets that far"* | so there is **never** disk waste from missing the flag — the data placement is always right |
+| **the SN is strongly encouraged to rewrite small sealed objects** as inline or a common-stream range | so the metadata placement is right *eventually*, and the flag only makes it right *immediately* |
+| meanwhile the user **sees a stream + extent metadata tax** | which is what makes the flag worth setting |
+
+> **The layering is the design.** Data is placed correctly always; metadata correctly eventually; the
+> flag buys immediacy. Nothing about a missing flag is unrecoverable, which is what lets the fast path
+> be a hint rather than a contract.
+
+##### ⚠️ And the tax has to be billed, or nobody pays it
+
+**§12.2 has already priced this, and it says the tax does not currently exist.** A minimal stream is
+200 B of stream record plus a 100 B extent reference — **300 B of SN RAM**, and RAM against disk is
+~5,000, so **1.5 MB of disk-equivalent**. Break-even is a **~375 KB** payload.
+
+So a tiny object with a dedicated stream costs the operator more in metadata than in data, by a wide
+margin — and §12.2 measures the 1 KB case as **underbilled 375×**. ⚠️ **Today that is a cost to the
+operator and not a tax on the user**, which means the incentive to set the flag points the wrong way:
+the cheapest thing for the user is the ruinous one for the operator, which §12.2 already names as the
+workload pricing selects for.
+
+**Billing therefore has to charge for metadata records and not only for bytes**, which is a real
+addition to §17.25.2's model: physical bytes from the compressed length and the storage class are the
+*data* half, and a per-stream and per-extent charge is the other. Without it "users will see a
+metadata tax" is not true of anything the system computes (§16.153).
