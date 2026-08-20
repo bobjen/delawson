@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-137 things *not* decided.
+138 things *not* decided.
 
 **Priorities and framing**
 
@@ -295,6 +295,9 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | The key store is **append-only and never prunes**: pruning a key deletes a day's data irreversibly | §7.3.2.4 |
 | Ultimate recovery is **k-of-n shards** — surviving n−k losses and resisting k−1 colluders are the same knob, pulled opposite ways | §7.3.2.5 |
 | And **shards are never stored with the hardware**, which is the only thing separating owner-recovery from thief-recovery | §7.3.2.5 |
+| ⚠️ Automatic re-keying is a **key-extraction oracle** for physical access, and consensus cannot close it — membership speaks to identity, not integrity | §7.3.2.7 |
+| **Splitting the secret does not help**: a member that can do the job can leak the job, so an envelope just moves the problem | §7.3.2.7 |
+| The only structural fix is **threshold-sharing each master key across the ring**, affordable because KS is low-rate — undecided, §16.138 | §7.3.2.7 |
 | Index granularity is `latency × bandwidth / 2` — **1 MB HDD, 20 KB SSD**, in *physical* bytes | §7.1.1 |
 | Compression improves **HDD** read bandwidth and degrades **NVMe** read bandwidth; it is mandatory regardless | §7.1.2 |
 | **An extent has exactly one media class**, because compression block size is durable and EC needs identical bytes | §7.4.2 |
@@ -5779,9 +5782,12 @@ for it.
 
 ⚠️ **What that implies is worth stating rather than inferring: after the ceremony, the unlocking key —
 or something equivalent — is live in KS members' memory.** It has to be, or a quorum could not hand a
-returning member what it needs. That is the cost of rung one, and it is also what sets the real
-boundary further down the ladder: **the ceremony is needed when the key is in no memory anywhere**, not
-when quorum is lost.
+returning member what it needs. That is the cost of rung one, and it sets the real boundary further down
+the ladder: **the ceremony is needed when the key is in no memory anywhere**, not when quorum is lost.
+
+⚠️ **It is also an oracle.** Rung one hands keys to a machine on the strength of committed membership,
+which cannot speak to whether that machine's hardware was modified while it was down. §7.3.2.7 works
+through the attack, why splitting the secret does not help, and the one structural answer.
 
 ##### 7.3.2.2 Losing quorum need not need people, and the reason is that quorums intersect
 
@@ -5900,6 +5906,70 @@ serve the machine list and ring membership while the key custodians are still tr
 So the slowest rung overlaps with useful work — rings can re-form and the cluster can establish what
 exists — and only operations that genuinely need plaintext wait. With one undivided encrypted store,
 every recovery step would queue behind a journey.
+
+##### 7.3.2.7 A tampered member is a key-extraction oracle
+
+⚠️ **Rung one is an oracle for anyone with physical access** (Asserted, Bob, 2026-08-19): take a member
+down, modify its hardware to leak what it is given, bring it back up, and the ring re-keys it
+automatically, because committed membership says it belongs. Saying so plainly is better than implying
+the ladder is airtight.
+
+**Why consensus cannot close it.** Committed membership answers *is this machine a member*. It cannot
+answer *has this machine been tampered with*, and no amount of agreement makes it able to — the ring's
+knowledge is of identity, and the attack is on the integrity of something the ring cannot observe. Rung
+one exists so a routine reboot needs no human, and from the ring's side a routine reboot and a
+malicious one are the same event.
+
+⚠️ **And splitting the secret does not help, which is worth recording because it is the obvious first
+idea** (Asserted, Bob, 2026-08-19). The tempting move is an envelope: keep the unlocking key for the
+ceremony only, wrap a store key with it, and hand a returning member less than the root. It fails,
+because a KS member writes a new master key every day and therefore needs the store key to function —
+so the store key becomes an equal problem, and the exchange buys almost nothing.
+
+The general form is the useful statement, and it applies to any variant of the idea:
+
+> **A member that can do the job can leak the job.** There is no credential that lets a machine serve
+> master keys without being able to exfiltrate them, so partitioning *what protects* the secret cannot
+> reduce what a functioning member must hold.
+
+**So the only structural fix is to make no single member hold anything usable**, and that is threshold
+cryptography rather than key management: **share each master key across the ring so that serving one
+requires k members to cooperate**, and no member ever assembles a whole key.
+
+| | One tampered member leaks |
+|---|---|
+| today's design | **every master key in existence** |
+| threshold-shared | **one share**, which is nothing. It takes k tampered members |
+
+**It is the same primitive as §7.3.2.5's k-of-n shards, applied to the running system rather than only
+to disaster recovery** — and the two would want the same k, since they are answering the same question
+about how many custodians can be compromised at once.
+
+**And it is affordable here specifically because KS is a low-rate component.** A key fetch is once per
+SN per day per EN (§7.3.1), not per request, so multiplying each fetch by k participants costs messages
+in a place with no throughput requirement. This is the same argument §7.2.1 uses about encryption being
+free where compression is not: the cost lands where there is room for it.
+
+⚠️ **What it costs is complexity in the component that must never be wrong**, and that is a serious
+objection rather than a footnote. Threshold schemes have subtle failure modes, KS is the root of trust,
+and a bug there is unrecoverable in a way a bug elsewhere is not. §16.138 holds the decision.
+
+**If threshold is not taken, this is an accepted risk and should be named as one**: an attacker with
+physical access to one KS machine, the ability to modify it below the attestation boundary, and the
+patience to let it be re-admitted, obtains every master key and therefore every byte in the cluster.
+Three things narrow it without closing it, and none is cryptographic:
+
+- **Attestation** forces the attacker below the measured boundary — from soldering a wire onto a
+  working machine to defeating the boot chain or tapping the memory bus. Not a new component: §1.5
+  already makes code signing load-bearing, #23 records it as unspecified, and §16.137's machine
+  identity is the same question. A TPM measures code and not the bus, so DMA interposers and cold-boot
+  attacks survive it.
+- **Loud re-keying.** A re-key cannot be refused, since reboots are routine, but every one can be
+  logged with the member, how long it was absent, and its attestation — turning a silent compromise
+  into one with a record.
+- **An absence threshold.** A member gone longer than some period, or whose attestation changed, goes
+  to the ceremony rather than being re-keyed automatically. That prices the attack in availability
+  instead of closing it, and it is a policy knob rather than a mechanism.
 
 #### 7.3.3 What the extent entry must record
 
@@ -12308,6 +12378,16 @@ Roughly in order of how much else depends on them.
      the encrypted half of KS's own state. §5.5.6.3's signed half is the right home, and §1.5's code
      signing is adjacent and equally unspecified (#23), but nothing says whether identity is a per-machine
      keypair, hardware-backed attestation, or something issued at provisioning.
+
+138. **Whether master keys are threshold-shared across the KS ring** (§7.3.2.7). It is the only
+     structural answer to a tampered member being re-keyed automatically: shared k-of-n across members,
+     one compromised machine leaks a share rather than every key. Affordable, because a key fetch is once
+     per SN per day per EN (§7.3.1) rather than per request, so multiplying it by k participants costs
+     messages where there is no throughput requirement — and it would want the same k as §7.3.2.5's
+     recovery shards, since both ask how many custodians can be compromised at once. ⚠️ Against it: it
+     puts subtle machinery in the component that must never be wrong, where a bug is unrecoverable in a
+     way a bug elsewhere is not. If it is declined, §7.3.2.7's attack is an accepted risk whose controls
+     are physical security, attestation and audit — none of them cryptographic.
 
 **Closed** since earlier drafts:
 

@@ -434,6 +434,17 @@ broken by a convenience later, so it wants a check rather than a comment
 brute-force oracle** against anything a human composed. Harmless against 256 random bits; the whole
 attack against a passphrase.
 
+**`A-MEMBER-THAT-CAN-SERVE-CAN-LEAK`** — no credential lets a machine serve master keys without being
+able to exfiltrate them, so protecting the secret differently cannot reduce what a functioning member
+holds.
+*Argued* §7.3.2.7 · *Enforced* nothing enforces it — it is a **limit**, listed so that designs are
+checked against it · *Checked* by argument: any proposal that hands a member less must be tested against
+what the member has to do
+*Breaks* nothing directly. It is here because it kills a whole family of tempting fixes — the envelope
+that keeps the unlocking key for the ceremony and hands over a store key instead was one, and it fails
+because a member writes a new master key daily and therefore needs the store key. The only escape is
+threshold sharing, so that no member holds anything usable (§16.138).
+
 **`SHARDS-ARE-NOT-STORED-WITH-THE-HARDWARE`** — the k-of-n shards of the unlocking key live apart from
 the machines, in separate places and under separate credentials.
 *Argued* §7.3.2.5 · *Enforced* nothing can enforce it — it is operational, and listed here **because**
