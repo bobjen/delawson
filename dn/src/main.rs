@@ -16,7 +16,7 @@
 
 use common::config::{DNConfig, ServiceKind};
 use common::framing::Framing;
-use common::info::{Described, ExtentRow, ExtentRun, Listing, Shape, StreamRow, UNKNOWN};
+use common::info::{Batch, Described, ExtentRow, ExtentRun, Listing, Shape, StreamRow, UNKNOWN};
 use common::logw;
 use common::range::{Detail, Want};
 use common::server::{self, Process, Reply, Service};
@@ -57,16 +57,24 @@ const SHARDS: usize = 64;
 const ANSWERS: u64 =
     Detail::Streams.bit() | Detail::Counts.bit() | Detail::Extents.bit() | Detail::Instances.bit();
 
+/// And what a *batch* answers, which is less.
+///
+/// ⚠️ **Extents are missing on purpose rather than by oversight.** One object's extents cost one ask per
+/// SN (§17.22); a batch of a thousand names would want them grouped across *every* object at once, which
+/// is the same gather over a wider set. Until that exists a batch says so by name, because an answer
+/// that quietly dropped the level asked for is the failure §17's rule exists to prevent.
+const BATCH_ANSWERS: u64 = Detail::Streams.bit() | Detail::Counts.bit();
+
 /// What a lookup wants, and a refusal naming the parts of it this build cannot supply.
 ///
 /// **A request with no want field is `Want::plain()`**, which is exactly today's answer — so every
 /// caller that predates the field keeps working and keeps costing what it cost (§9.1.3.11).
-fn wanted(args: &[Arg]) -> Result<Want> {
+fn wanted(args: &[Arg], answers: u64) -> Result<Want> {
     let want = match args {
         [] => Want::plain(),
         _ => Want::of_args(args)?.0,
     };
-    let beyond = want.beyond(ANSWERS);
+    let beyond = want.beyond(answers);
     if !beyond.is_empty() {
         return Err(Error::new(format!("object-info cannot yet return {}", beyond.join(", "))));
     }
@@ -797,7 +805,7 @@ impl DN {
         // `locate-stream` puts a record number where a want field would be, and it asks for
         // nothing beyond the stream holding it, so it is not read here.
         let rest = if record.is_some() { &rest[1..] } else { rest };
-        let want = match wanted(rest) {
+        let want = match wanted(rest, ANSWERS) {
             Ok(want) => want,
             Err(e) => return reply.send(Response::error(Status::Unimplemented, e.to_string())),
         };
@@ -926,18 +934,33 @@ impl DN {
         }
     }
 
-    /// One answer for many names, in the order asked. A name that is not there
-    /// gets a zero id, so the answer lines up with the question without saying
-    /// which was missing twice.
+    /// One answer for many names, in the order asked, up to the entry limit.
+    ///
+    /// **A name that is not there still occupies a row**, with a zero id, so that the rows a caller
+    /// gets line up with the names it asked about — but the answer no longer relies on that alone:
+    /// it leads with a `Batch` header saying **how many names it covered** (§9.1.3.7).
+    ///
+    /// ⚠️ **It stops at a name boundary, always.** §9.1.3.7 permits stopping mid-object only when one
+    /// object alone exceeds the limit, and at the levels a batch answers today an object is one entry —
+    /// so that case cannot arise and every answer is a **prefix** of the request. Which is what makes
+    /// the continuation an index: the caller slices its own list and asks again.
     fn info_many(&self, request: &Request) -> Response {
         // The names, then one want field for all of them — a batch asks the same question about
         // every name, so carrying it per name would repeat it a thousand times (§9.1.3.11).
         let names = request.args.iter().position(|arg| !matches!(arg, Arg::Text(_)));
         let (names, rest) = request.args.split_at(names.unwrap_or(request.args.len()));
-        if let Err(e) = wanted(rest) {
-            return Response::error(Status::Unimplemented, e.to_string());
-        }
+        let want = match wanted(rest, BATCH_ANSWERS) {
+            Ok(want) => want,
+            Err(e) => return Response::error(Status::Unimplemented, e.to_string()),
+        };
+        let limit = match want.limit {
+            0 => self.config.info_entries,
+            asked => asked.min(self.config.info_entries),
+        };
+
         let mut args = Vec::with_capacity(names.len() * Described::ARGS);
+        let mut spent = 0;
+        let mut given = 0;
         for asked in names {
             let name = match asked {
                 Arg::Text(name) => name.as_str(),
@@ -945,12 +968,52 @@ impl DN {
                     return Response::error(Status::BadRequest, "batch-object-info takes names");
                 }
             };
-            match self.look(name) {
-                Some(found) => args.extend(found),
-                None => args.extend(Described::missing()),
+            // What this name will cost, before committing to it: an object, plus its streams if
+            // they were asked for. ⚠️ Measured first so the answer never overruns the limit — the
+            // §17.22.2 bug was spending a cap and then spending it again.
+            let piece = self.piece(name, &want, limit.saturating_sub(spent));
+            let cost = piece.as_ref().map_or(1, |(entries, _)| *entries);
+            if given > 0 && spent + cost > limit {
+                break;
             }
+            match piece {
+                Some((entries, mut of)) => {
+                    spent += entries;
+                    args.append(&mut of);
+                }
+                None => {
+                    spent += 1;
+                    args.extend(Described::missing());
+                }
+            }
+            given += 1;
         }
-        Response { id: 0, status: Status::Ok, args }
+
+        let covered = Batch {
+            asked: names.len() as u64,
+            given,
+            entries: spent,
+            next: if given as usize == names.len() { UNKNOWN } else { given },
+        };
+        let mut out = covered.args();
+        out.append(&mut args);
+        Response { id: 0, status: Status::Ok, args: out }
+    }
+
+    /// One name's worth of a batch answer, and what it costs in entries.
+    ///
+    /// ⚠️ **Takes the name's shard lock** — see `look`.
+    fn piece(&self, name: &str, want: &Want, room: u64) -> Option<(u64, Vec<Arg>)> {
+        let shard = self.shards[shard_of(name)].lock().expect("objects");
+        let object = shard.get(name)?;
+        if want.detail == 0 {
+            return object.args(None).map(|args| (1, args));
+        }
+        // Room is what the limit has left, and an object costs at least its own entry, so a name
+        // reached with no room to spare still gets its row and no streams.
+        let levelled = detailed(object, want, room.max(1))?;
+        let entries = levelled.shape.entries;
+        Some((entries, levelled.args(HashMap::new())))
     }
 
     /// What an object is: id, stream, the SN holding it, the second it was made,
@@ -1249,6 +1312,126 @@ mod tests {
         assert_eq!((shape.streams, shape.given, shape.entries), (3, 0, 1));
         assert!(rows.is_empty());
         assert!(!shape.more(), "nothing was asked to be described, so nothing follows");
+    }
+
+    /// A DN holding `count` objects named `/n0`, `/n1`, and so on.
+    fn with_objects(count: u64) -> Arc<DN> {
+        let dn = Arc::new(DN::new(testing::dn_config()));
+        for n in 0..count {
+            let name = format!("/n{n}");
+            dn.shards[shard_of(&name)].lock().unwrap().insert(
+                Box::from(name.as_str()),
+                Object {
+                    id: n + 1,
+                    framing: Framing::Lf,
+                    streams: vec![Held { id: n + 1, sn: 0, first_record: 0, records: None }],
+                    extending: false,
+                    waiting: Vec::new(),
+                    keyed: false,
+                    created: 1_000_000,
+                },
+            );
+        }
+        dn
+    }
+
+    fn batch_of(dn: &Arc<DN>, names: &[&str], want: Option<Want>) -> Response {
+        let mut request = Request::new(Op::BatchInfo);
+        for name in names {
+            request = request.text(*name);
+        }
+        if let Some(want) = want {
+            request.args.extend(want.args());
+        }
+        dn.info_many(&request)
+    }
+
+    /// The limit stops a batch at a **name boundary**, and the answer says how many names it
+    /// covered rather than leaving a caller to count rows against its question.
+    #[test]
+    fn a_batch_stops_at_a_name_and_says_where() {
+        // The test config allows 8 entries, so 8 of ten names at one entry each.
+        let dn = with_objects(10);
+        let names: Vec<String> = (0..10).map(|n| format!("/n{n}")).collect();
+        let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+        let answer = batch_of(&dn, &borrowed, None);
+        assert_eq!(answer.status, Status::Ok);
+
+        let (covered, rest) = Batch::of_args(&answer.args).expect("a batch header");
+        assert_eq!(covered.asked, 10);
+        assert_eq!(covered.given, 8, "the configured limit, spent one per object");
+        assert_eq!(covered.entries, 8);
+        assert_eq!(covered.next, 8, "so the caller asks about its own names from index 8");
+        assert!(covered.more());
+        let rows = Described::all_of_args(rest).expect("rows");
+        assert_eq!(rows.len(), 8, "and the rows match what it said");
+        assert!(rows.iter().all(Option::is_some));
+    }
+
+    /// A batch that fits says so, and its continuation is UNKNOWN rather than one past the end.
+    #[test]
+    fn a_batch_that_fits_says_there_is_no_more() {
+        let dn = with_objects(3);
+        let answer = batch_of(&dn, &["/n0", "/n1", "/n2"], None);
+        let (covered, rest) = Batch::of_args(&answer.args).expect("a batch header");
+        assert_eq!((covered.asked, covered.given, covered.next), (3, 3, UNKNOWN));
+        assert!(!covered.more());
+        assert_eq!(Described::all_of_args(rest).expect("rows").len(), 3);
+    }
+
+    /// A name nobody took still occupies a row, so rows line up with names — and it costs an
+    /// entry, since the answer carried it.
+    #[test]
+    fn a_missing_name_costs_a_row_and_an_entry() {
+        let dn = with_objects(2);
+        let answer = batch_of(&dn, &["/n0", "/nothing", "/n1"], None);
+        let (covered, rest) = Batch::of_args(&answer.args).expect("a batch header");
+        assert_eq!((covered.given, covered.entries), (3, 3));
+        let rows = Described::all_of_args(rest).expect("rows");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1], None, "the gap, in its place");
+        assert_eq!(rows.iter().flatten().count(), 2);
+    }
+
+    /// Asking for streams makes each name cost more than one entry, so fewer names fit — which
+    /// is the limit being one number over the whole answer rather than a count of objects.
+    #[test]
+    fn detail_makes_a_name_cost_more_so_fewer_fit() {
+        let dn = with_objects(10);
+        let names: Vec<String> = (0..10).map(|n| format!("/n{n}")).collect();
+        let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+        let want = Want::plain().with(Detail::Streams).with(Detail::Counts);
+        let answer = batch_of(&dn, &borrowed, Some(want));
+        let (covered, _) = Batch::of_args(&answer.args).expect("a batch header");
+        assert_eq!(covered.given, 4, "an object plus its one stream, so two entries each");
+        assert_eq!(covered.entries, 8, "and the limit is what bounds it");
+        assert!(covered.more());
+    }
+
+    /// ⚠️ At least one name is always described, even when it alone exceeds the limit — or a
+    /// caller with a small cap makes no progress and retries for ever (§9.1.3.6's rule, on the
+    /// other level).
+    #[test]
+    fn one_name_always_comes_back() {
+        let dn = with_objects(3);
+        let want = Want { limit: 1, ..Want::plain().with(Detail::Streams) };
+        let answer = batch_of(&dn, &["/n0", "/n1", "/n2"], Some(want));
+        let (covered, _) = Batch::of_args(&answer.args).expect("a batch header");
+        assert_eq!(covered.given, 1, "one name, whatever it cost");
+        assert_eq!(covered.next, 1, "and the caller carries on from the next");
+    }
+
+    /// A batch cannot fan out for extents yet, and says which level it cannot give rather than
+    /// answering without it.
+    #[test]
+    fn a_batch_refuses_extents_by_name() {
+        let dn = with_objects(1);
+        let want = Want::plain().with(Detail::Extents);
+        let answer = batch_of(&dn, &["/n0"], Some(want));
+        assert_eq!(answer.status, Status::Unimplemented);
+        let said = answer.message().unwrap_or_default();
+        assert!(said.contains("extents"), "{said}");
+        assert!(!said.contains("streams"), "streams it can do: {said}");
     }
 
     /// A create carries a name, a flavour and a framing, and anything after those is

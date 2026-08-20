@@ -14,7 +14,7 @@ use common::block::{Holds, expand, squeeze};
 use common::config::Compress;
 use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
-use common::info::{Described, ExtentRow, Shape, StreamRow, UNKNOWN};
+use common::info::{Batch, Described, ExtentRow, Shape, StreamRow, UNKNOWN};
 use common::placement;
 use common::random::Rng;
 use common::range::{Budget, Covered, Detail, Piece, Range, Start, Want};
@@ -1061,7 +1061,14 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
                     // and that is not a failure — it is what looking up a name nobody
                     // took looks like, and it is worth measuring on purpose.
                     if answer.status == Status::Ok {
-                        found += Described::all_of_args(&answer.args)?
+                        // A batch answer leads with what it covered; a single one is a bare row
+                        // (§9.1.3.7). Which it is follows from what was asked, not from guessing.
+                        let rows = if batch == 1 {
+                            &answer.args[..]
+                        } else {
+                            Batch::of_args(&answer.args)?.1
+                        };
+                        found += Described::all_of_args(rows)?
                             .iter()
                             .filter(|row| row.is_some())
                             .count() as u64;

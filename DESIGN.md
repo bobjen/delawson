@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-148 things *not* decided.
+150 things *not* decided.
 
 **Priorities and framing**
 
@@ -390,6 +390,14 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | The birthday bound does not apply, since the attacker needs **one particular** extent — so 8 bytes would be sound | §9.1.3.5.4 |
 | A budget is in **records, logical bytes or compressed bytes** — one named, all three reported; **one block always returns**, even past it | §9.1.3.6 |
 | `object-info` is **extended, not replaced**, and bounded by **one entry limit** over objects + streams + extents (default **10,000**) | §9.1.3.7 |
+| A batch answer leads with a **header**, and its continuation is an **index** — the caller already holds the list | §17.23 |
+| It measures a name's cost **before** committing, stops at a **name boundary**, and always returns **at least one** | §17.23.1 |
+| ⚠️ A batch **spans DNs**, so asking all of them for everything wastes up to **D times** the work — and wastes the expensive part | §9.1.3.12 |
+| A batch is an **explicit list**, so routing is free and needs no round trip; what the FE lacks is each name's **cost** | §9.1.3.12, §9.1.3.1 |
+| So: full ask to one DN, a **per-object summary** to the rest — one row per name, fixed work, no SN hop | §9.1.3.12 |
+| That summary gives the **exact object count** elsewhere, and the first DN gets **limit − that count** | §9.1.3.12 |
+| The detailed ask goes to the DN holding the **earliest names**, because the answer must be a prefix in the *caller's* order | §9.1.3.12 |
+| It also tells a caller enough to **parallelize the rest itself**, which is §9.1.3.2's shape one level out | §9.1.3.12, §9.1.3.2 |
 | **HDFS scans** its block list to find an offset — 2 × 10^9 blocks at 256 PB, the same number §14.1 reaches | §9.1.3.8 |
 | Which is §4.5's rule with the counterfactual attached: locating by **record** is a descent, locating by **byte** is a walk | §9.1.3.8, §4.5 |
 | **Streams carry flags**, and `updatable` is one — a *declared* guarantee, not an observed one | §9.1.3.9 |
@@ -9667,6 +9675,85 @@ the answer lines up positionally with the request (§17.12). Once an answer may 
 no longer enough — it has to say **how many of the names it covered**, and a caller reading it the
 old way would silently attribute one object's metadata to a different name.
 
+#### 9.1.3.12 A batch spans DNs, and a one-entry summary is what bounds the first one's budget
+
+⚠️ **A batch of names is not one DN's business** (Asserted, Bob, 2026-08-19). Names route to DNs by the
+namespace partition (§5.5.1, §5.11.3), so a thousand names can touch many — and §17.23's implementation
+asks exactly one, which a single-DN test cluster hides completely.
+
+**But note what a batch is not** (Asserted, Bob, 2026-08-20): *"there may eventually be a command that
+does an objectinfo of everything in a directory, but BatchObjectInfo is not it."* A batch carries an
+**explicit list** of names, optionally a range per name. So the FE does **not** have to discover which
+names exist or where they live — it holds the list and the partition map, and groups them by DN with no
+round trip at all (§16.150 for the directory-wide command, which is a different problem).
+
+> **What the FE does not know is what each name will *cost*.** §9.1.3.1: a batch cannot be pre-sliced
+> because the answer size per object is the thing being asked about. Routing is free; **budgeting is not**.
+
+**Three ways to spend one entry limit (§9.1.3.7) across D DNs:**
+
+| | Cost |
+|---|---|
+| **serially**, DN after DN | slow — a round trip per DN, §9.1.3.1's serial chain one level up |
+| **in parallel**, each asked for everything | ⚠️ up to **D times too much work**, and all but one answer's worth is discarded — and the discarded part is the *expensive* part, since extents cost an SN hop each (§17.22) |
+| **asymmetrically** — the full ask to one, a **per-object summary** to the rest | one round trip, and the others' work is fixed at one row per name |
+
+##### The cheap tier is a per-object summary — not a stream list
+
+⚠️ **My first draft of this had the later DNs return their stream lists, and that is more than is needed**
+(Asserted, Bob, 2026-08-20): *"ask later DNs for only a per-object summary, not even their lists of
+streams."*
+
+**Which is better on both sides of the trade:**
+
+- **The work is fixed, not variable.** A stream list is per-object variable-length; a summary is one row.
+  A DN with a thousand names in the batch does a thousand table lookups and stops, with no SN hop
+  (§17.20) and no per-object fan-out (§17.22).
+- **It is exactly what the budget needs.** Every name the answer covers costs **at least** its own object
+  row — one entry, by §9.1.3.7's accounting over objects + streams + extents. So the summary yields the
+  **exact count of objects the later DNs contribute**, and:
+
+> **the first DN is given the limit *minus* that count.** It cannot then expand streams and extents so
+> greedily that there is no room left for the later DNs' rows.
+
+**And the reservation errs in the recoverable direction.** One entry per name is a *lower* bound on that
+name's cost, so subtracting it can leave the first DN a smaller budget than it could have used — never a
+larger one. **Under-spending is fixable in a second round; over-spending is not**, because the only way
+back from an over-full answer is to throw work away. If the first DN does not fill `limit − count`, ask
+again with detail.
+
+##### Why the first DN is the one holding the earliest names
+
+**Because §9.1.3.7 makes the answer a prefix of the request and the continuation an index**, which is what
+lets a caller slice its own list. ⚠️ **A prefix in the caller's order is not a prefix in any DN's order**:
+if names 1, 3, 5 live on one DN and 2, 4, 6 on another, filling greedily from the first alone yields
+1, 3, 5 — not a prefix of anything, and not describable by an index. So the detailed ask goes to whichever
+DN owns the earliest names, and the quota is spent in the caller's order.
+
+##### And even if it stops there, the caller can finish the job itself
+
+**The most useful thing about the cheap round trip is what it tells the caller** (Asserted, Bob,
+2026-08-19): *"even if this doesn't need to go on to other DNs, it tells the user enough information for
+them to be able to parallelize fetching the remaining batch infos themselves."*
+
+That is §9.1.3.2's shape — **one round trip to learn the shape, then everything else at once** — arriving
+one level out. §9.1.3.2 applies it within an object's answer, using exact counts so a caller can compute
+its remaining requests by arithmetic. This applies it *across* a batch: the summaries say which names
+exist and what each will cost, so a caller can slice the rest into requests that will each fit and issue
+them all together.
+
+⚠️ **Which raises the question of whether the FE should do the asymmetric fan-out at all.** Two answers,
+and they are not exclusive:
+
+| | Suits |
+|---|---|
+| the **FE** does it | a caller that wants one request and one answer, and does not want to know about DNs |
+| the **caller** does it, from the summaries | a caller with many batches in flight, which can pipeline across them — and it has the context to order the work, which the FE does not |
+
+**§9.1.3.1 already found that batch lookups cannot be pre-sliced** because the answer size per object is
+the thing being asked about. **The counts are what removes that**, and they remove it for the caller as
+well as for the FE — so the second row may be sufficient and the first is a convenience (§16.149).
+
 #### 9.1.3.8 Prior art: HDFS supports 256 PB files and scans to find an offset
 
 **HDFS supports files up to about 256 PB, and reportedly finds the block containing a byte offset by
@@ -13836,6 +13923,20 @@ Roughly in order of how much else depends on them.
      resolution is a scoped answer — the canonical path as far as your own grants reach, and told that it
      continues — but that is a guess, and the leak is the reason to settle it before building it.
 
+149. **Whether the FE assembles a multi-DN batch, or the caller does** (§9.1.3.12, §9.1.3.2). The cheap
+     round trip that §9.1.3.12 needs anyway produces exact counts for every name, and those let **either**
+     party slice the remainder into requests that will each fit. The FE doing it suits a caller that wants
+     one request and one answer; the caller doing it suits one with many batches in flight, which can
+     pipeline across them and has the context to order the work. ⚠️ Note §9.1.3.1 named this as a problem
+     with no fix — batch lookups cannot be pre-sliced because the answer size per object is what is being
+     asked about — and the counts are the fix, for whichever party holds them. So the question is only who
+     is served, not whether it can be done.
+
+150. **A directory-wide object-info, which BatchObjectInfo is not** (§9.1.3.12). A batch carries an explicit
+     list; enumerating a directory instead discovers names as it goes, so it cannot route or budget up
+     front the way §9.1.3.12 does, and it inherits §5.1.1.1a's alias questions about what "everything in
+     a directory" even means. Bob expects such a command eventually; it is not this one.
+
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
@@ -15874,3 +15975,56 @@ Measured on the single-box cluster, 1,501 records over two streams and five exte
 every extent carries the whole name — `(SnId, ExtentId, creation second)` — plus its instances, which is
 what #61 asked for. **What is still missing from a usable hint is the capability** (#78), waiting on
 #82's key.
+
+### 17.23 The batch limit measures the cost of a name before it commits to it
+
+**Built for #80's second half.** §9.1.3.7's entry limit applies to `BatchObjectInfo` as much as to
+`ObjectInfo`, but the batch has an extra property to preserve: the answer must stay readable positionally
+(§17.12 padded a missing name with zeros so it did), and a truncated answer cannot.
+
+**So the answer leads with a header** — `info::Batch { asked, given, entries, next }`. `asked` and `given`
+are the name counts, `entries` the entries spent, and `next` is an **index, not a name**, because the
+caller already holds the list. A caller resumes by slicing its own request.
+
+#### 17.23.1 Measure, then commit — not the other way around
+
+⚠️ **§17.22.2's bug was spending the limit twice**: the DN charged itself for the object and its streams
+and then handed the *whole* cap to the SNs. The batch loop is the same shape one level up, and it avoids
+the bug by construction:
+
+```
+for each name:
+    (entries, args) = piece(name)      // what this name would cost
+    if committed > 0 and committed + entries > limit: stop here
+    commit it
+```
+
+**Two rules make that correct.** It stops **at a name boundary**, never inside one, so the answer stays a
+prefix (`A-BATCH-ANSWER-IS-A-PREFIX`). And it **always returns at least one name** even if that name alone
+exceeds the limit — the same rule as `ONE-BLOCK-ALWAYS-RETURNS` (§8.1.5) and for the same reason: a limit
+that can return nothing is a limit that can make forward progress impossible.
+
+#### 17.23.2 A batch answers the cheap levels only
+
+`BATCH_ANSWERS` is `Streams | Counts`, against `ANSWERS`' `Streams | Counts | Extents | Instances` for
+the single case. Asking a batch for extents is `Unimplemented` rather than silently ignored, because
+§9.1.3.12's fan-out is what makes extents affordable in a batch and it is not built (#96).
+
+#### 17.23.3 ⚠️ The benchmark now measures truncation, not lookup
+
+Live on a release cluster with `info_entries = 6`:
+
+| | |
+|---|---|
+| `bench-create --objects 2000 --batch 100` | 210,758/s |
+| `bench-info --batch 100` | 2,464,449/s, **295,770 found of 4,929,500** |
+| `bench-info --batch 1` | 43,978/s, 87,963 found |
+
+**That 6.0% is exactly 6/100** — the limit truncating every batch of 100 to six names. The limit is working
+as designed and the number is nonetheless a trap twice over:
+
+- **`bench-info` counts names *asked*, not names *answered*.** The rate is 2.5M/s of *asking*, which is a
+  57× "speedup" over `--batch 1` bought almost entirely by not doing the work (#97).
+- **Any batch benchmark is meaningless unless the limit exceeds the batch size**, which now includes #79's
+  re-measurement and #88's cross-session variance work. §17.19.2 already required both arms in one session
+  for the ±25% reason; they also need a limit large enough to reach the object.

@@ -215,6 +215,22 @@ signal rather than a state to tolerate.
 *Argued* §12.6.4 · *Enforced* design only · *Checked* the billing sweep detects it for free
 *Breaks* real cost accrues that nobody is charged for, and silently.
 
+**`A-BATCH-ANSWER-IS-A-PREFIX`** — a batch answer covers names 0..k of the request in the caller's
+order and says k, so a short answer is never a hole.
+*Argued* §9.1.3.7, §9.1.3.12 · *Enforced* `dn::info_many` stops at a name boundary and leads with
+`info::Batch` · *Checked* unit test
+*Breaks* the continuation cannot be an index, and §17.12's positional reading silently attributes one
+object's metadata to a different name. It is also what forces §9.1.3.12's detailed ask to go to the DN
+holding the *earliest* names: a prefix in the caller's order is not a prefix in any one DN's order.
+
+**`A-NAME-COSTS-AT-LEAST-ONE-ENTRY`** — every name a batch answer covers spends at least its own
+object row against the entry limit.
+*Argued* §9.1.3.12, §9.1.3.7 · *Enforced* design only; the multi-DN fan-out is not built · *Checked*
+not yet
+*Breaks* §9.1.3.12's budget reservation. It is the whole reason a one-row summary from the other DNs
+is enough to bound the first DN's share: the bound is a *lower* bound on their cost, so subtracting it
+can only under-spend, and under-spending is recoverable in a second round where over-spending is not.
+
 ## The append path
 
 **`APPLIED-IS-A-PREFIX`** — an append is applied on a machine only once every append before it is
@@ -829,6 +845,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **placement** | §5.6 | `PLACEMENT-NEVER-REVISITED`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `NESTED-NOT-ORTHOGONAL-DOMAINS`, `SOLVER-TIMEOUT-DEFERS-NEVER-DROPS`, `UNENFORCEABLE-RULE-NOT-ENFORCED`, `NO-DATA-MOVEMENT-EXCEPT-RANGE-SPLIT` |
 | **primary** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `TRUNCATION-SEALS` |
 | **quorum** | §8.1.1 | `QUORUM-OVERLAPS`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `UNAPPENDABLE-EXTENT-SEALS`, `SELF-SEAL-MARK-IS-DURABLE` |
+| **batch** | §9.1.3.7 | `A-BATCH-ANSWER-IS-A-PREFIX`, `A-NAME-COSTS-AT-LEAST-ONE-ENTRY` |
 | **record** | §8.2 | `EXTENT-HOLDS-WHOLE-RECORDS`, `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `INCOMPLETE-RECORD-NOT-DURABLE`, `RECORD-FITS-ONE-EXTENT`, `TERMINATOR-NOT-IN-DATA`, `OFFSET-SNAPS-FORWARD`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `EXTENT-SEALS-BETWEEN-RECORDS`, `RANGE-ENDS-ON-A-RECORD-BOUNDARY` |
 | **record number** | §3 | `RECORD-NUMBER-STABLE`, `RECORD-NUMBERS-DENSE`, `UNKEYED-COUNT-EXACT`, `UPDATE-DELETE-PRESERVE-COUNTS`, `PATH-IS-THE-PORTABLE-NAME`, `SPACES-ARE-TYPES-WHEN-A-MIX-UP-IS-SILENT` |
 | **reference** | §4.6 | `NO-CLUSTER-NAMES-IN-DATA-PLANE`, `REVERSE-EDGE-IS-A-COUNT`, `COUNTS-ARE-RECOMPUTABLE`, `ZERO-REFERENCES-IS-A-BUG`, `POSITION-FACTS-IN-REFERRER`, `REVENUE-INVARIANT-UNDER-REGROUPING` |

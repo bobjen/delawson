@@ -371,6 +371,58 @@ impl ExtentRow {
     }
 }
 
+/// What a batch answer covered, and where to carry on.
+///
+/// ⚠️ **This replaces lining up by position** (§9.1.3.7). The old answer padded a missing
+/// name with a zero-id row so that the *n*th row was the *n*th name; once an answer may
+/// stop early, position is not enough, and a caller reading it the old way would
+/// silently attribute one object's metadata to a different name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Batch {
+    /// Names the request held.
+    pub asked: u64,
+    /// Names described. **Always a prefix of the request**, so what is missing is a
+    /// suffix and the caller need only slice its own list.
+    pub given: u64,
+    /// Entries the whole answer spent, against the limit (§9.1.3.7).
+    pub entries: u64,
+    /// Index of the first name not described, or `UNKNOWN` when all were.
+    ///
+    /// **An index rather than a name**, because the caller already holds the list and an
+    /// index is what it needs to slice it — and because a name would have to be repeated
+    /// in an answer that is trying to be smaller.
+    pub next: u64,
+}
+
+impl Batch {
+    pub fn args(&self) -> Vec<Arg> {
+        vec![
+            Arg::Number(self.asked),
+            Arg::Number(self.given),
+            Arg::Number(self.entries),
+            Arg::Number(self.next),
+        ]
+    }
+
+    pub fn of_args(args: &[Arg]) -> Result<(Batch, &[Arg])> {
+        let [
+            Arg::Number(asked),
+            Arg::Number(given),
+            Arg::Number(entries),
+            Arg::Number(next),
+            rest @ ..,
+        ] = args
+        else {
+            return Err(Error::new("that batch answer did not say what it covered"));
+        };
+        Ok((Batch { asked: *asked, given: *given, entries: *entries, next: *next }, rest))
+    }
+
+    pub fn more(&self) -> bool {
+        self.next != UNKNOWN
+    }
+}
+
 /// Several streams to describe in one ask, which is what makes `batch-object-info`
 /// batch all the way down.
 ///
