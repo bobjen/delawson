@@ -284,7 +284,7 @@ impl Detail {
         Detail::Flags,
     ];
 
-    pub fn bit(self) -> u64 {
+    pub const fn bit(self) -> u64 {
         self as u64
     }
 

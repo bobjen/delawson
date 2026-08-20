@@ -579,6 +579,12 @@ pub struct DNConfig {
     /// held outside the object hierarchy. Nothing reads this yet; it is here so
     /// the file exists where the decision will land.
     pub self_hosted: bool,
+    /// The most entries — objects plus streams plus extents — one `object-info`
+    /// answer may carry (§9.1.3.7). **One number over all three kinds**, because what
+    /// has to be bounded is the answer's size and a per-kind cap lets one pathological
+    /// object evade the total. A request may name a smaller cap; a larger one is
+    /// capped rather than refused.
+    pub info_entries: u64,
 }
 
 /// SN's own configuration.

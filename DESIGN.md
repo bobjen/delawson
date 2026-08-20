@@ -14936,3 +14936,51 @@ Two consequences, and neither is about this benchmark in particular:
 ⚠️ **What causes the 23% is not established** and should not be guessed at in this document; #88 holds
 it. The object count differed (17 M against 20 M, which should favour today's run), so the likely
 candidates are outside the code.
+
+### 17.20 object-info grows levels, and the DN answers the two it owns
+
+§9.1.3.7's answer shape went in, along with the entry limit, for the detail the DN can supply without
+asking anyone: **streams and counts**. Extents wait on an SN hop per stream (§9.1.3.3), capabilities on
+#82's key, and stream flags on §4.1.1 existing at all — so a caller asking for those is told **which**
+by name rather than handed an answer that quietly omits what it asked for.
+
+**The answer is a shape, then the object, then its streams**, and the order is the point: the header
+says how many rows follow before a reader starts reading them, so nothing counts positions or infers a
+count from a length. `Shape`, `StreamRow` and `Described` all live in `common` (§17.19's lesson).
+
+⚠️ **Which it is comes from whether the plain row parses at the front**, not from a flag. A request that
+asked for nothing gets the bare eight-argument row exactly as before — **byte for byte**, which is what
+keeps every existing caller working and keeps §17.5g's baseline comparable. A request that asked for
+something gets a shape in front. That is §13.2.5.1's rule inside a request rather than a config file:
+the new thing defaults to the old behaviour.
+
+#### 17.20.1 Three things the implementation had to get right
+
+**The counts are exact while the detail is capped**, which is §9.1.3.2's whole point: the stream total
+is the DN's own, so it costs nothing and is always right, while the rows stop at the limit. A caller
+learns *how many there are* in the same answer that tells it *how many it got*.
+
+**The continuation is a record number and it must advance.** `next` is the first record of the stream
+after the last one described, and a test walks the loop to exhaustion asserting `next > at` each time —
+because a continuation that does not advance is a livelock, and it is the same failure §17.18 guarded
+against on the read path.
+
+⚠️ **And a growing stream reports `UNKNOWN`, not zero.** How far the stream being appended to reaches is
+not the DN's to say (§6.3), and a sealed stream holding nothing would be a real zero — so the two cannot
+share an encoding. §8.1.6.3 had just settled that a sentinel goes at the top of the range for a count,
+and this is the first place it was needed: **#90 is the same mistake already in the code**, where an
+open extent reports zero records for the same idea.
+
+#### 17.20.2 Two caps, and the smaller wins
+
+`info_entries` is the DN's configured limit and a request may name its own; the answer honours whichever
+is smaller. **A request may ask for less and may not ask for more**, which is §9.1.3.7's rule and the
+only sane direction — a caller knows its own buffer and the operator knows the fleet's.
+
+The test cluster sets it to **3**, low on purpose so that paging is the common path rather than the rare
+one — the same reasoning as `extents.per_stream` in §17.12, and for the same reason: a limit that never
+binds is a limit that never gets tested.
+
+⚠️ **The knob's placement in `dn.toml` cost a restart to find.** A top-level key written after a `[knobs]`
+table parses as a member of it, so the first attempt failed with *unknown field `info_entries`, expected
+`workers`* — TOML's rule, not a bug, and worth knowing before the next machine type grows a knob.

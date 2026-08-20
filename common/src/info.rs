@@ -115,6 +115,140 @@ impl Described {
     }
 }
 
+/// **No value given**, for the counts in an answer that may or may not know them.
+///
+/// At the top of the range rather than at zero, because zero is a count a stream can
+/// legitimately have — §8.1.6.3's rule, and #90 is what putting it at zero costs.
+pub const UNKNOWN: u64 = u64::MAX;
+
+/// What an answer covered and what it did not tell you (§9.1.3.2).
+///
+/// **Complete in counts even when partial in detail**, which is what lets a caller
+/// compute every remaining request by arithmetic instead of discovering them one at a
+/// time. A count of `UNKNOWN` means *nobody asked* rather than *none*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shape {
+    /// Streams the object has, whether or not they are all described here.
+    pub streams: u64,
+    /// Stream rows that follow.
+    pub given: u64,
+    /// Extents across the streams described, or `UNKNOWN` when no SN was asked.
+    pub extents: u64,
+    /// Entries this answer spent, against the limit it was given (§9.1.3.7).
+    pub entries: u64,
+    /// The object-local record to ask from next, or `UNKNOWN` when nothing follows.
+    pub next: u64,
+}
+
+impl Shape {
+    /// What an answer carrying no detail says: one object, nothing else asked about.
+    pub fn plain() -> Shape {
+        Shape { streams: 0, given: 0, extents: UNKNOWN, entries: 1, next: UNKNOWN }
+    }
+
+    pub fn more(&self) -> bool {
+        self.next != UNKNOWN
+    }
+
+    pub fn args(&self) -> Vec<Arg> {
+        vec![
+            Arg::Number(self.streams),
+            Arg::Number(self.given),
+            Arg::Number(self.extents),
+            Arg::Number(self.entries),
+            Arg::Number(self.next),
+        ]
+    }
+
+    pub fn of_args(args: &[Arg]) -> Result<(Shape, &[Arg])> {
+        let [
+            Arg::Number(streams),
+            Arg::Number(given),
+            Arg::Number(extents),
+            Arg::Number(entries),
+            Arg::Number(next),
+            rest @ ..,
+        ] = args
+        else {
+            return Err(Error::new("that answer did not say what shape it was"));
+        };
+        Ok((
+            Shape {
+                streams: *streams,
+                given: *given,
+                extents: *extents,
+                entries: *entries,
+                next: *next,
+            },
+            rest,
+        ))
+    }
+}
+
+/// One of an object's streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamRow {
+    pub stream: u64,
+    pub sn: u32,
+    /// The object-local number of this stream's first record.
+    pub first_record: u64,
+    /// Records in it once sealed, and **`UNKNOWN` while it is the one being appended
+    /// to** — how far that one reaches is not the DN's to say (§6.3).
+    pub records: u64,
+    /// Extents in it, or `UNKNOWN` when no SN was asked.
+    pub extents: u64,
+}
+
+impl StreamRow {
+    pub const ARGS: usize = 5;
+
+    pub fn args(&self) -> Vec<Arg> {
+        vec![
+            Arg::Number(self.stream),
+            Arg::Number(self.sn as u64),
+            Arg::Number(self.first_record),
+            Arg::Number(self.records),
+            Arg::Number(self.extents),
+        ]
+    }
+
+    pub fn of_args(args: &[Arg]) -> Result<(StreamRow, &[Arg])> {
+        let [
+            Arg::Number(stream),
+            Arg::Number(sn),
+            Arg::Number(first_record),
+            Arg::Number(records),
+            Arg::Number(extents),
+            rest @ ..,
+        ] = args
+        else {
+            return Err(Error::new("that answer's streams are not streams"));
+        };
+        Ok((
+            StreamRow {
+                stream: *stream,
+                sn: *sn as u32,
+                first_record: *first_record,
+                records: *records,
+                extents: *extents,
+            },
+            rest,
+        ))
+    }
+
+    /// `given` rows, and whatever followed them.
+    pub fn some_of_args(args: &[Arg], given: u64) -> Result<(Vec<StreamRow>, &[Arg])> {
+        let mut rows = Vec::with_capacity(given as usize);
+        let mut rest = args;
+        for _ in 0..given {
+            let (row, after) = StreamRow::of_args(rest)?;
+            rows.push(row);
+            rest = after;
+        }
+        Ok((rows, rest))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +319,66 @@ mod tests {
         let mut args = one(1).args();
         args[5] = Arg::Number(99);
         assert!(Described::of_args(&args).is_err());
+    }
+
+    fn stream(stream: u64, first_record: u64, records: u64) -> StreamRow {
+        StreamRow { stream, sn: 0, first_record, records, extents: UNKNOWN }
+    }
+
+    /// The header says how many rows follow, so a reader never guesses — and the
+    /// rows come back as themselves.
+    #[test]
+    fn a_shape_and_its_streams_survive_the_wire() {
+        let shape = Shape { streams: 3, given: 2, extents: 40, entries: 3, next: 700 };
+        let rows = vec![stream(1, 0, 300), stream(2, 300, 400)];
+        let mut args = shape.args();
+        for row in &rows {
+            args.extend(row.args());
+        }
+        let (back, rest) = Shape::of_args(&args).expect("a shape");
+        assert_eq!(back, shape);
+        let (given, rest) = StreamRow::some_of_args(rest, back.given).expect("streams");
+        assert_eq!(given, rows);
+        assert!(rest.is_empty());
+    }
+
+    /// ⚠️ `UNKNOWN` is *nobody asked*, not *none*, and it sits at the top of the
+    /// range because zero is a count a stream can legitimately have (§8.1.6.3).
+    #[test]
+    fn unknown_is_not_zero() {
+        assert_ne!(UNKNOWN, 0);
+        let open = stream(9, 0, UNKNOWN);
+        assert_eq!(open.records, UNKNOWN, "the stream being appended to");
+        let empty = stream(9, 0, 0);
+        assert_eq!(empty.records, 0, "and a sealed stream holding nothing is not the same");
+        assert_ne!(open, empty);
+        // A plain answer knows its own entry count and nothing else.
+        let plain = Shape::plain();
+        assert_eq!((plain.entries, plain.extents), (1, UNKNOWN));
+        assert!(!plain.more(), "nothing follows a plain answer");
+    }
+
+    /// The header's count is what bounds the read, so a truncated answer is refused
+    /// rather than read as fewer rows.
+    #[test]
+    fn a_shape_promising_more_rows_than_it_carries_is_refused() {
+        let shape = Shape { streams: 9, given: 3, extents: UNKNOWN, entries: 4, next: UNKNOWN };
+        let mut args = shape.args();
+        args.extend(stream(1, 0, 10).args());
+        let (back, rest) = Shape::of_args(&args).expect("a shape");
+        assert!(StreamRow::some_of_args(rest, back.given).is_err(), "three promised, one given");
+    }
+
+    /// And the counts survive being complete while the detail is partial, which is
+    /// the whole point of §9.1.3.2.
+    #[test]
+    fn an_answer_can_be_complete_in_counts_and_partial_in_detail() {
+        let shape = Shape { streams: 1000, given: 2, extents: UNKNOWN, entries: 3, next: 512 };
+        let args = shape.args();
+        let (back, _) = Shape::of_args(&args).expect("a shape");
+        assert_eq!(back.streams, 1000, "how many there are");
+        assert_eq!(back.given, 2, "how many are described");
+        assert!(back.more(), "and where to carry on");
+        assert_eq!(back.next, 512);
     }
 }

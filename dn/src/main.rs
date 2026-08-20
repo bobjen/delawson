@@ -16,9 +16,9 @@
 
 use common::config::{DNConfig, ServiceKind};
 use common::framing::Framing;
-use common::info::Described;
+use common::info::{Described, Shape, StreamRow, UNKNOWN};
 use common::logw;
-use common::range::Want;
+use common::range::{Detail, Want};
 use common::server::{self, Process, Reply, Service};
 use common::wire::{Arg, Op, Request, Response, Status};
 use common::{Error, Result};
@@ -51,11 +51,10 @@ const SHARDS: usize = 64;
 
 /// Which `Detail` bits this build actually answers.
 ///
-/// ⚠️ **Zero, and that is the honest value.** `object-info` returns the object and one stream, which
-/// is what §9.1.3.7 wants extended and what #79 will extend it to. Until then a caller asking for
-/// more is told so by name rather than being handed an answer that quietly omits what it asked for —
-/// §17's rule that a well-formed request for something unbuilt is `unimplemented`, not `ok`.
-const ANSWERS: u64 = 0;
+/// **Streams and counts, because the DN holds both.** Extents need an SN hop per stream (§9.1.3.3),
+/// capabilities need the key of #82, and the stream flags of §4.1.1 do not exist — so a caller asking
+/// for those is told which by name rather than handed an answer that quietly omits what it asked for.
+const ANSWERS: u64 = Detail::Streams.bit() | Detail::Counts.bit();
 
 /// What a lookup wants, and a refusal naming the parts of it this build cannot supply.
 ///
@@ -71,6 +70,79 @@ fn wanted(args: &[Arg]) -> Result<Want> {
         return Err(Error::new(format!("object-info cannot yet return {}", beyond.join(", "))));
     }
     Ok(want)
+}
+
+/// The answer for a lookup: the plain row when a record was named or no detail was
+/// asked for, and the levelled answer otherwise.
+///
+/// ⚠️ **`locate-stream` always gets the plain row.** It asks *which stream holds this
+/// record*, an FE's question on the read path, and it must keep the shape `Located::of`
+/// reads — so detail is an `object-info` feature and not a lookup feature.
+fn describe_at(object: &Object, record: Option<u64>, want: &Want, limit: u64) -> Option<Vec<Arg>> {
+    match record {
+        Some(_) => object.args(record),
+        None => detailed(object, want, limit),
+    }
+}
+
+/// What an object says about itself at the level asked for.
+///
+/// ⚠️ **The counts are exact even when the detail is not** (§9.1.3.2), which is what lets a caller
+/// compute the requests it has not made yet instead of discovering them one answer at a time. The
+/// stream count is the DN's own, so it costs nothing to include and is always right.
+fn detailed(object: &Object, want: &Want, limit: u64) -> Option<Vec<Arg>> {
+    let mut args = object.args(None)?;
+    if want.detail == 0 {
+        return Some(args);
+    }
+
+    let total = object.streams.len() as u64;
+    let from = want.from.record().unwrap_or(0);
+    // Streams are in record order, so the first to describe is the last one starting
+    // at or before `from` — the same rule a read uses to pick a stream.
+    let first = object.streams.iter().rposition(|held| held.first_record <= from).unwrap_or(0);
+
+    // One entry for the object, then one per stream, against whichever cap is smaller.
+    let cap = match want.limit {
+        0 => limit,
+        asked => asked.min(limit),
+    };
+    let room = cap.saturating_sub(1);
+    let mut rows = Vec::new();
+    if want.wants(Detail::Streams) {
+        for held in object.streams.iter().skip(first).take(room as usize) {
+            rows.push(StreamRow {
+                stream: held.id,
+                sn: held.sn,
+                first_record: held.first_record,
+                // ⚠️ UNKNOWN, not zero: how far the stream being appended to reaches is
+                // not the DN's to say (§6.3), and a sealed stream may hold nothing.
+                records: held.records.unwrap_or(UNKNOWN),
+                extents: UNKNOWN,
+            });
+        }
+    }
+
+    // Where to carry on: the first record of the stream after the last one described,
+    // and nothing when the last stream described is the object's last.
+    let after = first + rows.len();
+    let next = object.streams.get(after).map_or(UNKNOWN, |held| held.first_record);
+    let shape = Shape {
+        streams: if want.wants(Detail::Counts) { total } else { UNKNOWN },
+        given: rows.len() as u64,
+        extents: UNKNOWN,
+        entries: 1 + rows.len() as u64,
+        next: if want.wants(Detail::Streams) { next } else { UNKNOWN },
+    };
+
+    // The shape first, then the object, then its streams — so a reader knows how many
+    // rows follow before it starts reading them.
+    let mut out = shape.args();
+    out.append(&mut args);
+    for row in rows {
+        out.extend(row.args());
+    }
+    Some(out)
 }
 
 struct Object {
@@ -578,9 +650,11 @@ impl DN {
         // `locate-stream` puts a record number where a want field would be, and it asks for
         // nothing beyond the stream holding it, so it is not read here.
         let rest = if record.is_some() { &rest[1..] } else { rest };
-        if let Err(e) = wanted(rest) {
-            return reply.send(Response::error(Status::Unimplemented, e.to_string()));
-        }
+        let want = match wanted(rest) {
+            Ok(want) => want,
+            Err(e) => return reply.send(Response::error(Status::Unimplemented, e.to_string())),
+        };
+        let limit = self.config.info_entries;
         // Under one lock: answer, or park. Deciding to wait and then waiting must be
         // one step, or the work can finish in between and wake nobody.
         let mut carry = Some(reply);
@@ -588,7 +662,7 @@ impl DN {
             let mut shard = self.shards[shard_of(name)].lock().expect("objects");
             match shard.get_mut(name) {
                 None => Some(Response::error(Status::NotFound, format!("no object {name}"))),
-                Some(object) => match object.args(record) {
+                Some(object) => match describe_at(object, record, &want, limit) {
                     Some(args) => Some(Response { id: 0, status: Status::Ok, args }),
                     None if object.between_streams() => {
                         object.waiting.push(carry.take().expect("a reply"));
@@ -717,6 +791,8 @@ mod tests {
     }
 
     use super::*;
+    use common::info::{Shape, StreamRow, UNKNOWN};
+    use common::range::Start;
     use common::testing;
 
     /// An object as `record` leaves it before the SN has answered: the name is
@@ -826,6 +902,117 @@ mod tests {
         // And an append always goes to the last.
         assert_eq!(object.last().unwrap().id, 3);
         assert!(!object.between_streams());
+    }
+
+    /// An object with three streams, two sealed and one still growing.
+    fn grown() -> Object {
+        let mut object = Object {
+            id: 1,
+            framing: Framing::Lf,
+            streams: Vec::new(),
+            extending: false,
+            waiting: Vec::new(),
+            keyed: false,
+            created: 1_000_000,
+        };
+        object.streams.push(Held { id: 1, sn: 0, first_record: 0, records: Some(100) });
+        object.streams.push(Held { id: 2, sn: 1, first_record: 100, records: Some(50) });
+        object.streams.push(Held { id: 3, sn: 2, first_record: 150, records: None });
+        object
+    }
+
+    fn read_back(args: &[Arg]) -> (Shape, Vec<StreamRow>) {
+        let (shape, rest) = Shape::of_args(args).expect("a shape");
+        let (_, rest) = Described::of_args(rest).expect("an object");
+        let (rows, rest) = StreamRow::some_of_args(rest, shape.given).expect("streams");
+        assert!(rest.is_empty(), "and nothing left over");
+        (shape, rows)
+    }
+
+    /// Wanting nothing gets the row that predates the field, with no shape in front
+    /// of it — which is what keeps every existing caller and §17.5g's baseline.
+    #[test]
+    fn wanting_nothing_answers_the_bare_row() {
+        let args = detailed(&grown(), &Want::plain(), 100).expect("an answer");
+        assert_eq!(args.len(), Described::ARGS);
+        assert!(Described::of_args(&args).expect("a row").0.is_some());
+    }
+
+    /// The counts are exact even when the detail is not, which is what lets a caller
+    /// compute the requests it has not made yet (§9.1.3.2).
+    #[test]
+    fn the_counts_are_exact_while_the_detail_is_capped() {
+        let want = Want::plain().with(Detail::Streams).with(Detail::Counts);
+        // Two entries: one for the object, so room for one stream.
+        let args = detailed(&grown(), &Want { limit: 2, ..want }, 100).expect("an answer");
+        let (shape, rows) = read_back(&args);
+        assert_eq!(shape.streams, 3, "how many there are");
+        assert_eq!((shape.given, rows.len()), (1, 1), "how many are described");
+        assert_eq!(shape.entries, 2, "the object and one stream");
+        assert_eq!(shape.next, 100, "and where to carry on");
+        assert!(shape.more());
+    }
+
+    /// ⚠️ The continuation is a record number, so resuming from it describes the next
+    /// stream and not the same one again — §9.1.3's whole scheme in one assertion.
+    #[test]
+    fn resuming_from_the_continuation_makes_progress() {
+        let want = Want::plain().with(Detail::Streams).with(Detail::Counts);
+        let object = grown();
+        let mut at = 0;
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            let args = detailed(&object, &Want { limit: 2, from: Start::Record(at), ..want }, 100)
+                .expect("an answer");
+            let (shape, rows) = read_back(&args);
+            seen.extend(rows.iter().map(|row| row.stream));
+            if !shape.more() {
+                break;
+            }
+            assert!(shape.next > at, "a continuation that does not advance is a livelock");
+            at = shape.next;
+        }
+        assert_eq!(seen, vec![1, 2, 3], "every stream, once, in order");
+    }
+
+    /// The configured cap and the request's cap are both honoured, whichever is
+    /// smaller — a request may ask for less and may not ask for more.
+    #[test]
+    fn the_smaller_of_the_two_caps_wins() {
+        let want = Want::plain().with(Detail::Streams);
+        let given = |asked, configured| {
+            let args =
+                detailed(&grown(), &Want { limit: asked, ..want }, configured).expect("an answer");
+            read_back(&args).0.given
+        };
+        assert_eq!(given(0, 3), 2, "no request cap, so the configured one: object plus two");
+        assert_eq!(given(2, 100), 1, "the request asks for less");
+        assert_eq!(given(100, 2), 1, "and may not ask for more");
+    }
+
+    /// ⚠️ A stream still being appended to reports UNKNOWN rather than zero, because
+    /// how far it reaches is not the DN's to say — and a sealed stream holding
+    /// nothing would be a real zero (§8.1.6.3, #90).
+    #[test]
+    fn the_growing_stream_says_unknown_and_not_zero() {
+        let want = Want::plain().with(Detail::Streams);
+        let args = detailed(&grown(), &Want { limit: 100, ..want }, 100).expect("an answer");
+        let (_, rows) = read_back(&args);
+        assert_eq!(rows[0].records, 100);
+        assert_eq!(rows[2].records, UNKNOWN, "the one being appended to");
+        assert_ne!(rows[2].records, 0, "which is not a count of none");
+    }
+
+    /// Counts without streams is a legitimate question: how big is this object,
+    /// without the rows.
+    #[test]
+    fn counts_alone_bring_no_rows() {
+        let want = Want::plain().with(Detail::Counts);
+        let args = detailed(&grown(), &want, 100).expect("an answer");
+        let (shape, rows) = read_back(&args);
+        assert_eq!((shape.streams, shape.given, shape.entries), (3, 0, 1));
+        assert!(rows.is_empty());
+        assert!(!shape.more(), "nothing was asked to be described, so nothing follows");
     }
 
     /// A create carries a name, a flavour and a framing, and anything after those is

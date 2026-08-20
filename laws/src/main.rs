@@ -14,7 +14,7 @@ use common::block::{Holds, expand, squeeze};
 use common::config::Compress;
 use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
-use common::info::Described;
+use common::info::{Described, Shape, StreamRow, UNKNOWN};
 use common::placement;
 use common::random::Rng;
 use common::range::{Budget, Covered, Detail, Piece, Range, Start, Want};
@@ -1179,14 +1179,59 @@ fn receipt(target: &Target, response: &Response) -> Result<()> {
 /// What an object is, which is what both a lookup and a create answer with. Seven
 /// numbers read as one line.
 fn object(target: &Target, response: &Response) -> Result<()> {
-    let Ok((Some(it), [])) = Described::of_args(&response.args) else {
+    // A plain answer is the row alone; a levelled one leads with its shape, so which
+    // it is comes from whether the row parses at the front (§9.1.3.2).
+    if let Ok((Some(it), [])) = Described::of_args(&response.args) {
+        return say(target, &it, None, &[]);
+    }
+    let Ok((shape, rest)) = Shape::of_args(&response.args) else {
         return report(target, response);
     };
+    let Ok((Some(it), rest)) = Described::of_args(rest) else {
+        return report(target, response);
+    };
+    let Ok((streams, [])) = StreamRow::some_of_args(rest, shape.given) else {
+        return report(target, response);
+    };
+    say(target, &it, Some(shape), &streams)
+}
+
+/// An object, and whatever detail came with it.
+fn say(target: &Target, it: &Described, shape: Option<Shape>, streams: &[StreamRow]) -> Result<()> {
     let flavor = if it.keyed { "keyed" } else { "unkeyed" };
     println!(
         "{} object {} {flavor} framed {}, stream {} on SN{} from record {}, made in second {}",
         target.identity, it.id, it.framing, it.stream, it.sn, it.first_record, it.created
     );
+    let Some(shape) = shape else { return Ok(()) };
+    for row in streams {
+        // UNKNOWN is "nobody asked" or "not knowable here", never a count of zero.
+        let records = match row.records {
+            UNKNOWN => "still growing".to_string(),
+            n => format!("{n} records"),
+        };
+        println!(
+            "  stream {} on SN{} from record {}, {records}",
+            row.stream, row.sn, row.first_record
+        );
+    }
+    // What it did not tell you, which is what makes a partial answer usable.
+    let of = match shape.streams {
+        UNKNOWN => String::new(),
+        total => format!(" of {total}"),
+    };
+    let s = if shape.given == 1 { "" } else { "s" };
+    let e = if shape.entries == 1 { "y" } else { "ies" };
+    match shape.next {
+        UNKNOWN => println!(
+            "{} {} stream{s}{of} described, {} entr{e}, nothing more",
+            target.identity, shape.given, shape.entries
+        ),
+        next => println!(
+            "{} {} stream{s}{of} described, {} entr{e}, ask from record {next}",
+            target.identity, shape.given, shape.entries
+        ),
+    }
     Ok(())
 }
 
