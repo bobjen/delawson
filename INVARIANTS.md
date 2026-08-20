@@ -772,9 +772,14 @@ like a performance problem and was a liveness one.**
 
 **`WAITERS-ARE-ALWAYS-ANSWERED`** — every parked request is eventually answered, including when the
 work it waited on failed.
-*Argued* §17.12.1 · *Enforced* code: `give_back`, `gave_up` and `give_up` exist for exactly this ·
-*Checked* unit test wanted for the failure paths specifically; **model check wanted**
+*Argued* §17.12.1, §17.22.2 · *Enforced* code: `give_back`, `gave_up` and `give_up` exist for exactly
+this · *Checked* unit test wanted for the failure paths specifically; **model check wanted**
 *Breaks* a request holds a `Reply` nothing will ever send.
+⚠️ **And a panic breaks it invisibly** (§17.22.2): a thread that dies holding a `Reply` presents to the
+client as a **timeout**, not an error, and nothing reaches the log because a panic goes to stderr. Every
+structure that holds a reply for later — `Gather`, the EN's `Pending`, the DN's `Object.waiting`, the FE's
+`Stream.getting` — is a place this can happen, which argues for answering on an unsent drop rather than
+fixing each site (#95).
 
 **`ONE-REQUEST-IN-FLIGHT-PER-STREAM`** — when many callers need the same next extent or stream, one
 asks and the rest join it.
