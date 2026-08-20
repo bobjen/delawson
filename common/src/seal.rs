@@ -285,7 +285,6 @@ mod tests {
 
 #[cfg(test)]
 mod ratio {
-    use super::*;
     use crate::random::Rng;
 
     /// A batch of replies with random bodies must not compress. If it does, a
