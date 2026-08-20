@@ -496,13 +496,36 @@ is no per-object ACL and no per-tenant one.
 "who can read what" unanswerable — the failure that made S3 and GCS deprecate object ACLs. Note a
 tenant is **not** a unit here: aliases mean an object is reachable under two tenants at once.
 
-**`ALIAS-READS-INTERSECT`** — a read through an alias must satisfy the alias's grant **and** the
-owner's ACL, checked at the target.
-*Argued* §5.1.1, §5.9.1a · *Enforced* design only · *Checked* not yet — and the test that matters
-grants through an alias and then narrows the owner's ACL
-*Breaks* an alias becomes a way to escape the owner's policy, which would make aliases a privilege
-escalation rather than a view. It is also what makes deny rules unnecessary: intersection is monotone,
-so every restriction is expressible as a smaller grant.
+**`ALIAS-ACCESS-INTERSECTS`** — any operation through an alias must satisfy the alias's grant **and** the
+owner's ACL, checked at the target. Reads and writes alike.
+*Argued* §5.1.1, §5.9.1a, §5.1.1.3 · *Enforced* design only · *Checked* not yet — and the test that
+matters grants through an alias and then narrows the owner's ACL
+*Breaks* an alias becomes a way to escape the owner's policy, making it a privilege escalation rather
+than a view. It is also what makes deny rules unnecessary: intersection is monotone, so every restriction
+is a smaller grant — and that holds for **any** number of terms, which is why §5.1.1.1a unbounding the
+alias chain does not disturb it.
+⚠️ **Now load-bearing in a way it was not**: with writable aliases, delete comes with write
+(§5.1.1.1a), so this is the only thing standing between a recursive delete on a worker's tree and the
+shared project it aliases. The traversal rule bounds termination, not authority.
+
+**`EVERY-OBJECT-HAS-ONE-CANONICAL-PATH`** — the alias-free path, and it exists and is unique for every
+object. Scrub and billing use only canonical paths.
+*Argued* §5.1.1.1a · *Enforced* design only · *Checked* not yet
+*Breaks* the whole scheme, because this is what lets aliases be a graph while everything structural stays
+a tree — **ownership is a tree, reachability is a graph**. Uniqueness is by induction (one parent each)
+and existence by the hierarchy being rooted; and no canonical path can lie on a cycle, since a cycle needs
+an alias and a canonical path has none. ⚠️ Note what canonical-paths-only still counts: several streams
+referencing one extent and several objects referencing one stream are genuine references (§4.6.1) and are
+divided by §12.6.3. Only the alias is not one.
+
+**`ALIAS-TRAVERSAL-CARRIES-ITS-PATH`** — a traversal that follows aliases keeps the aliases on the current
+path and checks a new one against them before recursing.
+*Argued* §5.1.1.1a · *Enforced* design only · *Checked* not yet; the test builds a cycle and lists through
+it
+*Breaks* a recursive listing or delete does not terminate. ⚠️ **The *path* set, not a global visited set** —
+a cycle is re-entering what you are already inside, and two aliases on different branches pointing at one
+directory are not one. Exact in both directions, which neither a depth cap nor a level order is: those
+refuse legal structures to avoid cycles, and this refuses exactly the cycles.
 
 **`KEYS-NEVER-WHERE-USER-CODE-RUNS`** — user code runs only on Compute, and keys never exist where
 user code runs.
@@ -777,7 +800,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **append block** | §8.1 | `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `RECORD-FITS-ONE-EXTENT`, `EXTENT-SEALS-BETWEEN-RECORDS`, `APPLIED-IS-A-PREFIX`, `ONE-BLOCK-ALWAYS-RETURNS` |
 | **applied** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE` |
 | **capability** | §9.1.3.5 | `A-CERTIFICATE-NAMES-ITS-TENANT-AND-ITS-EXTENT`, `HINT-BOUND-BY-CAPABILITY`, `KEY-AND-SALT-COVER-ONE-PLAINTEXT` |
-| **directory** | §5.1 | `POLICY-ATTACHES-TO-A-DIRECTORY`, `ALIAS-READS-INTERSECT` |
+| **directory** | §5.1 | `POLICY-ATTACHES-TO-A-DIRECTORY`, `ALIAS-ACCESS-INTERSECTS`, `EVERY-OBJECT-HAS-ONE-CANONICAL-PATH`, `ALIAS-TRAVERSAL-CARRIES-ITS-PATH` |
 | ⚠️ **compressed position** | §8.1.6 | `KEY-AND-SALT-COVER-ONE-PLAINTEXT`, `EC-GROUP-EQUAL-LENGTH`, `SPACES-ARE-TYPES-WHEN-A-MIX-UP-IS-SILENT`. *The same space §4.5 and §8.1.1a-2 call **physical**.* |
 | **creation second** | §4.6.3 | `EXTENT-IDENTITY-UNIQUE`, `EXTENT-KEY-FROM-CREATING-SN`, `HINT-BOUND-BY-CAPABILITY` |
 | **durable** | §8.1.1 | `DURABLE-IS-QUORUM-WATERMARK`, `INCOMPLETE-RECORD-NOT-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `SEAL-NEVER-BELOW-DURABLE` |

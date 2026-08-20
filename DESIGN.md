@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-145 things *not* decided.
+147 things *not* decided.
 
 **Priorities and framing**
 
@@ -165,7 +165,7 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | **No per-object ACL**: unbounded per-object metadata (§14.2), and S3 and GCS both shipped object ACLs and **deprecated** them for unauditability | §5.9.1a |
 | If policy needs a grouping the tree does not express, **the tree is wrong** — cheap here, since a directory is derived and renames move nothing | §5.9.1a, §5.1.2.2 |
 | **No deny rules**: composition is an alias AND the owner's ACL, and intersection is monotone, so any deny is a smaller grant | §5.9.1a, §5.1.1 |
-| Composition depth is **capped at two** by §5.1.1.1's cycle rule, so a reader can always be told what governed the answer | §5.9.1a |
+| No-deny rests on **monotonicity**, not on how many policies compose — §5.1.1.1a unbounds the chain | §5.9.1a, §5.1.1.1a |
 | Sharing one object is an **event with an expiry**, not durable state — a capability, not an ACL | §5.9.1a, §9.1.3.5 |
 | The real boundary is **signed executables**, not absence of keys — which makes code signing load-bearing | §1.5 |
 | **Extent decryption happens on the EN**; end-to-end encryption is a user-side option, not a product | §5.9.2, §7.2.3 |
@@ -3292,6 +3292,10 @@ than having to be answered:
 | Who pays? | **The owner.** Nothing aliased counts against the reader's quota |
 | Whose ACL governs a read? | The **owner's**, checked at the target; the alias only says the reader may look |
 
+⚠️ **The read-only row is superseded by §5.1.1.1a**: writable aliases are allowed, which Bob wants for many
+workers sharing one object while each keeps private scratch — and which turns out to be what lets the tenant
+stay the unit of trust (§16.145). Read-only survives as the sensible **default** for a grant, not as a rule.
+
 ⚠️ **An alias is the one directory reference that needs a name bigger than a ring.** §4.6's
 rule is that nothing in the data plane carries a cluster-wide name — every reference is
 node-local, an index into a population its holder knows. An alias breaks that by construction,
@@ -3303,6 +3307,11 @@ It leaves open **what a reader sees during the owner's writes**, since an alias 
 data rather than a snapshot. Cycles are handled by §5.1.1.1.
 
 ##### 5.1.1.1 No alias may point into a tree that contains aliases
+
+⚠️ **Superseded by §5.1.1.1a** (Bob, 2026-08-19): cycles are now *allowed*, bounded by cycle detection
+on traversal, and the machinery below — the two bits, the sweep, the upward walk, the move rules — goes
+with the rule. **Kept because the reasoning is what §5.1.1.1a had to answer**, and because the
+asymmetric-error argument about greedy-set-lazy-clear is worth keeping wherever a bit like it reappears.
 
 A tree with aliases in it is a graph, so listing, recursive delete, quota walks, the §4.6.6.2
 scrub and §71's sweep all have to cope with cycles — unless cycles are impossible. **They are
@@ -3357,6 +3366,65 @@ contains aliases sets its new ancestors eagerly, by the same stop-at-the-first-s
 leaves the old chain to the sweep — and a move that would place an aliased directory under
 another aliased directory is refused by check (a).
 
+##### 5.1.1.1a Cycles are allowed, and the canonical path is what counts
+
+**The rule set** (Asserted, Bob, 2026-08-19), replacing §5.1.1.1's prohibition:
+
+| | |
+|---|---|
+| **cycles of aliases** | **allowed** |
+| every object has a **canonical path** | the one with no aliases in it |
+| **writable aliases** | allowed |
+| **recursive delete** — a type of write | traverses, and **stops at cycle detection** |
+| **recursive directory listing** | traverses, and **stops at cycle detection** |
+| **§4.6.6.2's scrub** | **only pays attention to canonical paths** |
+| **billing** | leaning to **canonical paths only** — which still count several streams referencing one extent and several objects referencing one stream, but do not count an alias as a new set of references |
+
+**One idea organizes all of it, and it is worth stating on its own:**
+
+> **Ownership is a tree; reachability is a graph.** Aliases add ways to *reach* an object and change
+> nothing about what *owns* it — so everything structural runs on the tree, and only traversal has to
+> cope with the graph.
+
+⚠️ **That is why forbidding cycles was never necessary.** §5.1.1.1 forbade nesting so that five
+traversals would not meet one; the rule set above lets them exist and gives each traversal the right
+answer instead — the two that follow the user's view bound themselves, and the two that account for
+things never leave the tree.
+
+##### The canonical path exists and is unique, which is what makes this work
+
+**Every object has exactly one.** An object sits in exactly one directory, and a directory sits in
+exactly one parent, so the alias-free path is its parent's canonical path plus its name — unique by
+induction, and it exists because the ownership hierarchy is rooted.
+
+**And no canonical path can be part of a cycle**, since a cycle needs an alias and a canonical path has
+none. So the structure everything structural depends on is a **tree**, whatever the alias graph does
+above it.
+
+##### Detecting the cycle: the aliases on the path so far
+
+**Keep a list of the aliases traversed on the current path and check a new one against it before
+recursing** (Asserted, Bob, 2026-08-19).
+
+Ordinary depth-first detection, and the **path** set rather than a global visited set is the right thing:
+a cycle is re-entering something you are already inside. ⚠️ **It is exact in both directions**, which
+neither alternative is:
+
+| | Refuses legal structures | Permits a cycle |
+|---|---|---|
+| a **depth cap** (symlink `ELOOP`) | **yes** — a legitimate deep chain | no, by refusing depth |
+| **levels**, aliases pointing strictly downward | **yes** — anything the declared order did not foresee | no |
+| **the path set** | **no** | **no** |
+
+⚠️ **And §5.1.1.1 had the costs the wrong way round.** Its argument for forbidding nesting was that
+*"there is no traversal to bound and no visited set to carry."* The set is a handful of entries on a
+stack, held per traversal and stored nowhere. **The rule it justified costs two bits per directory, a
+greedy-set-lazy-clear discipline, a sweep to clear them, an upward walk on every alias creation, and
+special handling for moves — all of which the new rules delete.**
+
+**A cycle also leaks nothing**, which removes the last worry: an alias is not a counted reference, so a
+loop of them holds no storage and keeps nothing alive.
+
 ##### 5.1.1.2 Aliases are why a cross-ring clone may copy
 
 §4.6.6.1 left open what to do about a stream referenced from two DN rings, which has no single
@@ -3372,6 +3440,97 @@ correct semantics.
 
 So the sharing rule ends up simple: **share inside a ring, copy across one, alias when reading
 is all you wanted.**
+
+##### 5.1.1.3 Whether an alias may be writable, and what the read-only rule was carrying
+
+⚠️ **§5.1.1 asserts an alias is read-only always, and that is stronger than what is needed** (Asserted,
+Bob, 2026-08-19): *"I know they need to be able to be read-only, but I don't immediately see a problem
+with allowing them to be writable as well."*
+
+**The use case is specific**: splitting one tenant into several that can all write *almost* the same
+things. **Many workers on a gorilla, each with its own private scratch space** — shared write access to
+the big thing, private write access to their own.
+
+##### The strongest argument for it comes from somewhere else entirely
+
+**Writable aliases are what let the tenant stay the unit of trust**, and that matters because
+§9.1.3.5's certificate binds the tenant:
+
+| The gorilla-plus-scratch case, built as | The boundary between workers is | Consequence |
+|---|---|---|
+| **one tenant**, per-principal directory ACLs (§5.9.1a) | **inside** a tenant | §16.145's assumption breaks, so the certificate must bind a **principal** — and §8.1.1a-10's scheduler can no longer mint once and hand hints to many vertices |
+| **several tenants**, writable aliases onto the shared thing | **between** tenants | the assumption holds, and the scheduler case survives |
+
+So this is not only a convenience. ⚠️ **Without writable aliases, the first serious multi-worker
+workload forces an intra-tenant boundary, and that boundary is what §16.145 says would cost the hint
+design its coarse binding.** Two features that look unrelated are the same decision seen twice.
+
+##### Writable means writable, and delete comes with it
+
+⚠️ **A draft of this section proposed the narrower change — appendable but not deletable — and that is not
+what is meant.** Bob counts **recursive delete as a type of write** (§5.1.1.1a), so a writable alias
+carries deletion too.
+
+**Which puts a hazard in plain sight**: a recursive delete on a worker's own tree would reach through its
+alias and delete the shared project. That is not what anyone wants, and **the traversal rule is not what
+prevents it** — cycle detection bounds termination, not authority.
+
+**What prevents it is the alias's own grant.** §5.9.1a's intersection already governs: an operation
+through an alias must be permitted by *both* the alias's grant and the owner's ACL. So an alias granting
+append-only refuses the recursive delete, and one granting delete permits it because somebody said so.
+
+⚠️ **So the vocabulary of a grant becomes load-bearing** where it was not before — read, append, write,
+delete are now distinctions an alias has to be able to express, and **read-only remains the right
+default** (§16.146). Bob's original instinct survives as a default rather than as a rule, which is
+usually where a too-strong rule should end up.
+
+##### The four answers §5.1.1 derived from read-only, re-examined
+
+| Question | Under an appendable alias |
+|---|---|
+| Does it pin storage? | **Unchanged.** Still not a counted reference (§4.6.6), and an append lands in the *owner's* tree where the owner's counts already cover it |
+| What happens when the owner deletes? | ⚠️ **Sharper than before.** The alias dangled and took someone else's data with it; now it takes **the worker's own output** |
+| Who pays? | ⚠️ **The real cost — see below** |
+| Whose ACL governs? | **Unchanged.** The owner's, checked at the target, intersected with the alias's grant (§5.9.1a's `ALIAS-READS-INTERSECT` extends to writes unchanged) |
+
+**Billing is well defined, and an earlier draft of this paragraph said otherwise.** It claimed §12.6.3
+could not attribute a write made through an alias. **It can**: §5.1.1.1a settles that billing counts
+**canonical paths only**, and data written through an alias sits under the owner's canonical path — so it
+bills to the owner, which is the same answer §5.1.1 already gave.
+
+⚠️ **What is open is whether that is the right *policy*, not whether it computes.** Granting write access
+through an alias is granting spend on your own quota, and that is a coherent thing to mean — it is what
+lending a credit card means. The alternative attributes to the writer, which needs an alias to become
+something §12 counts and gives up the property that makes an alias free (§16.146).
+
+##### And §5.1.1.2's rule survives, with a third clause
+
+A writable alias is **not** a substitute for the copying clone. §5.1.1.2 keeps copying for *"your own
+writable, independently-owned duplicate"*; this adds **shared-writable, single-owner**, which is a
+distinct semantic rather than a cheaper version of that one. Nor does it reopen §4.6.6.1's refcount
+problem, since it creates no reference.
+
+##### ⚠️ The alternative worth pricing: invert the alias
+
+**The gorilla case may not need writable aliases at all**, and the alternative is faster:
+
+> Each worker **owns** its scratch and appends there — private, uncontended. The gorilla's owner holds a
+> **read-only** alias onto each worker's scratch and **concatenates** (§8.6.1).
+
+That is §8.6's answer to this exact workload, and it gets §8.6.1's parallel bandwidth instead of
+§8.1.1a-8's **~200 MB/s per-object ceiling**, which is one disk's worth because one extent is open. **The
+shared-write version runs straight into that ceiling**, and §1.0's motivating case — many writers into
+one object — is precisely why §8.6 exists.
+
+| | Bandwidth | Visibility |
+|---|---|---|
+| **writable aliases**, all appending to the gorilla | one open extent, so ~200 MB/s (§8.1.1a-8) | **immediate** |
+| **inverted**: private scratch, owner concatenates (§8.6.1) | parallel across workers | **at the concat** |
+
+**So the question is whether the gorilla needs live shared appends or eventual assembly.** If eventual,
+the inversion serves it with mechanisms that already exist — read-only aliases and #84's seal, then
+concat — and is faster. If visibility must be immediate, writable aliases are the answer and the
+throughput ceiling is the price, which is §8.6.2's trilemma rather than anything new.
 
 #### 5.1.2 Virtual directories
 
@@ -4513,10 +4672,14 @@ only saying the reader may look. That is an **AND** of two gates, and AND is mon
 side narrows the result, so any restriction expressible as a deny is expressible as a smaller grant.
 Deny earns its keep only where composition is a union.
 
-⚠️ **And the composition depth is capped at two, by a rule made for another purpose.** §5.1.1.1 forbids
-an alias pointing into a tree that contains aliases — written to prevent cycles — which incidentally
-means at most two policies ever bear on one read. So the comprehensibility objection to composed policy
-does not arise: a reader can always be told the two things that governed the answer.
+⚠️ **An earlier draft leaned on the composition depth being capped at two**, since §5.1.1.1 bounded an
+alias chain at one hop. **That cap is gone** — §5.1.1.1a allows nesting, because two levels of sharing
+cannot express a shared foundation under a shared project.
+
+**The argument that matters survives untouched**: no-deny rests on intersection being **monotone**
+(§5.9.1a), which holds for any number of terms. Only the comprehensibility claim weakens, and it weakens
+to something workable — **explaining a refusal means reporting a chain rather than a pair**, and the
+chain is known exactly, because §5.1.1.1a's path set is the list of what was traversed.
 
 ##### What this leaves open
 
@@ -13478,6 +13641,25 @@ Roughly in order of how much else depends on them.
      once and handing them to many vertices, which works because the binding is coarse. Narrowing to a
      principal enforces intra-tenant policy and costs that. So this stays open as *the price of the first
      use case that needs it*, and the answer will be to narrow the binding rather than to patch around it.
+
+146. **Whether an alias may be appendable, and who pays if it is** (§5.1.1.3, §5.1.1, §12.6.3). Bob wants
+     it for many workers sharing one object while each keeps private scratch, and it has a second argument
+     nothing to do with that: it keeps the worker boundary *between* tenants, so §16.145's assumption
+     holds and §9.1.3.5's certificate can go on binding the tenant. ⚠️ The sharp objection is billing —
+     write access through an alias is spend authority on another tenant's quota, and an alias is
+     deliberately not a counted reference, so §12.6.3 cannot attribute it. Either the owner accepts that,
+     or an alias becomes something §12 can count and stops being free. And ⚠️ the case may not need it:
+     §5.1.1.3 prices inverting the alias — private scratch, owner concatenates (§8.6.1) — which is faster,
+     since shared appends meet §8.1.1a-8's one-disk ceiling. What decides it is whether the shared object
+     needs **immediate** visibility or eventual assembly.
+
+147. **Whether billing should count only canonical paths** (§5.1.1.1a, §12.6.3, §5.1.1.3). Bob leans yes:
+     an alias is not a new set of references, so data written through one bills to the owner whose canonical
+     path it sits under. That **computes** — an earlier draft wrongly said it could not — and what is open is
+     whether it is the right policy, since granting write through an alias then means granting spend on your
+     own quota. Note what canonical-paths-only still counts: several streams referencing one extent and
+     several objects referencing one stream (§4.6.1) are genuine references and are divided by §12.6.3. It is
+     only the alias that is not one.
 
 **Closed** since earlier drafts:
 
