@@ -26,6 +26,24 @@ macro_rules! space {
         impl $name {
             pub const ZERO: $name = $name(0);
 
+            /// **No value given**, which is the top of the range rather than zero,
+            /// because zero is a length a caller can legitimately mean (§8.1.6.2).
+            pub const NONE: $name = $name(u32::MAX);
+
+            /// The largest real value, one below `NONE`.
+            ///
+            /// ⚠️ **Reserving it costs almost nothing, which is why every space does
+            /// it** (Asserted, Bob, 2026-08-19): a bound has to be compared against
+            /// anyway to keep *one past the end* representable, and comparing against
+            /// `MAX - 1` is the same instruction as comparing against `MAX`. So the
+            /// reservation is uniform whether or not a given space uses it today —
+            /// and a space that needs it later does not have to change its documented
+            /// maximum, which would be a format contract change.
+            pub const MAX: $name = $name(u32::MAX - 1);
+
+            /// ⚠️ **Unchecked, for literals.** `new(u32::MAX)` is `NONE`, which is
+            /// almost certainly not what a caller writing a literal meant; the
+            /// checked constructors are `of_len` and `of_number`.
             pub const fn new(bytes: u32) -> $name {
                 $name(bytes)
             }
@@ -34,14 +52,27 @@ macro_rules! space {
                 self.0
             }
 
-            /// From a count of bytes in hand, which is how a length arrives.
-            pub fn of_len(len: usize) -> Result<$name> {
-                u32::try_from(len).map($name).map_err(|_| {
-                    Error::new(format!(concat!($what, " length {} does not fit an extent"), len))
-                })
+            pub const fn is_none(self) -> bool {
+                self.0 == u32::MAX
             }
 
-            /// From the wire, where every number is 64 bits.
+            pub const fn is_some(self) -> bool {
+                self.0 != u32::MAX
+            }
+
+            /// From a count of bytes in hand, which is how a length arrives.
+            pub fn of_len(len: usize) -> Result<$name> {
+                match u32::try_from(len) {
+                    Ok(bytes) if bytes < u32::MAX => Ok($name(bytes)),
+                    _ => Err(Error::new(format!(
+                        concat!($what, " length {} does not fit an extent"),
+                        len
+                    ))),
+                }
+            }
+
+            /// From the wire, where every number is 64 bits. `NONE` survives the trip,
+            /// since a field that may be absent has to be able to say so.
             pub fn of_number(number: u64) -> Result<$name> {
                 u32::try_from(number).map($name).map_err(|_| {
                     Error::new(format!(
@@ -58,10 +89,14 @@ macro_rules! space {
             /// Move on by a length in the same space. An extent that would run past
             /// what a position can name is full, which is a reason to seal it and
             /// not a reason to wrap.
+            ///
+            /// **Stops one short of the type's ceiling**, since the top value is
+            /// `NONE`. That is the same check either way — §8.1.6.2's point that the
+            /// sentinel rides along free.
             pub fn plus(self, len: $name) -> Result<$name> {
                 match self.0.checked_add(len.0) {
-                    Some(sum) => Ok($name(sum)),
-                    None => Err(Error::new(format!(
+                    Some(sum) if sum < u32::MAX => Ok($name(sum)),
+                    _ => Err(Error::new(format!(
                         concat!("an extent cannot reach ", $what, " byte {} plus {}"),
                         self.0, len.0
                     ))),
@@ -96,7 +131,41 @@ mod tests {
     #[test]
     fn running_off_the_end_is_an_error_not_a_wrap() {
         assert!(COff::new(u32::MAX).plus(COff::new(1)).is_err());
-        assert!(LOff::new(u32::MAX - 1).plus(LOff::new(1)).is_ok());
+        // ⚠️ And it stops one short of the ceiling, because the top value is NONE.
+        // This used to be `is_ok`, which would have produced a length equal to the
+        // sentinel — a full extent reporting "no value" (§8.1.6.2).
+        assert!(LOff::new(u32::MAX - 1).plus(LOff::new(1)).is_err());
+        assert_eq!(LOff::MAX.plus(LOff::ZERO).unwrap(), LOff::MAX);
+    }
+
+    /// The sentinel is the top of the range, not zero, because zero is a length a
+    /// caller can legitimately mean.
+    #[test]
+    fn nothing_is_the_top_of_the_range_and_zero_is_a_real_length() {
+        assert!(COff::NONE.is_none());
+        assert!(!COff::ZERO.is_none(), "zero bytes is a length, not an absence");
+        assert!(COff::ZERO.is_some());
+        assert!(COff::MAX.is_some());
+        assert_eq!(COff::MAX.get(), u32::MAX - 1);
+    }
+
+    /// A length equal to the sentinel is refused rather than silently becoming it,
+    /// which is the whole point of reserving a value.
+    #[test]
+    fn a_length_may_not_be_the_sentinel() {
+        assert!(LOff::of_len(u32::MAX as usize).is_err());
+        assert!(
+            LOff::of_len(u32::MAX as usize - 1).is_ok(),
+            "one below is the largest real length"
+        );
+    }
+
+    /// But it survives the wire, since a field that may be absent has to say so.
+    #[test]
+    fn the_sentinel_survives_the_wire() {
+        let sent = COff::NONE;
+        let back = COff::of_number(sent.number()).expect("none is a value on the wire");
+        assert!(back.is_none());
     }
 
     /// The wire carries 64-bit numbers, and a position that could not have come

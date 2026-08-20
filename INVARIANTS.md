@@ -85,14 +85,27 @@ out-of-order cache, and cumulative byte totals.
 **`ONE-PAST-THE-END-IS-REPRESENTABLE`** — a count and an index sharing a type leave room for one past the
 end, so the largest count is one below the type's maximum, or two below it if a value is reserved for
 "none".
-*Argued* §8.1.6.2 · *Enforced* **code** for `LOff` and `COff`, whose `plus` errors rather than wrapping;
-nothing enforces it for record counts, which are bare `u64` · *Checked*
-`running_off_the_end_is_an_error_not_a_wrap` in `common/src/offset.rs`
+*Argued* §8.1.6.2, §8.1.6.3 · *Enforced* **code** for `LOff` and `COff`, which now reserve `MAX` as
+`NONE`, stop `plus` one short of the ceiling, and refuse a length equal to the sentinel; record counts
+and ids are still bare integers (#86) · *Checked* four tests in `common/src/offset.rs`, including the one
+that **reversed**: a sum reaching `u32::MAX - 1 + 1` used to be allowed and produced a length equal to
+the sentinel
 *Breaks* only at the top of the range, which is where nothing is tested — and §9.1.3's `next` computes
 one past the end on **every** answer, so the expression is on the hot path even though the boundary is
 not. ⚠️ Two live consequences: §6's 4 GB logical cap is one byte outside the `u32` that enforces it
 (#89), and `records = 0` already means *unknown* for an open extent, which a real count of zero collides
 with (#90).
+
+**`EVERY-SPACE-RESERVES-A-SENTINEL`** — every space type reserves a value for *no value given*, whether
+or not anything uses it: `MAX` for measures, `0` for ids.
+*Argued* §8.1.6.3 · *Enforced* **code** for `LOff` and `COff`; ids rely on allocation starting at 1,
+which is code but not stated as a rule · *Checked*
+`nothing_is_the_top_of_the_range_and_zero_is_a_real_length`, `a_length_may_not_be_the_sentinel`
+*Breaks* not immediately, which is the point — a space that reserves nothing and later needs a sentinel
+has to lower its documented maximum, and that is a **format contract change** needing §13.2.5's
+parameter and an upgrade path. Reserving now costs one value; reserving later costs a version. ⚠️ And the
+sentinel must sit where the space has no legitimate value: at `MAX` for counts and lengths because zero is
+real, at `0` for ids because they are allocated from 1. Putting it at zero for a count is #90's live bug.
 
 **`SPACES-ARE-TYPES-WHEN-A-MIX-UP-IS-SILENT`** — two same-typed quantities that mean different things
 get different types whenever confusing them would produce a wrong answer rather than an error.
@@ -763,7 +776,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **key** (cryptographic) | §7.3 | `KEY-AND-SALT-COVER-ONE-PLAINTEXT`, `KEYS-NEVER-WHERE-USER-CODE-RUNS`, `DISK-KEYS-ONLY-ON-ENS`, `EXTENT-KEY-FROM-CREATING-SN`, `NO-TWO-SEGMENTS-SHARE-A-NONCE`, `MASTER-KEYS-ARE-NEVER-PRUNED`, `UNLOCKING-KEY-IS-GENERATED`, `SHARDS-ARE-NOT-STORED-WITH-THE-HARDWARE` |
 | **tombstone** | §8.3 | `A-TOMBSTONE-KEEPS-ITS-WIDTH`, `UPDATE-DELETE-PRESERVE-COUNTS` |
 | **stream flag** | §4.1.1 | `A-CAPABILITY-RESTORES-CHEAPLY-AND-WITHDRAWS-SLOWLY`, `THE-OFFICIAL-FLAG-STAYS-PERMISSIVE-UNTIL-CLEANUP-ENDS`, `A-NAME-IS-NOT-A-NEGATION`, `RARE-AND-TRANSIENT-FIELDS-GO-OUT-OF-LINE` |
-| **count** | §8.1.6.2 | `ONE-PAST-THE-END-IS-REPRESENTABLE`, `UNKEYED-COUNT-EXACT`, `UPDATE-DELETE-PRESERVE-COUNTS` |
+| **count** | §8.1.6.2 | `ONE-PAST-THE-END-IS-REPRESENTABLE`, `EVERY-SPACE-RESERVES-A-SENTINEL`, `UNKEYED-COUNT-EXACT`, `UPDATE-DELETE-PRESERVE-COUNTS` |
 | ⚠️ **logical offset** | §8.1.6, §8.2.2 | `LOGICAL-OFFSETS-DENSE`, `CANONICAL-OFFSET-SPACE`, `FIXED-OFFSET-ADVANCES`, `OFFSET-SNAPS-FORWARD`, `EXTENT-OFFSET-WRITE-ONCE`, `ONE-UNSEALED-EXTENT-UNKEYED`. *Measured in canonical length-stuffed bytes, not in the stored framing.* |
 | **media class** | §7.4 | `ONE-MEDIA-CLASS-PER-EXTENT` |
 | **object** | §3 | `READ-NAMES-THE-OBJECT`, `RECORD-NUMBER-STABLE`, `HINT-BOUND-BY-CAPABILITY`, `CAPABILITY-IS-MEMBERSHIP-ONLY`, `ZERO-REFERENCES-IS-A-BUG`, `ONE-UNSEALED-EXTENT-UNKEYED` |

@@ -384,6 +384,9 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | ⚠️ So §6's **4 GB** logical cap is one byte outside the `u32` enforcing it — the code is right, the doc is round (#89) | §8.1.6.2 |
 | ⚠️ And `records = 0` already means *unknown* for an open extent, colliding with a real zero (#90) | §8.1.6.2 |
 | Which is the best argument for the newtypes: the type owns the **sentinel** and the **boundary arithmetic**, at `u64`'s size | §8.1.6.2 |
+| **Every space reserves a sentinel**, used or not: the bound comparison exists anyway, so it is nearly free | §8.1.6.3 |
+| And uniform now beats a **format-contract change** later, which is what needing one later would cost | §8.1.6.3 |
+| Sentinel at **`MAX` for measures** (zero is a real length) and at **`0` for ids** (allocated from 1, so free) | §8.1.6.3 |
 | Because **double negatives read as emphasis of the negative** — a default of the language faculty, seen in novel languages | §4.1.1.0 |
 | Withdrawing a capability is **deferred**, but the **official flag stays permissive** until cleanup completes | §4.1.1.1 |
 | So the reliance rule is **unrepresentable to get wrong**: nothing can see a half-established restriction | §4.1.1.1 |
@@ -7477,6 +7480,53 @@ Put together, this is a better case for `ROff` and friends than catching mix-ups
   §4.7 budgets ~100 bytes for an extent record — so the niche-free encoding matters against a budget
   §14.1.2 says decides how many machines an object needs. A newtype gives `Option`-like ergonomics at
   `u64`'s size.
+
+#### 8.1.6.3 Settled: every space reserves a sentinel, used or not
+
+**Every one of these types gets a sentinel** (Decided, Bob, 2026-08-19), and the argument is marginal
+cost rather than need:
+
+> **A comparison has to happen anyway** to keep the maximum length representable — so comparing against
+> `MAX − 1` instead of `MAX` is the same instruction, and reserving the value is nearly free even where
+> nothing uses it.
+
+**And the uniformity is the real prize**, because the alternative is a migration. A space that reserves
+nothing today and needs a sentinel tomorrow has to lower its documented maximum, which is a change to a
+format contract — the kind §13.2.5 needs a parameter and an upgrade path for. Reserving now costs one
+value; reserving later costs a version.
+
+##### Where the sentinel sits differs by kind, and both are provably safe
+
+| Kind | Sentinel | Why there | Cost |
+|---|---|---|---|
+| **measures** — `ROff`, `LOff`, `COff`: counts, lengths, offsets | **`MAX`** | zero is a length a caller can legitimately mean, so it cannot be the absence | one value |
+| **ids** — `ObjectId`, `StreamId`, `ExtentId` | **`0`** | ids are allocated from **1** (`next_object`, `next_stream`, the SN's `Naming`), so zero is already impossible | **nothing** |
+
+**So the rule is uniform in kind rather than in literal value**, and the id case is genuinely free: it
+needs no headroom for one-past-the-end either, because nothing computes one past an id. §17.12's batch
+answer already relies on this, marking an absent name with a zero id — `Described::missing()` — so the
+convention exists and this only names it.
+
+##### Done for the two spaces that exist
+
+`LOff` and `COff` now carry `NONE`, `MAX`, `is_none()` and `is_some()`, and the checked constructors
+refuse a length equal to the sentinel rather than letting it become one. **One existing test reversed**,
+which is the useful part:
+
+```
+assert!(LOff::new(u32::MAX - 1).plus(LOff::new(1)).is_ok());   // was
+assert!(LOff::new(u32::MAX - 1).plus(LOff::new(1)).is_err());  // is
+```
+
+That sum used to be allowed and produced a length **equal to the sentinel** — a full extent whose
+logical end reads as *no value*. Nothing could reach it, since §6's cap bites long before, but it is the
+exact shape of the bug the reservation prevents.
+
+⚠️ **It also tightens §6's cap by one more byte**, which sharpens #89 rather than settling it: the
+largest logical extent is now 2^32 − 2. Restating §6's "4 GB" as 2^32 − 2 is honest and ugly, so #89's
+third option — **a round cap comfortably below the type's ceiling** — looks better than it did. The cap
+is a guess (§0) rather than a derived figure, so lowering it to a number with headroom costs capacity
+nobody is using and buys arithmetic nobody has to check.
 
 **The first row is the one to do, because the bug is not hypothetical.** §17.16.2 records it: three
 numbering spaces meet on the read path, all three are zero until an object outgrows its first extent,
