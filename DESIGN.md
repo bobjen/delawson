@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-133 things *not* decided.
+134 things *not* decided.
 
 **Priorities and framing**
 
@@ -319,6 +319,11 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | An instance may **mark itself broken and request a seal**; ***I* − *Q* + 1** of them force one, because the extent is then unappendable | §8.1.7.4 |
 | A single instance may trigger one — sealing is universally safe, so the cost is **metadata churn**, damped at the SN | §8.1.7.4 |
 | The mark is **durable and one-way**, and a marked instance fails every append **it sees** — so nobody counts, and the threshold is a consequence rather than a detector | §8.1.7.4.1 |
+| **Seal requests exist at all three levels** — object, stream, extent — because concatenation needs sealed inputs | §6.4, §8.6.1 |
+| For an **unkeyed** object that is one extent's work, since §6.3 and §8.1.1a-7 leave exactly one open extent | §6.4 |
+| **Top-down**: close the container before its contents, or a concurrent append is still entitled to a new extent | §6.4 |
+| **Ask the primary first, fall back to failure-mode sealing** — the fallback is slower *and* seals above the durable length | §6.4.1 |
+| A requested seal **quiesces**, so it discards nothing; only handover and broken instances truncate | §6.4.1, §7.2.4 |
 | **Every read names the object**, whatever else it names: the ACL is the object's, and no reverse edge recovers it | §9.1.3.4, §4.6.6 |
 | A range start is the **object**, optionally **how far the caller already resolved**, and a **position**; a stale narrowing falls back to the object | §9.1.3.4 |
 | A bare offset **snaps forward** to the next record boundary, so independently computed chunk boundaries are a **partition** — the Hadoop split rule | §9.1.3.4 |
@@ -4976,6 +4981,92 @@ the same reason it may not take an append: it would renumber what follows.
 Why a stream seals in the first place is a separate question with a separate answer: its SN's memory
 is what bounds how many extents it can hold (§14.1), so a stream fills. `extents.per_stream` is that
 limit, and on a test cluster it is set low so a stream sealing is the common path (§17.12).
+
+### 6.4 Sealing on request, at all three levels
+
+**There are requests to seal an object, its streams, and its extents** (Asserted, Bob, 2026-08-19).
+Sealing so far has been something that *happens* — an extent fills (§6), a stream runs out of extents
+(§6.3), an instance breaks (§8.1.7.4). This is sealing because somebody asked.
+
+**It exists because concatenation requires sealed inputs** (§8.6.1). That is not a nicety: §8.6 makes
+parallel-partitions-then-concatenate the only way to build a large object at aggregate bandwidth, so
+a writer that has finished a partition needs a way to say so. Without a seal request the writer's
+options are to wait for the partition to happen to fill or to leave the extent open for ever, and
+neither is a way to finish a job.
+
+**And for an unkeyed object it is one extent's worth of work, which is the whole payoff of two earlier
+decisions.** §6.3 makes every stream before the last sealed by construction, and §8.1.1a-7 gives an
+unkeyed object exactly one unsealed extent. So:
+
+| Sealing | Unkeyed | Keyed |
+|---|---|---|
+| an **extent** | its primary seals it | the same |
+| a **stream** | mark it closed, then seal its **one** open extent | the same |
+| an **object** | mark it closed, then its **one** open stream, then that stream's **one** open extent | several unsealed extents at once, so a fan-out |
+
+**So the three levels are one path with different starting points**, and only keyed objects make it a
+recursion worth worrying about. The partial-failure question below is correspondingly small for
+unkeyed and real for keyed.
+
+**Top-down, and the order is not a preference.** Mark the container closed *before* sealing its
+contents, because the other order races: seal the open extent first and a concurrent append asks the
+SN for the next one, which it is still entitled to give. Closing the object stops new streams,
+closing the stream stops new extents, and only then is there a fixed thing to seal. Same direction as
+§13.1's sync loops, for the same reason — the level above is what can still create work.
+
+#### 6.4.1 Ask the primary first, and fall back to failure-mode sealing
+
+⚠️ **A seal request must try the normal path before the SN-coordinated one** (Asserted, Bob,
+2026-08-19): ask the primary of each open extent to seal the ordinary way, and only fall back to
+§8.1.7's failure-mode sealing if that does not work.
+
+**The cost argument is the obvious one.** The normal seal is the primary saying where the extent ends,
+which it knows because it assigned every offset — one hop. Failure-mode sealing is a quorum read:
+poll the instances, discard the smallest *I* − *Q* responses, take the order statistic, and coordinate
+the result at the SN. Several round trips and a decision, against one hop and an answer.
+
+**And a user-triggered seal is not a failure**, which is why the cheap path usually works. Nothing has
+gone wrong; a writer has finished. The primary is almost certainly alive, because the request arrives
+on the heels of appends it was just serving.
+
+**The stronger argument is that the fallback produces a worse answer, not merely a slower one.**
+§8.1.7.1 shows failure-mode sealing never seals *below* the durable length but may seal *above* it —
+which is a commitment to repair up to that length rather than a claim the bytes are there. A normal
+seal has no such gap: the primary knows the durable length exactly, so it seals exactly there.
+
+| | Round trips | Seals at | Leaves behind |
+|---|---|---|---|
+| **Normal**, via the primary | one | the durable length, **exactly** | nothing |
+| **Failure-mode**, via the SN | several | at or **above** it | a repair obligation, and possibly a hole to fill |
+
+So trying the cheap path first **costs nothing when it works and loses nothing when it does not**,
+which is the shape that makes a fallback unambiguously right rather than a tuning question. What is
+left to choose is how long to try before giving up, which is §8.1.7.2's question and not a new one.
+
+**A requested normal seal quiesces the extent rather than cutting it.** The primary stops accepting
+appends, lets the ones in flight settle, and seals at the durable length that results. So it discards
+nothing, truncates nothing, and has no interaction with §7.2.4 at all — which is worth saying because
+"seal" now names two operations that look similar and differ in exactly that respect:
+
+| Trigger | Discards anything? |
+|---|---|
+| a request (§6.4), or an extent filling (§6) | **no** — it seals where the bytes already stop |
+| handover or a broken instance (§7.2.4, §8.1.7.4) | **yes**, above the durable watermark, which is why that path must seal |
+
+⚠️ **A writer racing a seal loses, and there is no way to be kind about it.** An append accepted but
+not yet durable when the seal lands is refused, and the writer cannot retry into the next extent
+because the stream is closed and cannot be given one. That is the correct outcome — the object is
+being sealed, so appends to it are ending — but it is user-visible, and a writer that wants a clean
+finish should stop appending before asking.
+
+**Seal requests are idempotent.** Sealing something already sealed succeeds and reports what it came
+to, because a retry after a timeout is the ordinary case and the fallback above makes timeouts
+expected.
+
+⚠️ **What a partial seal answers is undecided.** A keyed object with many unsealed extents may seal
+most and fail one, and "ok" is wrong while a bare failure throws away the work that succeeded. The
+shape §9.1.3 already uses — say what was done and what to ask for next — looks right, and idempotence
+is what makes retrying the whole request cheap. Left open (§16.134).
 
 ## 7. The storage pipeline
 
@@ -11783,6 +11874,12 @@ Roughly in order of how much else depends on them.
      instance may request a seal, so a flapping EN can produce short extents across every extent it
      holds. The SN records every seal and is therefore where both are damped, but the threshold or rate
      limit is unchosen.
+
+134. **What a partial seal answers** (§6.4.1). A keyed object with many unsealed extents may seal most and
+     fail one. "Ok" is wrong, and a bare failure discards the work that succeeded. §9.1.3's shape — say what
+     was done and what to ask for next — looks right, and idempotence is what makes retrying the whole
+     request cheap, but neither the answer nor whether the operation is resumable is chosen. Unkeyed objects
+     do not have the problem, since they have one open extent.
 
 **Closed** since earlier drafts:
 

@@ -322,6 +322,29 @@ request · *Checked* unit test over translation
 *Breaks* nothing immediately, but it is what `CANONICAL-OFFSET-SPACE` is protecting, and the two must
 be read together.
 
+**`SEAL-CLOSES-TOP-DOWN`** — a container is marked closed before anything inside it is sealed: object,
+then stream, then extent.
+*Argued* §6.4 · *Enforced* design only · *Checked* not yet; the test that matters races an append
+against a seal request
+*Breaks* sealing the open extent first leaves the level above still entitled to hand out another, so
+a concurrent append reopens what was just closed and the seal never converges. Same direction as
+§13.1's sync loops, for the same reason.
+
+**`REQUESTED-SEAL-DISCARDS-NOTHING`** — a seal from a request, or from an extent filling, quiesces and
+seals where the bytes already stop. Only handover and a broken instance truncate.
+*Argued* §6.4.1, §7.2.4 · *Enforced* code for the filling case (`take` seals at `extent.end`); the
+requested case is design only · *Checked* unit tests cover the filling case
+*Breaks* nothing directly — it is here because "seal" now names two operations that look alike and
+differ in exactly this respect, and confusing them means either truncating when nothing needed it or
+failing to truncate when something did (`TRUNCATION-SEALS`).
+
+**`SEAL-REQUESTS-ARE-IDEMPOTENT`** — sealing something already sealed succeeds and reports what it
+came to.
+*Argued* §6.4.1 · *Enforced* design only · *Checked* not yet
+*Breaks* retrying becomes unsafe, and the normal-then-failure-mode fallback makes timeouts the
+ordinary case rather than an exception — so a non-idempotent seal is a seal that cannot be retried
+exactly when it most needs to be.
+
 **`SEALED-EXTENT-IMMUTABLE`** — a sealed extent's base is never rewritten in place. Update and delete
 append to its log.
 *Argued* §4.2, §8.3 · *Enforced* design only · *Checked* not yet
@@ -572,7 +595,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **record** | §8.2 | `EXTENT-HOLDS-WHOLE-RECORDS`, `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `INCOMPLETE-RECORD-NOT-DURABLE`, `RECORD-FITS-ONE-EXTENT`, `TERMINATOR-NOT-IN-DATA`, `OFFSET-SNAPS-FORWARD`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `EXTENT-SEALS-BETWEEN-RECORDS` |
 | **record number** | §3 | `RECORD-NUMBER-STABLE`, `RECORD-NUMBERS-DENSE`, `UNKEYED-COUNT-EXACT`, `UPDATE-DELETE-PRESERVE-COUNTS`, `PATH-IS-THE-PORTABLE-NAME` |
 | **reference** | §4.6 | `NO-CLUSTER-NAMES-IN-DATA-PLANE`, `REVERSE-EDGE-IS-A-COUNT`, `COUNTS-ARE-RECOMPUTABLE`, `ZERO-REFERENCES-IS-A-BUG`, `POSITION-FACTS-IN-REFERRER`, `REVENUE-INVARIANT-UNDER-REGROUPING` |
-| **seal** (extent) | §6 | `EXTENT-SEALS-BETWEEN-RECORDS`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATION-SEALS`, `SEALED-EXTENT-IMMUTABLE`, `RECORD-NUMBERS-DENSE`, `UNAPPENDABLE-EXTENT-SEALS` |
+| **seal** (extent) | §6 | `EXTENT-SEALS-BETWEEN-RECORDS`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATION-SEALS`, `SEALED-EXTENT-IMMUTABLE`, `RECORD-NUMBERS-DENSE`, `UNAPPENDABLE-EXTENT-SEALS`, `SEAL-CLOSES-TOP-DOWN`, `REQUESTED-SEAL-DISCARDS-NOTHING`, `SEAL-REQUESTS-ARE-IDEMPOTENT` |
 | **seal** (wire segment) | §17.5a | `NO-TWO-SEGMENTS-SHARE-A-NONCE`. ⚠️ *An unrelated sense of the word; `common/src/seal.rs` is this one.* |
 | **stream** | §4.1 | `STREAM-IDENTITY-OWNED`, `SN-NOT-IN-WRITE-PATH`, `ONE-REQUEST-IN-FLIGHT-PER-STREAM`, `EXTENT-KEY-FROM-CREATING-SN`, `READ-NAMES-THE-OBJECT` |
 | **summary** | §4.5 | `TAIL-ONLY-SUMMARIES-EXACT`, `UNKEYED-COUNT-EXACT`, `COUNTS-ARE-RECOMPUTABLE` |
