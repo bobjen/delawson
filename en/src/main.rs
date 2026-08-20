@@ -23,6 +23,7 @@
 use common::block::Holds;
 use common::config::ENConfig;
 use common::offset::{COff, LOff};
+use common::range::{Budget, Covered, Piece, Range};
 use common::server::{self, Process, Reply, Service};
 use common::wire::{AppendBlock, Arg, Op, Request, Response, Status};
 use common::{Error, Result, logw};
@@ -62,10 +63,10 @@ struct Extent {
 struct Append {
     /// Which extent, as an index into the extent table.
     extent: usize,
-    /// Where in the extent's stored bytes it sits. Nothing in a running process
-    /// reads it back yet — a reader asks for a block by record, not by offset —
-    /// and what will is the device write and the journal that describes it.
-    #[allow(dead_code)]
+    /// Where in the extent's stored bytes it sits, which is what puts the blocks of
+    /// an extent in order. **Offset order, not record order**, because a secondary
+    /// may be told of its blocks in any order and because a block completing no
+    /// record has no record to sort by (§8.2.4).
     offset: COff,
     /// The extent-local number of the first record this block completed — which is
     /// how a read finds the block holding a record **without parsing anything**.
@@ -77,10 +78,10 @@ struct Append {
     bytes: Vec<u8>,
 }
 
-impl Append {
-    fn covers(&self, record: u64) -> bool {
-        record >= self.first_record && record < self.first_record + self.holds.records
-    }
+/// The blocks a range read is answered with, and what they came to.
+struct Ranged<'a> {
+    blocks: Vec<&'a Append>,
+    covered: Covered,
 }
 
 /// What became of an append: a place in the extent, or an extent that is closed.
@@ -384,15 +385,61 @@ impl Extents {
         Ok(Truncated { discarded, records, length })
     }
 
-    /// The block holding a record, whole.
+    /// The blocks of an extent from a record onward, whole, until the budget is met.
     ///
-    /// ⚠️ **Whole, even though the caller asked for one record.** A block is
-    /// compressed, so cutting a record out of it means decompressing — CPU this tier
-    /// does not have, for a job belonging to whoever compressed it. Finding *which*
-    /// block is arithmetic on record counts, and that this tier can do.
-    fn block(&self, sn: u32, id: u64, record: u64) -> Option<&Append> {
-        let place = self.at.get(&(sn, id))?;
-        self.appends.iter().find(|append| append.extent == *place && append.covers(record))
+    /// ⚠️ **Whole blocks, even for a one-record range.** A block is compressed, so
+    /// cutting a record out of it means decompressing — CPU this tier does not have,
+    /// for a job belonging to whoever compressed it (§9.1). Finding *which* blocks is
+    /// arithmetic on the counts the writer supplied, and that this tier can do.
+    ///
+    /// `None` means no block holds that record. Ordered by offset rather than by
+    /// record, because a secondary may have been told about its blocks in any order
+    /// and because a block completing no record has no record to sort by.
+    fn range(&self, sn: u32, id: u64, from: u64, budget: Budget) -> Result<Option<Ranged<'_>>> {
+        let Some(&place) = self.at.get(&(sn, id)) else { return Ok(None) };
+        let mut blocks: Vec<&Append> =
+            self.appends.iter().filter(|append| append.extent == place).collect();
+        blocks.sort_by_key(|append| append.offset);
+
+        // Where to start: the block that completes `from` or a later record, or the
+        // one `from` falls inside. ⚠️ **A block completing no record still counts** —
+        // it sits inside a record an earlier block began (§8.2.4), and its bytes are
+        // part of that record, so a range over that record has to carry it.
+        let Some(first) = blocks
+            .iter()
+            .position(|a| a.first_record >= from || from < a.first_record + a.holds.records)
+        else {
+            return Ok(None);
+        };
+
+        let mut covered = Covered::default();
+        let mut taken: Vec<&Append> = Vec::new();
+        for block in &blocks[first..] {
+            covered.took(
+                block.holds.records,
+                LOff::of_len(block.holds.logical as usize)?,
+                COff::of_len(block.bytes.len())?,
+            );
+            taken.push(block);
+            // ⚠️ Two rules, and the order of the test is both of them. The budget is
+            // checked **after** taking a block, so one block always comes back even
+            // past it (§9.1.3.6) — a smaller budget must not return nothing, or a
+            // caller with a small buffer retries for ever. And stopping is only
+            // allowed with no record open, so `next` is a real record number rather
+            // than the one we started at: §8.2.3's durability gate, arriving on the
+            // read path for the same reason.
+            if budget.met(&covered) && !block.holds.open_record {
+                break;
+            }
+        }
+
+        // Where to carry on. The last block taken completed records up to here — and
+        // if it completed none, because the extent ran out mid-record, this is that
+        // open record's own number and `more` is false, so a caller stops rather than
+        // asking for the same thing again.
+        covered.next = taken.last().map_or(from, |last| last.first_record + last.holds.records);
+        covered.more = first + taken.len() < blocks.len();
+        Ok(Some(Ranged { blocks: taken, covered }))
     }
 
     /// The second an extent here was made in, which is the rest of its name.
@@ -642,44 +689,79 @@ impl EN {
     /// back beside the bytes is what makes that possible: the logical size, the
     /// record the block starts at, how many it holds, and the CRC.
     fn read(&self, request: &Request) -> Response {
-        let [Arg::Number(sn), Arg::Number(extent), Arg::Number(created), Arg::Number(record)] =
+        let [Arg::Number(sn), Arg::Number(extent), Arg::Number(created), rest @ ..] =
             request.args.as_slice()
         else {
             return Response::error(
                 Status::BadRequest,
-                "read-extent takes an SnId, an extent, a second and a record",
+                "read-extent takes an SnId, an extent, a second and a range",
             );
         };
+        let range = match Range::of_args(rest) {
+            Ok((range, [])) => range,
+            _ => {
+                return Response::error(
+                    Status::BadRequest,
+                    "read-extent takes an SnId, an extent, a second and a range",
+                );
+            }
+        };
+        // The extent-local record to start at. The other two start forms need a
+        // prefix sum of logical lengths, which §4.5 keeps lazily and nothing here
+        // has — so they are well-formed requests for something unbuilt (§9.1.3.4).
+        let Some(from) = range.start.record() else {
+            return Response::error(
+                Status::Unimplemented,
+                "starting from a logical offset needs a prefix sum nothing keeps yet",
+            );
+        };
+
         let held = self.held.lock().expect("extents");
         match held.created(*sn as u32, *extent) {
             None => {
-                Response::error(Status::NotFound, format!("no extent {extent} of sn {sn} here"))
+                return Response::error(
+                    Status::NotFound,
+                    format!("no extent {extent} of sn {sn} here"),
+                );
             }
             // The second is part of the name, so a reader asking with the wrong one
             // is asking about an extent that no longer exists rather than this one.
-            Some(second) if second != *created => Response::error(
-                Status::NotFound,
-                format!("extent {extent} of sn {sn} was made in second {second}"),
-            ),
-            Some(_) => match held.block(*sn as u32, *extent, *record) {
-                Some(block) => Response {
-                    id: 0,
-                    status: Status::Ok,
-                    args: vec![
-                        Arg::Number(block.holds.logical),
-                        Arg::Number(block.first_record),
-                        Arg::Number(block.holds.records),
-                        Arg::Flag(block.holds.crc.is_some()),
-                        Arg::Number(block.holds.crc.unwrap_or(0)),
-                        Arg::Bytes(block.bytes.clone()),
-                    ],
-                },
-                None => Response::error(
+            Some(second) if second != *created => {
+                return Response::error(
                     Status::NotFound,
-                    format!("extent {extent} of sn {sn} has no record {record}"),
-                ),
-            },
+                    format!("extent {extent} of sn {sn} was made in second {second}"),
+                );
+            }
+            Some(_) => {}
         }
+        let ranged = match held.range(*sn as u32, *extent, from, range.budget) {
+            Ok(Some(ranged)) => ranged,
+            Ok(None) => {
+                return Response::error(
+                    Status::NotFound,
+                    format!("extent {extent} of sn {sn} has no record {from}"),
+                );
+            }
+            Err(e) => return Response::error(Status::Internal, e.to_string()),
+        };
+
+        // What it covered first, then the blocks. Built through the shapes in
+        // `common` so that nothing here and nothing in the FE counts positions
+        // independently — §17.13.3's mistake.
+        let mut args = ranged.covered.args();
+        for block in ranged.blocks {
+            args.extend(
+                Piece {
+                    logical: block.holds.logical,
+                    first_record: block.first_record,
+                    records: block.holds.records,
+                    crc: block.holds.crc,
+                    bytes: block.bytes.clone(),
+                }
+                .args(),
+            );
+        }
+        Response { id: 0, status: Status::Ok, args }
     }
 }
 
@@ -1017,21 +1099,120 @@ mod tests {
         assert_eq!(held.read(0, 1), stored, "handed back as it arrived");
     }
 
-    /// A read finds the block holding a record by arithmetic on the counts, and
-    /// returns the whole thing.
+    /// A point read is a range of one record: it finds the block holding it by
+    /// arithmetic on the counts and returns the whole thing.
     #[test]
     fn a_read_returns_the_block_holding_the_record() {
         let en = EN::new(testing::en_config());
         append(&en, 1, b"one\ntwo\n");
         append(&en, 1, b"three\nfour\nfive\n");
         let held = en.held.lock().unwrap();
-        assert_eq!(held.block(0, 1, 0).unwrap().bytes, b"one\ntwo\n");
-        assert_eq!(held.block(0, 1, 1).unwrap().bytes, b"one\ntwo\n");
-        assert_eq!(held.block(0, 1, 2).unwrap().bytes, b"three\nfour\nfive\n");
-        assert_eq!(held.block(0, 1, 4).unwrap().bytes, b"three\nfour\nfive\n");
-        assert!(held.block(0, 1, 5).is_none(), "past the end");
-        // And the block says where it starts, so a reader can index into it.
-        assert_eq!(held.block(0, 1, 4).unwrap().first_record, 2);
+        let one = |record| {
+            held.range(0, 1, record, Budget::Records(1))
+                .expect("no arithmetic to fail")
+                .map(|ranged| ranged.blocks[0].bytes.clone())
+        };
+        assert_eq!(one(0).unwrap(), b"one\ntwo\n");
+        assert_eq!(one(1).unwrap(), b"one\ntwo\n");
+        assert_eq!(one(2).unwrap(), b"three\nfour\nfive\n");
+        assert_eq!(one(4).unwrap(), b"three\nfour\nfive\n");
+        assert!(one(5).is_none(), "past the end");
+
+        // And the answer says where the block starts, so a reader can index into it,
+        // and where to carry on, which is what makes it a range.
+        let ranged = held.range(0, 1, 4, Budget::Records(1)).unwrap().expect("a block");
+        assert_eq!(ranged.blocks[0].first_record, 2);
+        assert_eq!(ranged.covered.next, 5, "one past the last record it completed");
+        assert!(!ranged.covered.more, "and this extent has no more blocks");
+    }
+
+    /// A budget in each of the three spaces, over the same two blocks. The caller
+    /// names one and the answer reports all three (§9.1.3.6).
+    #[test]
+    fn a_budget_is_honoured_in_whichever_space_it_names() {
+        let en = EN::new(testing::en_config());
+        append(&en, 1, b"one\ntwo\n"); // 2 records, 8 bytes
+        append(&en, 1, b"three\nfour\nfive\n"); // 3 records, 16 bytes
+        let held = en.held.lock().unwrap();
+        let ranged = |budget| held.range(0, 1, 0, budget).unwrap().expect("blocks");
+
+        // Enough for the first block only, in each space.
+        for budget in [Budget::Records(2), Budget::Logical(8), Budget::Compressed(8)] {
+            let one = ranged(budget);
+            assert_eq!(one.blocks.len(), 1, "{budget:?}");
+            assert_eq!((one.covered.records, one.covered.logical), (2, 8), "{budget:?}");
+            assert_eq!(one.covered.compressed, 8, "nothing compressed, so equal");
+            assert_eq!(one.covered.next, 2, "{budget:?}");
+            assert!(one.covered.more, "{budget:?}");
+        }
+        // Enough for both.
+        for budget in [Budget::Records(5), Budget::Logical(24), Budget::Compressed(24)] {
+            let both = ranged(budget);
+            assert_eq!(both.blocks.len(), 2, "{budget:?}");
+            assert_eq!((both.covered.records, both.covered.logical), (5, 24), "{budget:?}");
+            assert_eq!(both.covered.next, 5, "{budget:?}");
+            assert!(!both.covered.more, "{budget:?}");
+        }
+    }
+
+    /// ⚠️ One block always comes back, even past the budget. A budget below the
+    /// first block's size returning nothing would be a livelock: the caller retries
+    /// for ever and never learns it asked for too little.
+    #[test]
+    fn a_budget_smaller_than_a_block_still_gets_a_block() {
+        let en = EN::new(testing::en_config());
+        append(&en, 1, b"one\ntwo\n");
+        append(&en, 1, b"three\n");
+        let held = en.held.lock().unwrap();
+        for budget in [Budget::Records(0), Budget::Logical(0), Budget::Logical(1)] {
+            let ranged = held.range(0, 1, 0, budget).unwrap().expect("a block");
+            assert_eq!(ranged.blocks.len(), 1, "{budget:?}");
+            assert_eq!(ranged.covered.logical, 8, "and it is reported at its real size");
+            assert!(ranged.covered.more);
+        }
+    }
+
+    /// ⚠️ A range never stops with a record open, so `next` is always a real record
+    /// number rather than the one it started at. That is §8.2.3's durability gate
+    /// arriving on the read path: a caller resuming from `next` must make progress.
+    #[test]
+    fn a_range_does_not_stop_in_the_middle_of_a_record() {
+        let en = EN::new(testing::en_config());
+        append(&en, 1, b"one\n");
+        // A record spanning two blocks: the first completes nothing.
+        let opened = Holds::of(Framing::Lf, b"", b"half a rec", None).unwrap();
+        en.take(&AppendBlock { holds: opened, ..block(0, 1, b"half a rec") }, ROOM).unwrap();
+        let closed = Holds::of(Framing::Lf, b"half a rec", b"ord\n", None).unwrap();
+        en.take(&AppendBlock { holds: closed, ..block(0, 1, b"ord\n") }, ROOM).unwrap();
+
+        let held = en.held.lock().unwrap();
+        // A one-record budget from record 1 cannot stop after the opening block,
+        // because that block completed nothing and `next` would be 1 again.
+        let ranged = held.range(0, 1, 1, Budget::Records(1)).unwrap().expect("blocks");
+        assert_eq!(ranged.blocks.len(), 2, "the opener and the closer");
+        assert_eq!(ranged.blocks[0].bytes, b"half a rec");
+        assert_eq!(ranged.covered.records, 1);
+        assert_eq!(ranged.covered.next, 2, "past the record that spanned them");
+        assert!(!ranged.covered.more);
+    }
+
+    /// A block that completes no record is still part of the answer, because its
+    /// bytes are part of a record somebody asked for. The old point read could not
+    /// find one at all.
+    #[test]
+    fn a_block_completing_no_record_is_carried_anyway() {
+        let en = EN::new(testing::en_config());
+        let opened = Holds::of(Framing::Lf, b"", b"start", None).unwrap();
+        en.take(&AppendBlock { holds: opened, ..block(0, 1, b"start") }, ROOM).unwrap();
+        let held = en.held.lock().unwrap();
+        // Record 0 has begun and not finished, so there is nothing complete to
+        // report — but the bytes that exist come back, and `more` is false because
+        // the extent holds nothing further.
+        let ranged = held.range(0, 1, 0, Budget::Records(1)).unwrap().expect("blocks");
+        assert_eq!(ranged.blocks.len(), 1);
+        assert_eq!(ranged.covered.records, 0);
+        assert_eq!(ranged.covered.next, 0, "record 0 is still open");
+        assert!(!ranged.covered.more, "so a caller stops rather than asking again");
     }
 
     /// A secondary puts the append where the primary said, and does not choose.

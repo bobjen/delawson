@@ -16,6 +16,7 @@ use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
 use common::placement;
 use common::random::Rng;
+use common::range::{Budget, Covered, Piece, Range, Start};
 use common::wire::{Arg, Op, Request, Response, Status};
 use common::{Error, Result};
 use std::collections::HashMap;
@@ -315,17 +316,31 @@ enum Cmd {
         #[command(flatten)]
         at: At,
     },
-    /// Read records in order.
+    /// Read records in order, from a record number, following the answer's
+    /// continuation until there is no more.
+    ///
+    /// A budget names one of three spaces (§9.1.3.6) and the answer reports all
+    /// three. Naming none means logical bytes, because a buffer is the thing a
+    /// caller is certain about.
     Scan {
         path: String,
-        /// Record number or key to start at.
+        #[arg(long, default_value = "lf")]
+        framing: String,
+        /// Record number to start at.
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+        /// Stop before this record number. The scan may stop sooner.
+        ///
+        /// Not `--to`, which is the global argument naming the process to talk to —
+        /// and clap resolves that collision by panicking at run time rather than at
+        /// build time, so the name matters.
         #[arg(long)]
-        from: Option<String>,
-        /// Record number or key to stop before.
-        #[arg(long)]
-        to: Option<String>,
-        #[arg(long)]
-        limit: Option<u64>,
+        before: Option<u64>,
+        #[command(flatten)]
+        budget: Wants,
+        /// Stop after this many requests, so a mistake is not an unbounded loop.
+        #[arg(long, default_value_t = 1000)]
+        rounds: usize,
     },
     /// How many records an object holds.
     Count { path: String },
@@ -347,6 +362,34 @@ struct At {
     record: Option<u64>,
     #[arg(long)]
     key: Option<String>,
+}
+
+/// How much one answer may carry. One space, never two: a caller cannot know the
+/// compression ratio in advance, so a request bounding two would satisfy neither
+/// (§9.1.3.6).
+#[derive(clap::Args)]
+#[group(multiple = false)]
+struct Wants {
+    /// At most this many records.
+    #[arg(long)]
+    records: Option<u64>,
+    /// At most this many bytes before compression, which bounds the buffer.
+    #[arg(long)]
+    logical_bytes: Option<u64>,
+    /// At most this many bytes as stored, which bounds the network and the bill.
+    #[arg(long)]
+    compressed_bytes: Option<u64>,
+}
+
+impl Wants {
+    fn budget(&self) -> Budget {
+        match (self.records, self.logical_bytes, self.compressed_bytes) {
+            (Some(n), _, _) => Budget::Records(n),
+            (_, Some(n), _) => Budget::Logical(n),
+            (_, _, Some(n)) => Budget::Compressed(n),
+            _ => Budget::Logical(Range::DEFAULT_LOGICAL),
+        }
+    }
 }
 
 impl At {
@@ -566,6 +609,20 @@ fn run(cli: Cli) -> Result<()> {
                 timeout,
             };
             bench_info(&target, &plan, &cluster.messaging)
+        }
+        Cmd::Scan { path, framing, from, before, budget, rounds } => {
+            let target = resolve(&cluster, &cli, ServiceKind::Fe)?;
+            let mut conn = open(&target, timeout, &cluster.messaging)?;
+            scan(
+                &mut conn,
+                &target,
+                path,
+                Framing::parse(framing)?,
+                *from,
+                *before,
+                budget.budget(),
+                *rounds,
+            )
         }
         cmd => {
             let request = build(cmd)?;
@@ -1078,35 +1135,163 @@ fn object(target: &Target, response: &Response) -> Result<()> {
 /// the CRC against what it promised, parses by the framing, and takes the record it
 /// wanted. Nothing in between ever looked inside, and nothing in between could have
 /// checked this.
+/// Every record a range answer holds, in order, with the number each one has.
+///
+/// **This is the far end of the chain the client started when it appended.** It
+/// compressed each block and computed its CRC going in; here it decompresses, checks
+/// the CRC against what it promised, parses by the framing, and numbers what it
+/// finds. Nothing in between ever looked inside, and nothing in between could have
+/// checked this.
+fn records_of(framing: Framing, pieces: &[Piece]) -> Result<Vec<(u64, Vec<u8>)>> {
+    let mut found = Vec::new();
+    // ⚠️ A record may span blocks (§8.2.3), so the tail of one block is carried into
+    // the next rather than parsed on its own. A block that completed no record
+    // contributes only carry.
+    let mut carry: Vec<u8> = Vec::new();
+    let mut numbering = pieces.first().map_or(0, |piece| piece.first_record);
+    for piece in pieces {
+        let block = expand(Compress::Lz4, &piece.bytes, piece.logical)?;
+        if let Some(crc) = piece.crc
+            && crc != common::crc::of(&block)
+        {
+            return Err(Error::new(format!(
+                "{} bytes came back and do not match the CRC they were written with",
+                block.len()
+            )));
+        }
+        carry.extend_from_slice(&block);
+        // Whole records out of what has accumulated; whatever is left over stays.
+        // `measure` says how many bytes those took, which is the only way to know
+        // for a framing whose boundary is not a fixed width.
+        let (_, taken) = framing.measure(&carry);
+        for record in framing.records(&carry) {
+            found.push((numbering, record.to_vec()));
+            numbering += 1;
+        }
+        carry.drain(..taken);
+    }
+    Ok(found)
+}
+
+/// One record out of a range answer, which is what a point read asks for.
 fn record(target: &Target, framing: Framing, want: u64, response: &Response) -> Result<()> {
-    let [
-        Arg::Number(logical),
-        Arg::Number(first_record),
-        Arg::Number(_records),
-        Arg::Flag(has_crc),
-        Arg::Number(crc),
-        Arg::Bytes(stored),
-    ] = response.args.as_slice()
-    else {
+    let Ok((_covered, rest)) = Covered::of_args(&response.args) else {
         return report(target, response);
     };
-
-    let block = expand(Compress::Lz4, stored, *logical)?;
-    if *has_crc && *crc != common::crc::of(&block) {
-        return Err(Error::new(format!(
-            "{} bytes came back and do not match the CRC they were written with",
-            block.len()
-        )));
-    }
-    let within = want.saturating_sub(*first_record);
-    let Some(found) = framing.records(&block).nth(within as usize) else {
-        return Err(Error::new(format!("that block does not hold record {want}")));
+    let pieces = Piece::all_of_args(rest)?;
+    let found = records_of(framing, &pieces)?;
+    let Some((_, bytes)) = found.iter().find(|(number, _)| *number == want) else {
+        return Err(Error::new(format!("that answer does not hold record {want}")));
     };
-    match std::str::from_utf8(found) {
+    match std::str::from_utf8(bytes) {
         Ok(text) => println!("{text}"),
-        Err(_) => println!("{} {} bytes, not text", target.identity, found.len()),
+        Err(_) => println!("{} {} bytes, not text", target.identity, bytes.len()),
     }
     Ok(())
+}
+
+/// Records in order, following each answer's continuation until there is no more.
+///
+/// ⚠️ **The continuation is a record number the store computed, never an offset this
+/// client worked out from where the bytes stopped** (§9.1.3). That is the whole point
+/// of the scheme: a caller resuming from a row is resuming from a name, and a caller
+/// resuming from an offset is resuming from a hint that is allowed to move.
+///
+/// **Serial, and §9.1.3.1 says why that is the cost.** Each request waits for the
+/// previous answer to learn where to start, so a large object pays a round trip per
+/// page. Consistent read is what would let the boundaries be computed instead of
+/// discovered, and turn this loop into requests issued all at once.
+#[allow(clippy::too_many_arguments)]
+fn scan(
+    conn: &mut Conn,
+    target: &Target,
+    path: &str,
+    framing: Framing,
+    from: u64,
+    before: Option<u64>,
+    budget: Budget,
+    rounds: usize,
+) -> Result<()> {
+    let mut at = from;
+    let mut total = Covered::default();
+    let mut asked = 0;
+    let mut printed = 0u64;
+    for _ in 0..rounds {
+        if before.is_some_and(|stop| at >= stop) {
+            break;
+        }
+        let mut request = Request::new(Op::ReadRecord).text(path);
+        request.args.extend(Range { start: Start::Record(at), budget }.args());
+        let answer = conn.call(&request)?;
+        asked += 1;
+        // Running off the end is how a scan of an object whose length it does not
+        // know finds out, so it is the ordinary way to stop rather than a failure.
+        if answer.status == Status::NotFound {
+            break;
+        }
+        if answer.status != Status::Ok {
+            return report(target, &answer);
+        }
+        let (covered, shown) = ranged(target, framing, &answer, before)?;
+        total.records += covered.records;
+        total.logical += covered.logical;
+        total.compressed += covered.compressed;
+        printed += shown;
+        // ⚠️ No progress means stop, whatever the answer said. A continuation that
+        // does not advance would otherwise be an unbounded loop, and this is the one
+        // place a client can defend itself against one.
+        if covered.next <= at || !covered.more {
+            break;
+        }
+        at = covered.next;
+    }
+    // The stored figure is the one that costs, since §12.3 bills compressed bytes —
+    // so it is reported whatever the budget was named in. **The record count is very
+    // nearly uncorrelated with cost**: one record and a million cost about the same
+    // if they arrive in the same 2 MB, which is why a caller that wants to control
+    // its bill has to budget in `--compressed-bytes` and gets no such control from
+    // `--records`.
+    //
+    // `shown` differs from `records` only when `--before` trimmed the display, which
+    // is a convenience rather than a saving: the blocks came back either way.
+    let trimmed =
+        if printed == total.records { String::new() } else { format!(", {printed} shown") };
+    println!(
+        "{} {} records{trimmed}, {} logical bytes, {} stored, in {asked} requests",
+        target.identity, total.records, total.logical, total.compressed
+    );
+    Ok(())
+}
+
+/// A range of records, and what the answer said it covered.
+fn ranged(
+    target: &Target,
+    framing: Framing,
+    response: &Response,
+    before: Option<u64>,
+) -> Result<(Covered, u64)> {
+    let Ok((covered, rest)) = Covered::of_args(&response.args) else {
+        report(target, response)?;
+        return Err(Error::new("that answer did not say what it covered"));
+    };
+    let pieces = Piece::all_of_args(rest)?;
+    let mut printed = 0;
+    for (number, bytes) in records_of(framing, &pieces)? {
+        // The store stops on a block boundary and the caller asked for a record
+        // boundary, so the last block may carry records past `to`. Printing is where
+        // that is trimmed, since the bytes had to travel anyway.
+        // A bound only trims what is shown. The store stops on a block boundary, so
+        // the blocks arrived and were paid for regardless.
+        if before.is_some_and(|stop| number >= stop) {
+            break;
+        }
+        match std::str::from_utf8(&bytes) {
+            Ok(text) => println!("{number} {text}"),
+            Err(_) => println!("{number} {} bytes, not text", bytes.len()),
+        }
+        printed += 1;
+    }
+    Ok((covered, printed))
 }
 
 /// Print a response, and fail the process if the service refused.
@@ -1324,15 +1509,23 @@ fn build(cmd: &Cmd) -> Result<Request> {
         }
         Cmd::Read { path, at, .. } => {
             let mut request = Request::new(Op::ReadRecord).text(path);
-            request.args.push(at.arg());
+            match at.arg() {
+                // A point read is a range of one record (§9.1.3.6): the block
+                // holding it comes back whole either way, and asking this way means
+                // there is one shape on the read path rather than two.
+                Arg::Number(record) => request.args.extend(
+                    Range { start: Start::Record(record), budget: Budget::Records(1) }.args(),
+                ),
+                // A key, which is a keyed read and unbuilt. Sent as it stands so the
+                // answer says so rather than the client guessing.
+                key => request.args.push(key),
+            }
             request
         }
 
-        Cmd::Scan { path, from, to, limit } => Request::new(Op::Scan)
-            .text(path)
-            .text(from.clone().unwrap_or_default())
-            .text(to.clone().unwrap_or_default())
-            .number(limit.unwrap_or(0)),
+        // Scan is a loop over range reads rather than one request, so it is driven
+        // in `scan` and never reaches here.
+        Cmd::Scan { .. } => return Err(Error::new("a scan is many requests")),
         Cmd::Count { path } => Request::new(Op::Count).text(path),
         Cmd::TimeRange { path, from, to } => {
             Request::new(Op::TimeRange).text(path).number(*from).number(*to)

@@ -8056,6 +8056,23 @@ both logical and compressed bytes would routinely satisfy neither, with no rule 
 honour. **The default is logical**, because the buffer is the thing a caller is certain about; a
 caller sizing a network transfer or estimating a bill names compressed instead.
 
+⚠️ **Only one of the three bounds the bill, and it is not the intuitive one** (Asserted, Bob,
+2026-08-19). §12.3 bills physical bytes, so **the record count is very nearly uncorrelated with what
+a read costs**: one record and a million cost about the same if they arrive in the same 2 MB. Three
+consequences, and the first is the one a caller has to be told:
+
+- **A budget in records gives no cost control at all.** It is a convenience for a caller reasoning
+  about its own data, not a lever on its bill. A caller that wants the bill bounded must name
+  **compressed** bytes, and that is the only measure that does it.
+- **A budget in logical bytes is barely better**, because the ratio between logical and compressed is
+  the data's property rather than the caller's choice. It bounds memory, which is what it is for.
+- **So the answer must report the compressed figure whatever was asked for**, which is already the
+  rule above — and this is the reason it is not merely tidiness. It is the only number in the answer
+  that tells the caller what just happened to its bill.
+
+That asymmetry is worth stating because the three measures otherwise look interchangeable, and they
+are interchangeable for *bounding an answer* and not at all for *bounding a cost*.
+
 ⚠️ **One block always comes back, even past the budget.** A block is the unit an EN deals in (§9.1),
 so a budget below the first block's size would otherwise return nothing — for ever, on every retry,
 which is a livelock wearing back-pressure's clothes. The budget is therefore a **stopping rule
@@ -13421,3 +13438,50 @@ wearing a different hat.
 handover cannot be written casually, so it should exist before the protocol rather than after. What is
 enforced today is the `apply` refusal, which is on a live path, plus seven tests naming the two
 invariants they check.
+
+### 17.18 A read becomes a range, and one shape replaces two
+
+§9.1.3.4's start and §9.1.3.6's budget went in, along with the answer that says what it covered.
+Four things are worth recording, and two of them are about what the change *revealed*.
+
+**The point read did not survive as a separate thing, and should not have.** `laws read --record N`
+now sends a range of one record, so there is one code path where there were two. The old point read
+found the block *covering* a record by `first_record <= N < first_record + records`, and that
+predicate **cannot find a block that completes no record** — the block wholly inside one record that
+§8.2.4 explicitly permits. So the old path could not read a record larger than one block at all. The
+range walk orders by **offset** instead and carries every block from the one where the record starts,
+which fixes it as a side effect of being written properly.
+
+⚠️ **Two stopping rules, and the order of the test is both of them.** The budget is checked *after* a
+block is taken, so one block always comes back — a smaller budget returning nothing would be a
+caller retrying for ever and never learning it asked for too little. And stopping is only permitted
+with no record open, so `next` is a real record number rather than the one the request started at.
+**That second rule is §8.2.3's durability gate arriving on the read path**, for the same reason: half
+a record is not a record, so a range that ended on one would hand back a continuation that makes no
+progress. Neither rule is optional and neither is obvious from the design text, which is why they are
+here.
+
+⚠️ **The FE's numbering conversion had to stop patching a position.** It added the extent's origin to
+argument index 1, which was the block's first record. When the answer grew a header saying what it
+covered, index 1 became a **byte count** — so the patch would have corrupted a measure and left every
+record number unconverted, and the existing test would have gone on passing because it asserted the
+patch rather than the meaning. §17.13.3's lesson again, arriving through a different door: the shapes
+now live in `common` and both ends read them rather than counting.
+
+**And `more` is a statement about the tier that answered, not about the object.** An EN sets it from
+its own blocks because an extent is all it knows; only the FE knows there are further extents, so it
+widens the claim using something the EN cannot see — whether that extent is sealed. Overstating it
+costs one round trip that answers "no such record"; understating it would lose data silently, so the
+asymmetry decides which way to err.
+
+⚠️ **What is not built, and why each is blocked rather than skipped:**
+
+| Not built | Because |
+|---|---|
+| **stream and extent narrowing** (§9.1.3.4) | an asserted narrowing is only as good as the caller (§9.1.3.5), so it waits on the capability (#78) and its key (#82). Sending it before then would be building the unauthorizable version |
+| **logical-offset starts**, both forms | they need a prefix sum of logical lengths, which §4.5 keeps lazily and no tier can answer today. Well-formed requests for something unbuilt, so they return `unimplemented` rather than a wrong answer |
+| **crossing extents in one request** | the answer already says where to carry on, so stopping at an extent boundary is a correct paginated answer. A 1,600-record object over two streams and five extents scans in **five** requests, one per extent |
+
+**Measured, on the single-box cluster**: 1,600 records appended across 2 streams and 5 extents,
+scanned in 5 requests, every record number contiguous and matching its contents — including across
+both the extent seals and the stream seal, which is the conversion §17.16.2 records getting wrong.

@@ -23,6 +23,7 @@ use common::block::Holds;
 use common::config::{FEConfig, ServiceKind};
 use common::framing::Framing;
 use common::logw;
+use common::range::{Budget, Covered, Piece, Range, Start};
 use common::server::{self, Process, Reply, Service};
 use common::wire::{AppendBlock, Arg, Op, Request, Response, Status};
 use std::collections::HashMap;
@@ -638,8 +639,7 @@ impl FE {
     /// conversion happens here — a bug in one of them shows up as a read that works
     /// until the first seal and then does not.
     fn read(self: &Arc<Self>, process: &Arc<Process>, request: &Request, mut reply: Reply) {
-        let (path, record) = match request.args.as_slice() {
-            [Arg::Text(path), Arg::Number(record)] => (path.clone(), *record),
+        let (path, range) = match request.args.as_slice() {
             // A key rather than a record number is a keyed read, which needs the
             // key ordering nothing has built.
             [Arg::Text(_), Arg::Text(_)] => {
@@ -648,17 +648,35 @@ impl FE {
                     "reading by key is not built yet",
                 ));
             }
+            [Arg::Text(path), rest @ ..] => match Range::of_args(rest) {
+                Ok((range, [])) => (path.clone(), range),
+                _ => {
+                    return reply.send(Response::error(
+                        Status::BadRequest,
+                        "read takes a name and a range",
+                    ));
+                }
+            },
             _ => {
                 return reply
-                    .send(Response::error(Status::BadRequest, "read takes a name and a record"));
+                    .send(Response::error(Status::BadRequest, "read takes a name and a range"));
             }
         };
-        reply.about(format_args!("{path},record {record}"));
+        // The start has to be a record for now: the other two forms need a prefix sum
+        // of logical lengths, which §4.5 keeps lazily and nothing here can ask for
+        // (§9.1.3.4). A well-formed request for something unbuilt.
+        let Some(record) = range.start.record() else {
+            return reply.send(Response::error(
+                Status::Unimplemented,
+                "starting from a logical offset needs a prefix sum nothing keeps yet",
+            ));
+        };
+        reply.about(format_args!("{path},record {record},{:?}", range.budget));
         self.resolve_record(process, &path, record, reply, move |fe, process, located, reply| {
             // The DN answered with the stream holding it, so the number the stream
             // knows it by is what is left after that stream's first.
             let in_stream = within(record, located.first_record);
-            fe.locate(process, located, in_stream, reply);
+            fe.locate(process, located, in_stream, range.budget, reply);
         });
     }
 
@@ -674,6 +692,7 @@ impl FE {
         process: &Arc<Process>,
         located: Located,
         record: u64,
+        budget: Budget,
         reply: Reply,
     ) {
         let known = self
@@ -683,7 +702,7 @@ impl FE {
             .get(&(located.dn, located.stream))
             .and_then(|stream| stream.holding(record));
         if let Some(open) = known {
-            return from_instance(process, &located, &open, record, reply);
+            return from_instance(process, &located, &open, record, budget, reply);
         }
 
         let identity = format!("SN{}", located.sn);
@@ -711,7 +730,7 @@ impl FE {
                 .entry((located.dn, located.stream))
                 .or_default()
                 .remember(open.clone());
-            from_instance(&onward, &located, &open, record, reply);
+            from_instance(&onward, &located, &open, record, budget, reply);
         });
         if let Err(e) = asked {
             logw!("could not reach an SN", "sn {named},{e}");
@@ -790,6 +809,7 @@ fn from_instance(
     located: &Located,
     open: &Open,
     in_stream: u64,
+    budget: Budget,
     reply: Reply,
 ) {
     let identity = format!("EN{}", open.instances[0]);
@@ -800,17 +820,18 @@ fn from_instance(
     // caller's. Three numbering spaces meet here — object, stream, extent — and the
     // FE is the only party that knows all three, so it is the one that converts.
     let base = origin(located.first_record, open.first_record);
-    let ask = Request::new(Op::ReadExtent)
-        .number(open.sn as u64)
-        .number(open.id)
-        .number(open.created)
-        .number(in_extent);
+    // A sealed extent has something after it; the one still open is the object's
+    // tail, so what the EN says about its own blocks is the whole answer.
+    let sealed = open.records > 0;
+    let mut ask =
+        Request::new(Op::ReadExtent).number(open.sn as u64).number(open.id).number(open.created);
+    ask.args.extend(Range { start: Start::Record(in_extent), budget }.args());
     let named = identity.clone();
-    // The block comes back whole and is passed on whole: the reader decompresses it,
-    // checks the CRC against what it wrote, and takes the record it wanted. Doing
-    // that here would mean holding plaintext and spending CPU for no reason.
+    // The blocks come back whole and are passed on whole: the reader decompresses
+    // them, checks the CRC against what it wrote, and takes the records it wanted.
+    // Doing that here would mean holding plaintext and spending CPU for no reason.
     let asked = process.ask(&identity, &ask, move |answer| {
-        reply.send(in_the_callers_numbering(answer, base));
+        reply.send(in_the_callers_numbering(answer, base, sealed));
     });
     if let Err(e) = asked {
         logw!("could not reach an EN", "en {named},{e}");
@@ -833,15 +854,37 @@ fn origin(stream_first: u64, extent_first: u64) -> u64 {
     stream_first + extent_first
 }
 
-/// Put a block's first record into the numbering the caller asked in. An EN counts
-/// from the start of its extent; a caller counts from the start of the object.
-fn in_the_callers_numbering(mut answer: Response, base: u64) -> Response {
-    if answer.status == Status::Ok
-        && let Some(Arg::Number(first)) = answer.args.get_mut(1)
-    {
-        *first += base;
+/// Put every record number in an answer into the numbering the caller asked in. An
+/// EN counts from the start of its extent; a caller counts from the start of the
+/// object.
+///
+/// ⚠️ **This parses and rebuilds rather than patching a position.** An earlier
+/// version added `base` to argument index 1, which was the block's first record — and
+/// when the answer grew a header saying what it covered, index 1 became a byte count
+/// and the patch silently corrupted it instead. A shape read through `common` cannot
+/// go wrong that way, which is §17.13.3 again.
+///
+/// `sealed` says whether the extent this came from has anything after it, which the
+/// EN cannot know: it sets `more` from its own blocks, and only the FE knows there are
+/// further extents. Overstating it costs one round trip that answers "no such
+/// record"; understating it would lose data.
+fn in_the_callers_numbering(answer: Response, base: u64, sealed: bool) -> Response {
+    if answer.status != Status::Ok {
+        return answer;
     }
-    answer
+    let Ok((mut covered, rest)) = Covered::of_args(&answer.args) else {
+        return Response::error(Status::Internal, "that answer did not say what it covered");
+    };
+    let Ok(pieces) = Piece::all_of_args(rest) else {
+        return Response::error(Status::Internal, "that answer's blocks are not blocks");
+    };
+    covered.next += base;
+    covered.more = covered.more || sealed;
+    let mut args = covered.args();
+    for piece in pieces {
+        args.extend(Piece { first_record: piece.first_record + base, ..piece }.args());
+    }
+    Response { id: 0, status: Status::Ok, args }
 }
 
 /// What an append tells the writer. The durable reference comes first — a stream
@@ -949,7 +992,7 @@ mod tests {
     #[test]
     fn a_record_number_survives_the_trip_through_three_spaces() {
         use super::{in_the_callers_numbering, origin, within};
-        use common::wire::{Arg, Response, Status};
+        use common::wire::{Response, Status};
 
         let (stream_first, extent_first) = (700, 40);
         for asked in [740, 741, 800, 12_345] {
@@ -957,16 +1000,62 @@ mod tests {
             assert_eq!(in_extent + origin(stream_first, extent_first), asked, "record {asked}");
         }
 
-        // And the answer really is rewritten, in the second argument and nowhere else.
-        let answer = Response {
-            id: 0,
-            status: Status::Ok,
-            args: vec![Arg::Number(9), Arg::Number(0), Arg::Number(3)],
+        // And **every** record number in the answer is rewritten, while the three
+        // byte-and-count measures are left alone.
+        //
+        // ⚠️ An earlier version of this test asserted that argument index 1 was
+        // patched, which is what the code did. When the answer grew a header saying
+        // what it covered, index 1 became a byte count — so the test would have gone
+        // on passing while the code corrupted a measure and reported record numbers
+        // unconverted. Reading the shape is what makes the test about the meaning.
+        let covered = Covered { records: 3, logical: 9, compressed: 9, next: 3, more: false };
+        let piece = |first_record| Piece {
+            logical: 3,
+            first_record,
+            records: 1,
+            crc: None,
+            bytes: b"a\n".to_vec(),
         };
-        let told = in_the_callers_numbering(answer, origin(stream_first, extent_first));
-        assert_eq!(told.args[0], Arg::Number(9), "the logical size is not a record number");
-        assert_eq!(told.args[1], Arg::Number(740), "the extent's first record, made the caller's");
-        assert_eq!(told.args[2], Arg::Number(3), "nor is the count");
+        let mut args = covered.args();
+        for first_record in [0, 1, 2] {
+            args.extend(piece(first_record).args());
+        }
+        let told = in_the_callers_numbering(
+            Response { id: 0, status: Status::Ok, args },
+            origin(stream_first, extent_first),
+            true,
+        );
+
+        let (back, rest) = Covered::of_args(&told.args).expect("what it covered");
+        assert_eq!(back.next, 743, "the continuation, made the caller's");
+        assert_eq!((back.records, back.logical, back.compressed), (3, 9, 9), "measures untouched");
+        assert!(back.more, "and a sealed extent has something after it");
+        let pieces = Piece::all_of_args(rest).expect("blocks");
+        let numbers: Vec<u64> = pieces.iter().map(|piece| piece.first_record).collect();
+        assert_eq!(numbers, [740, 741, 742], "every block, not just the first");
+        assert!(pieces.iter().all(|piece| piece.logical == 3), "and not their sizes");
+    }
+
+    /// A read of the extent still open is the object's tail, so what the EN says
+    /// about its own blocks is the whole answer. A sealed extent has something after
+    /// it, which only the FE knows.
+    #[test]
+    fn only_the_fe_can_say_whether_the_object_has_more() {
+        let covered = Covered { records: 1, logical: 2, compressed: 2, next: 1, more: false };
+        let answer = || Response { id: 0, status: Status::Ok, args: covered.args() };
+
+        let tail = in_the_callers_numbering(answer(), 0, false);
+        assert!(!Covered::of_args(&tail.args).unwrap().0.more, "the open extent ends the object");
+        let sealed = in_the_callers_numbering(answer(), 0, true);
+        assert!(Covered::of_args(&sealed.args).unwrap().0.more, "a sealed one does not");
+    }
+
+    /// A refusal is passed through untouched: there are no record numbers in it to
+    /// convert, and dressing it up as an answer would be worse than useless.
+    #[test]
+    fn a_refusal_is_not_converted() {
+        let refused = Response::error(Status::NotFound, "no such record");
+        assert_eq!(in_the_callers_numbering(refused.clone(), 700, true), refused);
     }
 
     use super::*;

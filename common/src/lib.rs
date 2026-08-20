@@ -11,6 +11,7 @@ pub mod offset;
 pub mod peer;
 pub mod placement;
 pub mod random;
+pub mod range;
 pub mod registry;
 pub mod seal;
 pub mod server;

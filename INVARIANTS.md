@@ -132,14 +132,16 @@ internal and cluster-local.
 *Breaks* georeplication: nothing a user wrote down survives the trip.
 
 **`READ-NAMES-THE-OBJECT`** — every read names the object, whatever else it names.
-*Argued* §9.1.3.4 · *Enforced* design only (today's `read` takes a path, so it holds by accident) ·
-*Checked* unit test once ranges exist (#77)
+*Argued* §9.1.3.4, §17.18 · *Enforced* **code**: a range read takes a path and a range, and the
+narrowing that would let it name less is deliberately unbuilt until the capability exists (#78) ·
+*Checked* the shape is enforced by parsing; the narrowing case cannot be tested until it exists
 *Breaks* the request cannot be authorized at all, because the ACL is the object's and §4.6.6's
 reverse edge is a count. A stream or extent alone does not identify an object even in principle.
 
 **`OFFSET-SNAPS-FORWARD`** — a start named by a bare offset resolves to the first record beginning at
 or after it. Always forward, never nearest.
-*Argued* §9.1.3.4 · *Enforced* design only · *Checked* unit test, and it should assert the
+*Argued* §9.1.3.4 · *Enforced* design only — an offset start returns `unimplemented`, since resolving
+it needs a prefix sum §4.5 keeps lazily (§17.18) · *Checked* unit test, and it should assert the
 *partition* property over adjacent boundaries, not just one resolution
 *Breaks* independently computed chunk boundaries (§9.1.3.1) sometimes overlap and sometimes leave a
 gap, and **neither vertex can detect either**.
@@ -279,6 +281,22 @@ a record boundary. Only a writer that fixed its own offsets may leave a fragment
 bytes landed.
 
 ## Records, framing and sealing
+
+**`ONE-BLOCK-ALWAYS-RETURNS`** — a range answer carries at least one block, even when that block
+exceeds the budget.
+*Argued* §9.1.3.6, §17.18 · *Enforced* **code**: the budget is tested *after* a block is taken, in
+the EN's range walk · *Checked* unit test (`a_budget_smaller_than_a_block_still_gets_a_block`) over
+all three measures
+*Breaks* a caller whose buffer is smaller than one block gets nothing, retries, and gets nothing
+again — a livelock wearing back-pressure's clothes, and it never learns it asked for too little.
+
+**`RANGE-ENDS-ON-A-RECORD-BOUNDARY`** — a range answer never stops with a record open, so its
+continuation is a record number strictly past where it started.
+*Argued* §17.18, §8.2.3 · *Enforced* **code**: stopping requires both the budget met and no open
+record · *Checked* unit test (`a_range_does_not_stop_in_the_middle_of_a_record`)
+*Breaks* the continuation is the record the request already asked for, so a caller looping on it makes
+no progress. This is `INCOMPLETE-RECORD-NOT-DURABLE` on the read path — half a record is not a
+record — and the same rule stops both a write being acknowledged and a read being continued.
 
 **`EXTENT-HOLDS-WHOLE-RECORDS`** — an extent contains only whole records. The boundary that matters is
 the extent's, not the append's.
@@ -571,7 +589,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 
 | Term | Defined | Invariants naming it |
 |---|---|---|
-| **append block** | §8.1 | `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `RECORD-FITS-ONE-EXTENT`, `EXTENT-SEALS-BETWEEN-RECORDS`, `APPLIED-IS-A-PREFIX` |
+| **append block** | §8.1 | `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `RECORD-FITS-ONE-EXTENT`, `EXTENT-SEALS-BETWEEN-RECORDS`, `APPLIED-IS-A-PREFIX`, `ONE-BLOCK-ALWAYS-RETURNS` |
 | **applied** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE` |
 | **capability** | §9.1.3.5 | `CAPABILITY-IS-MEMBERSHIP-ONLY`, `HINT-BOUND-BY-CAPABILITY`, `KEY-AND-SALT-COVER-ONE-PLAINTEXT` |
 | ⚠️ **compressed position** | §8.1.6 | `KEY-AND-SALT-COVER-ONE-PLAINTEXT`, `EC-GROUP-EQUAL-LENGTH`. *The same space §4.5 and §8.1.1a-2 call **physical**.* |
@@ -592,7 +610,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **placement** | §5.6 | `PLACEMENT-NEVER-REVISITED`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `NESTED-NOT-ORTHOGONAL-DOMAINS`, `SOLVER-TIMEOUT-DEFERS-NEVER-DROPS`, `UNENFORCEABLE-RULE-NOT-ENFORCED`, `NO-DATA-MOVEMENT-EXCEPT-RANGE-SPLIT` |
 | **primary** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `TRUNCATION-SEALS` |
 | **quorum** | §8.1.1 | `QUORUM-OVERLAPS`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `UNAPPENDABLE-EXTENT-SEALS`, `SELF-SEAL-MARK-IS-DURABLE` |
-| **record** | §8.2 | `EXTENT-HOLDS-WHOLE-RECORDS`, `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `INCOMPLETE-RECORD-NOT-DURABLE`, `RECORD-FITS-ONE-EXTENT`, `TERMINATOR-NOT-IN-DATA`, `OFFSET-SNAPS-FORWARD`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `EXTENT-SEALS-BETWEEN-RECORDS` |
+| **record** | §8.2 | `EXTENT-HOLDS-WHOLE-RECORDS`, `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `INCOMPLETE-RECORD-NOT-DURABLE`, `RECORD-FITS-ONE-EXTENT`, `TERMINATOR-NOT-IN-DATA`, `OFFSET-SNAPS-FORWARD`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `EXTENT-SEALS-BETWEEN-RECORDS`, `RANGE-ENDS-ON-A-RECORD-BOUNDARY` |
 | **record number** | §3 | `RECORD-NUMBER-STABLE`, `RECORD-NUMBERS-DENSE`, `UNKEYED-COUNT-EXACT`, `UPDATE-DELETE-PRESERVE-COUNTS`, `PATH-IS-THE-PORTABLE-NAME` |
 | **reference** | §4.6 | `NO-CLUSTER-NAMES-IN-DATA-PLANE`, `REVERSE-EDGE-IS-A-COUNT`, `COUNTS-ARE-RECOMPUTABLE`, `ZERO-REFERENCES-IS-A-BUG`, `POSITION-FACTS-IN-REFERRER`, `REVENUE-INVARIANT-UNDER-REGROUPING` |
 | **seal** (extent) | §6 | `EXTENT-SEALS-BETWEEN-RECORDS`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATION-SEALS`, `SEALED-EXTENT-IMMUTABLE`, `RECORD-NUMBERS-DENSE`, `UNAPPENDABLE-EXTENT-SEALS`, `SEAL-CLOSES-TOP-DOWN`, `REQUESTED-SEAL-DISCARDS-NOTHING`, `SEAL-REQUESTS-ARE-IDEMPOTENT` |
