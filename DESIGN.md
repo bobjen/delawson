@@ -361,7 +361,17 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | `object-info` is **extended, not replaced**, and bounded by **one entry limit** over objects + streams + extents (default **10,000**) | §9.1.3.7 |
 | **HDFS scans** its block list to find an offset — 2 × 10^9 blocks at 256 PB, the same number §14.1 reaches | §9.1.3.8 |
 | Which is §4.5's rule with the counterfactual attached: locating by **record** is a descent, locating by **byte** is a walk | §9.1.3.8, §4.5 |
-| An **unkeyed object never updated** has a tail-only logical prefix sum, so bare-offset addressing *could* be exact for it | §9.1.3.8 |
+| **Streams carry flags**, and "updates disallowed" is one — a *declared* guarantee, not an observed one | §9.1.3.9 |
+| With it, and **tombstones retaining their original logical length**, the logical prefix sum is tail-only and may be exact | §9.1.3.9 |
+| So the byte space behaves as the number space already does: a dead record keeps its **number and its width** | §9.1.3.9, §3 |
+| Preserving a width **costs no space** — a logical offset is a name (§8.2.2), so compaction still reclaims the bytes | §9.1.3.9 |
+| The snap rule ignores liveness, or a delete would move a partition boundary | §9.1.3.9, §9.1.3.4 |
+| A promise flag is **three states, not a boolean**: off, enforcing (O(1)), valid (after a pass) — Oracle's `ENABLE NOVALIDATE` | §4.1.1.1 |
+| Which is **Bob's own Oracle feature**, so the pattern is first-hand rather than matched from the literature | §4.1.1.1 |
+| **"Deletes disallowed"** is a second promise flag: no *record* deletes, while dropping the whole stream stays possible | §9.1.3.10 |
+| It buys **no log to probe** on every read, no deletion-driven compaction, and no churn against the repair reserve | §9.1.3.10 |
+| ⚠️ Its cleanup pass is a compaction, and compaction must **preserve tombstone widths** — the two passes' natural implementations break each other | §9.1.3.10, §9.1.3.9 |
+| **Loosening is cheap, tightening is deferred** — and an omission may only be taken on a *valid* flag, never an *enforcing* one | §4.1.1.1 |
 | Large objects are built by **parallel partitions, sealed, then concatenated** | §8.6.1 |
 | **Trilemma**: parallel bandwidth, dense stable offsets, monotone time index — pick two | §8.6.2 |
 | The recursion to DN **attenuates** by fan-out; the rule is **spray per writer, not per request** | §8.6.4 |
@@ -1533,6 +1543,75 @@ stream; streams are added as it grows.
 
 A stream is the unit of assignment to a Stream Node (§5.2), and its ceiling is
 what one SN can hold — see §14.
+
+#### 4.1.1 A stream carries flags, and three kinds of them
+
+**A stream has a number of flags** (Asserted, Bob, 2026-08-19). This is the canonical statement of
+that; the individual flags are argued where their consequences are, and are collected here so the
+field has one home rather than being rediscovered in four places.
+
+⚠️ **They are not all the same kind of thing**, and the distinction decides whether a flag may be
+turned off:
+
+| Kind | Means | Reversible? | Examples |
+|---|---|---|---|
+| **state** | something that has happened | no, but only because the event cannot un-happen | `sealed` (§6.3) |
+| **policy** | what the system should do | **yes** — a policy is meant to be changed | storage class (#74), soft-delete opt-out (§8.4), expiry (§8.5) |
+| **promise** | what will *never* happen to this stream | ⚠️ **no** — see below | `updates disallowed` (§9.1.3.9), `deletes disallowed` (§9.1.3.10) |
+
+**A promise flag is the interesting kind, and it is new with those two.** What it buys is not a
+behaviour but an **omission**: because the thing can never happen, machinery that would have coped with
+it can be skipped, and readers can rely on properties that would otherwise be unprovable.
+
+##### 4.1.1.1 A promise is three states, not a boolean, and the asymmetry is which way is cheap
+
+⚠️ **An earlier draft of this section said a promise flag must be one-way — settable and never
+clearable. That is wrong in both directions** (Asserted, Bob, 2026-08-19).
+
+> **Not-allowed to allowed is cheap.** Tightening is the slow one, and it is *deferred*: start enforcing
+> the rule, run a lazy cleanup pass over what is already there, and only then is the rule valid of
+> everything.
+
+So a promise flag has **three states**, and what may be relied on differs in each:
+
+| State | Enforced on new writes? | True of existing data? | Cost to enter |
+|---|---|---|---|
+| **off** | no | — | — |
+| **enforcing** | **yes** | not yet known | **O(1)** — flip it |
+| **valid** | yes | **yes** | a background pass over the stream |
+
+**Cited: this is Oracle's constraint state machine**, and the correspondence is exact rather than
+loose. Oracle separates `ENABLE`/`DISABLE` from `VALIDATE`/`NOVALIDATE`, and the standard migration is
+`ENABLE NOVALIDATE` — instant, and binding on new DML only — followed by a long `VALIDATE` over the
+existing rows. ⚠️ **And the payoff lands in the same place**: Oracle's optimizer may only *rely* on a
+constraint that is validated, because a novalidate one may be false of data already there. DeLawson's
+omissions are the same — see below.
+
+**Provenance, because it changes how much weight the analogy carries: `ENABLE NOVALIDATE` is Bob's own
+feature — he proposed and implemented it** (Asserted, Bob, 2026-08-19). So this is not a pattern
+matched from the literature and hoped to fit; it is one brought in first-hand by the person who built
+it, which is why the three states and the reliance rule transfer as cleanly as they do. Where the two
+differ, the difference is likely to be real rather than a misreading of someone else's design.
+
+**Which is why the middle state has to be visible rather than internal.** The whole value of a promise
+is what other machinery is allowed to skip on the strength of it, and in the enforcing state that
+machinery must **not** skip anything:
+
+| Omission | Safe in *enforcing*? | Safe in *valid*? |
+|---|---|---|
+| skip the log probe on read (§9.1 step 3) | **no** — old tombstones may still be there | yes |
+| trust an exact logical prefix sum (§9.1.3.9) | **no** — past updates may have shifted it | yes |
+| treat hints as long-lived (§8.1.1a-10) | partly — no *new* rewrites from this cause | yes |
+
+**And the loosening direction really is cheap**, which is what makes the whole thing tolerable to
+operate: dropping back to *off* is a flag write plus abandoning the omissions, with no pass and no
+cleanup. The escape from a promise made wrongly is therefore not "delete the stream" as an earlier
+draft had it — it is simply to stop promising.
+
+⚠️ **What loosening does cost is not paid by the store.** An external index built on offsets that were
+exact stops being valid, and the store cannot rebuild it or even enumerate who holds one. So loosening
+is cheap *mechanically* and expensive *contractually*, and those are different budgets — which is an
+argument for the state being visible to readers, not for making the transition hard.
 
 ### 4.2 Extents: base plus log
 
@@ -8653,8 +8732,147 @@ logical prefix sum is tail-only, and by §4.5's own rule a tail-only summary may
 ⚠️ **The first row is probably the common case for the motivating workload** — §1.0's shared AI memory
 is append-only by construction, and so is every log-shaped object. So the pathology HDFS lives with may
 be avoidable for most objects, at the cost of maintaining one more exact summary and a flag saying
-whether it is still trustworthy. Whether that is worth it is undecided (§16.139); what HDFS supplies is
-the evidence that the case is worth examining rather than dismissing.
+whether it is still trustworthy. §9.1.3.9 settles how; what HDFS supplies is the evidence that the case
+was worth examining rather than dismissing.
+
+#### 9.1.3.9 A stream flag buys exact offsets, provided a tombstone keeps its width
+
+**Streams will carry a number of flags, and "updates disallowed" can be one of them** (Asserted, Bob,
+2026-08-19). That is what makes §9.1.3.8's subclass a *declared* property rather than an observed one,
+which matters: a reader can be told the guarantee holds, instead of the store having to notice that no
+update has happened yet and hope none does.
+
+**The condition Bob attaches is the load-bearing half: deletes must leave tombstones that retain their
+original logical length.** With it, the three mutations of §8.3 line up exactly as the prefix sum needs:
+
+| Mutation | Effect on the logical prefix sum | |
+|---|---|---|
+| **insert** — at the tail (§3) | grows the end only | tail-only, so §4.5 permits an exact summary |
+| **update** — rewrites a record, possibly to a different length | shifts every offset above it | **the flag forbids it** |
+| **delete** — a tombstone that keeps the slot's width | **none** | nothing moves |
+
+**So the byte space behaves exactly as the number space already does**, and that coherence is the real
+argument for it. §3 has counts stable under update and tombstone, so a deleted record keeps its record
+*number*; this says it also keeps its **width**. One rule, two spaces, and neither has holes that move.
+
+##### Preserving a width costs no space, because a logical offset is a name
+
+⚠️ **The obvious objection is that reserving width for dead records makes compaction pointless, and it
+does not** — because §8.2.2 already makes the logical offset a **canonical name space** rather than a
+measure of what is stored, with the sparse index (§9.3) mapping it to physical positions.
+
+| | Reclaimed by compaction? |
+|---|---|
+| the tombstoned record's **physical bytes** | **yes** — the index simply maps nothing there |
+| its **logical width** | no, and it costs nothing: a gap in a numbering is not a gap on a disk |
+
+And §12.3 bills **physical** bytes, so the user is not charged for the hole either. The cost is entirely
+in the index having a region with no mapping, which it must already tolerate.
+
+⚠️ **But it is an obligation on §10 that would not otherwise exist, and it is easy to violate.** The
+natural implementation of compaction — fold the log into the base and write out the surviving records —
+silently closes the gaps and shifts every offset above. **Compaction must preserve the widths of
+tombstoned records**, and nothing about compaction makes that obvious, so it wants to be a checked
+invariant rather than a remembered one.
+
+##### Trusting the sum needs the valid state, and the snap rule must ignore liveness
+
+Two consequences that are easy to get wrong:
+
+- ⚠️ **The exact sum may only be trusted in the flag's *valid* state**, not merely its *enforcing* one
+  (§4.1.1.1). Setting the flag is O(1) and binds new writes at once, but an object updated in the past
+  has a prefix sum that is already wrong — so the background pass that recomputes it is what makes the
+  guarantee true, exactly as Oracle's optimizer may only rely on a validated constraint. Loosening the
+  flag again is cheap for the store and expensive for whoever built an index on the offsets.
+- ⚠️ **§9.1.3.4's snap-forward must go to the next slot boundary, live or not.** If it skipped
+  tombstones, then **deleting a record would move a partition boundary** — two vertices that computed
+  adjacent boundaries before and after a delete would overlap or leave a gap, which is precisely the
+  property §9.1.3.4 fixed the snap rule to guarantee. So the snap is computed on the numbering, and
+  skipping dead records is the reader's job afterwards.
+
+##### What else the flags field is for, and one question left
+
+**Bob says flags, plural, and the design already has occupants for the field**: `sealed` is one (§6.3),
+#74 puts the **storage-class policy** on the stream, §8.4 has soft-delete opt-out, and §8.5 has expiry.
+So this is not a field invented for one purpose — it is a field that already had tenants and now has a
+named one.
+
+⚠️ **Where the flag is declared is not quite settled.** The guarantee a reader wants is about an
+**object** — *can I trust offsets here* — while enforcement has to be per **stream**, because that is
+where records live and where the SN can refuse an update. The natural reading is declared on the object
+at creation and carried onto every stream it is given, which leaves one case to think about: §5.11.3.4
+lets a stream be referenced from more than one place, so **a shared stream with the flag set constrains
+all of its referrers, and a shared stream without it cannot be used by an object that wants the
+guarantee** (§16.139).
+
+#### 9.1.3.10 "Deletes disallowed", and the compliance claim it encodes
+
+**"Deletes disallowed" is another such flag** (Asserted, Bob, 2026-08-19), and what motivates it is a
+compliance observation rather than a performance one:
+
+> **GDPR requires deletes of user data, but a stream with no user data will never have a GDPR delete,
+> and can be marked as knowing that.**
+
+⚠️ **What it must mean, precisely, or it is a compliance hazard rather than a feature.** The flag
+forbids **record-level** deletion within the stream. It does **not** make the stream undeletable —
+dropping the whole object or stream stays possible, and must, or a flag meant to be irrelevant to
+erasure law would create the exact problem it claims not to have.
+
+| | Allowed under the flag? |
+|---|---|
+| tombstone one record (§8.3) | **no** |
+| delete the whole object or stream (§8.4) | **yes** |
+| expiry firing on the whole object (§8.5) | **yes** |
+
+**What the promise buys is omission** (§4.1.1), and the list is longer than it looks, because
+record deletion is what several mechanisms exist to cope with:
+
+- **No tombstones, so no log.** §4.2's extents are base plus a lazily-created log; a stream taking
+  neither updates nor deletes never creates one. So §9.1's step 3 — *if the extent has a log, check it
+  for a newer version or a tombstone* — is skipped on every read.
+- **No deletion-driven compaction.** §10 folds base and log; with no log there is nothing to fold.
+  Rewriting for storage-class migration and re-encoding survives (§7.4.2), so extents still move — but
+  the routine cause is gone.
+- **No churn against the repair reserve.** §8.4.3 and §16.42 make retention window × churn consume the
+  1 − 1/D headroom §4.3.4 needs for repair. Deletes are that churn.
+- **The soft-delete machinery does not apply** at record level — §8.4's deferred decrement, the
+  three-day window, §8.4.1b's hard-delete brake all exist to make record deletion safe.
+
+⚠️ **And with both flags valid, hints get much longer-lived**, which is the dividend worth noticing.
+§8.1.1a-10 makes hint lifetime "a compaction-policy number", since a hint dies when its extent is
+rewritten. A stream that never updates and never deletes is rewritten only for tiering, so **its hints
+outlive §10.1's ten-minute window by a wide margin** — moving §8.1.1a-10's middle reference tier close
+to the durable one, for exactly the objects least likely to change.
+
+##### The cleanup pass is what "validate" means here, and it differs per flag
+
+§4.1.1.1's three states are not an abstraction over these two flags; each has a concrete pass, and they
+are different work:
+
+| Flag | Entering *enforcing* | The pass that reaches *valid* |
+|---|---|---|
+| **updates disallowed** | refuse new updates | **recompute** the logical prefix sums, which past updates may have shifted |
+| **deletes disallowed** | refuse new deletes | **compact away** the existing tombstones and logs, after which there is no log to probe |
+
+**So "lazy cleanup" is literal for deletes and figurative for updates** — one removes data that violates
+the promise, the other recomputes a summary the violations invalidated. Both are background passes over
+the stream, and neither blocks the O(1) transition into enforcing.
+
+⚠️ **Which means the deletes pass has an interaction worth flagging: it is a compaction, and compaction
+must preserve tombstone widths** (§9.1.3.9). Compacting away a tombstone's *bytes* is the point;
+compacting away its *slot* would shift every offset above it and break the other flag's guarantee. The
+two passes therefore have to agree, and the natural implementation of each breaks the other.
+
+##### Getting the claim wrong
+
+The flag asserts a fact about the **data** — that it holds nothing anyone may demand the erasure of —
+and that is a judgement by whoever creates the stream, which the store cannot check. If it turns out
+wrong, the remedy is cheap by §4.1.1.1: **loosen the flag and delete the record.** Nothing has to be
+rebuilt, because loosening costs only the omissions.
+
+**So the default is off, and setting it is a deliberate act.** It is right for derived data, telemetry,
+indexes and aggregates — the things that are regenerable and hold nobody's personal data — and wrong by
+default for anything else.
 
 ### 9.2 Keyed: locating key *K*
 
@@ -12453,15 +12671,18 @@ Roughly in order of how much else depends on them.
      way a bug elsewhere is not. If it is declined, §7.3.2.7's attack is an accepted risk whose controls
      are physical security, attestation and audit — none of them cryptographic.
 
-139. **Whether to maintain an exact logical prefix sum for never-updated objects** (§9.1.3.8, §4.5,
-     §9.1.3.4). §4.5 keeps logical bytes lazy because an update rewrites a record to a different length
-     and shifts every offset above it — but an object that has never been updated has no such case, so
-     its prefix sum is tail-only and may by §4.5's own rule be exact to the root. That would make a bare
-     object offset a B-tree descent instead of the walk HDFS is reported to do (§9.1.3.8), and §1.0's
-     motivating workload is append-only, so the subclass is probably the common one. Against it: one more
-     exact summary to maintain, plus a flag saying whether it is still trustworthy, plus the question of
-     what happens to the flag on the first update — recompute lazily, or abandon exactness for that object
-     for ever. Its motivating example depends on #85.
+139. **Where the "updates disallowed" flag is declared, and what a shared stream does about it**
+     (§9.1.3.9, §5.11.3.4). ✅ **The substance is settled**: streams carry flags, one of them disallows
+     updates, and with tombstones retaining their original logical length the prefix sum is tail-only and
+     may be exact — so a bare object offset becomes a descent rather than HDFS's walk (§9.1.3.8). What is
+     left is placement. The guarantee is about an *object* while enforcement must be per *stream*, so the
+     natural reading is declared at creation and carried onto every stream the object is given. §5.11.3.4
+     lets a stream be shared, which leaves the awkward case: a shared stream with the flag set constrains
+     every referrer, and one without it cannot serve an object that wants the guarantee. Also open, and
+     more likely to be got wrong: **§10's compaction must preserve the widths of tombstoned records**, and
+     the natural implementation closes the gaps instead — which is sharpest where §9.1.3.10's
+     deletes-disallowed cleanup pass *is* a compaction, so the two flags' validation passes have to agree
+     and each one's obvious implementation violates the other.
 
 **Closed** since earlier drafts:
 

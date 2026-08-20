@@ -369,6 +369,35 @@ append to its log.
 *Breaks* almost everything cacheable stops being cacheable (§9.1), and `INSTANCES-BYTE-IDENTICAL`
 loses its cheap argument.
 
+**`A-PROMISE-FLAG-LOOSENS-CHEAPLY-AND-TIGHTENS-SLOWLY`** — turning a stream promise off is O(1) and
+costs only the omissions. Turning one on is O(1) to *enforce* and needs a background pass to become
+*valid*.
+*Argued* §4.1.1.1 · *Enforced* design only · *Checked* not yet
+*Breaks* the two directions get treated alike. Making loosening hard is pointless — the store loses
+nothing by it — while making tightening instant is unsound, because existing data may already violate
+the promise. Cited: Oracle's `ENABLE NOVALIDATE`, which is Bob's own feature.
+
+**`A-TOMBSTONE-KEEPS-ITS-WIDTH`** — a deleted record keeps its slot in the logical offset space, at its
+original length. Only its physical bytes are reclaimed.
+*Argued* §9.1.3.9 · *Enforced* design only, and ⚠️ **§10's compaction is where it will be broken**: the
+natural implementation folds the log into the base and writes out the survivors, which closes the gaps ·
+*Checked* not yet — and this wants a test rather than a comment, because the violating implementation is
+the obvious one
+*Breaks* every offset above the deleted record moves, so the exact prefix sum
+`OMISSIONS-NEED-A-VALIDATED-FLAG` guards is wrong, and every external index built on an offset is silently
+invalidated. Note this is the byte-space twin of `UPDATE-DELETE-PRESERVE-COUNTS`: one keeps the number,
+the other keeps the width.
+
+**`OMISSIONS-NEED-A-VALIDATED-FLAG`** — machinery may be skipped on the strength of a promise flag only
+in its **valid** state, never in its **enforcing** state.
+*Argued* §4.1.1.1, §9.1.3.9 · *Enforced* design only · *Checked* not yet — and the test that matters
+sets a flag on a stream that already violates it, then confirms nothing is skipped until the pass has run
+*Breaks* the omission is taken while old data still violates the promise: a log probe skipped over
+existing tombstones returns deleted records, and an exact prefix sum trusted before recomputation is
+simply wrong. ⚠️ An earlier version of this entry said the flag was one-way, which was wrong in both
+directions — loosening is cheap, and tightening is the deferred one. Oracle's optimizer may likewise only
+rely on a `VALIDATE`d constraint, never a `NOVALIDATE` one.
+
 **`UPDATE-DELETE-PRESERVE-COUNTS`** — update and delete never change any cumulative record count and
 never reopen a sealed extent.
 *Argued* §8.3, §3 · *Enforced* design only · *Checked* unit test
@@ -675,6 +704,8 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **instance** | §4.3 | `INSTANCES-BYTE-IDENTICAL`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `QUORUM-OVERLAPS`, `ONE-MEDIA-CLASS-PER-EXTENT`, `EC-GROUP-EQUAL-LENGTH` |
 | **key** (record key) | §3 | `RECORD-NUMBER-STABLE` (by contrast — keyed objects have no positional address), `UPDATE-DELETE-PRESERVE-COUNTS` |
 | **key** (cryptographic) | §7.3 | `KEY-AND-SALT-COVER-ONE-PLAINTEXT`, `KEYS-NEVER-WHERE-USER-CODE-RUNS`, `DISK-KEYS-ONLY-ON-ENS`, `EXTENT-KEY-FROM-CREATING-SN`, `NO-TWO-SEGMENTS-SHARE-A-NONCE`, `MASTER-KEYS-ARE-NEVER-PRUNED`, `UNLOCKING-KEY-IS-GENERATED`, `SHARDS-ARE-NOT-STORED-WITH-THE-HARDWARE` |
+| **tombstone** | §8.3 | `A-TOMBSTONE-KEEPS-ITS-WIDTH`, `UPDATE-DELETE-PRESERVE-COUNTS` |
+| **stream flag** | §4.1.1 | `A-PROMISE-FLAG-LOOSENS-CHEAPLY-AND-TIGHTENS-SLOWLY`, `OMISSIONS-NEED-A-VALIDATED-FLAG`, `A-TOMBSTONE-KEEPS-ITS-WIDTH` |
 | ⚠️ **logical offset** | §8.1.6, §8.2.2 | `LOGICAL-OFFSETS-DENSE`, `CANONICAL-OFFSET-SPACE`, `FIXED-OFFSET-ADVANCES`, `OFFSET-SNAPS-FORWARD`, `EXTENT-OFFSET-WRITE-ONCE`, `ONE-UNSEALED-EXTENT-UNKEYED`. *Measured in canonical length-stuffed bytes, not in the stored framing.* |
 | **media class** | §7.4 | `ONE-MEDIA-CLASS-PER-EXTENT` |
 | **object** | §3 | `READ-NAMES-THE-OBJECT`, `RECORD-NUMBER-STABLE`, `HINT-BOUND-BY-CAPABILITY`, `CAPABILITY-IS-MEMBERSHIP-ONLY`, `ZERO-REFERENCES-IS-A-BUG`, `ONE-UNSEALED-EXTENT-UNKEYED` |
@@ -689,7 +720,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **reference** | §4.6 | `NO-CLUSTER-NAMES-IN-DATA-PLANE`, `REVERSE-EDGE-IS-A-COUNT`, `COUNTS-ARE-RECOMPUTABLE`, `ZERO-REFERENCES-IS-A-BUG`, `POSITION-FACTS-IN-REFERRER`, `REVENUE-INVARIANT-UNDER-REGROUPING` |
 | **seal** (extent) | §6 | `EXTENT-SEALS-BETWEEN-RECORDS`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATION-SEALS`, `SEALED-EXTENT-IMMUTABLE`, `RECORD-NUMBERS-DENSE`, `UNAPPENDABLE-EXTENT-SEALS`, `SEAL-CLOSES-TOP-DOWN`, `REQUESTED-SEAL-DISCARDS-NOTHING`, `SEAL-REQUESTS-ARE-IDEMPOTENT` |
 | **seal** (wire segment) | §17.5a | `NO-TWO-SEGMENTS-SHARE-A-NONCE`. ⚠️ *An unrelated sense of the word; `common/src/seal.rs` is this one.* |
-| **stream** | §4.1 | `STREAM-IDENTITY-OWNED`, `SN-NOT-IN-WRITE-PATH`, `ONE-REQUEST-IN-FLIGHT-PER-STREAM`, `EXTENT-KEY-FROM-CREATING-SN`, `READ-NAMES-THE-OBJECT` |
+| **stream** | §4.1 | `STREAM-IDENTITY-OWNED`, `SN-NOT-IN-WRITE-PATH`, `ONE-REQUEST-IN-FLIGHT-PER-STREAM`, `EXTENT-KEY-FROM-CREATING-SN`, `READ-NAMES-THE-OBJECT`, `OMISSIONS-NEED-A-VALIDATED-FLAG` |
 | **summary** | §4.5 | `TAIL-ONLY-SUMMARIES-EXACT`, `UNKEYED-COUNT-EXACT`, `COUNTS-ARE-RECOMPUTABLE` |
 | **watermark** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `SEAL-NEVER-BELOW-DURABLE`, `INCOMPLETE-RECORD-NOT-DURABLE` |
 
