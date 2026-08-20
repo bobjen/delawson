@@ -82,6 +82,16 @@ fit seals the extent short instead · *Checked* unit test; a sweep could verify 
 *Breaks* three mechanisms at once, which is why §8.1.1a-6 is emphatic: the fixed-offset check, the
 out-of-order cache, and cumulative byte totals.
 
+**`SPACES-ARE-TYPES-WHEN-A-MIX-UP-IS-SILENT`** — two same-typed quantities that mean different things
+get different types whenever confusing them would produce a wrong answer rather than an error.
+*Argued* §8.1.6.1, §8.1.6 · *Enforced* **code** for logical against compressed (`LOff`, `COff`); the
+three record spaces are still bare `u64` (#86) · *Checked* `the_two_spaces_do_not_mix` in
+`common/src/offset.rs` is the shape of the check — a test that would stop compiling if the types merged
+*Breaks* silently, and §17.16.2 is the incident: object, stream and extent record numbers are all zero
+until an object outgrows its first extent, so dropping a conversion passes every test that never leaves
+it and then fails 139 of 200 reads. ⚠️ **The sharpest form of the criterion**: wrap them when the two
+coincide in exactly the cases a test would naturally cover, since that is when nothing catches it.
+
 **`CANONICAL-OFFSET-SPACE`** — append offsets are assigned in a canonical length-stuffed space, so a
 logical offset is invariant under re-framing.
 *Argued* §8.2.2 · *Enforced* design only · *Checked* not yet; wants a test that re-frames an extent
@@ -724,7 +734,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **applied** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE` |
 | **capability** | §9.1.3.5 | `CAPABILITY-IS-MEMBERSHIP-ONLY`, `HINT-BOUND-BY-CAPABILITY`, `KEY-AND-SALT-COVER-ONE-PLAINTEXT` |
 | **directory** | §5.1 | `POLICY-ATTACHES-TO-A-DIRECTORY`, `ALIAS-READS-INTERSECT` |
-| ⚠️ **compressed position** | §8.1.6 | `KEY-AND-SALT-COVER-ONE-PLAINTEXT`, `EC-GROUP-EQUAL-LENGTH`. *The same space §4.5 and §8.1.1a-2 call **physical**.* |
+| ⚠️ **compressed position** | §8.1.6 | `KEY-AND-SALT-COVER-ONE-PLAINTEXT`, `EC-GROUP-EQUAL-LENGTH`, `SPACES-ARE-TYPES-WHEN-A-MIX-UP-IS-SILENT`. *The same space §4.5 and §8.1.1a-2 call **physical**.* |
 | **creation second** | §4.6.3 | `EXTENT-IDENTITY-UNIQUE`, `EXTENT-KEY-FROM-CREATING-SN`, `HINT-BOUND-BY-CAPABILITY` |
 | **durable** | §8.1.1 | `DURABLE-IS-QUORUM-WATERMARK`, `INCOMPLETE-RECORD-NOT-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `SEAL-NEVER-BELOW-DURABLE` |
 | **erasure-coding group** | §4.3.2.3 | `EC-NEVER-SPLITS-AN-EXTENT`, `EC-GROUP-EQUAL-LENGTH`, `INSTANCES-BYTE-IDENTICAL`, `AEAD-TAG-IS-THE-CHECKSUM`, `ONE-MEDIA-CLASS-PER-EXTENT` |
@@ -747,7 +757,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **primary** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `TRUNCATION-SEALS` |
 | **quorum** | §8.1.1 | `QUORUM-OVERLAPS`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `UNAPPENDABLE-EXTENT-SEALS`, `SELF-SEAL-MARK-IS-DURABLE` |
 | **record** | §8.2 | `EXTENT-HOLDS-WHOLE-RECORDS`, `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `INCOMPLETE-RECORD-NOT-DURABLE`, `RECORD-FITS-ONE-EXTENT`, `TERMINATOR-NOT-IN-DATA`, `OFFSET-SNAPS-FORWARD`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `EXTENT-SEALS-BETWEEN-RECORDS`, `RANGE-ENDS-ON-A-RECORD-BOUNDARY` |
-| **record number** | §3 | `RECORD-NUMBER-STABLE`, `RECORD-NUMBERS-DENSE`, `UNKEYED-COUNT-EXACT`, `UPDATE-DELETE-PRESERVE-COUNTS`, `PATH-IS-THE-PORTABLE-NAME` |
+| **record number** | §3 | `RECORD-NUMBER-STABLE`, `RECORD-NUMBERS-DENSE`, `UNKEYED-COUNT-EXACT`, `UPDATE-DELETE-PRESERVE-COUNTS`, `PATH-IS-THE-PORTABLE-NAME`, `SPACES-ARE-TYPES-WHEN-A-MIX-UP-IS-SILENT` |
 | **reference** | §4.6 | `NO-CLUSTER-NAMES-IN-DATA-PLANE`, `REVERSE-EDGE-IS-A-COUNT`, `COUNTS-ARE-RECOMPUTABLE`, `ZERO-REFERENCES-IS-A-BUG`, `POSITION-FACTS-IN-REFERRER`, `REVENUE-INVARIANT-UNDER-REGROUPING` |
 | **seal** (extent) | §6 | `EXTENT-SEALS-BETWEEN-RECORDS`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATION-SEALS`, `SEALED-EXTENT-IMMUTABLE`, `RECORD-NUMBERS-DENSE`, `UNAPPENDABLE-EXTENT-SEALS`, `SEAL-CLOSES-TOP-DOWN`, `REQUESTED-SEAL-DISCARDS-NOTHING`, `SEAL-REQUESTS-ARE-IDEMPOTENT` |
 | **seal** (wire segment) | §17.5a | `NO-TWO-SEGMENTS-SHARE-A-NONCE`. ⚠️ *An unrelated sense of the word; `common/src/seal.rs` is this one.* |

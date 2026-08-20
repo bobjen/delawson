@@ -373,6 +373,9 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | A rollout parameter **defaults to the old behaviour** — "checked in off" is that rule for an *additive* feature only | §13.2.5.1 |
 | So a *restrictive* feature's parameter is `deletes_allowed`, defaulting **true**: positive name, old behaviour, no thesaurus | §13.2.5.1 |
 | Positive naming costs a negation at the **enforcement** site, so name for the **more frequent reading** | §13.2.5.1 |
+| The **`LOff`/`COff` trick generalizes**: wrap same-typed values when a mix-up would be **silent** | §8.1.6.1 |
+| And the sharpest test of silent is that the two **coincide in the cases a test would cover** | §8.1.6.1 |
+| First: **object / stream / extent record numbers**, which §17.16.2 already failed 139 reads over | §8.1.6.1, §17.16.2 |
 | Because **double negatives read as emphasis of the negative** — a default of the language faculty, seen in novel languages | §4.1.1.0 |
 | Withdrawing a capability is **deferred**, but the **official flag stays permissive** until cleanup completes | §4.1.1.1 |
 | So the reliance rule is **unrepresentable to get wrong**: nothing can see a half-established restriction | §4.1.1.1 |
@@ -7306,6 +7309,61 @@ position from, and what it returns today is a compressed one wearing the wrong n
 has to carry the logical length**, and until it does the receipt is only correct because nothing
 compresses (#48).
 
+#### 8.1.6.1 The same trick applies elsewhere, and one test says where
+
+**`LOff` and `COff` are an instance of something general, and it can be done for other values**
+(Asserted, Bob, 2026-08-19): wrap same-typed quantities that mean different things, and argument
+mismatches become compile errors instead of wrong answers.
+
+**The marginal cost is already near zero**, which is what makes it worth being systematic about:
+`common/src/offset.rs` defines both types from one `space!` macro, so a third is a line, and the wire
+conversions come with it.
+
+##### The test for when it earns its keep
+
+Not every pair of same-typed values wants a type. The criterion is in §8.1.6's own argument, and it is
+sharper than "these are different things":
+
+> ⚠️ **Wrap them when a mix-up is *silent* — and the sharpest form of silent is that the two coincide
+> in exactly the cases a test would naturally cover.**
+
+`LOff` and `COff` are equal while nothing compresses, which was every test written before compression
+existed. That is not a fact about offsets; it is the shape of the hazard.
+
+| Candidate | Type today | Coincide when | A mix-up is | Verdict |
+|---|---|---|---|---|
+| **object / stream / extent record numbers** | `u64` | **before the first seal**, when all three origins are zero | **silent** — §17.16.2 is the incident report | **yes, first** |
+| **second / day** for key derivation (§7.3.3) | `u64` | never numerically, but a *derived* key looks valid either way | **silent, and unrecoverable** — a wrong key is lost data (§7.3.2.4) | **yes** |
+| **entries / bytes** for the answer limit (§9.1.3.7, §16.132) | `u64` | while entries are uniform | silent | yes, once the limit exists |
+| `DnId` / `SnId` / `EnId` | `u32` | in small clusters, where the three id spaces overlap | **loud** — the request goes to the wrong machine type and is refused | low priority |
+| `StreamId` / `ExtentId` / object id | `u64` | early, while all are small | mostly loud, since the target lookup fails | low priority |
+
+**The first row is the one to do, because the bug is not hypothetical.** §17.16.2 records it: three
+numbering spaces meet on the read path, all three are zero until an object outgrows its first extent,
+and **139 of 200 reads failed** the moment one did. §17.18 and §17.19 then found the same *class* of
+defect twice more in one afternoon — an FE patching a field by position, and a benchmark chopping an
+answer by an assumed width.
+
+**And it would replace a comment with a compiler.** The FE carries this warning today:
+
+> ⚠️ **`within` twice and `origin` are only correct as a set.** Both first-records are zero until an
+> object outgrows its first extent, so a version that drops either one passes everything that never
+> leaves that extent and then fails most reads.
+
+With typed spaces, `within` becomes two distinct conversions — object→stream and stream→extent — and
+`origin` the only way back. Dropping one stops compiling, so that paragraph describes a property of the
+types instead of a rule somebody has to hold in mind. §17.12.1's lesson again: **structural rather than
+careful.**
+
+##### What it does not fix
+
+⚠️ **A newtype prevents *mixing* spaces and does nothing about being wrong *within* one.** An
+`ExtentRecord` off by one is still off by one, and §17.16.2's bug had both faces. So this narrows the
+class rather than closing it, and the test that reads past the first seal is still what catches the
+rest.
+
+**Tracked in #86**, and it belongs to the coding rules §16.141 says have no home.
+
 ### 8.1.7 Sealing when an instance is down
 
 The normal seal is the primary's: it assigns the offsets, so it knows where the extent ends. **When
@@ -12926,7 +12984,8 @@ Roughly in order of how much else depends on them.
      to hide most of what §16's performance questions are asking about. The object count differed (17 M
      against 20 M, favouring the *newer* run), so the candidates are outside the code: CPU frequency
      behaviour, what else was on the box, page-cache and allocator state, or the object population's
-     layout in memory. Worth pinning down because it sets the resolution of every measurement here.
+     layout in memory (#88, and #87 for the run that failed partway). Worth pinning down because it
+     sets the resolution of every measurement here.
 
 **Closed** since earlier drafts:
 
@@ -14591,6 +14650,6 @@ Two consequences, and neither is about this benchmark in particular:
   to be measured back to back against one running cluster, and the *baseline arm re-run at the same
   time* rather than quoted from here.
 
-⚠️ **What causes the 23% is not established** and should not be guessed at in this document; #86 holds
+⚠️ **What causes the 23% is not established** and should not be guessed at in this document; #88 holds
 it. The object count differed (17 M against 20 M, which should favour today's run), so the likely
 candidates are outside the code.
