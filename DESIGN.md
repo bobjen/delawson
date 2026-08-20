@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-153 things *not* decided.
+154 things *not* decided.
 
 **Priorities and framing**
 
@@ -13984,6 +13984,15 @@ Roughly in order of how much else depends on them.
      the 1 KB case as underbilled 375×, so today the tax falls on the operator. A flag whose omission
      costs the user nothing is a flag nobody sets.
 
+154. **The fraction of time DN metadata is resident in RAM** (§17.25.6). §17.25.6 derives the
+     inline-versus-lumped cutoff as `R·(1 + E·G/(f·r))` and everything in it is known except *f*. The
+     cutoff is insensitive to it across four orders of magnitude — 56 bytes at always-resident, 123
+     at one part in a thousand — so a rough figure settles the boundary. ⚠️ But *f* is per-object
+     rather than per-fleet, since hot metadata stays resident and cold does not, and that makes the
+     cutoff a function of access frequency rather than a constant. Measuring the fleet average is a
+     benchmark; deciding whether the per-object form is worth using is a design question, and §17.25.5's
+     SN rewrite pass is where it would be applied.
+
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
@@ -16494,3 +16503,87 @@ workload pricing selects for.
 addition to §17.25.2's model: physical bytes from the compressed length and the storage class are the
 *data* half, and a per-stream and per-extent charge is the other. Without it "users will see a
 metadata tax" is not true of anything the system computes (§16.153).
+
+#### 17.25.6 The inline cutoff is calculable, and it comes out at the size of the pointer
+
+**Bob, 2026-08-20**: *"The cost of DN metadata depends on the fraction of time metadata is in RAM.
+Once you know that you can calculate where the tradeoff is for keeping the data inline vs as a range
+in a shared stream."* So the boundary between §11's first two regimes is **not a tuning knob to be
+guessed at**. Here is the arithmetic.
+
+##### The compaction terms, which have closed forms
+
+**A shared stream is rewritten when it is 1/3 garbage** (Asserted, Bob, *"going by memory I didn't
+redo the logic"*). Redoing it: of the objects live just after a compaction, a third have died by the
+next one — that is what makes the third of garbage — so an object survives each cycle with
+probability 2/3 and is copied when it does.
+
+| | |
+|---|---|
+| Expected copies | Σ (2/3)^k = **2** |
+| Total writes | 1 initial + 2 copies = **3** |
+
+**Which generalizes: compacting at garbage fraction *g* writes each object `1/g` times, and holds
+`1/(1−g)` bytes per live byte.** (Derived. Check: *g* = 1/3 gives 3 writes and 1.5× space, and Bob's
+memory is right — reading "rewritten 3 times" as three writes rather than three *re*-writes.)
+
+⚠️ **That is the whole compaction tradeoff in two terms pulling opposite ways**: tolerate more garbage
+and writes fall as `1/g` while space rises as `1/(1−g)`. Where to sit depends on the price of
+bandwidth against the price of space, which is a separate calculation this one does not need.
+
+##### The cutoff
+
+Costs per byte, in disk-byte-equivalents, with *r* = **5,000** for RAM against disk (§12.2, Cited),
+*E* the storage class expansion, *G* = `1/(1−g)` = **1.5** the garbage amplification, *R* the metadata
+a range costs that an inline object avoids, and **_f_ the fraction of time DN metadata is resident**:
+
+| | Cost of an *n*-byte object |
+|---|---|
+| **inline** | `n·(E·G + f·r)` — its bytes are DN metadata, so they pay the RAM term |
+| **ranged** | `n·E·G + R·(E·G + f·r)` — its bytes are ordinary data, and the range record is the metadata |
+
+Inline wins while `n·f·r < R·(E·G + f·r)`, so:
+
+> ### `n* = R · (1 + E·G / (f·r))`
+
+**With *E* = 4, *G* = 1.5, *r* = 5,000 and *R* = 56 bytes** — today's DN stream record (§4.7.1), which
+is exactly what a range costs and an inline object does not pay:
+
+| *f* | Cutoff |
+|---|---|
+| 1 (always resident) | **56 B** |
+| 0.1 | 57 B |
+| 0.01 | 63 B |
+| 0.001 | 123 B |
+| 10^-4 | 728 B |
+| 10^-5 | 6.8 KB |
+
+##### What the formula says
+
+> **Inline an object when it is smaller than the record that would otherwise point at it.** The limit
+> as `f·r → ∞` is exactly *R*, and the whole `E·G/(f·r)` term is the correction for metadata that is
+> *not* resident.
+
+**And it is remarkably insensitive.** Across four orders of magnitude of *f* — from always-resident to
+one part in a thousand — the cutoff moves from 56 to 123 bytes. It only runs away when DN metadata is
+nearly always cold, and then it does so fast.
+
+⚠️ **Which makes *R* the lever, not *f*.** The cutoff is proportional to the range record, so
+**shrinking the DN's stream record lowers the cutoff** and inlines fewer objects — correctly, because
+a cheap pointer makes pointing cheap. §4.7.1 is the relevant number: 56 bytes against a 4-byte design
+budget, so a DN stream record that met its budget would put the cutoff near **4 bytes** and inlining
+would be for almost nothing.
+
+##### ⚠️ *f* is per-object, so the cutoff is too
+
+**The fraction of time a byte of metadata is resident is not one number for the fleet.** A DN holding
+100 TB of metadata in 256 GB of RAM has *f* ≈ 0.0026 *averaged*, giving a cutoff near 80 bytes — but
+a hot object's metadata is resident and a cold one's is not, and the formula says a hot object should
+be inlined at a smaller size than a cold one.
+
+> **That is exactly what the SN's rewrite pass is positioned to use** (§17.25.5): it decides regimes
+> *after the fact*, when access frequency is an observed quantity rather than a prediction. The
+> cutoff formula is what tells it which comparison to make.
+
+**And *f* is a measurement nobody has taken** (§16.154). It is also, per §18.2, a **fraction in
+[0, 1]** and not a percentage — a parameter that will be multiplied by 5,000 in exactly one place.

@@ -793,6 +793,15 @@ physical is computed from compressed and the class every time it is asked for.
 and re-deriving it is then a migration rather than a multiply. See
 [[BILLING-CHARGES-THE-CLASS-NOT-THE-COPIES]] for what it is computed *from*.
 
+**`INLINE-BEATS-A-POINTER-TO-IT`** — an object is stored inline only while it is smaller than
+the metadata a reference to it would cost, `R·(1 + E·G/(f·r))`.
+*Argued* §17.25.6 · *Enforced* design only; no regime exists yet · *Checked* not yet
+*Breaks* both ways, and the wrong side is not symmetric. Inlining past the cutoff puts user
+bytes in RAM-backed metadata at ~5,000× the cost of disk; refusing to inline below it spends a
+56-byte record pointing at something smaller than the record. ⚠️ The cutoff is proportional to
+*R*, so it moves whenever the DN's stream record does — which it did on 2026-08-20, 40 B to
+56 B (§4.7.1).
+
 **`A-SEALED-SUMMARY-IS-FINAL`** — a sealed stream's sizes are exact and never change, so one
 refresh is correct for ever; a growing stream's are a point in time.
 *Argued* §17.25.1 · *Enforced* `Held::learned` never moves a number backwards, and the SN sums
@@ -882,6 +891,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **primary** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `TRUNCATION-SEALS` |
 | **quorum** | §8.1.1 | `QUORUM-OVERLAPS`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `UNAPPENDABLE-EXTENT-SEALS`, `SELF-SEAL-MARK-IS-DURABLE` |
 | **batch** | §9.1.3.7 | `A-BATCH-ANSWER-IS-A-PREFIX`, `A-NAME-COSTS-AT-LEAST-ONE-ENTRY`, `A-NAME-HAS-ONE-OWNER` |
+| **inline** | §11 | `INLINE-BEATS-A-POINTER-TO-IT`, `A-PHYSICAL-LENGTH-IS-NEVER-STORED` |
 | **stream summary** | §17.25.1 | `A-SEALED-SUMMARY-IS-FINAL`, `A-PHYSICAL-LENGTH-IS-NEVER-STORED`, `TAIL-ONLY-SUMMARIES-EXACT` |
 | **record** | §8.2 | `EXTENT-HOLDS-WHOLE-RECORDS`, `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `INCOMPLETE-RECORD-NOT-DURABLE`, `RECORD-FITS-ONE-EXTENT`, `TERMINATOR-NOT-IN-DATA`, `OFFSET-SNAPS-FORWARD`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `EXTENT-SEALS-BETWEEN-RECORDS`, `RANGE-ENDS-ON-A-RECORD-BOUNDARY` |
 | **record number** | §3 | `RECORD-NUMBER-STABLE`, `RECORD-NUMBERS-DENSE`, `UNKEYED-COUNT-EXACT`, `UPDATE-DELETE-PRESERVE-COUNTS`, `PATH-IS-THE-PORTABLE-NAME`, `SPACES-ARE-TYPES-WHEN-A-MIX-UP-IS-SILENT` |
