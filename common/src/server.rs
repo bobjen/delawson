@@ -45,6 +45,7 @@ use crate::config::{ClusterConfig, Messaging, ProcessConfig, SendMode, ServiceEn
 use crate::peer::Peers;
 use crate::random::Rng;
 use crate::registry::Peer;
+use crate::routing;
 use crate::wire::{
     self, Arg, BUF_BYTES, MAX_FRAME_BYTES, Op, Request, Response, Status, Wire, put_response,
 };
@@ -244,6 +245,24 @@ impl Process {
         }
         let turn = self.turn.fetch_add(1, Ordering::Relaxed) as usize;
         Ok(&of_kind[turn % of_kind.len()].identity)
+    }
+
+    /// The process of a kind that owns a name. ⚠️ **Not `pick`** — a name has an owner,
+    /// and taking DNs in turn means a create and the lookup that follows it go to
+    /// different machines, which with more than one DN loses the object. See
+    /// `routing`, and #75 for the real thing.
+    pub fn owner(&self, kind: ServiceKind, name: &str) -> Result<&str> {
+        let of_kind: Vec<&ServiceEntry> = self.cluster.services_of_kind(kind).collect();
+        if of_kind.is_empty() {
+            return Err(Error::new(format!("no {} in the roster", kind.as_str().to_uppercase())));
+        }
+        Ok(&of_kind[routing::owner_of(name, of_kind.len())].identity)
+    }
+
+    /// Every process of a kind, in roster order, so a fan-out can address them all and
+    /// an index into this list means the same thing to every caller.
+    pub fn all_of(&self, kind: ServiceKind) -> Vec<&str> {
+        self.cluster.services_of_kind(kind).map(|entry| entry.identity.as_str()).collect()
     }
 
     pub fn timeout(&self) -> Duration {

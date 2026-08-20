@@ -421,6 +421,38 @@ impl Batch {
     pub fn more(&self) -> bool {
         self.next != UNKNOWN
     }
+
+    /// One name's arguments at a time, from the body of a levelled batch answer.
+    ///
+    /// ⚠️ **Slices rather than parses.** A batch that came from several DNs has to be put
+    /// back together in the caller's order (§9.1.3.12), and re-encoding every row to do that
+    /// would mean the merge and the DN could disagree about the wire — §17.19's defect,
+    /// which cost an afternoon. Handing back the untouched arguments cannot.
+    ///
+    /// Each name is a `Shape`, an object row, then the stream rows the shape says, each
+    /// with the extents *its* row says. Only for the levelled form: a batch asked for no
+    /// detail at all answers with bare object rows and `Described::all_of_args` reads those.
+    pub fn pieces(mut args: &[Arg], count: u64) -> Result<Vec<&[Arg]>> {
+        let mut out = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let whole = args;
+            let (shape, mut rest) = Shape::of_args(args)?;
+            if rest.len() < Described::ARGS {
+                return Err(Error::new("a batch answer stopped inside an object row"));
+            }
+            rest = &rest[Described::ARGS..];
+            for _ in 0..shape.given {
+                let (row, after) = StreamRow::of_args(rest)?;
+                rest = after;
+                for _ in 0..row.given {
+                    rest = ExtentRow::of_args(rest)?.1;
+                }
+            }
+            out.push(&whole[..whole.len() - rest.len()]);
+            args = rest;
+        }
+        Ok(out)
+    }
 }
 
 /// Several streams to describe in one ask, which is what makes `batch-object-info`

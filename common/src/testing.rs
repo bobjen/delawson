@@ -135,7 +135,7 @@ pub fn en_config() -> ENConfig {
 }
 
 pub fn fe_config() -> FEConfig {
-    FEConfig { knobs: knobs(), stateless: true }
+    FEConfig { knobs: knobs(), stateless: true, info_entries: 10_000 }
 }
 
 pub fn dn_config() -> DNConfig {

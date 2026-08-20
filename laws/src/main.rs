@@ -270,6 +270,20 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         from: u64,
     },
+    /// What several objects are, in one request. Names may belong to different DNs, and
+    /// the answer says how many it covered and where to carry on (§9.1.3.12).
+    BatchObjectInfo {
+        /// The names, in the order the answer will describe them.
+        paths: Vec<String>,
+        #[arg(long, value_enum)]
+        want: Vec<Want1>,
+        /// The most entries the answer may carry, over objects plus streams. Zero means
+        /// the cluster's configured default.
+        #[arg(long, default_value_t = 0)]
+        limit: u64,
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+    },
     /// Create many objects, and time it. Paths are `<prefix><n>`.
     BenchCreate {
         #[arg(long, default_value_t = 1_000_000)]
@@ -696,6 +710,9 @@ fn run(cli: Cli) -> Result<()> {
                     record(&target, Framing::parse(framing)?, want, &answer)
                 }
                 (_, Op::ObjectInfo | Op::CreateObject) => object(&target, &answer),
+                (Cmd::BatchObjectInfo { paths, want, .. }, Op::BatchInfo) => {
+                    batch(&target, paths, !want.is_empty(), &answer)
+                }
                 _ => report(&target, &answer),
             }
         }
@@ -1237,6 +1254,47 @@ fn object(target: &Target, response: &Response) -> Result<()> {
     say(target, &it, Some(shape), &streams)
 }
 
+/// Several objects, in the order asked about, then what the answer did not cover.
+///
+/// ⚠️ **The names come from the request, not the answer.** A batch answer is a prefix of
+/// what was asked for and carries no names at all (§17.23), so printing them side by side
+/// is the only way to see which object each row is — and getting that wrong silently is
+/// exactly the failure §17.12 warned about.
+fn batch(target: &Target, paths: &[String], levelled: bool, response: &Response) -> Result<()> {
+    let (covered, rows) = match Batch::of_args(&response.args) {
+        Ok(read) => read,
+        Err(_) => return report(target, response),
+    };
+    let pieces = match levelled {
+        true => match Batch::pieces(rows, covered.given) {
+            Ok(pieces) => pieces,
+            Err(_) => return report(target, response),
+        },
+        false => rows.chunks(Described::ARGS).take(covered.given as usize).collect(),
+    };
+    for (n, piece) in pieces.iter().enumerate() {
+        let name = paths.get(n).map(String::as_str).unwrap_or("?");
+        print!("{name}: ");
+        object(target, &Response { id: 0, status: Status::Ok, args: piece.to_vec() })?;
+    }
+    let e = if covered.entries == 1 { "y" } else { "ies" };
+    match covered.next {
+        UNKNOWN => println!(
+            "{} {} of {} names described, {} entr{e}, nothing more",
+            target.identity, covered.given, covered.asked, covered.entries
+        ),
+        next => println!(
+            "{} {} of {} names described, {} entr{e}, carry on at name {next} ({})",
+            target.identity,
+            covered.given,
+            covered.asked,
+            covered.entries,
+            paths.get(next as usize).map(String::as_str).unwrap_or("?")
+        ),
+    }
+    Ok(())
+}
+
 /// An object, and whatever detail came with it.
 fn say(
     target: &Target,
@@ -1602,6 +1660,17 @@ fn build(cmd: &Cmd) -> Result<Request> {
             let mut request = Request::new(Op::ObjectInfo).text(path);
             // Sent only when something was asked for, so the common case is byte-for-byte the
             // request that predates the field — which is what keeps §17.5g's baseline honest.
+            let asked = asking(want, *limit, *from);
+            if asked != Want::plain() {
+                request.args.extend(asked.args());
+            }
+            request
+        }
+        Cmd::BatchObjectInfo { paths, want, limit, from } => {
+            let mut request = Request::new(Op::BatchInfo);
+            for path in paths {
+                request = request.text(path);
+            }
             let asked = asking(want, *limit, *from);
             if asked != Want::plain() {
                 request.args.extend(asked.args());

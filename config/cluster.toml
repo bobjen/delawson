@@ -122,7 +122,11 @@ domain = ["region0", "dc0", "rack0", "box0", "disk0"]
 
 [[service]]
 kind = "dn"
-count = 1
+# Three, not one. ⚠️ A one-DN cluster cannot exercise name routing or a batch's fan-out
+# across DNs at all, and two defects in that path survived a day of testing because of it
+# (§17.24.1). A batch is roughly half as fast here as on one DN, which is the finding of
+# §17.24.5 and not noise: the fan-out is messages, and messages are the cost.
+count = 3
 domain = ["region0", "dc0", "rack0", "box0", "disk0"]
 
 [[service]]

@@ -223,6 +223,15 @@ order and says k, so a short answer is never a hole.
 object's metadata to a different name. It is also what forces §9.1.3.12's detailed ask to go to the DN
 holding the *earliest* names: a prefix in the caller's order is not a prefix in any one DN's order.
 
+**`A-NAME-HAS-ONE-OWNER`** — a name resolves to the same DN every time it is routed, whoever
+routes it.
+*Argued* §17.24.0, §5.5.1 · *Enforced* `common::routing::owner_of`, and `Process::owner` rather
+than `pick` on every name-bearing request · *Checked* unit test
+*Breaks* a create lands on one machine and the lookup that follows it asks another, so the object is
+not lost but unreachable, which is worse. ⚠️ Round robin violates this and was what every DN-bound
+request used — invisible with one DN, and half the objects gone with two. `batch-create` still
+violates it (#98).
+
 **`A-NAME-COSTS-AT-LEAST-ONE-ENTRY`** — every name a batch answer covers spends at least its own
 object row against the entry limit.
 *Argued* §9.1.3.12, §9.1.3.7 · *Enforced* design only; the multi-DN fan-out is not built · *Checked*
@@ -845,7 +854,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **placement** | §5.6 | `PLACEMENT-NEVER-REVISITED`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `NESTED-NOT-ORTHOGONAL-DOMAINS`, `SOLVER-TIMEOUT-DEFERS-NEVER-DROPS`, `UNENFORCEABLE-RULE-NOT-ENFORCED`, `NO-DATA-MOVEMENT-EXCEPT-RANGE-SPLIT` |
 | **primary** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `TRUNCATION-SEALS` |
 | **quorum** | §8.1.1 | `QUORUM-OVERLAPS`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `UNAPPENDABLE-EXTENT-SEALS`, `SELF-SEAL-MARK-IS-DURABLE` |
-| **batch** | §9.1.3.7 | `A-BATCH-ANSWER-IS-A-PREFIX`, `A-NAME-COSTS-AT-LEAST-ONE-ENTRY` |
+| **batch** | §9.1.3.7 | `A-BATCH-ANSWER-IS-A-PREFIX`, `A-NAME-COSTS-AT-LEAST-ONE-ENTRY`, `A-NAME-HAS-ONE-OWNER` |
 | **record** | §8.2 | `EXTENT-HOLDS-WHOLE-RECORDS`, `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `INCOMPLETE-RECORD-NOT-DURABLE`, `RECORD-FITS-ONE-EXTENT`, `TERMINATOR-NOT-IN-DATA`, `OFFSET-SNAPS-FORWARD`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `EXTENT-SEALS-BETWEEN-RECORDS`, `RANGE-ENDS-ON-A-RECORD-BOUNDARY` |
 | **record number** | §3 | `RECORD-NUMBER-STABLE`, `RECORD-NUMBERS-DENSE`, `UNKEYED-COUNT-EXACT`, `UPDATE-DELETE-PRESERVE-COUNTS`, `PATH-IS-THE-PORTABLE-NAME`, `SPACES-ARE-TYPES-WHEN-A-MIX-UP-IS-SILENT` |
 | **reference** | §4.6 | `NO-CLUSTER-NAMES-IN-DATA-PLANE`, `REVERSE-EDGE-IS-A-COUNT`, `COUNTS-ARE-RECOMPUTABLE`, `ZERO-REFERENCES-IS-A-BUG`, `POSITION-FACTS-IN-REFERRER`, `REVENUE-INVARIANT-UNDER-REGROUPING` |

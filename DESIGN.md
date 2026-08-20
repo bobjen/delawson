@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-150 things *not* decided.
+151 things *not* decided.
 
 **Priorities and framing**
 
@@ -397,6 +397,12 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | So: full ask to one DN, a **per-object summary** to the rest — one row per name, fixed work, no SN hop | §9.1.3.12 |
 | That summary gives the **exact object count** elsewhere, and the first DN gets **limit − that count** | §9.1.3.12 |
 | The detailed ask goes to the DN holding the **earliest names**, because the answer must be a prefix in the *caller's* order | §9.1.3.12 |
+| The reservation needs **no round trip**: FE knows how many names it routed elsewhere, and each costs one entry | §17.24.3 |
+| Round two takes a **contiguous run from the first unfinished name**, since that is where the caller will come back to | §17.24.3 |
+| ⚠️ Every estimate is allowed to be wrong, because assembly **stops at the first name it does not have** | §17.24.4 |
+| A shape's `next` means **where a listing would resume**, not where the rows asked for ran out | §17.24.2 |
+| ⚠️ **Hash routing makes a batch cost D messages** — 46% slower over three DNs, and 63 requests per 100 names at a hundred | §17.24.5 |
+| So contiguous **ranges** (#75) are what keeps a batch one request; a hash is the worst case by construction | §17.24.5 |
 | It also tells a caller enough to **parallelize the rest itself**, which is §9.1.3.2's shape one level out | §9.1.3.12, §9.1.3.2 |
 | **HDFS scans** its block list to find an offset — 2 × 10^9 blocks at 256 PB, the same number §14.1 reaches | §9.1.3.8 |
 | Which is §4.5's rule with the counterfactual attached: locating by **record** is a descent, locating by **byte** is a walk | §9.1.3.8, §4.5 |
@@ -9732,6 +9738,11 @@ DN owns the earliest names, and the quota is spent in the caller's order.
 
 ##### And even if it stops there, the caller can finish the job itself
 
+⚠️ **One step of the above is unnecessary, found on building it** (§17.24.3): the summaries are not
+what tells the FE how much to reserve. A summary costs exactly one entry per name and the FE knows how
+many names it routed elsewhere *before it sends anything*, so the reservation needs **no measuring round
+trip** and round one is one parallel wave. What the summaries are for is sizing **round two**.
+
 **The most useful thing about the cheap round trip is what it tells the caller** (Asserted, Bob,
 2026-08-19): *"even if this doesn't need to go on to other DNs, it tells the user enough information for
 them to be able to parallelize fetching the remaining batch infos themselves."*
@@ -13937,6 +13948,15 @@ Roughly in order of how much else depends on them.
      front the way §9.1.3.12 does, and it inherits §5.1.1.1a's alias questions about what "everything in
      a directory" even means. Bob expects such a command eventually; it is not this one.
 
+151. **What gives a batch name locality** (§17.24.5, #75). A hash spreads a batch over every DN by
+     construction, so at a hundred DNs a hundred-name batch is 63 requests and batching has bought
+     almost nothing — the thing §1.4.0 built it for. Contiguous ranges are the obvious answer, but they
+     raise their own: a caller has to *know* to name things that land together, which means either the
+     namespace shape leaks into the routing (a directory's objects share a DN, and a hot directory is
+     then a hot DN) or the caller is given a way to ask. ⚠️ Note this is not fixed by §16.149's
+     caller-side assembly — a caller sending D requests costs the FE tier D too, so it is more messages
+     and not fewer. Locality is a routing property, not a fan-out one.
+
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
@@ -16068,3 +16088,112 @@ with an extent range only in the mid-object case."*
 **Only the last name given can be partial.** An earlier one stopping short would have spent the whole limit
 and ended the loop, so `whole` is a single flag over the loop rather than a per-name field on the wire.
 That is §18's decompose-the-state rule paying off: one bit, not one per name.
+
+### 17.24 A batch across DNs, and the routing that decides what it costs
+
+**Built for #96, on §9.1.3.12's design.** Two things had to exist first, and one of them was a
+surprise.
+
+#### 17.24.0 There was no name-to-DN routing at all
+
+⚠️ **`Process::pick` is round robin**, and every DN-bound request used it. With one DN that is
+invisible; with two it means **a create lands on one machine and the lookup that follows it asks
+another**, so half the objects are lost the moment a second DN exists. The fan-out had nothing to fan
+out *to* — it had to be built on routing that was not there.
+
+`common/src/routing.rs` is the crude version: a hash of the whole name over the DNs in the roster.
+It is wrong in every way #75 is about — a DN cannot be added without moving names, a range cannot be
+split — and right in the one way that has to hold first, `A-NAME-HAS-ONE-OWNER`. Everything that maps a
+name to a DN goes through it, so #75 replaces one function.
+
+`Process::owner` now routes `create-object`, `object-info` and single-name lookups. ⚠️ **`batch-create`
+still uses `pick`** and therefore still creates on the wrong DN (#98).
+
+#### 17.24.1 Two defects the single-DN cluster was hiding
+
+**Both were in code written and tested the same day**, and neither was reachable with one DN.
+
+| | |
+|---|---|
+| a **missing name** in a levelled batch got a bare object row while every other name got a shape first | so a reader counting arguments walks off by five and attributes rows to the wrong name — §17.12's failure exactly. A miss now carries `Shape::plain()`. |
+| a **summary** — counts, no rows — reported `nothing more` | while holding undescribed streams, contradicting the batch header that had just told the caller to come back to that name (§17.24.2) |
+
+#### 17.24.2 A shape says where a listing would resume, not whether rows were asked for
+
+`Shape::next` was set only when stream rows were wanted. But §9.1.3.12's summary asks for **counts and
+not rows on purpose**, and the answer has to say *"three streams, none described, a listing starts at
+record 0"* — which is the whole reason the summary is useful. Reporting `nothing more` there made a
+summary indistinguishable from a complete answer, and made every per-name line in a merged batch
+disagree with the header above it.
+
+> **So `next` means "where a stream listing would resume", not "where the rows you asked for ran out".**
+> One rule, true of a summary and a truncation alike.
+
+#### 17.24.3 The reservation needs no round trip
+
+⚠️ **§9.1.3.12 says the summaries are what tell the FE how much to reserve, and that is one step too
+many.** A summary costs *exactly* one entry per name — the object's own row, by
+`A-NAME-COSTS-AT-LEAST-ONE-ENTRY` — and the FE knows how many names it routed elsewhere before it
+sends anything. So the detailed ask can be given `limit − (names elsewhere)` **with no measuring round
+trip at all**, and round one is: full ask to the lead DN, summary to every other, all at once.
+
+**What the summaries are actually for is round two.** They report each name's exact stream count, which
+is what sizes the upgrade — §9.1.3.2's counts, one tier out.
+
+**Measured on the three-DN cluster, six one-stream objects, so a full name costs two entries:**
+
+| limit | what came back |
+|---|---|
+| 12 | all six in full, 12 entries, nothing more |
+| 8 | the lead DN's two names in full, four summaries reading *"0 streams of 1 described"*, exactly 8, carry on at name 1 |
+| 10 | slack of 2 spent upgrading the **two names nearest the front**, exactly 10, carry on at name 3 |
+
+**Round two takes a contiguous run from the first unfinished name, not the cheapest names going.** The
+continuation points at the first unfinished name, so a caller coming back for name 5 asks again *from*
+5 — detail fetched for name 9 in the meantime is work nobody will read.
+
+#### 17.24.4 ⚠️ Every estimate here is allowed to be wrong
+
+The DN's limit is the authority, a DN may answer shorter than asked, and #75 will make ownership move.
+What stops any of that from being a correctness problem is one property:
+
+> **Assembly walks the caller's order and stops at the first name it does not have.**
+
+A bad estimate then costs a round trip and never an answer attributed to the wrong name
+(`A-BATCH-ANSWER-IS-A-PREFIX`). That is what makes it safe to guess at all — and a refusal from a DN
+fails the whole batch rather than being reported as those objects not existing, which would be a wrong
+answer rather than a partial one.
+
+#### 17.24.5 ⚠️ Hash routing makes a batch cost D messages, which is the whole cost
+
+**Measured in one session, so §17.19.2's ±25% does not apply:**
+
+| | `--batch 100` | `--batch 1` |
+|---|---|---|
+| one DN | 4,156,402/s | 123,856/s |
+| three DNs | **2,262,083/s** | 105,892/s |
+
+**A batch got 46% slower by having three DNs to spread over**, and the reason is that one request became
+three. §1.4.0 measures nine tenths of a request's cost as messaging, so multiplying the messages is
+multiplying nearly all of it.
+
+⚠️ **It gets worse, and not gently.** A hash spreads *n* names over *D* DNs, so the number touched is
+`D(1 − (1 − 1/D)^n)`:
+
+| DNs | DNs a 100-name batch touches |
+|---|---|
+| 3 | 3.0 |
+| 10 | 10.0 |
+| 100 | **63.4** |
+| 1000 | 95.2 |
+
+**At a hundred DNs a hundred-name batch is 63 requests, and batching has bought almost nothing.** The
+thing §1.4.0 built batching for is gone at the scale the system is for.
+
+> **So #75's ranges are not only about splitting and moving.** A hash guarantees maximal fan-out — it is
+> the *worst* case for a batch, by construction. Contiguous ranges let names that are asked about
+> together live together, which is the only way a batch of a thousand stays one request.
+
+**And that reframes §16.149.** Caller-side assembly does not fix this: the caller sending D requests
+costs D to the FE tier as well, so it is more messages, not fewer — better latency, worse load. What
+fixes it is **locality**, which is a routing property and not a fan-out one. §16.151.

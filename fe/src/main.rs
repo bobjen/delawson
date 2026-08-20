@@ -19,12 +19,14 @@
 //! remembered costs one ask and nothing else, so an FE holding it is still an FE
 //! that holds no state.
 
+use common::Result;
 use common::block::Holds;
 use common::config::{FEConfig, ServiceKind};
 use common::framing::Framing;
-use common::info::Described;
+use common::info::{Batch, Described, Shape, UNKNOWN};
 use common::logw;
-use common::range::{Budget, Covered, Piece, Range, Start};
+use common::range::{Budget, Covered, Detail, Piece, Range, Start, Want};
+use common::routing;
 use common::server::{self, Process, Reply, Service};
 use common::wire::{AppendBlock, Arg, Op, Request, Response, Status};
 use std::collections::HashMap;
@@ -226,7 +228,7 @@ impl Service for FE {
         self.defers(op) || matches!(op, Op::Ping | Op::Status | Op::Shutdown | Op::Sites)
     }
 
-    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Request, mut reply: Reply) {
+    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Request, reply: Reply) {
         match request.op {
             Op::AppendRecord => return self.append(process, &request, reply),
             Op::ReadRecord => return self.read(process, &request, reply),
@@ -236,18 +238,10 @@ impl Service for FE {
             reply.send(server::unbuilt(process, SERVES, &request));
             return;
         }
-        let dn = match process.pick(ServiceKind::Dn) {
-            Ok(dn) => dn.to_string(),
-            Err(e) => return reply.send(Response::error(Status::Internal, e.to_string())),
-        };
-        // Which DN it went to belongs on the line, since that is the hop a
-        // live-site argument is about.
-        reply.about(format_args!("{},dn {dn}", first(&request)));
-        // The answer is whatever the DN says, since FE adds nothing to it yet.
-        if let Err(e) = process.ask(&dn, &request, move |answer| reply.send(answer)) {
-            // The reply went into the closure, so this needs its own.
-            logw!("could not reach a DN", "dn {dn},{e}");
+        if request.op == Op::BatchInfo {
+            return self.batch(process, &request, reply);
         }
+        self.onward(process, &request, reply);
     }
 
     fn status(&self, _process: &Process) -> Vec<String> {
@@ -954,6 +948,430 @@ impl Located {
     }
 }
 
+/// One name's place in a batch answer being put back together (§9.1.3.12).
+#[derive(Clone)]
+struct Slot {
+    /// The arguments the owning DN produced for this name, untouched. Copied rather than
+    /// re-encoded: a merge that re-encodes can disagree with the DN about the wire, which
+    /// is §17.19's defect.
+    args: Vec<Arg>,
+    /// Whether the name was described to the detail asked for. A summary is a *valid*
+    /// answer for one name — its shape says no streams follow and where to resume — but it
+    /// is not a finished one, and the continuation points at the first unfinished name.
+    whole: bool,
+    /// What describing this name in full would cost in entries: one for the object and one
+    /// per stream. **Exact**, because the stream count is the DN's own and it reports it
+    /// whether or not it described the streams (§9.1.3.2).
+    full: u64,
+    /// What it cost as answered.
+    spent: u64,
+}
+
+/// One request to one DN, and which of the caller's names it is about.
+struct Ask {
+    dn: String,
+    /// Indices into the caller's list, in the order they go on the wire — so the Nth name
+    /// of the answer is `at[N]`, and nothing has to match names up by string.
+    at: Vec<usize>,
+    want: Want,
+}
+
+/// A batch being assembled from several DNs.
+///
+/// ⚠️ **Every estimate here is allowed to be wrong.** The DN's limit is the authority, a
+/// DN may answer shorter than asked, and #75 will make ownership move. What keeps that from
+/// being a correctness problem is that assembly walks the caller's order and **stops at the
+/// first name it does not have**, so a bad estimate costs a round trip and never an answer
+/// attributed to the wrong name (`A-BATCH-ANSWER-IS-A-PREFIX`).
+struct Spread {
+    /// Answers still to come in this round. The one that takes it to zero moves on.
+    left: usize,
+    asked: usize,
+    want: Want,
+    limit: u64,
+    got: Vec<Option<Slot>>,
+    /// Set when a DN refused, so the whole batch fails rather than silently dropping the
+    /// names that DN owned — which would look like those objects not existing.
+    failed: Option<Response>,
+    reply: Option<Reply>,
+    /// Set once the second round has gone out, so it goes out once.
+    filled: bool,
+    /// Which DN owns each name, and their names, so a second round can be addressed
+    /// without recomputing the routing the first round already did.
+    owners: Vec<usize>,
+    dns: Vec<String>,
+    names: Vec<String>,
+}
+
+impl Spread {
+    /// Entries the answer as it stands would spend.
+    fn spent(&self) -> u64 {
+        self.got.iter().flatten().map(|slot| slot.spent).sum()
+    }
+
+    /// The first name not described in full: where the caller has to come back to. Names
+    /// after it are still worth sending — their counts are what let the caller size its own
+    /// next requests (§9.1.3.12) — but they are not what it asked for.
+    fn unfinished(&self) -> Option<usize> {
+        (0..self.got.len()).find(|i| self.got[*i].as_ref().is_none_or(|slot| !slot.whole))
+    }
+
+    /// What one DN said about the names it was asked about, filed under the caller's
+    /// indices. A name already described in full is not overwritten by a lesser answer.
+    fn take(&mut self, ask: &Ask, answer: Response) {
+        if answer.status != Status::Ok {
+            // ⚠️ Not "those names do not exist". A DN that refused is a DN whose names are
+            // unknown, and answering as though they were absent is a wrong answer rather
+            // than a partial one.
+            if self.failed.is_none() {
+                self.failed = Some(answer);
+            }
+            return;
+        }
+        let (covered, rows) = match Batch::of_args(&answer.args) {
+            Ok(read) => read,
+            Err(e) => return self.give_up(e.to_string()),
+        };
+        let pieces = match self.want.detail {
+            0 => rows.chunks(Described::ARGS).take(covered.given as usize).collect(),
+            _ => match Batch::pieces(rows, covered.given) {
+                Ok(pieces) => pieces,
+                Err(e) => return self.give_up(e.to_string()),
+            },
+        };
+        for (n, piece) in pieces.iter().enumerate() {
+            let Some(at) = ask.at.get(n) else {
+                return self.give_up("a DN described more names than it was asked about".into());
+            };
+            let slot = match self.slot_of(piece, ask) {
+                Ok(slot) => slot,
+                Err(e) => return self.give_up(e.to_string()),
+            };
+            let better = match &self.got[*at] {
+                None => true,
+                Some(old) => !old.whole && (slot.whole || slot.spent > old.spent),
+            };
+            if better {
+                self.got[*at] = Some(slot);
+            }
+        }
+    }
+
+    fn give_up(&mut self, why: String) {
+        if self.failed.is_none() {
+            self.failed = Some(Response::error(Status::Internal, why));
+        }
+    }
+
+    /// One name's arguments, read only as far as is needed to know what it cost and
+    /// whether it is finished. The rest is carried through untouched.
+    fn slot_of(&self, piece: &[Arg], ask: &Ask) -> Result<Slot> {
+        let args = piece.to_vec();
+        if self.want.detail == 0 {
+            return Ok(Slot { args, whole: true, full: 1, spent: 1 });
+        }
+        let (shape, _) = Shape::of_args(piece)?;
+        // Whether this ask covered everything the caller wanted. A summary did not — but a
+        // summary of an object with no streams is still all there is to say about it, which
+        // is why this is not simply `shape.more()`.
+        let covered = ask.want.detail & self.want.detail == self.want.detail;
+        let whole = if covered { !shape.more() } else { shape.streams == 0 };
+        let full = match shape.streams {
+            UNKNOWN => shape.entries,
+            streams => 1 + streams,
+        };
+        Ok(Slot { args, whole, full, spent: shape.entries })
+    }
+
+    /// The second round: spend whatever the first round left over on the names that are
+    /// still summaries, in the caller's order (§9.1.3.12).
+    ///
+    /// ⚠️ **A contiguous run from the first unfinished name, not the cheapest names going.**
+    /// The continuation points at the first unfinished name, so a caller that has to come
+    /// back for name 5 will ask again from 5 — and detail fetched for name 9 in the meantime
+    /// is work nobody will read.
+    fn refill(&mut self) -> Option<Vec<Ask>> {
+        if self.filled || self.failed.is_some() {
+            return None;
+        }
+        self.filled = true;
+        let start = self.unfinished()?;
+        // A name no DN produced is a DN that truncated, and there is no more room to be had.
+        self.got[start].as_ref()?;
+        let slack = self.limit.saturating_sub(self.spent());
+        let (mut extra, mut upgrade) = (0u64, Vec::new());
+        for at in start..self.got.len() {
+            let Some(slot) = &self.got[at] else { break };
+            if slot.whole {
+                continue;
+            }
+            let add = slot.full.saturating_sub(slot.spent);
+            if extra + add > slack {
+                break;
+            }
+            extra += add;
+            upgrade.push(at);
+        }
+        if upgrade.is_empty() {
+            return None;
+        }
+        let mut asks: Vec<Ask> = Vec::new();
+        for at in upgrade {
+            let dn = self.dns[self.owners[at]].clone();
+            let cost = self.got[at].as_ref().map_or(1, |slot| slot.full);
+            match asks.iter_mut().find(|ask| ask.dn == dn) {
+                Some(ask) => {
+                    ask.at.push(at);
+                    ask.want.limit += cost;
+                }
+                None => {
+                    asks.push(Ask { dn, at: vec![at], want: Want { limit: cost, ..self.want } })
+                }
+            }
+        }
+        self.left = asks.len();
+        Some(asks)
+    }
+
+    /// The header and body of the answer, in the caller's order, stopping at the first name
+    /// no DN produced.
+    fn answer(&mut self) -> Response {
+        if let Some(failed) = self.failed.take() {
+            return failed;
+        }
+        let mut args = Vec::new();
+        let mut given = 0;
+        for slot in &self.got {
+            match slot {
+                Some(slot) => {
+                    args.extend(slot.args.iter().cloned());
+                    given += 1;
+                }
+                None => break,
+            }
+        }
+        let next = match self.unfinished() {
+            Some(at) if (at as u64) < given => at as u64,
+            _ if given < self.asked as u64 => given,
+            _ => UNKNOWN,
+        };
+        let covered = Batch { asked: self.asked as u64, given, entries: self.spent(), next };
+        let mut out = covered.args();
+        out.append(&mut args);
+        Response { id: 0, status: Status::Ok, args: out }
+    }
+}
+
+impl FE {
+    /// A batch of lookups whose names may belong to different DNs (§9.1.3.12).
+    ///
+    /// **Round one is one round trip**: the DN owning the earliest names is asked for
+    /// everything, and every other DN for a per-object summary — one entry per name, no
+    /// stream rows, no SN hop. What the summaries will spend is therefore known *before*
+    /// any of them is asked, because a name costs at least its own row
+    /// (`A-NAME-COSTS-AT-LEAST-ONE-ENTRY`), so the detailed ask can be given the limit
+    /// minus that count with no measuring round trip at all.
+    ///
+    /// **Round two spends the slack**, if the first DN left any, on the summaries nearest
+    /// the front — sized from the exact stream counts the summaries reported.
+    fn batch(self: &Arc<Self>, process: &Arc<Process>, request: &Request, mut reply: Reply) {
+        let split = request
+            .args
+            .iter()
+            .position(|arg| !matches!(arg, Arg::Text(_)))
+            .unwrap_or(request.args.len());
+        let (asked, rest) = request.args.split_at(split);
+        let names: Vec<String> = asked
+            .iter()
+            .filter_map(|arg| match arg {
+                Arg::Text(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        let want = match rest {
+            [] => Want::plain(),
+            _ => match Want::of_args(rest) {
+                Ok((want, _)) => want,
+                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            },
+        };
+        let dns: Vec<String> =
+            process.all_of(ServiceKind::Dn).iter().map(|dn| dn.to_string()).collect();
+        // Nothing to divide: one DN owns everything, or there is one name. The request goes
+        // through untouched, which is also the path every measurement so far was taken on.
+        if dns.len() < 2 || names.len() < 2 {
+            return self.onward(process, request, reply);
+        }
+
+        let limit = match want.limit {
+            0 => self.config.info_entries,
+            asked => asked.min(self.config.info_entries),
+        };
+        // ⚠️ Names past the limit are not asked about at all. Each one would cost an entry
+        // there is not, so asking would be work whose answer must be thrown away — and the
+        // header still reports the whole count asked for, so the caller learns to come back.
+        let keep = (limit as usize).min(names.len());
+        let owners: Vec<usize> =
+            names[..keep].iter().map(|name| routing::owner_of(name, dns.len())).collect();
+        let asks = plan(&dns, &owners, want, limit);
+
+        reply.about(format_args!("{},dns {}", first(request), asks.len()));
+        let spread = Arc::new(Mutex::new(Spread {
+            left: asks.len(),
+            asked: names.len(),
+            want,
+            limit,
+            got: vec![None; keep],
+            failed: None,
+            reply: Some(reply),
+            filled: want.detail == 0,
+            owners,
+            dns,
+            names,
+        }));
+        send(self, process, &spread, asks);
+    }
+
+    /// Forward a request whole to the DN that should answer it.
+    fn onward(&self, process: &Arc<Process>, request: &Request, mut reply: Reply) {
+        let dn = match self.destination(process, request) {
+            Ok(dn) => dn.to_string(),
+            Err(e) => return reply.send(Response::error(Status::Internal, e.to_string())),
+        };
+        // Which DN it went to belongs on the line, since that is the hop a live-site
+        // argument is about.
+        reply.about(format_args!("{},dn {dn}", first(request)));
+        if let Err(e) = process.ask(&dn, request, move |answer| reply.send(answer)) {
+            // The reply went into the closure, so this needs its own.
+            logw!("could not reach a DN", "dn {dn},{e}");
+        }
+    }
+
+    /// Which DN answers for a request.
+    ///
+    /// ⚠️ **By name, not in turn.** A name has an owner, and taking DNs in turn means a
+    /// create lands on one machine and the lookup that follows it asks another — which with
+    /// one DN is invisible and with two loses half the objects.
+    fn destination<'a>(&self, process: &'a Process, request: &Request) -> Result<&'a str> {
+        match request.op {
+            Op::CreateObject | Op::ObjectInfo | Op::BatchInfo => {
+                process.owner(ServiceKind::Dn, first(request))
+            }
+            // ⚠️ #98: a batch create's names have owners too, and this sends them all to
+            // one DN. Harmless with one DN and wrong with two.
+            _ => process.pick(ServiceKind::Dn),
+        }
+    }
+}
+
+/// Group name indices by the DN that owns them, in the order the DNs first appear — so the
+/// DN owning the earliest name comes first, which is the one that gets the detailed ask
+/// (§9.1.3.12).
+fn by_owner(owners: &[usize]) -> Vec<(usize, Vec<usize>)> {
+    let mut out: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (at, dn) in owners.iter().enumerate() {
+        match out.iter_mut().find(|(owner, _)| owner == dn) {
+            Some((_, at_dn)) => at_dn.push(at),
+            None => out.push((*dn, vec![at])),
+        }
+    }
+    out
+}
+
+/// Round one: who is asked what (§9.1.3.12).
+///
+/// The DN owning the earliest name is asked for everything the caller wanted, and every
+/// other DN for a per-object summary. **What the summaries will spend is known before any
+/// of them is asked** — a name costs at least its own row and a summary costs exactly that
+/// (`A-NAME-COSTS-AT-LEAST-ONE-ENTRY`) — so the detailed ask gets the limit minus that
+/// count without a measuring round trip.
+fn plan(dns: &[String], owners: &[usize], want: Want, limit: u64) -> Vec<Ask> {
+    let groups = by_owner(owners);
+    let lead = groups[0].0;
+    let elsewhere = owners.iter().filter(|dn| **dn != lead).count() as u64;
+    groups
+        .iter()
+        .map(|(dn, at)| {
+            let want = if want.detail == 0 {
+                // No detail wanted, so every name costs exactly one entry and there is
+                // nothing to estimate: each DN is asked for its own share, and they add up
+                // to a count that already fits.
+                Want { limit: at.len() as u64, ..want }
+            } else if *dn == lead {
+                // At least one name, however little room the others left it
+                // (`ONE-BLOCK-ALWAYS-RETURNS`, one tier up).
+                Want { limit: limit.saturating_sub(elsewhere).max(1), ..want }
+            } else {
+                // Counts, and not streams: the object row and the exact number of streams
+                // it has. One entry, and no SN hop.
+                Want { detail: Detail::Counts.bit(), limit: at.len() as u64, from: want.from }
+            };
+            Ask { dn: dns[*dn].clone(), at: at.clone(), want }
+        })
+        .collect()
+}
+
+/// Send a round of asks, and answer when the last one is back.
+fn send(fe: &Arc<FE>, process: &Arc<Process>, spread: &Arc<Mutex<Spread>>, asks: Vec<Ask>) {
+    let names: Vec<String> = {
+        let held = spread.lock().expect("spread");
+        held.names.clone()
+    };
+    for ask in asks {
+        let mut request = Request::new(Op::BatchInfo);
+        for at in &ask.at {
+            request = request.text(&names[*at]);
+        }
+        request.args.extend(ask.want.args());
+        let ask = Arc::new(ask);
+        let (mine, onward, waiting) = (Arc::clone(fe), Arc::clone(process), Arc::clone(spread));
+        let named = ask.dn.clone();
+        let carried = Arc::clone(&ask);
+        let sent = process.ask(&ask.dn, &request, move |answer| {
+            arrived(&mine, &onward, &waiting, &carried, answer)
+        });
+        if let Err(e) = sent {
+            logw!("could not reach a DN", "dn {named},{e}");
+            let refused = Response::error(Status::Internal, format!("could not reach {named}"));
+            arrived(fe, process, spread, &ask, refused);
+        }
+    }
+}
+
+/// One DN's answer. The last one in either starts the second round or replies.
+fn arrived(
+    fe: &Arc<FE>,
+    process: &Arc<Process>,
+    spread: &Arc<Mutex<Spread>>,
+    ask: &Ask,
+    answer: Response,
+) {
+    let next = {
+        let mut held = spread.lock().expect("spread");
+        held.take(ask, answer);
+        held.left -= 1;
+        if held.left > 0 {
+            return;
+        }
+        // ⚠️ Both decided under the one lock, because `refill` sets `left` for the round it
+        // is asking for. Deciding to send and then sending must not be two steps here for
+        // the same reason waiting must not be at the DN: in between, everything can finish.
+        match held.refill() {
+            Some(asks) => Some(asks),
+            None => {
+                let answer = held.answer();
+                if let Some(reply) = held.reply.take() {
+                    reply.send(answer);
+                }
+                None
+            }
+        }
+    };
+    if let Some(asks) = next {
+        send(fe, process, spread, asks);
+    }
+}
+
 /// The request's first argument, which for anything about an object is the name.
 fn first(request: &Request) -> &str {
     match request.args.first() {
@@ -973,6 +1391,197 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use common::info::StreamRow;
+
+    fn dns(count: usize) -> Vec<String> {
+        (0..count).map(|n| format!("DN{n}")).collect()
+    }
+
+    /// The DN owning the earliest name comes first, because it is the one that gets the
+    /// detailed ask — a prefix in the caller's order is not a prefix in any DN's order.
+    #[test]
+    fn the_dn_owning_the_first_name_leads() {
+        let groups = by_owner(&[2, 0, 2, 1, 0]);
+        assert_eq!(groups[0], (2, vec![0, 2]), "DN2 owns name 0, so DN2 leads");
+        assert_eq!(groups[1], (0, vec![1, 4]));
+        assert_eq!(groups[2], (1, vec![3]));
+    }
+
+    /// Round one, on the numbers §9.1.3.12 argues: the lead is given the limit less one
+    /// entry for every name held elsewhere, and everyone else is asked for counts only.
+    #[test]
+    fn the_lead_is_given_the_limit_less_what_the_others_will_spend() {
+        let want = Want::plain().with(Detail::Streams);
+        // Six names: three on the lead, three elsewhere. Limit 12.
+        let asks = plan(&dns(3), &[0, 1, 2, 0, 1, 0], want, 12);
+        assert_eq!(asks.len(), 3);
+        assert_eq!(asks[0].dn, "DN0");
+        assert_eq!(asks[0].want.limit, 9, "12 less one apiece for the three elsewhere");
+        assert_eq!(asks[0].want.detail, want.detail, "and everything that was asked for");
+        for other in &asks[1..] {
+            assert_eq!(other.want.detail, Detail::Counts.bit(), "counts, and no rows");
+            assert!(!other.want.wants(Detail::Streams), "so no SN is asked anything");
+            assert_eq!(other.want.limit, other.at.len() as u64, "one entry per name");
+        }
+    }
+
+    /// ⚠️ The lead always gets room for one name, however many the others reserved. A
+    /// limit that can answer nothing cannot make progress (`ONE-BLOCK-ALWAYS-RETURNS`).
+    #[test]
+    fn the_lead_always_gets_room_for_one() {
+        let want = Want::plain().with(Detail::Streams);
+        let asks = plan(&dns(2), &[0, 1, 1, 1, 1], want, 3);
+        assert_eq!(asks[0].want.limit, 1);
+    }
+
+    /// With no detail wanted every name costs exactly one entry, so there is nothing to
+    /// estimate and nobody is singled out.
+    #[test]
+    fn no_detail_needs_no_reservation() {
+        let asks = plan(&dns(2), &[0, 1, 0, 1], Want::plain(), 10);
+        for ask in &asks {
+            assert_eq!(ask.want.detail, 0);
+            assert_eq!(ask.want.limit, 2);
+        }
+    }
+
+    /// A `Spread` holding `n` names, none answered yet.
+    fn spreading(n: usize, owners: Vec<usize>, want: Want, limit: u64) -> Spread {
+        Spread {
+            left: 1,
+            asked: n,
+            want,
+            limit,
+            got: vec![None; n],
+            failed: None,
+            reply: None,
+            filled: false,
+            owners,
+            dns: dns(2),
+            names: (0..n).map(|i| format!("/n{i}")).collect(),
+        }
+    }
+
+    /// One name's worth of a levelled answer, as a DN would send it.
+    fn described(streams: u64, given: u64, next: u64) -> Vec<Arg> {
+        let shape = Shape { streams, given, extents: UNKNOWN, entries: 1 + given, next };
+        let mut args = shape.args();
+        args.extend(
+            Described {
+                id: 1,
+                stream: 1,
+                sn: 0,
+                created: 0,
+                keyed: false,
+                framing: Framing::Lf,
+                first_record: 0,
+            }
+            .args(),
+        );
+        for _ in 0..given {
+            args.extend(
+                StreamRow {
+                    stream: 1,
+                    sn: 0,
+                    first_record: 0,
+                    records: 3,
+                    extents: UNKNOWN,
+                    given: 0,
+                }
+                .args(),
+            );
+        }
+        args
+    }
+
+    fn answer_of(pieces: &[Vec<Arg>], entries: u64) -> Response {
+        let covered = Batch {
+            asked: pieces.len() as u64,
+            given: pieces.len() as u64,
+            entries,
+            next: UNKNOWN,
+        };
+        let mut args = covered.args();
+        for piece in pieces {
+            args.extend(piece.iter().cloned());
+        }
+        Response { id: 0, status: Status::Ok, args }
+    }
+
+    /// A summary is a valid answer for a name and not a finished one, so the continuation
+    /// points at it — even though every name asked about came back (§17.23.4).
+    #[test]
+    fn a_summary_is_not_a_finished_name() {
+        let want = Want::plain().with(Detail::Streams);
+        let mut spread = spreading(2, vec![0, 1], want, 10);
+        let lead = Ask { dn: "DN0".into(), at: vec![0], want };
+        spread.take(&lead, answer_of(&[described(1, 1, UNKNOWN)], 2));
+        let other = Ask {
+            dn: "DN1".into(),
+            at: vec![1],
+            want: Want { detail: Detail::Counts.bit(), ..want },
+        };
+        spread.take(&other, answer_of(&[described(1, 0, 0)], 1));
+        assert_eq!(spread.unfinished(), Some(1));
+        let answer = spread.answer();
+        let (covered, _) = Batch::of_args(&answer.args).expect("a header");
+        assert_eq!((covered.given, covered.entries), (2, 3));
+        assert_eq!(covered.next, 1, "come back for the one described only in counts");
+    }
+
+    /// Round two upgrades a contiguous run from the first unfinished name, and stops when
+    /// the slack runs out rather than skipping ahead to a cheaper name further on.
+    #[test]
+    fn round_two_fills_from_the_front_and_stops() {
+        let want = Want::plain().with(Detail::Streams);
+        let mut spread = spreading(4, vec![0, 1, 1, 1], want, 8);
+        let lead = Ask { dn: "DN0".into(), at: vec![0], want };
+        spread.take(&lead, answer_of(&[described(1, 1, UNKNOWN)], 2));
+        // Three summaries, each of an object with three streams: full cost 4 apiece.
+        let summary = Ask {
+            dn: "DN1".into(),
+            at: vec![1, 2, 3],
+            want: Want { detail: Detail::Counts.bit(), ..want },
+        };
+        let one = described(3, 0, 0);
+        spread.take(&summary, answer_of(&[one.clone(), one.clone(), one], 3));
+        // Spent 5 of 8, so 3 to spend and an upgrade costs 3: exactly one of them.
+        let asks = spread.refill().expect("a second round");
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].at, vec![1], "the first unfinished name, and no further");
+        assert_eq!(asks[0].want.limit, 4, "sized from the count the summary reported");
+        assert_eq!(asks[0].want.detail, want.detail, "and this time in full");
+    }
+
+    /// ⚠️ The one property that makes every estimate here safe: assembly walks the caller's
+    /// order and stops at the first name nobody produced, so a short answer is a prefix and
+    /// never a hole (`A-BATCH-ANSWER-IS-A-PREFIX`).
+    #[test]
+    fn a_hole_ends_the_answer() {
+        let want = Want::plain().with(Detail::Streams);
+        let mut spread = spreading(3, vec![0, 1, 0], want, 10);
+        // The lead answers about names 0 and 2; nobody answers about name 1.
+        let lead = Ask { dn: "DN0".into(), at: vec![0, 2], want };
+        spread.take(&lead, answer_of(&[described(1, 1, UNKNOWN), described(1, 1, UNKNOWN)], 4));
+        let answer = spread.answer();
+        let (covered, _) = Batch::of_args(&answer.args).expect("a header");
+        assert_eq!(covered.given, 1, "name 2 is held back rather than passed off as name 1");
+        assert_eq!(covered.next, 1);
+    }
+
+    /// A DN that refused is not a DN whose objects are absent.
+    #[test]
+    fn a_refusal_is_not_an_absence() {
+        let want = Want::plain().with(Detail::Streams);
+        let mut spread = spreading(2, vec![0, 1], want, 10);
+        let lead = Ask { dn: "DN0".into(), at: vec![0], want };
+        spread.take(&lead, answer_of(&[described(1, 1, UNKNOWN)], 2));
+        let other = Ask { dn: "DN1".into(), at: vec![1], want };
+        spread.take(&other, Response::error(Status::Internal, "DN1 is down"));
+        assert_eq!(spread.answer().status, Status::Internal);
+    }
+
     /// A caller's record number goes in through two origins and an answer comes back
     /// out through their sum, so the two directions have to agree.
     ///
@@ -1048,7 +1657,6 @@ mod tests {
         assert_eq!(in_the_callers_numbering(refused.clone(), 700, true), refused);
     }
 
-    use super::*;
     use common::testing;
 
     /// The SN answers with the id, the second, the first record, then the instances.

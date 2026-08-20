@@ -615,6 +615,14 @@ pub struct FEConfig {
     /// FE holds no persistent state, and this says so out loud: a front end that
     /// starts keeping things is a design change, not a configuration one.
     pub stateless: bool,
+    /// §9.1.3.7's entry limit again, because a batch spanning DNs has to be *divided*
+    /// before any DN sees it, and dividing needs the number here (§9.1.3.12).
+    ///
+    /// ⚠️ **The DN's copy is still the authority** — it takes the smaller of this and its
+    /// own, so setting this higher makes FE's division optimistic and nothing worse: the
+    /// answer comes back shorter than planned, says so, and the assembly stops at the
+    /// first name it does not have (`A-BATCH-ANSWER-IS-A-PREFIX`).
+    pub info_entries: u64,
 }
 
 macro_rules! loaders {

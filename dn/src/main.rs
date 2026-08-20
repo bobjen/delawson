@@ -152,7 +152,17 @@ fn detailed(object: &Object, want: &Want, limit: u64) -> Option<Levelled> {
         given: rows.len() as u64,
         extents: UNKNOWN,
         entries: 1 + rows.len() as u64,
-        next: if want.wants(Detail::Streams) { next } else { UNKNOWN },
+        // ⚠️ **Wherever a stream count was given, not only where stream rows were.** A
+        // summary — counts and no rows — is what a batch asks the DNs it is not leading
+        // (§9.1.3.12), and one that says `nothing more` while holding undescribed streams
+        // contradicts the batch header that sent the caller back to it. So this says where a
+        // stream listing *would* resume, which is true of a summary and of a truncation
+        // alike (§17.24.2).
+        next: if want.wants(Detail::Counts) || want.wants(Detail::Streams) {
+            next
+        } else {
+            UNKNOWN
+        },
     };
 
     // The shape first, then the object, then its streams — so a reader knows how many
@@ -988,6 +998,13 @@ impl DN {
                 None => {
                     spent += 1;
                     whole = true;
+                    // ⚠️ A shape for a name that is not there too, whenever the rest of the answer
+                    // has shapes. Without it a levelled batch holding one miss cannot be read at
+                    // all: every other name begins with a shape, so a reader counting arguments
+                    // walks off by five and attributes rows to the wrong name (§17.24.1).
+                    if want.detail != 0 {
+                        args.extend(Shape::plain().args());
+                    }
                     args.extend(Described::missing());
                 }
             }
@@ -1319,15 +1336,17 @@ mod tests {
     }
 
     /// Counts without streams is a legitimate question: how big is this object,
-    /// without the rows.
+    /// without the rows. ⚠️ And it still says where the rows would start — see §17.24.2
+    /// for why saying `nothing more` there was wrong.
     #[test]
-    fn counts_alone_bring_no_rows() {
+    fn counts_alone_bring_no_rows_but_say_where_rows_start() {
         let want = Want::plain().with(Detail::Counts);
         let args = flat(detailed(&grown(), &want, 100).expect("an answer"));
         let (shape, rows) = read_back(&args);
         assert_eq!((shape.streams, shape.given, shape.entries), (3, 0, 1));
         assert!(rows.is_empty());
-        assert!(!shape.more(), "nothing was asked to be described, so nothing follows");
+        assert!(shape.more(), "three streams it did not describe is not nothing more");
+        assert_eq!(shape.next, 0, "and a listing would start at the first of them");
     }
 
     /// A DN holding `count` objects named `/n0`, `/n1`, and so on.
@@ -1437,6 +1456,28 @@ mod tests {
         // ⚠️ Not 1. That name got its object row and none of its streams, so the caller has to come
         // back to *it* — resuming at name 1 would drop the rest of name 0 without saying so.
         assert_eq!(covered.next, 0, "and the caller carries on from the name still owed to it");
+    }
+
+    /// ⚠️ A levelled batch holding a name that is not there is still readable: every name begins
+    /// with a shape, present or not, so nothing is attributed to the wrong name (§17.24.1).
+    #[test]
+    fn a_missing_name_in_a_levelled_batch_still_has_a_shape() {
+        let dn = with_objects(2);
+        let want = Want { limit: 100, ..Want::plain().with(Detail::Streams) };
+        let answer = batch_of(&dn, &["/n0", "/gone", "/n1"], Some(want));
+        let (covered, rows) = Batch::of_args(&answer.args).expect("a batch header");
+        assert_eq!(covered.given, 3, "a miss is answered, not skipped");
+        let pieces = Batch::pieces(rows, covered.given).expect("one slice per name");
+        assert_eq!(pieces.len(), 3);
+        // The middle one is the miss: a shape saying nothing, then a row saying nothing.
+        let (shape, rest) = Shape::of_args(pieces[1]).expect("a shape");
+        assert_eq!((shape.streams, shape.given, shape.entries), (0, 0, 1));
+        assert!(Described::of_args(rest).expect("a row").0.is_none(), "the name is not there");
+        // And the ones either side are real, which is what proves nothing slid by five.
+        for present in [pieces[0], pieces[2]] {
+            let (_, rest) = Shape::of_args(present).expect("a shape");
+            assert!(Described::of_args(rest).expect("a row").0.is_some());
+        }
     }
 
     /// A batch that reached every name and described each one whole says nothing follows, and that
