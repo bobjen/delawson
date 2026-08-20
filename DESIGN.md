@@ -64,7 +64,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-128 things *not* decided.
+133 things *not* decided.
 
 **Priorities and framing**
 
@@ -307,6 +307,17 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Prior art returns an offset only with **one** unsealed region (VSAM RBA); parallel writers always change the **name space** | §8.1.1a-9 |
 | Three reference tiers: **durable** (key / record number), **hint** (`EnId`, extent name, row — a route a caller may hold, good for at least the hint window), and **none** (object offset) | §8.1.1a-10, §10.1 |
 | Hints fail **detectably** because extent identity carries a creation second — Oracle's logical rowid pattern | §8.1.1a-10 |
+| One key and one salt may cover **one** plaintext, so **within an extent an offset is written at most once, ever** | §7.2.4 |
+| Therefore **a truncation seals the extent** — chosen over an IV epoch, which would need agreement in the write path and could be silently missed | §7.2.4, §8.1.1a |
+| **Every read names the object**, whatever else it names: the ACL is the object's, and no reverse edge recovers it | §9.1.3.4, §4.6.6 |
+| A range start is the **object**, optionally **how far the caller already resolved**, and a **position**; a stale narrowing falls back to the object | §9.1.3.4 |
+| A bare offset **snaps forward** to the next record boundary, so independently computed chunk boundaries are a **partition** — the Hadoop split rule | §9.1.3.4 |
+| **Record + logical offset** is the only way to address the **interior of a record**, which a store for very large objects needs | §9.1.3.4 |
+| A hint carries an unforgeable **capability** attesting `extent ∈ object` — asserting the pairing, or indexing extents by id, both fail | §9.1.3.5, §4.6.6 |
+| The capability attests **membership only, never authorization**, so ACLs stay current and a quoted hint grants nothing | §9.1.3.5 |
+| The hint stays **plaintext with the capability appended**, so an operator can act on a hint a user quoted | §9.1.3.5 |
+| A budget is in **records, logical bytes or compressed bytes** — one named, all three reported; **one block always returns**, even past it | §9.1.3.6 |
+| `object-info` is **extended, not replaced**, and bounded by **one entry limit** over objects + streams + extents (default **10,000**) | §9.1.3.7 |
 | Large objects are built by **parallel partitions, sealed, then concatenated** | §8.6.1 |
 | **Trilemma**: parallel bandwidth, dense stable offsets, monotone time index — pick two | §8.6.2 |
 | The recursion to DN **attenuates** by fan-out; the rule is **spray per writer, not per request** | §8.6.4 |
@@ -2711,14 +2722,30 @@ stream carries one reference per tiny object lumped into it and needs 32.
 | Billing a shared extent | the count | computed forward per object, divided by the count; the other referrers are never named |
 | Checking invariants | the count | a forward mark-and-sweep recomputes every count, so **counts are auditable and repairable** — a list is one more thing that can be wrong |
 | Debugging "what stream is this extent in?" | — | the metadata snapshot answers it for anything over a day old, and under a day the writer is still there |
-| Authorizing a direct `(EnId, extent, record)` hint | — | **put the stream in the hint** |
+| Authorizing a direct `(EnId, extent, record)` hint | — | ⚠️ **not the count, and not a list either — see the correction below** |
 | ⚠️ Reporting what a permanent loss destroyed | genuinely reverse | see below |
 | Impact of a planned decommission | genuinely reverse | same shape, and nobody minds if it takes an hour |
 
 **The general rule underneath most of those rows: wanting a reverse lookup usually means
-context was thrown away that could have been carried.** The hint is the clean example — it
-names an extent directly, so authorizing it appears to need extent → object, until you put the
-stream in the hint and the question disappears.
+context was thrown away that could have been carried.**
+
+⚠️ **An earlier version of this paragraph offered the hint as the clean example of that rule, and
+it is the one row where the rule does not close the question** (Asserted, Bob, 2026-08-19). It said
+that authorizing a hint appears to need extent → object until you put the stream in the hint, at
+which point the question disappears. **It does not disappear**, for two reasons that survive putting
+anything at all in the hint:
+
+- **A hint carried by a caller is asserted, not proved.** A caller may name any extent beside any
+  stream. Believing the pairing is believing the caller, and checking it is the extent-list search
+  the hint existed to avoid — which the SN cannot even do quickly, since its list is ordered by
+  record number and not by extent id (§9.1).
+- **It is two edges, not one.** Extent → stream is the cheap one; **stream → object** is still
+  wanted, because the ACL governs the object, and it crosses the DN → SN boundary this section's
+  last paragraph explains cannot hold a maintained reverse edge.
+
+**The count is still right and a list is still wrong** — the fix is neither. It is to make the
+carried context *unforgeable*, which §9.1.3.5 does with a capability, and which needs no reverse
+structure on any tier.
 
 The one row that is real is **reporting a permanent loss** — when a quorum is gone for good,
 every affected user is owed a list of what they lost, which is extent → stream → object for
@@ -5237,6 +5264,77 @@ prohibitions, they are prices:
 That is the §12.1 pattern once more: billing proportional to cost turns what would have
 to be an administered restriction into a self-enforcing trade.
 
+#### 7.2.4 One key and one IV may cover one plaintext, which makes an offset write-once
+
+**The same key and salt may never be used twice for different data** (Asserted, Bob, 2026-08-19).
+This is the AEAD rule rather than a DeLawson choice, and it is not a degradation when broken: under
+a nonce-respecting construction, IV reuse across two plaintexts leaks their XOR, and AEGIS's
+nonce-misuse profile also hands over the ability to forge tags under that key.
+
+**Most of the requirement is already met by construction**, which is worth stating before the hole:
+
+| Level | Distinct because |
+|---|---|
+| across days | the daily master key is fresh (§7.3) |
+| across SNs | the SN-master key is derived per SN (§7.3) |
+| across extents | the extent key is derived from `(SnId, ExtentId, creation second)` (§7.3.3), and the second makes even a reused id a different key |
+| across blocks in an extent | `block IV = f(extent id, block index)` (§7.2) |
+| across wire segments | a connection prefix, a direction byte and a segment counter — §17.5a settled this and stated the invariant explicitly |
+
+So the whole question reduces to one: **can a block index be used twice, for different data, within
+one extent identity?**
+
+⚠️ **It can, in exactly one place: truncation above the durable watermark** (§8.1.1a). Handover
+discards a suffix nobody agreed to, and subsequent appends then land at offsets the discarded blocks
+occupied — **same extent identity, same block index, different plaintext.** The severity is not
+softened by those bytes being unreadable to users:
+
+| | |
+|---|---|
+| The discarded ciphertext | was written to disks, and up to 3 of 4 instances may hold it |
+| The replacement ciphertext | goes to the same offsets, under the same key and the same IV |
+| What an attacker needs besides the two | **nothing** — the XOR of the ciphertexts is the XOR of the plaintexts |
+| Who reads whole instances anyway | §13.1's sync loops and EC repair (§4.3.2.3) |
+
+**Three fixes, and they are not equally good:**
+
+| Fix | Cost |
+|---|---|
+| an **epoch** in the IV derivation, bumped per truncation, recorded with the extent | ⚠️ every instance must agree on the bump — consensus on a value in the write path, which is what §8.1.3 keeps the SN out of the path to avoid. An instance that missed a bump reuses the IV, so the failure mode is silent |
+| a **per-block nonce carried with the block** rather than derived | 16 B per block on the wire and on disk, and it must be stored to decrypt — it stops being derived, which is the property §7.3 is built on |
+| **a truncation seals the extent** | one extra extent per handover event |
+
+**Settled: sealing** (Asserted, Bob and reasoning here, 2026-08-19). §8.1.1c already establishes that
+sealing an extent short is free and preferable to padding, and §6 permits sealing at any size, so
+this needs no new mechanism — only a new trigger for one that exists and is exercised. And it
+converts a cryptographic side condition into an invariant that is local, checkable, and stated
+positively:
+
+> **Within one extent identity, an offset is written at most once, ever.**
+
+**That invariant is worth more than the rule that motivated it**, which is the argument for
+preferring it to the epoch:
+
+- it is what makes §8.1.1a-3's fixed-offset exactly-once check sound — the check compares content at
+  an expected offset, which presumes the offset has one history;
+- it is what makes a sealed extent's bytes a function of its name, which is what EC's byte-identical
+  instances need (§4.3.2.3);
+- it needs no field, no agreement, and no bump that can be missed. Nothing can silently violate it,
+  because the only thing that could is now required to seal.
+
+⚠️ **What it costs, stated plainly: a flapping primary produces short extents**, and extent count is
+what bounds an SN's memory (§14.1). So this couples primary stability to metadata growth where
+before it did not. The coupling is bounded by the handover rate, which #56 has to settle regardless —
+but the cost now falls on a different budget than it did, and #56 should hear about it.
+
+**And the rule applies upward, to anything else under a cluster-wide key.** §9.1.3.5's capability
+authenticates and encrypts nothing, so it has no keystream to leak — but it is built from the same
+primitive, so it **carries a salt in its plaintext prefix** rather than resting on an argument that a
+fixed nonce is safe for MAC-only use. `(FE id, monotone counter)` suffices and needs no RNG: the FE
+id is 2 bytes by §5.10.4, and seeding the counter from the clock means a restart cannot repeat one.
+That is §17.5a's construction reused, and reusing it is the point — **a nonce discipline that is
+stated once and applied everywhere is the only kind that survives**.
+
 ### 7.3 The key hierarchy: daily, derived, and scoped by SN
 
 Per-extent keys are right, but *storing* them is arithmetically impossible. At 32
@@ -6004,6 +6102,12 @@ Three things follow:
   used *by* an FE on a user's behalf preserves it, while a user reaching an EN directly would skip it. That
   makes "who may hold a hint" a different question from "who may use one", and the first has a much easier
   answer.
+  ⚠️ **But the hop removal as stated here does not hold, and §9.1.3.5 is the correction** (Asserted, Bob,
+  2026-08-19). An FE authorizes an *object* and a hint names an *extent*, and nothing in the tuple above
+  binds them — so proving the hint belongs to the object it is presented with costs exactly the DN and SN
+  descents the hint was meant to skip. The tuple therefore needs a fourth part, an unforgeable
+  **capability** attesting `extent ∈ object`, and the fields listed here are the *plaintext prefix* it is
+  appended to.
 - **It is what the user is given, not only what the FE keeps** (Asserted, Bob, 2026-08-17). The motivating
   shape is a job scheduler: **ask once up front, hand the hints to the vertices, and let them use them as
   the job runs.** So `object-info` has to return enough for a caller to construct hints — extent names,
@@ -7556,6 +7660,275 @@ of whoever maintains them.
   expect to re-ask, and one that pages a huge object should expect its early pages to have aged
   out by the time it finishes.
 
+#### 9.1.3.4 A start is the object, plus how far the caller already resolved, plus a position
+
+§9.1.3 settled the *end* of a range: a budget, not an address. This settles the *start*, which needs
+more room than a record number, because the whole point of handing a caller extents (§9.1.3.2, #61)
+is that it should not then have to re-derive what it was just told.
+
+⚠️ **Every read names the object, whatever else it names** (Asserted, Bob, 2026-08-19). That is not
+redundancy and it is not politeness to the API:
+
+- **Authorization is per object and lives at the FE** (§1.5, §5.9, §9.1 step 0). The FE checks the
+  object's ACL and *then* forwards, so a request naming no object could not be authorized at all.
+- **The object cannot be recovered from a stream or an extent.** The edges run downward, and §4.6.6
+  makes the reverse edge a *count* rather than a list on purpose. A stream may also be referenced by
+  more than one object (§4.6.1, §5.11.3.4), so even paying for a reverse index would not give a
+  unique answer.
+
+So a stream or an extent in a request is **an optimization on top of the object, never a substitute
+for it**, and a start is three things:
+
+| Resolved as far as | What it saves | What it costs when stale |
+|---|---|---|
+| **the object** only | nothing — §9.1's ordinary walk | — |
+| a **stream** of it | the DN's descent over the stream list | fall back to the object |
+| an **extent** of that stream | the DN's descent *and* the SN's | fall back to the object |
+
+⚠️ **A stale narrowing is recoverable rather than fatal, and that is entirely because the object is
+always present.** This is Oracle's logical rowid exactly (§8.1.1a-10): a durable name plus a physical
+guess, where the guess is tried and the name is the fallback. A start naming only an extent would
+have no fallback, and could not be authorized either.
+
+**The position, for an append-only object, is one of three:**
+
+| Position | Means | Tier (§8.1.1a-10) |
+|---|---|---|
+| **record number** | that record's first logical byte | **durable** — good for ever |
+| **record number + logical offset** | that many logical bytes past that record's start, possibly *inside* it | **durable** — a rewrite moves neither part |
+| **logical offset** alone | that many logical bytes into whichever container was named | below |
+
+**The two offset forms are not redundant, and what separates them is which one snaps.** Naming a
+record says *I know where the records are, and I want a byte inside this one*; naming only an offset
+says *I do not know where the records are, so put me at the next one*.
+
+- **Record + offset is exact, and may land mid-record.** That is its purpose: §1.0's objects are very
+  large, one record may be far bigger than any caller's buffer, and a record number alone cannot say
+  where inside it to resume. Nothing else in the design addresses the interior of a record.
+- **A bare offset snaps forward**, to the first record beginning at or after it.
+
+⚠️ **The snap rule has to be fixed rather than merely documented, and §9.1.3.1 is why.** Vertices
+computing adjacent chunk boundaries by arithmetic resolve them *independently*. Under a
+"nearest boundary" or implementation-defined rule, adjacent chunks would sometimes overlap and
+sometimes leave a gap, and **neither vertex could detect either**. Snapping forward always makes
+independently computed boundaries a partition: the vertex holding a chunk reads past its end to
+finish its last record, and its neighbour starts after that. (Cited: this is the Hadoop input-split
+rule, adopted for the same reason.)
+
+**Why the narrowing dimension exists at all is §4.5**, and this is the load-bearing paragraph:
+
+> A descent on **record numbers** is an index lookup, because the unkeyed record count is the one
+> summary §4.5 permits to be exact and synchronous to the root. A descent on **byte counts** is not,
+> because logical and physical byte totals are explicitly lazy.
+
+So a caller naming a stream or an extent is **supplying the prefix sum the store declines to
+maintain**. That is the same division of labour as §9.1.3's — the caller brings the budget, the
+system computes the continuation — with the caller also bringing the part it was already given.
+
+⚠️ **`(object, logical offset)` looks like it contradicts two earlier sections, and does not.**
+§8.1.1a-7 calls the object logical offset "well defined, dense, stable and writer-predictable" for
+unkeyed objects, while §8.1.1a-10 files it under the tier called **none**. Both are right, about
+different properties:
+
+| | |
+|---|---|
+| Is it **stable**? | **Yes**, for append-only data — appended logical bytes never move, and compacting append-only extents has no tombstones to drop, so logical content is preserved exactly |
+| Is it **cheaply resolvable**? | **No** — that needs a prefix sum of logical lengths, which §4.5 keeps lazily |
+
+**A stable address the store cannot cheaply resolve is a different defect from an unstable one**, and
+it has a far better remedy. For an append-only object the lazy sums are **exact over the sealed
+prefix and merely behind at the frontier** (§8.6.6): a sealed extent's logical length never changes,
+so "lazy" here means *short*, never *wrong in the middle*. An object-relative logical offset therefore
+resolves exactly everywhere except the growing tail — and at the tail the answer says where it
+actually started, which §9.1.3.2 already obliges it to do.
+
+**Keyed objects get none of that**, which is the conclusion §8.1.1a-7 reaches from the write side:
+interior inserts change logical lengths anywhere (§4.5), so no prefix sum over a keyed object is ever
+exact. Their start space is a different cross product, and this is a placeholder for its shape rather
+than a design of it:
+
+| Keyed start | Note |
+|---|---|
+| (object \| stream \| extent, **key**) | the durable form, and the one a caller should normally use |
+| (**extent**, **row**) | §8.1.1a-10's hint tier exactly — valid until that extent is rewritten |
+
+#### 9.1.3.5 A narrowing must be proved, not asserted, so the hint carries a capability
+
+⚠️ **The spec §8.1.1a-10 gives for a hint has a hole, and it is fatal to the hop it claims to save**
+(Asserted, Bob, 2026-08-19). A caller presents an extent; the FE authorizes an *object*; **nothing
+binds the two.** The consequences compound:
+
+| | |
+|---|---|
+| Proving `extent ∈ object` structurally | DN (object → streams) then SN (stream → extents) — **precisely the two hops the hint exists to remove** |
+| Doing it at the SN | the extent list is searchable by **record number**, not by extent id (§9.1), so membership-by-id is a scan of up to 2 × 10^9 entries (§14.1) |
+| Indexing by extent id instead | a per-extent reverse entry on the one tier §14.1 says is memory-bound — the trade §4.6.6 already refused |
+| Sending `(object, row)` alongside `(extent, row)` | no help: the object-relative row is the thing whose resolution costs the hops |
+| Putting the **stream** in the hint (§4.6.6's earlier answer) | no help either: an asserted pairing is only as good as the caller, and `stream ∈ object` is still the DN's to answer |
+
+**So the binding cannot be recomputed cheaply, and it must therefore be carried unforgeably.**
+Whoever first resolved object → stream → extent did the full walk anyway; it mints a **capability**
+attesting that this extent is in this object, and a later FE **verifies the capability instead of
+repeating the walk.**
+
+**The capability attests membership only — never authorization** (Decided, Bob and reasoning here,
+2026-08-19). This is the decision that makes the rest safe, and it buys three things at once:
+
+- **No revocation lag.** The FE still evaluates the object's ACL on every request, as it always did,
+  so access decisions are always current. The usual objection to capabilities does not arise.
+- **Nothing to go stale silently.** A *structural* fact holds until the extent is rewritten, at which
+  point its creation second changes (§4.6.3) and the read fails loudly. So the expiry can simply be
+  the hint window (§10.1) that already exists, rather than a new security parameter.
+- **A hint is safe to quote.** Pasting one into a bug report grants nobody anything, because the
+  reader must still pass the object's ACL.
+
+**The hint stays readable, with the capability appended** (Asserted, Bob, 2026-08-19), which is a
+requirement rather than an encoding preference: **an operator debugging a complaint must be able to
+read a hint a user quoted and go look at that extent under their own privileges.** An opaque or
+encrypted handle would make the user's own bug report unactionable.
+
+| Part | Contents | Form |
+|---|---|---|
+| **the hint** | `StreamId`, `(SnId, ExtentId, creation second)`, the extent's first object-local record, the row | **plaintext**, versioned, printable |
+| **the capability** | **salt**, expiry second, key version, MAC | appended suffix |
+
+The MAC is taken over the plaintext prefix **plus the object's path**, and the path is therefore not
+in the hint: the request carries it already (§9.1.3.4), so the FE recomputes rather than compares.
+That keeps the capability to about **34 bytes** — an 8-byte salt, an 8-byte expiry, a 2-byte key
+version and a 16-byte tag — and gives a rename the right behaviour for free, since a renamed object
+no longer verifies and the hint falls back to the ordinary walk.
+
+**The salt is §7.2.4's rule, not a belt-and-braces measure.** One key and one salt may cover one
+plaintext, and a cluster-wide daily key (§16.130) is the widest key in the system — so the mint
+carries `(FE id, monotone counter)` rather than resting on an argument that a fixed nonce is safe
+for MAC-only use. It needs no RNG, and seeding the counter from the clock means an FE restart cannot
+repeat one.
+
+**The path is the right thing to bind to**, per §4.6.3: it is the portable durable name, and it is
+what the ACL is attached to. Binding the object *id* instead would force a DN lookup to translate,
+which is the hop being saved.
+
+**What it costs to verify is nothing worth measuring.** §7.2.1 puts AEGIS at ~20 GB/s per core, so a
+26-byte tag is noise against the request it authorizes — the same argument that licensed checking an
+auth code on every read off disk (§9.1.1).
+
+**Three failures, and they are distinguishable**, which settles #61's fourth question:
+
+| Symptom | Means | The caller should |
+|---|---|---|
+| MAC does not verify | forged, expired, or the object was renamed | re-resolve from the object |
+| MAC verifies, extent's creation second does not match | that extent was rewritten (§10) | re-resolve from the object |
+| both fine, row absent | there is no such record | not retry |
+
+⚠️ **Two things this needs that do not exist yet.**
+
+- **A key.** Any FE must verify what any other FE minted, so this wants a **cluster-wide daily key**
+  from KS. §7.3's hierarchy is scoped by *SN* and day, deliberately (§7.3.1), so this is a new scope
+  rather than an existing key used differently — small, but it is an addition to §7.3 and not a
+  consequence of it. Daily rotation also bounds a token's life independently of its expiry field.
+- ⚠️ **How many hops this actually saves depends on where the ACL is fetched from**, which is not
+  decided. §5.1 has the object record holding an ACL reference, which would put authorization at the
+  DN — and then the DN hop survives for authorization no matter what a hint carries, and the
+  capability's saving is the SN hop plus the DN's *descent* rather than the DN round trip. §9.1
+  counts the authorization hop separately from the DN hop, which suggests the intended answer is a
+  cached or separately-held ACL, but nothing says so. **The ACL's home is now load-bearing for the
+  hint story**, which it was not before.
+
+**Prior art, and it is the ordinary shape.** S3 presigned URLs, Kerberos service tickets and
+capability systems generally all carry an unforgeable statement rather than re-deriving it at the
+point of use. What is slightly unusual here is how *little* the token says: not "the bearer may
+read this", only "this extent is inside this object". The narrow claim is what removes the
+revocation problem, and it is the whole reason the scheme is cheap.
+
+#### 9.1.3.6 Three measures, and why a request may name only one
+
+A budget is a number in one of three spaces. All three are wanted, by different callers, for reasons
+that do not overlap:
+
+| Budget in | Bounds | Enforced by | Cost |
+|---|---|---|---|
+| **records** | nothing physical — a count | the record counts, already exact (§4.5) | free |
+| **logical bytes** | the caller's **decompressed buffer** | summing `logical` over the blocks returned | free |
+| **compressed bytes** | the **network and the disk read** — what §12.3 bills and §5.12.1 makes scarce | the bytes the EN hands back | free |
+
+**All three are free to enforce, which is why there is no reason to offer only one.** The logical
+case is the one that looks impossible: a block is opaque below the client (§8.1.4.1), so it seems
+only a decompressor could bound logical bytes. But the writer's logical count travels beside every
+block *precisely because* nothing below can recompute it (§8.2, §17.16.1), and summing numbers you
+were handed costs nothing.
+
+**A request names exactly one, and the answer reports all three actually returned.** It may not name
+two, because a caller cannot know the compression ratio in advance (§9.1.3.3) — a request bounding
+both logical and compressed bytes would routinely satisfy neither, with no rule saying which to
+honour. **The default is logical**, because the buffer is the thing a caller is certain about; a
+caller sizing a network transfer or estimating a bill names compressed instead.
+
+⚠️ **One block always comes back, even past the budget.** A block is the unit an EN deals in (§9.1),
+so a budget below the first block's size would otherwise return nothing — for ever, on every retry,
+which is a livelock wearing back-pressure's clothes. The budget is therefore a **stopping rule
+applied after the first block**, and the overshoot is bounded by one block, which §8.1.1a-2 bounds
+at 32 MB.
+
+⚠️ **32 MB is a poor thing to promise a caller with a 64 KB buffer**, and the remedy is not here: it
+is #53, how large a block may be on the wire. What this section fixes is that the overshoot is
+**bounded and reported** rather than silent — the three measures in the answer are what a caller
+must believe, not its own budget.
+
+#### 9.1.3.7 What `object-info` must answer with, and the one limit over the whole answer
+
+**Settled: `object-info` is extended, rather than joined by a second operation** (Asserted, Bob,
+2026-08-19). #61 leaned the other way, on the grounds that extent detail would make every lookup pay
+for what most lookups do not want. **The limit below dissolves that objection**: with a cap on
+entries per request, a caller wanting the object alone asks for no extents and pays exactly what it
+pays today. A separate operation would then buy nothing an argument does not.
+
+The answer has three levels, and the fields at each are set by what a hint needs (§9.1.3.5, #61):
+
+| Level | Fields |
+|---|---|
+| **the object** | id, flavour, framing, creation second — and the **counts** below |
+| each **stream** returned | `StreamId`, its `SnId`, its first object-local record, its record count once sealed, its extent count |
+| each **extent** returned | `(SnId, ExtentId, creation second)`, its instances **primary first**, its first stream-local record, its record count, its compressed length, whether it is sealed, and **its capability** (§9.1.3.5) |
+
+The extent row is the hint plus what planning needs: the name, so a stale one fails loudly (§4.6.3);
+the instances, so it is a route rather than a description; the ranges and lengths, so a caller can
+compute chunk boundaries without asking again (§9.1.3.1); and the capability, without which none of
+it may be used.
+
+**And the counts, which are what make a partial answer useful** (§9.1.3.2): streams per object,
+extents per stream, records per stream. An answer complete in counts and partial in detail lets a
+caller compute every remaining request by arithmetic rather than discovering them one at a time.
+
+**The limit is one number over entries of all three kinds together** (Asserted, Bob, 2026-08-19) —
+objects plus streams plus extents. One number rather than three, because what has to be bounded is
+the *answer's size*, and a per-kind cap lets a single pathological object evade the total. It is a
+configured knob, a request may name a smaller cap of its own, and **hitting it succeeds** (§9.1.3):
+the answer says which range of each level it covered, and what to ask for next.
+
+**Default: 10,000 entries.** Derived, from the answer it produces and the batch it must not break:
+
+| | |
+|---|---|
+| An extent entry | 3 name fields, 4 instances, 3 ranges and lengths, a flag, a 34-byte capability (§7.2.4) ≈ **~140 B** in the current encoding |
+| 10,000 of them | **~1.4 MB**, well inside `MAX_SEGMENT_BYTES` (8 MB), so an answer never needs segmenting |
+| §1.4.0's measured batch — 1,000 objects, one stream each | **2,000 entries**, leaving room for objects averaging five entries |
+
+⚠️ **What the limit says at the top end is that enumerating a whole large object is the wrong
+request.** §14.1 allows 2 × 10^9 extent references in one object: 2 × 10^5 requests, and ~260 GB of
+answers. So **`object-info` takes a range as well** — the same (start, budget) shape as a read, with
+the budget in entries — and a scheduler asks about the partition its vertex will read rather than
+about the object. A caller that genuinely wants every extent of a 10 PB object wants §13.5's
+snapshots, not this path.
+
+**`batch-object-info` stops at a name boundary wherever it can**, and mid-object only when one object
+alone exceeds the limit. The continuation is then *the next name*, with an extent range only in the
+mid-object case, which keeps the common answer a simple prefix of the list asked about.
+
+⚠️ **That breaks a property the current answer has**: today a batch pads a missing name with zeros so
+the answer lines up positionally with the request (§17.12). Once an answer may be short, position is
+no longer enough — it has to say **how many of the names it covered**, and a caller reading it the
+old way would silently attribute one object's metadata to a different name.
+
 ### 9.2 Keyed: locating key *K*
 
 Identical in shape, with `first_key` comparisons replacing starting record
@@ -7596,6 +7969,10 @@ object parallelize across the cluster naturally.
 Keyed objects support ordered and range scans by key but **not** positional
 access — "the 10,000,000th record" is unanswerable, because counts are
 statistics rather than addresses (§3).
+
+**What a caller actually sends to scan a range is §9.1.3.4's start and §9.1.3.6's budget**, and what
+it needs in hand to send them is §9.1.3.7's answer. This section is the physical shape of a scan; those
+are its interface.
 
 ---
 
@@ -11279,6 +11656,28 @@ Roughly in order of how much else depends on them.
      utilization and predictable enough to plan against, or it gives customers no way to shift load and fails at
      its only job. A published forward curve, a posted current rate, or an auction — and the choice determines
      whether §12.6's simple presentation survives.
+129. **Where an object's ACL is fetched from** (§9.1.3.5, §5.1, §9.1; #81). It was a detail while every read
+     walked the DN anyway; the hint capability makes it load-bearing, because it decides whether a hint
+     saves two round trips or one. §5.1 puts an ACL reference in the DN's object record, which would keep
+     the DN on the authorization path for ever; §9.1 counts the authorization hop separately from the DN
+     hop, which implies it is held or cached elsewhere. One of the two has to give.
+130. **The cluster-wide daily key the hint capability needs** (§9.1.3.5, §7.3; #82). §7.3's hierarchy is scoped
+     by SN and day on purpose, so a key any FE can verify with is a new scope rather than an existing key
+     reused. Small, but it needs a custody story of its own and it widens §7.3.1's blast radius argument.
+131. **The snap rule's interaction with a record that spans extents** (§9.1.3.4, §8.2.3). Snapping forward
+     is defined on record boundaries, and §8.2.3 lets a record span appends; whether a boundary search may
+     have to cross into the next extent — and therefore onto another EN — decides whether resolving an
+     offset start is one EN round trip or two.
+132. **Whether the entry limit should be in entries or in bytes** (§9.1.3.7). Entries are what a caller can
+     reason about and what the continuation is expressed in; bytes are what actually has to be bounded, and
+     the two differ by whether an extent has 4 instances or 15 fragments after erasure coding (§4.3.2). The
+     10,000 default is derived from a byte target, which is a hint that the byte form is the real one.
+133. **What the short extents from truncation-sealing cost an SN** (§7.2.4, §14.1; #56, #83). Sealing on
+     truncation is what turns the IV rule into an invariant, and it makes primary stability a driver of
+     **extent count** — which is what bounds an SN's memory. Nothing yet says how often a handover
+     happens, so nothing bounds the growth. #56 has to settle handover regardless; what is new is that
+     handover frequency now lands in a second budget, and a flapping primary is a metadata cost and not
+     only an availability one.
 
 **Closed** since earlier drafts:
 
@@ -11391,7 +11790,28 @@ Roughly in order of how much else depends on them.
 - whether recompression must be deterministic across instances — no, because exactly one node
   performs it and the second instance is a byte copy (§8.1.4.4);
 - why a read request would be logged at all — because §12 requires metering request rate,
-  so the log write is the billing record rather than overhead (§1.4.0.3).
+  so the log write is the billing record rather than overhead (§1.4.0.3);
+- whether a read may name only an extent — **no**; the ACL is the object's and no reverse edge
+  recovers it, so every read names the object and a narrowing is an optimization on top (§9.1.3.4);
+- whether putting the stream in a hint makes it authorizable — **no**, and §4.6.6 said so wrongly:
+  an asserted pairing is only as good as the caller, and `stream → object` is still the DN's
+  (§9.1.3.5, §4.6.6);
+- what binds a hint to its object — an unforgeable **capability** attesting membership only, verified
+  at the FE, with the ACL still evaluated fresh on every request (§9.1.3.5);
+- whether a hint may be opaque — **no**; it stays plaintext with the capability appended, so an
+  operator can act on a hint quoted in a bug report (§9.1.3.5);
+- which space a range budget is in — the caller picks one of **records, logical bytes or compressed
+  bytes**, and the answer reports all three (§9.1.3.6);
+- what a budget smaller than one block returns — **one block**, since anything else is a livelock;
+  the overshoot is bounded and reported (§9.1.3.6);
+- whether extent detail wants an operation of its own — **no**; the entry limit makes it opt-in, so
+  `object-info` is extended instead (§9.1.3.7, #61);
+- whether an extent offset may be written twice — **no, ever**, because key-and-IV reuse over
+  different plaintexts is catastrophic rather than degrading, so **a truncation seals the extent**
+  (§7.2.4, §8.1.1a);
+- whether the IV should carry a truncation epoch instead — **no**; it would need agreement across
+  instances in the write path, and a missed bump fails silently, where sealing cannot be violated
+  by anything (§7.2.4).
 
 ---
 
