@@ -384,6 +384,19 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | An id mix-up is **loud as an address and silent as a map key**, which is most places | §8.1.6.1 |
 | **Wrap values; group parameters.** A run of same-typed arguments wants a struct, as `AppendBlock` was | §8.1.6.1, §17.13.3 |
 | ⚠️ `ROff` does **not** catch §17.16.2's three record spaces, and a partial fix that looks total is the risk | §8.1.6.1 |
+
+**Coding rules**
+
+| | |
+|---|---|
+| They have a home: **§18**, with four occupants, since a rule stated where it was argued drifts | §18, §16.141 |
+| **Decompose the state**: m + n things is far less code than m × n, usually down to almost-independent booleans | §18.1 |
+| Already done six times here — the `Want` bits, the capability flags, per-tier masks, nonce dimensions | §18.1.1 |
+| And once by **removing** a dimension: a budget names one measure of three, never two | §18.1.1, §9.1.3.6 |
+| For an **implication**, **normalize rather than validate** — then no illegal combination exists to test | §18.1.2 |
+| An **exclusion** cannot be normalized away, and that is the kind wanting a negative test | §18.1.2 |
+| **`jenny`** covers pairs over almost-independent dimensions and negative-tests the disallowed ones | §18.1.3 |
+| ⚠️ And the **term index is a first cut at which invariants interact**, so the pairs worth covering are already computed | §18.1.4, #92 |
 | An index and a count sharing a type make the max count **2^64 − 1**, or **2^64 − 2** with a sentinel | §8.1.6.2 |
 | Because **one past the end** must be representable, which §9.1.3's `next` computes on every answer | §8.1.6.2 |
 | ⚠️ So §6's **4 GB** logical cap is one byte outside the `u32` enforcing it — the code is right, the doc is round (#89) | §8.1.6.2 |
@@ -13243,13 +13256,11 @@ Roughly in order of how much else depends on them.
      a new one. Whether the cursor is purely SN-side, and what a reader is told while the two disagree,
      are both open.
 
-141. **Where the coding rules live** (§13.2.5.1, §4.1.1.0). *Make the logic simple → reduce the depth of
-     negations → name things positively* is a coding standard, it applies across the whole codebase, and it
-     currently sits inside a subsection about deployment parameters because that is where the conflict
-     surfaced. §15.3 covers the test strategy and §17 covers what is built; neither is a home for rules
-     about how code should read. There is probably more than one such rule already implicit — §17.12.1's
-     "the fix is structural rather than careful" and §8.1.6's "make the compiler catch it" are two — so the
-     section would have occupants the moment it existed.
+141. ✅ **Where the coding rules live** — **answered: §18.** They now have a section, with four
+     occupants: *make the logic simple* (§13.2.5.1, §4.1.1.0), *structural rather than careful*
+     (§17.12.1), *make the compiler catch it* (§8.1.6.1) and *decompose the state* (§18.1). What remains
+     open is only whether more are implicit and unnamed; the guess when the section was created was that
+     it would have occupants immediately, and it had four.
 
 142. **Why the same lookup benchmark differs 23% between sessions** (§17.19.2). Three trials back to back
      spread 0.6%; the same measurement four days apart differs by 23%, on one box, against builds proven
@@ -14984,3 +14995,118 @@ binds is a limit that never gets tested.
 ⚠️ **The knob's placement in `dn.toml` cost a restart to find.** A top-level key written after a `[knobs]`
 table parses as a member of it, so the first attempt failed with *unknown field `info_entries`, expected
 `workers`* — TOML's rule, not a bug, and worth knowing before the next machine type grows a knob.
+
+---
+
+## 18. Coding rules
+
+§16.141 recorded that these had no home and sat wherever the argument that produced them happened to
+land. There are now four, which is enough to collect: they are about **how code should read and be
+shaped**, which is neither the test strategy (§15.3) nor what is built (§17).
+
+Each is stated where it was argued and summarised here. **The summary is not the definition** — the
+sections are, and they carry the reasoning that makes each rule more than a preference.
+
+| Rule | Argued | In one line |
+|---|---|---|
+| **Make the logic simple** | §13.2.5.1, §4.1.1.0 | reduce the depth of negations; name things positively; a name is never a negation |
+| **Structural rather than careful** | §17.12.1 | if a rule can be broken by forgetting, change the shape so forgetting is impossible |
+| **Make the compiler catch it** | §8.1.6, §8.1.6.1 | wrap same-typed values when a mix-up would be silent; group parameters when a signature has a run of them |
+| **Decompose the state** | §18.1 | m + n things is far less code than m × n |
+
+⚠️ **They are not independent, which is itself an instance of the last one.** "Structural rather than
+careful" is often achieved by "make the compiler catch it", and both are ways of making the logic
+simple. Where they conflict — §13.2.5.1 works through a case where naming positively costs a negation
+at the enforcement site — the rule higher up the list wins, because the lower ones exist to serve it.
+
+### 18.1 Decompose the state, because m + n beats m × n
+
+**When there are lots of states, look at whether they decompose into small independent things**
+(Asserted, Bob, 2026-08-19): *"handling m+n things is a lot less code than m*n things. Usually you can
+decompose them all the way down to a bunch of almost-independent booleans but not always."*
+
+**The saving is not linear-versus-quadratic in the running code; it is in what has to be written and
+what has to be tested.** A mode enum with m × n cases needs every case written, read, and covered. The
+same information as two independent fields needs m + n pieces of handling and the product falls out.
+
+#### 18.1.1 Where this design already does it, mostly without having named it
+
+| | Decomposed as | Rather than |
+|---|---|---|
+| what an `object-info` answer should carry (§9.1.3.11) | **six independent bits** in one flag field | a ladder of detail levels |
+| a stream's capabilities (§4.1.1) | independent booleans — `updatable`, `deletable` | a mode enum over their combinations |
+| which detail a tier can answer (§17.20) | **one bitmask per tier**, and a set difference for the rest | a table of supported combinations |
+| nonce distinctness (§7.2.4) | day × SN × extent × block, each independent | anything that had to enumerate the product |
+| a range budget (§9.1.3.6) | **one measure of three**, never two | a cross product of bounds |
+
+**The nonce case is the one worth pausing on**, because there the decomposition is doing *correctness*
+work rather than saving code: each dimension is independently unique, so the product is unique without
+anybody enumerating it. §7.2.4's whole argument is that the one place the decomposition fails —
+truncation reusing an offset — is the one place the rule breaks.
+
+**And the budget case is the rule applied in the other direction: by removing a dimension.** §9.1.3.6
+refuses to let a request bound two measures at once, so what could have been a 3 × 3 space of
+combinations is 3. The reason given there is that a caller cannot know the compression ratio in
+advance — but the *shape* of the fix is this rule.
+
+#### 18.1.2 The almost in "almost-independent": normalize rather than validate
+
+⚠️ **The bits are rarely quite independent, and what to do about it matters.** `Detail::Extents` implies
+`Detail::Streams`, because an extent's record numbers mean nothing without the stream containing them.
+Three ways to handle that, and they are not equally good:
+
+| | Cost |
+|---|---|
+| **reject** the incomplete combination | a `BadRequest` for something the caller obviously meant, and a case to document and test |
+| **ignore** the missing bit | the answer omits something the caller needs, silently |
+| ⚠️ **normalize** — complete the implication on the way in | **no illegal combination exists to reject or test** |
+
+**Normalizing is what `Want::of_args` does**, and it is the better answer for an *implication*. It
+converts a disallowed-combination problem into no problem, which is the same move as
+§17.12.1's structural-rather-than-careful: the bad state stops being representable rather than being
+checked for.
+
+**That does not dissolve every dependency.** A genuine *exclusion* — two bits that must not both be set
+— cannot be normalized away, and there the combination has to be refused and tested. The distinction is
+whether the dependency says *and also* or *not both*.
+
+#### 18.1.3 Prior art, and a tool: jenny
+
+**Cited: `jenny` generates n-way covering arrays over almost-independent dimensions, and can list,
+avoid and negative-test the disallowed combinations** ([tool](https://github.com/bobjen/jenny),
+[description](https://burtleburtle.net/bob/math/jenny.html)). ⚠️ **Provenance, as with §4.1.1.1's
+`ENABLE NOVALIDATE`: it is Bob's own**, so the analogy is first-hand rather than matched from the
+literature.
+
+**Why a covering array is the right instrument once the state is decomposed**: with the dimensions
+separated, the bugs that remain are *interactions*, and covering all **pairs** is a small fraction of
+covering all combinations while catching most interaction defects. The disallowed-combination handling
+is what makes it usable on a real system, where the dimensions are almost-independent rather than
+independent — and negative-testing those combinations is the part that is easy to skip by hand.
+
+#### 18.1.4 Where DeLawson has an m × n problem it has not decomposed
+
+**This is the useful direction to point the rule**, and #67 already wrote the observation without
+naming it:
+
+> Six of them interlocked inside one function: the block rule (§8.2.4), seal-on-a-record-boundary
+> (§8.2.3), records spanning appends, the two durability gates, tenant purity of a block (§9.1.2), and
+> who decompresses. **Each is right; the interaction is where the bugs were.**
+
+Six almost-independent conditions is 64 combinations if they were independent, and they are not — which
+is exactly the shape jenny exists for. §17.12.1's three bugs were all interaction bugs, and #67 already
+concluded that a spec would have found the missed wakeup "by construction".
+
+⚠️ **And `INVARIANTS.md`'s term index turns out to be a first cut at which of these are not
+independent**, which was not why it was built. Invariants sharing a term are the ones liable to
+interact:
+
+| Term | Invariants naming it |
+|---|---|
+| `record` | nine |
+| `extent`, `watermark`, `seal` | five to nine each |
+
+**So the pairs worth covering are the pairs within a term group**, not all ~4,600 pairs over 96
+invariants. That is a much smaller set, it is already computed, and it is the natural input to a
+covering-array generator — which makes the term index a testing artefact as well as a navigational one
+(#92).

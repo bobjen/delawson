@@ -808,6 +808,11 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 
 ## What the index shows
 
+⚠️ **And one thing it shows that it was not built for**: invariants sharing a term are the ones liable to
+**interact**, so this table is a first cut at which of them are not independent — which is the input a
+covering-array generator wants (§18.1.4, #92). Pairs *within* a term group are the plausible interaction
+sets, and that is a far smaller list than all ~4,500 pairs over ninety-odd invariants.
+
 Three things fall out of the counts, and each is a claim about where to spend effort:
 
 - **`extent`, `record` and `watermark` are the most-referenced terms**, and all three are in the write
