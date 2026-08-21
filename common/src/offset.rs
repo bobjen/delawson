@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn a_list_of_triples_compresses_and_a_list_of_guids_does_not() {
         let mut rng = crate::random::Rng::new();
-        let (mut triples, mut guids) = (Vec::new(), Vec::new());
+        let (mut triples, mut guids, mut beside) = (Vec::new(), Vec::new(), Vec::new());
         // Ten thousand extents of one stream: one SN, consecutive ids, seconds creeping up.
         let mut second = 1_787_000_000u64;
         for id in 0..10_000u32 {
@@ -272,16 +272,25 @@ mod tests {
             second += u64::from(id % 3 == 0);
             guids.extend_from_slice(&rng.next().to_le_bytes());
             guids.extend_from_slice(&rng.next().to_le_bytes());
+            // ⚠️ And what a GUID does *not* carry has to be stored beside it: the creating SN,
+            // which §7.3.3 needs to derive the key, and the second, which selects the day's
+            // master key and is the extent's age. The triple has both inside its 16 bytes.
+            beside.extend_from_slice(&guids[guids.len() - 16..]);
+            beside.extend_from_slice(&7u32.to_le_bytes());
+            beside.extend_from_slice(&second.to_le_bytes());
         }
         assert_eq!(triples.len(), guids.len(), "16 bytes apiece either way");
+        assert_eq!(beside.len(), triples.len() * 28 / 16, "but a GUID needs 12 more beside it");
 
         let small = lz4_flex::compress_prepend_size(&triples).len();
         let big = lz4_flex::compress_prepend_size(&guids).len();
+        let whole = lz4_flex::compress_prepend_size(&beside).len();
         println!(
-            "10,000 names: {} B raw, triples {small} B ({:.0}x), guids {big} B ({:.2}x)",
+            "10,000 names: triples {} B raw -> {small} B; guids {} B -> {big} B; \
+             guids plus what they do not carry {} B -> {whole} B",
             triples.len(),
-            triples.len() as f64 / small as f64,
-            triples.len() as f64 / big as f64
+            guids.len(),
+            beside.len()
         );
         // ⚠️ **3x, not 30x, and the shortfall is the compressor rather than the encoding.**
         // LZ4 matches repeated byte *sequences*: the SN field repeats every 16 bytes and the
@@ -291,5 +300,10 @@ mod tests {
         // around 30x, while a GUID has neither, being random on purpose (§17.34).
         assert!(small * 2 < big, "triples {small} against guids {big}");
         assert!(big >= triples.len(), "random bytes do not compress at all");
+        // ⚠️ **The honest comparison is against this, not against a bare GUID** (Asserted,
+        // Bob, 2026-08-20): the triple *encodes other fields that would have to be stored
+        // separately otherwise*. So the triple is smaller before compression as well as
+        // after — 16 bytes against 28.
+        assert!(whole > small * 3, "triples {small} against guids-and-fields {whole}");
     }
 }

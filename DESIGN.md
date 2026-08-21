@@ -17193,10 +17193,24 @@ like:
 **Ten thousand names of one stream** — one SN, consecutive ids, seconds creeping up — against ten
 thousand random 16-byte GUIDs, both through the LZ4 the wire already uses:
 
-| | 160,000 B raw | compressed |
+| | raw | compressed |
 |---|---|---|
-| triples | | **53,403 B — 3.0×** |
-| GUIDs | | 160,633 B — **1.00×**, very slightly *larger* |
+| triples | 160,000 B | **53,403 B — 3.0×** |
+| GUIDs | 160,000 B | 160,633 B — **1.00×**, very slightly *larger* |
+| ⚠️ GUIDs **plus what they do not carry** | 280,000 B | 219,672 B |
+
+**That third row is the honest comparison** (Asserted, Bob, 2026-08-20): *"mine also encodes other
+fields that would have to be stored separately otherwise."* A GUID names an extent and says nothing
+about it. Beside it you still have to keep:
+
+| | why it cannot be dropped |
+|---|---|
+| the **creating SN** | §7.3.3 derives the extent's key from it — *the creating SN, never the serving one* |
+| the **second** | selects the day's master key (§7.3), and is the extent's age for GC, tiering and repair |
+
+**So the triple is smaller before compression as well as after**: 16 bytes against 28, and **53,403
+against 219,672 — 4.1×** once both are compressed. The identifier is doing the work of three fields
+because it *is* three fields.
 
 **The GUID figure is not a defect of the compressor.** A GUID is random by construction; that is what
 makes it collide-resistant, and it is exactly what makes it incompressible. **The two properties are
