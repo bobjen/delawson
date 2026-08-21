@@ -17476,3 +17476,65 @@ was silent.
 > **Detect, do not prevent.** Nothing here stops a path being repointed under a reader; it stops the
 > reader being told a lie about it. That is the same trade §9.1.3.5 makes for a stale certificate, and
 > the same one an `ETag` makes over HTTP.
+
+## 17.37 Seven kinds of identity, and none of them a bare integer
+
+**Bob, 2026-08-20**, on a `held.id as u64` in the DN: *"DnId, RangeId, ObjectId, SnId, EnId,
+ExtentId should all be u32, and they should all be explicit types as well. Any raw u32 or u64,
+especially u64, is suspicious."*
+
+**Seven, with `StreamId` and `DiskId`** — the two the list implies. §8.1.6 made this argument for
+byte offsets and §17.32 for record offsets; identity was the largest remaining population of bare
+integers, and the largest one where a wrong value is *another real thing* rather than a wrong place
+in the right thing.
+
+**The cast that prompted it is gone with all the others.** A stream id was being widened to 64 bits
+to sit in a wire row; the row holds a `StreamId` now.
+
+### 17.37.1 Why 32 bits is a decision and not an economy
+
+Every one is part of a 16-byte triple whose third component is a creation second (§17.34), so an id
+has only to be unique among what **one minter makes in one second**. A 64-bit id would be eight
+bytes buying a range nothing can reach — and #110's reuse gate, not the width, is what actually
+keeps them apart.
+
+### 17.37.2 Zero is the sentinel here and the top is the sentinel there
+
+⚠️ **The opposite of `offset`'s convention, on purpose** (Asserted, Bob): *"it's not like offsets
+where 0 is definitely a legal offset."*
+
+| | reserved | because |
+|---|---|---|
+| an offset or count | **the top** | zero is a length somebody means |
+| an id | **zero** | a thing numbered zero is a thing nobody minted |
+
+**Both reserve exactly one value**; they differ in which one cannot occur naturally.
+
+### 17.37.3 ⚠️ And that asymmetry is worth more than tidiness
+
+**Every id has callers that look one up and may not find it** (Asserted, Bob, 2026-08-20), and the
+two ways to say so are a sentinel or an `Option`. **Reserving zero makes them the same choice**,
+because zero is a *niche*. Measured:
+
+| | `Id` | `Option<Id>` |
+|---|---|---|
+| over a plain `u32` | 4 | **8** |
+| over a `NonZeroU32` | 4 | **4** |
+
+> **So `Option<Id>` can cost nothing and have the compiler insist on the not-found branch**, where a
+> sentinel costs nothing and asks every caller to remember. That is §18's rule — make the compiler
+> catch it — available for free, and only because the reserved value is at the bottom.
+
+⚠️ **An offset cannot have this.** Its reserved value is at the *top*, and a top-valued niche is not
+one Rust exposes — a second reason the two conventions differ, beyond zero being a legal offset.
+
+**The sentinel stays for now**, because it is what the rest of the store does and the typing was
+already a hundred call sites. #112 is the conversion, and the wire keeps zero for none either way: a
+wire number has no niche, so the boundary is where it is decided.
+
+### 17.37.4 What the types said as soon as they existed
+
+⚠️ **`placement::en_of` now reads `DiskId -> EnId`**, so the placeholder identity function says in
+its own signature that it converts between two different things (§17.29.3). It was
+`fn en_of(u32) -> u32`, which is indistinguishable from doing nothing — and doing nothing is
+precisely what it must stop doing when #108 lands.
