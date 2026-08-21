@@ -1,4 +1,6 @@
-//! Two kinds of position in an extent, and they are not interchangeable.
+//! Positions that share a width and must not share a type.
+//!
+//! Two kinds of position in an extent's bytes, and three in its records.
 //!
 //! A **logical** position counts the bytes a writer wrote. A **compressed** one
 //! counts the bytes that were stored. Both are 32-bit — an extent is capped well
@@ -14,21 +16,34 @@
 //! A locator handed back to a writer is logical, since a writer knows what it
 //! wrote and not what that compressed to. What is on a device is compressed, and
 //! the sparse index is what relates the two.
+//!
+//! ⚠️ **The record spaces are the same argument with a worse precedent.** A record
+//! number means one of three things — its position in an *object*, in a *stream*, or
+//! in an *extent* — and §17.16.2 is what happened when a conversion between them was
+//! skipped: 139 of 200 reads returned the wrong record, invisibly until the first seal,
+//! because all three origins are zero while an object fits one extent. Object-local and
+//! stream-local also share a width, so nothing but a type separates them.
+//!
+//! **A count and a position share a type here, deliberately**, as they do for bytes:
+//! adding a count to a position is ordinary arithmetic. ⚠️ That leaves one confusion
+//! these types do not catch, and §17.29.5 is an instance of it — a count passed where a
+//! position was wanted, in the same space. What catches that is not naming the space but
+//! naming the *pair*, which is what `sn::Placed` does.
 
 use crate::{Error, Result};
 
 macro_rules! space {
-    ($name:ident, $what:literal) => {
-        #[doc = concat!("A position or length in ", $what, " bytes.")]
+    ($name:ident, $width:ty, $unit:literal, $within:literal) => {
+        #[doc = concat!("A position or count of ", $unit, " in ", $within, ".")]
         #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(u32);
+        pub struct $name($width);
 
         impl $name {
             pub const ZERO: $name = $name(0);
 
             /// **No value given**, which is the top of the range rather than zero,
-            /// because zero is a length a caller can legitimately mean (§8.1.6.2).
-            pub const NONE: $name = $name(u32::MAX);
+            /// because zero is a count a caller can legitimately mean (§8.1.6.2).
+            pub const NONE: $name = $name(<$width>::MAX);
 
             /// The largest real value, one below `NONE`.
             ///
@@ -39,33 +54,33 @@ macro_rules! space {
             /// reservation is uniform whether or not a given space uses it today —
             /// and a space that needs it later does not have to change its documented
             /// maximum, which would be a format contract change.
-            pub const MAX: $name = $name(u32::MAX - 1);
+            pub const MAX: $name = $name(<$width>::MAX - 1);
 
-            /// ⚠️ **Unchecked, for literals.** `new(u32::MAX)` is `NONE`, which is
-            /// almost certainly not what a caller writing a literal meant; the
-            /// checked constructors are `of_len` and `of_number`.
-            pub const fn new(bytes: u32) -> $name {
-                $name(bytes)
+            /// ⚠️ **Unchecked, for literals.** `new(MAX)` is `NONE`, which is almost
+            /// certainly not what a caller writing a literal meant; the checked
+            /// constructors are `of_len` and `of_number`.
+            pub const fn new(count: $width) -> $name {
+                $name(count)
             }
 
-            pub const fn get(self) -> u32 {
+            pub const fn get(self) -> $width {
                 self.0
             }
 
             pub const fn is_none(self) -> bool {
-                self.0 == u32::MAX
+                self.0 == <$width>::MAX
             }
 
             pub const fn is_some(self) -> bool {
-                self.0 != u32::MAX
+                self.0 != <$width>::MAX
             }
 
-            /// From a count of bytes in hand, which is how a length arrives.
+            /// From a count in hand, which is how a length arrives.
             pub fn of_len(len: usize) -> Result<$name> {
-                match u32::try_from(len) {
-                    Ok(bytes) if bytes < u32::MAX => Ok($name(bytes)),
+                match <$width>::try_from(len) {
+                    Ok(count) if count < <$width>::MAX => Ok($name(count)),
                     _ => Err(Error::new(format!(
-                        concat!($what, " length {} does not fit an extent"),
+                        concat!("{} is too many ", $unit, " for ", $within),
                         len
                     ))),
                 }
@@ -74,11 +89,8 @@ macro_rules! space {
             /// From the wire, where every number is 64 bits. `NONE` survives the trip,
             /// since a field that may be absent has to be able to say so.
             pub fn of_number(number: u64) -> Result<$name> {
-                u32::try_from(number).map($name).map_err(|_| {
-                    Error::new(format!(
-                        concat!($what, " position {} is past the end of any extent"),
-                        number
-                    ))
+                <$width>::try_from(number).map($name).map_err(|_| {
+                    Error::new(format!(concat!($unit, " {} is past the end of ", $within), number))
                 })
             }
 
@@ -86,21 +98,27 @@ macro_rules! space {
                 self.0 as u64
             }
 
-            /// Move on by a length in the same space. An extent that would run past
-            /// what a position can name is full, which is a reason to seal it and
-            /// not a reason to wrap.
+            /// Move on by a count in the same space. Running past what a position can
+            /// name is a reason to stop, not a reason to wrap.
             ///
             /// **Stops one short of the type's ceiling**, since the top value is
             /// `NONE`. That is the same check either way — §8.1.6.2's point that the
             /// sentinel rides along free.
-            pub fn plus(self, len: $name) -> Result<$name> {
-                match self.0.checked_add(len.0) {
-                    Some(sum) if sum < u32::MAX => Ok($name(sum)),
+            pub fn plus(self, count: $name) -> Result<$name> {
+                match self.0.checked_add(count.0) {
+                    Some(sum) if sum < <$width>::MAX => Ok($name(sum)),
                     _ => Err(Error::new(format!(
-                        concat!("an extent cannot reach ", $what, " byte {} plus {}"),
-                        self.0, len.0
+                        concat!($within, " cannot reach ", $unit, " {} plus {}"),
+                        self.0, count.0
                     ))),
                 }
+            }
+
+            /// How far this is past an earlier position in the same space. ⚠️ Saturating
+            /// rather than wrapping: a position before the origin is a bug at the caller,
+            /// and a huge positive number is a worse way to learn about it than a zero.
+            pub fn since(self, origin: $name) -> $name {
+                $name(self.0.saturating_sub(origin.0))
             }
         }
 
@@ -112,8 +130,25 @@ macro_rules! space {
     };
 }
 
-space!(LOff, "logical");
-space!(COff, "compressed");
+// ⚠️ **`LOff` and `COff` are the *extent-local* byte spaces**, which their names predate and
+// do not say. Read them as `ELOff` and `ECOff`. There is deliberately no `SLOff`/`OLOff`
+// pair — see §17.32.2 for why, and for what would make them worth adding.
+//
+// ⚠️ **And they are 32-bit because an extent is capped** (Asserted, Bob, 2026-08-20): *"logical
+// and compressed in SN and DN can be u64, it's only in EN that LOff and COff are u32."* A
+// stream's or an object's byte totals are sums over extents and pass 4 GB in the second one,
+// so `info::Totals` and the DN's cache hold `u64` and **must not** be given these types.
+space!(LOff, u32, "logical bytes", "an extent");
+space!(COff, u32, "compressed bytes", "an extent");
+
+// The three record spaces §17.16.2 cost 139 of 200 reads by confusing (Asserted, Bob,
+// 2026-08-20). ⚠️ **Object-local and stream-local are the dangerous pair** — *"exceptionally
+// easy to confuse"* — and they are the two that share a width, so a type is the only thing
+// that can tell them apart. Extent-local is 32-bit because an extent seals at 32 MB, so even
+// one-byte records do not reach 4.3 × 10^9.
+space!(ORoff, u64, "records", "an object");
+space!(SRoff, u64, "records", "a stream");
+space!(ERoff, u32, "records", "an extent");
 
 #[cfg(test)]
 mod tests {
@@ -192,5 +227,30 @@ mod tests {
         assert_eq!(logical.get(), compressed.get());
         // Deliberately not written: `logical.plus(compressed)`, which is the bug
         // these types exist to refuse, and it does not compile.
+    }
+
+    /// ⚠️ **The three record spaces are three types, not one.** This does not compile if
+    /// they collapse into an alias, which is the whole point — object-local and
+    /// stream-local share a width, so the compiler is the only thing between them
+    /// (§17.16.2).
+    #[test]
+    fn a_record_space_is_not_another_record_space() {
+        let in_object = ORoff::new(700);
+        let in_stream = SRoff::new(40);
+        // The conversion is arithmetic the caller has to write down, which is the point:
+        // object-local is stream-local plus where the stream starts in the object.
+        let converted = ORoff::new(in_object.number() + in_stream.number());
+        assert_eq!(converted, ORoff::new(740));
+        // And an extent's space is narrower, because an extent seals long before 2^32.
+        assert!(ERoff::of_number(u32::MAX as u64 + 1).is_err());
+        assert!(SRoff::of_number(u32::MAX as u64 + 1).is_ok());
+    }
+
+    /// Going back further than the origin is a caller bug, and a zero says so better
+    /// than an enormous positive number does.
+    #[test]
+    fn a_position_before_its_origin_saturates() {
+        assert_eq!(SRoff::new(10).since(SRoff::new(4)), SRoff::new(6));
+        assert_eq!(SRoff::new(4).since(SRoff::new(10)), SRoff::ZERO);
     }
 }

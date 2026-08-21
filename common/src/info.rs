@@ -13,6 +13,7 @@
 
 use crate::framing::Framing;
 use crate::placement::Expansion;
+use crate::time::TimeSec;
 use crate::wire::Arg;
 use crate::{Error, Result};
 
@@ -24,7 +25,7 @@ pub struct Described {
     /// holding a record for a read.
     pub stream: u64,
     pub sn: u32,
-    pub created: u64,
+    pub created: TimeSec,
     pub keyed: bool,
     pub framing: Framing,
     /// The object-local number of that stream's first record, which is what makes
@@ -61,7 +62,7 @@ impl Described {
             Arg::Number(self.id),
             Arg::Number(self.stream),
             Arg::Number(self.sn as u64),
-            Arg::Number(self.created),
+            Arg::Number(self.created.number()),
             Arg::Flag(self.keyed),
             Arg::Number(kind),
             Arg::Number(width),
@@ -94,7 +95,7 @@ impl Described {
                 id: *id,
                 stream: *stream,
                 sn: *sn as u32,
-                created: *created,
+                created: TimeSec::new(*created),
                 keyed: *keyed,
                 framing: Framing::of_wire(*kind, *width)?,
                 first_record: *first_record,
@@ -300,7 +301,7 @@ pub struct StreamRow {
     /// to** — how far that one reaches is not the DN's to say (§6.3).
     pub records: u64,
     /// The second the stream was made. The DN's own, so always exact.
-    pub created: u64,
+    pub created: TimeSec,
     /// What it has come to. `extents` is here rather than in the row proper because the
     /// three travel together and mean the same thing about staleness.
     pub totals: Totals,
@@ -319,7 +320,7 @@ impl StreamRow {
             Arg::Number(self.sn as u64),
             Arg::Number(self.first_record),
             Arg::Number(self.records),
-            Arg::Number(self.created),
+            Arg::Number(self.created.number()),
         ];
         args.extend(self.totals.args());
         args.push(Arg::Number(self.given));
@@ -348,7 +349,7 @@ impl StreamRow {
                 sn: *sn as u32,
                 first_record: *first_record,
                 records: *records,
-                created: *created,
+                created: TimeSec::new(*created),
                 totals,
                 given: *given,
             },
@@ -383,7 +384,7 @@ pub struct ExtentRow {
     /// (§4.6.3) — and the second is what makes a stale hint fail loudly.
     pub sn: u32,
     pub id: u64,
-    pub created: u64,
+    pub created: TimeSec,
     /// Its first record. **Stream-local from the SN, object-local once the FE has
     /// converted it** (§17.16.2 is what happens when that is skipped).
     pub first_record: u64,
@@ -418,7 +419,7 @@ impl ExtentRow {
         let mut args = vec![
             Arg::Number(self.sn as u64),
             Arg::Number(self.id),
-            Arg::Number(self.created),
+            Arg::Number(self.created.number()),
             Arg::Number(self.first_record),
             Arg::Number(self.records),
             Arg::Number(self.logical),
@@ -463,7 +464,7 @@ impl ExtentRow {
             ExtentRow {
                 sn: *sn as u32,
                 id: *id,
-                created: *created,
+                created: TimeSec::new(*created),
                 first_record: *first_record,
                 records: *records,
                 logical: *logical,
@@ -683,7 +684,7 @@ mod tests {
             id,
             stream: 17,
             sn: 3,
-            created: 1_000_000,
+            created: TimeSec::new(1_000_000),
             keyed: false,
             framing: Framing::Lf,
             first_record: 400,
@@ -752,7 +753,7 @@ mod tests {
             sn: 0,
             first_record,
             records,
-            created: 1_000_000,
+            created: TimeSec::new(1_000_000),
             totals: Totals::unknown(),
             given: 0,
         }
@@ -806,7 +807,7 @@ mod tests {
         ExtentRow {
             sn: 2,
             id,
-            created: 1_000_000,
+            created: TimeSec::new(1_000_000),
             first_record,
             records,
             logical: if records == UNKNOWN { UNKNOWN } else { records * 100 },

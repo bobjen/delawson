@@ -25,10 +25,12 @@ use common::config::{FEConfig, ServiceKind};
 use common::framing::Framing;
 use common::info::{Batch, Described, Shape, UNKNOWN, Wanted};
 use common::logw;
+use common::offset::{ERoff, ORoff, SRoff};
 use common::placement;
 use common::range::{Budget, Covered, Detail, Filled, Piece, Range, Start, Want};
 use common::routing;
 use common::server::{self, Process, Reply, Service};
+use common::time::TimeSec;
 use common::wire::{AppendBlock, Arg, Op, Request, Response, Status};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -74,7 +76,7 @@ const COORDINATED: &[Op] = &[Op::AppendRecord, Op::ReadRecord];
 struct Open {
     sn: u32,
     id: u64,
-    created: u64,
+    created: TimeSec,
     /// The stream-local number of this extent's first record, which is what turns an
     /// extent-local number into a durable reference.
     first_record: u64,
@@ -111,7 +113,7 @@ impl Open {
         (!disks.is_empty()).then_some(Open {
             sn,
             id: *id,
-            created: *created,
+            created: TimeSec::new(*created),
             first_record: *first_record,
             records: *records,
             disks,
@@ -120,8 +122,9 @@ impl Open {
 
     /// Whether a stream-local record is in this extent. False for an extent whose
     /// count is not known, which is the one still being appended to.
-    fn holds(&self, record: u64) -> bool {
-        self.records > 0 && record >= self.first_record && record < self.first_record + self.records
+    fn holds(&self, record: SRoff) -> bool {
+        let first = SRoff::new(self.first_record);
+        self.records > 0 && record >= first && record.number() < self.first_record + self.records
     }
 }
 
@@ -192,7 +195,7 @@ impl Stream {
     }
 
     /// The sealed extent holding a stream-local record, if this FE knows of it.
-    fn holding(&self, record: u64) -> Option<Open> {
+    fn holding(&self, record: SRoff) -> Option<Open> {
         self.sealed.iter().find(|extent| extent.holds(record)).cloned()
     }
 
@@ -678,8 +681,8 @@ impl FE {
         self.resolve_record(process, &path, record, reply, move |fe, process, located, reply| {
             // The DN answered with the stream holding it, so the number the stream
             // knows it by is what is left after that stream's first.
-            let in_stream = within(record, located.first_record);
-            fe.locate(process, located, in_stream, range.budget, reply);
+            let at = in_stream(ORoff::new(record), ORoff::new(located.first_record));
+            fe.locate(process, located, at, range.budget, reply);
         });
     }
 
@@ -694,7 +697,7 @@ impl FE {
         self: &Arc<Self>,
         process: &Arc<Process>,
         located: Located,
-        record: u64,
+        record: SRoff,
         budget: Budget,
         reply: Reply,
     ) {
@@ -712,7 +715,7 @@ impl FE {
         let ask = Request::new(Op::LocateRecord)
             .number(located.dn as u64)
             .number(located.stream)
-            .number(record);
+            .number(record.number());
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
         let named = identity.clone();
@@ -811,24 +814,26 @@ fn from_instance(
     process: &Arc<Process>,
     located: &Located,
     open: &Open,
-    in_stream: u64,
+    in_stream: SRoff,
     budget: Budget,
     reply: Reply,
 ) {
     let identity = format!("EN{}", placement::en_of(open.disks[0]));
     // The record number the extent knows is its own, counted from its first — and no
     // framing goes with it, because the EN will not be looking inside.
-    let in_extent = within(in_stream, open.first_record);
+    let at = in_extent(in_stream, SRoff::new(open.first_record));
     // ⚠️ And the answer comes back in the extent's numbering, which is not the
     // caller's. Three numbering spaces meet here — object, stream, extent — and the
     // FE is the only party that knows all three, so it is the one that converts.
-    let base = origin(located.first_record, open.first_record);
+    let base = origin(ORoff::new(located.first_record), SRoff::new(open.first_record));
     // A sealed extent has something after it; the one still open is the object's
     // tail, so what the EN says about its own blocks is the whole answer.
     let sealed = open.records > 0;
-    let mut ask =
-        Request::new(Op::ReadExtent).number(open.sn as u64).number(open.id).number(open.created);
-    ask.args.extend(Range { start: Start::Record(in_extent), budget }.args());
+    let mut ask = Request::new(Op::ReadExtent)
+        .number(open.sn as u64)
+        .number(open.id)
+        .number(open.created.number());
+    ask.args.extend(Range { start: Start::Record(at.number()), budget }.args());
     let named = identity.clone();
     // The blocks come back whole and are passed on whole: the reader decompresses
     // them, checks the CRC against what it wrote, and takes the records it wanted.
@@ -843,8 +848,25 @@ fn from_instance(
 
 /// A record number one space inward: an object's into its stream's, or a stream's into
 /// its extent's. Both are the same subtraction, of that container's first record.
-fn within(record: u64, first: u64) -> u64 {
-    record.saturating_sub(first)
+/// A caller's object-local record number in the numbering its stream knows it by.
+fn in_stream(record: ORoff, stream_first: ORoff) -> SRoff {
+    SRoff::new(record.since(stream_first).number())
+}
+
+/// And a stream-local record number in the extent's own numbering.
+///
+/// ⚠️ **Two functions, because these are two conversions.** One `within` served both until
+/// the record spaces became types (§17.32.1) — object-to-stream at one call site and
+/// stream-to-extent at the other, told apart only by which caller you were reading. That is
+/// §17.16.2's bug written as a helper: the arithmetic is identical, the meaning is not, and
+/// nothing but the types objects to using the wrong one.
+///
+/// The narrowing is the space change made visible: a stream's record space is 64-bit and an
+/// extent's is 32-bit, so a difference that does not fit is a record that is not in this
+/// extent. Clamped rather than refused, because the caller is about to ask the EN and the EN
+/// is the one that can say it is not there.
+fn in_extent(record: SRoff, extent_first: SRoff) -> ERoff {
+    ERoff::of_number(record.since(extent_first).number()).unwrap_or(ERoff::MAX)
 }
 
 /// And what puts an extent's answer back into the caller's numbering — the two origins
@@ -853,8 +875,11 @@ fn within(record: u64, first: u64) -> u64 {
 /// ⚠️ **`within` twice and `origin` are only correct as a set.** Both first-records are
 /// zero until an object outgrows its first extent, so a version that drops either one
 /// passes everything that never leaves that extent and then fails most reads.
-fn origin(stream_first: u64, extent_first: u64) -> u64 {
-    stream_first + extent_first
+fn origin(stream_first: ORoff, extent_first: SRoff) -> ORoff {
+    // ⚠️ **Two different spaces added, which is exactly why they are two types.** The first
+    // is where this stream starts in the object; the second is where this extent starts in
+    // the stream. Their sum is object-local, and neither addend is.
+    ORoff::new(stream_first.number() + extent_first.number())
 }
 
 /// Put every record number in an answer into the numbering the caller asked in. An
@@ -871,7 +896,7 @@ fn origin(stream_first: u64, extent_first: u64) -> u64 {
 /// EN cannot know: it sets `more` from its own blocks, and only the FE knows there are
 /// further extents. Overstating it costs one round trip that answers "no such
 /// record"; understating it would lose data.
-fn in_the_callers_numbering(answer: Response, base: u64, sealed: bool) -> Response {
+fn in_the_callers_numbering(answer: Response, base: ORoff, sealed: bool) -> Response {
     if answer.status != Status::Ok {
         return answer;
     }
@@ -881,11 +906,11 @@ fn in_the_callers_numbering(answer: Response, base: u64, sealed: bool) -> Respon
     let Ok(pieces) = Piece::all_of_args(rest) else {
         return Response::error(Status::Internal, "that answer's blocks are not blocks");
     };
-    covered.next += base;
+    covered.next += base.number();
     covered.more = covered.more || sealed;
     let mut args = covered.args();
     for piece in pieces {
-        args.extend(Piece { first_record: piece.first_record + base, ..piece }.args());
+        args.extend(Piece { first_record: piece.first_record + base.number(), ..piece }.args());
     }
     Response { id: 0, status: Status::Ok, args }
 }
@@ -1571,7 +1596,7 @@ mod tests {
                 id: 1,
                 stream: 1,
                 sn: 0,
-                created: 0,
+                created: TimeSec::EPOCH,
                 keyed: false,
                 framing: Framing::Lf,
                 first_record: 0,
@@ -1585,7 +1610,7 @@ mod tests {
                     sn: 0,
                     first_record: 0,
                     records: 3,
-                    created: 1_000_000,
+                    created: TimeSec::new(1_000_000),
                     totals: Totals::unknown(),
                     given: 0,
                 }
@@ -1690,13 +1715,18 @@ mod tests {
     /// does not.
     #[test]
     fn a_record_number_survives_the_trip_through_three_spaces() {
-        use super::{in_the_callers_numbering, origin, within};
+        use super::{in_extent, in_stream, in_the_callers_numbering, origin};
         use common::wire::{Response, Status};
 
-        let (stream_first, extent_first) = (700, 40);
+        // ⚠️ Each step names the space it lands in, which is what stops the two
+        // conversions being the same helper called twice (§17.32.1).
+        let stream_first = ORoff::new(700);
+        let extent_first = SRoff::new(40);
         for asked in [740, 741, 800, 12_345] {
-            let in_extent = within(within(asked, stream_first), extent_first);
-            assert_eq!(in_extent + origin(stream_first, extent_first), asked, "record {asked}");
+            let at_stream: SRoff = in_stream(ORoff::new(asked), stream_first);
+            let at_extent: ERoff = in_extent(at_stream, extent_first);
+            let back: ORoff = origin(stream_first, extent_first);
+            assert_eq!(at_extent.number() + back.number(), asked, "record {asked}");
         }
 
         // And **every** record number in the answer is rewritten, while the three
@@ -1743,9 +1773,9 @@ mod tests {
         let covered = Covered { records: 1, logical: 2, compressed: 2, next: 1, more: false };
         let answer = || Response { id: 0, status: Status::Ok, args: covered.args() };
 
-        let tail = in_the_callers_numbering(answer(), 0, false);
+        let tail = in_the_callers_numbering(answer(), ORoff::new(0), false);
         assert!(!Covered::of_args(&tail.args).unwrap().0.more, "the open extent ends the object");
-        let sealed = in_the_callers_numbering(answer(), 0, true);
+        let sealed = in_the_callers_numbering(answer(), ORoff::new(0), true);
         assert!(Covered::of_args(&sealed.args).unwrap().0.more, "a sealed one does not");
     }
 
@@ -1754,7 +1784,7 @@ mod tests {
     #[test]
     fn a_refusal_is_not_converted() {
         let refused = Response::error(Status::NotFound, "no such record");
-        assert_eq!(in_the_callers_numbering(refused.clone(), 700, true), refused);
+        assert_eq!(in_the_callers_numbering(refused.clone(), ORoff::new(700), true), refused);
     }
 
     use common::testing;
@@ -1773,7 +1803,10 @@ mod tests {
             Arg::Number(1),
         ];
         let open = Open::of(0, &args).expect("an extent");
-        assert_eq!((open.sn, open.id, open.created, open.first_record), (0, 7, 1_000_000, 40));
+        assert_eq!(
+            (open.sn, open.id, open.created, open.first_record),
+            (0, 7, TimeSec::new(1_000_000), 40)
+        );
         assert_eq!(open.records, 90, "sealed, so its range is known");
         assert_eq!(open.disks, [2, 3, 0, 1]);
         // The primary is the first, which is the one an append is sent to.
@@ -1821,7 +1854,7 @@ mod tests {
         let open = Open {
             sn: 0,
             id: 7,
-            created: 1_000_000,
+            created: TimeSec::new(1_000_000),
             first_record: 40,
             records: 0,
             disks: vec![2, 3],
@@ -1863,14 +1896,27 @@ mod tests {
     #[test]
     fn a_failed_append_is_not_dressed_up_as_a_receipt() {
         let located = Located { dn: 0, stream: 17, sn: 0, framing: Framing::Lf, first_record: 0 };
-        let open =
-            Open { sn: 0, id: 7, created: 1_000_000, first_record: 0, records: 0, disks: vec![2] };
+        let open = Open {
+            sn: 0,
+            id: 7,
+            created: TimeSec::new(1_000_000),
+            first_record: 0,
+            records: 0,
+            disks: vec![2],
+        };
         let refused = Response::error(Status::Internal, "two instances would not apply it");
         assert_eq!(receipt(&located, &open, refused.clone()), refused);
     }
 
     fn extent(id: u64, first_record: u64) -> Open {
-        Open { sn: 0, id, created: 1_000_000, first_record, records: 0, disks: vec![2, 3, 0, 1] }
+        Open {
+            sn: 0,
+            id,
+            created: TimeSec::new(1_000_000),
+            first_record,
+            records: 0,
+            disks: vec![2, 3, 0, 1],
+        }
     }
 
     /// One append asks the SN and the rest join it. Without this, every append in
@@ -1923,13 +1969,13 @@ mod tests {
         stream.plan(Some((2, 80)));
         stream.open = Some(extent(3, 170));
 
-        assert_eq!(stream.holding(0).unwrap().id, 1);
-        assert_eq!(stream.holding(89).unwrap().id, 1);
-        assert_eq!(stream.holding(90).unwrap().id, 2);
-        assert_eq!(stream.holding(169).unwrap().id, 2);
+        assert_eq!(stream.holding(SRoff::new(0)).unwrap().id, 1);
+        assert_eq!(stream.holding(SRoff::new(89)).unwrap().id, 1);
+        assert_eq!(stream.holding(SRoff::new(90)).unwrap().id, 2);
+        assert_eq!(stream.holding(SRoff::new(169)).unwrap().id, 2);
         // In the extent still open, so the SN has to be asked.
-        assert!(stream.holding(170).is_none());
-        assert!(stream.holding(5000).is_none());
+        assert!(stream.holding(SRoff::new(170)).is_none());
+        assert!(stream.holding(SRoff::new(5000)).is_none());
     }
 
     /// An FE that never wrote an extent can still learn where its records are, because
@@ -1938,18 +1984,18 @@ mod tests {
     #[test]
     fn a_read_teaches_an_fe_that_never_wrote() {
         let mut stream = Stream::default();
-        assert!(stream.holding(5).is_none(), "nothing known yet");
+        assert!(stream.holding(SRoff::new(5)).is_none(), "nothing known yet");
 
         // What a locate answers for a sealed extent: 90 records from 0.
         let mut sealed = extent(1, 0);
         sealed.records = 90;
         stream.remember(sealed);
-        assert_eq!(stream.holding(5).unwrap().id, 1);
-        assert_eq!(stream.holding(89).unwrap().id, 1);
-        assert!(stream.holding(90).is_none());
+        assert_eq!(stream.holding(SRoff::new(5)).unwrap().id, 1);
+        assert_eq!(stream.holding(SRoff::new(89)).unwrap().id, 1);
+        assert!(stream.holding(SRoff::new(90)).is_none());
 
         // Learning it twice keeps one copy, since appends and reads both teach it.
-        stream.remember(stream.holding(5).unwrap());
+        stream.remember(stream.holding(SRoff::new(5)).unwrap());
         assert_eq!(stream.sealed.len(), 1);
 
         // And the extent still open says zero records, which is not rememberable.

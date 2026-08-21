@@ -19,6 +19,7 @@ pub mod seal;
 pub mod server;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+pub mod time;
 pub mod wire;
 
 #[derive(Debug)]

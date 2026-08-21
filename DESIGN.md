@@ -86,7 +86,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-155 things *not* decided, numbered to 156 with one tombstone.
+156 things *not* decided, numbered to 157 with one tombstone.
 
 **Priorities and framing**
 
@@ -14020,6 +14020,13 @@ Roughly in order of how much else depends on them.
      `batch-object-info` grew (§17.23) would fix it — asked, made, and an index — but a create's
      natural unit is the name rather than the entry, so it is not the same header.
 
+157. **Whether byte offsets need per-space types** (§17.32.2). `LOff`/`COff` are the extent-local
+     pair already; `OLOff`/`SLOff` and their compressed twins are not built, because what lives
+     above the extent today is *lengths* rather than positions, and a length has no origin to
+     convert from. ⚠️ The trigger is §9.1.3.4's `Start::Logical`: an object-local byte position
+     whose conversion to an extent-local one is §17.16.2's shape exactly, and which the EN refuses
+     today for want of a prefix sum. If that is built, build the types with it.
+
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
@@ -17036,3 +17043,78 @@ that debt, so `any_of` is gone and `pick` refuses a DN with nothing to route aro
 > **Three call sites, converted over one day, in the wrong order** — the generic helper was made safe
 > *before* the last caller was fixed, so the hatch existed for one commit. Doing it the other way
 > round would have needed no hatch, and there would have been nothing to remember to remove.
+
+## 17.32 Three record spaces, and a moment that is not a count
+
+**Bob, 2026-08-20**, extending §8.1.6's `LOff`/`COff` trick: *"there are actually two [record
+offsets], one within an object and one within an extent"*, then — *"I suppose you could have ORoff
+SRoff and ERoff for object, stream, and [extent] records … probably a good idea, since ORoff and
+SRoff are exceptionally easy to confuse."* Plus `TimeSec` for every timestamp in seconds.
+
+| Type | Width | Why |
+|---|---|---|
+| `ORoff` | `u64` | a record's place in an **object** |
+| `SRoff` | `u64` | in a **stream** |
+| `ERoff` | `u32` | in an **extent**, which seals at 32 MB, so even one-byte records do not reach 4.3 × 10^9 |
+
+**Object-local and stream-local are the pair that needed this**, and they are the two that share a
+width — so before the types, nothing but attention separated them. §17.16.2 is what that cost: 139
+of 200 reads returning the wrong record, invisible until the first seal because all three origins
+are zero while an object fits one extent.
+
+### 17.32.1 ⚠️ One helper was doing two conversions
+
+**The types found something on the first build.** `FE::within` was called twice:
+
+```
+within(record, located.first_record)   // object-local → stream-local
+within(in_stream, open.first_record)   // stream-local → extent-local
+```
+
+**The arithmetic is identical and the meaning is not**, and which conversion you were reading came
+only from the caller. That is §17.16.2's bug written as a helper, sitting in the code the whole
+time. It is two functions now — `in_stream` and `in_extent` — and they no longer typecheck in each
+other's place.
+
+**And `in_extent` narrows**, 64-bit to 32-bit, which is the space change made visible: a difference
+that does not fit is a record that is not in this extent.
+
+### 17.32.2 What the byte spaces would cost, and why not yet
+
+**Bob asked whether to extend it** (2026-08-20): *"we could do OLOff, SLOff, ELOff, OCOff, SCOff,
+ECOff, don't know if that is worthwhile."*
+
+⚠️ **Two of the six already exist**: `LOff` and `COff` *are* `ELOff` and `ECOff` under names that
+predate the scheme. The other four are the question, and the answer is **not yet**, on Bob's own
+rule from §8.1.6.1 — *"Rust seems to make these compiler-sensitive aliased types more expensive
+than C++, so use the technique only when there's a clear benefit."*
+
+**The discriminator is whether a conversion exists**, because a conversion is what goes wrong:
+
+| | Record spaces | Byte spaces above the extent |
+|---|---|---|
+| what lives there | **positions**, converted on every read and append | **lengths** — `Totals`, `Covered` — which are sums, and a sum has no origin to convert from |
+| conversion sites | three, on the hot path | none built |
+| history | §17.16.2, and §17.32.1 found another | none |
+
+> **A length cannot be converted wrongly between spaces, because it does not name a place in one.**
+> That is the whole reason the record types earn their keep and these do not, yet.
+
+**What would change it**: §9.1.3.4's `Start::Logical` is a genuine *object-local byte position*, and
+serving it means finding the extent holding it — exactly §17.16.2's shape. The EN refuses it today
+(*"starting from a logical offset needs a prefix sum nothing keeps yet"*). **When that lands,
+`OLOff` becomes worth having**, and `SLOff` with it (§16.157).
+
+### 17.32.3 `TimeSec`, and one clock
+
+Every timestamp in the store is whole seconds — an extent's creation second selects its key
+(§7.3.3), a stream's says when a user made it, a hint's expiry is §10.1's window — and all of them
+were `u64`, indistinguishable from the record counts and byte lengths they sit beside.
+
+**It also removed a duplicate.** `fn now()` existed identically in the DN and the SN; it is
+`TimeSec::now()` once, *"so that three tiers do not each keep their own copy of the same four
+lines — which is how a unit would have come to differ between them."*
+
+**And it absorbed a check that was inline.** §7.3.3 needs a creation second never to go backwards,
+because the second selects the key; that is `TimeSec::not_before`, so the rule and its message live
+where the type does rather than in the one caller that happened to need it first.

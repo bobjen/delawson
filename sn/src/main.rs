@@ -15,15 +15,15 @@
 
 use common::config::{SNConfig, ServiceKind};
 use common::info::{ExtentRow, ExtentRun, Listing, Totals, UNKNOWN};
-use common::offset::{COff, LOff};
+use common::offset::{COff, ERoff, LOff, SRoff};
 use common::range::Filled;
 use common::server::{self, Process, Reply, Service};
+use common::time::TimeSec;
 use common::wire::{Arg, Op, Request, Response, Status};
 use common::{Error, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const SERVES: &[Op] =
     &[Op::CreateStream, Op::OpenExtent, Op::LocateRecord, Op::SealExtent, Op::ListExtents];
@@ -33,10 +33,10 @@ const SERVES: &[Op] =
 const SHARDS: usize = 64;
 
 struct Stream {
-    /// Seconds since the epoch. Nothing reads it yet; whether a stream needs a
-    /// creation timestamp of its own at all is an open question.
+    /// When it was made. Nothing reads it yet; whether a stream needs a creation
+    /// timestamp of its own at all is an open question.
     #[allow(dead_code)]
-    created: u64,
+    created: TimeSec,
     /// The SN that created this stream's extents, which is part of their name
     /// (§4.6.3) and what §7.3.3 requires key derivation to use — **the creating SN,
     /// never the serving one**, because a reassigned stream keeps its old extents'
@@ -56,8 +56,9 @@ struct Stream {
     /// The extent appends are landing in, once anything has asked for one.
     open: Option<Extent>,
     /// Records in the sealed extents, which is where the open extent's numbering
-    /// starts from.
-    sealed_records: u64,
+    /// starts from. **Stream-local**, which is the space above the extent's and below
+    /// the object's — see `offset` for why all three are separate types.
+    sealed_records: SRoff,
     /// Sealed: no more appends and no more concatenates, so the object this belongs
     /// to needs another stream for anything further.
     ///
@@ -78,10 +79,10 @@ impl Stream {
     /// 128 MB against 32 MB extents), so nothing here got slower. A stream with millions
     /// of extents would want a sparse checkpoint every *k* extents, which is one `u64`
     /// per *k* rather than per extent (#107).
-    fn sealed_from(&self) -> impl Iterator<Item = (u64, &Sealed)> {
-        self.sealed.iter().scan(0u64, |at, sealed| {
+    fn sealed_from(&self) -> impl Iterator<Item = (SRoff, &Sealed)> {
+        self.sealed.iter().scan(SRoff::ZERO, |at, sealed| {
             let first = *at;
-            *at += sealed.records();
+            *at = SRoff::new(at.number() + sealed.records().number());
             Some((first, sealed))
         })
     }
@@ -104,14 +105,17 @@ struct Sealed {
 }
 
 impl Sealed {
-    fn records(&self) -> u64 {
-        self.extent.records as u64
+    /// ⚠️ **A count of records in an extent, widened into the stream's space** — which is
+    /// a conversion and not a cast, since the two spaces are only equal for a stream of one
+    /// extent. Written once, here, so the callers that sum it cannot get it wrong.
+    fn records(&self) -> SRoff {
+        SRoff::new(self.extent.records.number())
     }
 
     /// Whether a stream-local record number falls in this extent, given where the
     /// extent starts — which the *stream* knows and the extent does not.
-    fn holds(&self, first: u64, record: u64) -> bool {
-        record >= first && record < first + self.records()
+    fn holds(&self, first: SRoff, record: SRoff) -> bool {
+        record >= first && record.number() < first.number() + self.records().number()
     }
 }
 
@@ -129,11 +133,12 @@ struct Extent {
     /// SN makes in one second — which 4.3 × 10^9 is not close to (§17.29.2).
     id: u32,
     /// Records it holds, and **zero until it is sealed**, because until then the count
-    /// grows with every append. `u32`: an extent seals at 32 MB compressed, so even
-    /// one-byte records do not reach 4.3 × 10^9.
-    records: u32,
-    /// The second it was made in, which selects its key.
-    created: u64,
+    /// grows with every append. `ERoff`, so it cannot be handed to anything counting a
+    /// stream's or an object's records — and 32-bit because an extent seals at 32 MB
+    /// compressed, so even one-byte records do not reach 4.3 × 10^9.
+    records: ERoff,
+    /// The second it was made in, which selects its key (§7.3.3).
+    created: TimeSec,
     /// The **disks** holding its instances, primary first, which is the order an FE needs
     /// them in.
     ///
@@ -155,7 +160,7 @@ struct Extent {
 #[derive(Clone, Debug)]
 struct Placed {
     extent: Extent,
-    first: u64,
+    first: SRoff,
 }
 
 impl Extent {
@@ -164,12 +169,12 @@ impl Extent {
     ///
     /// ⚠️ **The caller supplies `first`**, because the extent does not know it. That is
     /// the whole of §17.29.1 in one signature: position is the stream's to say.
-    fn args(&self, first: u64) -> Vec<Arg> {
+    fn args(&self, first: SRoff) -> Vec<Arg> {
         let mut args = vec![
             Arg::Number(self.id as u64),
-            Arg::Number(self.created),
-            Arg::Number(first),
-            Arg::Number(self.records as u64),
+            Arg::Number(self.created.number()),
+            Arg::Number(first.number()),
+            Arg::Number(self.records.number()),
         ];
         args.extend(self.disks.iter().map(|disk| Arg::Number(*disk as u64)));
         args
@@ -214,11 +219,11 @@ impl Naming {
     /// already used is refused rather than quietly moved forward: the second is
     /// what selects the key, so reaching back for an earlier one asks for a key
     /// that may since have been retired.
-    fn name(&self, second: u64) -> Result<(u32, u64)> {
-        let latest = self.latest.fetch_max(second, Ordering::Relaxed);
-        if second < latest {
-            return Err(Error::new(format!("the clock went back to {second} from {latest}")));
-        }
+    fn name(&self, second: TimeSec) -> Result<(u32, TimeSec)> {
+        // The atomic holds seconds; the check that they only move forward is `TimeSec`'s,
+        // so the message is the same wherever a creation second is taken (§17.32).
+        let latest = TimeSec::new(self.latest.fetch_max(second.number(), Ordering::Relaxed));
+        let second = second.not_before(latest)?;
         Ok((self.next.fetch_add(1, Ordering::Relaxed) as u32, second))
     }
 
@@ -258,10 +263,6 @@ fn shard_of(dn: u32, stream: u64) -> usize {
     // Stream ids from one DN are consecutive, so mixing the low bits spreads a
     // batch of them across every shard rather than filling one.
     (stream.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (dn as u64)) as usize % SHARDS
-}
-
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 impl Service for SN {
@@ -324,7 +325,7 @@ impl SN {
     fn create(&self, request: &Request) -> Response {
         let (dn, first, count, created) = match request.args.as_slice() {
             [Arg::Number(dn), Arg::Number(first), Arg::Number(count), Arg::Number(created)] => {
-                (*dn as u32, *first, *count, *created)
+                (*dn as u32, *first, *count, TimeSec::new(*created))
             }
             _ => {
                 return Response::error(
@@ -344,7 +345,7 @@ impl SN {
                     creator: self.mine,
                     sealed: Vec::new(),
                     open: None,
-                    sealed_records: 0,
+                    sealed_records: SRoff::ZERO,
                     sealed_stream: false,
                 },
             );
@@ -367,7 +368,7 @@ impl SN {
         };
         let ens: Vec<u32> =
             process.cluster.services_of_kind(ServiceKind::En).map(|en| en.number()).collect();
-        match self.open(dn, stream, now(), &ens, process.cluster.extents.instances) {
+        match self.open(dn, stream, TimeSec::now(), &ens, process.cluster.extents.instances) {
             Ok(placed) => {
                 Response { id: 0, status: Status::Ok, args: placed.extent.args(placed.first) }
             }
@@ -385,7 +386,7 @@ impl SN {
     fn locate(&self, request: &Request) -> Response {
         let (dn, stream, record) = match request.args.as_slice() {
             [Arg::Number(dn), Arg::Number(stream), Arg::Number(record), ..] => {
-                (*dn as u32, *stream, *record)
+                (*dn as u32, *stream, SRoff::new(*record))
             }
             _ => {
                 return Response::error(
@@ -464,7 +465,7 @@ impl SN {
         let first = if from == 0 {
             0
         } else {
-            held.sealed_from().filter(|(at, _)| *at <= from).count().saturating_sub(1)
+            held.sealed_from().filter(|(at, _)| at.number() <= from).count().saturating_sub(1)
         };
         let total = held.sealed.len() as u64 + u64::from(held.open.is_some());
 
@@ -476,8 +477,8 @@ impl SN {
                 sn: held.creator,
                 id: sealed.extent.id as u64,
                 created: sealed.extent.created,
-                first_record: at,
-                records: sealed.records(),
+                first_record: at.number(),
+                records: sealed.records().number(),
                 logical: sealed.logical.number(),
                 length: sealed.compressed.number(),
                 disks: sealed.extent.disks.clone(),
@@ -496,7 +497,7 @@ impl SN {
                 sn: held.creator,
                 id: open.id as u64,
                 created: open.created,
-                first_record: held.sealed_records,
+                first_record: held.sealed_records.number(),
                 records: UNKNOWN,
                 logical: UNKNOWN,
                 length: UNKNOWN,
@@ -507,9 +508,9 @@ impl SN {
         // Where to carry on: the first record of the next extent not described.
         let after = first + rows.len();
         let next = match held.sealed.get(after) {
-            Some(_) => held.sealed_from().nth(after).map_or(UNKNOWN, |(at, _)| at),
+            Some(_) => held.sealed_from().nth(after).map_or(UNKNOWN, |(at, _)| at.number()),
             None if after < total as usize => {
-                held.open.as_ref().map_or(UNKNOWN, |_| held.sealed_records)
+                held.open.as_ref().map_or(UNKNOWN, |_| held.sealed_records.number())
             }
             None => UNKNOWN,
         };
@@ -559,7 +560,7 @@ impl SN {
             stream,
             id,
             came_to,
-            now(),
+            TimeSec::now(),
             &ens,
             process.cluster.extents.instances,
             process.cluster.extents.per_stream,
@@ -586,7 +587,7 @@ impl SN {
         stream: u64,
         id: u64,
         came_to: Filled,
-        second: u64,
+        second: TimeSec,
         ens: &[u32],
         instances: usize,
         per_stream: usize,
@@ -601,8 +602,8 @@ impl SN {
             let extent = held.open.take().expect("an open extent");
             // ⚠️ Accumulated rather than computed from a stored base, which is the same
             // change one level down: the running total is the stream's (§17.29.1).
-            held.sealed_records += came_to.records;
-            let extent = Extent { records: came_to.records as u32, ..extent };
+            held.sealed_records = SRoff::new(held.sealed_records.number() + came_to.records);
+            let extent = Extent { records: ERoff::of_number(came_to.records)?, ..extent };
             held.sealed.push(Sealed {
                 extent,
                 logical: came_to.logical,
@@ -615,7 +616,7 @@ impl SN {
             }
         }
         if held.sealed_stream {
-            return Err(Full::records(held.sealed_records));
+            return Err(Full::records(held.sealed_records.number()));
         }
         self.appendable(held, second, ens, instances).map_err(Full::from)
     }
@@ -625,7 +626,7 @@ impl SN {
         &self,
         dn: u32,
         stream: u64,
-        second: u64,
+        second: TimeSec,
         ens: &[u32],
         instances: usize,
     ) -> std::result::Result<Placed, Full> {
@@ -634,7 +635,7 @@ impl SN {
             return Err(Full::from(Error::new(format!("no stream {stream} from dn {dn}"))));
         };
         if held.sealed_stream {
-            return Err(Full::records(held.sealed_records));
+            return Err(Full::records(held.sealed_records.number()));
         }
         self.appendable(held, second, ens, instances).map_err(Full::from)
     }
@@ -654,7 +655,7 @@ impl SN {
     fn appendable(
         &self,
         held: &mut Stream,
-        second: u64,
+        second: TimeSec,
         ens: &[u32],
         instances: usize,
     ) -> Result<Placed> {
@@ -665,7 +666,8 @@ impl SN {
             return Ok(Placed { extent: extent.clone(), first });
         }
         let (id, created) = self.naming.name(second)?;
-        let extent = Extent { id, created, records: 0, disks: self.naming.disks(ens, instances)? };
+        let extent =
+            Extent { id, created, records: ERoff::ZERO, disks: self.naming.disks(ens, instances)? };
         held.open = Some(extent.clone());
         self.extents.fetch_add(1, Ordering::Relaxed);
         Ok(Placed { extent, first })
@@ -757,8 +759,8 @@ mod tests {
         let sn = sn_with_stream(0, 7);
         let ens = [0, 1, 2, 3];
         let want = testing::extents().instances;
-        let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
-        let again = sn.open(0, 7, 1_000_001, &ens, want).unwrap();
+        let first = sn.open(0, 7, TimeSec::new(1_000_000), &ens, want).unwrap();
+        let again = sn.open(0, 7, TimeSec::new(1_000_001), &ens, want).unwrap();
         assert_eq!(first.extent.id, again.extent.id, "the second ask should find the open extent");
         assert_eq!(first.extent.created, again.extent.created);
         assert_eq!(sn.extents.load(Ordering::Relaxed), 1);
@@ -767,7 +769,7 @@ mod tests {
     #[test]
     fn an_extent_on_a_stream_that_does_not_exist_is_refused() {
         let sn = SN::new(testing::sn_config(), 0);
-        assert!(sn.open(0, 7, 1_000_000, &[0, 1, 2, 3], 4).is_err());
+        assert!(sn.open(0, 7, TimeSec::new(1_000_000), &[0, 1, 2, 3], 4).is_err());
     }
 
     /// Sealing records what the extent came to and names the next one, whose
@@ -780,35 +782,53 @@ mod tests {
         // ⚠️ Asserted on the *stream*, because an extent no longer carries where it starts
         // (§17.29.1) — which is the point: the running total is the stream's, and testing it
         // there tests the thing that is actually maintained.
-        let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
-        assert_eq!(sn.starts_at(0, 7), 0);
+        let first = sn.open(0, 7, TimeSec::new(1_000_000), &ens, want).unwrap();
+        assert_eq!(sn.starts_at(0, 7), SRoff::new(0));
 
         // Twelve records in it, and 400 bytes.
         let second = sn
-            .close(0, 7, first.extent.id as u64, came(12, 400), 1_000_001, &ens, want, ROOMY)
+            .close(
+                0,
+                7,
+                first.extent.id as u64,
+                came(12, 400),
+                TimeSec::new(1_000_001),
+                &ens,
+                want,
+                ROOMY,
+            )
             .unwrap();
         assert_ne!(second.extent.id, first.extent.id, "a fresh extent");
-        assert_eq!(sn.starts_at(0, 7), 12, "numbering carries on");
+        assert_eq!(sn.starts_at(0, 7), SRoff::new(12), "numbering carries on");
 
         let third = sn
-            .close(0, 7, second.extent.id as u64, came(5, 90), 1_000_002, &ens, want, ROOMY)
+            .close(
+                0,
+                7,
+                second.extent.id as u64,
+                came(5, 90),
+                TimeSec::new(1_000_002),
+                &ens,
+                want,
+                ROOMY,
+            )
             .unwrap();
-        assert_eq!(sn.starts_at(0, 7), 17);
-        assert_eq!(third.extent.records, 0, "and the fresh one holds nothing yet");
+        assert_eq!(sn.starts_at(0, 7), SRoff::new(17));
+        assert_eq!(third.extent.records, ERoff::ZERO, "and the fresh one holds nothing yet");
         assert_eq!(sn.sealed.load(Ordering::Relaxed), 2);
 
         // And the positions the stream hands out are the running sum of what came before.
-        assert_eq!(sn.firsts(0, 7), vec![0, 12], "one per sealed extent");
+        assert_eq!(sn.firsts(0, 7), vec![SRoff::ZERO, SRoff::new(12)], "one per sealed extent");
     }
 
     /// Where the open extent starts, for a test.
     impl SN {
-        fn starts_at(&self, dn: u32, stream: u64) -> u64 {
+        fn starts_at(&self, dn: u32, stream: u64) -> SRoff {
             self.shards[shard_of(dn, stream)].lock().unwrap()[&(dn, stream)].sealed_records
         }
 
         /// The stream-local first record of every sealed extent, recomputed by summing.
-        fn firsts(&self, dn: u32, stream: u64) -> Vec<u64> {
+        fn firsts(&self, dn: u32, stream: u64) -> Vec<SRoff> {
             self.shards[shard_of(dn, stream)].lock().unwrap()[&(dn, stream)]
                 .sealed_from()
                 .map(|(at, _)| at)
@@ -826,14 +846,23 @@ mod tests {
         let sn = sn_with_stream(0, 7);
         let ens = [0, 1, 2, 3];
         let want = testing::extents().instances;
-        let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
-        assert_eq!(first.first, 0, "the first extent starts the stream");
+        let first = sn.open(0, 7, TimeSec::new(1_000_000), &ens, want).unwrap();
+        assert_eq!(first.first, SRoff::ZERO, "the first extent starts the stream");
 
         // Seal it with twelve records, so the next one does not start at zero.
-        sn.close(0, 7, first.extent.id as u64, came(12, 400), 1_000_001, &ens, want, ROOMY)
-            .unwrap();
-        let next = sn.open(0, 7, 1_000_002, &ens, want).unwrap();
-        assert_eq!(next.first, 12, "and the next carries on from what came before");
+        sn.close(
+            0,
+            7,
+            first.extent.id as u64,
+            came(12, 400),
+            TimeSec::new(1_000_001),
+            &ens,
+            want,
+            ROOMY,
+        )
+        .unwrap();
+        let next = sn.open(0, 7, TimeSec::new(1_000_002), &ens, want).unwrap();
+        assert_eq!(next.first, SRoff::new(12), "and the next carries on from what came before");
 
         // And the answer on the wire says so, which is the argument that was wrong: third
         // field is the first record, fourth is the count.
@@ -852,21 +881,42 @@ mod tests {
         let sn = sn_with_stream(0, 7);
         let ens = [0, 1, 2, 3];
         let want = testing::extents().instances;
-        let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
+        let first = sn.open(0, 7, TimeSec::new(1_000_000), &ens, want).unwrap();
         let second = sn
-            .close(0, 7, first.extent.id as u64, came(4, 100), 1_000_001, &ens, want, ROOMY)
+            .close(
+                0,
+                7,
+                first.extent.id as u64,
+                came(4, 100),
+                TimeSec::new(1_000_001),
+                &ens,
+                want,
+                ROOMY,
+            )
             .unwrap();
         // A request that saw the seal a moment later, naming the extent that is now
         // sealed, and one naming an extent this stream never had.
         assert_eq!(
-            sn.close(0, 7, first.extent.id as u64, came(4, 100), 1_000_002, &ens, want, ROOMY)
-                .unwrap()
-                .extent
-                .id,
+            sn.close(
+                0,
+                7,
+                first.extent.id as u64,
+                came(4, 100),
+                TimeSec::new(1_000_002),
+                &ens,
+                want,
+                ROOMY
+            )
+            .unwrap()
+            .extent
+            .id,
             second.extent.id
         );
         assert_eq!(
-            sn.close(0, 7, 999, came(0, 0), 1_000_003, &ens, want, ROOMY).unwrap().extent.id,
+            sn.close(0, 7, 999, came(0, 0), TimeSec::new(1_000_003), &ens, want, ROOMY)
+                .unwrap()
+                .extent
+                .id,
             second.extent.id
         );
         assert_eq!(sn.sealed.load(Ordering::Relaxed), 1, "sealed once");
@@ -880,12 +930,30 @@ mod tests {
         let sn = sn_with_stream(0, 7);
         let ens = [0, 1, 2, 3];
         let want = testing::extents().instances;
-        let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
+        let first = sn.open(0, 7, TimeSec::new(1_000_000), &ens, want).unwrap();
         let second = sn
-            .close(0, 7, first.extent.id as u64, came(4, 100), 1_000_001, &ens, want, ROOMY)
+            .close(
+                0,
+                7,
+                first.extent.id as u64,
+                came(4, 100),
+                TimeSec::new(1_000_001),
+                &ens,
+                want,
+                ROOMY,
+            )
             .unwrap();
         let repeat = sn
-            .close(0, 7, first.extent.id as u64, came(4, 100), 1_000_002, &ens, want, ROOMY)
+            .close(
+                0,
+                7,
+                first.extent.id as u64,
+                came(4, 100),
+                TimeSec::new(1_000_002),
+                &ens,
+                want,
+                ROOMY,
+            )
             .unwrap();
         assert_eq!(repeat.extent.id, second.extent.id, "the extent that is open now");
         assert_eq!(sn.sealed.load(Ordering::Relaxed), 1, "sealed once");
@@ -900,21 +968,39 @@ mod tests {
         let want = testing::extents().instances;
         // Room for two extents, so the second seal fills the stream.
         let two = 2;
-        let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
+        let first = sn.open(0, 7, TimeSec::new(1_000_000), &ens, want).unwrap();
         let second = sn
-            .close(0, 7, first.extent.id as u64, came(10, 100), 1_000_001, &ens, want, two)
+            .close(
+                0,
+                7,
+                first.extent.id as u64,
+                came(10, 100),
+                TimeSec::new(1_000_001),
+                &ens,
+                want,
+                two,
+            )
             .unwrap();
-        assert_eq!(sn.starts_at(0, 7), 10);
+        assert_eq!(sn.starts_at(0, 7), SRoff::new(10));
 
         let full = sn
-            .close(0, 7, second.extent.id as u64, came(7, 70), 1_000_002, &ens, want, two)
+            .close(
+                0,
+                7,
+                second.extent.id as u64,
+                came(7, 70),
+                TimeSec::new(1_000_002),
+                &ens,
+                want,
+                two,
+            )
             .expect_err("the stream should be full");
         assert!(full.why.is_none(), "full is not a failure");
         assert_eq!(full.records, 17, "what the whole stream came to");
         assert_eq!(sn.sealed_streams.load(Ordering::Relaxed), 1);
 
         // And it stays sealed: nothing opens another extent on it.
-        let again = sn.open(0, 7, 1_000_003, &ens, want).expect_err("sealed");
+        let again = sn.open(0, 7, TimeSec::new(1_000_003), &ens, want).expect_err("sealed");
         assert_eq!(again.records, 17);
         assert!(again.why.is_none());
     }
@@ -926,12 +1012,30 @@ mod tests {
         let sn = sn_with_stream(0, 7);
         let ens = [0, 1, 2, 3];
         let want = testing::extents().instances;
-        let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
+        let first = sn.open(0, 7, TimeSec::new(1_000_000), &ens, want).unwrap();
         let second = sn
-            .close(0, 7, first.extent.id as u64, came(3, 60), 1_000_001, &ens, want, ROOMY)
+            .close(
+                0,
+                7,
+                first.extent.id as u64,
+                came(3, 60),
+                TimeSec::new(1_000_001),
+                &ens,
+                want,
+                ROOMY,
+            )
             .unwrap();
         let third = sn
-            .close(0, 7, second.extent.id as u64, came(2, 40), 1_000_002, &ens, want, ROOMY)
+            .close(
+                0,
+                7,
+                second.extent.id as u64,
+                came(2, 40),
+                TimeSec::new(1_000_002),
+                &ens,
+                want,
+                ROOMY,
+            )
             .unwrap();
 
         let holds = |record: u64| {
@@ -966,18 +1070,18 @@ mod tests {
     #[test]
     fn a_second_may_not_go_backwards() {
         let naming = Naming::new();
-        assert!(naming.name(1_000_000).is_ok());
-        assert!(naming.name(1_000_005).is_ok());
-        assert!(naming.name(999_999).is_err());
+        assert!(naming.name(TimeSec::new(1_000_000)).is_ok());
+        assert!(naming.name(TimeSec::new(1_000_005)).is_ok());
+        assert!(naming.name(TimeSec::new(999_999)).is_err());
         // And the refusal did not lose the position it had reached.
-        assert!(naming.name(1_000_005).is_ok());
+        assert!(naming.name(TimeSec::new(1_000_005)).is_ok());
     }
 
     #[test]
     fn every_extent_gets_a_name_of_its_own() {
         let naming = Naming::new();
-        let (first, _) = naming.name(1_000_000).unwrap();
-        let (second, _) = naming.name(1_000_000).unwrap();
+        let (first, _) = naming.name(TimeSec::new(1_000_000)).unwrap();
+        let (second, _) = naming.name(TimeSec::new(1_000_000)).unwrap();
         assert_ne!(first, second);
     }
 

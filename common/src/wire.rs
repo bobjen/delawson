@@ -28,6 +28,7 @@
 use crate::config::Messaging;
 use crate::random::Rng;
 use crate::seal::{self, Seal};
+use crate::time::TimeSec;
 use crate::{Context, Error, Result};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -331,7 +332,7 @@ pub struct AppendBlock {
     pub sn: u32,
     pub extent: u64,
     /// The second the extent was created in, which is part of its name.
-    pub created: u64,
+    pub created: TimeSec,
     /// What the writer says these bytes contain.
     pub holds: crate::block::Holds,
     /// Instances of the extent, primary first. Empty on the way to a secondary,
@@ -346,8 +347,10 @@ pub struct AppendBlock {
 
 impl AppendBlock {
     pub fn request(&self, op: Op) -> Request {
-        let mut request =
-            Request::new(op).number(self.sn as u64).number(self.extent).number(self.created);
+        let mut request = Request::new(op)
+            .number(self.sn as u64)
+            .number(self.extent)
+            .number(self.created.number());
         request.args.extend(self.holds.args());
         request = request.flag(self.offset.is_some()).number(self.offset.unwrap_or(0));
         for en in &self.instances {
@@ -372,7 +375,7 @@ impl AppendBlock {
         Ok(AppendBlock {
             sn: *sn as u32,
             extent: *extent,
-            created: *created,
+            created: TimeSec::new(*created),
             holds,
             instances: instances
                 .iter()
@@ -773,7 +776,7 @@ mod tests {
         let block = AppendBlock {
             sn: 3,
             extent: 17,
-            created: 1_000_000,
+            created: TimeSec::new(1_000_000),
             holds: crate::block::Holds {
                 logical: 10,
                 records: 2,

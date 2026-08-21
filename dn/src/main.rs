@@ -22,12 +22,12 @@ use common::info::{
 use common::logw;
 use common::range::{Detail, Want};
 use common::server::{self, Process, Reply, Service};
+use common::time::TimeSec;
 use common::wire::{Arg, Op, Request, Response, Status};
 use common::{Error, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const SERVES: &[Op] = &[
     Op::CreateObject,
@@ -236,7 +236,7 @@ struct Object {
     /// left holding a `Reply` that nothing will ever answer.
     waiting: Vec<Reply>,
     keyed: bool,
-    created: u64,
+    created: TimeSec,
 }
 
 /// What an `extend-object` request turned out to be: the one doing the work, one
@@ -271,7 +271,7 @@ struct Held {
     /// The second this stream was handed to the object. The DN's own, so always exact —
     /// which is what a directory listing wants and what nothing else could supply as
     /// cheaply.
-    created: u64,
+    created: TimeSec,
     /// Bytes the writer wrote and bytes stored, summed over the stream's extents.
     ///
     /// ⚠️ **Exact for a sealed stream, as-of for a growing one, `UNKNOWN` until an SN has
@@ -288,7 +288,7 @@ struct Held {
 
 impl Held {
     /// A stream just handed out: nothing has come to anything yet.
-    fn new(id: u64, sn: u32, first_record: u64, created: u64) -> Held {
+    fn new(id: u64, sn: u32, first_record: u64, created: TimeSec) -> Held {
         Held {
             id,
             first_record,
@@ -516,10 +516,6 @@ fn shard_of(name: &str) -> usize {
     hash as usize % SHARDS
 }
 
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-}
-
 impl Service for DN {
     fn serves(&self) -> &'static [Op] {
         SERVES
@@ -639,7 +635,7 @@ impl DN {
         mut reply: Reply,
         say: impl FnOnce(&DN, u64) -> Response + Send + 'static,
     ) {
-        let created = now();
+        let created = TimeSec::now();
 
         // Whoever inserts the name owns the object; anyone else finds it there.
         let mut mine = Vec::with_capacity(wanted.len());
@@ -683,7 +679,7 @@ impl DN {
             .number(process.entry.number() as u64)
             .number(first)
             .number(count)
-            .number(created);
+            .number(created.number());
 
         let dn = Arc::clone(self);
         let sn_number = process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0);
@@ -791,7 +787,7 @@ impl DN {
         first_record: u64,
         mut reply: Reply,
     ) {
-        let created = now();
+        let created = TimeSec::now();
         let stream = self.next_stream.fetch_add(1, Ordering::Relaxed);
         let sn = match process.pick(ServiceKind::Sn) {
             Ok(sn) => sn.to_string(),
@@ -802,7 +798,7 @@ impl DN {
             .number(process.entry.number() as u64)
             .number(stream)
             .number(1)
-            .number(created);
+            .number(created.number());
 
         let dn = Arc::clone(self);
         let named = sn.clone();
@@ -817,7 +813,7 @@ impl DN {
             {
                 let mut shard = dn.shards[shard_of(&name)].lock().expect("objects");
                 if let Some(object) = shard.get_mut(name.as_str()) {
-                    object.streams.push(Held::new(stream, sn_number, first_record, now()));
+                    object.streams.push(Held::new(stream, sn_number, first_record, TimeSec::now()));
                     object.extending = false;
                 }
             }
@@ -1169,7 +1165,10 @@ mod tests {
     /// A stream in a test object. `records` is `None` for the one still being appended to,
     /// which is what the sentinel means on the real thing.
     fn held(id: u64, sn: u32, first_record: u64, records: Option<u64>) -> Held {
-        Held { records: records.unwrap_or(UNKNOWN), ..Held::new(id, sn, first_record, 1_000_000) }
+        Held {
+            records: records.unwrap_or(UNKNOWN),
+            ..Held::new(id, sn, first_record, TimeSec::new(1_000_000))
+        }
     }
 
     use std::mem::size_of;
@@ -1211,7 +1210,7 @@ mod tests {
                 extending: false,
                 waiting: Vec::new(),
                 keyed: false,
-                created: 1_000_000,
+                created: TimeSec::new(1_000_000),
             },
         );
     }
@@ -1267,7 +1266,7 @@ mod tests {
                         extending: false,
                         waiting: Vec::new(),
                         keyed: false,
-                        created: 1_000_000,
+                        created: TimeSec::new(1_000_000),
                     },
                 );
                 taken.push(name);
@@ -1289,7 +1288,7 @@ mod tests {
             extending: false,
             waiting: Vec::new(),
             keyed: false,
-            created: 1_000_000,
+            created: TimeSec::new(1_000_000),
         };
         // Two sealed streams and one still open.
         object.streams.push(held(1, 0, 0, Some(10)));
@@ -1318,7 +1317,7 @@ mod tests {
             extending: false,
             waiting: Vec::new(),
             keyed: false,
-            created: 1_000_000,
+            created: TimeSec::new(1_000_000),
         };
         object.streams.push(held(1, 0, 0, Some(100)));
         object.streams.push(held(2, 1, 100, Some(50)));
@@ -1451,7 +1450,7 @@ mod tests {
                     extending: false,
                     waiting: Vec::new(),
                     keyed: false,
-                    created: 1_000_000,
+                    created: TimeSec::new(1_000_000),
                 },
             );
         }
