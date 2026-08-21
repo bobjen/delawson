@@ -17543,3 +17543,53 @@ ids it is a choice.
 its own signature that it converts between two different things (§17.29.3). It was
 `fn en_of(u32) -> u32`, which is indistinguishable from doing nothing — and doing nothing is
 precisely what it must stop doing when #108 lands.
+
+### 17.37.6 Re-measured: the typing cost 13.6% on the batch path
+
+**Asked for after the naming and typing work** (Bob, 2026-08-20), on the expectation that it *"shouldn't
+make a big difference, mostly made some memory a little smaller."* It made a difference on one path.
+
+**One session, 100,000 objects, every lookup found, spreads under 1%:**
+
+| | 1 DN before | 1 DN now | 3 DN before | 3 DN now |
+|---|---|---|---|---|
+| `--batch 100` | 3,479,408 | **3,004,638** — **−13.6%** | 2,037,511 | **1,799,034** — −11.7% |
+| `--batch 1` | 130,825 | **126,432** — −3.4% | 109,226 | **106,119** — −2.8% |
+
+**The structure is unchanged**, which is the reassuring half: the fan-out cost is 41.4% → 40.1%, the
+box-contention share 16.5% → 16.1%, and fan-out net of contention 29.9% → 28.7%. Nothing about §17.24.5's
+conclusions moves.
+
+#### 17.37.6.1 ⚠️ The batch path lost four times what the single path did, and that says where it went
+
+**13.6% against 3.4% is not a uniform slowdown**, and the asymmetry is the diagnosis: a change that cost
+*per request* would hit both alike, and a change that costs *per row* hits the path carrying a hundred
+rows four times harder than the one carrying a single row plus a round trip.
+
+**`Described` is what grew.** Eight arguments originally, ten when the stream became a whole name
+(§17.33.3), eleven when the object did (§17.35.2) — **+10% on a row** since the baseline these numbers
+are against, on a path whose cost is rows.
+
+| | why it is per-row |
+|---|---|
+| **wider rows** | 11 numbers instead of 10, encoded, sent and parsed for every object in the batch |
+| **checked parsing** | every id now goes through `of_number`, a `try_from` per field, where it was an unchecked `as u32` |
+
+> **So the price of the naming is roughly a tenth of the batch lookup path**, and it is not a
+> regression to hunt but a cost to accept or to buy back deliberately.
+
+⚠️ **And a batch answer is a poor shape to have made wider**, because §9.1.3.7's whole argument is that
+what has to be bounded is the answer's *size*. A row that grew 10% is 10% fewer entries inside the same
+byte target, which §16.132 already flags — the limit is counted in entries and the thing that matters is
+bytes.
+
+#### 17.37.6.2 ⚠️ The first attempt at this measured a one-DN cluster twice
+
+**The three-DN arm was one DN**, and the two arms agreeing to within 1% is what gave it away — a fan-out
+that had cost 41% the week before cannot cost nothing. The config edit had silently matched nothing: a
+comment block sits between `kind = "dn"` and `count`, so a scripted replace keyed on the two being
+adjacent found no match and changed no bytes.
+
+> **A configuration change that fails is indistinguishable from one that succeeded and did not matter.**
+> The check that caught it is cheap and belongs in the routine: `laws registry | grep -c DN`, and each
+> DN's object count, *before* believing a number that depends on how many there are.
