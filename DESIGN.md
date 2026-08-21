@@ -16205,6 +16205,10 @@ answer rather than a partial one.
 
 #### 17.24.5 ⚠️ Hash routing makes a batch cost D messages, which is the whole cost
 
+⚠️ **The table below is not to be trusted — see §17.30.3.** It was measured on a cluster where
+`bench-create` scattered objects round-robin while `bench-info` looked them up by owner, so most
+lookups missed. The reasoning that follows it is arithmetic and stands; the numbers must be retaken.
+
 **Measured in one session, so §17.19.2's ±25% does not apply:**
 
 | | `--batch 100` | `--batch 1` |
@@ -16878,3 +16882,57 @@ can pass by accident, because it comes back from the thing that knows it.
 > position, exchanged silently — which is the case #86's `ORoff`/`SRoff`/`ERoff` exist to make
 > impossible, and this one is not covered even by those, since a count and an offset in the *same*
 > space share a type (§8.1.6.2).
+
+## 17.30 One name, two routers: how appends were silently lost
+
+⚠️ **Five appends to one object produced two records, and every one of them reported success**
+(#106). Found by running the thing, not by any test.
+
+```
+laws create /h --flavor unkeyed
+for i in 1 2 3 4 5; do laws append /h --data "seq $i"; done
+  → record 0, record 0, record 0, record 1, record 1
+laws read /h --record 0  → seq 3
+laws read /h --record 2  → not found
+```
+
+### 17.30.1 The cause: half the routing was converted
+
+§17.24.0 replaced round-robin DN selection with `Process::owner`, because *"a create lands on one
+machine and the lookup that follows it asks another"*. It converted `FE::handle`'s forwarding path
+through a new `destination`, and **missed `FE::resolving`** — the path every *coordinated*
+operation takes, which is to say every append and every read.
+
+**So the object had two routers.** `object-info` went to the name's owner; `append` went to
+whichever DN came up next. With three DNs:
+
+| | |
+|---|---|
+| each DN made **its own object** under that name, with its own stream numbered 1 | so the SN held three stream keys, one per DN |
+| each append was the first into *its* DN's stream | which is why the record numbers read **0, 0, 0, 1, 1** — three DNs each answering 0, then two answering 1 |
+| the read went to the name's owner | and found only the third of the appends that had gone there |
+
+**The pattern in the numbers was the whole diagnosis**: three zeros then two ones, over three DNs,
+is one append per DN per round.
+
+### 17.30.2 ⚠️ It was introduced by the fix for the same bug
+
+§17.24.0 exists *because* round-robin loses objects. The commit that said so converted one call site
+and left the other, **and turned the test cluster to three DNs in the same change** — so it created
+the conditions for the bug it was fixing, in the act of fixing it.
+
+> **What would have caught it is a test that appends *n* records and reads back *n*.** Every append
+> test runs one process against one tier; nothing exercised FE → DN → SN → EN with more than one DN
+> until a human typed five commands.
+
+### 17.30.3 ⚠️ And it invalidates §17.24.5's measurement
+
+§17.24.5 reports a batch lookup as **46% slower over three DNs than one** and reasons from it that
+hash routing multiplies messages. **That number was taken on this cluster**, where `bench-create`
+still scatters objects round-robin (#98 — `batch-create` is the *third* call site, still unconverted)
+while `bench-info` looks them up by owner. Most lookups were missing, so the figure measures a
+cluster that was not finding its own data.
+
+**The analysis survives and the number does not.** A batch whose names span *D* DNs really does
+become *D* requests, and `D(1 − (1 − 1/D)^n)` is arithmetic rather than measurement. The 46% and the
+4,296,330/s must be retaken once #98 lands.

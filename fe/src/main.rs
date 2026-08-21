@@ -309,7 +309,11 @@ impl FE {
         reply: Reply,
         then: impl FnOnce(&Arc<FE>, &Arc<Process>, Located, Reply) + Send + 'static,
     ) {
-        let dn = match process.pick(ServiceKind::Dn) {
+        // ⚠️ **By name, not in turn** (`A-NAME-HAS-ONE-OWNER`). This was `pick` until #106:
+        // every append to one object resolved through a different DN, so each DN made its
+        // own object under that name with its own stream, and the SN saw one stream key per
+        // DN. Appends reported success and landed in three unrelated streams (§17.30).
+        let dn = match process.owner(ServiceKind::Dn, path) {
             Ok(dn) => dn.to_string(),
             Err(e) => return reply.send(Response::error(Status::Internal, e.to_string())),
         };
