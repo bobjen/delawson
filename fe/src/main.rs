@@ -23,7 +23,7 @@ use common::Result;
 use common::block::Holds;
 use common::config::{FEConfig, ServiceKind};
 use common::framing::Framing;
-use common::info::{Batch, Described, Shape, StreamName, UNKNOWN, Wanted};
+use common::info::{Batch, Described, Expecting, Shape, StreamName, UNKNOWN, Wanted};
 use common::logw;
 use common::offset::{ERoff, ORoff, SRoff};
 use common::placement;
@@ -279,11 +279,12 @@ impl FE {
         self: &Arc<Self>,
         process: &Arc<Process>,
         path: &str,
+        expect: Expecting,
         make: Option<Framing>,
         reply: Reply,
         then: impl FnOnce(&Arc<FE>, &Arc<Process>, Located, Reply) + Send + 'static,
     ) {
-        self.resolving(process, path, None, make, true, reply, then)
+        self.resolving(process, path, None, expect, make, true, reply, then)
     }
 
     /// The stream holding a record, rather than the one being appended to. Same
@@ -294,10 +295,11 @@ impl FE {
         process: &Arc<Process>,
         path: &str,
         record: u64,
+        expect: Expecting,
         reply: Reply,
         then: impl FnOnce(&Arc<FE>, &Arc<Process>, Located, Reply) + Send + 'static,
     ) {
-        self.resolving(process, path, Some(record), None, false, reply, then)
+        self.resolving(process, path, Some(record), expect, None, false, reply, then)
     }
 
     /// `again` is the one retry a lost race gets: two appends to a name that does not
@@ -311,6 +313,7 @@ impl FE {
         process: &Arc<Process>,
         path: &str,
         record: Option<u64>,
+        expect: Expecting,
         make: Option<Framing>,
         again: bool,
         reply: Reply,
@@ -331,10 +334,16 @@ impl FE {
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
         let path = path.to_string();
-        let ask = match record {
+        // ⚠️ The expectation goes to the **DN**, because the DN owns the path table and is the
+        // only tier that can see the path point somewhere new (§17.36).
+        let mut ask = match record {
             None => Request::new(Op::ObjectInfo).text(&path),
             Some(record) => Request::new(Op::LocateStream).text(&path).number(record),
         };
+        // ⚠️ Only when there is an opinion, so a plain resolve is the request §17.5g measured.
+        if expect.asked() {
+            ask.args.extend(Want { expect, ..Want::plain() }.args());
+        }
         let named = dn.clone();
         let asked = process.ask(&dn, &ask, move |answer| {
             // An append may make the object it is appending to, which is one more
@@ -369,8 +378,17 @@ impl FE {
     /// An append: resolve the name — making the object if it is not there — find the
     /// extent, and hand the bytes to its primary.
     fn append(self: &Arc<Self>, process: &Arc<Process>, request: &Request, mut reply: Reply) {
-        let (path, framing, holds, body) = match request.args.as_slice() {
-            [Arg::Text(path), Arg::Number(kind), Arg::Number(width), rest @ ..] => {
+        let (path, expect, framing, holds, body) = match request.args.as_slice() {
+            // The name, what the caller expects it to be, then the framing and the block.
+            [Arg::Text(path), rest @ ..] => {
+                let Ok((expect, [Arg::Number(kind), Arg::Number(width), rest @ ..])) =
+                    Expecting::of_args(rest)
+                else {
+                    return reply.send(Response::error(
+                        Status::BadRequest,
+                        "append takes a name, what object it expects, a framing and bytes",
+                    ));
+                };
                 let framing = match Framing::of_wire(*kind, *width) {
                     Ok(framing) => framing,
                     Err(e) => {
@@ -378,7 +396,9 @@ impl FE {
                     }
                 };
                 match Holds::of_args(rest) {
-                    Ok((holds, [Arg::Bytes(body)])) => (path.clone(), framing, holds, body.clone()),
+                    Ok((holds, [Arg::Bytes(body)])) => {
+                        (path.clone(), expect, framing, holds, body.clone())
+                    }
                     _ => {
                         return reply.send(Response::error(
                             Status::BadRequest,
@@ -396,21 +416,28 @@ impl FE {
         };
         reply.about(format_args!("{path},bytes {},logical {}", body.len(), holds.logical));
         let named = path.clone();
-        self.resolve(process, &path, Some(framing), reply, move |fe, process, located, reply| {
-            // The object's own framing wins, and a writer that disagrees about it is
-            // writing records the object cannot hold.
-            if located.framing != framing {
-                return reply.send(Response::error(
-                    Status::BadRequest,
-                    format!(
-                        "that object is framed {} because it was made that way, not {framing}",
-                        located.framing
-                    ),
-                ));
-            }
-            let wanting = Wanting { path: named, located, body, holds, tries: TRIES, reply };
-            fe.somewhere(process, wanting, None);
-        });
+        self.resolve(
+            process,
+            &path,
+            expect,
+            Some(framing),
+            reply,
+            move |fe, process, located, reply| {
+                // The object's own framing wins, and a writer that disagrees about it is
+                // writing records the object cannot hold.
+                if located.framing != framing {
+                    return reply.send(Response::error(
+                        Status::BadRequest,
+                        format!(
+                            "that object is framed {} because it was made that way, not {framing}",
+                            located.framing
+                        ),
+                    ));
+                }
+                let wanting = Wanting { path: named, located, body, holds, tries: TRIES, reply };
+                fe.somewhere(process, wanting, None);
+            },
+        );
     }
 
     /// Find this append somewhere to go, and go there.
@@ -650,7 +677,7 @@ impl FE {
     /// conversion happens here — a bug in one of them shows up as a read that works
     /// until the first seal and then does not.
     fn read(self: &Arc<Self>, process: &Arc<Process>, request: &Request, mut reply: Reply) {
-        let (path, range) = match request.args.as_slice() {
+        let (path, expect, range) = match request.args.as_slice() {
             // A key rather than a record number is a keyed read, which needs the
             // key ordering nothing has built.
             [Arg::Text(_), Arg::Text(_)] => {
@@ -659,18 +686,24 @@ impl FE {
                     "reading by key is not built yet",
                 ));
             }
-            [Arg::Text(path), rest @ ..] => match Range::of_args(rest) {
-                Ok((range, [])) => (path.clone(), range),
-                _ => {
-                    return reply.send(Response::error(
-                        Status::BadRequest,
-                        "read takes a name and a range",
-                    ));
-                }
+            // The name, what the caller expects it to be, then the range.
+            [Arg::Text(path), rest @ ..] => match Expecting::of_args(rest) {
+                Ok((expect, rest)) => match Range::of_args(rest) {
+                    Ok((range, [])) => (path.clone(), expect, range),
+                    _ => {
+                        return reply.send(Response::error(
+                            Status::BadRequest,
+                            "read takes a name, what object it expects, and a range",
+                        ));
+                    }
+                },
+                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
             },
             _ => {
-                return reply
-                    .send(Response::error(Status::BadRequest, "read takes a name and a range"));
+                return reply.send(Response::error(
+                    Status::BadRequest,
+                    "read takes a name, what object it expects, and a range",
+                ));
             }
         };
         // The start has to be a record for now: the other two forms need a prefix sum
@@ -683,12 +716,19 @@ impl FE {
             ));
         };
         reply.about(format_args!("{path},record {record},{:?}", range.budget));
-        self.resolve_record(process, &path, record, reply, move |fe, process, located, reply| {
-            // The DN answered with the stream holding it, so the number the stream
-            // knows it by is what is left after that stream's first.
-            let at = in_stream(ORoff::new(record), ORoff::new(located.first_record));
-            fe.locate(process, located, at, range.budget, reply);
-        });
+        self.resolve_record(
+            process,
+            &path,
+            record,
+            expect,
+            reply,
+            move |fe, process, located, reply| {
+                // The DN answered with the stream holding it, so the number the stream
+                // knows it by is what is left after that stream's first.
+                let at = in_stream(ORoff::new(record), ORoff::new(located.first_record));
+                fe.locate(process, located, at, range.budget, reply);
+            },
+        );
     }
 
     /// Which extent holds a record.
@@ -787,7 +827,18 @@ fn make_object(
         // Somebody else made it first. For a create that is the answer; for an
         // append it is only a reason to look again.
         if answer.status == Status::BadRequest && again {
-            return fe.resolving(&onward, &path, None, Some(framing), false, reply, then);
+            // ⚠️ No expectation on the retry: this is the losing side of a create race looking
+            // the object up again, and what it wants is whatever won, not what it guessed.
+            return fe.resolving(
+                &onward,
+                &path,
+                None,
+                Expecting::whatever(),
+                Some(framing),
+                false,
+                reply,
+                then,
+            );
         }
         if answer.status != Status::Ok {
             return reply.send(answer);
@@ -1433,7 +1484,12 @@ fn plan(dns: &[String], owners: &[usize], want: Want, limit: u64) -> Vec<Ask> {
             } else {
                 // Counts, and not streams: the object row and the exact number of streams
                 // it has. One entry, and no SN hop.
-                Want { detail: Detail::Counts.bit(), limit: at.len() as u64, from: want.from }
+                Want {
+                    detail: Detail::Counts.bit(),
+                    limit: at.len() as u64,
+                    from: want.from,
+                    expect: want.expect,
+                }
             };
             Ask { dn: dns[*dn].clone(), at: at.clone(), want }
         })

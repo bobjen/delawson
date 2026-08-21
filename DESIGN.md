@@ -17387,7 +17387,7 @@ triples, an SN, a flavour, a framing and a first record — and nothing in it is
 **Tested where it is hard**: two objects created at one path in one second have the *same* creation
 second and different names, so a reference to the first cannot resolve to the second.
 
-### 17.35.3 What is still missing is the check
+### 17.35.3 What was missing is the check
 
 **The incarnation is distinguishable and nothing compares it** (#111). A read names a path, so it
 resolves to whatever that path points at now — the right default, and how POSIX behaves. A caller that
@@ -17396,3 +17396,83 @@ wants the incarnation pinned has no way to ask, and the failure is silent rather
 > **The fix is small because the field is already on the wire**: let a read carry the name it expects,
 > and answer *"that object was replaced"* rather than answering about a different object. Same shape
 > as §9.1.3.5's certificate — carry enough to detect staleness rather than enough to prevent it.
+
+**Built — §17.36.**
+
+#### 17.35.4 The pointer is bigger than the thing it points at
+
+**Bob, 2026-08-20**: *"(RangeId, ObjectId, createSec) is usually shorter than a path anyhow."*
+Measured against paths of the shape this store is for:
+
+| | bytes |
+|---|---|
+| `(RangeId, ObjectId, CreateSec)` | **16, always** |
+| `/gorilla/worker-3/scratch/tmp.bin` | 33 |
+| `/tenant/project/dataset/2026/08/20/part-00017.parquet` | 53 |
+
+⚠️ **Which is the unusual part: a path *points at* a name (§17.35.2), and the pointer is larger than
+the target.** That inverts the usual reason to indirect — you normally add a level to make references
+small — and it means the indirection here is not a cost to justify but a saving on its own.
+
+> **A path is paid once, in the directory entry that holds it. Everything below the directory holds
+> names.** A reverse edge, a hint, a capability, a reference from a stream: all 16 fixed bytes, none
+> of them carrying `/tenant/project/dataset/…` around.
+
+**And fixed width buys more than the average saving does.** A variable-length key needs a length, an
+allocation or an offset table, and it cannot be delta-encoded — where §17.34.1 gets 3× on a run of
+triples with LZ4 and around 30× with a delta encoder, precisely because they are fixed and nearly
+sequential. **A run of paths has neither property.**
+
+## 17.36 Answering about the wrong object, out loud
+
+**#111.** A caller holding `(object, record)` across a replacement was answered about whichever object
+the path points at now, and could not tell. It can ask now, and be refused.
+
+### 17.36.1 Only where the answer does not already carry the name
+
+⚠️ **`object-info` needed nothing, and working out why is what scoped this.**
+
+| | its answer | can a caller detect a replacement? |
+|---|---|---|
+| `object-info` | a `Described`, which **carries the object's name** | **yes**, by comparing — so no mechanism is needed |
+| `read` | `Covered` and blocks | no |
+| `append` | a receipt: extent, offset, record number | no |
+
+> **The gap is exactly where the answer does not say which object it was about.** Two operations, not
+> the whole surface — and both of them the ones where being wrong is expensive, since one returns
+> bytes and the other *writes* them.
+
+**The expectation rides inside `Want`**, not as a group of its own. A second optional group after the
+path would be told from the first only by counting arguments, and §17.19 and §17.12 are both about
+what happens then. One optional group stays one — and a caller with no want and no opinion sends
+neither, so the plain lookup is byte-for-byte the request §17.5g measured.
+
+**Fixed width, with a zero object id meaning *no opinion***, which is the sentinel `Described`
+already uses for a name that is not there (`EVERY-SPACE-RESERVES-A-SENTINEL` again, in a third place).
+
+### 17.36.2 The check is at the DN, because only the DN can see it
+
+The FE resolves a path by asking the DN, so the expectation travels client → FE → DN and is compared
+where the path table is. No other tier knows a path at all.
+
+⚠️ **`Status::Replaced`, and deliberately not `NotFound`**: the path resolves perfectly well, to
+something else. Saying "not found" would be a second wrong answer about the same situation.
+
+**One place deliberately does not pass an expectation on**: the retry after a lost create race
+(§17.5's `again`). That caller is looking the object up a second time *because* somebody else won, and
+what it wants is whatever won — not what it guessed.
+
+**Measured live**: a pinned read of the right name returns the record; a wrong range, a wrong id and a
+wrong second are each refused; a pinned append to the wrong object is refused; an unpinned append still
+works.
+
+### 17.36.3 The default is unchanged, and that is the design
+
+**A bare path still names whatever it points at now.** That is what a path means, it is how POSIX
+behaves, and it is what almost every caller wants. What was wrong was not the default but that there
+was no alternative — a caller wanting the incarnation pinned had no way to say so, and the failure
+was silent.
+
+> **Detect, do not prevent.** Nothing here stops a path being repointed under a reader; it stops the
+> reader being told a lie about it. That is the same trade §9.1.3.5 makes for a stale certificate, and
+> the same one an `ETag` makes over HTTP.

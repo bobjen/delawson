@@ -260,6 +260,53 @@ macro_rules! name {
 name!(ObjectName, range, object, "an object");
 name!(StreamName, range, stream, "a stream");
 
+/// What a caller believes it is addressing, when it has an opinion.
+///
+/// ⚠️ **Only where the answer does not already carry the name.** `object-info` returns an
+/// object's name, so a caller can compare for itself and needs nothing here. A **read** answers
+/// with blocks and a **append** with a receipt — neither says which object it was about, so a
+/// caller holding a reference across a replacement is answered about a different object and
+/// cannot tell (§17.36).
+///
+/// **Fixed width and always present**, three numbers after the path, with a zero object id
+/// meaning *no opinion* — which is the sentinel `Described` already uses for a name that is not
+/// there, and it avoids an optional group that a parser has to guess the presence of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Expecting(pub ObjectName);
+
+impl Expecting {
+    pub const ARGS: usize = ObjectName::ARGS;
+
+    /// No opinion: whatever the path points at now.
+    pub fn whatever() -> Expecting {
+        Expecting(ObjectName::default())
+    }
+
+    pub fn of(name: ObjectName) -> Expecting {
+        Expecting(name)
+    }
+
+    pub fn asked(&self) -> bool {
+        self.0.object != 0
+    }
+
+    pub fn args(&self) -> Vec<Arg> {
+        self.0.args()
+    }
+
+    pub fn of_args(args: &[Arg]) -> Result<(Expecting, &[Arg])> {
+        let (name, rest) = ObjectName::of_args(args)?;
+        Ok((Expecting(name), rest))
+    }
+
+    /// Whether `found` is the object the caller meant. ⚠️ **True when nothing was asked**, so
+    /// the default stays "whatever the path points at now" — which is what a path means, and
+    /// what almost every caller wants.
+    pub fn holds(&self, found: ObjectName) -> bool {
+        !self.asked() || self.0 == found
+    }
+}
+
 /// One object a create asks for: a name, a flavour, and a framing.
 ///
 /// ⚠️ **Here rather than in `dn`, on §17.13.3's rule.** A batch create has to be *divided* by
@@ -963,5 +1010,39 @@ mod tests {
         assert_eq!(back.given, 2, "how many are described");
         assert!(back.more(), "and where to carry on");
         assert_eq!(back.next, 512);
+    }
+
+    /// ⚠️ **The rule #111 turns on**, tested where it lives rather than through the tier that
+    /// calls it. A caller with no opinion gets whatever the path points at, which is what a
+    /// path means; a caller with one gets an error rather than a different object.
+    #[test]
+    fn an_expectation_holds_only_for_the_object_it_names() {
+        let mine = ObjectName { range: 2, object: 7, created: TimeSec::new(1_000_000) };
+        assert!(Expecting::whatever().holds(mine), "no opinion, so anything");
+        assert!(!Expecting::whatever().asked());
+        assert!(Expecting::of(mine).holds(mine));
+
+        // ⚠️ Every component, because any one of them differing is a different object — and
+        // the second is the one a replacement inside a second will *not* differ in (§17.35.2).
+        for other in [
+            ObjectName { range: 3, ..mine },
+            ObjectName { object: 8, ..mine },
+            ObjectName { created: TimeSec::new(1_000_001), ..mine },
+        ] {
+            assert!(!Expecting::of(mine).holds(other), "{other} is not {mine}");
+        }
+    }
+
+    /// A zero object id is "no opinion" and not an object, which is the same sentinel a row
+    /// for a name that is not there uses.
+    #[test]
+    fn a_zero_object_is_no_opinion() {
+        let none = ObjectName { range: 4, object: 0, created: TimeSec::new(9) };
+        assert!(!Expecting::of(none).asked(), "a range and a second alone name nothing");
+        assert!(Expecting::of(none).holds(ObjectName {
+            range: 0,
+            object: 1,
+            created: TimeSec::EPOCH
+        }));
     }
 }

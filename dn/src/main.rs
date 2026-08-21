@@ -393,7 +393,7 @@ impl Object {
         };
         Some(
             Described {
-                object: ObjectName { range, object: self.id, created: self.created },
+                object: self.named(range),
                 stream: StreamName { range, stream: held.id, created: held.created },
                 sn: held.sn,
                 keyed: self.keyed,
@@ -402,6 +402,12 @@ impl Object {
             }
             .args(),
         )
+    }
+
+    /// This object's name, which is `(RangeId, ObjectId, CreateSec)` and not its path — a path
+    /// points at this and may be repointed (§17.35.2).
+    fn named(&self, range: u32) -> ObjectName {
+        ObjectName { range, object: self.id, created: self.created }
     }
 
     /// Records the object holds, which is also where its next stream would start.
@@ -938,6 +944,17 @@ impl DN {
             let mut shard = self.shards[shard_of(name)].lock().expect("objects");
             match shard.get_mut(name) {
                 None => Some(Err(Response::error(Status::NotFound, format!("no object {name}")))),
+                // ⚠️ **The check goes here and nowhere else**, because the DN owns the path
+                // table and is the only tier that can see a path point somewhere new. A read
+                // answers with blocks and an append with a receipt; neither says which object
+                // it was about, so without this a caller is answered about a different one and
+                // cannot tell (§17.36).
+                Some(object) if !want.expect.holds(object.named(self.mine)) => {
+                    Some(Err(Response::error(
+                        Status::Replaced,
+                        format!("{name} is {} and not {}", object.named(self.mine), want.expect.0),
+                    )))
+                }
                 Some(object) => match describe_at(object, self.mine, record, &want, limit) {
                     Some(answering) => Some(Ok(answering)),
                     None if object.between_streams() => {

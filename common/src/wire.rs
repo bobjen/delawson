@@ -164,6 +164,10 @@ pub enum Status {
     /// the caller is being told where to go, and the answer carries what the extent
     /// came to.
     Sealed = 6,
+    /// The path names a different object than the caller expected. **Not `NotFound`**: the
+    /// path resolves perfectly well, to something else — and answering about that something
+    /// else is the silent wrong answer this exists to prevent (§17.36).
+    Replaced = 7,
 }
 
 impl Status {
@@ -176,6 +180,7 @@ impl Status {
             4 => Status::Locked,
             5 => Status::Internal,
             6 => Status::Sealed,
+            7 => Status::Replaced,
             other => return Err(Error::new(format!("unknown status {other}"))),
         })
     }
@@ -191,6 +196,7 @@ impl std::fmt::Display for Status {
             Status::Locked => "locked",
             Status::Internal => "internal error",
             Status::Sealed => "that extent is sealed",
+            Status::Replaced => "that object was replaced",
         };
         f.write_str(text)
     }

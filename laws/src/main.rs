@@ -14,10 +14,11 @@ use common::block::{Holds, expand, squeeze};
 use common::config::Compress;
 use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
-use common::info::{Batch, Described, ExtentRow, Shape, StreamRow, UNKNOWN};
+use common::info::{Batch, Described, Expecting, ExtentRow, ObjectName, Shape, StreamRow, UNKNOWN};
 use common::placement::{self, Expansion};
 use common::random::Rng;
 use common::range::{Budget, Covered, Detail, Piece, Range, Start, Want};
+use common::time::TimeSec;
 use common::wire::{Arg, Op, Request, Response, Status};
 use common::{Error, Result};
 use std::collections::HashMap;
@@ -75,7 +76,7 @@ impl Want1 {
 
 /// What a run of `--want` choices comes to, with implications applied.
 fn asking(want: &[Want1], limit: u64, from: u64) -> Want {
-    let mut asked = Want { detail: 0, limit, from: Start::Record(from) };
+    let mut asked = Want { detail: 0, limit, from: Start::Record(from), ..Want::plain() };
     for one in want {
         asked = asked.with(one.detail());
     }
@@ -351,6 +352,12 @@ enum Cmd {
         /// buffer, after its own checks; this computes it here.
         #[arg(long)]
         crc: bool,
+        /// The object this must still be, as `RANGE:ID:SECOND` from `object-info`. Without
+        /// it the path names whatever it points at now, which is what a path means — with
+        /// it, a path that was repointed answers "that object was replaced" instead of
+        /// answering about something else (§17.36).
+        #[arg(long)]
+        expect: Option<String>,
         #[command(flatten)]
         body: Body,
     },
@@ -383,6 +390,12 @@ enum Cmd {
         /// comes back — nothing below the client parses one.
         #[arg(long, default_value = "lf")]
         framing: String,
+        /// The object this must still be, as `RANGE:ID:SECOND` from `object-info`. Without
+        /// it the path names whatever it points at now, which is what a path means — with
+        /// it, a path that was repointed answers "that object was replaced" instead of
+        /// answering about something else (§17.36).
+        #[arg(long)]
+        expect: Option<String>,
         #[command(flatten)]
         at: At,
     },
@@ -1256,6 +1269,24 @@ fn object(target: &Target, response: &Response, expansion: Expansion) -> Result<
     say(target, &it, Some(shape), &streams, expansion)
 }
 
+/// `RANGE:ID:SECOND`, the name `object-info` prints, or nothing for "whatever the path points at
+/// now" — which is what a path means and what almost every caller wants (§17.36).
+fn expecting(text: &Option<String>) -> Result<Expecting> {
+    let Some(text) = text else { return Ok(Expecting::whatever()) };
+    let parts: Vec<&str> = text.split(':').collect();
+    let [range, object, created] = parts.as_slice() else {
+        return Err(Error::new(format!("--expect takes RANGE:ID:SECOND, not {text}")));
+    };
+    let number = |what: &str, of: &str| {
+        of.parse::<u64>().map_err(|_| Error::new(format!("{what} {of} is not a number")))
+    };
+    Ok(Expecting::of(ObjectName {
+        range: number("a range", range)? as u32,
+        object: number("an object", object)? as u32,
+        created: TimeSec::new(number("a second", created)?),
+    }))
+}
+
 /// Several objects, in the order asked about, then what the answer did not cover.
 ///
 /// ⚠️ **The names come from the request, not the answer.** A batch answer is a prefix of
@@ -1767,7 +1798,7 @@ fn build(cmd: &Cmd) -> Result<Request> {
             request
         }
 
-        Cmd::Append { path, framing, crc, body } => {
+        Cmd::Append { path, framing, crc, body, expect } => {
             let framing = Framing::parse(framing)?;
             let (kind, width) = framing.wire();
             let block = frame(framing, &body.bytes()?)?;
@@ -1790,7 +1821,9 @@ fn build(cmd: &Cmd) -> Result<Request> {
                 return Err(Error::new("this buffer changed while it was being compressed"));
             }
 
-            let mut request = Request::new(Op::AppendRecord).text(path).number(kind).number(width);
+            let mut request = Request::new(Op::AppendRecord).text(path);
+            request.args.extend(expecting(expect)?.args());
+            request = request.number(kind).number(width);
             request.args.extend(holds.args());
             request.bytes(stored)
         }
@@ -1807,8 +1840,9 @@ fn build(cmd: &Cmd) -> Result<Request> {
             request.args.push(at.arg());
             request
         }
-        Cmd::Read { path, at, .. } => {
+        Cmd::Read { path, at, expect, .. } => {
             let mut request = Request::new(Op::ReadRecord).text(path);
+            request.args.extend(expecting(expect)?.args());
             match at.arg() {
                 // A point read is a range of one record (§9.1.3.6): the block
                 // holding it comes back whole either way, and asking this way means
@@ -1872,7 +1906,7 @@ mod tests {
         let asked =
             Cmd::ObjectInfo { path: "/x".into(), want: vec![Want1::Instances], limit: 7, from: 3 };
         let request = build(&asked).expect("a request");
-        assert_eq!(request.args.len(), 5, "the name plus a want");
+        assert_eq!(request.args.len(), 1 + Want::ARGS, "the name plus a want");
         let (want, rest) = Want::of_args(&request.args[1..]).expect("a want");
         assert!(rest.is_empty());
         assert!(want.wants(Detail::Instances) && want.wants(Detail::Extents));

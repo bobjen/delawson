@@ -15,6 +15,7 @@
 //!   block's size must not return nothing, or a caller with a small buffer retries
 //!   for ever — back-pressure that is really a livelock.
 
+use crate::info::Expecting;
 use crate::offset::{COff, LOff};
 use crate::placement::Expansion;
 use crate::wire::Arg;
@@ -405,13 +406,20 @@ pub struct Want {
     pub limit: u64,
     /// Which record to describe from, for an object too large to describe at once.
     pub from: Start,
+    /// What object the caller believes the path points at, or nothing if it has no opinion
+    /// (§17.36).
+    pub expect: Expecting,
 }
 
 impl Want {
+    /// Arguments a want takes on the wire, so a caller sizing or slicing a request does not
+    /// count them itself (§17.13.3).
+    pub const ARGS: usize = 4 + Expecting::ARGS;
+
     /// Nothing beyond the object and its first stream: what every caller asked for before this
     /// field existed.
     pub fn plain() -> Want {
-        Want { detail: 0, limit: 0, from: Start::Record(0) }
+        Want { detail: 0, limit: 0, from: Start::Record(0), expect: Expecting::whatever() }
     }
 
     pub fn with(mut self, detail: Detail) -> Want {
@@ -432,14 +440,28 @@ impl Want {
             .collect()
     }
 
-    /// Four arguments: the flag field, the limit, and the start as a kind and a number.
+    /// The flag field, the limit, the start as a kind and a number, and what object the
+    /// caller believes it is addressing.
+    ///
+    /// ⚠️ **The expectation rides here rather than as a group of its own** (§17.36.1). A
+    /// second optional group after the path would be told from the first only by counting
+    /// arguments, and this document is full of what happens then (§17.19, §17.12). One
+    /// optional group stays one optional group, and a caller with no want and no opinion
+    /// sends neither — so the plain lookup is byte-for-byte what §17.5g measured.
     pub fn args(&self) -> Vec<Arg> {
         let (kind, at) = match self.from {
             Start::Record(record) => (0, record),
             Start::RecordThen(record, _) => (1, record),
             Start::Logical(offset) => (2, offset),
         };
-        vec![Arg::Number(self.detail), Arg::Number(self.limit), Arg::Number(kind), Arg::Number(at)]
+        let mut args = vec![
+            Arg::Number(self.detail),
+            Arg::Number(self.limit),
+            Arg::Number(kind),
+            Arg::Number(at),
+        ];
+        args.extend(self.expect.args());
+        args
     }
 
     /// And back. ⚠️ **A bit nothing here defines is not an error**, which is the forward
@@ -456,6 +478,7 @@ impl Want {
         else {
             return Err(Error::new("a want takes a detail field, a limit and a start"));
         };
+        let (expect, rest) = Expecting::of_args(rest)?;
         let from = match kind {
             0 => Start::Record(*at),
             1 => Start::RecordThen(*at, 0),
@@ -463,7 +486,7 @@ impl Want {
             other => return Err(Error::new(format!("no range start of kind {other}"))),
         };
         // Normalized on the way in, so nothing downstream has to remember the implications.
-        let mut want = Want { detail: 0, limit: *limit, from };
+        let mut want = Want { detail: 0, limit: *limit, from, expect };
         want.detail = *detail;
         for one in Detail::ALL {
             if want.wants(*one) {
@@ -666,12 +689,7 @@ mod tests {
     /// implications does not produce an answer nobody can interpret.
     #[test]
     fn implications_are_restored_off_the_wire() {
-        let raw = vec![
-            Arg::Number(Detail::Instances.bit()),
-            Arg::Number(0),
-            Arg::Number(0),
-            Arg::Number(0),
-        ];
+        let raw = Want { detail: Detail::Instances.bit(), ..Want::plain() }.args();
         let (want, _) = Want::of_args(&raw).expect("a want");
         assert!(want.wants(Detail::Extents) && want.wants(Detail::Streams));
     }
@@ -680,7 +698,9 @@ mod tests {
     /// field exists for — and `beyond` is what turns it into a refusal that says which.
     #[test]
     fn an_unknown_bit_is_reported_rather_than_refused() {
-        let raw = vec![Arg::Number(1 << 40), Arg::Number(0), Arg::Number(0), Arg::Number(0)];
+        // ⚠️ Built through the shape, so a field joining a want is a compile error here rather
+        // than a raw list that silently stops parsing (§17.36.1 added the expectation).
+        let raw = Want { detail: 1 << 40, ..Want::plain() }.args();
         let (want, _) = Want::of_args(&raw).expect("an unknown bit parses");
         assert_eq!(want.beyond(0), Vec::<&str>::new(), "nothing named, so nothing to report");
 
@@ -695,7 +715,12 @@ mod tests {
     /// describe at once is paged with.
     #[test]
     fn a_limit_and_a_start_survive_the_wire() {
-        let want = Want { detail: Detail::Extents.bit(), limit: 500, from: Start::Record(9_000) };
+        let want = Want {
+            detail: Detail::Extents.bit(),
+            limit: 500,
+            from: Start::Record(9_000),
+            ..Want::plain()
+        };
         let args = want.args();
         let (back, _) = Want::of_args(&args).expect("a want");
         assert_eq!(back.limit, 500);
