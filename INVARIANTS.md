@@ -777,6 +777,16 @@ among tenants.
 test** — it is arithmetic over the sharing rule
 *Breaks* sharing becomes an exploit: colluding tenants cut their combined bill.
 
+**`A-USER-CHOSEN-NAME-IS-PINNED-BY-A-COUNTER`** — an incarnation of a path is told apart by a
+number that increments on reuse, never by the second it was made in.
+*Argued* §17.35.1, §17.35.2 · *Enforced* `next_object` is monotonic, so a recreated path gets a
+fresh `ObjectId` — but ⚠️ **nothing compares it** (#111) · *Checked* not yet
+*Breaks* a caller holding `(object, record)` across a replacement reads the new object's record
+and is told nothing. ⚠️ Note why the sibling rule does not apply: the store mints extent and
+stream names and can gate their reuse to more than a second
+([[A-NAME-IS-NEVER-REMINTED-IN-ITS-OWN-SECOND]]), while a path is reused at the *user's* rate, and
+throttling a user to make a naming scheme work is the wrong way round.
+
 **`A-NAME-IS-NEVER-REMINTED-IN-ITS-OWN-SECOND`** — an id returned to a free list cannot be
 handed out again in the second it was freed in, so a triple names one thing for ever.
 *Argued* §17.34.3, §17.34.2 · *Enforced* design only; nothing recycles ids yet, and the
@@ -929,7 +939,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **count** | §8.1.6.2 | `ONE-PAST-THE-END-IS-REPRESENTABLE`, `EVERY-SPACE-RESERVES-A-SENTINEL`, `UNKEYED-COUNT-EXACT`, `UPDATE-DELETE-PRESERVE-COUNTS` |
 | ⚠️ **logical offset** | §8.1.6, §8.2.2 | `LOGICAL-OFFSETS-DENSE`, `CANONICAL-OFFSET-SPACE`, `FIXED-OFFSET-ADVANCES`, `OFFSET-SNAPS-FORWARD`, `EXTENT-OFFSET-WRITE-ONCE`, `ONE-UNSEALED-EXTENT-UNKEYED`. *Measured in canonical length-stuffed bytes, not in the stored framing.* |
 | **media class** | §7.4 | `ONE-MEDIA-CLASS-PER-EXTENT` |
-| **object** | §3 | `READ-NAMES-THE-OBJECT`, `RECORD-NUMBER-STABLE`, `HINT-BOUND-BY-CAPABILITY`, `CAPABILITY-IS-MEMBERSHIP-ONLY`, `ZERO-REFERENCES-IS-A-BUG`, `ONE-UNSEALED-EXTENT-UNKEYED` |
+| **object** | §3 | `A-USER-CHOSEN-NAME-IS-PINNED-BY-A-COUNTER`, `READ-NAMES-THE-OBJECT`, `RECORD-NUMBER-STABLE`, `HINT-BOUND-BY-CAPABILITY`, `CAPABILITY-IS-MEMBERSHIP-ONLY`, `ZERO-REFERENCES-IS-A-BUG`, `ONE-UNSEALED-EXTENT-UNKEYED` |
 | **path** | §4.6.3 | `PATH-IS-THE-PORTABLE-NAME`, `HINT-BOUND-BY-CAPABILITY`, `READ-NAMES-THE-OBJECT`, `POLICY-ATTACHES-TO-A-DIRECTORY` |
 | **failure domain** | §5.6 | `NESTED-NOT-ORTHOGONAL-DOMAINS`, `TOPOLOGY-IS-SIGNED-NOT-SECRET`, `SOLVER-TIMEOUT-DEFERS-NEVER-DROPS` |
 | **ring** | §5.7 | `MEMBERSHIP-IS-NOT-LEADERSHIP`, `TOPOLOGY-IS-SIGNED-NOT-SECRET`, `RE-KEYING-NEEDS-A-COMMITTED-MEMBERSHIP` |

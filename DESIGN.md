@@ -17314,3 +17314,60 @@ that survives the shape moving.
 
 > **A test that hard-codes a position has to be edited every time the shape does**, which is the
 > same complaint §17.19 makes about the code. The fix in both places is to read through the shape.
+
+## 17.35 The user's stable reference is `(object, record)`, and a second cannot pin it
+
+**Bob, 2026-08-20**: *"Stable references are (object, record). 'object' is identified by full path, and
+many systems allow it to be replaced more than once a second."*
+
+**The first half is the addressing scheme working as designed.** §9.1.3 makes the continuation a record
+number the system computed, and Bob's earlier rule is that *offsets involving extent and stream are
+ephemeral because extents and streams can be rewritten*. So the durable coordinate is the object's,
+and the tiers below it are implementation:
+
+| reference | durable? |
+|---|---|
+| `(object, record)` | **yes** — this is what a user keeps |
+| `(stream, record)` | no: streams are rewritten, and §11 shares one between objects |
+| `(extent, offset)` | no: extents are rewritten, and a hint carries an expiry for exactly that reason (§10.1) |
+
+### 17.35.1 ⚠️ Which is where the triple pattern stops
+
+§17.29.2, §17.33.2 and §17.34 all lean on the same trick: the third component of a name is a
+**creation second**, and it makes the other two safe to reuse because nothing can be re-minted twice
+in one second (#110).
+
+> **That trick works because the system controls the reuse rate. It does not transfer to a path,
+> because the *user* controls the reuse rate.**
+
+**A path can be deleted and recreated many times a second**, so `(path, CreateSec)` names an
+incarnation only as precisely as the clock ticks — and the clock ticks far too slowly. This is not a
+weakness in the second; it is a category difference between a name the store mints and a name a
+caller chooses.
+
+⚠️ **It also bounds #110.** That issue gates id reuse to more than a second, and it is right for
+extent and stream ids because the store mints them. **The same gate applied to anything a user renames
+at will would be throttling the user to make a naming scheme work**, which is the wrong way round.
+
+### 17.35.2 A counter, not a clock — and one already exists
+
+**The disambiguator for a user-reused name has to be a counter**, bumped on each reuse, which is what
+NFS file handles do with an inode's generation number. **DeLawson already mints one**: `next_object` is
+monotonic, so deleting `/foo` and recreating it yields a *different* `ObjectId`, and `Described.id`
+already carries it back to the caller.
+
+**So the incarnation is already distinguishable. What is missing is anywhere that checks it** (#111):
+
+| | |
+|---|---|
+| a read names a **path** | so it resolves to whatever is at that path now |
+| the caller may hold an **id** from an earlier answer | and nothing compares the two |
+| the result | a caller holding `(object, record)` across a replacement **silently reads the new object's record** |
+
+**Which is the right default and the wrong only option.** A path naming whatever is there now is how
+POSIX behaves and what most callers want; a caller that wants the incarnation pinned has no way to ask,
+and the failure is silent rather than an error.
+
+> **The fix is small because the field is already on the wire**: let a read carry the id it expects, and
+> answer *"that object was replaced"* rather than answering about a different object. That is the same
+> shape as §9.1.3.5's certificate — carry enough to detect staleness rather than enough to prevent it.
