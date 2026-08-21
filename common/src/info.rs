@@ -255,9 +255,14 @@ macro_rules! name {
     };
 }
 
-// ⚠️ **Scoped to the range and not to the DN**, both of them, because #75 makes the range the
-// durable key precisely so it can move between DNs. `routing::range_of_dn` stands in until ranges
-// exist. And ⚠️ **`range` is not `sn`**: the range is *whose* a thing is, the SN is *where* it lives.
+// ⚠️ **Scoped to the range and not to the DN**, both of them, because a range outlives the DN
+// serving it. `routing::range_of_dn` stands in until ranges exist. And ⚠️ **`range` is not `sn`**:
+// the range is *whose* a thing is, the SN is *where* it lives.
+//
+// ⚠️ **It is the *minting* range and it is not durable.** #75 makes the range a hint and the key
+// the name, because a **split renames a range** — so this component says who handed the id out,
+// which is unique for ever, and not where the thing lives now. A name identifies; it does not
+// locate (§17.38.1).
 name!(ObjectName, range, RangeId, object, ObjectId, "an object");
 name!(StreamName, range, RangeId, stream, StreamId, "a stream");
 

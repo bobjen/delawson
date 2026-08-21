@@ -35,10 +35,13 @@ use crate::ids::{DnId, RangeId};
 /// Which range a DN's streams belong to.
 ///
 /// ⚠️ **The identity function, and a placeholder for #75.** A stream is named by
-/// `(RangeId, StreamId, CreateSec)` (#109), and the range is the durable half precisely
-/// because a range *moves between DNs* — so once ranges exist this stops being derivable
-/// from a DN at all, and becomes something the DN is told. Everything that needs a `RangeId`
-/// goes through here, so that day is one edit.
+/// `(RangeId, StreamId, CreateSec)` (#109), and the range is the half that outlives a DN — so
+/// once ranges exist this stops being derivable from a DN at all, and becomes something the DN
+/// is told. Everything that needs a `RangeId` goes through here, so that day is one edit.
+///
+/// ⚠️ **It outlives a DN and is not durable.** #75 makes the range a *hint* and the key the name,
+/// because a **split renames a range**. So the `RangeId` in a name is the range that *minted* it,
+/// which stays unique for ever, and is not where the thing lives now (§17.38.1).
 pub fn range_of_dn(dn: DnId) -> RangeId {
     RangeId::new(dn.get())
 }

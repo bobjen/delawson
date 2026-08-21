@@ -86,7 +86,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-156 things *not* decided, numbered to 157 with one tombstone.
+158 things *not* decided, numbered to 158 with one tombstone.
 
 **Priorities and framing**
 
@@ -14027,6 +14027,15 @@ Roughly in order of how much else depends on them.
      whose conversion to an extent-local one is §17.16.2's shape exactly, and which the EN refuses
      today for want of a prefix sum. If that is built, build the types with it.
 
+158. **Whether an index may decline to pin the incarnation, and what an object must promise for that
+     to be safe** (§17.38.4, §4.1.1). Ignoring the original triple makes an index point at whatever is
+     at the path now, which is coherent for a **keyed** object — a key is semantic and a rebuilt object
+     can legitimately have the same row — and incoherent for an **append-only** one, whose record
+     numbers are positional. ⚠️ Except where a replacement is a copy plus more, which preserves every
+     old record number and is a common way to rebuild. So the safe form is an object *promising*
+     prefix-stable replacement, in the shape §4.1.1's flags already have. Open: whether that promise is
+     worth a flag, and whether an index declares its pinning or infers it from the object's flavour.
+
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
@@ -17593,3 +17602,130 @@ adjacent found no match and changed no bytes.
 > **A configuration change that fails is indistinguishable from one that succeeded and did not matter.**
 > The check that caught it is cheap and belongs in the routine: `laws registry | grep -c DN`, and each
 > DN's object count, *before* believing a number that depends on how many there are.
+
+## 17.38 A stable reference for an index, and what it costs per entry
+
+**Bob, 2026-08-20**, on stable indexes as a use case: *"a stable reference is really full path plus
+original (RangeId, ObjectId, createSec) plus record number (or key for keyed objects)."*
+
+### 17.38.1 ⚠️ A name identifies; it does not locate
+
+**Three places in today's code say #75 makes the range "the durable key". That is backwards** and now
+corrected. #75 makes the range a **hint** and the *key* the durable name, because **a split renames a
+range** — the very operation the range was introduced to survive.
+
+> **So the `RangeId` in a name is the range that *minted* it.** That is unique for ever, since a
+> range's counter is its own and a split gives the children fresh ones. It is not where the thing
+> lives now, and nothing can find an object from it in one hop.
+
+**Which is why an object reference needs two durable parts and not one:**
+
+| | job | fails how |
+|---|---|---|
+| the **path** | **locates** — routing turns it into a DN in one hop | it can be repointed, so it does not say *which* object (§17.35) |
+| the **original triple** | **identifies** the incarnation | nothing can locate from it |
+
+⚠️ **Neither is both.** That is the whole content of "full path plus original triple", and it is a
+*different* pairing from §10's Oracle precedent: a logical rowid is a durable locator plus a
+**decaying** locator, where this is a durable locator plus a durable **identifier**. The failure modes
+differ accordingly — **a stale hint costs a re-descent; a mismatched identity costs the answer**, and
+#111's `Status::Replaced` is that error.
+
+### 17.38.2 The three regimes are one mechanism with two degenerate ends
+
+Bob's three storage strategies, priced against §17.35.4's measured path lengths (43 B typical), a
+16-byte triple and an 8-byte record number:
+
+| | per entry | when |
+|---|---|---|
+| the whole reference inline | **67 B** | every entry points at a different object |
+| a per-index **side table**, values `(side index, record)` | **12 B** + the table | the general case |
+| path and triple once for the index, values are records | **8 B** | one object |
+
+**Break-even is 1.22 entries per object.** Above that the side table wins, and it wins enormously:
+at ten entries per object it is 18.7 B against 67 B, so a billion-entry index is **19 GB rather than
+67 GB**.
+
+> **And the one-object case is a side table with one row**, so there are not three mechanisms — there
+> is one, and the interesting question is only where it degenerates. The inline form is worth having
+> only for an index whose entries almost never share an object.
+
+### 17.38.3 The side table's row is also the authorization unit
+
+**Bob raises per-object authorization as a separate possibility** — *"index reads doing authorization
+per object instead of per index entry"* — and it is the same amortization over the same key.
+
+> **A side-table row is exactly one object.** Checking it once and reusing the verdict for every entry
+> pointing at that row is not an additional mechanism; it is the mechanism already built for space,
+> read a second way.
+
+⚠️ **Which makes the side table pay for itself twice and argues for building it first.** An index over
+ten entries per object does 1/10th the ACL evaluations *and* uses 28% of the bytes, and neither saving
+needs the other to be designed.
+
+### 17.38.4 Whether to pin the incarnation is semantic against positional
+
+**Bob's intuition** — plausible to ignore the triple for keyed objects, *"much less likely for record
+numbers to be stable across objects"* — has a rule underneath it, and the rule is sharper than the
+intuition:
+
+| coordinate | what it is | survives a replacement? |
+|---|---|---|
+| a **key** | **semantic** — chosen for what the row *is* | **yes**, if the new object has a row meaning the same thing |
+| a **record number** | **positional** — an artifact of the order things were written | **no**, unless the order is preserved |
+
+**So an unpinned index is coherent for keyed objects and incoherent for append-only ones**, and that
+is not a preference but whether the coordinate means anything in a different object.
+
+⚠️ **With one real exception, which is worth naming rather than dismissing.** An append-only object
+replaced by *a copy of itself plus more* keeps every old record number, because append-only means
+prefix-stable. That is a common way to rebuild. **So the property an unpinned append-only index needs
+is "replacements preserve the prefix"** — which is exactly the shape of §4.1.1's promise flags, and
+would be one more of them rather than a new mechanism (§16.158).
+
+### 17.38.5 The current pair is an address, so it need not be stored at all
+
+**Bob, 2026-08-20**: *"the RangeId, ObjectId in (RangeId, ObjectId, createSec) is original, not
+current, so you have to store the current ones in the object as well. This may be rare so you can
+store them in the unusual structure, don't know, it'd have to be measured."*
+
+**The first half is right and the second does not follow, twice over.**
+
+#### Why `ObjectId` moves and not only `RangeId`
+
+⚠️ **§14.6.2 makes the id the index into its arena.** An object that moves to a child range moves to a
+different arena, and its old slot number is already taken there — so it gets a **new current
+`ObjectId`**, not merely a new range. Both halves of the pair move together, which is why the pair is
+the unit.
+
+#### It is not rare — it is about two thirds
+
+**A split diverges every object it touches at once.** Immediately after, 100% of a child range's
+objects have `original ≠ current`; the fraction falls only as new objects are created, and rises again
+at the next split.
+
+| | diverged |
+|---|---|
+| just after a split | **100%** |
+| just before the next one | 50% |
+| averaged over a split cycle | **≈69%** |
+
+> **So §4.1.2's rare-field rule does not apply**, and this is one of the places where reasoning
+> answers a question faster than measuring would: the rate is a property of the split policy, not of
+> the workload.
+
+#### And it need not be stored either way
+
+**The current pair is where the record *is*.** The arena belongs to the current range, and the slot the
+record occupies *is* the current `ObjectId`. A DN finding an object by path reads the slot out of its
+path map — which the map holds anyway, as its value.
+
+| | where it lives | cost |
+|---|---|---|
+| **current** `(RangeId, ObjectId)` | the arena it sits in, and the slot it sits at | **nothing** |
+| **original** triple | a field on the record, because nothing implies it | 16 B, and it is the name — needed regardless |
+
+⚠️ **The trap is storing the one that is implied and inferring the one that is not.** An object record
+carrying its *current* ids would be carrying its own address, which every move must rewrite and which
+is wrong for as long as the rewrite is pending. The original never changes, which is exactly why it is
+the thing worth writing down.

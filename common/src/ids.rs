@@ -112,8 +112,9 @@ id!(EnId, "an EN");
 // ⚠️ A **disk**, not the EN serving it: an EN serves several and a disk moves between them, so
 // which EN to ask is a lookup (`placement::en_of`, §17.29.3).
 id!(DiskId, "a disk");
-// ⚠️ A **range**, not the DN serving it, for the same reason a disk is not an EN: #75 makes the
-// range the durable key precisely because it moves between DNs.
+// ⚠️ A **range**, not the DN serving it, for the same reason a disk is not an EN. But note what
+// #75 actually settles: the range is a **hint** and the *key* is the durable name — a range is more
+// stable than a DN and is not itself stable, because a split renames it (§17.38.1).
 id!(RangeId, "a range");
 id!(ObjectId, "an object");
 id!(StreamId, "a stream");
