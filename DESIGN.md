@@ -17729,3 +17729,70 @@ path map — which the map holds anyway, as its value.
 carrying its *current* ids would be carrying its own address, which every move must rewrite and which
 is wrong for as long as the rewrite is pending. The original never changes, which is exactly why it is
 the thing worth writing down.
+
+## 17.39 Memory-resident is the finished DN for large objects, not a placeholder
+
+**Bob, 2026-08-20**, on sequencing: rings, checkpoints and logs go to disk soon, *"probably starting
+with KS which has the simplest state and most complex ring requirements"*. And on the DN:
+
+> *"DN is supposed to be a cache of metadata stored in DeLawson rather than memory resident, but
+> memory resident is complete and is all you ever need for large objects. It's only small objects that
+> demand metadata on disk and cached."*
+
+⚠️ **This corrects §17.38's status note, which listed self-hosting among the things that will land on
+the lookup path.** For large objects it will not. The DN as it stands is the finished design for the
+case the store is named for, and the cached form is a small-object feature wearing an
+architecture-shaped hat.
+
+### 17.39.1 Why the object size decides it
+
+**Metadata is per object and data is per byte**, so their ratio is the whole question. §12.2.1 prices
+it — and the row that matters is not the one about streams:
+
+| Metadata | Medium | One record | Break-even payload |
+|---|---|---|---|
+| a stream, on an SN | **RAM** | 300 B × 5,000 | ~375 KB |
+| an object, on a DN | **disk** | ~112 B | ~112 B |
+
+**An object above a few hundred bytes already pays for its own metadata**, so a DN holding large
+objects holds few records for many bytes and RAM is never the constraint. A DN holding 10^12 tiny ones
+holds 10^12 records, which is the case that cannot be resident at any price.
+
+### 17.39.2 ⚠️ That table is ahead of the code, and it is what lumping's argument rests on
+
+**§12.2.1's object row says *disk*, and today the DN is RAM.** So the ~112 B figure — and with it
+§12.2.1's conclusion that *"the stream case is 3,300× more dangerous than the object case"* — describes
+the DN that self-hosting will build, not the one running now.
+
+**Which means lumping's benefit arrives in two halves, and only one of them is available:**
+
+| | needs | available |
+|---|---|---|
+| out of the **RAM-backed stream tier** — the 3,300× half | only that small objects share a stream | **now** |
+| into the **disk-backed DN tier** | a self-hosted, cached DN | **not yet** |
+
+> **So §11's small-object regimes are gated on the same thing the DN is** — not merely unbuilt but
+> unable to deliver their stated economics until the DN's metadata is disk-backed. #101, #102 and #103
+> inherit that.
+
+### 17.39.3 The dependency chain, and one link that is not about objects
+
+**append-only → keyed objects → persistence → a self-hosted, cached DN.** Bob names the keyed-objects
+link: caching metadata stored in DeLawson wants keyed lookup, and keyed objects are distant.
+
+⚠️ **There is a second link, already §16 item 1.** A self-hosted DN reads DeLawson on every miss, so
+§5.5's **bootstrap root** stops being a startup concern and becomes *"on the path of every DN lookup"*
+(§5.11). That has to be settled before the last arrow, not during it.
+
+### 17.39.4 KS first is the right order, and the coupling to name
+
+**Smallest state, hardest semantics** — which is the right way round, because it exercises checkpoint
+and log against Raft, quorum and restart without also exercising them against volume. §7.3's key store
+is ~1 MB per century.
+
+⚠️ **And there is a specific coupling that makes KS the honest first target rather than merely the
+easy one: its checkpoint contains the thing its unlock key protects.** §7.3.2.1's ladder has every
+daily master key encrypted on disk so that a fully-down ring can be recovered — so persisting KS state
+*is* the encrypted-at-rest problem and the unlock ceremony's restart path, not a preliminary to them.
+Doing KS first means meeting that on 1 MB rather than discovering it later on a tier that also has to
+be fast.
