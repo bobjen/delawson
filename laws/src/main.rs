@@ -14,6 +14,7 @@ use common::block::{Holds, expand, squeeze};
 use common::config::Compress;
 use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
+use common::ids::{ObjectId, RangeId};
 use common::info::{Batch, Described, Expecting, ExtentRow, ObjectName, Shape, StreamRow, UNKNOWN};
 use common::placement::{self, Expansion};
 use common::random::Rng;
@@ -1281,8 +1282,8 @@ fn expecting(text: &Option<String>) -> Result<Expecting> {
         of.parse::<u64>().map_err(|_| Error::new(format!("{what} {of} is not a number")))
     };
     Ok(Expecting::of(ObjectName {
-        range: number("a range", range)? as u32,
-        object: number("an object", object)? as u32,
+        range: RangeId::of_number(number("a range", range)?)?,
+        object: ObjectId::of_number(number("an object", object)?)?,
         created: TimeSec::new(number("a second", created)?),
     }))
 }
@@ -1411,11 +1412,15 @@ fn say(
             // The whole name, since that is what a hint is built from (§8.1.1a-10).
             // ⚠️ Disks, and the ENs serving them, because the two are the same number only
             // while there is one disk per EN (`placement::en_of`).
-            let ens: Vec<u32> = extent.disks.iter().map(|disk| placement::en_of(*disk)).collect();
+            // ⚠️ As numbers, not as `{:?}` — a typed id's `Debug` is `DiskId(0)`, which is right
+            // in a panic and noise in a listing.
+            let disks: Vec<u32> = extent.disks.iter().map(|disk| disk.get()).collect();
+            let ens: Vec<u32> =
+                extent.disks.iter().map(|disk| placement::en_of(*disk).get()).collect();
             println!(
                 "    extent {} of SN{} made in second {}, from record {}, {held}, \
-                 on disks {:?} at ENs {ens:?}",
-                extent.id, extent.sn, extent.created, extent.first_record, extent.disks
+                 on disks {disks:?} at ENs {ens:?}",
+                extent.id, extent.sn, extent.created, extent.first_record
             );
         }
     }

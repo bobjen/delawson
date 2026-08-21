@@ -5,6 +5,7 @@ pub mod block;
 pub mod config;
 pub mod crc;
 pub mod framing;
+pub mod ids;
 pub mod info;
 pub mod log;
 pub mod logread;

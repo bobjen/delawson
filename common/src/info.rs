@@ -12,6 +12,7 @@
 //! One shape, built and read here, makes that a compile error instead.
 
 use crate::framing::Framing;
+use crate::ids::{DiskId, ExtentId, ObjectId, RangeId, SnId, StreamId};
 use crate::placement::Expansion;
 use crate::time::TimeSec;
 use crate::wire::Arg;
@@ -33,7 +34,7 @@ pub struct Described {
     /// extent, seal one, locate a record — keys a stream at the SN by
     /// `(RangeId, StreamId, CreateSec)`, and the DN is the only tier holding all three.
     pub stream: StreamName,
-    pub sn: u32,
+    pub sn: SnId,
     pub keyed: bool,
     pub framing: Framing,
     /// The object-local number of that stream's first record, which is what makes
@@ -69,7 +70,7 @@ impl Described {
         let mut args = self.object.args();
         args.extend(self.stream.args());
         args.extend([
-            Arg::Number(self.sn as u64),
+            Arg::Number(self.sn.number()),
             Arg::Flag(self.keyed),
             Arg::Number(kind),
             Arg::Number(width),
@@ -96,14 +97,14 @@ impl Described {
         };
         // ⚠️ A zero *object id* is what marks a missing name, not a zero range: range 0 is a real
         // range, and an id is minted from one so it is never zero for a thing that exists.
-        if object.object == 0 {
+        if object.object.is_none() {
             return Ok((None, rest));
         }
         Ok((
             Some(Described {
                 object,
                 stream,
-                sn: *sn as u32,
+                sn: SnId::of_number(*sn)?,
                 keyed: *keyed,
                 framing: Framing::of_wire(*kind, *width)?,
                 first_record: *first_record,
@@ -205,12 +206,12 @@ impl Shape {
 /// **Sixteen bytes, like a GUID, and §17.34 measures the difference**: a list of these compresses
 /// where a list of GUIDs cannot, and they carry fields a GUID would need stored beside it.
 macro_rules! name {
-    ($name:ident, $minter:ident, $what:ident, $mints:literal) => {
+    ($name:ident, $minter:ident, $minted:ty, $what:ident, $what_ty:ty, $mints:literal) => {
         #[doc = concat!("What names one of ", $mints, " for ever.")]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
         pub struct $name {
-            pub $minter: u32,
-            pub $what: u32,
+            pub $minter: $minted,
+            pub $what: $what_ty,
             pub created: TimeSec,
         }
 
@@ -219,8 +220,8 @@ macro_rules! name {
 
             pub fn args(&self) -> Vec<Arg> {
                 vec![
-                    Arg::Number(self.$minter as u64),
-                    Arg::Number(self.$what as u64),
+                    Arg::Number(self.$minter.number()),
+                    Arg::Number(self.$what.number()),
                     Arg::Number(self.created.number()),
                 ]
             }
@@ -234,8 +235,8 @@ macro_rules! name {
                     )));
                 };
                 let name = $name {
-                    $minter: *minter as u32,
-                    $what: *id as u32,
+                    $minter: <$minted>::of_number(*minter)?,
+                    $what: <$what_ty>::of_number(*id)?,
                     created: TimeSec::new(*created),
                 };
                 Ok((name, rest))
@@ -257,8 +258,8 @@ macro_rules! name {
 // ⚠️ **Scoped to the range and not to the DN**, both of them, because #75 makes the range the
 // durable key precisely so it can move between DNs. `routing::range_of_dn` stands in until ranges
 // exist. And ⚠️ **`range` is not `sn`**: the range is *whose* a thing is, the SN is *where* it lives.
-name!(ObjectName, range, object, "an object");
-name!(StreamName, range, stream, "a stream");
+name!(ObjectName, range, RangeId, object, ObjectId, "an object");
+name!(StreamName, range, RangeId, stream, StreamId, "a stream");
 
 /// What a caller believes it is addressing, when it has an opinion.
 ///
@@ -287,7 +288,7 @@ impl Expecting {
     }
 
     pub fn asked(&self) -> bool {
-        self.0.object != 0
+        self.0.object.is_some()
     }
 
     pub fn args(&self) -> Vec<Arg> {
@@ -413,8 +414,8 @@ impl Totals {
 /// One of an object's streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamRow {
-    pub stream: u64,
-    pub sn: u32,
+    pub stream: StreamId,
+    pub sn: SnId,
     /// The object-local number of this stream's first record.
     pub first_record: u64,
     /// Records in it once sealed, and **`UNKNOWN` while it is the one being appended
@@ -436,8 +437,8 @@ impl StreamRow {
 
     pub fn args(&self) -> Vec<Arg> {
         let mut args = vec![
-            Arg::Number(self.stream),
-            Arg::Number(self.sn as u64),
+            Arg::Number(self.stream.number()),
+            Arg::Number(self.sn.number()),
             Arg::Number(self.first_record),
             Arg::Number(self.records),
             Arg::Number(self.created.number()),
@@ -465,8 +466,8 @@ impl StreamRow {
         };
         Ok((
             StreamRow {
-                stream: *stream,
-                sn: *sn as u32,
+                stream: StreamId::of_number(*stream)?,
+                sn: SnId::of_number(*sn)?,
                 first_record: *first_record,
                 records: *records,
                 created: TimeSec::new(*created),
@@ -502,8 +503,8 @@ impl StreamRow {
 pub struct ExtentRow {
     /// The SN that created it, which with the id and the second is its whole name
     /// (§4.6.3) — and the second is what makes a stale hint fail loudly.
-    pub sn: u32,
-    pub id: u64,
+    pub sn: SnId,
+    pub id: ExtentId,
     pub created: TimeSec,
     /// Its first record. **Stream-local from the SN, object-local once the FE has
     /// converted it** (§17.16.2 is what happens when that is skipped).
@@ -527,7 +528,7 @@ pub struct ExtentRow {
     /// (§4.3.2).
     /// The **disks** holding its instances, primary first. ⚠️ Disks rather than ENs — see
     /// `placement::en_of` for why, and for the lookup that turns one into a process.
-    pub disks: Vec<u32>,
+    pub disks: Vec<DiskId>,
 }
 
 impl ExtentRow {
@@ -537,8 +538,8 @@ impl ExtentRow {
 
     pub fn args(&self) -> Vec<Arg> {
         let mut args = vec![
-            Arg::Number(self.sn as u64),
-            Arg::Number(self.id),
+            Arg::Number(self.sn.number()),
+            Arg::Number(self.id.number()),
             Arg::Number(self.created.number()),
             Arg::Number(self.first_record),
             Arg::Number(self.records),
@@ -546,7 +547,7 @@ impl ExtentRow {
             Arg::Number(self.length),
             Arg::Number(self.disks.len() as u64),
         ];
-        args.extend(self.disks.iter().map(|disk| Arg::Number(*disk as u64)));
+        args.extend(self.disks.iter().map(|disk| Arg::Number(disk.number())));
         args
     }
 
@@ -576,14 +577,14 @@ impl ExtentRow {
         let mut disks = Vec::with_capacity(count);
         for one in given {
             match one {
-                Arg::Number(disk) => disks.push(*disk as u32),
+                Arg::Number(disk) => disks.push(DiskId::of_number(*disk)?),
                 _ => return Err(Error::new("an instance list is numbers")),
             }
         }
         Ok((
             ExtentRow {
-                sn: *sn as u32,
-                id: *id,
+                sn: SnId::of_number(*sn)?,
+                id: ExtentId::of_number(*id)?,
                 created: TimeSec::new(*created),
                 first_record: *first_record,
                 records: *records,
@@ -754,7 +755,7 @@ pub struct ExtentRun {
     /// Which stream this run is about. ⚠️ **Named rather than positional**, so a batch
     /// answer says what it is answering instead of relying on the order matching the
     /// question — §17.19's defect was exactly that assumption.
-    pub stream: u64,
+    pub stream: StreamId,
     /// What the stream has come to, which the SN is the authority for and the DN caches
     /// (§17.25.1). Includes the extent count, whether or not the rows are all here.
     pub totals: Totals,
@@ -767,7 +768,7 @@ pub struct ExtentRun {
 
 impl ExtentRun {
     pub fn args(&self) -> Vec<Arg> {
-        let mut args = vec![Arg::Number(self.stream)];
+        let mut args = vec![Arg::Number(self.stream.number())];
         args.extend(self.totals.args());
         args.push(Arg::Number(self.given));
         args.push(Arg::Number(self.next));
@@ -782,7 +783,10 @@ impl ExtentRun {
         let [Arg::Number(given), Arg::Number(next), rest @ ..] = rest else {
             return Err(Error::new("that answer did not say what run of extents it was"));
         };
-        Ok((ExtentRun { stream: *stream, totals, given: *given, next: *next }, rest))
+        Ok((
+            ExtentRun { stream: StreamId::of_number(*stream)?, totals, given: *given, next: *next },
+            rest,
+        ))
     }
 
     /// Every run in a batch answer, each followed by its own rows.
@@ -803,10 +807,19 @@ mod tests {
     use super::*;
 
     fn one(id: u32) -> Described {
+        let id = ObjectId::new(id);
         Described {
-            object: ObjectName { range: 2, object: id, created: TimeSec::new(1_000_000) },
-            stream: StreamName { range: 2, stream: 17, created: TimeSec::new(1_000_000) },
-            sn: 3,
+            object: ObjectName {
+                range: RangeId::new(2),
+                object: id,
+                created: TimeSec::new(1_000_000),
+            },
+            stream: StreamName {
+                range: RangeId::new(2),
+                stream: StreamId::new(17),
+                created: TimeSec::new(1_000_000),
+            },
+            sn: SnId::new(3),
             keyed: false,
             framing: Framing::Lf,
             first_record: 400,
@@ -877,9 +890,10 @@ mod tests {
     }
 
     fn stream(stream: u64, first_record: u64, records: u64) -> StreamRow {
+        let stream = StreamId::of_number(stream).expect("a stream");
         StreamRow {
             stream,
-            sn: 0,
+            sn: SnId::new(0),
             first_record,
             records,
             created: TimeSec::new(1_000_000),
@@ -934,14 +948,14 @@ mod tests {
 
     fn extent(id: u64, first_record: u64, records: u64) -> ExtentRow {
         ExtentRow {
-            sn: 2,
-            id,
+            sn: SnId::new(2),
+            id: ExtentId::of_number(id).expect("an extent"),
             created: TimeSec::new(1_000_000),
             first_record,
             records,
             logical: if records == UNKNOWN { UNKNOWN } else { records * 100 },
             length: if records == UNKNOWN { UNKNOWN } else { records * 10 },
-            disks: vec![3, 1, 0, 2],
+            disks: vec![DiskId::new(3), DiskId::new(1), DiskId::new(0), DiskId::new(2)],
         }
     }
 
@@ -950,7 +964,7 @@ mod tests {
     #[test]
     fn a_run_of_extents_survives_the_wire() {
         let totals = Totals { extents: 5, logical: 900, compressed: 300 };
-        let run = ExtentRun { stream: 7, totals, given: 2, next: 90 };
+        let run = ExtentRun { stream: StreamId::new(7), totals, given: 2, next: 90 };
         let rows = vec![extent(1, 0, 40), extent(2, 40, 50)];
         let mut args = run.args();
         for row in &rows {
@@ -961,7 +975,11 @@ mod tests {
         let (given, rest) = ExtentRow::some_of_args(rest, back.given).expect("extents");
         assert_eq!(given, rows);
         assert!(rest.is_empty());
-        assert_eq!(given[0].disks, vec![3, 1, 0, 2], "primary first, in order");
+        assert_eq!(
+            given[0].disks,
+            vec![DiskId::new(3), DiskId::new(1), DiskId::new(0), DiskId::new(2)],
+            "primary first, in order"
+        );
     }
 
     /// Instance lists of different lengths in one answer, which is what erasure
@@ -969,8 +987,18 @@ mod tests {
     #[test]
     fn extents_may_carry_different_numbers_of_instances() {
         let mut wide = extent(1, 0, 40);
-        wide.disks = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
-        let narrow = ExtentRow { disks: vec![9], ..extent(2, 40, 50) };
+        wide.disks = vec![
+            DiskId::new(0),
+            DiskId::new(1),
+            DiskId::new(2),
+            DiskId::new(3),
+            DiskId::new(4),
+            DiskId::new(5),
+            DiskId::new(6),
+            DiskId::new(7),
+            DiskId::new(8),
+        ];
+        let narrow = ExtentRow { disks: vec![DiskId::new(9)], ..extent(2, 40, 50) };
         let mut args = Vec::new();
         args.extend(wide.args());
         args.extend(narrow.args());
@@ -1017,7 +1045,11 @@ mod tests {
     /// path means; a caller with one gets an error rather than a different object.
     #[test]
     fn an_expectation_holds_only_for_the_object_it_names() {
-        let mine = ObjectName { range: 2, object: 7, created: TimeSec::new(1_000_000) };
+        let mine = ObjectName {
+            range: RangeId::new(2),
+            object: ObjectId::new(7),
+            created: TimeSec::new(1_000_000),
+        };
         assert!(Expecting::whatever().holds(mine), "no opinion, so anything");
         assert!(!Expecting::whatever().asked());
         assert!(Expecting::of(mine).holds(mine));
@@ -1025,8 +1057,8 @@ mod tests {
         // ⚠️ Every component, because any one of them differing is a different object — and
         // the second is the one a replacement inside a second will *not* differ in (§17.35.2).
         for other in [
-            ObjectName { range: 3, ..mine },
-            ObjectName { object: 8, ..mine },
+            ObjectName { range: RangeId::new(3), ..mine },
+            ObjectName { object: ObjectId::new(8), ..mine },
             ObjectName { created: TimeSec::new(1_000_001), ..mine },
         ] {
             assert!(!Expecting::of(mine).holds(other), "{other} is not {mine}");
@@ -1037,11 +1069,15 @@ mod tests {
     /// for a name that is not there uses.
     #[test]
     fn a_zero_object_is_no_opinion() {
-        let none = ObjectName { range: 4, object: 0, created: TimeSec::new(9) };
+        let none = ObjectName {
+            range: RangeId::new(4),
+            object: ObjectId::new(0),
+            created: TimeSec::new(9),
+        };
         assert!(!Expecting::of(none).asked(), "a range and a second alone name nothing");
         assert!(Expecting::of(none).holds(ObjectName {
-            range: 0,
-            object: 1,
+            range: RangeId::new(0),
+            object: ObjectId::new(1),
             created: TimeSec::EPOCH
         }));
     }

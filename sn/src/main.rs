@@ -14,6 +14,7 @@
 //! to cope with reuse — an index that has to survive churn is a later problem.
 
 use common::config::{SNConfig, ServiceKind};
+use common::ids::{DiskId, ExtentId, RangeId, SnId, StreamId};
 use common::info::{ExtentRow, ExtentRun, Listing, StreamName, Totals, UNKNOWN};
 use common::offset::{COff, ERoff, LOff, SRoff};
 use common::range::Filled;
@@ -48,7 +49,7 @@ struct Stream {
     /// of an SN's memory** — for a fact that is almost always the stream's own. When
     /// reassignment arrives, the exceptions want an override out of line, not a field
     /// inline on the rule.
-    creator: u32,
+    creator: SnId,
     /// This stream's sealed extents, oldest first, each with the record count it
     /// came to. In record order, because a stream only ever appends — which is what
     /// makes finding the extent holding a record a search rather than a scan.
@@ -131,7 +132,7 @@ struct Extent {
     /// ⚠️ **`u32`, and safe because the id was never the name.** An extent is
     /// `(SN, id, second)` (§4.6.3), so an id only has to be unique among the extents one
     /// SN makes in one second — which 4.3 × 10^9 is not close to (§17.29.2).
-    id: u32,
+    id: ExtentId,
     /// Records it holds, and **zero until it is sealed**, because until then the count
     /// grows with every append. `ERoff`, so it cannot be handed to anything counting a
     /// stream's or an object's records — and 32-bit because an extent seals at 32 MB
@@ -146,7 +147,7 @@ struct Extent {
     /// disk can move between ENs, so which EN to ask is a lookup and not this number —
     /// see `placement::en_of`, which is an identity function only because the code still
     /// runs one disk per EN (§17.29.3).
-    disks: Vec<u32>,
+    disks: Vec<DiskId>,
 }
 
 /// An extent **as one stream holds it**: the extent, and where its records start in that
@@ -171,12 +172,12 @@ impl Extent {
     /// the whole of §17.29.1 in one signature: position is the stream's to say.
     fn args(&self, first: SRoff) -> Vec<Arg> {
         let mut args = vec![
-            Arg::Number(self.id as u64),
+            Arg::Number(self.id.number()),
             Arg::Number(self.created.number()),
             Arg::Number(first.number()),
             Arg::Number(self.records.number()),
         ];
-        args.extend(self.disks.iter().map(|disk| Arg::Number(*disk as u64)));
+        args.extend(self.disks.iter().map(|disk| Arg::Number(disk.number())));
         args
     }
 }
@@ -219,18 +220,18 @@ impl Naming {
     /// already used is refused rather than quietly moved forward: the second is
     /// what selects the key, so reaching back for an earlier one asks for a key
     /// that may since have been retired.
-    fn name(&self, second: TimeSec) -> Result<(u32, TimeSec)> {
+    fn name(&self, second: TimeSec) -> Result<(ExtentId, TimeSec)> {
         // The atomic holds seconds; the check that they only move forward is `TimeSec`'s,
         // so the message is the same wherever a creation second is taken (§17.32).
         let latest = TimeSec::new(self.latest.fetch_max(second.number(), Ordering::Relaxed));
         let second = second.not_before(latest)?;
-        Ok((self.next.fetch_add(1, Ordering::Relaxed) as u32, second))
+        Ok((ExtentId::new(self.next.fetch_add(1, Ordering::Relaxed) as u32), second))
     }
 
     /// Instances for one extent, taken in turn from the ENs there are. Round
     /// robin is not placement — it is blind to fullness and to failure domains —
     /// but it is honest striping until there is a solver to ask.
-    fn disks(&self, ens: &[u32], want: usize) -> Result<Vec<u32>> {
+    fn disks(&self, ens: &[DiskId], want: usize) -> Result<Vec<DiskId>> {
         if ens.len() < want {
             return Err(Error::new(format!(
                 "an extent wants {want} instances, and there are {} ENs",
@@ -250,7 +251,7 @@ struct SN {
     /// parameter list as the worst run of same-typed arguments in the code and passing
     /// this down would have made it one longer. An SN's identity is a property of the
     /// SN, not an argument to its methods.
-    mine: u32,
+    mine: SnId,
     /// ⚠️ **Keyed by the whole name**, `(RangeId, StreamId, CreateSec)`, and not by the id
     /// alone (#109). That is what makes the id safe at 32 bits and what makes recycling one
     /// safe at all: a re-minted id in a later second is a different key, so the old stream is
@@ -270,7 +271,7 @@ fn shard_of(name: StreamName) -> usize {
     // mixed in: streams made together share it, and hashing it would undo the spreading
     // the id gives — and two streams differing only in the second are a recycled id, which
     // is rare by construction (#110).
-    ((name.stream as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (name.range as u64)) as usize
+    (name.stream.number().wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ name.range.number()) as usize
         % SHARDS
 }
 
@@ -316,7 +317,7 @@ impl Service for SN {
 }
 
 impl SN {
-    fn new(config: SNConfig, mine: u32) -> SN {
+    fn new(config: SNConfig, mine: SnId) -> SN {
         SN {
             config,
             mine,
@@ -335,7 +336,7 @@ impl SN {
     fn create(&self, request: &Request) -> Response {
         let (dn, first, count, created) = match request.args.as_slice() {
             [Arg::Number(dn), Arg::Number(first), Arg::Number(count), Arg::Number(created)] => {
-                (*dn as u32, *first, *count, TimeSec::new(*created))
+                (RangeId::new(*dn as u32), *first, *count, TimeSec::new(*created))
             }
             _ => {
                 return Response::error(
@@ -348,7 +349,13 @@ impl SN {
         for n in 0..count {
             // Every stream of the run shares the second, which is what makes the ids have to
             // differ — and they do, being consecutive (#110).
-            let name = StreamName { range: dn, stream: (first + n) as u32, created };
+            let Ok(stream) = StreamId::of_number(first + n) else {
+                return Response::error(
+                    Status::BadRequest,
+                    format!("{} is not a stream", first + n),
+                );
+            };
+            let name = StreamName { range: dn, stream, created };
             let mut shard = self.shards[shard_of(name)].lock().expect("streams");
             shard.insert(
                 name,
@@ -373,8 +380,12 @@ impl SN {
             Ok((name, _)) => name,
             Err(e) => return Response::error(Status::BadRequest, e.to_string()),
         };
-        let ens: Vec<u32> =
-            process.cluster.services_of_kind(ServiceKind::En).map(|en| en.number()).collect();
+        // ⚠️ Disks, and they are EN numbers only while there is one disk per EN (#108).
+        let ens: Vec<DiskId> = process
+            .cluster
+            .services_of_kind(ServiceKind::En)
+            .map(|en| DiskId::new(en.number()))
+            .collect();
         match self.open(name, TimeSec::now(), &ens, process.cluster.extents.instances) {
             Ok(placed) => {
                 Response { id: 0, status: Status::Ok, args: placed.extent.args(placed.first) }
@@ -458,7 +469,7 @@ impl SN {
             let Some(held) = shard.get(name) else {
                 return Response::error(Status::NotFound, format!("no {name}"));
             };
-            let (run, rows) = Self::run_of(held, name.stream as u64, *from, room);
+            let (run, rows) = Self::run_of(held, name.stream, *from, room);
             room = room.saturating_sub(rows.len() as u64);
             args.extend(run.args());
             for row in rows {
@@ -469,7 +480,12 @@ impl SN {
     }
 
     /// One stream's run, up to `room` rows.
-    fn run_of(held: &Stream, stream: u64, from: u64, room: u64) -> (ExtentRun, Vec<ExtentRow>) {
+    fn run_of(
+        held: &Stream,
+        stream: StreamId,
+        from: u64,
+        room: u64,
+    ) -> (ExtentRun, Vec<ExtentRow>) {
         // The sealed extents are in record order, so the first to describe is the last
         // one starting at or before `from` — the same rule locate uses to pick one.
         let first = if from == 0 {
@@ -485,7 +501,7 @@ impl SN {
             .take(room as usize)
             .map(|(at, sealed)| ExtentRow {
                 sn: held.creator,
-                id: sealed.extent.id as u64,
+                id: sealed.extent.id,
                 created: sealed.extent.created,
                 first_record: at.number(),
                 records: sealed.records().number(),
@@ -505,7 +521,7 @@ impl SN {
         {
             rows.push(ExtentRow {
                 sn: held.creator,
-                id: open.id as u64,
+                id: open.id,
                 created: open.created,
                 first_record: held.sealed_records.number(),
                 records: UNKNOWN,
@@ -543,25 +559,33 @@ impl SN {
     /// A stream's name, the sealed extent and what it came to: record it and open the next
     /// one, which is one round trip rather than two because whoever saw the seal wants both.
     fn seal(&self, process: &Process, request: &Request) -> Response {
-        let (name, id, came_to) = match StreamName::of_args(&request.args) {
-            Ok((name, [Arg::Number(id), rest @ ..])) => match Filled::of_args(rest) {
-                Ok((came_to, [])) => (name, *id, came_to),
+        let (name, id, came_to): (StreamName, ExtentId, Filled) =
+            match StreamName::of_args(&request.args) {
+                Ok((name, [Arg::Number(id), rest @ ..])) => match Filled::of_args(rest) {
+                    Ok((came_to, [])) => match ExtentId::of_number(*id) {
+                        Ok(id) => (name, id, came_to),
+                        Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                    },
+                    _ => {
+                        return Response::error(
+                            Status::BadRequest,
+                            "seal-extent takes a stream's name, an extent and what it came to",
+                        );
+                    }
+                },
                 _ => {
                     return Response::error(
                         Status::BadRequest,
-                        "seal-extent takes a stream's name, an extent and what it came to",
+                        "seal-extent takes a DnId, a StreamId, an extent and what it came to",
                     );
                 }
-            },
-            _ => {
-                return Response::error(
-                    Status::BadRequest,
-                    "seal-extent takes a DnId, a StreamId, an extent and what it came to",
-                );
-            }
-        };
-        let ens: Vec<u32> =
-            process.cluster.services_of_kind(ServiceKind::En).map(|en| en.number()).collect();
+            };
+        // ⚠️ Disks, and they are EN numbers only while there is one disk per EN (#108).
+        let ens: Vec<DiskId> = process
+            .cluster
+            .services_of_kind(ServiceKind::En)
+            .map(|en| DiskId::new(en.number()))
+            .collect();
         match self.close(
             name,
             id,
@@ -590,10 +614,10 @@ impl SN {
     fn close(
         &self,
         name: StreamName,
-        id: u64,
+        id: ExtentId,
         came_to: Filled,
         second: TimeSec,
-        ens: &[u32],
+        ens: &[DiskId],
         instances: usize,
         per_stream: usize,
     ) -> std::result::Result<Placed, Full> {
@@ -603,7 +627,7 @@ impl SN {
         };
         // Only whoever names the open extent seals it. Two appends can find the same
         // extent full at once, and the second one has nothing left to do.
-        if held.open.as_ref().is_some_and(|open| open.id as u64 == id) {
+        if held.open.as_ref().is_some_and(|open| open.id == id) {
             let extent = held.open.take().expect("an open extent");
             // ⚠️ Accumulated rather than computed from a stored base, which is the same
             // change one level down: the running total is the stream's (§17.29.1).
@@ -631,7 +655,7 @@ impl SN {
         &self,
         name: StreamName,
         second: TimeSec,
-        ens: &[u32],
+        ens: &[DiskId],
         instances: usize,
     ) -> std::result::Result<Placed, Full> {
         let mut shard = self.shards[shard_of(name)].lock().expect("streams");
@@ -660,7 +684,7 @@ impl SN {
         &self,
         held: &mut Stream,
         second: TimeSec,
-        ens: &[u32],
+        ens: &[DiskId],
         instances: usize,
     ) -> Result<Placed> {
         // Where the open extent starts is the stream's running total, whether the extent
@@ -680,7 +704,10 @@ impl SN {
 
 fn main() {
     let result = server::main(|process| {
-        Ok(SN::new(SNConfig::load(&process.config.service_config)?, process.entry.number()))
+        Ok(SN::new(
+            SNConfig::load(&process.config.service_config)?,
+            SnId::new(process.entry.number()),
+        ))
     });
     if let Err(e) = result {
         eprintln!("sn: {e}");
@@ -749,11 +776,11 @@ mod tests {
     const MADE: TimeSec = TimeSec::new(1_000_000);
 
     fn named(range: u32, stream: u32) -> StreamName {
-        StreamName { range, stream, created: MADE }
+        StreamName { range: RangeId::new(range), stream: StreamId::new(stream), created: MADE }
     }
 
     fn sn_with_stream(dn: u32, stream: u64) -> SN {
-        let sn = SN::new(testing::sn_config(), 0);
+        let sn = SN::new(testing::sn_config(), SnId::new(0));
         let made = sn.create(
             &Request::new(Op::CreateStream)
                 .number(dn as u64)
@@ -768,7 +795,7 @@ mod tests {
     #[test]
     fn a_stream_opens_one_extent_however_often_it_is_asked() {
         let sn = sn_with_stream(0, 7);
-        let ens = [0, 1, 2, 3];
+        let ens = [DiskId::new(0), DiskId::new(1), DiskId::new(2), DiskId::new(3)];
         let want = testing::extents().instances;
         let first = sn.open(named(0, 7), TimeSec::new(1_000_000), &ens, want).unwrap();
         let again = sn.open(named(0, 7), TimeSec::new(1_000_001), &ens, want).unwrap();
@@ -779,8 +806,16 @@ mod tests {
 
     #[test]
     fn an_extent_on_a_stream_that_does_not_exist_is_refused() {
-        let sn = SN::new(testing::sn_config(), 0);
-        assert!(sn.open(named(0, 7), TimeSec::new(1_000_000), &[0, 1, 2, 3], 4).is_err());
+        let sn = SN::new(testing::sn_config(), SnId::new(0));
+        assert!(
+            sn.open(
+                named(0, 7),
+                TimeSec::new(1_000_000),
+                &[DiskId::new(0), DiskId::new(1), DiskId::new(2), DiskId::new(3)],
+                4
+            )
+            .is_err()
+        );
     }
 
     /// Sealing records what the extent came to and names the next one, whose
@@ -788,7 +823,7 @@ mod tests {
     #[test]
     fn sealing_starts_the_next_extent_where_the_last_one_stopped() {
         let sn = sn_with_stream(0, 7);
-        let ens = [0, 1, 2, 3];
+        let ens = [DiskId::new(0), DiskId::new(1), DiskId::new(2), DiskId::new(3)];
         let want = testing::extents().instances;
         // ⚠️ Asserted on the *stream*, because an extent no longer carries where it starts
         // (§17.29.1) — which is the point: the running total is the stream's, and testing it
@@ -800,7 +835,7 @@ mod tests {
         let second = sn
             .close(
                 named(0, 7),
-                first.extent.id as u64,
+                first.extent.id,
                 came(12, 400),
                 TimeSec::new(1_000_001),
                 &ens,
@@ -814,7 +849,7 @@ mod tests {
         let third = sn
             .close(
                 named(0, 7),
-                second.extent.id as u64,
+                second.extent.id,
                 came(5, 90),
                 TimeSec::new(1_000_002),
                 &ens,
@@ -856,7 +891,7 @@ mod tests {
     #[test]
     fn the_open_extent_answers_with_where_it_starts_in_the_stream() {
         let sn = sn_with_stream(0, 7);
-        let ens = [0, 1, 2, 3];
+        let ens = [DiskId::new(0), DiskId::new(1), DiskId::new(2), DiskId::new(3)];
         let want = testing::extents().instances;
         let first = sn.open(named(0, 7), TimeSec::new(1_000_000), &ens, want).unwrap();
         assert_eq!(first.first, SRoff::ZERO, "the first extent starts the stream");
@@ -864,7 +899,7 @@ mod tests {
         // Seal it with twelve records, so the next one does not start at zero.
         sn.close(
             named(0, 7),
-            first.extent.id as u64,
+            first.extent.id,
             came(12, 400),
             TimeSec::new(1_000_001),
             &ens,
@@ -890,13 +925,13 @@ mod tests {
     #[test]
     fn sealing_an_extent_that_is_already_gone_gives_the_one_that_replaced_it() {
         let sn = sn_with_stream(0, 7);
-        let ens = [0, 1, 2, 3];
+        let ens = [DiskId::new(0), DiskId::new(1), DiskId::new(2), DiskId::new(3)];
         let want = testing::extents().instances;
         let first = sn.open(named(0, 7), TimeSec::new(1_000_000), &ens, want).unwrap();
         let second = sn
             .close(
                 named(0, 7),
-                first.extent.id as u64,
+                first.extent.id,
                 came(4, 100),
                 TimeSec::new(1_000_001),
                 &ens,
@@ -909,7 +944,7 @@ mod tests {
         assert_eq!(
             sn.close(
                 named(0, 7),
-                first.extent.id as u64,
+                first.extent.id,
                 came(4, 100),
                 TimeSec::new(1_000_002),
                 &ens,
@@ -922,10 +957,18 @@ mod tests {
             second.extent.id
         );
         assert_eq!(
-            sn.close(named(0, 7), 999, came(0, 0), TimeSec::new(1_000_003), &ens, want, ROOMY)
-                .unwrap()
-                .extent
-                .id,
+            sn.close(
+                named(0, 7),
+                ExtentId::new(999),
+                came(0, 0),
+                TimeSec::new(1_000_003),
+                &ens,
+                want,
+                ROOMY
+            )
+            .unwrap()
+            .extent
+            .id,
             second.extent.id
         );
         assert_eq!(sn.sealed.load(Ordering::Relaxed), 1, "sealed once");
@@ -937,13 +980,13 @@ mod tests {
     #[test]
     fn sealing_the_same_extent_twice_opens_one_extent() {
         let sn = sn_with_stream(0, 7);
-        let ens = [0, 1, 2, 3];
+        let ens = [DiskId::new(0), DiskId::new(1), DiskId::new(2), DiskId::new(3)];
         let want = testing::extents().instances;
         let first = sn.open(named(0, 7), TimeSec::new(1_000_000), &ens, want).unwrap();
         let second = sn
             .close(
                 named(0, 7),
-                first.extent.id as u64,
+                first.extent.id,
                 came(4, 100),
                 TimeSec::new(1_000_001),
                 &ens,
@@ -954,7 +997,7 @@ mod tests {
         let repeat = sn
             .close(
                 named(0, 7),
-                first.extent.id as u64,
+                first.extent.id,
                 came(4, 100),
                 TimeSec::new(1_000_002),
                 &ens,
@@ -971,7 +1014,7 @@ mod tests {
     #[test]
     fn a_stream_seals_once_it_has_its_extents() {
         let sn = sn_with_stream(0, 7);
-        let ens = [0, 1, 2, 3];
+        let ens = [DiskId::new(0), DiskId::new(1), DiskId::new(2), DiskId::new(3)];
         let want = testing::extents().instances;
         // Room for two extents, so the second seal fills the stream.
         let two = 2;
@@ -979,7 +1022,7 @@ mod tests {
         let second = sn
             .close(
                 named(0, 7),
-                first.extent.id as u64,
+                first.extent.id,
                 came(10, 100),
                 TimeSec::new(1_000_001),
                 &ens,
@@ -992,7 +1035,7 @@ mod tests {
         let full = sn
             .close(
                 named(0, 7),
-                second.extent.id as u64,
+                second.extent.id,
                 came(7, 70),
                 TimeSec::new(1_000_002),
                 &ens,
@@ -1015,13 +1058,13 @@ mod tests {
     #[test]
     fn a_record_is_found_in_the_extent_holding_it() {
         let sn = sn_with_stream(0, 7);
-        let ens = [0, 1, 2, 3];
+        let ens = [DiskId::new(0), DiskId::new(1), DiskId::new(2), DiskId::new(3)];
         let want = testing::extents().instances;
         let first = sn.open(named(0, 7), TimeSec::new(1_000_000), &ens, want).unwrap();
         let second = sn
             .close(
                 named(0, 7),
-                first.extent.id as u64,
+                first.extent.id,
                 came(3, 60),
                 TimeSec::new(1_000_001),
                 &ens,
@@ -1032,7 +1075,7 @@ mod tests {
         let third = sn
             .close(
                 named(0, 7),
-                second.extent.id as u64,
+                second.extent.id,
                 came(2, 40),
                 TimeSec::new(1_000_002),
                 &ens,
@@ -1055,12 +1098,12 @@ mod tests {
         };
         // Records 0 to 2 are in the first extent, 3 and 4 in the second, and
         // anything from 5 on is routed to the one still open.
-        assert_eq!(holds(0), first.extent.id as u64);
-        assert_eq!(holds(2), first.extent.id as u64);
-        assert_eq!(holds(3), second.extent.id as u64);
-        assert_eq!(holds(4), second.extent.id as u64);
-        assert_eq!(holds(5), third.extent.id as u64);
-        assert_eq!(holds(500), third.extent.id as u64, "the EN says whether it is really there");
+        assert_eq!(holds(0), first.extent.id.number());
+        assert_eq!(holds(2), first.extent.id.number());
+        assert_eq!(holds(3), second.extent.id.number());
+        assert_eq!(holds(4), second.extent.id.number());
+        assert_eq!(holds(5), third.extent.id.number());
+        assert_eq!(holds(500), third.extent.id.number(), "the EN says whether it is really there");
     }
 
     /// A stream with no extent at all has nowhere to look.
@@ -1099,7 +1142,7 @@ mod tests {
     #[test]
     fn instances_are_four_distinct_ens_taken_in_turn() {
         let naming = Naming::new();
-        let ens = [0, 1, 2, 3, 4, 5, 6];
+        let ens: Vec<DiskId> = (0..7).map(DiskId::new).collect();
         for _ in 0..20 {
             let picked = naming.disks(&ens, testing::extents().instances).unwrap();
             assert_eq!(picked.len(), testing::extents().instances);
@@ -1115,15 +1158,22 @@ mod tests {
     #[test]
     fn too_few_ens_is_an_error_not_a_repeat() {
         let naming = Naming::new();
-        assert!(naming.disks(&[0, 1, 2], testing::extents().instances).is_err());
+        assert!(
+            naming
+                .disks(
+                    &[DiskId::new(0), DiskId::new(1), DiskId::new(2)],
+                    testing::extents().instances
+                )
+                .is_err()
+        );
     }
 
     /// The four ENs in the default roster are exactly what an extent needs.
     #[test]
     fn the_test_roster_has_an_extent_worth_of_ens() {
         let cluster = testing::cluster();
-        let ens: Vec<u32> =
-            cluster.services_of_kind(ServiceKind::En).map(|en| en.number()).collect();
+        let ens: Vec<DiskId> =
+            cluster.services_of_kind(ServiceKind::En).map(|en| DiskId::new(en.number())).collect();
         assert_eq!(ens.len(), testing::extents().instances);
         assert!(Naming::new().disks(&ens, testing::extents().instances).is_ok());
     }

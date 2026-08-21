@@ -30,6 +30,8 @@ pub fn hash_of(name: &str) -> u64 {
     hash ^ (hash >> 33)
 }
 
+use crate::ids::{DnId, RangeId};
+
 /// Which range a DN's streams belong to.
 ///
 /// ⚠️ **The identity function, and a placeholder for #75.** A stream is named by
@@ -37,8 +39,8 @@ pub fn hash_of(name: &str) -> u64 {
 /// because a range *moves between DNs* — so once ranges exist this stops being derivable
 /// from a DN at all, and becomes something the DN is told. Everything that needs a `RangeId`
 /// goes through here, so that day is one edit.
-pub fn range_of_dn(dn: u32) -> u32 {
-    dn
+pub fn range_of_dn(dn: DnId) -> RangeId {
+    RangeId::new(dn.get())
 }
 
 /// Which of `count` owners holds a name. Zero owners is not a question this can answer,

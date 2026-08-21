@@ -16,6 +16,7 @@
 
 use common::config::{DNConfig, ServiceKind};
 use common::framing::Framing;
+use common::ids::{DnId, ObjectId, RangeId, SnId, StreamId};
 use common::info::{
     Batch, Described, ExtentRow, ExtentRun, Listing, ObjectName, Shape, StreamName, StreamRow,
     Totals, UNKNOWN, Wanted,
@@ -94,7 +95,7 @@ fn wanted(args: &[Arg], answers: u64) -> Result<Want> {
 /// reads — so detail is an `object-info` feature and not a lookup feature.
 fn describe_at(
     object: &Object,
-    range: u32,
+    range: RangeId,
     record: Option<u64>,
     want: &Want,
     limit: u64,
@@ -120,7 +121,7 @@ enum Answering {
 /// ⚠️ **The counts are exact even when the detail is not** (§9.1.3.2), which is what lets a caller
 /// compute the requests it has not made yet instead of discovering them one answer at a time. The
 /// stream count is the DN's own, so it costs nothing to include and is always right.
-fn detailed(object: &Object, range: u32, want: &Want, limit: u64) -> Option<Levelled> {
+fn detailed(object: &Object, range: RangeId, want: &Want, limit: u64) -> Option<Levelled> {
     let args = object.args(range, None)?;
     if want.detail == 0 {
         return None;
@@ -143,7 +144,7 @@ fn detailed(object: &Object, range: u32, want: &Want, limit: u64) -> Option<Leve
     if want.wants(Detail::Streams) {
         for (at, held) in object.streams_from().skip(first).take(room as usize) {
             rows.push(StreamRow {
-                stream: held.id as u64,
+                stream: held.id,
                 sn: held.sn,
                 first_record: at.number(),
                 // ⚠️ UNKNOWN, not zero: how far the stream being appended to reaches is
@@ -198,7 +199,7 @@ impl Levelled {
     /// ⚠️ **Interleaved rather than two blocks**, so the answer is self-describing: a reader takes a
     /// stream, reads the extents it says follow, and takes the next. Two blocks would need the reader
     /// to attribute extents to streams by position, which is §17.19's defect.
-    fn args(self, mut extents: HashMap<u64, (ExtentRun, Vec<ExtentRow>)>) -> Vec<Arg> {
+    fn args(self, mut extents: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)>) -> Vec<Arg> {
         let mut out = self.shape.args();
         out.extend(self.head);
         for mut row in self.rows {
@@ -227,7 +228,7 @@ struct Object {
     /// the same triple as a stream's and an extent's (§17.35.2). **A path is not part of it**: a
     /// path points at a name and may be repointed as often as a user likes, which is exactly what
     /// a creation second cannot pin and does not have to.
-    id: u32,
+    id: ObjectId,
     /// Where one record ends and the next begins, declared here and never
     /// changed: everything that reads or writes this object's records needs it.
     framing: Framing,
@@ -286,7 +287,7 @@ struct Stream {
     /// precisely because a range moves between DNs — so a DN-scoped id would stop meaning
     /// what it meant the first time its range moved. `dn` stands in for `RangeId` until
     /// ranges exist (#109).
-    id: u32,
+    id: StreamId,
     /// Records in it once sealed, and **`UNKNOWN` while it is the one being appended to**.
     ///
     /// ⚠️ **This one does not go stale, unlike the sizes below.** §4.5's exact record count
@@ -306,7 +307,7 @@ struct Stream {
     /// good enough for the listing these exist for.
     logical: u64,
     compressed: u64,
-    sn: u32,
+    sn: SnId,
     /// Extents in it. `UNKNOWN` is not representable in 32 bits alongside a real count, so
     /// this uses `u32::MAX` and the accessor is what reads it (§8.1.6.2).
     extents: u32,
@@ -314,7 +315,7 @@ struct Stream {
 
 impl Stream {
     /// A stream just handed out: nothing has come to anything yet.
-    fn new(id: u32, sn: u32, created: TimeSec) -> Stream {
+    fn new(id: StreamId, sn: SnId, created: TimeSec) -> Stream {
         Stream {
             id,
             records: UNKNOWN,
@@ -384,7 +385,7 @@ impl Object {
 
     /// What this object is, at one of its streams: the last for an append, or the one
     /// holding a record for a read.
-    fn args(&self, range: u32, record: Option<u64>) -> Option<Vec<Arg>> {
+    fn args(&self, range: RangeId, record: Option<u64>) -> Option<Vec<Arg>> {
         // ⚠️ The position comes back *with* the stream, because the stream does not carry
         // it (§17.33.1) — the same shape as `sn::Placed`, and for the same reason.
         let (first, held) = match record {
@@ -406,7 +407,7 @@ impl Object {
 
     /// This object's name, which is `(RangeId, ObjectId, CreateSec)` and not its path — a path
     /// points at this and may be repointed (§17.35.2).
-    fn named(&self, range: u32) -> ObjectName {
+    fn named(&self, range: RangeId) -> ObjectName {
         ObjectName { range, object: self.id, created: self.created }
     }
 
@@ -491,7 +492,7 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Response) {
     dn.remember(&held.name, &runs);
     let mut extents = 0;
     let mut given = 0;
-    let mut converted: HashMap<u64, (ExtentRun, Vec<ExtentRow>)> = HashMap::new();
+    let mut converted: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)> = HashMap::new();
     for row in &held.rows {
         let Some((run, rows)) = runs.remove(&row.stream) else { continue };
         extents += if run.totals.extents == UNKNOWN { 0 } else { run.totals.extents };
@@ -537,7 +538,7 @@ struct Gather {
     /// Answers still to come. The one that takes it to zero assembles and replies.
     left: usize,
     /// What each SN said, keyed by stream so nothing depends on the order they return in.
-    runs: HashMap<u64, (ExtentRun, Vec<ExtentRow>)>,
+    runs: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)>,
     /// Set when any SN refused, so the whole answer fails rather than silently omitting extents
     /// the caller asked for.
     failed: Option<Response>,
@@ -561,7 +562,7 @@ struct DN {
     /// ⚠️ **Held here rather than threaded through**, for §8.1.6.1's reason: a DN's identity is
     /// a property of the DN, not an argument to its methods — and `Object::args` is four call
     /// sites deep from anything holding a `Process`.
-    mine: u32,
+    mine: RangeId,
     shards: Vec<Mutex<HashMap<Box<str>, Object>>>,
     /// How many requests are waiting for an object to have a stream, for `status`.
     parked: AtomicU64,
@@ -710,7 +711,7 @@ impl DN {
         for one in &wanted {
             let mut shard = self.shards[shard_of(&one.name)].lock().expect("objects");
             if !shard.contains_key(one.name.as_str()) {
-                let id = self.next_object.fetch_add(1, Ordering::Relaxed) as u32;
+                let id = ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32);
                 shard.insert(
                     Box::from(one.name.as_str()),
                     Object {
@@ -750,7 +751,8 @@ impl DN {
             .number(created.number());
 
         let dn = Arc::clone(self);
-        let sn_number = process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0);
+        let sn_number =
+            SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
         let named = sn.clone();
         let asked = process.ask(&sn, &ask, move |answer| {
             if answer.status != Status::Ok {
@@ -763,7 +765,11 @@ impl DN {
                 let mut shard = dn.shards[shard_of(name)].lock().expect("objects");
                 if let Some(object) = shard.get_mut(name.as_str()) {
                     let made = object.created;
-                    object.streams.push(Stream::new((first + n as u64) as u32, sn_number, made));
+                    object.streams.push(Stream::new(
+                        StreamId::new((first + n as u64) as u32),
+                        sn_number,
+                        made,
+                    ));
                 }
             }
             dn.objects.fetch_add(count, Ordering::Relaxed);
@@ -810,7 +816,7 @@ impl DN {
                 Some(object) => {
                     // Whoever names the stream that filled is the one that seals it in
                     // the list; the rest are late and have nothing to record.
-                    let ours = object.streams.last().is_some_and(|last| last.id as u64 == sealed);
+                    let ours = object.streams.last().is_some_and(|last| last.id.number() == sealed);
                     if let Some(last) = object.streams.last_mut().filter(|_| ours) {
                         last.records = records;
                     }
@@ -862,7 +868,8 @@ impl DN {
             Ok(sn) => sn.to_string(),
             Err(e) => return reply.send(self.gave_up(&name, Status::Internal, e.to_string())),
         };
-        let sn_number = process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0);
+        let sn_number =
+            SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
         let ask = Request::new(Op::CreateStream)
             .number(process.entry.number() as u64)
             .number(stream)
@@ -882,7 +889,11 @@ impl DN {
             {
                 let mut shard = dn.shards[shard_of(&name)].lock().expect("objects");
                 if let Some(object) = shard.get_mut(name.as_str()) {
-                    object.streams.push(Stream::new(stream as u32, sn_number, TimeSec::now()));
+                    object.streams.push(Stream::new(
+                        StreamId::new(stream as u32),
+                        sn_number,
+                        TimeSec::now(),
+                    ));
                     object.extending = false;
                 }
             }
@@ -1002,10 +1013,11 @@ impl DN {
         // Group by SN, keeping each stream's record to start from.
         // ⚠️ The whole name per stream, not the id: the SN keys streams by
         // `(RangeId, StreamId, CreateSec)` (#109), and the DN is what holds all three.
-        let range = routing::range_of_dn(process.entry.number());
-        let mut by_sn: HashMap<u32, Vec<(StreamName, u64)>> = HashMap::new();
+        // The DN's own range, which it already holds — see `DN::mine`.
+        let range = self.mine;
+        let mut by_sn: HashMap<SnId, Vec<(StreamName, u64)>> = HashMap::new();
         for row in &levelled.rows {
-            let name = StreamName { range, stream: row.stream as u32, created: row.created };
+            let name = StreamName { range, stream: row.stream, created: row.created };
             by_sn.entry(row.sn).or_default().push((name, 0));
         }
         if by_sn.is_empty() {
@@ -1058,7 +1070,7 @@ impl DN {
 
     /// What the SNs said a stream has come to, kept against the next question about it
     /// (§17.25.1). Takes the name's shard lock, so nothing may hold it.
-    fn remember(&self, name: &str, runs: &HashMap<u64, (ExtentRun, Vec<ExtentRow>)>) {
+    fn remember(&self, name: &str, runs: &HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)>) {
         if runs.is_empty() {
             return;
         }
@@ -1067,7 +1079,7 @@ impl DN {
         // about, since the streams it named are going away too.
         let Some(object) = shard.get_mut(name) else { return };
         for held in &mut object.streams {
-            if let Some((run, _)) = runs.get(&(held.id as u64)) {
+            if let Some((run, _)) = runs.get(&held.id) {
                 held.learned(run.totals);
             }
         }
@@ -1220,7 +1232,7 @@ impl DN {
 }
 
 impl DN {
-    fn new(config: DNConfig, mine: u32) -> DN {
+    fn new(config: DNConfig, mine: RangeId) -> DN {
         DN {
             config,
             mine,
@@ -1244,7 +1256,10 @@ struct Piece {
 
 fn main() {
     let result = server::main(|process| {
-        Ok(DN::new(DNConfig::load(&process.config.service_config)?, process.entry.number()))
+        Ok(DN::new(
+            DNConfig::load(&process.config.service_config)?,
+            routing::range_of_dn(DnId::new(process.entry.number())),
+        ))
     });
     if let Err(e) = result {
         eprintln!("dn: {e}");
@@ -1260,7 +1275,7 @@ mod tests {
     /// read from a clock.
     #[test]
     fn two_objects_at_one_path_in_one_second_have_different_names() {
-        let dn = Arc::new(DN::new(testing::dn_config(), 0));
+        let dn = Arc::new(DN::new(testing::dn_config(), RangeId::new(0)));
         let made = TimeSec::new(1_000_000);
         let name_of = |dn: &DN| {
             let shard = dn.shards[shard_of("/p")].lock().unwrap();
@@ -1271,7 +1286,7 @@ mod tests {
             dn.shards[shard_of("/p")].lock().unwrap().insert(
                 Box::from("/p"),
                 Object {
-                    id: dn.next_object.fetch_add(1, Ordering::Relaxed) as u32,
+                    id: ObjectId::new(dn.next_object.fetch_add(1, Ordering::Relaxed) as u32),
                     framing: Framing::Lf,
                     streams: Vec::new(),
                     extending: false,
@@ -1302,7 +1317,7 @@ mod tests {
     fn held(id: u32, sn: u32, records: Option<u64>) -> Stream {
         Stream {
             records: records.unwrap_or(UNKNOWN),
-            ..Stream::new(id, sn, TimeSec::new(1_000_000))
+            ..Stream::new(StreamId::new(id), SnId::new(sn), TimeSec::new(1_000_000))
         }
     }
 
@@ -1344,7 +1359,7 @@ mod tests {
         dn.shards[shard_of(name)].lock().unwrap().insert(
             Box::from(name),
             Object {
-                id: 1,
+                id: ObjectId::new(1),
                 framing: Framing::Lf,
                 streams: Vec::new(),
                 extending: false,
@@ -1360,7 +1375,7 @@ mod tests {
     /// answer from "no object".
     #[test]
     fn an_object_being_made_does_not_look_like_a_finished_one() {
-        let dn = DN::new(testing::dn_config(), 0);
+        let dn = DN::new(testing::dn_config(), RangeId::new(0));
         half_made(&dn, "/half");
         assert!(dn.look("/half").is_none(), "nothing to say about it yet");
         let waits = |name: &str| {
@@ -1386,7 +1401,7 @@ mod tests {
         // (#109), so its id is no longer argument one, and an index would have gone on
         // asserting about whatever moved into that slot.
         let (described, _) = Described::of_args(&args).expect("a row");
-        assert_eq!(described.expect("an object").stream.stream, 7, "its stream");
+        assert_eq!(described.expect("an object").stream.stream, StreamId::new(7), "its stream");
         assert!(!waits("/half"), "and it is no longer half made");
     }
 
@@ -1395,7 +1410,7 @@ mod tests {
     /// behind when it loses the race.
     #[test]
     fn one_name_is_taken_once() {
-        let dn = DN::new(testing::dn_config(), 0);
+        let dn = DN::new(testing::dn_config(), RangeId::new(0));
         let mine = |dn: &DN| {
             let mut taken = Vec::new();
             let name = "/same".to_string();
@@ -1404,7 +1419,7 @@ mod tests {
                 shard.insert(
                     Box::from(name.as_str()),
                     Object {
-                        id: dn.next_object.fetch_add(1, Ordering::Relaxed) as u32,
+                        id: ObjectId::new(dn.next_object.fetch_add(1, Ordering::Relaxed) as u32),
                         framing: Framing::Lf,
                         streams: Vec::new(),
                         extending: false,
@@ -1426,7 +1441,7 @@ mod tests {
     #[test]
     fn an_objects_streams_carry_on_from_one_another() {
         let mut object = Object {
-            id: 1,
+            id: ObjectId::new(1),
             framing: Framing::Lf,
             streams: Vec::new(),
             extending: false,
@@ -1439,23 +1454,23 @@ mod tests {
         object.streams.push(held(2, 0, Some(5)));
         object.streams.push(held(3, 0, None));
 
-        assert_eq!(object.holding(ORoff::new(0)).unwrap().1.id, 1);
-        assert_eq!(object.holding(ORoff::new(9)).unwrap().1.id, 1);
-        assert_eq!(object.holding(ORoff::new(10)).unwrap().1.id, 2);
-        assert_eq!(object.holding(ORoff::new(14)).unwrap().1.id, 2);
-        assert_eq!(object.holding(ORoff::new(15)).unwrap().1.id, 3);
+        assert_eq!(object.holding(ORoff::new(0)).unwrap().1.id, StreamId::new(1));
+        assert_eq!(object.holding(ORoff::new(9)).unwrap().1.id, StreamId::new(1));
+        assert_eq!(object.holding(ORoff::new(10)).unwrap().1.id, StreamId::new(2));
+        assert_eq!(object.holding(ORoff::new(14)).unwrap().1.id, StreamId::new(2));
+        assert_eq!(object.holding(ORoff::new(15)).unwrap().1.id, StreamId::new(3));
         // Past everything sealed goes to the open stream, whose reach is not known
         // here — the SN and EN say whether the record is really there.
-        assert_eq!(object.holding(ORoff::new(1000)).unwrap().1.id, 3);
+        assert_eq!(object.holding(ORoff::new(1000)).unwrap().1.id, StreamId::new(3));
         // And an append always goes to the last.
-        assert_eq!(object.last().unwrap().1.id, 3);
+        assert_eq!(object.last().unwrap().1.id, StreamId::new(3));
         assert!(!object.between_streams());
     }
 
     /// An object with three streams, two sealed and one still growing.
     fn grown() -> Object {
         let mut object = Object {
-            id: 1,
+            id: ObjectId::new(1),
             framing: Framing::Lf,
             streams: Vec::new(),
             extending: false,
@@ -1487,9 +1502,12 @@ mod tests {
     /// baseline.
     #[test]
     fn wanting_nothing_answers_the_bare_row() {
-        assert!(detailed(&grown(), 0, &Want::plain(), 100).is_none(), "nothing levelled to build");
+        assert!(
+            detailed(&grown(), RangeId::new(0), &Want::plain(), 100).is_none(),
+            "nothing levelled to build"
+        );
         let object = grown();
-        match describe_at(&object, 0, None, &Want::plain(), 100).expect("an answer") {
+        match describe_at(&object, RangeId::new(0), None, &Want::plain(), 100).expect("an answer") {
             Answering::Plain(args) => {
                 assert_eq!(args.len(), Described::ARGS);
                 assert!(Described::of_args(&args).expect("a row").0.is_some());
@@ -1504,7 +1522,10 @@ mod tests {
     fn the_counts_are_exact_while_the_detail_is_capped() {
         let want = Want::plain().with(Detail::Streams).with(Detail::Counts);
         // Two entries: one for the object, so room for one stream.
-        let args = flat(detailed(&grown(), 0, &Want { limit: 2, ..want }, 100).expect("an answer"));
+        let args = flat(
+            detailed(&grown(), RangeId::new(0), &Want { limit: 2, ..want }, 100)
+                .expect("an answer"),
+        );
         let (shape, rows) = read_back(&args);
         assert_eq!(shape.streams, 3, "how many there are");
         assert_eq!((shape.given, rows.len()), (1, 1), "how many are described");
@@ -1523,8 +1544,13 @@ mod tests {
         let mut seen = Vec::new();
         for _ in 0..8 {
             let args = flat(
-                detailed(&object, 0, &Want { limit: 2, from: Start::Record(at), ..want }, 100)
-                    .expect("an answer"),
+                detailed(
+                    &object,
+                    RangeId::new(0),
+                    &Want { limit: 2, from: Start::Record(at), ..want },
+                    100,
+                )
+                .expect("an answer"),
             );
             let (shape, rows) = read_back(&args);
             seen.extend(rows.iter().map(|row| row.stream));
@@ -1534,7 +1560,11 @@ mod tests {
             assert!(shape.next > at, "a continuation that does not advance is a livelock");
             at = shape.next;
         }
-        assert_eq!(seen, vec![1, 2, 3], "every stream, once, in order");
+        assert_eq!(
+            seen,
+            vec![StreamId::new(1), StreamId::new(2), StreamId::new(3)],
+            "every stream, once, in order"
+        );
     }
 
     /// The configured cap and the request's cap are both honoured, whichever is
@@ -1544,7 +1574,7 @@ mod tests {
         let want = Want::plain().with(Detail::Streams);
         let given = |asked, configured| {
             let args = flat(
-                detailed(&grown(), 0, &Want { limit: asked, ..want }, configured)
+                detailed(&grown(), RangeId::new(0), &Want { limit: asked, ..want }, configured)
                     .expect("an answer"),
             );
             read_back(&args).0.given
@@ -1560,8 +1590,10 @@ mod tests {
     #[test]
     fn the_growing_stream_says_unknown_and_not_zero() {
         let want = Want::plain().with(Detail::Streams);
-        let args =
-            flat(detailed(&grown(), 0, &Want { limit: 100, ..want }, 100).expect("an answer"));
+        let args = flat(
+            detailed(&grown(), RangeId::new(0), &Want { limit: 100, ..want }, 100)
+                .expect("an answer"),
+        );
         let (_, rows) = read_back(&args);
         assert_eq!(rows[0].records, 100);
         assert_eq!(rows[2].records, UNKNOWN, "the one being appended to");
@@ -1574,7 +1606,7 @@ mod tests {
     #[test]
     fn counts_alone_bring_no_rows_but_say_where_rows_start() {
         let want = Want::plain().with(Detail::Counts);
-        let args = flat(detailed(&grown(), 0, &want, 100).expect("an answer"));
+        let args = flat(detailed(&grown(), RangeId::new(0), &want, 100).expect("an answer"));
         let (shape, rows) = read_back(&args);
         assert_eq!((shape.streams, shape.given, shape.entries), (3, 0, 1));
         assert!(rows.is_empty());
@@ -1584,13 +1616,13 @@ mod tests {
 
     /// A DN holding `count` objects named `/n0`, `/n1`, and so on.
     fn with_objects(count: u64) -> Arc<DN> {
-        let dn = Arc::new(DN::new(testing::dn_config(), 0));
+        let dn = Arc::new(DN::new(testing::dn_config(), RangeId::new(0)));
         for n in 0..count {
             let name = format!("/n{n}");
             dn.shards[shard_of(&name)].lock().unwrap().insert(
                 Box::from(name.as_str()),
                 Object {
-                    id: n as u32 + 1,
+                    id: ObjectId::new(n as u32 + 1),
                     framing: Framing::Lf,
                     streams: vec![held(n as u32 + 1, 0, None)],
                     extending: false,

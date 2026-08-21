@@ -26,6 +26,7 @@
 //! the messages are just length-prefixed.
 
 use crate::config::Messaging;
+use crate::ids::{DiskId, ExtentId, SnId};
 use crate::random::Rng;
 use crate::seal::{self, Seal};
 use crate::time::TimeSec;
@@ -335,15 +336,16 @@ impl Response {
 /// alongside as numbers rather than being worked out from the bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendBlock {
-    pub sn: u32,
-    pub extent: u64,
+    pub sn: SnId,
+    pub extent: ExtentId,
     /// The second the extent was created in, which is part of its name.
     pub created: TimeSec,
     /// What the writer says these bytes contain.
     pub holds: crate::block::Holds,
     /// Instances of the extent, primary first. Empty on the way to a secondary,
     /// which has nothing to broadcast to.
-    pub instances: Vec<u32>,
+    /// The **disks** holding it, primary first (§17.29.3).
+    pub instances: Vec<DiskId>,
     /// The offset the primary chose, on the way to a secondary. None on the way in,
     /// since choosing it is the primary's job.
     pub offset: Option<u64>,
@@ -354,13 +356,13 @@ pub struct AppendBlock {
 impl AppendBlock {
     pub fn request(&self, op: Op) -> Request {
         let mut request = Request::new(op)
-            .number(self.sn as u64)
-            .number(self.extent)
+            .number(self.sn.number())
+            .number(self.extent.number())
             .number(self.created.number());
         request.args.extend(self.holds.args());
         request = request.flag(self.offset.is_some()).number(self.offset.unwrap_or(0));
         for en in &self.instances {
-            request = request.number(*en as u64);
+            request = request.number(en.number());
         }
         request.bytes(self.bytes.clone())
     }
@@ -379,17 +381,17 @@ impl AppendBlock {
             return Err(Error::new("an append carries bytes last"));
         };
         Ok(AppendBlock {
-            sn: *sn as u32,
-            extent: *extent,
+            sn: SnId::of_number(*sn)?,
+            extent: ExtentId::of_number(*extent)?,
             created: TimeSec::new(*created),
             holds,
             instances: instances
                 .iter()
                 .map(|arg| match arg {
-                    Arg::Number(en) => Ok(*en as u32),
+                    Arg::Number(disk) => DiskId::of_number(*disk),
                     _ => Err(Error::new("an instance list is numbers")),
                 })
-                .collect::<Result<Vec<u32>>>()?,
+                .collect::<Result<Vec<DiskId>>>()?,
             offset: has_offset.then_some(*offset),
             bytes: bytes.clone(),
         })
@@ -780,8 +782,8 @@ mod tests {
     #[test]
     fn an_append_survives_the_wire() {
         let block = AppendBlock {
-            sn: 3,
-            extent: 17,
+            sn: SnId::new(3),
+            extent: ExtentId::new(17),
             created: TimeSec::new(1_000_000),
             holds: crate::block::Holds {
                 logical: 10,
@@ -789,7 +791,7 @@ mod tests {
                 open_record: false,
                 crc: Some(0xae8b_1486_0a79_9888),
             },
-            instances: vec![2, 3, 0, 1],
+            instances: vec![DiskId::new(2), DiskId::new(3), DiskId::new(0), DiskId::new(1)],
             offset: None,
             bytes: b"squeezed".to_vec(),
         };

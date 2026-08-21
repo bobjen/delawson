@@ -8,6 +8,7 @@
 //! system is how to violate its own invariant.
 
 use crate::config::{ClusterConfig, ServiceKind};
+use crate::ids::{DiskId, EnId};
 use std::collections::BTreeSet;
 
 pub const EXTENT_INSTANCES: usize = 4;
@@ -24,8 +25,8 @@ pub const EXTENT_INSTANCES: usize = 4;
 /// disk per EN and numbers them the same. Everything that turns an instance into a process
 /// to talk to goes through here, so the real mapping replaces one function rather than being
 /// hunted for (§17.29.3, #108).
-pub fn en_of(disk: u32) -> u32 {
-    disk
+pub fn en_of(disk: DiskId) -> EnId {
+    EnId::new(disk.get())
 }
 
 /// How many bytes of device a stored byte actually costs (Asserted, Bob, 2026-08-20).

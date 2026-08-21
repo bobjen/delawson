@@ -23,6 +23,7 @@ use common::Result;
 use common::block::Holds;
 use common::config::{FEConfig, ServiceKind};
 use common::framing::Framing;
+use common::ids::{DiskId, DnId, ExtentId, SnId};
 use common::info::{Batch, Described, Expecting, Shape, StreamName, UNKNOWN, Wanted};
 use common::logw;
 use common::offset::{ERoff, ORoff, SRoff};
@@ -74,8 +75,8 @@ const COORDINATED: &[Op] = &[Op::AppendRecord, Op::ReadRecord];
 /// An extent, as the SN described it.
 #[derive(Clone)]
 struct Open {
-    sn: u32,
-    id: u64,
+    sn: SnId,
+    id: ExtentId,
     created: TimeSec,
     /// The stream-local number of this extent's first record, which is what turns an
     /// extent-local number into a durable reference.
@@ -86,13 +87,13 @@ struct Open {
     /// The **disks** holding its instances, primary first. ⚠️ Disks rather than ENs: which
     /// EN serves one is a lookup (`placement::en_of`), and the two are the same number only
     /// while there is one disk per EN.
-    disks: Vec<u32>,
+    disks: Vec<DiskId>,
 }
 
 impl Open {
     /// The id, the second, the first record, then the instances, which is the order
     /// the SN answers in.
-    fn of(sn: u32, args: &[Arg]) -> Option<Open> {
+    fn of(sn: SnId, args: &[Arg]) -> Option<Open> {
         let [
             Arg::Number(id),
             Arg::Number(created),
@@ -103,16 +104,16 @@ impl Open {
         else {
             return None;
         };
-        let disks: Vec<u32> = instances
+        let disks: Vec<DiskId> = instances
             .iter()
             .filter_map(|arg| match arg {
-                Arg::Number(disk) => Some(*disk as u32),
+                Arg::Number(disk) => DiskId::of_number(*disk).ok(),
                 _ => None,
             })
             .collect();
         (!disks.is_empty()).then_some(Open {
             sn,
-            id: *id,
+            id: ExtentId::of_number(*id).ok()?,
             created: TimeSec::new(*created),
             first_record: *first_record,
             records: *records,
@@ -173,7 +174,7 @@ impl Stream {
     /// `sealed` is `(extent, records)` when the caller has just been told that extent
     /// filled up. Remembering it here rather than forgetting it is what lets a read of
     /// those records skip the SN afterwards.
-    fn plan(&mut self, sealed: Option<(u64, u64)>) -> Plan {
+    fn plan(&mut self, sealed: Option<(ExtentId, u64)>) -> Plan {
         let stale = sealed.map(|(id, _)| id);
         if self.open.is_some() && self.open.as_ref().map(|open| open.id) != stale {
             // Either nothing has filled, or somebody has already replaced what did.
@@ -329,7 +330,8 @@ impl FE {
         };
         // The DN that answers is the one that owns the name, so its number is half
         // of the stream's name.
-        let owner = process.cluster.service(&dn).map(|entry| entry.number()).unwrap_or(0);
+        let owner =
+            DnId::new(process.cluster.service(&dn).map(|entry| entry.number()).unwrap_or(0));
 
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
@@ -364,7 +366,7 @@ impl FE {
             };
             // A create takes the name first and names the stream afterwards, so a
             // zero here is an object caught between the two.
-            if located.stream.stream == 0 {
+            if located.stream.stream.is_none() {
                 return reply
                     .send(Response::error(Status::Internal, format!("{path} has no stream yet")));
             }
@@ -455,7 +457,7 @@ impl FE {
         self: &Arc<Self>,
         process: &Arc<Process>,
         wanting: Wanting,
-        sealed: Option<(u64, Filled)>,
+        sealed: Option<(ExtentId, Filled)>,
     ) {
         let key = wanting.located.stream;
         // ⚠️ Deciding and waiting under one lock. With the lock released in between,
@@ -641,7 +643,7 @@ impl FE {
         let dn = format!("DN{}", located.dn);
         let ask = Request::new(Op::ExtendObject)
             .text(&path)
-            .number(located.stream.stream as u64)
+            .number(located.stream.stream.number())
             .number(*records);
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
@@ -790,14 +792,14 @@ impl FE {
 
 /// What to ask the SN for the next extent: open one, or report the one that filled
 /// and get its replacement in the same round trip.
-fn wanting_extent(key: StreamName, sealed: Option<(u64, Filled)>) -> Request {
+fn wanting_extent(key: StreamName, sealed: Option<(ExtentId, Filled)>) -> Request {
     let mut request = Request::new(match sealed {
         None => Op::OpenExtent,
         Some(_) => Op::SealExtent,
     });
     request.args.extend(key.args());
     if let Some((id, came_to)) = sealed {
-        request.args.push(Arg::Number(id));
+        request.args.push(Arg::Number(id.number()));
         request.args.extend(came_to.args());
     }
     request
@@ -808,7 +810,7 @@ fn make_object(
     fe: &Arc<FE>,
     process: &Arc<Process>,
     dn: &str,
-    owner: u32,
+    owner: DnId,
     path: &str,
     framing: Framing,
     again: bool,
@@ -846,7 +848,7 @@ fn make_object(
         let Some(located) = Located::of(owner, &answer.args) else {
             return reply.send(Response::error(Status::Internal, "that create made no object"));
         };
-        if located.stream.stream == 0 {
+        if located.stream.stream.is_none() {
             return reply.send(Response::error(Status::Internal, "that object has no stream"));
         }
         then(&fe, &onward, located, reply);
@@ -885,8 +887,8 @@ fn from_instance(
     // tail, so what the EN says about its own blocks is the whole answer.
     let sealed = open.records > 0;
     let mut ask = Request::new(Op::ReadExtent)
-        .number(open.sn as u64)
-        .number(open.id)
+        .number(open.sn.number())
+        .number(open.id.number())
         .number(open.created.number());
     ask.args.extend(Range { start: Start::Record(at.number()), budget }.args());
     let named = identity.clone();
@@ -997,7 +999,7 @@ fn receipt(located: &Located, open: &Open, answer: Response) -> Response {
         id: 0,
         status: Status::Ok,
         args: vec![
-            Arg::Number(located.stream.stream as u64),
+            Arg::Number(located.stream.stream.number()),
             Arg::Number(in_stream),
             Arg::Number(located.first_record + in_stream),
             Arg::Number(*records),
@@ -1013,10 +1015,10 @@ fn receipt(located: &Located, open: &Open, answer: Response) -> Response {
 /// its records are framed.
 #[derive(Clone, Copy)]
 struct Located {
-    dn: u32,
+    dn: DnId,
     /// The stream's whole name, which is what the SN keys by (#109).
     stream: StreamName,
-    sn: u32,
+    sn: SnId,
     framing: Framing,
     /// The object-local number of this stream's first record, which is what turns a
     /// record number the user gave into one the stream knows.
@@ -1024,7 +1026,7 @@ struct Located {
 }
 
 impl Located {
-    fn of(dn: u32, args: &[Arg]) -> Option<Located> {
+    fn of(dn: DnId, args: &[Arg]) -> Option<Located> {
         let (described, rest) = Described::of_args(args).ok()?;
         let described = described?;
         rest.is_empty().then_some(Located {
@@ -1577,6 +1579,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::ids::{ObjectId, RangeId, StreamId};
     use common::info::{ObjectName, StreamRow, Totals};
 
     fn dns(count: usize) -> Vec<String> {
@@ -1654,9 +1657,17 @@ mod tests {
         let mut args = shape.args();
         args.extend(
             Described {
-                object: ObjectName { range: 0, object: 1, created: TimeSec::EPOCH },
-                stream: StreamName { range: 0, stream: 1, created: TimeSec::new(1_000_000) },
-                sn: 0,
+                object: ObjectName {
+                    range: RangeId::new(0),
+                    object: ObjectId::new(1),
+                    created: TimeSec::EPOCH,
+                },
+                stream: StreamName {
+                    range: RangeId::new(0),
+                    stream: StreamId::new(1),
+                    created: TimeSec::new(1_000_000),
+                },
+                sn: SnId::new(0),
                 keyed: false,
                 framing: Framing::Lf,
                 first_record: 0,
@@ -1666,8 +1677,8 @@ mod tests {
         for _ in 0..given {
             args.extend(
                 StreamRow {
-                    stream: 1,
-                    sn: 0,
+                    stream: StreamId::new(1),
+                    sn: SnId::new(0),
                     first_record: 0,
                     records: 3,
                     created: TimeSec::new(1_000_000),
@@ -1862,26 +1873,29 @@ mod tests {
             Arg::Number(0),
             Arg::Number(1),
         ];
-        let open = Open::of(0, &args).expect("an extent");
+        let open = Open::of(SnId::new(0), &args).expect("an extent");
         assert_eq!(
             (open.sn, open.id, open.created, open.first_record),
-            (0, 7, TimeSec::new(1_000_000), 40)
+            (SnId::new(0), ExtentId::new(7), TimeSec::new(1_000_000), 40)
         );
         assert_eq!(open.records, 90, "sealed, so its range is known");
-        assert_eq!(open.disks, [2, 3, 0, 1]);
+        assert_eq!(open.disks, [DiskId::new(2), DiskId::new(3), DiskId::new(0), DiskId::new(1)]);
         // The primary is the first, which is the one an append is sent to.
-        assert_eq!(open.disks[0], 2);
+        assert_eq!(open.disks[0], DiskId::new(2));
     }
 
     /// An extent with nowhere to put it is not an extent.
     #[test]
     fn an_extent_with_no_instances_is_refused() {
         assert!(
-            Open::of(0, &[Arg::Number(7), Arg::Number(1_000_000), Arg::Number(0), Arg::Number(0)])
-                .is_none()
+            Open::of(
+                SnId::new(0),
+                &[Arg::Number(7), Arg::Number(1_000_000), Arg::Number(0), Arg::Number(0)]
+            )
+            .is_none()
         );
-        assert!(Open::of(0, &[Arg::Number(7), Arg::Number(1_000_000)]).is_none());
-        assert!(Open::of(0, &[]).is_none());
+        assert!(Open::of(SnId::new(0), &[Arg::Number(7), Arg::Number(1_000_000)]).is_none());
+        assert!(Open::of(SnId::new(0), &[]).is_none());
     }
 
     /// The DN's answer says which stream, which SN, and how the records are framed.
@@ -1891,20 +1905,31 @@ mod tests {
         // growing — as the stream id did into a whole name, #109 — is a compile error here
         // instead of a row that parses into the wrong things.
         let args = Described {
-            object: ObjectName { range: 3, object: 9, created: TimeSec::new(1_000_000) },
-            stream: StreamName { range: 3, stream: 17, created: TimeSec::new(1_000_000) },
-            sn: 0,
+            object: ObjectName {
+                range: RangeId::new(3),
+                object: ObjectId::new(9),
+                created: TimeSec::new(1_000_000),
+            },
+            stream: StreamName {
+                range: RangeId::new(3),
+                stream: StreamId::new(17),
+                created: TimeSec::new(1_000_000),
+            },
+            sn: SnId::new(0),
             keyed: false,
             framing: Framing::CrLf,
             first_record: 400,
         }
         .args();
-        let located = Located::of(3, &args).expect("an object");
-        assert_eq!((located.dn, located.stream.stream, located.sn), (3, 17, 0));
+        let located = Located::of(DnId::new(3), &args).expect("an object");
+        assert_eq!(
+            (located.dn, located.stream.stream, located.sn),
+            (DnId::new(3), StreamId::new(17), SnId::new(0))
+        );
         assert_eq!(located.framing, Framing::CrLf);
         assert_eq!(located.first_record, 400, "where this stream's records start");
         // A framing the DN could not have meant is not an object either.
-        assert!(Located::of(3, &args[..5]).is_none());
+        assert!(Located::of(DnId::new(3), &args[..5]).is_none());
     }
 
     /// The receipt leads with the durable reference and follows with the hint, and
@@ -1912,19 +1937,23 @@ mod tests {
     #[test]
     fn a_receipt_leads_with_the_durable_reference() {
         let located = Located {
-            dn: 0,
-            stream: StreamName { range: 0, stream: 17, created: TimeSec::new(1_000_000) },
-            sn: 0,
+            dn: DnId::new(0),
+            stream: StreamName {
+                range: RangeId::new(0),
+                stream: StreamId::new(17),
+                created: TimeSec::new(1_000_000),
+            },
+            sn: SnId::new(0),
             framing: Framing::Lf,
             first_record: 0,
         };
         let open = Open {
-            sn: 0,
-            id: 7,
+            sn: SnId::new(0),
+            id: ExtentId::new(7),
             created: TimeSec::new(1_000_000),
             first_record: 40,
             records: 0,
-            disks: vec![2, 3],
+            disks: vec![DiskId::new(2), DiskId::new(3)],
         };
         let from_en = Response {
             id: 0,
@@ -1963,32 +1992,36 @@ mod tests {
     #[test]
     fn a_failed_append_is_not_dressed_up_as_a_receipt() {
         let located = Located {
-            dn: 0,
-            stream: StreamName { range: 0, stream: 17, created: TimeSec::new(1_000_000) },
-            sn: 0,
+            dn: DnId::new(0),
+            stream: StreamName {
+                range: RangeId::new(0),
+                stream: StreamId::new(17),
+                created: TimeSec::new(1_000_000),
+            },
+            sn: SnId::new(0),
             framing: Framing::Lf,
             first_record: 0,
         };
         let open = Open {
-            sn: 0,
-            id: 7,
+            sn: SnId::new(0),
+            id: ExtentId::new(7),
             created: TimeSec::new(1_000_000),
             first_record: 0,
             records: 0,
-            disks: vec![2],
+            disks: vec![DiskId::new(2)],
         };
         let refused = Response::error(Status::Internal, "two instances would not apply it");
         assert_eq!(receipt(&located, &open, refused.clone()), refused);
     }
 
-    fn extent(id: u64, first_record: u64) -> Open {
+    fn extent(id: u32, first_record: u64) -> Open {
         Open {
-            sn: 0,
-            id,
+            sn: SnId::new(0),
+            id: ExtentId::new(id),
             created: TimeSec::new(1_000_000),
             first_record,
             records: 0,
-            disks: vec![2, 3, 0, 1],
+            disks: vec![DiskId::new(2), DiskId::new(3), DiskId::new(0), DiskId::new(1)],
         }
     }
 
@@ -2014,9 +2047,9 @@ mod tests {
     #[test]
     fn appends_that_all_saw_the_same_extent_fill_ask_once() {
         let mut stream = Stream { open: Some(extent(1, 0)), ..Stream::default() };
-        assert_eq!(stream.plan(Some((1, 90))), Plan::Ask, "the first to notice");
-        assert_eq!(stream.plan(Some((1, 90))), Plan::Join, "the rest of them");
-        assert_eq!(stream.plan(Some((1, 90))), Plan::Join);
+        assert_eq!(stream.plan(Some((ExtentId::new(1), 90))), Plan::Ask, "the first to notice");
+        assert_eq!(stream.plan(Some((ExtentId::new(1), 90))), Plan::Join, "the rest of them");
+        assert_eq!(stream.plan(Some((ExtentId::new(1), 90))), Plan::Join);
         // And it was remembered on the way past, which is what a read wants.
         assert_eq!(stream.sealed.len(), 1);
         assert_eq!(stream.sealed[0].records, 90);
@@ -2027,7 +2060,7 @@ mod tests {
     #[test]
     fn an_append_late_to_a_seal_uses_what_replaced_it() {
         let mut stream = Stream { open: Some(extent(2, 90)), ..Stream::default() };
-        assert_eq!(stream.plan(Some((1, 90))), Plan::Use);
+        assert_eq!(stream.plan(Some((ExtentId::new(1), 90))), Plan::Use);
         assert!(stream.sealed.is_empty(), "extent 1 was not this FE's to remember");
     }
 
@@ -2037,15 +2070,15 @@ mod tests {
     #[test]
     fn a_read_finds_a_record_in_a_remembered_extent() {
         let mut stream = Stream { open: Some(extent(1, 0)), ..Stream::default() };
-        stream.plan(Some((1, 90)));
+        stream.plan(Some((ExtentId::new(1), 90)));
         stream.open = Some(extent(2, 90));
-        stream.plan(Some((2, 80)));
+        stream.plan(Some((ExtentId::new(2), 80)));
         stream.open = Some(extent(3, 170));
 
-        assert_eq!(stream.holding(SRoff::new(0)).unwrap().id, 1);
-        assert_eq!(stream.holding(SRoff::new(89)).unwrap().id, 1);
-        assert_eq!(stream.holding(SRoff::new(90)).unwrap().id, 2);
-        assert_eq!(stream.holding(SRoff::new(169)).unwrap().id, 2);
+        assert_eq!(stream.holding(SRoff::new(0)).unwrap().id, ExtentId::new(1));
+        assert_eq!(stream.holding(SRoff::new(89)).unwrap().id, ExtentId::new(1));
+        assert_eq!(stream.holding(SRoff::new(90)).unwrap().id, ExtentId::new(2));
+        assert_eq!(stream.holding(SRoff::new(169)).unwrap().id, ExtentId::new(2));
         // In the extent still open, so the SN has to be asked.
         assert!(stream.holding(SRoff::new(170)).is_none());
         assert!(stream.holding(SRoff::new(5000)).is_none());
@@ -2063,8 +2096,8 @@ mod tests {
         let mut sealed = extent(1, 0);
         sealed.records = 90;
         stream.remember(sealed);
-        assert_eq!(stream.holding(SRoff::new(5)).unwrap().id, 1);
-        assert_eq!(stream.holding(SRoff::new(89)).unwrap().id, 1);
+        assert_eq!(stream.holding(SRoff::new(5)).unwrap().id, ExtentId::new(1));
+        assert_eq!(stream.holding(SRoff::new(89)).unwrap().id, ExtentId::new(1));
         assert!(stream.holding(SRoff::new(90)).is_none());
 
         // Learning it twice keeps one copy, since appends and reads both teach it.

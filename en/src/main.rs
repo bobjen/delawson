@@ -22,6 +22,7 @@
 
 use common::block::Holds;
 use common::config::ENConfig;
+use common::ids::{EnId, ExtentId, SnId};
 use common::offset::{COff, ERoff, LOff};
 use common::placement;
 use common::range::{Budget, Covered, Filled, Piece, Range};
@@ -36,7 +37,7 @@ use std::sync::{Arc, Mutex};
 const SERVES: &[Op] = &[Op::AppendExtent, Op::ApplyAppend, Op::ReadExtent];
 
 /// Appends held back per extent, waiting for a record to close.
-type Waiting = HashMap<(u32, u64), Vec<Arc<Pending>>>;
+type Waiting = HashMap<(SnId, ExtentId), Vec<Arc<Pending>>>;
 
 /// An extent instance held here. Its name is the key it is found by — this SN,
 /// this id — and the second, which is part of the name too.
@@ -153,7 +154,7 @@ struct Landed {
 /// path long before it was the smallest.
 struct Extents {
     extents: Vec<Extent>,
-    at: HashMap<(u32, u64), usize>,
+    at: HashMap<(SnId, ExtentId), usize>,
     appends: Vec<Append>,
 }
 
@@ -168,7 +169,7 @@ impl Extents {
     ///
     /// The second is part of the name, so an append naming a different one for an
     /// extent already here is refused rather than merged into it.
-    fn place(&mut self, sn: u32, id: u64, created: TimeSec) -> Result<usize> {
+    fn place(&mut self, sn: SnId, id: ExtentId, created: TimeSec) -> Result<usize> {
         if let Some(place) = self.at.get(&(sn, id)) {
             let held = self.extents[*place].created;
             if held != created {
@@ -329,7 +330,7 @@ impl Extents {
     /// new primary computing its end from one of those would hand out an offset
     /// another instance has already written.
     #[allow(dead_code)]
-    fn truncate(&mut self, sn: u32, id: u64, above: COff) -> Result<Truncated> {
+    fn truncate(&mut self, sn: SnId, id: ExtentId, above: COff) -> Result<Truncated> {
         let Some(&place) = self.at.get(&(sn, id)) else {
             return Err(Error::new(format!("no extent {id} of sn {sn} here")));
         };
@@ -404,7 +405,13 @@ impl Extents {
     /// `None` means no block holds that record. Ordered by offset rather than by
     /// record, because a secondary may have been told about its blocks in any order
     /// and because a block completing no record has no record to sort by.
-    fn range(&self, sn: u32, id: u64, from: ERoff, budget: Budget) -> Result<Option<Ranged<'_>>> {
+    fn range(
+        &self,
+        sn: SnId,
+        id: ExtentId,
+        from: ERoff,
+        budget: Budget,
+    ) -> Result<Option<Ranged<'_>>> {
         let Some(&place) = self.at.get(&(sn, id)) else { return Ok(None) };
         let mut blocks: Vec<&Append> =
             self.appends.iter().filter(|append| append.extent == place).collect();
@@ -453,7 +460,7 @@ impl Extents {
     }
 
     /// The second an extent here was made in, which is the rest of its name.
-    fn created(&self, sn: u32, id: u64) -> Option<TimeSec> {
+    fn created(&self, sn: SnId, id: ExtentId) -> Option<TimeSec> {
         self.at.get(&(sn, id)).map(|place| self.extents[*place].created)
     }
 
@@ -461,7 +468,7 @@ impl Extents {
     /// reader asks for a block — but a test does, to say the blocks landed where
     /// they were meant to.
     #[cfg(test)]
-    fn read(&self, sn: u32, id: u64) -> Vec<u8> {
+    fn read(&self, sn: SnId, id: ExtentId) -> Vec<u8> {
         let Some(place) = self.at.get(&(sn, id)) else { return Vec::new() };
         let mut found: Vec<&Append> =
             self.appends.iter().filter(|append| append.extent == *place).collect();
@@ -593,8 +600,8 @@ impl EN {
         // one disk per EN the two numbers coincide and this reads as a no-op; with several
         // disks on one EN, filtering on the raw disk number would have this process send
         // itself its own append (`placement::en_of`, §17.29.3).
-        let mine = process.entry.number();
-        let others: Vec<u32> = appending
+        let mine = EnId::new(process.entry.number());
+        let others: Vec<EnId> = appending
             .instances
             .iter()
             .map(|disk| placement::en_of(*disk))
@@ -605,8 +612,8 @@ impl EN {
         // knows what it wrote, not what that compressed to. The stored position is
         // this tier's business and stays here.
         let receipt = vec![
-            Arg::Number(appending.sn as u64),
-            Arg::Number(appending.extent),
+            Arg::Number(appending.sn.number()),
+            Arg::Number(appending.extent.number()),
             Arg::Number(appending.created.number()),
             Arg::Number(landed.logical.number()),
             Arg::Number(appending.holds.logical),
@@ -669,7 +676,7 @@ impl EN {
     /// A record closed, so every append still waiting on this extent is waiting on
     /// nothing: a fragment only ever sits at the end, so anything before the record
     /// that just closed is inside a whole one.
-    fn finish(&self, sn: u32, extent: u64) {
+    fn finish(&self, sn: SnId, extent: ExtentId) {
         let waiting = self.waiting.lock().expect("waiting").remove(&(sn, extent));
         for pending in waiting.unwrap_or_default() {
             pending.records_are_whole();
@@ -740,7 +747,7 @@ impl EN {
         };
 
         let held = self.held.lock().expect("extents");
-        match held.created(*sn as u32, *extent) {
+        match held.created(SnId::new(*sn as u32), ExtentId::new(*extent as u32)) {
             None => {
                 return Response::error(
                     Status::NotFound,
@@ -763,7 +770,12 @@ impl EN {
             Ok(from) => from,
             Err(e) => return Response::error(Status::NotFound, e.to_string()),
         };
-        let ranged = match held.range(*sn as u32, *extent, from, range.budget) {
+        let ranged = match held.range(
+            SnId::new(*sn as u32),
+            ExtentId::new(*extent as u32),
+            from,
+            range.budget,
+        ) {
             Ok(Some(ranged)) => ranged,
             Ok(None) => {
                 return Response::error(
@@ -977,8 +989,8 @@ mod tests {
         let holds = Holds::of(Framing::Lf, b"", bytes, Some(common::crc::of(bytes)))
             .expect("a well-formed block");
         AppendBlock {
-            sn,
-            extent,
+            sn: SnId::new(sn),
+            extent: ExtentId::new(extent as u32),
             created: TimeSec::new(1_000_000),
             holds,
             instances: Vec::new(),
@@ -1002,7 +1014,10 @@ mod tests {
         assert_eq!(append(&en, 1, &line("hello")).offset, COff::new(0));
         assert_eq!(append(&en, 1, &line("there")).offset, COff::new(6));
         assert_eq!(append(&en, 1, &line("!")).offset, COff::new(12));
-        assert_eq!(en.held.lock().unwrap().read(0, 1), b"hello\nthere\n!\n");
+        assert_eq!(
+            en.held.lock().unwrap().read(SnId::new(0), ExtentId::new(1)),
+            b"hello\nthere\n!\n"
+        );
     }
 
     /// Two extents are two byte streams, whatever order the appends arrive in.
@@ -1012,7 +1027,7 @@ mod tests {
         assert_eq!(append(&en, 1, &line("one")).offset, COff::new(0));
         assert_eq!(append(&en, 2, &line("two")).offset, COff::new(0));
         assert_eq!(append(&en, 1, &line("more")).offset, COff::new(4));
-        assert_eq!(en.held.lock().unwrap().read(0, 1), b"one\nmore\n");
+        assert_eq!(en.held.lock().unwrap().read(SnId::new(0), ExtentId::new(1)), b"one\nmore\n");
     }
 
     /// The same extent id from two SNs is two extents: an id is a name only
@@ -1034,7 +1049,7 @@ mod tests {
         let later =
             AppendBlock { created: TimeSec::new(1_000_001), ..block(0, 1, &line("second")) };
         assert!(en.take(&later, ROOM).is_err());
-        assert_eq!(en.held.lock().unwrap().read(0, 1), b"first\n");
+        assert_eq!(en.held.lock().unwrap().read(SnId::new(0), ExtentId::new(1)), b"first\n");
     }
 
     /// Records are numbered from zero within an extent, from the counts the writer
@@ -1129,7 +1144,7 @@ mod tests {
         let held = en.held.lock().unwrap();
         assert_eq!(held.extents[0].end, COff::of_len(stored.len()).unwrap());
         assert_eq!(held.extents[0].logical_end, LOff::of_len(records.len()).unwrap());
-        assert_eq!(held.read(0, 1), stored, "handed back as it arrived");
+        assert_eq!(held.read(SnId::new(0), ExtentId::new(1)), stored, "handed back as it arrived");
     }
 
     /// A point read is a range of one record: it finds the block holding it by
@@ -1141,7 +1156,7 @@ mod tests {
         append(&en, 1, b"three\nfour\nfive\n");
         let held = en.held.lock().unwrap();
         let one = |record| {
-            held.range(0, 1, record, Budget::Records(1))
+            held.range(SnId::new(0), ExtentId::new(1), record, Budget::Records(1))
                 .expect("no arithmetic to fail")
                 .map(|ranged| ranged.blocks[0].bytes.clone())
         };
@@ -1153,7 +1168,10 @@ mod tests {
 
         // And the answer says where the block starts, so a reader can index into it,
         // and where to carry on, which is what makes it a range.
-        let ranged = held.range(0, 1, ERoff::new(4), Budget::Records(1)).unwrap().expect("a block");
+        let ranged = held
+            .range(SnId::new(0), ExtentId::new(1), ERoff::new(4), Budget::Records(1))
+            .unwrap()
+            .expect("a block");
         assert_eq!(ranged.blocks[0].first_record, ERoff::new(2));
         assert_eq!(ranged.covered.next, 5, "one past the last record it completed");
         assert!(!ranged.covered.more, "and this extent has no more blocks");
@@ -1167,7 +1185,11 @@ mod tests {
         append(&en, 1, b"one\ntwo\n"); // 2 records, 8 bytes
         append(&en, 1, b"three\nfour\nfive\n"); // 3 records, 16 bytes
         let held = en.held.lock().unwrap();
-        let ranged = |budget| held.range(0, 1, ERoff::new(0), budget).unwrap().expect("blocks");
+        let ranged = |budget| {
+            held.range(SnId::new(0), ExtentId::new(1), ERoff::new(0), budget)
+                .unwrap()
+                .expect("blocks")
+        };
 
         // Enough for the first block only, in each space.
         for budget in [Budget::Records(2), Budget::Logical(8), Budget::Compressed(8)] {
@@ -1198,7 +1220,10 @@ mod tests {
         append(&en, 1, b"three\n");
         let held = en.held.lock().unwrap();
         for budget in [Budget::Records(0), Budget::Logical(0), Budget::Logical(1)] {
-            let ranged = held.range(0, 1, ERoff::new(0), budget).unwrap().expect("a block");
+            let ranged = held
+                .range(SnId::new(0), ExtentId::new(1), ERoff::new(0), budget)
+                .unwrap()
+                .expect("a block");
             assert_eq!(ranged.blocks.len(), 1, "{budget:?}");
             assert_eq!(ranged.covered.logical, 8, "and it is reported at its real size");
             assert!(ranged.covered.more);
@@ -1221,7 +1246,10 @@ mod tests {
         let held = en.held.lock().unwrap();
         // A one-record budget from record 1 cannot stop after the opening block,
         // because that block completed nothing and `next` would be 1 again.
-        let ranged = held.range(0, 1, ERoff::new(1), Budget::Records(1)).unwrap().expect("blocks");
+        let ranged = held
+            .range(SnId::new(0), ExtentId::new(1), ERoff::new(1), Budget::Records(1))
+            .unwrap()
+            .expect("blocks");
         assert_eq!(ranged.blocks.len(), 2, "the opener and the closer");
         assert_eq!(ranged.blocks[0].bytes, b"half a rec");
         assert_eq!(ranged.covered.records, 1);
@@ -1241,7 +1269,10 @@ mod tests {
         // Record 0 has begun and not finished, so there is nothing complete to
         // report — but the bytes that exist come back, and `more` is false because
         // the extent holds nothing further.
-        let ranged = held.range(0, 1, ERoff::new(0), Budget::Records(1)).unwrap().expect("blocks");
+        let ranged = held
+            .range(SnId::new(0), ExtentId::new(1), ERoff::new(0), Budget::Records(1))
+            .unwrap()
+            .expect("blocks");
         assert_eq!(ranged.blocks.len(), 1);
         assert_eq!(ranged.covered.records, 0);
         assert_eq!(ranged.covered.next, 0, "record 0 is still open");
@@ -1350,7 +1381,11 @@ mod tests {
         assert!(clash.is_err(), "different bytes at a written offset");
         // Overlapping partway is the same violation, and so is straddling the start.
         assert!(held.apply(&block(0, 1, b"xx\n"), COff::new(3)).is_err());
-        assert_eq!(held.read(0, 1), b"first\n", "and the refusal changed nothing");
+        assert_eq!(
+            held.read(SnId::new(0), ExtentId::new(1)),
+            b"first\n",
+            "and the refusal changed nothing"
+        );
     }
 
     /// The one benign overlap: the same bytes at the same offset, which is an append
@@ -1363,7 +1398,7 @@ mod tests {
         let same = block(0, 1, b"once\n");
         assert!(matches!(held.apply(&same, COff::ZERO), Ok(Applied::Stored)));
         assert!(matches!(held.apply(&same, COff::ZERO), Ok(Applied::Already)));
-        assert_eq!(held.read(0, 1), b"once\n", "stored once, not twice");
+        assert_eq!(held.read(SnId::new(0), ExtentId::new(1)), b"once\n", "stored once, not twice");
         assert_eq!(held.extents[0].records, ERoff::new(1), "and counted once");
     }
 
@@ -1377,9 +1412,13 @@ mod tests {
         let mut held = en.held.lock().unwrap();
         assert_eq!(held.extents[0].end, COff::new(10));
 
-        let cut = held.truncate(0, 1, COff::new(5)).expect("a boundary");
+        let cut = held.truncate(SnId::new(0), ExtentId::new(1), COff::new(5)).expect("a boundary");
         assert_eq!((cut.discarded, cut.records, cut.length), (1, 1, COff::new(5)));
-        assert_eq!(held.read(0, 1), b"keep\n", "the discarded block is gone");
+        assert_eq!(
+            held.read(SnId::new(0), ExtentId::new(1)),
+            b"keep\n",
+            "the discarded block is gone"
+        );
         assert!(held.extents[0].sealed, "and the extent is sealed");
         assert_eq!(held.extents[0].records, ERoff::new(1), "counts rebuilt from what survived");
         assert_eq!(held.extents[0].logical_end, LOff::new(5));
@@ -1398,10 +1437,16 @@ mod tests {
         let en = EN::new(testing::en_config());
         append(&en, 1, &line("all of it"));
         let mut held = en.held.lock().unwrap();
-        let cut = held.truncate(0, 1, COff::new(10)).expect("the end is a boundary");
+        let cut = held
+            .truncate(SnId::new(0), ExtentId::new(1), COff::new(10))
+            .expect("the end is a boundary");
         assert_eq!(cut.discarded, 0);
         assert!(held.extents[0].sealed);
-        assert_eq!(held.read(0, 1), b"all of it\n", "and kept everything");
+        assert_eq!(
+            held.read(SnId::new(0), ExtentId::new(1)),
+            b"all of it\n",
+            "and kept everything"
+        );
     }
 
     /// A cut inside a block would split an append, which §8.2.4 makes impossible —
@@ -1413,16 +1458,28 @@ mod tests {
         append(&en, 1, &line("first"));
         append(&en, 1, &line("second"));
         let mut held = en.held.lock().unwrap();
-        assert!(held.truncate(0, 1, COff::new(3)).is_err(), "inside the first block");
-        assert!(held.truncate(0, 1, COff::new(9)).is_err(), "inside the second");
-        assert!(held.truncate(0, 1, COff::new(99)).is_err(), "past everything");
+        assert!(
+            held.truncate(SnId::new(0), ExtentId::new(1), COff::new(3)).is_err(),
+            "inside the first block"
+        );
+        assert!(
+            held.truncate(SnId::new(0), ExtentId::new(1), COff::new(9)).is_err(),
+            "inside the second"
+        );
+        assert!(
+            held.truncate(SnId::new(0), ExtentId::new(1), COff::new(99)).is_err(),
+            "past everything"
+        );
         assert!(!held.extents[0].sealed, "and a refused truncation seals nothing");
-        assert_eq!(held.read(0, 1), b"first\nsecond\n");
+        assert_eq!(held.read(SnId::new(0), ExtentId::new(1)), b"first\nsecond\n");
 
         // Zero is always a boundary: discarding the lot is a truncation too.
-        assert_eq!(held.truncate(0, 1, COff::ZERO).expect("the start").discarded, 2);
+        assert_eq!(
+            held.truncate(SnId::new(0), ExtentId::new(1), COff::ZERO).expect("the start").discarded,
+            2
+        );
         assert_eq!(held.extents[0].records, ERoff::new(0));
-        assert!(held.read(0, 1).is_empty());
+        assert!(held.read(SnId::new(0), ExtentId::new(1)).is_empty());
     }
 
     /// An extent holds whole records, so it may not seal with one open. A durable
@@ -1439,10 +1496,10 @@ mod tests {
 
         let mut held = en.held.lock().unwrap();
         // Cutting between the two blocks is a block boundary and a record's middle.
-        assert!(held.truncate(0, 1, COff::new(10)).is_err());
+        assert!(held.truncate(SnId::new(0), ExtentId::new(1), COff::new(10)).is_err());
         assert!(!held.extents[0].sealed);
         // Keeping both is fine, because the record closed.
-        assert!(held.truncate(0, 1, COff::new(14)).is_ok());
+        assert!(held.truncate(SnId::new(0), ExtentId::new(1), COff::new(14)).is_ok());
     }
 
     /// A sealed extent takes nothing more by either path. `take` already answered
