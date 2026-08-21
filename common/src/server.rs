@@ -142,6 +142,20 @@ pub trait Service: Send + Sync + Sized + 'static {
     }
 }
 
+/// Whether a kind may be chosen in turn.
+///
+/// ⚠️ **A free function so that the test tests the rule and not a copy of it.** The rule
+/// lives in one place, `Process::pick` calls it, and so does the test — which matters more
+/// here than usual, since a test that restates a rule catches nothing when the rule moves.
+pub fn pickable(kind: ServiceKind) -> Result<()> {
+    match kind {
+        ServiceKind::Dn => {
+            Err(Error::new("a DN is chosen by the name it owns, not in turn — use Process::owner"))
+        }
+        _ => Ok(()),
+    }
+}
+
 impl Process {
     pub fn load(process_config: &Path) -> Result<Process> {
         let config = ProcessConfig::load(process_config)?;
@@ -238,7 +252,25 @@ impl Process {
     /// The next process of a kind, taken in turn. Round robin is not placement —
     /// it spreads without regard to fullness or failure domains — but it is
     /// honest striping until there is a placement solver to ask.
+    ///
+    /// ⚠️ **Refuses a DN, on purpose** (#106). A DN is chosen by the name it owns, never
+    /// in turn, and the reason this is a refusal rather than a comment is that a comment
+    /// did not work: §17.24.0 converted one of the three call sites, and the one it missed
+    /// silently sent every append for one object to a different machine. The generic
+    /// helper is where the mistake was cheap to make, so the generic helper is where it is
+    /// now impossible — `owner` is the only way to a DN (`A-NAME-HAS-ONE-OWNER`).
     pub fn pick(&self, kind: ServiceKind) -> Result<&str> {
+        pickable(kind)?;
+        self.any_of(kind)
+    }
+
+    /// A process of a kind, taken in turn, **whatever the kind**.
+    ///
+    /// ⚠️ **The escape hatch from `pick`'s refusal, and it has exactly one caller**:
+    /// `batch-create`, whose names have owners it does not yet group by (#98). Named
+    /// separately so that the one place still doing the wrong thing says so at its call
+    /// site, rather than hiding inside the helper everything else uses.
+    pub fn any_of(&self, kind: ServiceKind) -> Result<&str> {
         let of_kind: Vec<&ServiceEntry> = self.cluster.services_of_kind(kind).collect();
         if of_kind.is_empty() {
             return Err(Error::new(format!("no {} in the roster", kind.as_str().to_uppercase())));
@@ -702,10 +734,8 @@ fn answer_here<S: Service>(
         started: logging.then_some(arrived),
         about: String::new(),
     };
-    if logging {
-        if let Some(arg) = request.args.first() {
-            reply.about(arg);
-        }
+    if logging && let Some(arg) = request.args.first() {
+        reply.about(arg);
     }
     match op {
         Op::Ping => reply.send(ping(process, &request)),
@@ -884,4 +914,28 @@ pub fn main<S: Service>(build: impl FnOnce(&Process) -> Result<S>) -> Result<()>
     let process = Arc::new(Process::load(Path::new(&path))?);
     let service = Arc::new(build(&process)?);
     serve(process, service)
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    /// ⚠️ **The spot #106 was at.** A DN is chosen by the name it owns, and the generic
+    /// round-robin helper must not be able to return one — a comment saying so did not stop
+    /// one of three call sites from using it, and that call site sent every append for one
+    /// object to a different machine (§17.30).
+    #[test]
+    fn a_dn_cannot_be_picked_in_turn() {
+        let said = pickable(ServiceKind::Dn).expect_err("not in turn").to_string();
+        assert!(said.contains("owner"), "and it says what to use instead: {said}");
+    }
+
+    /// Every other kind still takes its turn: nothing owns them, so round robin is the
+    /// honest answer and the refusal must not spread to them.
+    #[test]
+    fn other_kinds_still_take_turns() {
+        for kind in [ServiceKind::En, ServiceKind::Sn, ServiceKind::Fe, ServiceKind::Ks] {
+            assert!(pickable(kind).is_ok(), "{kind:?} is picked in turn");
+        }
+    }
 }

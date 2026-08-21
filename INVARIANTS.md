@@ -225,12 +225,15 @@ holding the *earliest* names: a prefix in the caller's order is not a prefix in 
 
 **`A-NAME-HAS-ONE-OWNER`** — a name resolves to the same DN every time it is routed, whoever
 routes it.
-*Argued* §17.24.0, §5.5.1 · *Enforced* `common::routing::owner_of`, and `Process::owner` rather
-than `pick` on every name-bearing request · *Checked* unit test
+*Argued* §17.24.0, §17.30, §5.5.1 · *Enforced* structurally — `Process::pick` **refuses** to
+return a DN (`server::pickable`), so `owner` is the only way to one · *Checked* unit test on the
+rule itself, not on a copy of it
 *Breaks* a create lands on one machine and the lookup that follows it asks another, so the object is
 not lost but unreachable, which is worse. ⚠️ Round robin violates this and was what every DN-bound
 request used — invisible with one DN, and half the objects gone with two. `batch-create` still
-violates it (#98).
+violates it (#98), and calls `any_of` rather than `pick` so that the one place doing so is
+greppable. ⚠️ A comment saying "not `pick`" was already there and did not work: §17.24.0 converted
+one of three call sites, and the one it missed lost appends silently (§17.30).
 
 **`A-NAME-COSTS-AT-LEAST-ONE-ENTRY`** — every name a batch answer covers spends at least its own
 object row against the entry limit.

@@ -1265,8 +1265,10 @@ impl FE {
                 process.owner(ServiceKind::Dn, first(request))
             }
             // ⚠️ #98: a batch create's names have owners too, and this sends them all to
-            // one DN. Harmless with one DN and wrong with two.
-            _ => process.pick(ServiceKind::Dn),
+            // one DN. Harmless with one DN and wrong with two — and `any_of` rather than
+            // `pick` because `pick` now refuses a DN outright (#106), so the one caller
+            // still doing this has to say so.
+            _ => process.any_of(ServiceKind::Dn),
         }
     }
 }

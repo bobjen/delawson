@@ -16921,9 +16921,32 @@ is one append per DN per round.
 and left the other, **and turned the test cluster to three DNs in the same change** — so it created
 the conditions for the bug it was fixing, in the act of fixing it.
 
-> **What would have caught it is a test that appends *n* records and reads back *n*.** Every append
-> test runs one process against one tier; nothing exercised FE → DN → SN → EN with more than one DN
-> until a human typed five commands.
+### 17.30.2a ⚠️ The test goes where the bug is, not around the outside
+
+**A first attempt at this wrote an end-to-end script** — start a cluster, append *n*, read back *n*.
+Bob's correction (2026-08-20): *"end-to-end tests are expensive to maintain, they are good to run
+one-off, but ideally there would be a unit test covering the spot where the bug is. Bugs usually
+aren't in generic glue code."*
+
+**And the spot is nameable.** The bug was not in appending, or in resolving, or in any of the chain
+the script would have walked. It was one call site choosing a DN the wrong way. So:
+
+> **`Process::pick` now refuses to return a DN.** A DN is chosen by the name it owns, and the
+> generic round-robin helper — which is exactly where the mistake was cheap to make — can no longer
+> make it.
+
+**The one caller that still needs the old behaviour says so at its call site**: `batch-create` calls
+`any_of`, named separately and documented as #98's debt, rather than hiding inside the helper
+everything else uses. So the remaining offender is greppable instead of indistinguishable.
+
+⚠️ **And the rule is a free function, `pickable`, so the test tests the rule rather than a copy of
+it.** A first draft of the test restated the refusal inline because `Process` needs a socket — which
+would have passed for ever regardless of what `pick` did. A test that restates a rule catches
+nothing when the rule moves.
+
+**The second bug of the day got the same treatment.** §17.29.5's `args(0)` was in the *answer*
+`open-extent` builds, not in `open`, which was right — so the test asserts what the answer's third
+field says after a seal, which is the argument that was wrong.
 
 ### 17.30.3 ⚠️ And it invalidates §17.24.5's measurement
 

@@ -816,6 +816,34 @@ mod tests {
         }
     }
 
+    /// ⚠️ **The spot the `args(0)` bug was at** (§17.29.5). `open-extent` answers with the
+    /// extent *and where it starts in this stream*, and the second one is easy to get wrong
+    /// by passing a literal: the same argument used to mean "how many records" and now means
+    /// "from which record", so `0` stayed correct-looking and became wrong. Nothing at this
+    /// tier caught it, because `open` itself was right — the mistake was in the answer.
+    #[test]
+    fn the_open_extent_answers_with_where_it_starts_in_the_stream() {
+        let sn = sn_with_stream(0, 7);
+        let ens = [0, 1, 2, 3];
+        let want = testing::extents().instances;
+        let first = sn.open(0, 7, 1_000_000, &ens, want).unwrap();
+        assert_eq!(first.first, 0, "the first extent starts the stream");
+
+        // Seal it with twelve records, so the next one does not start at zero.
+        sn.close(0, 7, first.extent.id as u64, came(12, 400), 1_000_001, &ens, want, ROOMY)
+            .unwrap();
+        let next = sn.open(0, 7, 1_000_002, &ens, want).unwrap();
+        assert_eq!(next.first, 12, "and the next carries on from what came before");
+
+        // And the answer on the wire says so, which is the argument that was wrong: third
+        // field is the first record, fourth is the count.
+        let answer = next.extent.args(next.first);
+        let [_, _, Arg::Number(at), Arg::Number(records), ..] = answer.as_slice() else {
+            panic!("an extent answers with an id, a second, a first record and a count")
+        };
+        assert_eq!((*at, *records), (12, 0), "starts at 12, holds nothing yet");
+    }
+
     /// An extent already sealed by somebody else does not fail: the caller wanted
     /// somewhere to append, and the extent that replaced it is the answer. This is
     /// the race the stream's lock exists to make harmless.
