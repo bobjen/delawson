@@ -17,11 +17,13 @@
 use common::config::{DNConfig, ServiceKind};
 use common::framing::Framing;
 use common::info::{
-    Batch, Described, ExtentRow, ExtentRun, Listing, Shape, StreamRow, Totals, UNKNOWN, Wanted,
+    Batch, Described, ExtentRow, ExtentRun, Listing, Shape, StreamName, StreamRow, Totals, UNKNOWN,
+    Wanted,
 };
 use common::logw;
 use common::offset::ORoff;
 use common::range::{Detail, Want};
+use common::routing;
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::wire::{Arg, Op, Request, Response, Status};
@@ -90,13 +92,19 @@ fn wanted(args: &[Arg], answers: u64) -> Result<Want> {
 /// ⚠️ **`locate-stream` always gets the plain row.** It asks *which stream holds this
 /// record*, an FE's question on the read path, and it must keep the shape `Located::of`
 /// reads — so detail is an `object-info` feature and not a lookup feature.
-fn describe_at(object: &Object, record: Option<u64>, want: &Want, limit: u64) -> Option<Answering> {
+fn describe_at(
+    object: &Object,
+    range: u32,
+    record: Option<u64>,
+    want: &Want,
+    limit: u64,
+) -> Option<Answering> {
     match record {
-        Some(_) => object.args(record).map(Answering::Plain),
-        None => match detailed(object, want, limit) {
+        Some(_) => object.args(range, record).map(Answering::Plain),
+        None => match detailed(object, range, want, limit) {
             Some(levelled) => Some(Answering::Levelled(levelled)),
             // No detail asked for, so the row that predates the field, byte for byte.
-            None => object.args(None).map(Answering::Plain),
+            None => object.args(range, None).map(Answering::Plain),
         },
     }
 }
@@ -112,8 +120,8 @@ enum Answering {
 /// ⚠️ **The counts are exact even when the detail is not** (§9.1.3.2), which is what lets a caller
 /// compute the requests it has not made yet instead of discovering them one answer at a time. The
 /// stream count is the DN's own, so it costs nothing to include and is always right.
-fn detailed(object: &Object, want: &Want, limit: u64) -> Option<Levelled> {
-    let args = object.args(None)?;
+fn detailed(object: &Object, range: u32, want: &Want, limit: u64) -> Option<Levelled> {
+    let args = object.args(range, None)?;
     if want.detail == 0 {
         return None;
     }
@@ -372,7 +380,7 @@ impl Object {
 
     /// What this object is, at one of its streams: the last for an append, or the one
     /// holding a record for a read.
-    fn args(&self, record: Option<u64>) -> Option<Vec<Arg>> {
+    fn args(&self, range: u32, record: Option<u64>) -> Option<Vec<Arg>> {
         // ⚠️ The position comes back *with* the stream, because the stream does not carry
         // it (§17.33.1) — the same shape as `sn::Placed`, and for the same reason.
         let (first, held) = match record {
@@ -382,7 +390,7 @@ impl Object {
         Some(
             Described {
                 id: self.id,
-                stream: held.id as u64,
+                stream: StreamName { range, stream: held.id, created: held.created },
                 sn: held.sn,
                 created: self.created,
                 keyed: self.keyed,
@@ -538,6 +546,13 @@ struct Gather {
 
 struct DN {
     config: DNConfig,
+    /// This DN's own number, which stands in for the `RangeId` half of every stream name it
+    /// hands out (#109, `routing::range_of_dn`).
+    ///
+    /// ⚠️ **Held here rather than threaded through**, for §8.1.6.1's reason: a DN's identity is
+    /// a property of the DN, not an argument to its methods — and `Object::args` is four call
+    /// sites deep from anything holding a `Process`.
+    mine: u32,
     shards: Vec<Mutex<HashMap<Box<str>, Object>>>,
     /// How many requests are waiting for an object to have a stream, for `status`.
     parked: AtomicU64,
@@ -802,7 +817,7 @@ impl DN {
                     } else {
                         // Somebody else extended past it already, so whatever is last
                         // now is the answer.
-                        match object.args(None) {
+                        match object.args(self.mine, None) {
                             Some(args) => Next::Say(Response { id: 0, status: Status::Ok, args }),
                             None => Next::Say(Response::error(
                                 Status::Internal,
@@ -920,7 +935,7 @@ impl DN {
             let mut shard = self.shards[shard_of(name)].lock().expect("objects");
             match shard.get_mut(name) {
                 None => Some(Err(Response::error(Status::NotFound, format!("no object {name}")))),
-                Some(object) => match describe_at(object, record, &want, limit) {
+                Some(object) => match describe_at(object, self.mine, record, &want, limit) {
                     Some(answering) => Some(Ok(answering)),
                     None if object.between_streams() => {
                         object.waiting.push(carry.take().expect("a reply"));
@@ -965,9 +980,13 @@ impl DN {
         reply: Reply,
     ) {
         // Group by SN, keeping each stream's record to start from.
-        let mut by_sn: HashMap<u32, Vec<(u64, u64)>> = HashMap::new();
+        // ⚠️ The whole name per stream, not the id: the SN keys streams by
+        // `(RangeId, StreamId, CreateSec)` (#109), and the DN is what holds all three.
+        let range = routing::range_of_dn(process.entry.number());
+        let mut by_sn: HashMap<u32, Vec<(StreamName, u64)>> = HashMap::new();
         for row in &levelled.rows {
-            by_sn.entry(row.sn).or_default().push((row.stream, 0));
+            let name = StreamName { range, stream: row.stream as u32, created: row.created };
+            by_sn.entry(row.sn).or_default().push((name, 0));
         }
         if by_sn.is_empty() {
             return reply.send(Response {
@@ -998,7 +1017,7 @@ impl DN {
             let identity = format!("SN{sn}");
             let ask = {
                 let mut request = Request::new(Op::ListExtents);
-                request.args = Listing { dn: process.entry.number(), limit: room, at }.args();
+                request.args = Listing { limit: room, at }.args();
                 request
             };
             let waiting = Arc::clone(&gather);
@@ -1042,7 +1061,9 @@ impl DN {
             let (waiters, args) = {
                 let mut shard = self.shards[shard_of(name)].lock().expect("objects");
                 match shard.get_mut(name.as_str()) {
-                    Some(object) => (std::mem::take(&mut object.waiting), object.args(None)),
+                    Some(object) => {
+                        (std::mem::take(&mut object.waiting), object.args(self.mine, None))
+                    }
                     None => (Vec::new(), None),
                 }
             };
@@ -1149,11 +1170,15 @@ impl DN {
         let shard = self.shards[shard_of(name)].lock().expect("objects");
         let object = shard.get(name)?;
         if want.detail == 0 {
-            return object.args(None).map(|args| Piece { entries: 1, whole: true, args });
+            return object.args(self.mine, None).map(|args| Piece {
+                entries: 1,
+                whole: true,
+                args,
+            });
         }
         // Room is what the limit has left, and an object costs at least its own entry, so a name
         // reached with no room to spare still gets its row and no streams.
-        let levelled = detailed(object, want, room.max(1))?;
+        let levelled = detailed(object, self.mine, want, room.max(1))?;
         let (entries, whole) = (levelled.shape.entries, !levelled.shape.more());
         Some(Piece { entries, whole, args: levelled.args(HashMap::new()) })
     }
@@ -1170,14 +1195,15 @@ impl DN {
 
     /// ⚠️ **Takes the name's shard lock** — see `look`.
     fn describe(&self, name: &str, record: Option<u64>) -> Option<Vec<Arg>> {
-        self.shards[shard_of(name)].lock().expect("objects").get(name)?.args(record)
+        self.shards[shard_of(name)].lock().expect("objects").get(name)?.args(self.mine, record)
     }
 }
 
 impl DN {
-    fn new(config: DNConfig) -> DN {
+    fn new(config: DNConfig, mine: u32) -> DN {
         DN {
             config,
+            mine,
             shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
             parked: AtomicU64::new(0),
             objects: AtomicU64::new(0),
@@ -1197,8 +1223,9 @@ struct Piece {
 }
 
 fn main() {
-    let result =
-        server::main(|process| Ok(DN::new(DNConfig::load(&process.config.service_config)?)));
+    let result = server::main(|process| {
+        Ok(DN::new(DNConfig::load(&process.config.service_config)?, process.entry.number()))
+    });
     if let Err(e) = result {
         eprintln!("dn: {e}");
         std::process::exit(1);
@@ -1274,7 +1301,7 @@ mod tests {
     /// answer from "no object".
     #[test]
     fn an_object_being_made_does_not_look_like_a_finished_one() {
-        let dn = DN::new(testing::dn_config());
+        let dn = DN::new(testing::dn_config(), 0);
         half_made(&dn, "/half");
         assert!(dn.look("/half").is_none(), "nothing to say about it yet");
         let waits = |name: &str| {
@@ -1296,7 +1323,11 @@ mod tests {
             .streams
             .push(held(7, 0, None));
         let args = dn.look("/half").expect("an object");
-        assert_eq!(args[1], Arg::Number(7), "its stream");
+        // ⚠️ Read through the shape rather than by index: the stream is a whole name now
+        // (#109), so its id is no longer argument one, and an index would have gone on
+        // asserting about whatever moved into that slot.
+        let (described, _) = Described::of_args(&args).expect("a row");
+        assert_eq!(described.expect("an object").stream.stream, 7, "its stream");
         assert!(!waits("/half"), "and it is no longer half made");
     }
 
@@ -1305,7 +1336,7 @@ mod tests {
     /// behind when it loses the race.
     #[test]
     fn one_name_is_taken_once() {
-        let dn = DN::new(testing::dn_config());
+        let dn = DN::new(testing::dn_config(), 0);
         let mine = |dn: &DN| {
             let mut taken = Vec::new();
             let name = "/same".to_string();
@@ -1397,9 +1428,9 @@ mod tests {
     /// baseline.
     #[test]
     fn wanting_nothing_answers_the_bare_row() {
-        assert!(detailed(&grown(), &Want::plain(), 100).is_none(), "nothing levelled to build");
+        assert!(detailed(&grown(), 0, &Want::plain(), 100).is_none(), "nothing levelled to build");
         let object = grown();
-        match describe_at(&object, None, &Want::plain(), 100).expect("an answer") {
+        match describe_at(&object, 0, None, &Want::plain(), 100).expect("an answer") {
             Answering::Plain(args) => {
                 assert_eq!(args.len(), Described::ARGS);
                 assert!(Described::of_args(&args).expect("a row").0.is_some());
@@ -1414,7 +1445,7 @@ mod tests {
     fn the_counts_are_exact_while_the_detail_is_capped() {
         let want = Want::plain().with(Detail::Streams).with(Detail::Counts);
         // Two entries: one for the object, so room for one stream.
-        let args = flat(detailed(&grown(), &Want { limit: 2, ..want }, 100).expect("an answer"));
+        let args = flat(detailed(&grown(), 0, &Want { limit: 2, ..want }, 100).expect("an answer"));
         let (shape, rows) = read_back(&args);
         assert_eq!(shape.streams, 3, "how many there are");
         assert_eq!((shape.given, rows.len()), (1, 1), "how many are described");
@@ -1433,7 +1464,7 @@ mod tests {
         let mut seen = Vec::new();
         for _ in 0..8 {
             let args = flat(
-                detailed(&object, &Want { limit: 2, from: Start::Record(at), ..want }, 100)
+                detailed(&object, 0, &Want { limit: 2, from: Start::Record(at), ..want }, 100)
                     .expect("an answer"),
             );
             let (shape, rows) = read_back(&args);
@@ -1454,7 +1485,8 @@ mod tests {
         let want = Want::plain().with(Detail::Streams);
         let given = |asked, configured| {
             let args = flat(
-                detailed(&grown(), &Want { limit: asked, ..want }, configured).expect("an answer"),
+                detailed(&grown(), 0, &Want { limit: asked, ..want }, configured)
+                    .expect("an answer"),
             );
             read_back(&args).0.given
         };
@@ -1469,7 +1501,8 @@ mod tests {
     #[test]
     fn the_growing_stream_says_unknown_and_not_zero() {
         let want = Want::plain().with(Detail::Streams);
-        let args = flat(detailed(&grown(), &Want { limit: 100, ..want }, 100).expect("an answer"));
+        let args =
+            flat(detailed(&grown(), 0, &Want { limit: 100, ..want }, 100).expect("an answer"));
         let (_, rows) = read_back(&args);
         assert_eq!(rows[0].records, 100);
         assert_eq!(rows[2].records, UNKNOWN, "the one being appended to");
@@ -1482,7 +1515,7 @@ mod tests {
     #[test]
     fn counts_alone_bring_no_rows_but_say_where_rows_start() {
         let want = Want::plain().with(Detail::Counts);
-        let args = flat(detailed(&grown(), &want, 100).expect("an answer"));
+        let args = flat(detailed(&grown(), 0, &want, 100).expect("an answer"));
         let (shape, rows) = read_back(&args);
         assert_eq!((shape.streams, shape.given, shape.entries), (3, 0, 1));
         assert!(rows.is_empty());
@@ -1492,7 +1525,7 @@ mod tests {
 
     /// A DN holding `count` objects named `/n0`, `/n1`, and so on.
     fn with_objects(count: u64) -> Arc<DN> {
-        let dn = Arc::new(DN::new(testing::dn_config()));
+        let dn = Arc::new(DN::new(testing::dn_config(), 0));
         for n in 0..count {
             let name = format!("/n{n}");
             dn.shards[shard_of(&name)].lock().unwrap().insert(

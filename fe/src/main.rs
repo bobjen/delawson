@@ -23,7 +23,7 @@ use common::Result;
 use common::block::Holds;
 use common::config::{FEConfig, ServiceKind};
 use common::framing::Framing;
-use common::info::{Batch, Described, Shape, UNKNOWN, Wanted};
+use common::info::{Batch, Described, Shape, StreamName, UNKNOWN, Wanted};
 use common::logw;
 use common::offset::{ERoff, ORoff, SRoff};
 use common::placement;
@@ -211,7 +211,10 @@ impl Stream {
 struct FE {
     config: FEConfig,
     /// Per `(DnId, StreamId)`.
-    streams: Mutex<HashMap<(u32, u64), Stream>>,
+    /// Keyed by the stream's whole name (#109), which is also what the SN keys by — so a
+    /// recycled id in a later second cannot find a cached open extent belonging to the old
+    /// stream (`A-NAME-IS-NEVER-REMINTED-IN-ITS-OWN-SECOND`).
+    streams: Mutex<HashMap<StreamName, Stream>>,
 }
 
 impl Service for FE {
@@ -352,7 +355,7 @@ impl FE {
             };
             // A create takes the name first and names the stream afterwards, so a
             // zero here is an object caught between the two.
-            if located.stream == 0 {
+            if located.stream.stream == 0 {
                 return reply
                     .send(Response::error(Status::Internal, format!("{path} has no stream yet")));
             }
@@ -427,7 +430,7 @@ impl FE {
         wanting: Wanting,
         sealed: Option<(u64, Filled)>,
     ) {
-        let key = (wanting.located.dn, wanting.located.stream);
+        let key = wanting.located.stream;
         // ⚠️ Deciding and waiting under one lock. With the lock released in between,
         // the answer can arrive in the gap and wake nobody.
         let mut carry = Some(wanting);
@@ -475,7 +478,7 @@ impl FE {
     fn arrived(
         self: &Arc<Self>,
         process: &Arc<Process>,
-        key: (u32, u64),
+        key: StreamName,
         wanting: Wanting,
         answer: Response,
     ) {
@@ -520,7 +523,7 @@ impl FE {
     }
 
     /// Nothing is in flight, and nothing may be left waiting for it.
-    fn give_up(&self, key: (u32, u64), status: Status, why: &str) {
+    fn give_up(&self, key: StreamName, status: Status, why: &str) {
         let waiting = {
             let mut streams = self.streams.lock().expect("streams");
             streams.get_mut(&key).and_then(|stream| stream.getting.take())
@@ -606,11 +609,13 @@ impl FE {
         let Wanting { path, located, body, holds, tries, reply } = wanting;
         // Nothing may hand out an extent of a stream that will take no more, and what
         // is remembered about it is no use to an append either.
-        self.streams.lock().expect("streams").remove(&(located.dn, located.stream));
+        self.streams.lock().expect("streams").remove(&located.stream);
 
         let dn = format!("DN{}", located.dn);
-        let ask =
-            Request::new(Op::ExtendObject).text(&path).number(located.stream).number(*records);
+        let ask = Request::new(Op::ExtendObject)
+            .text(&path)
+            .number(located.stream.stream as u64)
+            .number(*records);
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
         let named = dn.clone();
@@ -705,17 +710,16 @@ impl FE {
             .streams
             .lock()
             .expect("streams")
-            .get(&(located.dn, located.stream))
+            .get(&located.stream)
             .and_then(|stream| stream.holding(record));
         if let Some(open) = known {
             return from_instance(process, &located, &open, record, budget, reply);
         }
 
         let identity = format!("SN{}", located.sn);
-        let ask = Request::new(Op::LocateRecord)
-            .number(located.dn as u64)
-            .number(located.stream)
-            .number(record.number());
+        let mut ask = Request::new(Op::LocateRecord);
+        ask.args.extend(located.stream.args());
+        ask.args.push(Arg::Number(record.number()));
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
         let named = identity.clone();
@@ -733,7 +737,7 @@ impl FE {
             fe.streams
                 .lock()
                 .expect("streams")
-                .entry((located.dn, located.stream))
+                .entry(located.stream)
                 .or_default()
                 .remember(open.clone());
             from_instance(&onward, &located, &open, record, budget, reply);
@@ -746,17 +750,17 @@ impl FE {
 
 /// What to ask the SN for the next extent: open one, or report the one that filled
 /// and get its replacement in the same round trip.
-fn wanting_extent(key: (u32, u64), sealed: Option<(u64, Filled)>) -> Request {
-    let (dn, stream) = key;
-    match sealed {
-        None => Request::new(Op::OpenExtent).number(dn as u64).number(stream),
-        Some((id, came_to)) => {
-            let mut request =
-                Request::new(Op::SealExtent).number(dn as u64).number(stream).number(id);
-            request.args.extend(came_to.args());
-            request
-        }
+fn wanting_extent(key: StreamName, sealed: Option<(u64, Filled)>) -> Request {
+    let mut request = Request::new(match sealed {
+        None => Op::OpenExtent,
+        Some(_) => Op::SealExtent,
+    });
+    request.args.extend(key.args());
+    if let Some((id, came_to)) = sealed {
+        request.args.push(Arg::Number(id));
+        request.args.extend(came_to.args());
     }
+    request
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -791,7 +795,7 @@ fn make_object(
         let Some(located) = Located::of(owner, &answer.args) else {
             return reply.send(Response::error(Status::Internal, "that create made no object"));
         };
-        if located.stream == 0 {
+        if located.stream.stream == 0 {
             return reply.send(Response::error(Status::Internal, "that object has no stream"));
         }
         then(&fe, &onward, located, reply);
@@ -942,7 +946,7 @@ fn receipt(located: &Located, open: &Open, answer: Response) -> Response {
         id: 0,
         status: Status::Ok,
         args: vec![
-            Arg::Number(located.stream),
+            Arg::Number(located.stream.stream as u64),
             Arg::Number(in_stream),
             Arg::Number(located.first_record + in_stream),
             Arg::Number(*records),
@@ -959,7 +963,8 @@ fn receipt(located: &Located, open: &Open, answer: Response) -> Response {
 #[derive(Clone, Copy)]
 struct Located {
     dn: u32,
-    stream: u64,
+    /// The stream's whole name, which is what the SN keys by (#109).
+    stream: StreamName,
     sn: u32,
     framing: Framing,
     /// The object-local number of this stream's first record, which is what turns a
@@ -1594,7 +1599,7 @@ mod tests {
         args.extend(
             Described {
                 id: 1,
-                stream: 1,
+                stream: StreamName { range: 0, stream: 1, created: TimeSec::new(1_000_000) },
                 sn: 0,
                 created: TimeSec::EPOCH,
                 keyed: false,
@@ -1827,19 +1832,21 @@ mod tests {
     /// The DN's answer says which stream, which SN, and how the records are framed.
     #[test]
     fn an_object_is_read_out_of_the_dns_answer() {
-        let (kind, width) = Framing::CrLf.wire();
-        let args = vec![
-            Arg::Number(9),
-            Arg::Number(17),
-            Arg::Number(0),
-            Arg::Number(1_000_000),
-            Arg::Flag(false),
-            Arg::Number(kind),
-            Arg::Number(width),
-            Arg::Number(400),
-        ];
+        // ⚠️ Built through the shape rather than as a list of numbers, so that a field
+        // growing — as the stream id did into a whole name, #109 — is a compile error here
+        // instead of a row that parses into the wrong things.
+        let args = Described {
+            id: 9,
+            stream: StreamName { range: 3, stream: 17, created: TimeSec::new(1_000_000) },
+            sn: 0,
+            created: TimeSec::new(1_000_000),
+            keyed: false,
+            framing: Framing::CrLf,
+            first_record: 400,
+        }
+        .args();
         let located = Located::of(3, &args).expect("an object");
-        assert_eq!((located.dn, located.stream, located.sn), (3, 17, 0));
+        assert_eq!((located.dn, located.stream.stream, located.sn), (3, 17, 0));
         assert_eq!(located.framing, Framing::CrLf);
         assert_eq!(located.first_record, 400, "where this stream's records start");
         // A framing the DN could not have meant is not an object either.
@@ -1850,7 +1857,13 @@ mod tests {
     /// the record number it reports is stream-local rather than extent-local.
     #[test]
     fn a_receipt_leads_with_the_durable_reference() {
-        let located = Located { dn: 0, stream: 17, sn: 0, framing: Framing::Lf, first_record: 0 };
+        let located = Located {
+            dn: 0,
+            stream: StreamName { range: 0, stream: 17, created: TimeSec::new(1_000_000) },
+            sn: 0,
+            framing: Framing::Lf,
+            first_record: 0,
+        };
         let open = Open {
             sn: 0,
             id: 7,
@@ -1895,7 +1908,13 @@ mod tests {
     /// to it and must not turn it into a receipt.
     #[test]
     fn a_failed_append_is_not_dressed_up_as_a_receipt() {
-        let located = Located { dn: 0, stream: 17, sn: 0, framing: Framing::Lf, first_record: 0 };
+        let located = Located {
+            dn: 0,
+            stream: StreamName { range: 0, stream: 17, created: TimeSec::new(1_000_000) },
+            sn: 0,
+            framing: Framing::Lf,
+            first_record: 0,
+        };
         let open = Open {
             sn: 0,
             id: 7,

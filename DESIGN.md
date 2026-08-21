@@ -17271,3 +17271,46 @@ nothing deletes an extent or a stream — so this is a note for when it does (#1
 `(dn, stream)` with no second at all, so the guarantee above holds for extents and is currently a
 statement of intent for streams. Until it lands, the `u32` stream id rests on a name the code does not
 check.
+
+### 17.33.3 The name is enforced now, not merely intended
+
+**#109 closed.** §17.33.2 narrowed the stream id to `u32` on the strength of
+`(RangeId, StreamId, CreateSec)` — and the code did not check that name anywhere, so it was
+narrower than its guarantee. It is checked now.
+
+| | before | now |
+|---|---|---|
+| the SN's stream table | keyed by `(dn, stream)` | keyed by **`StreamName`** |
+| `open-extent`, `seal-extent`, `locate-record` | `(dn, stream, …)` | the **whole name**, then the rest |
+| `list-extents` | one `dn` at the front, ids after | **a name per entry** |
+| the FE's open-extent cache | `(dn, stream)` | keyed by **`StreamName`** |
+| `Described` | a bare stream id | the **whole name**, so the FE can key by it |
+
+> **The `Listing` change is the one that will matter later.** Its range used to sit once at the
+> front, which assumes every stream in a batch belongs to one range. That is true while a range is a
+> DN; #75 makes ranges split and move, and then a batch routinely spans them — so the range travels
+> **per entry**.
+
+⚠️ **`RangeId` still does not exist**: `routing::range_of_dn` is the identity function, the same
+placeholder shape as `placement::en_of` (§17.29.3). What has changed is that there is now exactly one
+function to replace, and every tier already carries the field.
+
+#### 17.33.4 Four tests were asserting positions, and the shape moved under them
+
+**The stream id growing into a three-field name shifted every argument after it**, and four tests
+broke — each of them reading a row by index:
+
+| | |
+|---|---|
+| `args[5] = 99` to make a bad framing | the framing had moved; now `args[Described::ARGS - 3]`, counted from the end |
+| `args[1]` is the stream | now read through `Described::of_args` |
+| a `Located` built from eight bare numbers | now built through `Described { .. }.args()`, so a new field is a compile error |
+| `args.len() / 5` "would have found four" | ⚠️ it says **six** now — kept, because the point was never the number |
+
+**That last one is the joke on itself.** It exists to record that chopping a row into fixed chunks
+gives a wrong answer — and the wrong answer it gives changed when the row did. It asserts
+`args.len() == 3 * Described::ARGS` and that five-chunks does *not* find three, which is the claim
+that survives the shape moving.
+
+> **A test that hard-codes a position has to be edited every time the shape does**, which is the
+> same complaint §17.19 makes about the code. The fix in both places is to read through the shape.

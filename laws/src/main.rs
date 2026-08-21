@@ -1334,8 +1334,16 @@ fn say(
 ) -> Result<()> {
     let flavor = if it.keyed { "keyed" } else { "unkeyed" };
     println!(
-        "{} object {} {flavor} framed {}, stream {} on SN{} from record {}, made in second {}",
-        target.identity, it.id, it.framing, it.stream, it.sn, it.first_record, it.created
+        "{} object {} {flavor} framed {}, made in second {}, at stream {} on SN{} \
+         (made in second {}) from record {}",
+        target.identity,
+        it.id,
+        it.framing,
+        it.created,
+        it.stream.stream,
+        it.sn,
+        it.stream.created,
+        it.first_record
     );
     let Some(shape) = shape else { return Ok(()) };
     for (row, extents) in streams {

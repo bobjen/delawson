@@ -21,9 +21,13 @@ use crate::{Error, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Described {
     pub id: u64,
-    /// The stream this answer is about: the last one for an append, or the one
-    /// holding a record for a read.
-    pub stream: u64,
+    /// The stream this answer is about, **by its whole name**: the last one for an append,
+    /// or the one holding a record for a read.
+    ///
+    /// ⚠️ **The name and not the id** (#109), because everything the FE does next — open an
+    /// extent, seal one, locate a record — keys a stream at the SN by
+    /// `(RangeId, StreamId, CreateSec)`, and the DN is the only tier holding all three.
+    pub stream: StreamName,
     pub sn: u32,
     pub created: TimeSec,
     pub keyed: bool,
@@ -36,7 +40,7 @@ pub struct Described {
 impl Described {
     /// Fields per row on the wire. Public because a caller sizing a buffer wants it,
     /// and **derived from the shape rather than written down twice**.
-    pub const ARGS: usize = 8;
+    pub const ARGS: usize = 7 + StreamName::ARGS;
 
     /// A row meaning "there is no such object", for a batch answer that must line up
     /// with the names it was asked about. A zero id is what marks it.
@@ -44,38 +48,42 @@ impl Described {
     /// ⚠️ §9.1.3.7 will retire this: once an answer may be short, lining up by
     /// position stops working and the answer has to say how many names it covered.
     pub fn missing() -> Vec<Arg> {
-        vec![
-            Arg::Number(0),
-            Arg::Number(0),
+        let mut args = vec![Arg::Number(0)];
+        args.extend(StreamName::default().args());
+        args.extend([
             Arg::Number(0),
             Arg::Number(0),
             Arg::Flag(false),
             Arg::Number(0),
             Arg::Number(0),
             Arg::Number(0),
-        ]
+        ]);
+        args
     }
 
     pub fn args(&self) -> Vec<Arg> {
         let (kind, width) = self.framing.wire();
-        vec![
-            Arg::Number(self.id),
-            Arg::Number(self.stream),
+        let mut args = vec![Arg::Number(self.id)];
+        args.extend(self.stream.args());
+        args.extend([
             Arg::Number(self.sn as u64),
             Arg::Number(self.created.number()),
             Arg::Flag(self.keyed),
             Arg::Number(kind),
             Arg::Number(width),
             Arg::Number(self.first_record),
-        ]
+        ]);
+        args
     }
 
     /// And back, returning whatever followed it. `None` for a row marked missing,
     /// since a zero id is not an object.
     pub fn of_args(args: &[Arg]) -> Result<(Option<Described>, &[Arg])> {
+        let [Arg::Number(id), after @ ..] = args else {
+            return Err(Error::new("that answer did not describe an object"));
+        };
+        let (stream, after) = StreamName::of_args(after)?;
         let [
-            Arg::Number(id),
-            Arg::Number(stream),
             Arg::Number(sn),
             Arg::Number(created),
             Arg::Flag(keyed),
@@ -83,7 +91,7 @@ impl Described {
             Arg::Number(width),
             Arg::Number(first_record),
             rest @ ..,
-        ] = args
+        ] = after
         else {
             return Err(Error::new("that answer did not describe an object"));
         };
@@ -93,7 +101,7 @@ impl Described {
         Ok((
             Some(Described {
                 id: *id,
-                stream: *stream,
+                stream,
                 sn: *sn as u32,
                 created: TimeSec::new(*created),
                 keyed: *keyed,
@@ -184,6 +192,56 @@ impl Shape {
             },
             rest,
         ))
+    }
+}
+
+/// What names a stream for ever: `(RangeId, StreamId, CreateSec)`.
+///
+/// ⚠️ **Three parts, because the id alone was never the name** (Asserted, Bob, 2026-08-20).
+/// The same argument as an extent's `(SnId, ExtentId, CreateSec)` (§17.29.2): an id has only
+/// to be unique among the streams one range makes in one second, which is what lets it be 32
+/// bits — and what makes recycling one safe, once #110's gate exists.
+///
+/// **Scoped to the range and not to the DN**, because #75 makes the range the durable key
+/// precisely so it can move between DNs. `routing::range_of_dn` stands in until ranges exist.
+///
+/// ⚠️ **`range` is not `sn`.** The range is *whose* the stream is; the SN is *where* it lives.
+/// Both travel, and they are different numbers the moment a stream is reassigned (§7.3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct StreamName {
+    pub range: u32,
+    pub stream: u32,
+    pub created: TimeSec,
+}
+
+impl StreamName {
+    pub const ARGS: usize = 3;
+
+    pub fn args(&self) -> Vec<Arg> {
+        vec![
+            Arg::Number(self.range as u64),
+            Arg::Number(self.stream as u64),
+            Arg::Number(self.created.number()),
+        ]
+    }
+
+    pub fn of_args(args: &[Arg]) -> Result<(StreamName, &[Arg])> {
+        let [Arg::Number(range), Arg::Number(stream), Arg::Number(created), rest @ ..] = args
+        else {
+            return Err(Error::new("a stream is named by a range, an id and a second"));
+        };
+        let name = StreamName {
+            range: *range as u32,
+            stream: *stream as u32,
+            created: TimeSec::new(*created),
+        };
+        Ok((name, rest))
+    }
+}
+
+impl std::fmt::Display for StreamName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stream {} of range {} made in second {}", self.stream, self.range, self.created)
     }
 }
 
@@ -581,46 +639,49 @@ impl Batch {
 /// §9.1.3.7's limit is one number over the answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listing {
-    pub dn: u32,
     /// Entries the whole answer may carry, over every stream in it.
     pub limit: u64,
-    /// `(StreamId, first stream-local record to describe from)`, in order.
-    pub at: Vec<(u64, u64)>,
+    /// `(name, first stream-local record to describe from)`, in order.
+    ///
+    /// ⚠️ **A whole name per stream, not an id against one shared range.** A batch may
+    /// name streams of different ranges — and once ranges split and move (#75) it routinely
+    /// will — so the range travels with each entry rather than once at the front.
+    pub at: Vec<(StreamName, u64)>,
 }
 
 impl Listing {
     pub fn args(&self) -> Vec<Arg> {
-        let mut args = vec![
-            Arg::Number(self.dn as u64),
-            Arg::Number(self.limit),
-            Arg::Number(self.at.len() as u64),
-        ];
-        for (stream, from) in &self.at {
-            args.push(Arg::Number(*stream));
+        let mut args = vec![Arg::Number(self.limit), Arg::Number(self.at.len() as u64)];
+        for (name, from) in &self.at {
+            args.extend(name.args());
             args.push(Arg::Number(*from));
         }
         args
     }
 
     pub fn of_args(args: &[Arg]) -> Result<Listing> {
-        let [Arg::Number(dn), Arg::Number(limit), Arg::Number(count), rest @ ..] = args else {
-            return Err(Error::new("list-extents takes a DnId, a limit and a run of streams"));
+        let [Arg::Number(limit), Arg::Number(count), rest @ ..] = args else {
+            return Err(Error::new("list-extents takes a limit and a run of streams"));
         };
         let count = *count as usize;
-        if rest.len() != count * 2 {
+        let each = StreamName::ARGS + 1;
+        if rest.len() != count * each {
             return Err(Error::new(format!(
                 "list-extents says it names {count} streams and carries {}",
-                rest.len() / 2
+                rest.len() / each
             )));
         }
         let mut at = Vec::with_capacity(count);
-        for pair in rest.chunks(2) {
-            match pair {
-                [Arg::Number(stream), Arg::Number(from)] => at.push((*stream, *from)),
-                _ => return Err(Error::new("a stream and a record are numbers")),
-            }
+        let mut rest = rest;
+        for _ in 0..count {
+            let (name, after) = StreamName::of_args(rest)?;
+            let [Arg::Number(from), after @ ..] = after else {
+                return Err(Error::new("a stream is named, then the record to start from"));
+            };
+            at.push((name, *from));
+            rest = after;
         }
-        Ok(Listing { dn: *dn as u32, limit: *limit, at })
+        Ok(Listing { limit: *limit, at })
     }
 }
 
@@ -682,7 +743,7 @@ mod tests {
     fn one(id: u64) -> Described {
         Described {
             id,
-            stream: 17,
+            stream: StreamName { range: 2, stream: 17, created: TimeSec::new(1_000_000) },
             sn: 3,
             created: TimeSec::new(1_000_000),
             keyed: false,
@@ -713,8 +774,11 @@ mod tests {
         let rows = Described::all_of_args(&args).expect("rows");
         assert_eq!(rows.len(), 3, "three objects, not six");
         assert_eq!(rows.iter().filter(|row| row.is_some()).count(), 3);
-        // What the old arithmetic would have said, kept as the thing not to do.
-        assert_eq!(args.len() / 5, 4, "chunks of five would have found four");
+        // What the old arithmetic would have said, kept as the thing not to do. ⚠️ It said
+        // four when the row was eight fields and says six now the row is ten — the number is
+        // not the point, being wrong in a different way each time the shape moves is.
+        assert_eq!(args.len(), 3 * Described::ARGS);
+        assert_ne!(args.len() / 5, 3, "chunks of five find something other than three");
     }
 
     /// A missing name still occupies a row, so a batch answer lines up with the
@@ -743,7 +807,11 @@ mod tests {
     #[test]
     fn an_impossible_framing_is_refused() {
         let mut args = one(1).args();
-        args[5] = Arg::Number(99);
+        // ⚠️ Counted back from the end rather than forward from the start: the framing is the
+        // last three fields but one, and this test broke when the stream id at the front grew
+        // into a whole name (#109). A test that hard-codes a position is a test that has to be
+        // edited every time the shape does — which is the same complaint the *next* test makes.
+        args[Described::ARGS - 3] = Arg::Number(99);
         assert!(Described::of_args(&args).is_err());
     }
 
