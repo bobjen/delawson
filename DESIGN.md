@@ -17232,12 +17232,40 @@ encoding over triples is how that budget becomes reachable; over GUIDs it is not
 arithmetic. Two extents collide only if **one SN mints two with the same id in the same second**,
 which needs 2^32 extents inside one second from one machine: at 32 MB apiece, 137 PB/s.
 
-**The two things that could break it are both closed:**
+**And it runs until the second field itself wraps**, which at 64 bits is **584 billion years**
+(Asserted, Bob, 2026-08-20: *"2^64 seconds is 584 billion years, so millions undersold it"* — an
+earlier draft here said a few million).
 
 | | |
 |---|---|
-| the id **wrapping** | harmless, because the second differs — a wrapped id recurring is a different name, not a collision. It would only matter for a wrap *within* one second. |
 | the clock **going backwards** | refused, not tolerated: `TimeSec::not_before` (§17.32.3), and it is refused precisely because a creation second selects a key (§7.3.3) |
+| the id **being reused** | ⚠️ **the real one**, and it needs a mechanism — §17.34.3 |
+
+#### 17.34.3 ⚠️ Recycling ids is what makes the second load-bearing
+
+**An earlier draft of this section said id wrapping was harmless because the second differs. That is
+true of a monotonic counter and false the moment ids are recycled** — which they must be, since a
+`u32` cap is on ids *live*, not ids ever created (§17.33.2's 4.3 × 10^9 against §14.1's 1.7 × 10^9).
+
+**The collision is a short-lived object**: an extent created in second *S*, deleted in second *S*, its
+id returned to the free list and handed out again in second *S*. Two extents, one name.
+
+**Bob's fix** (Asserted, 2026-08-20): *"gate reusing (SnId, ExtentId) and (RangeId, StreamId) to more
+than a second by moving the recycled list to free list at most once every two seconds."*
+
+⚠️ **The cadence alone does not do it, and the difference is one epoch.** A single list drained every
+two seconds releases an id freed a microsecond before the drain — a wait of ~0, and the same second.
+What holds the bound is **two buckets**: freed ids go to the open one, and the swap releases the
+*closed* one.
+
+| | minimum wait |
+|---|---|
+| one list, drained every 2 s | ⚠️ **~0** — broken |
+| two buckets, swapped every 2 s | **2 s**, for an id freed just before a swap; 4 s at most |
+
+**So the minimum wait is one whole interval**, and two seconds is chosen over one to leave margin
+against an unpunctual drain rather than because one would be too short. Nothing recycles ids yet —
+nothing deletes an extent or a stream — so this is a note for when it does (#110).
 
 ⚠️ **What is not yet closed is that the stream name is not enforced** (#109): the SN keys streams by
 `(dn, stream)` with no second at all, so the guarantee above holds for extents and is currently a

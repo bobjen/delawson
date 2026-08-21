@@ -777,6 +777,17 @@ among tenants.
 test** — it is arithmetic over the sharing rule
 *Breaks* sharing becomes an exploit: colluding tenants cut their combined bill.
 
+**`A-NAME-IS-NEVER-REMINTED-IN-ITS-OWN-SECOND`** — an id returned to a free list cannot be
+handed out again in the second it was freed in, so a triple names one thing for ever.
+*Argued* §17.34.3, §17.34.2 · *Enforced* design only; nothing recycles ids yet, and the
+two-bucket free list is #110 · *Checked* not yet
+*Breaks* the whole guarantee that a 16-byte triple beats a 16-byte GUID: collision stops being
+arithmetic and becomes a race. ⚠️ And it is not a naming inconvenience — a name derives the
+extent's key (§7.3.3), so two extents sharing one is two plaintexts under one key and one IV,
+which [[EXTENT-OFFSET-WRITE-ONCE]] exists to make impossible. ⚠️ Note the mechanism is two
+buckets and not a drain cadence: a single list on a timer releases an id freed a moment before
+the drain, which is a wait of nothing.
+
 **`AN-EXTENT-HAS-NO-POSITION`** — an extent records how many records it holds, never where
 they start; a first-record is a property of a stream's list, not of the extent.
 *Argued* §17.29.1 · *Enforced* `sn::Extent` has no such field, and `Extent::args` takes the
@@ -906,7 +917,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **durable** | §8.1.1 | `DURABLE-IS-QUORUM-WATERMARK`, `INCOMPLETE-RECORD-NOT-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `SEAL-NEVER-BELOW-DURABLE` |
 | **erasure-coding group** | §4.3.2.3 | `EC-NEVER-SPLITS-AN-EXTENT`, `EC-GROUP-EQUAL-LENGTH`, `INSTANCES-BYTE-IDENTICAL`, `AEAD-TAG-IS-THE-CHECKSUM`, `ONE-MEDIA-CLASS-PER-EXTENT` |
 | **billing** | §12 | `A-STREAM-HOLDS-ONE-TENANT`, `BILLING-CHARGES-THE-CLASS-NOT-THE-COPIES`, `A-PHYSICAL-LENGTH-IS-NEVER-STORED`, `ZERO-REFERENCES-IS-A-BUG` |
-| **extent** | §4.2 | `AN-EXTENT-HAS-NO-POSITION`, `EXTENT-IDENTITY-UNIQUE`, `EXTENT-HOLDS-WHOLE-RECORDS`, `EXTENT-OFFSET-WRITE-ONCE`, `EXTENT-SEALS-BETWEEN-RECORDS`, `SEALED-EXTENT-IMMUTABLE`, `ONE-UNSEALED-EXTENT-UNKEYED`, `RECORD-FITS-ONE-EXTENT`, `ONE-MEDIA-CLASS-PER-EXTENT`, `EC-NEVER-SPLITS-AN-EXTENT` |
+| **extent** | §4.2 | `A-NAME-IS-NEVER-REMINTED-IN-ITS-OWN-SECOND`, `AN-EXTENT-HAS-NO-POSITION`, `EXTENT-IDENTITY-UNIQUE`, `EXTENT-HOLDS-WHOLE-RECORDS`, `EXTENT-OFFSET-WRITE-ONCE`, `EXTENT-SEALS-BETWEEN-RECORDS`, `SEALED-EXTENT-IMMUTABLE`, `ONE-UNSEALED-EXTENT-UNKEYED`, `RECORD-FITS-ONE-EXTENT`, `ONE-MEDIA-CLASS-PER-EXTENT`, `EC-NEVER-SPLITS-AN-EXTENT` |
 | **extent identity** | §4.6.3 | `EXTENT-IDENTITY-UNIQUE`, `EXTENT-OFFSET-WRITE-ONCE`, `EXTENT-KEY-FROM-CREATING-SN`, `HINT-BOUND-BY-CAPABILITY` |
 | **framing** | §8.2 | `FRAMING-IS-A-REPRESENTATION`, `TERMINATOR-NOT-IN-DATA`, `EXTENT-HOLDS-WHOLE-RECORDS`, `CANONICAL-OFFSET-SPACE` |
 | **hint** | §8.1.1a-10 | `HINT-BOUND-BY-CAPABILITY`, `CAPABILITY-IS-MEMBERSHIP-ONLY`, `EXTENT-IDENTITY-UNIQUE`, `RETAIN-REWRITE-INPUTS-FOR-THE-HINT-WINDOW` |
