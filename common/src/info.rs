@@ -1065,20 +1065,19 @@ mod tests {
         }
     }
 
-    /// A zero object id is "no opinion" and not an object, which is the same sentinel a row
-    /// for a name that is not there uses.
+    /// ⚠️ **`NONE` is "no opinion", and zero is a real object** — the sentinel moved to the top
+    /// of the range so that slot 0 of an arena is usable (§17.37.2). A test with zero meaning
+    /// nothing is exactly what would have gone on passing while an object numbered zero became
+    /// unaddressable.
     #[test]
-    fn a_zero_object_is_no_opinion() {
-        let none = ObjectName {
-            range: RangeId::new(4),
-            object: ObjectId::new(0),
-            created: TimeSec::new(9),
-        };
-        assert!(!Expecting::of(none).asked(), "a range and a second alone name nothing");
-        assert!(Expecting::of(none).holds(ObjectName {
-            range: RangeId::new(0),
-            object: ObjectId::new(1),
-            created: TimeSec::EPOCH
-        }));
+    fn an_unset_object_is_no_opinion_and_zero_is_not() {
+        let unset =
+            ObjectName { range: RangeId::new(4), object: ObjectId::NONE, created: TimeSec::new(9) };
+        assert!(!Expecting::of(unset).asked(), "a range and a second alone name nothing");
+        let first =
+            ObjectName { range: RangeId::new(0), object: ObjectId::FIRST, created: TimeSec::EPOCH };
+        assert!(Expecting::of(unset).holds(first), "no opinion holds of anything");
+        assert!(Expecting::of(first).asked(), "and object zero is an object");
+        assert!(!Expecting::of(first).holds(unset));
     }
 }

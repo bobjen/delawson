@@ -17498,39 +17498,44 @@ has only to be unique among what **one minter makes in one second**. A 64-bit id
 bytes buying a range nothing can reach — and #110's reuse gate, not the width, is what actually
 keeps them apart.
 
-### 17.37.2 Zero is the sentinel here and the top is the sentinel there
+### 17.37.2 ⚠️ Zero was tried as the sentinel and the top is better
 
-⚠️ **The opposite of `offset`'s convention, on purpose** (Asserted, Bob): *"it's not like offsets
-where 0 is definitely a legal offset."*
+**A first version reserved zero**, on the reasoning that a count of zero is a count somebody means
+while a *thing* numbered zero is a thing nobody minted. That is true and it is not the deciding
+fact.
 
-| | reserved | because |
-|---|---|---|
-| an offset or count | **the top** | zero is a length somebody means |
-| an id | **zero** | a thing numbered zero is a thing nobody minted |
+⚠️ **§14.6.2 makes the id the index into its arena**, so reserving zero reserves **slot 0** — and
+then, in Bob's words (2026-08-20), *"the count is one bigger than it ought to be"*: in every length,
+every total, every answer to how many things an arena holds.
 
-**Both reserve exactly one value**; they differ in which one cannot occur naturally.
+**Spending that slot on the arena's header does not rescue it**, which was the next idea and a worse
+one:
 
-### 17.37.3 ⚠️ And that asymmetry is worth more than tidiness
+| | |
+|---|---|
+| it puts *"a type-shaped thing that somehow isn't a type"* in an array of records | defeating the array's type for the sake of one slot |
+| **and it does not fit** | the arena's singleton has statistics, accumulating statistics and locks that GC reads (Asserted, Bob) — not a record's worth of anything |
 
-**Every id has callers that look one up and may not find it** (Asserted, Bob, 2026-08-20), and the
-two ways to say so are a sentinel or an `Option`. **Reserving zero makes them the same choice**,
-because zero is a *niche*. Measured:
+**So the sentinel is the top of the range, the same as `offset`'s**, and one convention serves both.
+Slot 0 of every arena holds a real thing: object 0 and stream 0 exist and are addressable, which is
+checked live and by test.
 
-| | `Id` | `Option<Id>` |
-|---|---|---|
-| over a plain `u32` | 4 | **8** |
-| over a `NonZeroU32` | 4 | **4** |
+⚠️ **`Default` is `NONE` and not the derived zero**, which is the one place this bites: a derived
+`Default` would hand out the first slot of an arena as *"unset"*, and that is now a real thing.
 
-> **So `Option<Id>` can cost nothing and have the compiler insist on the not-found branch**, where a
-> sentinel costs nothing and asks every caller to remember. That is §18's rule — make the compiler
-> catch it — available for free, and only because the reserved value is at the bottom.
+### 17.37.3 The one argument for zero, and what taking it would cost
 
-⚠️ **An offset cannot have this.** Its reserved value is at the *top*, and a top-valued niche is not
-one Rust exposes — a second reason the two conventions differ, beyond zero being a legal offset.
+**A niche.** `Option<Id>` is 8 bytes over a plain `u32` and **4 over a `NonZeroU32`** — the same as
+the id — so reserving *zero* would let the compiler insist on the not-found branch for free, where a
+sentinel asks every caller to remember. That is §18's make-the-compiler-catch-it rule available at
+no cost in space.
 
-**The sentinel stays for now**, because it is what the rest of the store does and the typing was
-already a hundred call sites. #112 is the conversion, and the wire keeps zero for none either way: a
-wire number has no niche, so the boundary is where it is decided.
+> **It is the only argument, and it is not free after all**: taking it means taking the wasted slot
+> and the off-by-one count with it. #112 records the trade rather than deciding it.
+
+⚠️ **An offset could not have this either way.** Its reserved value is at the *top*, and a
+top-valued niche is not one Rust exposes — so for offsets the sentinel is the only option, and for
+ids it is a choice.
 
 ### 17.37.4 What the types said as soon as they existed
 

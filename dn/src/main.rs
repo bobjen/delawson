@@ -1240,8 +1240,10 @@ impl DN {
             parked: AtomicU64::new(0),
             objects: AtomicU64::new(0),
             streams: AtomicU64::new(0),
-            next_object: AtomicU64::new(1),
-            next_stream: AtomicU64::new(1),
+            // ⚠️ From zero, because the sentinel is at the top of the range now: slot 0 of an
+            // arena is a real object, and starting at one would waste it (§17.37.2).
+            next_object: AtomicU64::new(0),
+            next_stream: AtomicU64::new(0),
         }
     }
 }

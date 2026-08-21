@@ -12,40 +12,50 @@
 //! only to be unique among what one minter makes in one second. A `u64` id would be eight
 //! bytes buying a range nothing can reach.
 //!
-//! **Zero is the sentinel**, not the top of the range — the opposite of `offset`'s convention,
-//! and for a reason (Asserted, Bob, 2026-08-20): *"it's not like offsets where 0 is definitely a
-//! legal offset."* A count of zero is a count somebody means; a *thing* numbered zero is a thing
-//! nobody minted. Both conventions reserve one value and differ in which value cannot occur
-//! naturally.
+//! **The top of the range is the sentinel**, the same convention `offset` uses, and a caller
+//! looking one of these up and not finding it gets `NONE`.
 //!
-//! ⚠️ **And that asymmetry is worth more than tidiness.** A caller looking one of these up has to
-//! deal with *not found*, and the two ways are a sentinel or an `Option` — except that reserving
-//! **zero** makes them the same choice, because zero is a *niche*. Measured:
+//! ⚠️ **Zero was tried and is worse** (Asserted, Bob, 2026-08-20). It is tempting, since a thing
+//! numbered zero is a thing nobody minted — and §14.6.2 makes **the id the index** into its arena,
+//! so reserving zero reserves slot 0, and then *"the count is one bigger than it ought to be"* in
+//! every length, every total, every answer to how many things an arena holds. Spending that slot
+//! on the arena's header does not rescue it: it puts *"a type-shaped thing that somehow isn't a
+//! type"* in an array of records — and the header does not fit anyway, being a singleton with
+//! statistics, accumulating statistics and locks that GC reads (§17.37.2).
 //!
-//! | | size |
-//! |---|---|
-//! | `Id` over a plain `u32`, and `Option<Id>` | 4, **8** |
-//! | `Id` over a `NonZeroU32`, and `Option<Id>` | 4, **4** |
-//!
-//! So `Option<Id>` can cost nothing and have the compiler insist on the *not found* branch, where
-//! a sentinel costs nothing and asks every caller to remember. An offset cannot have that, because
-//! its reserved value is at the top and a top-valued niche is not one Rust exposes. **The sentinel
-//! stays for now** — it is what the rest of the store already does — and #112 is the conversion.
+//! **The one thing that would justify zero is a niche.** `Option<Id>` is 8 bytes over a plain
+//! `u32` and **4 over a `NonZeroU32`** — the same as the id — so reserving *zero* would let the
+//! compiler insist on the not-found branch for free, where a sentinel asks every caller to
+//! remember. That is a real argument and it is the only one; taking it means taking the wasted
+//! slot with it (#112). Until it is taken, the top of the range costs nothing and leaves the
+//! arenas dense.
 
 use crate::{Error, Result};
 
 macro_rules! id {
     ($name:ident, $what:literal) => {
         #[doc = concat!("Which ", $what, ".")]
-        #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(u32);
 
-        impl $name {
-            /// **No such thing**, which for an id is zero: nothing is minted with it.
-            pub const NONE: $name = $name(0);
+        /// ⚠️ **`NONE`, not zero.** Zero is a real id now that the sentinel is at the top, so
+        /// a derived `Default` would hand out the first slot of an arena as "unset".
+        impl Default for $name {
+            fn default() -> $name {
+                $name::NONE
+            }
+        }
 
-            /// The first one a minter hands out, since zero is the sentinel.
-            pub const FIRST: $name = $name(1);
+        impl $name {
+            /// **No such thing** — the top of the range, so that every slot of an arena
+            /// indexed by one of these is a slot a real thing can occupy (§14.6.2).
+            pub const NONE: $name = $name(u32::MAX);
+
+            /// The largest real one, one below `NONE`.
+            pub const MAX: $name = $name(u32::MAX - 1);
+
+            /// The first one a minter hands out, which is the first slot of its arena.
+            pub const FIRST: $name = $name(0);
 
             pub const fn new(id: u32) -> $name {
                 $name(id)
@@ -70,16 +80,21 @@ macro_rules! id {
             }
 
             pub const fn is_none(self) -> bool {
-                self.0 == 0
+                self.0 == u32::MAX
             }
 
             pub const fn is_some(self) -> bool {
-                self.0 != 0
+                self.0 != u32::MAX
             }
 
-            /// The next one after this, for a minter counting upward.
+            /// The next one after this, for a minter counting upward. ⚠️ Wraps to the first
+            /// rather than landing on the sentinel — and a minter that reaches here is one
+            /// #110's gate has to have been keeping honest, since a wrapped id collides.
             pub fn next(self) -> $name {
-                $name(self.0.wrapping_add(1).max(1))
+                match self.0 + 1 {
+                    u32::MAX => $name::FIRST,
+                    next => $name(next),
+                }
             }
         }
 
@@ -120,13 +135,18 @@ mod tests {
         assert_eq!(object, ObjectId::new(7));
     }
 
-    /// Zero is nothing, which is the opposite of `offset`'s sentinel and deliberately so.
+    /// ⚠️ **Zero is a real id**, which is the whole reason the sentinel is at the top: §14.6.2
+    /// makes the id the index into its arena, so a reserved zero would leave slot 0 empty and
+    /// every count one larger than the thing it counts (§17.37.2).
     #[test]
-    fn zero_is_nothing_and_one_is_the_first() {
+    fn zero_is_a_real_id_and_the_top_is_not() {
+        assert!(ExtentId::FIRST.is_some(), "the first slot of an arena holds a real extent");
+        assert_eq!(ExtentId::FIRST.get(), 0);
         assert!(ExtentId::NONE.is_none());
-        assert!(ExtentId::FIRST.is_some());
+        assert!(ExtentId::MAX.is_some());
+        // ⚠️ And an unset id is `NONE` rather than the derived zero, which would have handed
+        // out the first slot of an arena as "nothing here".
         assert_eq!(ExtentId::default(), ExtentId::NONE, "an unset id is no id");
-        assert_eq!(ExtentId::NONE.next(), ExtentId::FIRST);
     }
 
     /// ⚠️ A number too wide is refused, not truncated: keeping the low bits would hand back a
@@ -144,6 +164,7 @@ mod tests {
     /// colliding id rather than a nonexistent one — which #110's gate is what really prevents.
     #[test]
     fn counting_skips_the_sentinel() {
-        assert_eq!(ObjectId::new(u32::MAX).next(), ObjectId::FIRST);
+        assert_eq!(ObjectId::FIRST.next(), ObjectId::new(1));
+        assert_eq!(ObjectId::MAX.next(), ObjectId::FIRST, "wrapped, not nothing");
     }
 }
