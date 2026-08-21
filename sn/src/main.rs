@@ -77,7 +77,7 @@ impl Stream {
     /// scan, and a stream holds a handful of extents in the expected case (§14.1.1's
     /// 128 MB against 32 MB extents), so nothing here got slower. A stream with millions
     /// of extents would want a sparse checkpoint every *k* extents, which is one `u64`
-    /// per *k* rather than per extent (#106).
+    /// per *k* rather than per extent (#107).
     fn sealed_from(&self) -> impl Iterator<Item = (u64, &Sealed)> {
         self.sealed.iter().scan(0u64, |at, sealed| {
             let first = *at;

@@ -16837,7 +16837,7 @@ new `Placed { extent, first }` is what anything answering *about an extent in a 
 ⚠️ **The cost is that finding an extent is a walk rather than a search.** It was already a walk —
 `locate` used a linear `find` — and §14.1.1's 128 MB stream against 32 MB extents is a handful of
 entries. A stream with millions would want a sparse checkpoint every *k* extents, one `u64` per
-*k* rather than per extent (#106).
+*k* rather than per extent (#107).
 
 ### 17.29.2 `u32` ids are safe because the id was never the name
 
