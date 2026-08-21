@@ -804,13 +804,16 @@ cheapest way to hold this is placement — one common stream per authorization d
 — rather than one block per object, which would cost the shared compression lumping exists for.
 
 **`INLINE-BEATS-A-POINTER-TO-IT`** — an object is stored inline only while it is smaller than
-the metadata a reference to it would cost, `R·(1 + E·G/(f·r))`.
-*Argued* §17.25.6 · *Enforced* design only; no regime exists yet · *Checked* not yet
-*Breaks* both ways, and the wrong side is not symmetric. Inlining past the cutoff puts user
-bytes in RAM-backed metadata at ~5,000× the cost of disk; refusing to inline below it spends a
-56-byte record pointing at something smaller than the record. ⚠️ The cutoff is proportional to
-*R*, so it moves whenever the DN's stream record does — which it did on 2026-08-20, 40 B to
-56 B (§4.7.1).
+the stream range reference that would otherwise point at it: `n < R`.
+*Argued* §17.27, derived at §17.25.6 · *Enforced* design only; no regime exists yet ·
+*Checked* not yet
+*Breaks* asymmetrically, which is why the rule is stated at the limit rather than measured.
+Inlining **past** the cutoff puts user bytes in RAM-backed metadata at ~5,000× the cost of disk;
+refusing to inline **below** it spends a 56-byte record pointing at something smaller than the
+record. §17.25.6's full cutoff is `R·(1 + E·G/(f·r))` and the correction is strictly positive, so
+`n < R` can only ever under-inline — the cheap mistake — and the expensive one is unreachable.
+⚠️ Stated against *R* rather than as a constant, so it survives *R* moving: it went 40 B to 56 B
+on 2026-08-20 (§4.7.1) and this needed no edit.
 
 **`A-SEALED-SUMMARY-IS-FINAL`** — a sealed stream's sizes are exact and never change, so one
 refresh is correct for ever; a growing stream's are a point in time.

@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-155 things *not* decided.
+154 things *not* decided.
 
 **Priorities and framing**
 
@@ -13984,16 +13984,7 @@ Roughly in order of how much else depends on them.
      the 1 KB case as underbilled 375×, so today the tax falls on the operator. A flag whose omission
      costs the user nothing is a flag nobody sets.
 
-154. **The fraction of time DN metadata is resident in RAM** (§17.25.6). §17.25.6 derives the
-     inline-versus-lumped cutoff as `R·(1 + E·G/(f·r))` and everything in it is known except *f*. The
-     cutoff is insensitive to it across four orders of magnitude — 56 bytes at always-resident, 123
-     at one part in a thousand — so a rough figure settles the boundary. ⚠️ But *f* is per-object
-     rather than per-fleet, since hot metadata stays resident and cold does not, and that makes the
-     cutoff a function of access frequency rather than a constant. Measuring the fleet average is a
-     benchmark; deciding whether the per-object form is worth using is a design question, and §17.25.5's
-     SN rewrite pass is where it would be applied.
-
-155. **Whether a common stream is scoped to a tenant or to an authorization domain** (§17.26). Lumping
+154. **Whether a common stream is scoped to a tenant or to an authorization domain** (§17.26). Lumping
      puts many objects in one extent, and §5.1.1.1a's writable aliases mean a tenant can have a
      boundary inside itself — so an extent-scoped certificate over-grants. Scoping the common stream
      to the domain keeps every read-path mechanism intact and costs more streams; per-block separation
@@ -14004,6 +13995,8 @@ Roughly in order of how much else depends on them.
 
 **Closed** since earlier drafts:
 
+- how frequently DN metadata is resident in RAM — it does not need measuring, because the inline
+  cutoff is taken at its limit and the limit is the safe end (§17.27, §17.25.6);
 - the unkeyed overwrite/addressing contradiction (§3);
 - logical vs physical extent size, which is compression (§6);
 - the metadata topology, now three explicit node types (§5);
@@ -16555,6 +16548,10 @@ Inline wins while `n·f·r < R·(E·G + f·r)`, so:
 
 > ### `n* = R · (1 + E·G / (f·r))`
 
+⚠️ **§17.27 takes this at its limit and stops there** — `inline ⟺ n < R`, with no *f* to measure. What
+follows is why that limit is the *safe* end rather than merely the easy one, which is the part still
+worth having.
+
 **With *E* = 4, *G* = 1.5, *r* = 5,000 and *R* = 56 bytes** — today's DN stream record (§4.7.1), which
 is exactly what a range costs and an inline object does not pay:
 
@@ -16594,8 +16591,9 @@ be inlined at a smaller size than a cold one.
 > *after the fact*, when access frequency is an observed quantity rather than a prediction. The
 > cutoff formula is what tells it which comparison to make.
 
-**And *f* is a measurement nobody has taken** (§16.154). It is also, per §18.2, a **fraction in
-[0, 1]** and not a percentage — a parameter that will be multiplied by 5,000 in exactly one place.
+**And *f* is a measurement nobody has taken** — ⚠️ **nor will anyone**, since §17.27 takes the limit
+and closes the question. Were it ever needed it would be, per §18.2, a **fraction in [0, 1]** and not a
+percentage: a parameter multiplied by 5,000 in exactly one place.
 
 ## 17.26 Sharing an extent puts an authorization boundary inside it
 
@@ -16676,3 +16674,43 @@ extent, and ObjectInfo does give enough information to deduce offset within an e
 - **identity, never a derived position** — refined by Bob to *a position may be signed if its space is pinned by an identity in the signature*. The extent **is** in the signature, so an extent-local range is pinned and does not drag §17.16.2's three numbering spaces inside the certificate.
 
 So the mechanism is available and consistent; it is the compression cost in §17.26.2's first row that argues against reaching for it.
+
+### 17.27 Decided: inline while the data is smaller than the reference to it
+
+**Bob, 2026-08-20**: *"It's easiest then to inline only if the data is smaller than the stream range
+reference, and not worry about how frequently the metadata is loaded."*
+
+> ### `inline ⟺ n < R`
+
+**§17.25.6 derived `n* = R·(1 + E·G/(f·r))`; this is that formula's limit, and taking the limit is the
+decision.** The residency fraction *f* does not have to be measured, so §16.154 closes and #104 with it.
+
+#### 17.27.1 The error is one-sided, which is why the limit is safe to take
+
+⚠️ **This is not an approximation that could land either way.** The correction term `E·G/(f·r)` is
+**strictly positive**, so the true cutoff is always *at least* *R*:
+
+| | |
+|---|---|
+| `n < R` **under**-inlines | by at most the correction — 0.1% when metadata is always resident, 12% at one part in a hundred, and materially only when metadata is nearly always cold |
+| what under-inlining costs | a 56-byte range record pointing at an object slightly smaller than 56 bytes |
+| what **over**-inlining would cost | user bytes in RAM-backed metadata at **~5,000×** disk (§12.2) |
+
+**So the rule errs in the direction where a mistake is cheap**, and the expensive mistake is
+unreachable by construction. That is the whole argument for taking a limit rather than measuring.
+
+#### 17.27.2 And the rule has no free parameters
+
+**`n < R` is stated in terms of the thing it is compared against.** *R* moved on 2026-08-20, from 40
+bytes to 56, when the DN's stream record took a creation second and a stream's sizes (§4.7.1) — and a
+rule of this shape needed no re-derivation and no re-measurement, because the quantity it depends on is
+the one it is already reading.
+
+> **A cutoff written as a constant would have been silently wrong that day.** §4.7.1's placeholders mean
+> *R* is still fourteen times its design budget, so it will move again — and when the segmented array
+> and the B-tree land and *R* approaches 4 bytes, this rule will correctly stop inlining almost
+> anything, with nothing to change.
+
+**What §17.25.6 is still for** is the argument above: it is what proves the limit is the safe end rather
+than the convenient one, and it is where to look if *R* ever becomes small enough that the correction
+stops being a rounding error.
