@@ -3247,16 +3247,16 @@ lives once in a table those references point into.
 | List | Budget per entry | Today | 2^32 entries, today |
 |---|---|---|---|
 | An SN stream's extents | 4 B | **80 B** — 64 B inlined plus a 16 B instance list | 344 GB |
-| A DN object's streams | 4 B | **56 B**, inlined | 241 GB |
+| A DN object's streams | 4 B | **48 B**, inlined | 206 GB |
 
-⚠️ **40 B until 2026-08-20**, when the DN's stream record took a creation second and a
-stream's sizes (§17.25.1). Four fields for the space of two, since `records` stopped being an
-`Option<u64>` in the same change — but it is still 16 bytes on a list this table exists to
-warn about, and **it moved the 2^32 figure from 172 GB to 241 GB.** The size test is what
-sent this edit here (#9).
+⚠️ **40 B until 2026-08-20**, then 56, now 48. The DN's stream record took a creation second
+and a stream's sizes (§17.25.1) — four fields for the space of two, since `records` stopped
+being an `Option<u64>` in the same change — and then gave back the stream's position
+(§17.33.1), which a stream shared between objects does not have. **The 2^32 figure went 172 GB
+→ 241 GB → 206 GB.** The size test is what sends these edits here (#9).
 
 ⚠️ **Both lists inline the whole record where the design says reference**, so they
-cost twenty and fourteen times the budget. That is a property of §14.6's placeholders and
+cost sixteen and twelve times the budget. That is a property of §14.6's placeholders and
 not of the design — but it decides what a large-stream or large-object test can reach
 on real hardware, so it is the number to size against until the segmented array and
 the B-tree land. At 4 bytes a 2^32-entry list is 17 GB; at 80 it is a machine's worth
@@ -17118,3 +17118,114 @@ lines — which is how a unit would have come to differ between them."*
 **And it absorbed a check that was inline.** §7.3.3 needs a creation second never to go backwards,
 because the second selects the key; that is `TimeSec::not_before`, so the rule and its message live
 where the type does rather than in the one caller that happened to need it first.
+
+## 17.33 A stream does not know where it starts either
+
+**Bob, 2026-08-20**, on the DN's per-stream record: rename it, drop its position, narrow its id.
+
+**The rename first, because it is the smallest and says the most.** It was `Held`; it is `Stream`.
+The name is DN-local so it cannot collide with the SN's `Stream`, and calling a stream a stream
+costs nothing.
+
+### 17.33.1 The same argument as §17.29.1, one tier up
+
+`Held.first_record` was *"the object-local number of this stream's first record"* — and that is the
+extent's stored position again. ⚠️ **§11's lumping puts many objects in one stream**, so a stream's
+place *in an object* belongs to the object, and a stored one would be whichever object's list
+created it.
+
+**What the record already had is the right thing**: `records`, how many it holds. Position is
+recovered by `Object::streams_from`, summing what came before — the same walk as `Stream::sealed_from`
+at the SN.
+
+> ⚠️ **And the walk never meets an `UNKNOWN` it needs.** `records` is the sentinel while a stream is
+> open, and only the **last** stream of an object can be open — so every term of the sum before the
+> last is known, and the last one's position is the total of them.
+
+**`last` and `holding` now return the position with the stream**, which is `sn::Placed`'s shape and
+for the same reason: §17.29.5 was a caller passing a literal where a position belonged, and a
+position that arrives with the thing it describes cannot be passed by accident.
+
+**Measured on the real thing**: an object over two streams reports stream 2 *"from record 202"* —
+computed, not stored — and reads at 199, 201, 202, 250 and 349 all land on the right record.
+
+### 17.33.2 `(RangeId, StreamId, CreateSec)`, which is what makes 32 bits safe
+
+⚠️ **The id was `u64` and DN-scoped, and narrowing it looked unsafe.** §13.1.3's large-object row is
+10^12 streams on one DN — 233× past `u32` — and unlike an extent id there was no second in the name,
+so an id could never be reused and the cap was on streams *ever created*.
+
+**Bob's answer settles both halves** (Asserted, 2026-08-20): *"it should take (RangeId, StreamId,
+CreateSec) to be a stable reference to a stream."*
+
+| | |
+|---|---|
+| the id alone **was never the name** | so it need only be unique among the streams one range makes in one second — §17.29.2's argument exactly, and 4.3 × 10^9 is not close |
+| the scope is the **range**, not the DN | #75 makes the range the durable key *because a range moves between DNs*, so a DN-scoped id stops meaning what it meant the first time its range moves |
+
+**And the creation second was already there.** It went in yesterday so a directory listing could show
+when an object was made (§17.25.1) — and it turns out to be load-bearing for identity rather than
+decoration. That is the second time this week a field added for one reason has been the thing that
+made a narrowing safe.
+
+⚠️ **The narrowing bought nothing yet, and the size test says so.** Four `u64` and three `u32` is 44
+bytes, which alignment rounds back to 48. It buys 8 the moment a fourth `u32` joins it — worth
+knowing before anyone claims it as a saving.
+
+**What is not built is the reference itself** (#109): `RangeId` does not exist, `dn` stands in for it,
+and the SN keys streams by `(dn, stream)` with no second at all.
+
+## 17.34 A 16-byte triple against a 16-byte GUID
+
+**Bob, 2026-08-20**: *"Microsoft usually used 16-byte GUIDs for identifiers. I'm using 16-byte
+triples. Mine compress better and are guaranteed not to collide for a few million years."*
+
+**Both names in the store are exactly 16 bytes**, which is the point — the comparison is like for
+like:
+
+| | |
+|---|---|
+| an extent | `(SnId, ExtentId, CreateSec)` = 4 + 4 + 8 (§17.29.2) |
+| a stream | `(RangeId, StreamId, CreateSec)` = 4 + 4 + 8 (§17.33.2) |
+
+### 17.34.1 Measured: 3× against 1.00×
+
+**Ten thousand names of one stream** — one SN, consecutive ids, seconds creeping up — against ten
+thousand random 16-byte GUIDs, both through the LZ4 the wire already uses:
+
+| | 160,000 B raw | compressed |
+|---|---|---|
+| triples | | **53,403 B — 3.0×** |
+| GUIDs | | 160,633 B — **1.00×**, very slightly *larger* |
+
+**The GUID figure is not a defect of the compressor.** A GUID is random by construction; that is what
+makes it collide-resistant, and it is exactly what makes it incompressible. **The two properties are
+the same property.**
+
+⚠️ **And 3× is the floor, not the ceiling.** LZ4 matches repeated byte *sequences*: the SN field
+repeats every 16 bytes and the second barely moves, so both compress — but the id increments, and an
+incrementing integer has no repeated bytes to find. A **delta** encoder would spend about a bit on
+each id and each second, taking a name to well under a byte and the ratio to around **30×**. A GUID
+has no such headroom, because there is no structure to delta against.
+
+**Which matters here more than it usually would**: §4.7.1 makes a stream's extent list the largest
+thing the store keeps, and the design budgets 4 bytes per reference against a 16-byte name. A delta
+encoding over triples is how that budget becomes reachable; over GUIDs it is not reachable at all.
+
+### 17.34.2 Collision-free by construction, not by probability
+
+**A GUID's guarantee is statistical** — the birthday bound over 122 random bits — and a triple's is
+arithmetic. Two extents collide only if **one SN mints two with the same id in the same second**,
+which needs 2^32 extents inside one second from one machine: at 32 MB apiece, 137 PB/s.
+
+**The two things that could break it are both closed:**
+
+| | |
+|---|---|
+| the id **wrapping** | harmless, because the second differs — a wrapped id recurring is a different name, not a collision. It would only matter for a wrap *within* one second. |
+| the clock **going backwards** | refused, not tolerated: `TimeSec::not_before` (§17.32.3), and it is refused precisely because a creation second selects a key (§7.3.3) |
+
+⚠️ **What is not yet closed is that the stream name is not enforced** (#109): the SN keys streams by
+`(dn, stream)` with no second at all, so the guarantee above holds for extents and is currently a
+statement of intent for streams. Until it lands, the `u32` stream id rests on a name the code does not
+check.

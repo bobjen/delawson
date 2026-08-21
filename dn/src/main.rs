@@ -20,6 +20,7 @@ use common::info::{
     Batch, Described, ExtentRow, ExtentRun, Listing, Shape, StreamRow, Totals, UNKNOWN, Wanted,
 };
 use common::logw;
+use common::offset::ORoff;
 use common::range::{Detail, Want};
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
@@ -121,7 +122,8 @@ fn detailed(object: &Object, want: &Want, limit: u64) -> Option<Levelled> {
     let from = want.from.record().unwrap_or(0);
     // Streams are in record order, so the first to describe is the last one starting
     // at or before `from` — the same rule a read uses to pick a stream.
-    let first = object.streams.iter().rposition(|held| held.first_record <= from).unwrap_or(0);
+    let first =
+        object.streams_from().filter(|(at, _)| at.number() <= from).count().saturating_sub(1);
 
     // One entry for the object, then one per stream, against whichever cap is smaller.
     let cap = match want.limit {
@@ -131,11 +133,11 @@ fn detailed(object: &Object, want: &Want, limit: u64) -> Option<Levelled> {
     let room = cap.saturating_sub(1);
     let mut rows = Vec::new();
     if want.wants(Detail::Streams) {
-        for held in object.streams.iter().skip(first).take(room as usize) {
+        for (at, held) in object.streams_from().skip(first).take(room as usize) {
             rows.push(StreamRow {
-                stream: held.id,
+                stream: held.id as u64,
                 sn: held.sn,
-                first_record: held.first_record,
+                first_record: at.number(),
                 // ⚠️ UNKNOWN, not zero: how far the stream being appended to reaches is
                 // not the DN's to say (§6.3), and a sealed stream may hold nothing.
                 records: held.records,
@@ -151,7 +153,7 @@ fn detailed(object: &Object, want: &Want, limit: u64) -> Option<Levelled> {
     // Where to carry on: the first record of the stream after the last one described,
     // and nothing when the last stream described is the object's last.
     let after = first + rows.len();
-    let next = object.streams.get(after).map_or(UNKNOWN, |held| held.first_record);
+    let next = object.streams_from().nth(after).map_or(UNKNOWN, |(at, _)| at.number());
     let shape = Shape {
         streams: if want.wants(Detail::Counts) { total } else { UNKNOWN },
         given: rows.len() as u64,
@@ -223,7 +225,7 @@ struct Object {
     ///
     /// A stream fills, so an object grows more of them; the last is the one appends
     /// go to and the record ranges say which holds what.
-    streams: Vec<Held>,
+    streams: Vec<Stream>,
     /// An extension is being asked of an SN, so anything else that wants one waits
     /// rather than asking for a second.
     extending: bool,
@@ -247,7 +249,13 @@ enum Next {
     Say(Response),
 }
 
-/// One of an object's streams: where its records start, and what it has come to.
+/// One of an object's streams, and what it has come to.
+///
+/// ⚠️ **No first record here**, for the reason `sn::Extent` has none (§17.29.1) one tier up:
+/// §11's lumping puts many objects in one stream, so a stream's position *in an object* is the
+/// object's property and not the stream's. It is recovered by summing the `records` of the
+/// streams before it, and only the last stream of an object can be unsealed — so every term of
+/// that sum is known (§17.33.1).
 ///
 /// ⚠️ **The DN's largest structure, so every field here is paid 10^12 times** in §13.1.3's
 /// worst case. Adding the sizes took it from **40 to 56 bytes**, and four new fields cost
@@ -256,21 +264,27 @@ enum Next {
 /// (`EVERY-SPACE-RESERVES-A-SENTINEL`, §8.1.6.3). The layout is exact: six `u64` and two
 /// `u32`, no padding.
 #[derive(Clone, Copy)]
-struct Held {
-    id: u64,
-    /// The object-local number of this stream's first record. A stream numbers its
-    /// own records from zero; this is what makes an object's numbering continuous
-    /// across the streams it is made of.
-    first_record: u64,
+struct Stream {
+    /// ⚠️ **`u32`, and safe for the reason an extent id is** (§17.29.2): a stable reference
+    /// to a stream is `(RangeId, StreamId, CreateSec)` (Asserted, Bob, 2026-08-20), so the
+    /// id alone was never the name. It has only to be unique among the streams **one range
+    /// makes in one second**, which 4.3 × 10^9 is not close to.
+    ///
+    /// ⚠️ **Scoped to the range, not to the DN.** #75 makes the range the durable key
+    /// precisely because a range moves between DNs — so a DN-scoped id would stop meaning
+    /// what it meant the first time its range moved. `dn` stands in for `RangeId` until
+    /// ranges exist (#109).
+    id: u32,
     /// Records in it once sealed, and **`UNKNOWN` while it is the one being appended to**.
     ///
     /// ⚠️ **This one does not go stale, unlike the sizes below.** §4.5's exact record count
     /// is what addressing runs on, so a stale record count is a *wrong read*, while a stale
     /// byte count is a slightly wrong listing (§17.25.1).
     records: u64,
-    /// The second this stream was handed to the object. The DN's own, so always exact —
-    /// which is what a directory listing wants and what nothing else could supply as
-    /// cheaply.
+    /// The second this stream was handed out. The DN's own, so always exact — which is what
+    /// a directory listing wants, and ⚠️ **which turns out to be part of the stream's name**
+    /// rather than decoration: it is the third component of `(RangeId, StreamId, CreateSec)`,
+    /// and it is what makes a 32-bit id safe.
     created: TimeSec,
     /// Bytes the writer wrote and bytes stored, summed over the stream's extents.
     ///
@@ -286,12 +300,11 @@ struct Held {
     extents: u32,
 }
 
-impl Held {
+impl Stream {
     /// A stream just handed out: nothing has come to anything yet.
-    fn new(id: u64, sn: u32, first_record: u64, created: TimeSec) -> Held {
-        Held {
+    fn new(id: u32, sn: u32, created: TimeSec) -> Stream {
+        Stream {
             id,
-            first_record,
             records: UNKNOWN,
             created,
             logical: UNKNOWN,
@@ -334,6 +347,22 @@ impl Held {
 }
 
 impl Object {
+    /// Each stream with the object-local number of its first record — the running total of
+    /// the records in the streams before it.
+    ///
+    /// ⚠️ **Only the last stream of an object can be unsealed**, so every term of the sum
+    /// before the last is a known count and the walk never meets an `UNKNOWN` it needs. The
+    /// last one's own count is unknown, which is why it is the last (§17.33.1).
+    fn streams_from(&self) -> impl Iterator<Item = (ORoff, &Stream)> {
+        self.streams.iter().scan(ORoff::ZERO, |at, stream| {
+            let first = *at;
+            if stream.records != UNKNOWN {
+                *at = ORoff::new(at.number() + stream.records);
+            }
+            Some((first, stream))
+        })
+    }
+
     /// Nothing here can be appended to or read yet: the first stream is being made,
     /// or the next one is being asked for. Waiting is better than being told there is
     /// no stream, which is true for a moment and useless to hear.
@@ -344,38 +373,53 @@ impl Object {
     /// What this object is, at one of its streams: the last for an append, or the one
     /// holding a record for a read.
     fn args(&self, record: Option<u64>) -> Option<Vec<Arg>> {
-        let held = match record {
+        // ⚠️ The position comes back *with* the stream, because the stream does not carry
+        // it (§17.33.1) — the same shape as `sn::Placed`, and for the same reason.
+        let (first, held) = match record {
             None => self.last()?,
-            Some(record) => self.holding(record)?,
+            Some(record) => self.holding(ORoff::new(record))?,
         };
         Some(
             Described {
                 id: self.id,
-                stream: held.id,
+                stream: held.id as u64,
                 sn: held.sn,
                 created: self.created,
                 keyed: self.keyed,
                 framing: self.framing,
-                first_record: held.first_record,
+                first_record: first.number(),
             }
             .args(),
         )
     }
 
-    /// The stream appends go to, which is the last one.
-    fn last(&self) -> Option<Held> {
-        self.streams.last().copied()
+    /// Records the object holds, which is also where its next stream would start.
+    ///
+    /// ⚠️ **`UNKNOWN` while the last stream is open**, because how far that one reaches is
+    /// not the DN's to say (§6.3) — and a caller adding to `UNKNOWN` would get `u64::MAX`
+    /// plus a count, which §17.22.1 is the story of.
+    fn records(&self) -> u64 {
+        match self.streams_from().last() {
+            Some((_, last)) if last.records == UNKNOWN => UNKNOWN,
+            Some((at, last)) => at.number() + last.records,
+            None => 0,
+        }
+    }
+
+    /// The stream appends go to, which is the last one, and where it starts.
+    fn last(&self) -> Option<(ORoff, Stream)> {
+        self.streams_from().last().map(|(at, held)| (at, *held))
     }
 
     /// The stream holding an object-local record number: the sealed one whose range
     /// covers it, or the last, whose reach is not known here.
-    fn holding(&self, record: u64) -> Option<Held> {
-        for held in &self.streams {
+    fn holding(&self, record: ORoff) -> Option<(ORoff, Stream)> {
+        for (at, held) in self.streams_from() {
             match held.records {
                 // The stream still being appended to: anything past its start is
                 // routed to it, and the SN and EN say whether it is really there.
-                UNKNOWN => return Some(*held),
-                records if record < held.first_record + records => return Some(*held),
+                UNKNOWN => return Some((at, *held)),
+                records if record.number() < at.number() + records => return Some((at, *held)),
                 _ => continue,
             }
         }
@@ -425,7 +469,7 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Response) {
     // stream's cached sizes ever stop being UNKNOWN (§17.25.1), so skipping it would leave
     // every listing blank while the numbers sat in a response on their way out the door.
     // A sealed stream's totals are final, so once written they are right for ever; a growing
-    // one's are a point in time, which is what `Held::learned` refusing to go backwards is
+    // one's are a point in time, which is what `Stream::learned` refusing to go backwards is
     // for — two answers can cross in flight.
     dn.remember(&held.name, &runs);
     let mut extents = 0;
@@ -695,7 +739,7 @@ impl DN {
                 let mut shard = dn.shards[shard_of(name)].lock().expect("objects");
                 if let Some(object) = shard.get_mut(name.as_str()) {
                     let made = object.created;
-                    object.streams.push(Held::new(first + n as u64, sn_number, 0, made));
+                    object.streams.push(Stream::new((first + n as u64) as u32, sn_number, made));
                 }
             }
             dn.objects.fetch_add(count, Ordering::Relaxed);
@@ -742,7 +786,7 @@ impl DN {
                 Some(object) => {
                     // Whoever names the stream that filled is the one that seals it in
                     // the list; the rest are late and have nothing to record.
-                    let ours = object.streams.last().is_some_and(|last| last.id == sealed);
+                    let ours = object.streams.last().is_some_and(|last| last.id as u64 == sealed);
                     if let Some(last) = object.streams.last_mut().filter(|_| ours) {
                         last.records = records;
                     }
@@ -752,8 +796,9 @@ impl DN {
                         Next::Wait
                     } else if ours {
                         object.extending = true;
-                        let from = object.streams.last().map_or(0, |last| last.first_record);
-                        Next::Ours(from + records)
+                        // The sealed stream's count was just recorded above, so the object's
+                        // total is known and is where the next stream starts.
+                        Next::Ours(object.records())
                     } else {
                         // Somebody else extended past it already, so whatever is last
                         // now is the answer.
@@ -813,7 +858,7 @@ impl DN {
             {
                 let mut shard = dn.shards[shard_of(&name)].lock().expect("objects");
                 if let Some(object) = shard.get_mut(name.as_str()) {
-                    object.streams.push(Held::new(stream, sn_number, first_record, TimeSec::now()));
+                    object.streams.push(Stream::new(stream as u32, sn_number, TimeSec::now()));
                     object.extending = false;
                 }
             }
@@ -983,7 +1028,7 @@ impl DN {
         // about, since the streams it named are going away too.
         let Some(object) = shard.get_mut(name) else { return };
         for held in &mut object.streams {
-            if let Some((run, _)) = runs.get(&held.id) {
+            if let Some((run, _)) = runs.get(&(held.id as u64)) {
                 held.learned(run.totals);
             }
         }
@@ -1164,10 +1209,14 @@ fn main() {
 mod tests {
     /// A stream in a test object. `records` is `None` for the one still being appended to,
     /// which is what the sentinel means on the real thing.
-    fn held(id: u64, sn: u32, first_record: u64, records: Option<u64>) -> Held {
-        Held {
+    ///
+    /// ⚠️ **No first record to give it**: where a stream starts in an object is the object's
+    /// to work out by summing what came before (§17.33.1), so a test builds the list and the
+    /// positions follow.
+    fn held(id: u32, sn: u32, records: Option<u64>) -> Stream {
+        Stream {
             records: records.unwrap_or(UNKNOWN),
-            ..Held::new(id, sn, first_record, TimeSec::new(1_000_000))
+            ..Stream::new(id, sn, TimeSec::new(1_000_000))
         }
     }
 
@@ -1178,13 +1227,18 @@ mod tests {
     /// record, so an object's stream list is ten times its budget.
     #[test]
     fn a_stream_costs_an_object_more_than_a_reference() {
-        let each = size_of::<Held>();
-        assert_eq!(each, 56, "if this moved, §4.7 and issue #9 want to hear about it");
-        // ⚠️ **40 before the sizes went in** (§17.25.1): a creation second, an extent count,
-        // a logical length and a compressed one, for the space of two — because `records`
-        // stopped being an `Option<u64>` at the same time and a sentinel in a space that
-        // already reserves one costs nothing where a discriminant cost 8 plus padding.
-        assert_eq!(each, 6 * size_of::<u64>() + 2 * size_of::<u32>(), "and no padding");
+        let each = size_of::<Stream>();
+        assert_eq!(each, 48, "if this moved, §4.7 and issue #9 want to hear about it");
+        // ⚠️ **40, then 56, now 48.** The sizes went in (§17.25.1) — a creation second, an
+        // extent count, a logical length and a compressed one, for the space of two, because
+        // `records` stopped being an `Option<u64>` in the same change. Then the stream's
+        // position came out again (§17.33.1), because a stream shared between objects has no
+        // single one. Net: four fields gained and eight bytes, for a stream that now says
+        // what it holds rather than where somebody put it.
+        // ⚠️ Four `u64` and three `u32` is 44, and the alignment rounds it to 48 — so the
+        // id narrowing to `u32` (§17.33.2) bought nothing here, and would buy 8 bytes the
+        // moment a fourth `u32` joins it. Worth knowing before anyone claims it as a saving.
+        assert_eq!(4 * size_of::<u64>() + 3 * size_of::<u32>(), 44, "and 4 bytes of padding");
         for bits in [24u32, 27, 32] {
             println!(
                 "2^{bits} streams in one object = {:.0} GB",
@@ -1240,7 +1294,7 @@ mod tests {
             .get_mut("/half")
             .unwrap()
             .streams
-            .push(held(7, 0, 0, None));
+            .push(held(7, 0, None));
         let args = dn.look("/half").expect("an object");
         assert_eq!(args[1], Arg::Number(7), "its stream");
         assert!(!waits("/half"), "and it is no longer half made");
@@ -1291,20 +1345,20 @@ mod tests {
             created: TimeSec::new(1_000_000),
         };
         // Two sealed streams and one still open.
-        object.streams.push(held(1, 0, 0, Some(10)));
-        object.streams.push(held(2, 0, 10, Some(5)));
-        object.streams.push(held(3, 0, 15, None));
+        object.streams.push(held(1, 0, Some(10)));
+        object.streams.push(held(2, 0, Some(5)));
+        object.streams.push(held(3, 0, None));
 
-        assert_eq!(object.holding(0).unwrap().id, 1);
-        assert_eq!(object.holding(9).unwrap().id, 1);
-        assert_eq!(object.holding(10).unwrap().id, 2);
-        assert_eq!(object.holding(14).unwrap().id, 2);
-        assert_eq!(object.holding(15).unwrap().id, 3);
+        assert_eq!(object.holding(ORoff::new(0)).unwrap().1.id, 1);
+        assert_eq!(object.holding(ORoff::new(9)).unwrap().1.id, 1);
+        assert_eq!(object.holding(ORoff::new(10)).unwrap().1.id, 2);
+        assert_eq!(object.holding(ORoff::new(14)).unwrap().1.id, 2);
+        assert_eq!(object.holding(ORoff::new(15)).unwrap().1.id, 3);
         // Past everything sealed goes to the open stream, whose reach is not known
         // here — the SN and EN say whether the record is really there.
-        assert_eq!(object.holding(1000).unwrap().id, 3);
+        assert_eq!(object.holding(ORoff::new(1000)).unwrap().1.id, 3);
         // And an append always goes to the last.
-        assert_eq!(object.last().unwrap().id, 3);
+        assert_eq!(object.last().unwrap().1.id, 3);
         assert!(!object.between_streams());
     }
 
@@ -1319,9 +1373,9 @@ mod tests {
             keyed: false,
             created: TimeSec::new(1_000_000),
         };
-        object.streams.push(held(1, 0, 0, Some(100)));
-        object.streams.push(held(2, 1, 100, Some(50)));
-        object.streams.push(held(3, 2, 150, None));
+        object.streams.push(held(1, 0, Some(100)));
+        object.streams.push(held(2, 1, Some(50)));
+        object.streams.push(held(3, 2, None));
         object
     }
 
@@ -1446,7 +1500,7 @@ mod tests {
                 Object {
                     id: n + 1,
                     framing: Framing::Lf,
-                    streams: vec![held(n + 1, 0, 0, None)],
+                    streams: vec![held(n as u32 + 1, 0, None)],
                     extending: false,
                     waiting: Vec::new(),
                     keyed: false,

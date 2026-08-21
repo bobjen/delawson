@@ -253,4 +253,43 @@ mod tests {
         assert_eq!(SRoff::new(10).since(SRoff::new(4)), SRoff::new(6));
         assert_eq!(SRoff::new(4).since(SRoff::new(10)), SRoff::ZERO);
     }
+    /// ⚠️ **A 16-byte triple against a 16-byte GUID** (Asserted, Bob, 2026-08-20): *"Microsoft
+    /// usually used 16-byte GUIDs for identifiers. I'm using 16-byte triples. Mine compress
+    /// better and are guaranteed not to collide for a few million years."*
+    ///
+    /// The same width, so the claim is entirely about what a *list* of them costs — and a
+    /// stream's extent list is the largest structure the store keeps (§4.7.1). This measures it.
+    #[test]
+    fn a_list_of_triples_compresses_and_a_list_of_guids_does_not() {
+        let mut rng = crate::random::Rng::new();
+        let (mut triples, mut guids) = (Vec::new(), Vec::new());
+        // Ten thousand extents of one stream: one SN, consecutive ids, seconds creeping up.
+        let mut second = 1_787_000_000u64;
+        for id in 0..10_000u32 {
+            triples.extend_from_slice(&7u32.to_le_bytes());
+            triples.extend_from_slice(&id.to_le_bytes());
+            triples.extend_from_slice(&second.to_le_bytes());
+            second += u64::from(id % 3 == 0);
+            guids.extend_from_slice(&rng.next().to_le_bytes());
+            guids.extend_from_slice(&rng.next().to_le_bytes());
+        }
+        assert_eq!(triples.len(), guids.len(), "16 bytes apiece either way");
+
+        let small = lz4_flex::compress_prepend_size(&triples).len();
+        let big = lz4_flex::compress_prepend_size(&guids).len();
+        println!(
+            "10,000 names: {} B raw, triples {small} B ({:.0}x), guids {big} B ({:.2}x)",
+            triples.len(),
+            triples.len() as f64 / small as f64,
+            triples.len() as f64 / big as f64
+        );
+        // ⚠️ **3x, not 30x, and the shortfall is the compressor rather than the encoding.**
+        // LZ4 matches repeated byte *sequences*: the SN field repeats every 16 bytes and the
+        // second barely moves, so those compress — but the id increments, and an incrementing
+        // integer has no repeated bytes to find. A delta encoder would spend about a bit on
+        // each, taking a name to well under a byte. So 3x is the floor and the ceiling is
+        // around 30x, while a GUID has neither, being random on purpose (§17.34).
+        assert!(small * 2 < big, "triples {small} against guids {big}");
+        assert!(big >= triples.len(), "random bytes do not compress at all");
+    }
 }
