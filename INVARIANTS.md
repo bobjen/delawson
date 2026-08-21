@@ -777,15 +777,15 @@ among tenants.
 test** — it is arithmetic over the sharing rule
 *Breaks* sharing becomes an exploit: colluding tenants cut their combined bill.
 
-**`A-USER-CHOSEN-NAME-IS-PINNED-BY-A-COUNTER`** — an incarnation of a path is told apart by a
-number that increments on reuse, never by the second it was made in.
-*Argued* §17.35.1, §17.35.2 · *Enforced* `next_object` is monotonic, so a recreated path gets a
-fresh `ObjectId` — but ⚠️ **nothing compares it** (#111) · *Checked* not yet
-*Breaks* a caller holding `(object, record)` across a replacement reads the new object's record
-and is told nothing. ⚠️ Note why the sibling rule does not apply: the store mints extent and
-stream names and can gate their reuse to more than a second
-([[A-NAME-IS-NEVER-REMINTED-IN-ITS-OWN-SECOND]]), while a path is reused at the *user's* rate, and
-throttling a user to make a naming scheme work is the wrong way round.
+**`A-PATH-POINTS-AT-A-NAME`** — a path is a pointer at an object's name, never the name itself, so
+repointing it as often as a user likes leaves every incarnation it pointed at distinctly named.
+*Argued* §17.35.2 · *Enforced* an object is `(RangeId, ObjectId, CreateSec)` and the id comes from
+a counter, so two creates at one path in one second differ · *Checked* unit test
+*Breaks* the store would have to gate a user's use of a path to keep its own names apart, which is
+the wrong way round — see [[A-NAME-IS-NEVER-REMINTED-IN-ITS-OWN-SECOND]] for the reuse the store
+*can* gate, being its own. ⚠️ Note what is still open: nothing compares the name a caller expects
+against the one it gets, so a caller holding `(object, record)` across a replacement reads the new
+object's record and is told nothing (#111).
 
 **`A-NAME-IS-NEVER-REMINTED-IN-ITS-OWN-SECOND`** — an id returned to a free list cannot be
 handed out again in the second it was freed in, so a triple names one thing for ever.

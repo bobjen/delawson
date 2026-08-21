@@ -1521,7 +1521,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::info::{StreamRow, Totals};
+    use common::info::{ObjectName, StreamRow, Totals};
 
     fn dns(count: usize) -> Vec<String> {
         (0..count).map(|n| format!("DN{n}")).collect()
@@ -1598,10 +1598,9 @@ mod tests {
         let mut args = shape.args();
         args.extend(
             Described {
-                id: 1,
+                object: ObjectName { range: 0, object: 1, created: TimeSec::EPOCH },
                 stream: StreamName { range: 0, stream: 1, created: TimeSec::new(1_000_000) },
                 sn: 0,
-                created: TimeSec::EPOCH,
                 keyed: false,
                 framing: Framing::Lf,
                 first_record: 0,
@@ -1836,10 +1835,9 @@ mod tests {
         // growing — as the stream id did into a whole name, #109 — is a compile error here
         // instead of a row that parses into the wrong things.
         let args = Described {
-            id: 9,
+            object: ObjectName { range: 3, object: 9, created: TimeSec::new(1_000_000) },
             stream: StreamName { range: 3, stream: 17, created: TimeSec::new(1_000_000) },
             sn: 0,
-            created: TimeSec::new(1_000_000),
             keyed: false,
             framing: Framing::CrLf,
             first_record: 400,

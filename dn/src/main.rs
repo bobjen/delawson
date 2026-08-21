@@ -17,8 +17,8 @@
 use common::config::{DNConfig, ServiceKind};
 use common::framing::Framing;
 use common::info::{
-    Batch, Described, ExtentRow, ExtentRun, Listing, Shape, StreamName, StreamRow, Totals, UNKNOWN,
-    Wanted,
+    Batch, Described, ExtentRow, ExtentRun, Listing, ObjectName, Shape, StreamName, StreamRow,
+    Totals, UNKNOWN, Wanted,
 };
 use common::logw;
 use common::offset::ORoff;
@@ -223,7 +223,11 @@ impl Levelled {
 }
 
 struct Object {
-    id: u64,
+    /// ⚠️ **`u32`, minted per range**, so an object's name is `(RangeId, ObjectId, CreateSec)` —
+    /// the same triple as a stream's and an extent's (§17.35.2). **A path is not part of it**: a
+    /// path points at a name and may be repointed as often as a user likes, which is exactly what
+    /// a creation second cannot pin and does not have to.
+    id: u32,
     /// Where one record ends and the next begins, declared here and never
     /// changed: everything that reads or writes this object's records needs it.
     framing: Framing,
@@ -389,10 +393,9 @@ impl Object {
         };
         Some(
             Described {
-                id: self.id,
+                object: ObjectName { range, object: self.id, created: self.created },
                 stream: StreamName { range, stream: held.id, created: held.created },
                 sn: held.sn,
-                created: self.created,
                 keyed: self.keyed,
                 framing: self.framing,
                 first_record: first.number(),
@@ -701,7 +704,7 @@ impl DN {
         for one in &wanted {
             let mut shard = self.shards[shard_of(&one.name)].lock().expect("objects");
             if !shard.contains_key(one.name.as_str()) {
-                let id = self.next_object.fetch_add(1, Ordering::Relaxed);
+                let id = self.next_object.fetch_add(1, Ordering::Relaxed) as u32;
                 shard.insert(
                     Box::from(one.name.as_str()),
                     Object {
@@ -1234,6 +1237,45 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    /// ⚠️ **The property a path cannot supply and a name must** (§17.35.2). A user may replace an
+    /// object many times a second, so two incarnations at one path share a creation second — and
+    /// they must still be told apart. The id is what does it, minted from a counter rather than
+    /// read from a clock.
+    #[test]
+    fn two_objects_at_one_path_in_one_second_have_different_names() {
+        let dn = Arc::new(DN::new(testing::dn_config(), 0));
+        let made = TimeSec::new(1_000_000);
+        let name_of = |dn: &DN| {
+            let shard = dn.shards[shard_of("/p")].lock().unwrap();
+            let object = shard.get("/p").expect("an object");
+            ObjectName { range: dn.mine, object: object.id, created: object.created }
+        };
+        let put = |dn: &DN| {
+            dn.shards[shard_of("/p")].lock().unwrap().insert(
+                Box::from("/p"),
+                Object {
+                    id: dn.next_object.fetch_add(1, Ordering::Relaxed) as u32,
+                    framing: Framing::Lf,
+                    streams: Vec::new(),
+                    extending: false,
+                    waiting: Vec::new(),
+                    keyed: false,
+                    created: made,
+                },
+            );
+        };
+
+        put(&dn);
+        let first = name_of(&dn);
+        // The path is repointed — deleted and recreated — inside the same second.
+        put(&dn);
+        let second = name_of(&dn);
+
+        assert_eq!(first.created, second.created, "the same second, which is the hard case");
+        assert_ne!(first.object, second.object, "and still different names");
+        assert_ne!(first, second, "so a reference to the first cannot resolve to the second");
+    }
+
     /// A stream in a test object. `records` is `None` for the one still being appended to,
     /// which is what the sentinel means on the real thing.
     ///
@@ -1345,7 +1387,7 @@ mod tests {
                 shard.insert(
                     Box::from(name.as_str()),
                     Object {
-                        id: dn.next_object.fetch_add(1, Ordering::Relaxed),
+                        id: dn.next_object.fetch_add(1, Ordering::Relaxed) as u32,
                         framing: Framing::Lf,
                         streams: Vec::new(),
                         extending: false,
@@ -1531,7 +1573,7 @@ mod tests {
             dn.shards[shard_of(&name)].lock().unwrap().insert(
                 Box::from(name.as_str()),
                 Object {
-                    id: n + 1,
+                    id: n as u32 + 1,
                     framing: Framing::Lf,
                     streams: vec![held(n as u32 + 1, 0, None)],
                     extending: false,

@@ -20,7 +20,12 @@ use crate::{Error, Result};
 /// An object as the DN describes it, at one of its streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Described {
-    pub id: u64,
+    /// The object's own name, `(RangeId, ObjectId, CreateSec)`.
+    ///
+    /// ⚠️ **The path is not this** (Asserted, Bob, 2026-08-20): a path *points at* a name, and a
+    /// user may repoint it as often as they like — so the path recycles freely while every
+    /// incarnation it ever pointed at keeps a distinct name of its own (§17.35).
+    pub object: ObjectName,
     /// The stream this answer is about, **by its whole name**: the last one for an append,
     /// or the one holding a record for a read.
     ///
@@ -29,7 +34,6 @@ pub struct Described {
     /// `(RangeId, StreamId, CreateSec)`, and the DN is the only tier holding all three.
     pub stream: StreamName,
     pub sn: u32,
-    pub created: TimeSec,
     pub keyed: bool,
     pub framing: Framing,
     /// The object-local number of that stream's first record, which is what makes
@@ -40,7 +44,7 @@ pub struct Described {
 impl Described {
     /// Fields per row on the wire. Public because a caller sizing a buffer wants it,
     /// and **derived from the shape rather than written down twice**.
-    pub const ARGS: usize = 7 + StreamName::ARGS;
+    pub const ARGS: usize = 5 + ObjectName::ARGS + StreamName::ARGS;
 
     /// A row meaning "there is no such object", for a batch answer that must line up
     /// with the names it was asked about. A zero id is what marks it.
@@ -48,10 +52,9 @@ impl Described {
     /// ⚠️ §9.1.3.7 will retire this: once an answer may be short, lining up by
     /// position stops working and the answer has to say how many names it covered.
     pub fn missing() -> Vec<Arg> {
-        let mut args = vec![Arg::Number(0)];
+        let mut args = ObjectName::default().args();
         args.extend(StreamName::default().args());
         args.extend([
-            Arg::Number(0),
             Arg::Number(0),
             Arg::Flag(false),
             Arg::Number(0),
@@ -63,11 +66,10 @@ impl Described {
 
     pub fn args(&self) -> Vec<Arg> {
         let (kind, width) = self.framing.wire();
-        let mut args = vec![Arg::Number(self.id)];
+        let mut args = self.object.args();
         args.extend(self.stream.args());
         args.extend([
             Arg::Number(self.sn as u64),
-            Arg::Number(self.created.number()),
             Arg::Flag(self.keyed),
             Arg::Number(kind),
             Arg::Number(width),
@@ -79,13 +81,10 @@ impl Described {
     /// And back, returning whatever followed it. `None` for a row marked missing,
     /// since a zero id is not an object.
     pub fn of_args(args: &[Arg]) -> Result<(Option<Described>, &[Arg])> {
-        let [Arg::Number(id), after @ ..] = args else {
-            return Err(Error::new("that answer did not describe an object"));
-        };
+        let (object, after) = ObjectName::of_args(args)?;
         let (stream, after) = StreamName::of_args(after)?;
         let [
             Arg::Number(sn),
-            Arg::Number(created),
             Arg::Flag(keyed),
             Arg::Number(kind),
             Arg::Number(width),
@@ -95,15 +94,16 @@ impl Described {
         else {
             return Err(Error::new("that answer did not describe an object"));
         };
-        if *id == 0 {
+        // ⚠️ A zero *object id* is what marks a missing name, not a zero range: range 0 is a real
+        // range, and an id is minted from one so it is never zero for a thing that exists.
+        if object.object == 0 {
             return Ok((None, rest));
         }
         Ok((
             Some(Described {
-                id: *id,
+                object,
                 stream,
                 sn: *sn as u32,
-                created: TimeSec::new(*created),
                 keyed: *keyed,
                 framing: Framing::of_wire(*kind, *width)?,
                 first_record: *first_record,
@@ -195,55 +195,70 @@ impl Shape {
     }
 }
 
-/// What names a stream for ever: `(RangeId, StreamId, CreateSec)`.
+/// A name that holds for ever: **who mints it, which one, and when**.
 ///
-/// ⚠️ **Three parts, because the id alone was never the name** (Asserted, Bob, 2026-08-20).
-/// The same argument as an extent's `(SnId, ExtentId, CreateSec)` (§17.29.2): an id has only
-/// to be unique among the streams one range makes in one second, which is what lets it be 32
-/// bits — and what makes recycling one safe, once #110's gate exists.
+/// ⚠️ **Three parts, because the id alone was never the name** (Asserted, Bob, 2026-08-20). An id
+/// has only to be unique among the things one minter makes in one second, which is what lets it be
+/// 32 bits — and what makes recycling one safe, once #110's gate exists
+/// (`A-NAME-IS-NEVER-REMINTED-IN-ITS-OWN-SECOND`).
 ///
-/// **Scoped to the range and not to the DN**, because #75 makes the range the durable key
-/// precisely so it can move between DNs. `routing::range_of_dn` stands in until ranges exist.
-///
-/// ⚠️ **`range` is not `sn`.** The range is *whose* the stream is; the SN is *where* it lives.
-/// Both travel, and they are different numbers the moment a stream is reassigned (§7.3.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct StreamName {
-    pub range: u32,
-    pub stream: u32,
-    pub created: TimeSec,
+/// **Sixteen bytes, like a GUID, and §17.34 measures the difference**: a list of these compresses
+/// where a list of GUIDs cannot, and they carry fields a GUID would need stored beside it.
+macro_rules! name {
+    ($name:ident, $minter:ident, $what:ident, $mints:literal) => {
+        #[doc = concat!("What names one of ", $mints, " for ever.")]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+        pub struct $name {
+            pub $minter: u32,
+            pub $what: u32,
+            pub created: TimeSec,
+        }
+
+        impl $name {
+            pub const ARGS: usize = 3;
+
+            pub fn args(&self) -> Vec<Arg> {
+                vec![
+                    Arg::Number(self.$minter as u64),
+                    Arg::Number(self.$what as u64),
+                    Arg::Number(self.created.number()),
+                ]
+            }
+
+            pub fn of_args(args: &[Arg]) -> Result<($name, &[Arg])> {
+                let [Arg::Number(minter), Arg::Number(id), Arg::Number(created), rest @ ..] = args
+                else {
+                    return Err(Error::new(concat!(
+                        $mints,
+                        " is named by a minter, an id and a second"
+                    )));
+                };
+                let name = $name {
+                    $minter: *minter as u32,
+                    $what: *id as u32,
+                    created: TimeSec::new(*created),
+                };
+                Ok((name, rest))
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    f,
+                    concat!($mints, " {} of ", stringify!($minter), " {} made in second {}"),
+                    self.$what, self.$minter, self.created
+                )
+            }
+        }
+    };
 }
 
-impl StreamName {
-    pub const ARGS: usize = 3;
-
-    pub fn args(&self) -> Vec<Arg> {
-        vec![
-            Arg::Number(self.range as u64),
-            Arg::Number(self.stream as u64),
-            Arg::Number(self.created.number()),
-        ]
-    }
-
-    pub fn of_args(args: &[Arg]) -> Result<(StreamName, &[Arg])> {
-        let [Arg::Number(range), Arg::Number(stream), Arg::Number(created), rest @ ..] = args
-        else {
-            return Err(Error::new("a stream is named by a range, an id and a second"));
-        };
-        let name = StreamName {
-            range: *range as u32,
-            stream: *stream as u32,
-            created: TimeSec::new(*created),
-        };
-        Ok((name, rest))
-    }
-}
-
-impl std::fmt::Display for StreamName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "stream {} of range {} made in second {}", self.stream, self.range, self.created)
-    }
-}
+// ⚠️ **Scoped to the range and not to the DN**, both of them, because #75 makes the range the
+// durable key precisely so it can move between DNs. `routing::range_of_dn` stands in until ranges
+// exist. And ⚠️ **`range` is not `sn`**: the range is *whose* a thing is, the SN is *where* it lives.
+name!(ObjectName, range, object, "an object");
+name!(StreamName, range, stream, "a stream");
 
 /// One object a create asks for: a name, a flavour, and a framing.
 ///
@@ -740,12 +755,11 @@ impl ExtentRun {
 mod tests {
     use super::*;
 
-    fn one(id: u64) -> Described {
+    fn one(id: u32) -> Described {
         Described {
-            id,
+            object: ObjectName { range: 2, object: id, created: TimeSec::new(1_000_000) },
             stream: StreamName { range: 2, stream: 17, created: TimeSec::new(1_000_000) },
             sn: 3,
-            created: TimeSec::new(1_000_000),
             keyed: false,
             framing: Framing::Lf,
             first_record: 400,

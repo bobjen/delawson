@@ -1337,9 +1337,9 @@ fn say(
         "{} object {} {flavor} framed {}, made in second {}, at stream {} on SN{} \
          (made in second {}) from record {}",
         target.identity,
-        it.id,
+        it.object.object,
         it.framing,
-        it.created,
+        it.object.created,
         it.stream.stream,
         it.sn,
         it.stream.created,

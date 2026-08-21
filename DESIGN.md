@@ -17331,7 +17331,7 @@ and the tiers below it are implementation:
 | `(stream, record)` | no: streams are rewritten, and §11 shares one between objects |
 | `(extent, offset)` | no: extents are rewritten, and a hint carries an expiry for exactly that reason (§10.1) |
 
-### 17.35.1 ⚠️ Which is where the triple pattern stops
+### 17.35.1 ⚠️ Which is where the triple pattern stops — for the *path*, not the object
 
 §17.29.2, §17.33.2 and §17.34 all lean on the same trick: the third component of a name is a
 **creation second**, and it makes the other two safe to reuse because nothing can be re-minted twice
@@ -17339,6 +17339,11 @@ in one second (#110).
 
 > **That trick works because the system controls the reuse rate. It does not transfer to a path,
 > because the *user* controls the reuse rate.**
+
+⚠️ **A first draft of this section drew the line in the wrong place**, concluding that objects were
+outside the naming scheme. They are not — §17.35.2 gives an object the same triple as a stream and
+an extent. What is outside is the **path**, and the difference is that a path is not a name at all: it
+is a *pointer* at one.
 
 **A path can be deleted and recreated many times a second**, so `(path, CreateSec)` names an
 incarnation only as precisely as the clock ticks — and the clock ticks far too slowly. This is not a
@@ -17349,25 +17354,45 @@ caller chooses.
 extent and stream ids because the store mints them. **The same gate applied to anything a user renames
 at will would be throttling the user to make a naming scheme work**, which is the wrong way round.
 
-### 17.35.2 A counter, not a clock — and one already exists
+### 17.35.2 An object gets the same triple, and the path points at it
 
-**The disambiguator for a user-reused name has to be a counter**, bumped on each reuse, which is what
-NFS file handles do with an inode's generation number. **DeLawson already mints one**: `next_object` is
-monotonic, so deleting `/foo` and recreating it yields a *different* `ObjectId`, and `Described.id`
-already carries it back to the caller.
+**Bob's resolution** (Asserted, 2026-08-20): *"generate a 32-bit ObjectId per range and a
+second-granularity timestamp to go along with it, so (Range, ObjectId, timeSec) is the triple, and
+the name points at it. That lets the name recycle as often as it wants."*
 
-**So the incarnation is already distinguishable. What is missing is anywhere that checks it** (#111):
+> **The path is a pointer, and the triple is the thing pointed at.** Repointing a path is not
+> renaming anything — every incarnation it ever pointed at keeps a distinct name of its own, for ever.
 
-| | |
-|---|---|
-| a read names a **path** | so it resolves to whatever is at that path now |
-| the caller may hold an **id** from an earlier answer | and nothing compares the two |
-| the result | a caller holding `(object, record)` across a replacement **silently reads the new object's record** |
+**And the sub-second problem evaporates**, because it was never about the second. Two creates at one
+path inside one second take **two ids from the range's counter**, so the triples differ on their
+second component while agreeing on their third. The store mints ids and can gate their reuse (#110);
+it never has to gate the user's use of a path, which is what §17.35.1 said would be the wrong way
+round.
 
-**Which is the right default and the wrong only option.** A path naming whatever is there now is how
-POSIX behaves and what most callers want; a caller that wants the incarnation pinned has no way to ask,
-and the failure is silent rather than an error.
+| | minted by | reuse gated by |
+|---|---|---|
+| `(RangeId, ObjectId, CreateSec)` | the store | #110's two-bucket free list |
+| `(RangeId, StreamId, CreateSec)` | the store | the same |
+| `(SnId, ExtentId, CreateSec)` | the store | the same |
+| a **path** | the user | **nothing, and nothing needed** |
 
-> **The fix is small because the field is already on the wire**: let a read carry the id it expects, and
-> answer *"that object was replaced"* rather than answering about a different object. That is the same
-> shape as §9.1.3.5's certificate — carry enough to detect staleness rather than enough to prevent it.
+**Three names of one shape, so they are one macro** (`info::name!`) rather than three copies of
+`args` and `of_args` — and still three *types*, because handing an `ObjectName` to something wanting
+a `StreamName` is exactly the confusion §8.1.6 exists to catch.
+
+⚠️ **`Described` lost its separate `created` field**, which was the object's: it is inside the object's
+name now, where it was always a component rather than a property. The row is 11 arguments — two
+triples, an SN, a flavour, a framing and a first record — and nothing in it is a bare id any more.
+
+**Tested where it is hard**: two objects created at one path in one second have the *same* creation
+second and different names, so a reference to the first cannot resolve to the second.
+
+### 17.35.3 What is still missing is the check
+
+**The incarnation is distinguishable and nothing compares it** (#111). A read names a path, so it
+resolves to whatever that path points at now — the right default, and how POSIX behaves. A caller that
+wants the incarnation pinned has no way to ask, and the failure is silent rather than an error.
+
+> **The fix is small because the field is already on the wire**: let a read carry the name it expects,
+> and answer *"that object was replaced"* rather than answering about a different object. Same shape
+> as §9.1.3.5's certificate — carry enough to detect staleness rather than enough to prevent it.
