@@ -16808,3 +16808,73 @@ scoping question dissolves and nothing is given up for it.
 
 - **the reader needs the dictionary**, which the client does not have — it decompresses, not the EN (§8). So it is a per-stream artifact to fetch and cache, small and stable but another thing on a cold read's path.
 - **a dictionary is trained on data, so it leaks statistics about it.** Within one tenant that is nothing. It is the reason the dictionary must not be shared across a tenant boundary even if the blocks could be — which, given §5.11, is not a constraint that binds.
+
+## 17.29 An extent does not know where it starts
+
+**Bob, 2026-08-20**, reading `sn`'s `Extent`. Four corrections, and the first one is not the
+tidying it looks like.
+
+### 17.29.1 A stream offset in an extent has no correct value
+
+`Extent` carried `first_record`, *"the stream-local number of this extent's first record"*.
+⚠️ **Nonsensical, and not because it was derivable** (Asserted, Bob):
+
+> *"You can concatenate the same extent to multiple streams."*
+
+**So one extent has as many first-records as there are streams referencing it**, and the stored
+one recorded whichever stream created it. Every other reference reads a number that is wrong,
+silently, and reads wrong records with it. That is a correctness argument, not a size one —
+`REVERSE-EDGE-IS-A-COUNT` and §4.6.1's shared extents were always going to collide with a field
+that assumes a single referrer.
+
+**What the extent stores instead is how many records it holds**, which *is* intrinsic. Position
+becomes the stream's: `Stream::sealed_from` walks the list accumulating a running total, and the
+new `Placed { extent, first }` is what anything answering *about an extent in a stream* returns.
+
+> **The signature is the argument.** `Extent::args(first)` now takes the position from its
+> caller, because the extent has no opinion about it.
+
+⚠️ **The cost is that finding an extent is a walk rather than a search.** It was already a walk —
+`locate` used a linear `find` — and §14.1.1's 128 MB stream against 32 MB extents is a handful of
+entries. A stream with millions would want a sparse checkpoint every *k* extents, one `u64` per
+*k* rather than per extent (#106).
+
+### 17.29.2 `u32` ids are safe because the id was never the name
+
+An extent is `(SN, id, second)` (§4.6.3), so an id only has to be unique among the extents **one
+SN makes in one second**. 4.3 × 10^9 is not close to that, and the monotonic counter would need
+to wrap inside a single second to alias anything.
+
+### 17.29.3 The instance list names disks, not ENs
+
+⚠️ **An EN serves several disks, and a disk moves between ENs** — a rebuild, a chassis swap,
+capacity balancing — without any extent on it changing. So the durable fact is *which disk holds
+this instance*; which EN to ask is a lookup against a mapping that changes underneath it.
+
+`placement::en_of` is that lookup and is the identity function, because the code still runs one
+disk per EN and numbers them the same (#107). **Everything that turns an instance into a process
+goes through it**, so the real mapping replaces one function. The EN's own broadcast filter is the
+place that would have broken quietly: it removed itself from the instance list by comparing raw
+numbers, which with several disks per EN would have had it send itself its own append.
+
+### 17.29.4 What it saved
+
+`Sealed` went **80 bytes to 64** — a `u32` id, a `u32` record count in place of a `u64` one, and
+no stored position. At §14.1's 1.7 × 10^9 extents per SN that is **27 GB of an SN's memory**, and
+it takes the list from twenty times §4.7's reference budget to sixteen.
+
+### 17.29.5 ⚠️ The parameter changed meaning and the literal did not
+
+**A live run caught this, and no test did.** `Extent::args` used to take the record count and read
+the position from the field; it now takes the position and reads the count from the field. Two
+call sites passed a literal `0` — correct as *"this extent's count is not known"*, and wrong as
+*"this extent starts at record 0"* — and it type-checked.
+
+The symptom was an append to the second extent of a stream reporting record 9 instead of 66. **The
+`Placed` type is the fix that stops it recurring**: the position is no longer something a caller
+can pass by accident, because it comes back from the thing that knows it.
+
+> This is §8.1.6's argument arriving somewhere new. Two `u64`s, one meaning a count and one a
+> position, exchanged silently — which is the case #86's `ORoff`/`SRoff`/`ERoff` exist to make
+> impossible, and this one is not covered even by those, since a count and an offset in the *same*
+> space share a type (§8.1.6.2).

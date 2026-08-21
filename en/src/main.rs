@@ -23,6 +23,7 @@
 use common::block::Holds;
 use common::config::ENConfig;
 use common::offset::{COff, LOff};
+use common::placement;
 use common::range::{Budget, Covered, Filled, Piece, Range};
 use common::server::{self, Process, Reply, Service};
 use common::wire::{AppendBlock, Arg, Op, Request, Response, Status};
@@ -584,9 +585,18 @@ impl EN {
 
         // This process is one of the instances, and has just applied it, so the
         // rest are who else must hear about it.
+        //
+        // ⚠️ **The list names disks, so it is compared after the lookup, not before.** With
+        // one disk per EN the two numbers coincide and this reads as a no-op; with several
+        // disks on one EN, filtering on the raw disk number would have this process send
+        // itself its own append (`placement::en_of`, §17.29.3).
         let mine = process.entry.number();
-        let others: Vec<u32> =
-            appending.instances.iter().copied().filter(|en| *en != mine).collect();
+        let others: Vec<u32> = appending
+            .instances
+            .iter()
+            .map(|disk| placement::en_of(*disk))
+            .filter(|en| *en != mine)
+            .collect();
 
         // ⚠️ The **logical** offset and length, which is what a writer is owed: it
         // knows what it wrote, not what that compressed to. The stored position is

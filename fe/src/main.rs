@@ -25,6 +25,7 @@ use common::config::{FEConfig, ServiceKind};
 use common::framing::Framing;
 use common::info::{Batch, Described, Shape, UNKNOWN};
 use common::logw;
+use common::placement;
 use common::range::{Budget, Covered, Detail, Filled, Piece, Range, Start, Want};
 use common::routing;
 use common::server::{self, Process, Reply, Service};
@@ -80,8 +81,10 @@ struct Open {
     /// Records in it, or zero for the extent still being appended to — whose count
     /// changes with every append and is therefore not a thing to remember.
     records: u64,
-    /// The instances, primary first.
-    instances: Vec<u32>,
+    /// The **disks** holding its instances, primary first. ⚠️ Disks rather than ENs: which
+    /// EN serves one is a lookup (`placement::en_of`), and the two are the same number only
+    /// while there is one disk per EN.
+    disks: Vec<u32>,
 }
 
 impl Open {
@@ -98,20 +101,20 @@ impl Open {
         else {
             return None;
         };
-        let instances: Vec<u32> = instances
+        let disks: Vec<u32> = instances
             .iter()
             .filter_map(|arg| match arg {
-                Arg::Number(en) => Some(*en as u32),
+                Arg::Number(disk) => Some(*disk as u32),
                 _ => None,
             })
             .collect();
-        (!instances.is_empty()).then_some(Open {
+        (!disks.is_empty()).then_some(Open {
             sn,
             id: *id,
             created: *created,
             first_record: *first_record,
             records: *records,
-            instances,
+            disks,
         })
     }
 
@@ -524,14 +527,14 @@ impl FE {
     /// others, and the SN is not in this path to be asked again.
     fn to_primary(self: &Arc<Self>, process: &Arc<Process>, wanting: Wanting, open: Open) {
         let Wanting { path, located, body, holds, tries, reply } = wanting;
-        let identity = format!("EN{}", open.instances[0]);
+        let identity = format!("EN{}", placement::en_of(open.disks[0]));
         // One shape, built and read in `common`, so neither side counts positions.
         let ask = AppendBlock {
             sn: open.sn,
             extent: open.id,
             created: open.created,
             holds,
-            instances: open.instances.clone(),
+            instances: open.disks.clone(),
             offset: None,
             bytes: body.clone(),
         }
@@ -807,7 +810,7 @@ fn from_instance(
     budget: Budget,
     reply: Reply,
 ) {
-    let identity = format!("EN{}", open.instances[0]);
+    let identity = format!("EN{}", placement::en_of(open.disks[0]));
     // The record number the extent knows is its own, counted from its first — and no
     // framing goes with it, because the EN will not be looking inside.
     let in_extent = within(in_stream, open.first_record);
@@ -1676,9 +1679,9 @@ mod tests {
         let open = Open::of(0, &args).expect("an extent");
         assert_eq!((open.sn, open.id, open.created, open.first_record), (0, 7, 1_000_000, 40));
         assert_eq!(open.records, 90, "sealed, so its range is known");
-        assert_eq!(open.instances, [2, 3, 0, 1]);
+        assert_eq!(open.disks, [2, 3, 0, 1]);
         // The primary is the first, which is the one an append is sent to.
-        assert_eq!(open.instances[0], 2);
+        assert_eq!(open.disks[0], 2);
     }
 
     /// An extent with nowhere to put it is not an extent.
@@ -1725,7 +1728,7 @@ mod tests {
             created: 1_000_000,
             first_record: 40,
             records: 0,
-            instances: vec![2, 3],
+            disks: vec![2, 3],
         };
         let from_en = Response {
             id: 0,
@@ -1764,27 +1767,14 @@ mod tests {
     #[test]
     fn a_failed_append_is_not_dressed_up_as_a_receipt() {
         let located = Located { dn: 0, stream: 17, sn: 0, framing: Framing::Lf, first_record: 0 };
-        let open = Open {
-            sn: 0,
-            id: 7,
-            created: 1_000_000,
-            first_record: 0,
-            records: 0,
-            instances: vec![2],
-        };
+        let open =
+            Open { sn: 0, id: 7, created: 1_000_000, first_record: 0, records: 0, disks: vec![2] };
         let refused = Response::error(Status::Internal, "two instances would not apply it");
         assert_eq!(receipt(&located, &open, refused.clone()), refused);
     }
 
     fn extent(id: u64, first_record: u64) -> Open {
-        Open {
-            sn: 0,
-            id,
-            created: 1_000_000,
-            first_record,
-            records: 0,
-            instances: vec![2, 3, 0, 1],
-        }
+        Open { sn: 0, id, created: 1_000_000, first_record, records: 0, disks: vec![2, 3, 0, 1] }
     }
 
     /// One append asks the SN and the rest join it. Without this, every append in

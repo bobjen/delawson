@@ -349,7 +349,9 @@ pub struct ExtentRow {
     /// rather than a description. Length-prefixed on the wire because erasure coding
     /// will give a sealed extent a different number of them than an open one has
     /// (§4.3.2).
-    pub instances: Vec<u32>,
+    /// The **disks** holding its instances, primary first. ⚠️ Disks rather than ENs — see
+    /// `placement::en_of` for why, and for the lookup that turns one into a process.
+    pub disks: Vec<u32>,
 }
 
 impl ExtentRow {
@@ -366,9 +368,9 @@ impl ExtentRow {
             Arg::Number(self.records),
             Arg::Number(self.logical),
             Arg::Number(self.length),
-            Arg::Number(self.instances.len() as u64),
+            Arg::Number(self.disks.len() as u64),
         ];
-        args.extend(self.instances.iter().map(|en| Arg::Number(*en as u64)));
+        args.extend(self.disks.iter().map(|disk| Arg::Number(*disk as u64)));
         args
     }
 
@@ -395,10 +397,10 @@ impl ExtentRow {
             )));
         }
         let (given, rest) = rest.split_at(count);
-        let mut instances = Vec::with_capacity(count);
+        let mut disks = Vec::with_capacity(count);
         for one in given {
             match one {
-                Arg::Number(en) => instances.push(*en as u32),
+                Arg::Number(disk) => disks.push(*disk as u32),
                 _ => return Err(Error::new("an instance list is numbers")),
             }
         }
@@ -411,7 +413,7 @@ impl ExtentRow {
                 records: *records,
                 logical: *logical,
                 length: *length,
-                instances,
+                disks,
             },
             rest,
         ))
@@ -754,7 +756,7 @@ mod tests {
             records,
             logical: if records == UNKNOWN { UNKNOWN } else { records * 100 },
             length: if records == UNKNOWN { UNKNOWN } else { records * 10 },
-            instances: vec![3, 1, 0, 2],
+            disks: vec![3, 1, 0, 2],
         }
     }
 
@@ -774,7 +776,7 @@ mod tests {
         let (given, rest) = ExtentRow::some_of_args(rest, back.given).expect("extents");
         assert_eq!(given, rows);
         assert!(rest.is_empty());
-        assert_eq!(given[0].instances, vec![3, 1, 0, 2], "primary first, in order");
+        assert_eq!(given[0].disks, vec![3, 1, 0, 2], "primary first, in order");
     }
 
     /// Instance lists of different lengths in one answer, which is what erasure
@@ -782,14 +784,14 @@ mod tests {
     #[test]
     fn extents_may_carry_different_numbers_of_instances() {
         let mut wide = extent(1, 0, 40);
-        wide.instances = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
-        let narrow = ExtentRow { instances: vec![9], ..extent(2, 40, 50) };
+        wide.disks = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
+        let narrow = ExtentRow { disks: vec![9], ..extent(2, 40, 50) };
         let mut args = Vec::new();
         args.extend(wide.args());
         args.extend(narrow.args());
         let (rows, rest) = ExtentRow::some_of_args(&args, 2).expect("extents");
-        assert_eq!(rows[0].instances.len(), 9);
-        assert_eq!(rows[1].instances.len(), 1);
+        assert_eq!(rows[0].disks.len(), 9);
+        assert_eq!(rows[1].disks.len(), 1);
         assert!(rest.is_empty());
     }
 

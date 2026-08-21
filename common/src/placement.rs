@@ -12,6 +12,22 @@ use std::collections::BTreeSet;
 
 pub const EXTENT_INSTANCES: usize = 4;
 
+/// Which EN serves a disk.
+///
+/// ⚠️ **An extent's instance list names *disks*, not ENs** (Asserted, Bob, 2026-08-20). An
+/// EN serves several disks, and a disk can be moved to another EN — by a rebuild, by a
+/// chassis swap, by capacity balancing — without any extent on it changing. So the durable
+/// fact is *which disk holds this instance*, and *which EN to ask* is a lookup against a
+/// mapping that changes underneath it.
+///
+/// **This is that lookup, and it is the identity function**, because the code still runs one
+/// disk per EN and numbers them the same. Everything that turns an instance into a process
+/// to talk to goes through here, so the real mapping replaces one function rather than being
+/// hunted for (§17.29.3, #107).
+pub fn en_of(disk: u32) -> u32 {
+    disk
+}
+
 /// How many bytes of device a stored byte actually costs (Asserted, Bob, 2026-08-20).
 ///
 /// ⚠️ **Not an integer multiplier.** Plain replication is a whole number — four copies is
