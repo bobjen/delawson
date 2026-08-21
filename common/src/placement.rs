@@ -23,7 +23,7 @@ pub const EXTENT_INSTANCES: usize = 4;
 /// **This is that lookup, and it is the identity function**, because the code still runs one
 /// disk per EN and numbers them the same. Everything that turns an instance into a process
 /// to talk to goes through here, so the real mapping replaces one function rather than being
-/// hunted for (§17.29.3, #107).
+/// hunted for (§17.29.3, #108).
 pub fn en_of(disk: u32) -> u32 {
     disk
 }

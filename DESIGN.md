@@ -16852,7 +16852,7 @@ capacity balancing — without any extent on it changing. So the durable fact is
 this instance*; which EN to ask is a lookup against a mapping that changes underneath it.
 
 `placement::en_of` is that lookup and is the identity function, because the code still runs one
-disk per EN and numbers them the same (#107). **Everything that turns an instance into a process
+disk per EN and numbers them the same (#108). **Everything that turns an instance into a process
 goes through it**, so the real mapping replaces one function. The EN's own broadcast filter is the
 place that would have broken quietly: it removed itself from the instance list by comparing raw
 numbers, which with several disks per EN would have had it send itself its own append.
