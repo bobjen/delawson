@@ -259,18 +259,12 @@ impl Process {
     /// silently sent every append for one object to a different machine. The generic
     /// helper is where the mistake was cheap to make, so the generic helper is where it is
     /// now impossible — `owner` is the only way to a DN (`A-NAME-HAS-ONE-OWNER`).
+    ///
+    /// **There is no escape hatch.** One existed for `batch-create` while it still sent
+    /// every name to one DN; #98 grouped them by owner, so the hatch went with the debt it
+    /// was holding open.
     pub fn pick(&self, kind: ServiceKind) -> Result<&str> {
         pickable(kind)?;
-        self.any_of(kind)
-    }
-
-    /// A process of a kind, taken in turn, **whatever the kind**.
-    ///
-    /// ⚠️ **The escape hatch from `pick`'s refusal, and it has exactly one caller**:
-    /// `batch-create`, whose names have owners it does not yet group by (#98). Named
-    /// separately so that the one place still doing the wrong thing says so at its call
-    /// site, rather than hiding inside the helper everything else uses.
-    pub fn any_of(&self, kind: ServiceKind) -> Result<&str> {
         let of_kind: Vec<&ServiceEntry> = self.cluster.services_of_kind(kind).collect();
         if of_kind.is_empty() {
             return Err(Error::new(format!("no {} in the roster", kind.as_str().to_uppercase())));

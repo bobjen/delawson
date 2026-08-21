@@ -230,10 +230,9 @@ return a DN (`server::pickable`), so `owner` is the only way to one · *Checked*
 rule itself, not on a copy of it
 *Breaks* a create lands on one machine and the lookup that follows it asks another, so the object is
 not lost but unreachable, which is worse. ⚠️ Round robin violates this and was what every DN-bound
-request used — invisible with one DN, and half the objects gone with two. `batch-create` still
-violates it (#98), and calls `any_of` rather than `pick` so that the one place doing so is
-greppable. ⚠️ A comment saying "not `pick`" was already there and did not work: §17.24.0 converted
-one of three call sites, and the one it missed lost appends silently (§17.30).
+request used — invisible with one DN, and half the objects gone with two. ⚠️ A comment saying "not `pick`" was already there and did not work: §17.24.0 converted one of
+three call sites, and the one it missed lost appends silently (§17.30). All three are converted
+now (#98, §17.31), so the refusal has nothing to route around it.
 
 **`A-NAME-COSTS-AT-LEAST-ONE-ENTRY`** — every name a batch answer covers spends at least its own
 object row against the entry limit.

@@ -17,7 +17,7 @@
 use common::config::{DNConfig, ServiceKind};
 use common::framing::Framing;
 use common::info::{
-    Batch, Described, ExtentRow, ExtentRun, Listing, Shape, StreamRow, Totals, UNKNOWN,
+    Batch, Described, ExtentRow, ExtentRun, Listing, Shape, StreamRow, Totals, UNKNOWN, Wanted,
 };
 use common::logw;
 use common::range::{Detail, Want};
@@ -492,31 +492,6 @@ struct Gather {
     name: String,
 }
 
-/// One object a create asks for: a name, a flavour, and a framing.
-struct Wanted {
-    name: String,
-    keyed: bool,
-    framing: Framing,
-}
-
-impl Wanted {
-    /// Arguments per object, which is what a batch is cut into.
-    const ARGS: usize = 4;
-
-    fn of(args: &[Arg]) -> Result<Wanted> {
-        match args {
-            [Arg::Text(name), Arg::Flag(keyed), Arg::Number(kind), Arg::Number(width)] => {
-                Ok(Wanted {
-                    name: name.clone(),
-                    keyed: *keyed,
-                    framing: Framing::of_wire(*kind, *width)?,
-                })
-            }
-            _ => Err(Error::new("a create takes a name, a flavour and a framing")),
-        }
-    }
-}
-
 struct DN {
     config: DNConfig,
     shards: Vec<Mutex<HashMap<Box<str>, Object>>>,
@@ -619,7 +594,7 @@ impl DN {
         // Only the first few arguments are the object; a create may carry more —
         // media class, an expiry — that nothing here reads yet.
         let head = request.args.get(..Wanted::ARGS).unwrap_or_default();
-        let wanted = match Wanted::of(head) {
+        let wanted = match Wanted::of_args(head) {
             Ok(wanted) => wanted,
             Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
         };
@@ -640,13 +615,10 @@ impl DN {
     /// A run of `(name, keyed)` pairs, which costs one stream request and one
     /// answer however many objects it holds.
     fn create_many(self: &Arc<Self>, process: &Arc<Process>, request: &Request, reply: Reply) {
-        let mut wanted = Vec::with_capacity(request.args.len() / Wanted::ARGS);
-        for one in request.args.chunks(Wanted::ARGS) {
-            match Wanted::of(one) {
-                Ok(one) => wanted.push(one),
-                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
-            }
-        }
+        let wanted = match Wanted::all_of_args(&request.args) {
+            Ok(wanted) => wanted,
+            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+        };
         self.record(process, wanted, reply, |_, made| Response {
             id: 0,
             status: Status::Ok,
@@ -1628,7 +1600,7 @@ mod tests {
         let (kind, width) = Framing::CrLf.wire();
         let args =
             vec![Arg::Text("/x".into()), Arg::Flag(true), Arg::Number(kind), Arg::Number(width)];
-        let wanted = Wanted::of(&args).expect("an object");
+        let wanted = Wanted::of_args(&args).expect("an object");
         assert_eq!((wanted.name.as_str(), wanted.keyed), ("/x", true));
         assert_eq!(wanted.framing, Framing::CrLf);
 
@@ -1636,9 +1608,9 @@ mod tests {
         // of the request still parses.
         let mut more = args.clone();
         more.push(Arg::Text("ssd".into()));
-        assert!(Wanted::of(&more[..Wanted::ARGS]).is_ok());
+        assert!(Wanted::of_args(&more[..Wanted::ARGS]).is_ok());
         // But a framing that means nothing is a bad request.
         let bad = vec![Arg::Text("/x".into()), Arg::Flag(false), Arg::Number(9), Arg::Number(0)];
-        assert!(Wanted::of(&bad).is_err());
+        assert!(Wanted::of_args(&bad).is_err());
     }
 }

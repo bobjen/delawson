@@ -123,7 +123,7 @@ shutdown_grace_ms = 2000
 # have one member for now, so KS, DN and SN are one apiece.
 [[service]]
 kind = "ks"
-count = 1
+count = 3
 domain = ["region0", "dc0", "rack0", "box0", "disk0"]
 
 [[service]]
@@ -132,7 +132,7 @@ kind = "dn"
 # across DNs at all, and two defects in that path survived a day of testing because of it
 # (§17.24.1). A batch is roughly half as fast here as on one DN, which is the finding of
 # §17.24.5 and not noise: the fan-out is messages, and messages are the cost.
-count = 3
+count = 1
 domain = ["region0", "dc0", "rack0", "box0", "disk0"]
 
 [[service]]

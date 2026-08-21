@@ -23,7 +23,7 @@ use common::Result;
 use common::block::Holds;
 use common::config::{FEConfig, ServiceKind};
 use common::framing::Framing;
-use common::info::{Batch, Described, Shape, UNKNOWN};
+use common::info::{Batch, Described, Shape, UNKNOWN, Wanted};
 use common::logw;
 use common::placement;
 use common::range::{Budget, Covered, Detail, Filled, Piece, Range, Start, Want};
@@ -241,10 +241,11 @@ impl Service for FE {
             reply.send(server::unbuilt(process, SERVES, &request));
             return;
         }
-        if request.op == Op::BatchInfo {
-            return self.batch(process, &request, reply);
+        match request.op {
+            Op::BatchInfo => self.batch(process, &request, reply),
+            Op::BatchCreate => self.create(process, &request, reply),
+            _ => self.onward(process, &request, reply),
         }
-        self.onward(process, &request, reply);
     }
 
     fn status(&self, _process: &Process) -> Vec<String> {
@@ -1239,6 +1240,57 @@ impl FE {
         send(self, process, &spread, asks);
     }
 
+    /// A batch create whose names may belong to different DNs (#98).
+    ///
+    /// **Simpler than the lookup fan-out**, and worth saying why: a create has no entry limit
+    /// to divide, no detail levels, and its answer is a **count** rather than a row per name
+    /// — so there is nothing to budget, nothing to size, and nothing to put back in order.
+    /// The counts add.
+    ///
+    /// ⚠️ **The answer being a count is also its weakness.** A caller learns how many objects
+    /// were newly made and not *which*, so a partial failure names nothing. That was already
+    /// true of one DN; spreading over several makes it worse, which is why a DN that refuses
+    /// fails the whole batch rather than being quietly subtracted (§17.31.1).
+    fn create(self: &Arc<Self>, process: &Arc<Process>, request: &Request, mut reply: Reply) {
+        let wanted = match Wanted::all_of_args(&request.args) {
+            Ok(wanted) => wanted,
+            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+        };
+        let dns: Vec<String> =
+            process.all_of(ServiceKind::Dn).iter().map(|dn| dn.to_string()).collect();
+        if dns.len() < 2 || wanted.len() < 2 {
+            return self.onward(process, request, reply);
+        }
+
+        let owners: Vec<usize> =
+            wanted.iter().map(|one| routing::owner_of(&one.name, dns.len())).collect();
+        let groups = by_owner(&owners);
+        reply.about(format_args!("{},dns {}", first(request), groups.len()));
+        let making = Arc::new(Mutex::new(Making {
+            left: groups.len(),
+            made: 0,
+            failed: None,
+            reply: Some(reply),
+        }));
+
+        for (dn, at) in groups {
+            let mut ask = Request::new(Op::BatchCreate);
+            for one in at.iter().map(|at| &wanted[*at]) {
+                ask.args.extend(one.args());
+            }
+            let identity = dns[dn].clone();
+            let waiting = Arc::clone(&making);
+            let named = identity.clone();
+            if let Err(e) = process.ask(&identity, &ask, move |answer| made(&waiting, answer)) {
+                logw!("could not reach a DN", "dn {named},{e}");
+                made(
+                    &making,
+                    Response::error(Status::Internal, format!("could not reach {named}")),
+                );
+            }
+        }
+    }
+
     /// Forward a request whole to the DN that should answer it.
     fn onward(&self, process: &Arc<Process>, request: &Request, mut reply: Reply) {
         let dn = match self.destination(process, request) {
@@ -1264,11 +1316,49 @@ impl FE {
             Op::CreateObject | Op::ObjectInfo | Op::BatchInfo => {
                 process.owner(ServiceKind::Dn, first(request))
             }
-            // ⚠️ #98: a batch create's names have owners too, and this sends them all to
-            // one DN. Harmless with one DN and wrong with two — and `any_of` rather than
-            // `pick` because `pick` now refuses a DN outright (#106), so the one caller
-            // still doing this has to say so.
-            _ => process.any_of(ServiceKind::Dn),
+            // A batch create reaching here is one DN's worth: `FE::create` has already
+            // grouped by owner, or there was nothing to group (#98). Either way the name to
+            // route by is the first one.
+            Op::BatchCreate => process.owner(ServiceKind::Dn, first(request)),
+            _ => process.pick(ServiceKind::Dn),
+        }
+    }
+}
+
+/// A batch create being counted up from several DNs.
+struct Making {
+    left: usize,
+    made: u64,
+    /// ⚠️ Set when any DN refused, so the whole batch fails. A short count with no way to
+    /// say which names it is short of is not a partial answer, it is an unusable one.
+    failed: Option<Response>,
+    reply: Option<Reply>,
+}
+
+/// One DN's count. The last one in answers.
+fn made(making: &Arc<Mutex<Making>>, answer: Response) {
+    let mut held = making.lock().expect("making");
+    match (answer.status, answer.args.first()) {
+        (Status::Ok, Some(Arg::Number(made))) => held.made += made,
+        (Status::Ok, _) => {
+            held.failed.get_or_insert(Response::error(
+                Status::Internal,
+                "a batch create answered without saying how many it made",
+            ));
+        }
+        _ => {
+            held.failed.get_or_insert(answer);
+        }
+    }
+    held.left -= 1;
+    if held.left > 0 {
+        return;
+    }
+    let Some(reply) = held.reply.take() else { return };
+    match held.failed.take() {
+        Some(failed) => reply.send(failed),
+        None => {
+            reply.send(Response { id: 0, status: Status::Ok, args: vec![Arg::Number(held.made)] })
         }
     }
 }

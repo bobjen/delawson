@@ -13994,6 +13994,13 @@ Roughly in order of how much else depends on them.
      to have both, and names the two things to check: the client must fetch the dictionary, and a
      dictionary leaks statistics about what trained it.
 
+156. **How a batch create says which names it did not make** (§17.31.1). Its answer is a count, so a
+     caller learns how many objects were newly made and not which — and cannot distinguish a name
+     that already existed from one that failed. One DN made that tolerable; several make it worse,
+     and the current answer is to fail the whole batch on any DN's refusal. ⚠️ A header of the shape
+     `batch-object-info` grew (§17.23) would fix it — asked, made, and an index — but a create's
+     natural unit is the name rather than the entry, so it is not the same header.
+
 **Closed** since earlier drafts:
 
 - how frequently DN metadata is resident in RAM — it does not need measuring, because the inline
@@ -16205,20 +16212,26 @@ answer rather than a partial one.
 
 #### 17.24.5 ⚠️ Hash routing makes a batch cost D messages, which is the whole cost
 
-⚠️ **The table below is not to be trusted — see §17.30.3.** It was measured on a cluster where
-`bench-create` scattered objects round-robin while `bench-info` looked them up by owner, so most
-lookups missed. The reasoning that follows it is arithmetic and stands; the numbers must be retaken.
-
-**Measured in one session, so §17.19.2's ±25% does not apply:**
+⚠️ **Retaken after #98 and #106** — the first figures here were void, because `bench-create`
+scattered objects round-robin while `bench-info` looked them up by owner, so most lookups missed
+(§17.30.3). These are one session, 100,000 objects, **every lookup found**:
 
 | | `--batch 100` | `--batch 1` |
 |---|---|---|
-| one DN | 4,156,402/s | 123,856/s |
-| three DNs | **2,262,083/s** | 105,892/s |
+| one DN | 3,479,408/s | 130,825/s |
+| three DNs | **2,037,511/s** | 109,226/s |
 
-**A batch got 46% slower by having three DNs to spread over**, and the reason is that one request became
-three. §1.4.0 measures nine tenths of a request's cost as messaging, so multiplying the messages is
-multiplying nearly all of it.
+**A batch got 41% slower by having three DNs to spread over.** The void figure said 46%, so the
+conclusion was right and the number was luck.
+
+⚠️ **But the single-name column decomposes it, which the first version missed.** A one-name lookup
+does not fan out — it goes to one DN either way — and it is still **16.5% slower** on three. That is
+two extra processes competing for one box's cores, not routing. Against a contention-adjusted
+baseline of 2,904,963/s, the fan-out itself costs **30%**.
+
+**So the effect is real and was overstated by a third.** One request became three, and §1.4.0
+measures nine tenths of a request's cost as messaging, so multiplying the messages multiplies nearly
+all of it.
 
 ⚠️ **It gets worse, and not gently.** A hash spreads *n* names over *D* DNs, so the number touched is
 `D(1 − (1 − 1/D)^n)`:
@@ -16957,5 +16970,51 @@ while `bench-info` looks them up by owner. Most lookups were missing, so the fig
 cluster that was not finding its own data.
 
 **The analysis survives and the number does not.** A batch whose names span *D* DNs really does
-become *D* requests, and `D(1 − (1 − 1/D)^n)` is arithmetic rather than measurement. The 46% and the
-4,296,330/s must be retaken once #98 lands.
+become *D* requests, and `D(1 − (1 − 1/D)^n)` is arithmetic rather than measurement.
+
+⚠️ **Retaken after #98** (§17.24.5): 41% rather than 46%, of which **16.5 points are two extra
+processes on one box** and not routing at all. The first version attributed the whole gap to fan-out
+because it had nothing to subtract with — and the single-name arm, which cannot fan out, is what
+supplies the subtraction. **A one-armed benchmark cannot tell its effect from its overhead.**
+
+## 17.31 A batch create is grouped by owner, and its answer is a count
+
+**#98, the third and last call site.** §17.24.0 converted `object-info`, §17.30 converted the append
+and read path, and `batch-create` was left sending every name to one DN — harmless with one and
+wrong with two, since a create landed where a lookup would not go.
+
+### 17.31.1 Simpler than the lookup fan-out, and worth saying why
+
+| | `batch-object-info` | `batch-create` |
+|---|---|---|
+| an entry limit to divide | yes (§9.1.3.7) | **none** |
+| detail levels to negotiate | yes | **none** |
+| the answer | a row per name, which must come back **in the caller's order** | a **count** |
+
+**So there is nothing to budget, nothing to size, and nothing to put back in order.** The FE groups
+by owner, sends one request per DN, and the counts add. No `Spread`, no second round, no prefix rule.
+
+⚠️ **The answer being a count is also its weakness.** A caller learns how many objects were newly
+made and not *which* — so a partial failure names nothing. That was already true of one DN; spreading
+over several makes it worse, which is why **a DN that refuses fails the whole batch** rather than
+being quietly subtracted. A short count that cannot say what it is short of is not a partial answer,
+it is an unusable one (§16.156).
+
+### 17.31.2 The shape moved to `common`, which is the rule that made this cheap
+
+The FE now has to cut a create request into objects, and §17.13.3 says no two processes count
+argument positions independently. So `Wanted` — name, flavour, framing — moved out of `dn` into
+`common::info`, with one `ARGS` and one `all_of_args`.
+
+**And `all_of_args` refuses a trailing part-object rather than truncating**, which the DN's version
+did not: a batch that does not divide is one somebody built wrong, and creating the whole ones would
+leave a caller's list and the objects that exist disagreeing silently.
+
+### 17.31.3 The escape hatch went with the debt
+
+§17.30's `pick` refusal needed an `any_of` for `batch-create` while it was still round-robin. #98 was
+that debt, so `any_of` is gone and `pick` refuses a DN with nothing to route around it.
+
+> **Three call sites, converted over one day, in the wrong order** — the generic helper was made safe
+> *before* the last caller was fixed, so the hatch existed for one commit. Doing it the other way
+> round would have needed no hatch, and there would have been nothing to remember to remove.

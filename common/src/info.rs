@@ -186,6 +186,61 @@ impl Shape {
     }
 }
 
+/// One object a create asks for: a name, a flavour, and a framing.
+///
+/// ⚠️ **Here rather than in `dn`, on §17.13.3's rule.** A batch create has to be *divided* by
+/// the FE before any DN sees it (#98), which means the FE cuts the request into objects — and
+/// two processes counting argument positions independently is how §17.19 went wrong. One
+/// shape, one `ARGS`, one place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wanted {
+    pub name: String,
+    pub keyed: bool,
+    pub framing: Framing,
+}
+
+impl Wanted {
+    /// Arguments per object, which is what a batch is cut into.
+    pub const ARGS: usize = 4;
+
+    pub fn args(&self) -> Vec<Arg> {
+        let (kind, width) = self.framing.wire();
+        vec![
+            Arg::Text(self.name.clone()),
+            Arg::Flag(self.keyed),
+            Arg::Number(kind),
+            Arg::Number(width),
+        ]
+    }
+
+    pub fn of_args(args: &[Arg]) -> Result<Wanted> {
+        match args {
+            [Arg::Text(name), Arg::Flag(keyed), Arg::Number(kind), Arg::Number(width)] => {
+                Ok(Wanted {
+                    name: name.clone(),
+                    keyed: *keyed,
+                    framing: Framing::of_wire(*kind, *width)?,
+                })
+            }
+            _ => Err(Error::new("a create takes a name, a flavour and a framing")),
+        }
+    }
+
+    /// Every object in a batch. ⚠️ **A trailing part-object is an error, not a truncation**:
+    /// a batch that does not divide is a batch somebody built wrong, and creating the whole
+    /// ones would make a caller's list and the objects that exist disagree silently.
+    pub fn all_of_args(args: &[Arg]) -> Result<Vec<Wanted>> {
+        if !args.len().is_multiple_of(Wanted::ARGS) {
+            return Err(Error::new(format!(
+                "a batch create of {} arguments does not divide into objects of {}",
+                args.len(),
+                Wanted::ARGS
+            )));
+        }
+        args.chunks(Wanted::ARGS).map(Wanted::of_args).collect()
+    }
+}
+
 /// What a stream has come to: the sizes a user asks for and none of the addressing.
 ///
 /// ⚠️ **Sums, so `u64` — unlike `Filled`, whose measures are one extent's and fit 32 bits.**
