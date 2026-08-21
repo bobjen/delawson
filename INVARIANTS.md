@@ -793,6 +793,16 @@ physical is computed from compressed and the class every time it is asked for.
 and re-deriving it is then a migration rather than a multiply. See
 [[BILLING-CHARGES-THE-CLASS-NOT-THE-COPIES]] for what it is computed *from*.
 
+**`A-BLOCK-HOLDS-ONE-AUTHORIZATION-DOMAIN`** — every record in an append block is readable by
+the same set of principals.
+*Argued* §17.26.1, §17.26.2 · *Enforced* design only; lumping does not exist yet · *Checked*
+not yet
+*Breaks* a read hands out records the caller may not see, and there is **no recovery on the way
+out**: the CRC is over the block and the client checks it end to end, so trimming corrupts the
+answer, and the EN cannot re-cut a compressed block because it never decompresses. ⚠️ The
+cheapest way to hold this is placement — one common stream per authorization domain (§17.26.2)
+— rather than one block per object, which would cost the shared compression lumping exists for.
+
 **`INLINE-BEATS-A-POINTER-TO-IT`** — an object is stored inline only while it is smaller than
 the metadata a reference to it would cost, `R·(1 + E·G/(f·r))`.
 *Argued* §17.25.6 · *Enforced* design only; no regime exists yet · *Checked* not yet
@@ -862,7 +872,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 
 | Term | Defined | Invariants naming it |
 |---|---|---|
-| **append block** | §8.1 | `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `RECORD-FITS-ONE-EXTENT`, `EXTENT-SEALS-BETWEEN-RECORDS`, `APPLIED-IS-A-PREFIX`, `ONE-BLOCK-ALWAYS-RETURNS` |
+| **append block** | §8.1 | `A-BLOCK-HOLDS-ONE-AUTHORIZATION-DOMAIN`, `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `RECORD-FITS-ONE-EXTENT`, `EXTENT-SEALS-BETWEEN-RECORDS`, `APPLIED-IS-A-PREFIX`, `ONE-BLOCK-ALWAYS-RETURNS` |
 | **applied** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE` |
 | **capability** | §9.1.3.5 | `A-CERTIFICATE-NAMES-ITS-TENANT-AND-ITS-EXTENT`, `HINT-BOUND-BY-CAPABILITY`, `KEY-AND-SALT-COVER-ONE-PLAINTEXT` |
 | **directory** | §5.1 | `POLICY-ATTACHES-TO-A-DIRECTORY`, `ALIAS-ACCESS-INTERSECTS`, `EVERY-OBJECT-HAS-ONE-CANONICAL-PATH`, `ALIAS-TRAVERSAL-CARRIES-ITS-PATH` |
@@ -891,6 +901,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **primary** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `TRUNCATION-SEALS` |
 | **quorum** | §8.1.1 | `QUORUM-OVERLAPS`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `UNAPPENDABLE-EXTENT-SEALS`, `SELF-SEAL-MARK-IS-DURABLE` |
 | **batch** | §9.1.3.7 | `A-BATCH-ANSWER-IS-A-PREFIX`, `A-NAME-COSTS-AT-LEAST-ONE-ENTRY`, `A-NAME-HAS-ONE-OWNER` |
+| **authorization domain** | §5.9.1a | `A-BLOCK-HOLDS-ONE-AUTHORIZATION-DOMAIN`, `A-MEMBER-THAT-CAN-SERVE-CAN-LEAK` |
 | **inline** | §11 | `INLINE-BEATS-A-POINTER-TO-IT`, `A-PHYSICAL-LENGTH-IS-NEVER-STORED` |
 | **stream summary** | §17.25.1 | `A-SEALED-SUMMARY-IS-FINAL`, `A-PHYSICAL-LENGTH-IS-NEVER-STORED`, `TAIL-ONLY-SUMMARIES-EXACT` |
 | **record** | §8.2 | `EXTENT-HOLDS-WHOLE-RECORDS`, `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `INCOMPLETE-RECORD-NOT-DURABLE`, `RECORD-FITS-ONE-EXTENT`, `TERMINATOR-NOT-IN-DATA`, `OFFSET-SNAPS-FORWARD`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `EXTENT-SEALS-BETWEEN-RECORDS`, `RANGE-ENDS-ON-A-RECORD-BOUNDARY` |

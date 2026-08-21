@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-154 things *not* decided.
+155 things *not* decided.
 
 **Priorities and framing**
 
@@ -13993,6 +13993,15 @@ Roughly in order of how much else depends on them.
      benchmark; deciding whether the per-object form is worth using is a design question, and §17.25.5's
      SN rewrite pass is where it would be applied.
 
+155. **Whether a common stream is scoped to a tenant or to an authorization domain** (§17.26). Lumping
+     puts many objects in one extent, and §5.1.1.1a's writable aliases mean a tenant can have a
+     boundary inside itself — so an extent-scoped certificate over-grants. Scoping the common stream
+     to the domain keeps every read-path mechanism intact and costs more streams; per-block separation
+     keeps one stream and costs the shared compression that lumping exists for. ⚠️ The first stops
+     working if authorization ever becomes per-object, which §5.9.1a currently rules out and no use
+     case demands — so this is a bet on authorization staying directory-shaped, and worth recording as
+     one.
+
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
@@ -16587,3 +16596,83 @@ be inlined at a smaller size than a cold one.
 
 **And *f* is a measurement nobody has taken** (§16.154). It is also, per §18.2, a **fraction in
 [0, 1]** and not a percentage — a parameter that will be multiplied by 5,000 in exactly one place.
+
+## 17.26 Sharing an extent puts an authorization boundary inside it
+
+**Bob, 2026-08-20**, on §11's lumped and packed regimes: *"This is a use case where a user would be
+allowed to read some records in an extent but not all of them."*
+
+⚠️ **That falsifies a stated assumption.** §9.1.3.5 accepted the extent-scoped certificate partly on
+this ground:
+
+> *"I don't know of a use case where there is a security boundary between a tenant and itself, so the
+> security aspect isn't bothering me so far."*
+
+**There are now two**, and one of them Bob introduced himself:
+
+| | |
+|---|---|
+| **within a tenant** | §5.1.1.1a's writable aliases exist so that *"many workers on a gorilla"* can each have *"their own private scratch space"*. That is a boundary between a tenant and itself, by construction. |
+| **across tenants** | an inline object's records end up in a **metadata extent shared with thousands of other objects' metadata** (§11) — though see below, this one turns out not to bite |
+
+### 17.26.1 Three things assume the reader may see the whole block
+
+**The leak is not in the capability alone.** Three separate mechanisms in the read path each assume
+that whoever may read one record may read everything alongside it:
+
+| | Where |
+|---|---|
+| the certificate is **extent-scoped** — `(tenant, extent, write?)` | §9.1.3.5 |
+| a read **returns the block**, and the client picks its record out of it | §17.5's read path; `Piece` carries `bytes` |
+| the CRC is **over the block**, checked end to end by the client | §8.1 |
+
+> ⚠️ **So trimming the answer is not available.** Removing another object's records from a block breaks
+> the CRC the client is about to check, and the EN cannot re-cut a compressed block because **the EN
+> never decompresses** — that is the property that makes the whole read path cheap (§17.25's *"nothing
+> in between ever looked inside"*).
+
+**The block must therefore be clean by construction**, not cleaned on the way out.
+
+### 17.26.2 Two ways to make it clean, and the cheap one keeps everything
+
+| | Cost |
+|---|---|
+| **a block never spans two objects**, and the certificate carries a **range within the extent** | ⚠️ a tiny object gets a block of its own, and a block is the compression unit (§7.2) — so tiny objects can no longer be **compressed together**, which is a large part of what lumping was for. Plus the FE must check a range, and §9.1.3.5.4's signed form has to carry one. |
+| **a common stream never spans an authorization boundary** | more common streams — one per domain rather than per tenant — and a domain with few tiny objects gets an under-filled stream, which is §12.2's metadata tax again |
+
+**The second keeps every mechanism above intact.** Blocks may be shared freely, compression works
+across objects, the CRC stands, and the extent-scoped certificate is *exactly right again* — because
+everything in the extent is readable by the same set.
+
+> **So the fix is in placement, not in the read path.** Lump by authorization domain rather than by
+> tenant, and the boundary never lands inside an extent in the first place.
+
+⚠️ **And that only works while domains are coarse.** §5.9.1a makes authorization directory-shaped and
+Bob has *"no use case demanding per-object authorization"* — so domains are few and large, and one
+common stream apiece is affordable. **If authorization ever becomes per-object, this degenerates into
+a stream per object, which is precisely what lumping exists to avoid**, and the first row becomes the
+only option (§16.155).
+
+### 17.26.3 Inline objects are safe for a different reason
+
+**A metadata extent is shared across tenants, which sounds worse and is not.** An inline object's
+records are bytes in a DN metadata object, and a user never reads that extent — the **DN** reads it,
+and the DN is the authorization point. The user's read is answered from the DN's own metadata, so
+there is no extent-scoped certificate in play and nothing to over-grant.
+
+> **The regimes divide on who holds the bytes, not on how small the object is.** Inline is safe because
+> the DN mediates; lumped and packed are exposed because the point of them is that the **EN** serves
+> the bytes directly.
+
+### 17.26.4 What the range-bounded certificate would need, if it comes to that
+
+§9.1.3.5.4 anticipated this exactly (Bob, 2026-08-19): *"If I ever need authorization for a record
+offset or logical offset or compressed offset, it would be the extent offset since the hint is by
+extent, and ObjectInfo does give enough information to deduce offset within an extent."*
+
+**Both signed-form rules already permit it**, which is worth checking rather than assuming:
+
+- **the signed form is closed** — every field must be in the answer, the request, or ambient. `object-info` reports each extent's base offsets, so a range within an extent is computable by the caller and the closure holds.
+- **identity, never a derived position** — refined by Bob to *a position may be signed if its space is pinned by an identity in the signature*. The extent **is** in the signature, so an extent-local range is pinned and does not drag §17.16.2's three numbering spaces inside the certificate.
+
+So the mechanism is available and consistent; it is the compression cost in §17.26.2's first row that argues against reaching for it.
