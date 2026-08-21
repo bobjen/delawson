@@ -13984,14 +13984,15 @@ Roughly in order of how much else depends on them.
      the 1 KB case as underbilled 375×, so today the tax falls on the operator. A flag whose omission
      costs the user nothing is a flag nobody sets.
 
-154. **Whether a common stream is scoped to a tenant or to an authorization domain** (§17.26). Lumping
-     puts many objects in one extent, and §5.1.1.1a's writable aliases mean a tenant can have a
-     boundary inside itself — so an extent-scoped certificate over-grants. Scoping the common stream
-     to the domain keeps every read-path mechanism intact and costs more streams; per-block separation
-     keeps one stream and costs the shared compression that lumping exists for. ⚠️ The first stops
-     working if authorization ever becomes per-object, which §5.9.1a currently rules out and no use
-     case demands — so this is a bet on authorization staying directory-shaped, and worth recording as
-     one.
+154. **Whether lumped reads are row-limited, and what that costs in compression** (§17.26, §17.28).
+     ⚠️ **Reframed**: the question was how to scope a common stream, and §17.28 finds the scoping
+     already settled — streams are single-tenant (§5.11, §17.28.1), so that billing can charge whole
+     extents rather than ranges of them, which has nothing to do with reads. What is actually open is §5.1.1.1a's boundary *inside* a
+     tenant, and there the choice is row-limited reads (which force a block per object, so tiny
+     objects compress alone) against an extent-scoped certificate (which forces a common stream per
+     authorization domain). §17.28.3 proposes a shared per-stream compression dictionary as the way
+     to have both, and names the two things to check: the client must fetch the dictionary, and a
+     dictionary leaks statistics about what trained it.
 
 **Closed** since earlier drafts:
 
@@ -16714,3 +16715,96 @@ the one it is already reading.
 **What §17.25.6 is still for** is the argument above: it is what proves the limit is the safe end rather
 than the convenient one, and it is where to look if *R* ever becomes small enough that the correction
 stops being a rounding error.
+
+### 17.28 Why streams are single-tenant, which is not a read-authorization argument
+
+**Bob, 2026-08-20**: *"For #105, if read is limited to just the correct rows, I forget what the motive
+is for not combining all tenants in the same common stream."*
+
+**It is recorded, and it predates the question** — §5.11 and §12.4.3, both Asserted by Bob on
+2026-08-17 and 2026-08-19. Read authorization was never the reason:
+
+> *"Single-tenancy is what makes §7.3.3's key derivation, §12's attribution and the plain statement
+> 'this stream belongs to a tenant' all simple, and pricing gives them up for nothing."*
+
+**The attribution clause is the load-bearing one** — §17.28.1 works out why, and it is a bigger number
+than that sentence suggests. The pricing clause is what makes the trade free. The only thing multi-tenant streams buy is an answer to the
+zillion-tenants-with-one-tiny-object abuse, and §12.4.3 already buys that with a base tenant charge —
+so the benefit is nil and the cost does not need weighing.
+
+⚠️ **And the exposure is one object per tenant, ever.** §12.4.3: lumping puts a tenant's *later* small
+objects into common streams they already own, so single-tenancy bites only at the **first** one.
+Combining tenants would save on the order of a kilobyte of metadata per tenant — not per object.
+
+#### 17.28.1 The strongest leg is billing, and it is stronger than §5.11 states it
+
+⚠️ **A draft of this section had this backwards.** It argued that §12's attribution no longer needs
+single-tenancy, because §11's lumping makes many *objects* share a stream, so #102 must attribute per
+**range** regardless. That conflates two consumers with different granularities, and Bob's version is
+the right one (Asserted, 2026-08-20):
+
+> *"The most persuasive argument to me at the moment is to keep single-tenant streams, for billing:
+> I can bill whole extents instead of ranges of extents."*
+
+**Billing needs tenant granularity, not object granularity.** #102's per-range sizes are for a
+*listing* — what one object costs its owner to look at. A **bill** never has to descend below the
+stream, because the stream belongs to one tenant and therefore so does every byte in every one of its
+extents.
+
+##### What whole-extent billing actually costs to compute
+
+**It is already computed.** §17.25.1's `Totals` is the SN summing its sealed extents per stream, so a
+bill is:
+
+> **sum each stream's compressed total, multiply by the storage class's expansion (§17.25.2),
+> attribute to the stream's tenant.** No extent is divided, no object is visited, no range arithmetic
+> happens anywhere.
+
+⚠️ **And the sweep is `O(streams)`, not `O(objects)`.** §13.1.3's expected case is 10^12 objects in
+7.8 × 10^6 streams — so ranged billing would be **~128,000× the work** of whole-extent billing, on the
+one sweep that has to run over the entire fleet on a billing cycle. That is the argument, and it is
+much larger than "attribution is simple".
+
+##### It also settles whose garbage is whose
+
+**A stream carries up to a third garbage before it is compacted** (§17.25.6), so a tenant's
+whole-extent bill includes the garbage their own deletions left. That is the right answer — the
+operator is holding that space — and it arrives **for free** rather than as a rule.
+
+⚠️ **Multi-tenant streams would have to decide whose garbage it is**, which has no good answer: the
+space exists because of one tenant's deletions but sits between another's live records, and the
+compaction that reclaims it rewrites both. Single-tenancy makes the question not arise, and it aligns
+the incentive — the tenant who creates the garbage is the one paying to hold it.
+
+**So the conclusion stands on a broader base than §5.11 gave it**, not a narrower one. Key derivation
+and the pricing floor are the other two legs; this is the load-bearing one.
+
+#### 17.28.2 ⚠️ The premise is not free, which is the part worth pricing
+
+*"If read is limited to just the correct rows"* is **exactly §17.26.2's first branch**, and §17.26.1 is
+why it costs something: trimming on the way out is unavailable — the CRC covers the block and the EN
+never decompresses — so row-limited reads require **the block not to span an object**.
+
+**And a block is the compression unit.** `compress_block` is 256 KB on HDD and 64 KB on SSD, against
+lumped objects of tens to hundreds of bytes. So a tiny object in a block of its own is compressed
+**alone**, and small inputs compress badly — which gives away much of what lumping was for.
+
+| | Keeps | Costs |
+|---|---|---|
+| **row-limited reads** | one stream per tenant; the scoping question dissolves | tiny objects compress alone |
+| **extent-scoped certificate** | shared compression across objects | a common stream per authorization domain, not per tenant |
+
+#### 17.28.3 A shared dictionary gets both, and is the thing to try first
+
+**Compress each block against a dictionary trained on the stream**, rather than against its neighbours
+in the same block. Every block stays independently decompressable and independently CRC-checked, so
+§17.26.1's three mechanisms are all intact — and the cross-object redundancy that a 200-byte block
+cannot find on its own is in the dictionary instead.
+
+**That collapses the table above**: row-limited reads *and* most of the shared compression, so the
+scoping question dissolves and nothing is given up for it.
+
+⚠️ **Two things to check before believing it:**
+
+- **the reader needs the dictionary**, which the client does not have — it decompresses, not the EN (§8). So it is a per-stream artifact to fetch and cache, small and stable but another thing on a cold read's path.
+- **a dictionary is trained on data, so it leaks statistics about it.** Within one tenant that is nothing. It is the reason the dictionary must not be shared across a tenant boundary even if the blocks could be — which, given §5.11, is not a constraint that binds.

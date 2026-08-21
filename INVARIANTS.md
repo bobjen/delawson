@@ -775,6 +775,17 @@ among tenants.
 test** — it is arithmetic over the sharing rule
 *Breaks* sharing becomes an exploit: colluding tenants cut their combined bill.
 
+**`A-STREAM-HOLDS-ONE-TENANT`** — every byte in a stream, and therefore in each of its
+extents, belongs to one tenant.
+*Argued* §17.28.1, §5.11 · *Enforced* design only; the DN assures it when it hands out a
+stream · *Checked* not yet
+*Breaks* billing has to divide extents by range instead of charging them whole, which turns the
+one sweep that must cover the fleet from `O(streams)` into `O(objects)` — **~128,000×** at
+§13.1.3's expected lumping. ⚠️ It also makes garbage unattributable: the space exists because of
+one tenant's deletions but sits between another's live records, and single-tenancy is what stops
+that question from arising. See [[BILLING-CHARGES-THE-CLASS-NOT-THE-COPIES]] for the other half
+of what a bill is made of.
+
 **`BILLING-CHARGES-THE-CLASS-NOT-THE-COPIES`** — a physical size is the compressed size times
 the storage class's expansion factor, never a count of the instances that exist right now.
 *Argued* §17.25.2 · *Enforced* `placement::Expansion` is the only way to a physical number,
@@ -883,7 +894,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **creation second** | §4.6.3 | `EXTENT-IDENTITY-UNIQUE`, `EXTENT-KEY-FROM-CREATING-SN`, `HINT-BOUND-BY-CAPABILITY` |
 | **durable** | §8.1.1 | `DURABLE-IS-QUORUM-WATERMARK`, `INCOMPLETE-RECORD-NOT-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `SEAL-NEVER-BELOW-DURABLE` |
 | **erasure-coding group** | §4.3.2.3 | `EC-NEVER-SPLITS-AN-EXTENT`, `EC-GROUP-EQUAL-LENGTH`, `INSTANCES-BYTE-IDENTICAL`, `AEAD-TAG-IS-THE-CHECKSUM`, `ONE-MEDIA-CLASS-PER-EXTENT` |
-| **billing** | §12 | `BILLING-CHARGES-THE-CLASS-NOT-THE-COPIES`, `A-PHYSICAL-LENGTH-IS-NEVER-STORED`, `ZERO-REFERENCES-IS-A-BUG` |
+| **billing** | §12 | `A-STREAM-HOLDS-ONE-TENANT`, `BILLING-CHARGES-THE-CLASS-NOT-THE-COPIES`, `A-PHYSICAL-LENGTH-IS-NEVER-STORED`, `ZERO-REFERENCES-IS-A-BUG` |
 | **extent** | §4.2 | `EXTENT-IDENTITY-UNIQUE`, `EXTENT-HOLDS-WHOLE-RECORDS`, `EXTENT-OFFSET-WRITE-ONCE`, `EXTENT-SEALS-BETWEEN-RECORDS`, `SEALED-EXTENT-IMMUTABLE`, `ONE-UNSEALED-EXTENT-UNKEYED`, `RECORD-FITS-ONE-EXTENT`, `ONE-MEDIA-CLASS-PER-EXTENT`, `EC-NEVER-SPLITS-AN-EXTENT` |
 | **extent identity** | §4.6.3 | `EXTENT-IDENTITY-UNIQUE`, `EXTENT-OFFSET-WRITE-ONCE`, `EXTENT-KEY-FROM-CREATING-SN`, `HINT-BOUND-BY-CAPABILITY` |
 | **framing** | §8.2 | `FRAMING-IS-A-REPRESENTATION`, `TERMINATOR-NOT-IN-DATA`, `EXTENT-HOLDS-WHOLE-RECORDS`, `CANONICAL-OFFSET-SPACE` |
