@@ -71,7 +71,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-156 things *not* decided.
+155 things *not* decided.
 
 **Priorities and framing**
 
@@ -13994,7 +13994,7 @@ Roughly in order of how much else depends on them.
      to have both, and names the two things to check: the client must fetch the dictionary, and a
      dictionary leaks statistics about what trained it.
 
-156. **How a batch create says which names it did not make** (§17.31.1). Its answer is a count, so a
+155. **How a batch create says which names it did not make** (§17.31.1). Its answer is a count, so a
      caller learns how many objects were newly made and not which — and cannot distinguish a name
      that already existed from one that failed. One DN made that tolerable; several make it worse,
      and the current answer is to fail the whole batch on any DN's refusal. ⚠️ A header of the shape
@@ -16610,7 +16610,7 @@ be inlined at a smaller size than a cold one.
 > cutoff formula is what tells it which comparison to make.
 
 **And *f* is a measurement nobody has taken** — ⚠️ **nor will anyone**, since §17.27 takes the limit
-and closes the question. Were it ever needed it would be, per §18.2, a **fraction in [0, 1]** and not a
+and closes the question (§16's closed list). Were it ever needed it would be, per §18.2, a **fraction in [0, 1]** and not a
 percentage: a parameter multiplied by 5,000 in exactly one place.
 
 ## 17.26 Sharing an extent puts an authorization boundary inside it
@@ -16667,7 +16667,7 @@ everything in the extent is readable by the same set.
 Bob has *"no use case demanding per-object authorization"* — so domains are few and large, and one
 common stream apiece is affordable. **If authorization ever becomes per-object, this degenerates into
 a stream per object, which is precisely what lumping exists to avoid**, and the first row becomes the
-only option (§16.155).
+only option (§16.154).
 
 ### 17.26.3 Inline objects are safe for a different reason
 
@@ -16701,7 +16701,8 @@ reference, and not worry about how frequently the metadata is loaded."*
 > ### `inline ⟺ n < R`
 
 **§17.25.6 derived `n* = R·(1 + E·G/(f·r))`; this is that formula's limit, and taking the limit is the
-decision.** The residency fraction *f* does not have to be measured, so §16.154 closes and #104 with it.
+decision.** The residency fraction *f* does not have to be measured, so that question closes — it is
+in §16's closed list now — and #104 with it.
 
 #### 17.27.1 The error is one-sided, which is why the limit is safe to take
 
@@ -16998,7 +16999,7 @@ by owner, sends one request per DN, and the counts add. No `Spread`, no second r
 made and not *which* — so a partial failure names nothing. That was already true of one DN; spreading
 over several makes it worse, which is why **a DN that refuses fails the whole batch** rather than
 being quietly subtracted. A short count that cannot say what it is short of is not a partial answer,
-it is an unusable one (§16.156).
+it is an unusable one (§16.155).
 
 ### 17.31.2 The shape moved to `common`, which is the rule that made this cheap
 
