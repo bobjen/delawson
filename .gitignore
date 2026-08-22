@@ -1,3 +1,5 @@
 /target
 /run
 **/*.rs.bk
+.aider*
+.env
