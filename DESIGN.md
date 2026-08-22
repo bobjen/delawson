@@ -17796,3 +17796,105 @@ daily master key encrypted on disk so that a fully-down ring can be recovered �
 *is* the encrypted-at-rest problem and the unlock ceremony's restart path, not a preliminary to them.
 Doing KS first means meeting that on 1 MB rather than discovering it later on a tier that also has to
 be fast.
+
+## 17.40 A document tree that never renames a node
+
+**Bob, 2026-08-20**, on what an **updatable append-only object** buys: a large document can be a
+table-of-contents tree with very many children per node, **without references changing**.
+
+> *"You start with one row, adding children within the row, then if it gets big you split the row into
+> a row per section and turn the original row into a table of contents of sections, with tombstones."*
+
+⚠️ **Not keyed objects — a draft of this said so and was wrong.** That matters for sequencing: keyed
+objects are distant (§17.39.3) and this needs only what is being built first.
+
+### 17.40.1 Append-only is about *where* records are added, not whether they change
+
+**The phrase reads like a contradiction and is not.** Append-only constrains insertion to the end;
+`updatable` (§9.1.3.9) says a row may be rewritten in place. Together they give the one property the
+scheme runs on:
+
+> **A record number, once assigned, means that record for ever.** Appending extends the numbering
+> without disturbing it; deleting leaves a **tombstone** rather than closing the gap.
+
+⚠️ **And the design already guarantees this, for an unrelated reason.** §9.1.3.9 keeps the numbering
+dense through deletes so that a delete cannot move a partition boundary — *"the snap is computed on the
+numbering, and skipping dead records is the reader's job afterwards."* The document tree rides an
+invariant that already exists and was already argued; it asks for nothing new.
+
+### 17.40.2 It is a B-tree with the split turned around
+
+**A B+tree split makes a *sibling* and tells the *parent*.** That upward propagation buys balance, and
+it moves things other people point at. **This split makes *children* and tells nobody** — the
+overflowing row keeps its record number and becomes their table of contents.
+
+**It also needs no transaction**, which matters because §1580's first release has none:
+
+1. **append the children** — new rows at the end. The content exists twice, and readers still follow the parent, since nothing links to the children yet.
+2. **flip the parent** to a table of contents, in one row update.
+
+A crash between them leaves orphan rows for a sweep: **duplicated content, never missing content**.
+Single-row atomicity is the whole requirement. ⚠️ Between the steps a *tree traversal* is correct
+throughout while a *scan of every record* sees the content twice — and the ToC's tombstones are what let
+a scan tell a moved child from a deleted one.
+
+### 17.40.3 ⚠️ Unbalanced still bites, and high fanout does not save it
+
+**A draft claimed fanout made the imbalance harmless, with a table showing three levels for a billion
+leaves. That table was `log_fanout(n)` — the *balanced* depth — under the wrong heading** (Bob):
+*"if the root split into 10^3 children, and only one of those children grows, and so forth, a billion
+will have a depth of 10^9/10^3."*
+
+**Refusing to propagate upward is refusing to rebalance**, and then each level contributes only its own
+fanout before pushing the rest into one child:
+
+| fanout | balanced | **degenerate chain**, 10^9 leaves |
+|---|---|---|
+| 100 | 5 | **10,101,010** |
+| 1,000 | 3 | **1,001,001** |
+
+**Six orders of magnitude, not a level or two.** Fanout makes the good case flat and does nothing for
+the bad one.
+
+### 17.40.4 Virtual directories: what cannot be named can be rebalanced
+
+**A *virtual* directory is one you cannot refer to** *"unless it happens to be exactly a real
+directory"* (Asserted, Bob). So the structural interior nodes have no names — and:
+
+> **The prohibition on rewriting a child was never about rewriting; it was about the child being
+> referable.** Remove the reference and the freedom comes back.
+
+| | named by | may be reorganised |
+|---|---|---|
+| **real** nodes — what a user named | a path component | **no** — a reference points at it |
+| **virtual** nodes — structure the store inserted | nothing | **yes**, freely |
+
+**Under one real node, 10^9 referenceable children balance into 3 virtual levels at fanout 1,000**, and
+the rebalancing changes no record numbers — it appends virtual rows and repoints existing ones, which
+§17.40.1 says never renumbers anything.
+
+**This is a rule the design already follows, arriving somewhere new.** A range may be renamed by a split
+because it is a hint rather than a name (§17.38.1); an extent may not, because its triple *is* a name.
+**Nameability is what fixes a thing in place**, and virtual directories decline to name the parts that
+have to move.
+
+### 17.40.5 What bounds the real depth is a human, not a mechanism
+
+**A deep tree now needs a deep *referenceable* hierarchy**, hence a correspondingly long proper name —
+*"which is a problem for users as much as it is a problem internally"* (Bob).
+
+⚠️ **That is an alignment of incentives, not a guarantee.** Nothing stops a generated namespace from
+being a thousand components deep. What is true is that the party who would do it pays first and most
+visibly, so the degenerate case has not been made impossible — it has been made **unattractive to the
+only party who can cause it**, which is weaker than a limit and tends to last longer.
+
+### 17.40.6 What it costs to reference
+
+**Every node is a row of one object**, so §17.38.2's three regimes collapse to the cheapest: the path
+and the original triple are stored **once for the whole document**, and a node reference is its record
+number alone — the 8-byte row of that table rather than the 67-byte one.
+
+⚠️ **And the document must be updated in place, never replaced** (§17.35): a replacement mints a new
+triple and pins every reference to the old one. An updatable append-only object is exactly the primitive
+that lets a document grow without being replaced, so the requirement is met by the same choice that
+makes the scheme work.
