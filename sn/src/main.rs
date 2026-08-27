@@ -1,7 +1,7 @@
 //! SN, the Stream Node: the extents of a stream and the instances of an extent.
 //!
-//! A stream is named by the DN that owns it, so SN looks one up by
-//! `(DnId, StreamId)` and allocates neither. An extent is named here: this SN, an
+//! A stream is named by the range that owns it, so SN looks one up by
+//! `(RangeId, StreamId)` and allocates neither. An extent is named here: this SN, an
 //! id it hands out, and the second it was created in, which is what selects the
 //! key it is encrypted under.
 //!
@@ -286,10 +286,10 @@ impl Service for SN {
 
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Request, mut reply: Reply) {
         // The stream range, which is what a DN's line for the same request says.
-        if let [Arg::Number(dn), Arg::Number(first), Arg::Number(count), ..] =
+        if let [Arg::Number(range), Arg::Number(first), Arg::Number(count), ..] =
             request.args.as_slice()
         {
-            reply.about(format_args!("count {count} from {first} for dn {dn}"));
+            reply.about(format_args!("count {count} from {first} for range {range}"));
         }
         reply.send(self.answer(process, &request));
     }
@@ -334,14 +334,22 @@ impl SN {
     /// objects at once names a run of streams in one request, and they share the second —
     /// so it is the consecutive ids that keep the names apart (#110).
     fn create(&self, request: &Request) -> Response {
-        let (dn, first, count, created) = match request.args.as_slice() {
-            [Arg::Number(dn), Arg::Number(first), Arg::Number(count), Arg::Number(created)] => {
-                (RangeId::new(*dn as u32), *first, *count, TimeSec::new(*created))
+        let (range, first, count, created) = match request.args.as_slice() {
+            [Arg::Number(range), Arg::Number(first), Arg::Number(count), Arg::Number(created)] => {
+                match (RangeId::of_number(*range), StreamId::of_number(*first)) {
+                    (Ok(range), Ok(first)) => (range, first, *count, TimeSec::new(*created)),
+                    _ => {
+                        return Response::error(
+                            Status::BadRequest,
+                            "create-stream takes a RangeId, a first StreamId, a count and a second",
+                        );
+                    }
+                }
             }
             _ => {
                 return Response::error(
                     Status::BadRequest,
-                    "create-stream takes a DnId, a first StreamId, a count and a second",
+                    "create-stream takes a RangeId, a first StreamId, a count and a second",
                 );
             }
         };
@@ -349,13 +357,13 @@ impl SN {
         for n in 0..count {
             // Every stream of the run shares the second, which is what makes the ids have to
             // differ — and they do, being consecutive (#110).
-            let Ok(stream) = StreamId::of_number(first + n) else {
+            let Ok(stream) = StreamId::of_number(first.number() + n) else {
                 return Response::error(
                     Status::BadRequest,
-                    format!("{} is not a stream", first + n),
+                    format!("{} is not a stream", first.number() + n),
                 );
             };
-            let name = StreamName { range: dn, stream, created };
+            let name = StreamName { range, stream, created };
             let mut shard = self.shards[shard_of(name)].lock().expect("streams");
             shard.insert(
                 name,
@@ -397,7 +405,7 @@ impl SN {
         }
     }
 
-    /// `(DnId, StreamId, record)`, and back comes the extent whose numbering
+    /// `(RangeId, StreamId, record)`, and back comes the extent whose numbering
     /// starts at or before that record. Whether the record is actually there is
     /// the EN's to say: an SN keeps its byte and record totals lazily, so it
     /// routes a read and does not bound it.
@@ -576,7 +584,7 @@ impl SN {
                 _ => {
                     return Response::error(
                         Status::BadRequest,
-                        "seal-extent takes a DnId, a StreamId, an extent and what it came to",
+                        "seal-extent takes a RangeId, a StreamId, an extent and what it came to",
                     );
                 }
             };
@@ -779,12 +787,12 @@ mod tests {
         StreamName { range: RangeId::new(range), stream: StreamId::new(stream), created: MADE }
     }
 
-    fn sn_with_stream(dn: u32, stream: u64) -> SN {
+    fn sn_with_stream(range: u32, stream: u32) -> SN {
         let sn = SN::new(testing::sn_config(), SnId::new(0));
         let made = sn.create(
             &Request::new(Op::CreateStream)
-                .number(dn as u64)
-                .number(stream)
+                .number(range as u64)
+                .number(stream as u64)
                 .number(1)
                 .number(1_000_000),
         );
@@ -867,16 +875,14 @@ mod tests {
 
     /// Where the open extent starts, for a test.
     impl SN {
-        fn starts_at(&self, dn: u32, stream: u64) -> SRoff {
-            self.shards[shard_of(named(dn, stream as u32))].lock().unwrap()
-                [&named(dn, stream as u32)]
+        fn starts_at(&self, range: u32, stream: u32) -> SRoff {
+            self.shards[shard_of(named(range, stream))].lock().unwrap()[&named(range, stream)]
                 .sealed_records
         }
 
         /// The stream-local first record of every sealed extent, recomputed by summing.
-        fn firsts(&self, dn: u32, stream: u64) -> Vec<SRoff> {
-            self.shards[shard_of(named(dn, stream as u32))].lock().unwrap()
-                [&named(dn, stream as u32)]
+        fn firsts(&self, range: u32, stream: u32) -> Vec<SRoff> {
+            self.shards[shard_of(named(range, stream))].lock().unwrap()[&named(range, stream)]
                 .sealed_from()
                 .map(|(at, _)| at)
                 .collect()

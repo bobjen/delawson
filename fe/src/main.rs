@@ -211,7 +211,7 @@ impl Stream {
 
 struct FE {
     config: FEConfig,
-    /// Per `(DnId, StreamId)`.
+    /// Per `(RangeId, StreamId)`.
     /// Keyed by the stream's whole name (#109), which is also what the SN keys by — so a
     /// recycled id in a later second cannot find a cached open extent belonging to the old
     /// stream (`A-NAME-IS-NEVER-REMINTED-IN-ITS-OWN-SECOND`).
@@ -328,10 +328,6 @@ impl FE {
             Ok(dn) => dn.to_string(),
             Err(e) => return reply.send(Response::error(Status::Internal, e.to_string())),
         };
-        // The DN that answers is the one that owns the name, so its number is half
-        // of the stream's name.
-        let owner =
-            DnId::new(process.cluster.service(&dn).map(|entry| entry.number()).unwrap_or(0));
 
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
@@ -351,14 +347,12 @@ impl FE {
             // An append may make the object it is appending to, which is one more
             // hop and only on the first append.
             if let (Status::NotFound, Some(framing)) = (answer.status, make) {
-                return make_object(
-                    &fe, &onward, &named, owner, &path, framing, again, reply, then,
-                );
+                return make_object(&fe, &onward, &named, &path, framing, again, reply, then);
             }
             if answer.status != Status::Ok {
                 return reply.send(answer);
             }
-            let Some(located) = Located::of(owner, &answer.args) else {
+            let Some(located) = Located::of(&answer.args) else {
                 return reply.send(Response::error(
                     Status::Internal,
                     "that answer did not describe an object",
@@ -652,7 +646,7 @@ impl FE {
             if answer.status != Status::Ok {
                 return reply.send(answer);
             }
-            let Some(next) = Located::of(located.dn, &answer.args) else {
+            let Some(next) = Located::of(&answer.args) else {
                 return reply
                     .send(Response::error(Status::Internal, "that extension named no stream"));
             };
@@ -810,7 +804,6 @@ fn make_object(
     fe: &Arc<FE>,
     process: &Arc<Process>,
     dn: &str,
-    owner: DnId,
     path: &str,
     framing: Framing,
     again: bool,
@@ -845,7 +838,7 @@ fn make_object(
         if answer.status != Status::Ok {
             return reply.send(answer);
         }
-        let Some(located) = Located::of(owner, &answer.args) else {
+        let Some(located) = Located::of(&answer.args) else {
             return reply.send(Response::error(Status::Internal, "that create made no object"));
         };
         if located.stream.stream.is_none() {
@@ -1026,11 +1019,11 @@ struct Located {
 }
 
 impl Located {
-    fn of(dn: DnId, args: &[Arg]) -> Option<Located> {
+    fn of(args: &[Arg]) -> Option<Located> {
         let (described, rest) = Described::of_args(args).ok()?;
         let described = described?;
         rest.is_empty().then_some(Located {
-            dn,
+            dn: described.dn,
             stream: described.stream,
             sn: described.sn,
             framing: described.framing,
@@ -1662,6 +1655,7 @@ mod tests {
                     object: ObjectId::new(1),
                     created: TimeSec::EPOCH,
                 },
+                dn: DnId::new(0),
                 stream: StreamName {
                     range: RangeId::new(0),
                     stream: StreamId::new(1),
@@ -1910,6 +1904,7 @@ mod tests {
                 object: ObjectId::new(9),
                 created: TimeSec::new(1_000_000),
             },
+            dn: DnId::new(3),
             stream: StreamName {
                 range: RangeId::new(3),
                 stream: StreamId::new(17),
@@ -1921,7 +1916,7 @@ mod tests {
             first_record: 400,
         }
         .args();
-        let located = Located::of(DnId::new(3), &args).expect("an object");
+        let located = Located::of(&args).expect("an object");
         assert_eq!(
             (located.dn, located.stream.stream, located.sn),
             (DnId::new(3), StreamId::new(17), SnId::new(0))
@@ -1929,7 +1924,7 @@ mod tests {
         assert_eq!(located.framing, Framing::CrLf);
         assert_eq!(located.first_record, 400, "where this stream's records start");
         // A framing the DN could not have meant is not an object either.
-        assert!(Located::of(DnId::new(3), &args[..5]).is_none());
+        assert!(Located::of(&args[..5]).is_none());
     }
 
     /// The receipt leads with the durable reference and follows with the hint, and

@@ -142,7 +142,7 @@ already used (`Naming::name`) · *Checked* unit test exists (`a_second_may_not_g
 *Breaks* stale hints read whatever now occupies the slot instead of failing — §8.1.1a-10 calls id
 reuse a corruption vector, and this is what licenses handing out extent-relative rows at all.
 
-**`STREAM-IDENTITY-OWNED`** — a stream is `(DnId, StreamId)`, so exactly one DN owns it by
+**`STREAM-IDENTITY-OWNED`** — a stream is `(RangeId, StreamId)`, so exactly one range owns it by
 construction.
 *Argued* §4.6.3, §13.1.8 · *Enforced* by construction · *Checked* by construction
 *Breaks* who may authorize deleting a stream becomes unanswerable.

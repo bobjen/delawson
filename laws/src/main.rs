@@ -14,7 +14,7 @@ use common::block::{Holds, expand, squeeze};
 use common::config::Compress;
 use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
-use common::ids::{ObjectId, RangeId};
+use common::ids::{ObjectId, RangeId, StreamId};
 use common::info::{Batch, Described, Expecting, ExtentRow, ObjectName, Shape, StreamRow, UNKNOWN};
 use common::placement::{self, Expansion};
 use common::random::Rng;
@@ -1217,6 +1217,7 @@ fn receipt(target: &Target, response: &Response) -> Result<()> {
         Arg::Number(length),
     ] = response.args.as_slice()
     {
+        let stream = StreamId::of_number(*stream)?;
         // The record number to read it back by comes first, then the durable
         // reference it is made of, then where the bytes went.
         match records {
@@ -1366,12 +1367,14 @@ fn say(
 ) -> Result<()> {
     let flavor = if it.keyed { "keyed" } else { "unkeyed" };
     println!(
-        "{} object {} {flavor} framed {}, made in second {}, at stream {} on SN{} \
+        "{} object {} {flavor} framed {}, made in second {}, in range {} on DN{}, at stream {} on SN{} \
          (made in second {}) from record {}",
         target.identity,
         it.object.object,
         it.framing,
         it.object.created,
+        it.object.range,
+        it.dn,
         it.stream.stream,
         it.sn,
         it.stream.created,

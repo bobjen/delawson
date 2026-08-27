@@ -86,7 +86,7 @@ Five public sources by Bob set the motivation and the scale, and are cited where
 ### 0.1 Decided
 
 The load-bearing decisions, so a reader need not reconstruct them from four thousand lines. §16 holds the
-158 things *not* decided, numbered to 158 with one tombstone.
+159 things *not* decided, numbered to 159 with one tombstone.
 
 **Priorities and framing**
 
@@ -14036,6 +14036,16 @@ Roughly in order of how much else depends on them.
      prefix-stable replacement, in the shape §4.1.1's flags already have. Open: whether that promise is
      worth a flag, and whether an index declares its pinning or infers it from the object's flavour.
 
+159. **Whether a row-tree object may be compacted, and whether a same-object secondary index may be
+     lazy** (§17.41.2, §17.41.3, §4.1.1). Two questions with one shape. Compaction renumbers rows, which
+     is safe exactly when nothing outside can name one — a property the store cannot observe, since an
+     index in another object holds references it cannot see, so it wants declaring as a promise flag
+     beside `updatable` and `deletable`. And a secondary index over the *same* object is within §1.5's
+     atomicity boundary, but appending a row and updating its entry can half-happen in the direction
+     that **loses** rather than duplicates — unless the index is lazy, which makes the half-done state a
+     legal one. ⚠️ If both land, §1580's "no updatable secondary indexes" is narrower than it reads: it
+     bars *cross-object* ones.
+
 **Closed** since earlier drafts:
 
 - the unkeyed overwrite/addressing contradiction (§3);
@@ -17898,3 +17908,76 @@ number alone — the 8-byte row of that table rather than the 67-byte one.
 triple and pins every reference to the old one. An updatable append-only object is exactly the primitive
 that lets a document grow without being replaced, so the requirement is met by the same choice that
 makes the scheme work.
+
+## 17.41 Row 0 is the root, and the object indexes itself
+
+**Bob, 2026-08-20**, extending §17.40 well past documents:
+
+> *"It isn't immediately obvious to me why this can't be the design for keyed objects, or lazily
+> updated indexes or rooted graphs of any organization. It buys the automatic on-disk BTree that keyed
+> objects will want, and doesn't need some external related object to hold it. Row 0 is always the root
+> index."*
+
+⚠️ **§1.5 already asserted the conclusion and not the mechanism.** Its atomicity table says a keyed
+object needs atomicity only *within one object* because *"the rows **are** the index — index-organized,
+so one write changes one thing."* That was stated as a property. §17.40's split is a **construction that
+delivers it**, out of nothing but an updatable append-only object — so the two arrive at the same place
+from opposite ends, which is the best evidence either is right.
+
+### 17.41.1 A fixed root removes the case every B-tree special-cases
+
+**The root is the one node whose split is different.** In an ordinary B-tree a root split makes the tree
+taller from the top: a new root appears, and every reference to *the tree* — the root pointer — must be
+updated, atomically, or readers find the old root.
+
+**Here the root never moves.** Row 0 overflows into children and demotes to their index, so:
+
+| | root split |
+|---|---|
+| ordinary B-tree | a new node becomes the root; the root pointer changes; the special case every implementation carries |
+| row 0 | **an ordinary split** — the tree grows downward from a fixed address, and there is no root pointer to update because there is no root pointer |
+
+⚠️ **And row 0 is the same record on every lookup in the object**, so it is the hottest record there is
+and trivially cacheable. The first hop of every descent costs nothing after the first descent.
+
+### 17.41.2 Why it is transaction-free, and exactly where that stops
+
+**The reason is that there is only one object.** §1.5's boundary is drawn between *within one object*
+and *across two*, and a self-index is the first kind by construction — which is why §1580's first
+release can have keyed objects and not updatable secondary indexes.
+
+> **The capability boundary the design drew in §1.5 is exactly the boundary this structure provides.**
+> That is a consistency check passing, not a coincidence: the line was drawn at cross-object atomicity,
+> and the self-index is the thing that stays on the near side of it.
+
+⚠️ **Which suggests the boundary may be wider than "primary index".** A *secondary* index over the same
+object — rooted at another row, say — is also within one object. What stops it being free is that
+appending a row and updating its index entry are two row writes, and a crash between them **loses** an
+entry rather than duplicating one, unlike §17.40.2's split.
+
+**Unless the index is lazy, and this is where Bob's third case earns its place.** If the un-merged tail
+is a *legal* state that readers already consult, then a crash mid-update is indistinguishable from
+"not merged yet" — **laziness converts a transaction requirement into a normal state**. §4.2 already
+runs that pattern one level down, as an extent's sealed base plus lazily-created log; this is the same
+shape at object scale (§16.159).
+
+### 17.41.3 ⚠️ The tension: reclamation against reference stability
+
+**Rows are appended and tombstoned, never removed, so dead rows accumulate for ever.** Reclaiming them
+means rewriting the object, which renumbers rows — and §17.40's whole premise is that row numbers do
+not change.
+
+**The resolution is §17.40.4's, one level down: it depends on whether anything can name a row.**
+
+| how the object is used | row numbers are | may be compacted |
+|---|---|---|
+| a **keyed object**, reached by key | internal — a caller says a key, never a number | **yes**, freely; every row is effectively virtual |
+| an object an **external index** points into (§17.38) | the reference itself | **no** — compaction would break every entry |
+
+> **So the same structure has opposite reclamation properties depending on how it is referenced**, and
+> the store cannot tell which: an index in another object holds references it cannot see.
+
+⚠️ **It therefore has to be declared**, and §4.1.1's promise flags are the shape — a `renumberable`
+object may be compacted and rebalanced at will, and one that is not accumulates tombstones as the price
+of being pointed at. That is the same trade as §17.40.4's virtual directories, made per object instead
+of per node (§16.159).

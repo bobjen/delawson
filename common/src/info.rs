@@ -12,7 +12,7 @@
 //! One shape, built and read here, makes that a compile error instead.
 
 use crate::framing::Framing;
-use crate::ids::{DiskId, ExtentId, ObjectId, RangeId, SnId, StreamId};
+use crate::ids::{DiskId, DnId, ExtentId, ObjectId, RangeId, SnId, StreamId};
 use crate::placement::Expansion;
 use crate::time::TimeSec;
 use crate::wire::Arg;
@@ -27,6 +27,8 @@ pub struct Described {
     /// user may repoint it as often as they like — so the path recycles freely while every
     /// incarnation it ever pointed at keeps a distinct name of its own (§17.35).
     pub object: ObjectName,
+    /// The DN currently managing the range.
+    pub dn: DnId,
     /// The stream this answer is about, **by its whole name**: the last one for an append,
     /// or the one holding a record for a read.
     ///
@@ -45,7 +47,7 @@ pub struct Described {
 impl Described {
     /// Fields per row on the wire. Public because a caller sizing a buffer wants it,
     /// and **derived from the shape rather than written down twice**.
-    pub const ARGS: usize = 5 + ObjectName::ARGS + StreamName::ARGS;
+    pub const ARGS: usize = 6 + ObjectName::ARGS + StreamName::ARGS;
 
     /// A row meaning "there is no such object", for a batch answer that must line up
     /// with the names it was asked about. A zero id is what marks it.
@@ -54,6 +56,7 @@ impl Described {
     /// position stops working and the answer has to say how many names it covered.
     pub fn missing() -> Vec<Arg> {
         let mut args = ObjectName::default().args();
+        args.push(Arg::Number(0));
         args.extend(StreamName::default().args());
         args.extend([
             Arg::Number(0),
@@ -68,6 +71,7 @@ impl Described {
     pub fn args(&self) -> Vec<Arg> {
         let (kind, width) = self.framing.wire();
         let mut args = self.object.args();
+        args.push(Arg::Number(self.dn.number()));
         args.extend(self.stream.args());
         args.extend([
             Arg::Number(self.sn.number()),
@@ -83,6 +87,9 @@ impl Described {
     /// since a zero id is not an object.
     pub fn of_args(args: &[Arg]) -> Result<(Option<Described>, &[Arg])> {
         let (object, after) = ObjectName::of_args(args)?;
+        let [Arg::Number(dn), after @ ..] = after else {
+            return Err(Error::new("that answer did not describe an object"));
+        };
         let (stream, after) = StreamName::of_args(after)?;
         let [
             Arg::Number(sn),
@@ -103,6 +110,7 @@ impl Described {
         Ok((
             Some(Described {
                 object,
+                dn: DnId::of_number(*dn)?,
                 stream,
                 sn: SnId::of_number(*sn)?,
                 keyed: *keyed,
@@ -819,6 +827,7 @@ mod tests {
                 object: id,
                 created: TimeSec::new(1_000_000),
             },
+            dn: DnId::new(1),
             stream: StreamName {
                 range: RangeId::new(2),
                 stream: StreamId::new(17),
@@ -894,8 +903,8 @@ mod tests {
         assert!(Described::of_args(&args).is_err());
     }
 
-    fn stream(stream: u64, first_record: u64, records: u64) -> StreamRow {
-        let stream = StreamId::of_number(stream).expect("a stream");
+    fn stream(stream: u32, first_record: u64, records: u64) -> StreamRow {
+        let stream = StreamId::new(stream);
         StreamRow {
             stream,
             sn: SnId::new(0),
