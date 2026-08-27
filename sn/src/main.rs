@@ -282,6 +282,10 @@ impl Service for SN {
         self.config.knobs.workers
     }
 
+    fn inline(&self, op: Op) -> bool {
+        matches!(op, Op::Ping | Op::Status | Op::Shutdown | Op::Sites)
+    }
+
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Request, mut reply: Reply) {
         // The stream range, which is what a DN's line for the same request says.
         if let [Arg::Number(range), Arg::Number(first), Arg::Number(count), ..] =

@@ -238,9 +238,10 @@ impl Service for FE {
         FORWARDED.contains(&op) || COORDINATED.contains(&op)
     }
 
-    /// Issuing the first hop is a write, not work, so it happens on the read loop.
+    /// Only control operations are answered on the read loop. Everything that
+    /// touches another process runs on worker threads so the read loop never stalls.
     fn inline(&self, op: Op) -> bool {
-        self.defers(op) || matches!(op, Op::Ping | Op::Status | Op::Shutdown | Op::Sites)
+        matches!(op, Op::Ping | Op::Status | Op::Shutdown | Op::Sites)
     }
 
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Request, reply: Reply) {
@@ -2135,9 +2136,18 @@ mod tests {
         assert!(fe.defers(Op::AppendRecord));
         assert!(fe.defers(Op::ReadRecord));
         assert!(fe.defers(Op::CreateObject));
+        assert!(fe.defers(Op::BatchInfo));
+        assert!(fe.defers(Op::BatchCreate));
         assert!(!fe.defers(Op::Ping));
-        // And issuing the first hop is cheap enough to do on the read loop.
-        assert!(fe.inline(Op::AppendRecord));
+        // Only control operations are inline; everything that talks to another process goes to workers.
+        assert!(fe.inline(Op::Ping));
+        assert!(fe.inline(Op::Status));
+        assert!(!fe.inline(Op::AppendRecord));
+        assert!(!fe.inline(Op::ReadRecord));
+        assert!(!fe.inline(Op::ObjectInfo));
+        assert!(!fe.inline(Op::CreateObject));
+        assert!(!fe.inline(Op::BatchInfo));
+        assert!(!fe.inline(Op::BatchCreate));
     }
 
     /// An unbuilt operation is still one FE is the right place to send.

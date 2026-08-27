@@ -609,18 +609,19 @@ impl Service for DN {
             Op::CreateObject
                 | Op::BatchCreate
                 | Op::ObjectInfo
+                | Op::BatchInfo
                 | Op::LocateStream
                 | Op::ExtendObject
         )
     }
 
-    /// A lookup is a hash and a read, which is not worth a queue hop. Taking
-    /// names for a create is, since a batch of a thousand takes a thousand locks.
+    /// A single lookup is a hash and a read, which is not worth a queue hop. Taking
+    /// names for a create or looking up a batch of names is, since a batch of a
+    /// thousand takes a thousand locks.
     fn inline(&self, op: Op) -> bool {
         matches!(
             op,
             Op::ObjectInfo
-                | Op::BatchInfo
                 | Op::LocateStream
                 | Op::ExtendObject
                 | Op::Ping
