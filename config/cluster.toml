@@ -78,7 +78,7 @@ compress_sample = 4096
 # Connections a process keeps to each peer. The far side reads one connection
 # with one thread, so this is what lets a tier use more than one core of the tier
 # behind it.
-peer_conns = 8
+peer_conns = 2
 
 # ⚠️ A pre-shared test key. Every process in the cluster uses it, which is not a
 # key hierarchy — KS handing out message keys is what replaces this.
