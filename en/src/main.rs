@@ -132,7 +132,7 @@ struct Truncated {
     /// Blocks dropped. Zero is ordinary: an instance may have nothing above the
     /// watermark and is still sealed, because the *extent* is what sealed.
     discarded: usize,
-    records: u64,
+    records: ERoff,
     length: COff,
 }
 
@@ -143,9 +143,9 @@ struct Landed {
     /// is owed: a writer knows what it wrote, not what that compressed to.
     logical: LOff,
     /// The extent-local number of the first record this append completed.
-    first_record: u64,
+    first_record: ERoff,
     /// Records it completed, which is zero for a block wholly inside one record.
-    records: u64,
+    records: ERoff,
 }
 
 /// Everything this EN holds. Two vectors, with a map from an extent's name to its
@@ -199,7 +199,7 @@ impl Extents {
     /// writer supplied.
     fn take(&mut self, appending: &AppendBlock, cap: COff) -> Result<Took> {
         let stored = COff::of_len(appending.bytes.len())?;
-        let logical = LOff::of_len(appending.holds.logical as usize)?;
+        let logical = appending.holds.logical;
         let place = self.place(appending.sn, appending.extent, appending.created)?;
         let extent = &mut self.extents[place];
 
@@ -225,7 +225,8 @@ impl Extents {
         extent.end = offset.plus(stored)?;
         extent.logical_end = extent.logical_end.plus(logical)?;
         let first_record = extent.records;
-        extent.records = first_record.plus(ERoff::of_number(appending.holds.records)?)?;
+        let records = ERoff::of_number(appending.holds.records)?;
+        extent.records = first_record.plus(records)?;
         extent.open_record = appending.holds.open_record;
         self.appends.push(Append {
             extent: place,
@@ -234,12 +235,7 @@ impl Extents {
             holds: appending.holds,
             bytes: appending.bytes.clone(),
         });
-        Ok(Took::Landed(Landed {
-            offset,
-            logical: logical_offset,
-            first_record: first_record.number(),
-            records: appending.holds.records,
-        }))
+        Ok(Took::Landed(Landed { offset, logical: logical_offset, first_record, records }))
     }
 
     /// What is already stored across a byte range of an extent.
@@ -276,7 +272,7 @@ impl Extents {
     /// never learns them cannot become primary.
     fn apply(&mut self, appending: &AppendBlock, offset: COff) -> Result<Applied> {
         let stored = COff::of_len(appending.bytes.len())?;
-        let logical = LOff::of_len(appending.holds.logical as usize)?;
+        let logical = appending.holds.logical;
         let place = self.place(appending.sn, appending.extent, appending.created)?;
         // ⚠️ Both checks before anything moves, because a rejected apply must leave
         // the extent exactly as it was.
@@ -337,7 +333,7 @@ impl Extents {
         // One walk over this extent's blocks: what survives, what goes, and whether
         // the cut lands where a block ends.
         let mut boundary = above == COff::ZERO;
-        let mut records = 0u64;
+        let mut records = ERoff::ZERO;
         let mut logical = LOff::ZERO;
         let mut length = COff::ZERO;
         let mut discarded = 0usize;
@@ -361,8 +357,8 @@ impl Extents {
                     append.offset
                 )));
             }
-            records += append.holds.records;
-            logical = logical.plus(LOff::of_len(append.holds.logical as usize)?)?;
+            records = records.plus(ERoff::of_number(append.holds.records)?)?;
+            logical = logical.plus(append.holds.logical)?;
             length = length.max(past);
             if last.is_none_or(|(at, _)| append.offset >= at) {
                 last = Some((append.offset, append.holds.open_record));
@@ -389,7 +385,7 @@ impl Extents {
         extent.sealed = true;
         extent.end = length;
         extent.logical_end = logical;
-        extent.records = ERoff::of_number(records)?;
+        extent.records = records;
         extent.open_record = false;
         Ok(Truncated { discarded, records, length })
     }
@@ -431,7 +427,7 @@ impl Extents {
         for block in &blocks[first..] {
             covered.took(
                 block.holds.records,
-                LOff::of_len(block.holds.logical as usize)?,
+                block.holds.logical,
                 COff::of_len(block.bytes.len())?,
             );
             taken.push(block);
@@ -558,11 +554,23 @@ impl EN {
             Ok(appending) => appending,
             Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
         };
-        let length = appending.bytes.len() as u64;
-        let cap = match COff::of_number(process.cluster.extents.seal_bytes) {
-            Ok(cap) => cap,
-            Err(e) => return reply.send(Response::error(Status::Internal, e.to_string())),
+        let length: u32 = match u32::try_from(appending.bytes.len()) {
+            Ok(len) => len,
+            Err(_) => {
+                return reply
+                    .send(Response::error(Status::BadRequest, "append bytes exceed 32 bits"));
+            }
         };
+        if appending.holds.logical.get() > process.cluster.extents.max_append_bytes {
+            return reply.send(Response::error(
+                Status::BadRequest,
+                format!(
+                    "append of {} logical bytes exceeds maximum {}",
+                    appending.holds.logical, process.cluster.extents.max_append_bytes
+                ),
+            ));
+        }
+        let cap = COff::new(process.cluster.extents.seal_bytes);
         let landed = match self.take(&appending, cap) {
             Ok(Took::Landed(landed)) => landed,
             // Sealed: what the extent came to, so whoever asked can tell the SN and
@@ -611,23 +619,23 @@ impl EN {
             Arg::Number(appending.extent.number()),
             Arg::Number(appending.created.number()),
             Arg::Number(landed.logical.number()),
-            Arg::Number(appending.holds.logical),
-            Arg::Number(landed.first_record),
-            Arg::Number(landed.records),
+            Arg::Number(appending.holds.logical.number()),
+            Arg::Number(landed.first_record.number()),
+            Arg::Number(landed.records.number()),
         ];
         // Two gates, and an append passes both or is not durable: a quorum of
         // instances, and a record that has actually finished.
         let quorum_wants = process.cluster.extents.quorum;
         let pending = Arc::new(Pending::new(receipt, quorum_wants, reply));
-        match landed.records {
-            0 => self
+        match landed.records == ERoff::ZERO {
+            true => self
                 .waiting
                 .lock()
                 .expect("waiting")
                 .entry((appending.sn, appending.extent))
                 .or_default()
                 .push(Arc::clone(&pending)),
-            _ => {
+            false => {
                 pending.records_are_whole();
                 self.finish(appending.sn, appending.extent);
             }
@@ -788,7 +796,7 @@ impl EN {
         for block in ranged.blocks {
             args.extend(
                 Piece {
-                    logical: block.holds.logical,
+                    logical: block.holds.logical.number(),
                     first_record: block.first_record.number(),
                     records: block.holds.records,
                     crc: block.holds.crc,
@@ -980,12 +988,12 @@ mod tests {
     /// A block as a client would present it: measured before compressing, and here
     /// stored uncompressed, which is what a client does when compressing did not
     /// help. What the EN does is the same either way — it never looks inside.
-    fn block(sn: u32, extent: u64, bytes: &[u8]) -> AppendBlock {
+    fn block(sn: u32, extent: u32, bytes: &[u8]) -> AppendBlock {
         let holds = Holds::of(Framing::Lf, b"", bytes, Some(common::crc::of(bytes)))
             .expect("a well-formed block");
         AppendBlock {
             sn: SnId::new(sn),
-            extent: ExtentId::new(extent as u32),
+            extent: ExtentId::new(extent),
             created: TimeSec::new(1_000_000),
             holds,
             instances: Vec::new(),
@@ -994,7 +1002,7 @@ mod tests {
         }
     }
 
-    fn append(en: &EN, extent: u64, bytes: &[u8]) -> Landed {
+    fn append(en: &EN, extent: u32, bytes: &[u8]) -> Landed {
         match en.take(&block(0, extent, bytes), ROOM).expect("an append") {
             Took::Landed(landed) => landed,
             Took::Sealed { .. } => panic!("that should have fitted"),
@@ -1053,9 +1061,9 @@ mod tests {
     fn an_append_is_told_the_records_it_closed() {
         let en = EN::new(testing::en_config());
         let first = append(&en, 1, &line("one"));
-        assert_eq!((first.first_record, first.records), (0, 1));
+        assert_eq!((first.first_record, first.records), (ERoff::new(0), ERoff::new(1)));
         let pair = append(&en, 1, b"two\nthree\n");
-        assert_eq!((pair.first_record, pair.records), (1, 2));
+        assert_eq!((pair.first_record, pair.records), (ERoff::new(1), ERoff::new(2)));
         assert_eq!(en.held.lock().unwrap().extents[0].records, ERoff::new(3));
     }
 
@@ -1073,7 +1081,7 @@ mod tests {
         let closed = Holds::of(Framing::Lf, b"half a rec", b"ord\n", None).unwrap();
         let second = AppendBlock { holds: closed, ..block(0, 1, b"ord\n") };
         match en.take(&second, ROOM) {
-            Ok(Took::Landed(landed)) => assert_eq!(landed.records, 1),
+            Ok(Took::Landed(landed)) => assert_eq!(landed.records, ERoff::new(1)),
             _ => panic!("the record should close"),
         }
         assert!(!en.held.lock().unwrap().extents[0].open_record);
@@ -1408,7 +1416,7 @@ mod tests {
         assert_eq!(held.extents[0].end, COff::new(10));
 
         let cut = held.truncate(SnId::new(0), ExtentId::new(1), COff::new(5)).expect("a boundary");
-        assert_eq!((cut.discarded, cut.records, cut.length), (1, 1, COff::new(5)));
+        assert_eq!((cut.discarded, cut.records, cut.length), (1, ERoff::new(1), COff::new(5)));
         assert_eq!(
             held.read(SnId::new(0), ExtentId::new(1)),
             b"keep\n",

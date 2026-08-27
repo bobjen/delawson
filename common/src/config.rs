@@ -14,6 +14,7 @@
 //! asks KS where its peers are — so no process's address is checked in, and no
 //! two copies of one address can disagree.
 
+use crate::offset::{COff, LOff};
 use crate::placement::Expansion;
 use crate::{Context, Error, Result};
 use serde::Deserialize;
@@ -279,11 +280,15 @@ pub struct Extents {
     /// figure is 32 MB and it is a guess bracketed from both sides; a test cluster
     /// sets it small so that sealing is the common path rather than the rare one.
     /// It bounds the first write only — recompression may leave an extent larger.
-    pub seal_bytes: u64,
+    pub seal_bytes: u32,
     /// Extents a stream may hold before the stream itself is sealed and the object
     /// needs another. A real stream holds as many as its SN has memory for; a test
     /// cluster sets it low so that a stream sealing is the common path.
     pub per_stream: usize,
+    /// Maximum logical bytes allowed in a single append. Default is 32 MB (33,554,432 bytes),
+    /// bounded above by LOff::MAX.
+    #[serde(default = "default_max_append_bytes")]
+    pub max_append_bytes: u32,
     /// Bytes of device a stored byte costs, which is what billing charges for
     /// (§17.25.3). Absent means plain replication, so `instances`.
     ///
@@ -293,6 +298,10 @@ pub struct Extents {
     /// anything to be divided later (§18.2).
     #[serde(default)]
     pub expansion: Option<f64>,
+}
+
+fn default_max_append_bytes() -> u32 {
+    32 * 1024 * 1024
 }
 
 impl Extents {
@@ -331,10 +340,21 @@ impl Extents {
                 "extents.per_stream of zero leaves a stream nowhere to put an extent",
             ));
         }
+        if self.max_append_bytes == 0 {
+            return Err(Error::new(
+                "extents.max_append_bytes of zero leaves no room for an append",
+            ));
+        }
+        if self.max_append_bytes > LOff::MAX.get() {
+            return Err(Error::new(format!(
+                "extents.max_append_bytes {} is past what a position in an extent can name",
+                self.max_append_bytes
+            )));
+        }
         if self.seal_bytes == 0 {
             return Err(Error::new("extents.seal_bytes of zero seals every extent empty"));
         }
-        if self.seal_bytes > u32::MAX as u64 {
+        if self.seal_bytes > COff::MAX.get() {
             return Err(Error::new(format!(
                 "extents.seal_bytes {} is past what a position in an extent can name",
                 self.seal_bytes
@@ -743,6 +763,7 @@ mod expansion_tests {
             quorum: 3,
             seal_bytes: 4096,
             per_stream: 8,
+            max_append_bytes: 32 * 1024 * 1024,
             expansion: Some(0.5),
         };
         assert!(extents.validate().is_err());
@@ -849,8 +870,15 @@ mod tests {
     #[test]
     fn a_quorum_that_does_not_overlap_itself_is_refused() {
         let extents = |instances, quorum| {
-            Extents { instances, quorum, seal_bytes: 4096, per_stream: 8, expansion: None }
-                .validate()
+            Extents {
+                instances,
+                quorum,
+                seal_bytes: 4096,
+                per_stream: 8,
+                max_append_bytes: 32 * 1024 * 1024,
+                expansion: None,
+            }
+            .validate()
         };
         assert!(extents(4, 3).is_ok(), "the shipped shape");
         assert!(extents(3, 3).is_ok(), "every instance, which is its own quorum");
@@ -868,19 +896,54 @@ mod tests {
     #[test]
     fn a_seal_limit_has_to_be_reachable() {
         let capped = |seal_bytes| {
-            Extents { instances: 4, quorum: 3, seal_bytes, per_stream: 8, expansion: None }
-                .validate()
+            Extents {
+                instances: 4,
+                quorum: 3,
+                seal_bytes,
+                per_stream: 8,
+                max_append_bytes: 32 * 1024 * 1024,
+                expansion: None,
+            }
+            .validate()
         };
         assert!(capped(64).is_ok());
         assert!(capped(32 << 20).is_ok());
+        assert!(capped(COff::MAX.get()).is_ok());
         assert!(capped(0).is_err());
-        assert!(capped(u32::MAX as u64 + 1).is_err());
+        assert!(capped(COff::NONE.get()).is_err());
         // And a stream that can hold no extents can hold nothing at all.
         assert!(
-            Extents { instances: 4, quorum: 3, seal_bytes: 4096, per_stream: 0, expansion: None }
-                .validate()
-                .is_err()
+            Extents {
+                instances: 4,
+                quorum: 3,
+                seal_bytes: 4096,
+                per_stream: 0,
+                max_append_bytes: 32 * 1024 * 1024,
+                expansion: None
+            }
+            .validate()
+            .is_err()
         );
+    }
+
+    #[test]
+    fn a_max_append_bytes_limit_has_to_be_valid() {
+        let check = |max_append_bytes| {
+            Extents {
+                instances: 4,
+                quorum: 3,
+                seal_bytes: 4096,
+                per_stream: 8,
+                max_append_bytes,
+                expansion: None,
+            }
+            .validate()
+        };
+        assert!(check(32 * 1024 * 1024).is_ok());
+        assert!(check(1).is_ok());
+        assert!(check(LOff::MAX.get()).is_ok());
+        assert!(check(0).is_err());
+        assert!(check(LOff::NONE.get()).is_err());
     }
 
     /// What a failure-mode seal discards, which is what makes the same rule work at
@@ -888,8 +951,14 @@ mod tests {
     #[test]
     fn what_a_seal_discards_follows_from_the_two_numbers() {
         let shape = |instances, quorum| {
-            let extents =
-                Extents { instances, quorum, seal_bytes: 4096, per_stream: 8, expansion: None };
+            let extents = Extents {
+                instances,
+                quorum,
+                seal_bytes: 4096,
+                per_stream: 8,
+                max_append_bytes: 32 * 1024 * 1024,
+                expansion: None,
+            };
             (extents.discard(), extents.least_heard())
         };
         // Four of three discards one, so "the minimum, discarding the smallest".

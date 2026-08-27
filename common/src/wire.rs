@@ -792,7 +792,7 @@ mod tests {
             extent: ExtentId::new(17),
             created: TimeSec::new(1_000_000),
             holds: crate::block::Holds {
-                logical: 10,
+                logical: crate::offset::LOff::new(10),
                 records: 2,
                 open_record: false,
                 crc: Some(0xae8b_1486_0a79_9888),
@@ -817,7 +817,11 @@ mod tests {
         let bare = AppendBlock { holds, ..block };
         let read = AppendBlock::of(&bare.request(Op::AppendExtent)).unwrap();
         assert_eq!(read.holds.crc, None);
-        assert_eq!(read.holds.logical, 10, "what it holds survives either way");
+        assert_eq!(
+            read.holds.logical,
+            crate::offset::LOff::new(10),
+            "what it holds survives either way"
+        );
     }
 
     #[test]

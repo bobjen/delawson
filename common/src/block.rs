@@ -18,6 +18,7 @@
 
 use crate::config::Compress;
 use crate::framing::Framing;
+use crate::offset::LOff;
 use crate::{Error, Result};
 
 /// What a block holds, as the writer knows it and as everything below has to be
@@ -26,7 +27,7 @@ use crate::{Error, Result};
 pub struct Holds {
     /// Bytes before compression, which is the space it occupies in the writer's
     /// numbering and what a logical offset counts.
-    pub logical: u64,
+    pub logical: LOff,
     /// Records this block completed, which is what numbers them.
     pub records: u64,
     /// Whether the block ends inside a record. §8.2.4 permits that only for a block
@@ -42,7 +43,7 @@ impl Holds {
     pub fn args(&self) -> Vec<crate::wire::Arg> {
         use crate::wire::Arg;
         vec![
-            Arg::Number(self.logical),
+            Arg::Number(self.logical.number()),
             Arg::Number(self.records),
             Arg::Flag(self.open_record),
             Arg::Flag(self.crc.is_some()),
@@ -66,7 +67,7 @@ impl Holds {
         };
         Ok((
             Holds {
-                logical: *logical,
+                logical: LOff::of_number(*logical)?,
                 records: *records,
                 open_record: *open_record,
                 crc: has_crc.then_some(*crc),
@@ -79,7 +80,8 @@ impl Holds {
     /// that can: below here the bytes are compressed and the framing is invisible.
     pub fn of(framing: Framing, open: &[u8], block: &[u8], crc: Option<u64>) -> Result<Holds> {
         let (records, left) = framing.advance(open, block)?;
-        Ok(Holds { logical: block.len() as u64, records, open_record: !left.is_empty(), crc })
+        let logical = LOff::of_len(block.len())?;
+        Ok(Holds { logical, records, open_record: !left.is_empty(), crc })
     }
 }
 
@@ -177,7 +179,7 @@ mod tests {
         let block = lines(3);
         let holds = Holds::of(Framing::Lf, b"", &block, Some(7)).unwrap();
         assert_eq!(holds.records, 3);
-        assert_eq!(holds.logical, block.len() as u64);
+        assert_eq!(holds.logical, LOff::of_len(block.len()).unwrap());
         assert!(!holds.open_record);
         assert_eq!(holds.crc, Some(7));
 
