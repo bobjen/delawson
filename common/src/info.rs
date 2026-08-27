@@ -12,7 +12,7 @@
 //! One shape, built and read here, makes that a compile error instead.
 
 use crate::framing::Framing;
-use crate::ids::{DiskId, DnId, ExtentId, ObjectId, RangeId, SnId, StreamId};
+use crate::ids::{DiskId, DnId, EnId, ExtentId, ObjectId, RangeId, SnId, StreamId};
 use crate::placement::Expansion;
 use crate::time::TimeSec;
 use crate::wire::Arg;
@@ -535,13 +535,8 @@ pub struct ExtentRow {
     pub logical: u64,
     /// Compressed bytes, or `UNKNOWN` while it is open.
     pub length: u64,
-    /// The ENs holding it, **primary first**, which is what makes a hint a route
-    /// rather than a description. Length-prefixed on the wire because erasure coding
-    /// will give a sealed extent a different number of them than an open one has
-    /// (§4.3.2).
-    /// The **disks** holding its instances, primary first. ⚠️ Disks rather than ENs — see
-    /// `placement::en_of` for why, and for the lookup that turns one into a process.
-    pub disks: Vec<DiskId>,
+    /// The disks holding its instances, primary first, each as `(EnId, DiskId)`.
+    pub disks: Vec<(EnId, DiskId)>,
 }
 
 impl ExtentRow {
@@ -560,7 +555,10 @@ impl ExtentRow {
             Arg::Number(self.length),
             Arg::Number(self.disks.len() as u64),
         ];
-        args.extend(self.disks.iter().map(|disk| Arg::Number(disk.number())));
+        for (en, disk) in &self.disks {
+            args.push(Arg::Number(en.number()));
+            args.push(Arg::Number(disk.number()));
+        }
         args
     }
 
@@ -580,17 +578,20 @@ impl ExtentRow {
             return Err(Error::new("that answer's extents are not extents"));
         };
         let count = *count as usize;
-        if rest.len() < count {
+        let needed = count * 2;
+        if rest.len() < needed {
             return Err(Error::new(format!(
                 "an extent says it has {count} instances and carries {}",
                 rest.len()
             )));
         }
-        let (given, rest) = rest.split_at(count);
+        let (given, rest) = rest.split_at(needed);
         let mut disks = Vec::with_capacity(count);
-        for one in given {
-            match one {
-                Arg::Number(disk) => disks.push(DiskId::of_number(*disk)?),
+        for chunk in given.chunks_exact(2) {
+            match chunk {
+                [Arg::Number(en), Arg::Number(disk)] => {
+                    disks.push((EnId::of_number(*en)?, DiskId::of_number(*disk)?));
+                }
                 _ => return Err(Error::new("an instance list is numbers")),
             }
         }
@@ -969,7 +970,12 @@ mod tests {
             records,
             logical: if records == UNKNOWN { UNKNOWN } else { records * 100 },
             length: if records == UNKNOWN { UNKNOWN } else { records * 10 },
-            disks: vec![DiskId::new(3), DiskId::new(1), DiskId::new(0), DiskId::new(2)],
+            disks: vec![
+                (EnId::new(3), DiskId::new(0)),
+                (EnId::new(1), DiskId::new(0)),
+                (EnId::new(0), DiskId::new(0)),
+                (EnId::new(2), DiskId::new(0)),
+            ],
         }
     }
 
@@ -991,7 +997,12 @@ mod tests {
         assert!(rest.is_empty());
         assert_eq!(
             given[0].disks,
-            vec![DiskId::new(3), DiskId::new(1), DiskId::new(0), DiskId::new(2)],
+            vec![
+                (EnId::new(3), DiskId::new(0)),
+                (EnId::new(1), DiskId::new(0)),
+                (EnId::new(0), DiskId::new(0)),
+                (EnId::new(2), DiskId::new(0)),
+            ],
             "primary first, in order"
         );
     }
@@ -1001,18 +1012,8 @@ mod tests {
     #[test]
     fn extents_may_carry_different_numbers_of_instances() {
         let mut wide = extent(1, 0, 40);
-        wide.disks = vec![
-            DiskId::new(0),
-            DiskId::new(1),
-            DiskId::new(2),
-            DiskId::new(3),
-            DiskId::new(4),
-            DiskId::new(5),
-            DiskId::new(6),
-            DiskId::new(7),
-            DiskId::new(8),
-        ];
-        let narrow = ExtentRow { disks: vec![DiskId::new(9)], ..extent(2, 40, 50) };
+        wide.disks = (0..9).map(|i| (EnId::new(i), DiskId::new(0))).collect();
+        let narrow = ExtentRow { disks: vec![(EnId::new(9), DiskId::new(0))], ..extent(2, 40, 50) };
         let mut args = Vec::new();
         args.extend(wide.args());
         args.extend(narrow.args());

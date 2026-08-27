@@ -1413,13 +1413,10 @@ fn say(
                 n => format!("{n} records, {} stored", extent.length),
             };
             // The whole name, since that is what a hint is built from (§8.1.1a-10).
-            // ⚠️ Disks, and the ENs serving them, because the two are the same number only
-            // while there is one disk per EN (`placement::en_of`).
             // ⚠️ As numbers, not as `{:?}` — a typed id's `Debug` is `DiskId(0)`, which is right
             // in a panic and noise in a listing.
-            let disks: Vec<u32> = extent.disks.iter().map(|disk| disk.get()).collect();
-            let ens: Vec<u32> =
-                extent.disks.iter().map(|disk| placement::en_of(*disk).get()).collect();
+            let disks: Vec<u16> = extent.disks.iter().map(|(_, disk)| disk.get()).collect();
+            let ens: Vec<u32> = extent.disks.iter().map(|(en, _)| en.get()).collect();
             println!(
                 "    extent {} of SN{} made in second {}, from record {}, {held}, \
                  on disks {disks:?} at ENs {ens:?}",

@@ -26,7 +26,7 @@
 //! the messages are just length-prefixed.
 
 use crate::config::Messaging;
-use crate::ids::{DiskId, ExtentId, SnId};
+use crate::ids::{DiskId, EnId, ExtentId, SnId};
 use crate::random::Rng;
 use crate::seal::{self, Seal};
 use crate::time::TimeSec;
@@ -344,8 +344,8 @@ pub struct AppendBlock {
     pub holds: crate::block::Holds,
     /// Instances of the extent, primary first. Empty on the way to a secondary,
     /// which has nothing to broadcast to.
-    /// The **disks** holding it, primary first (§17.29.3).
-    pub instances: Vec<DiskId>,
+    /// The **(EnId, DiskId)** pairs holding it, primary first.
+    pub instances: Vec<(EnId, DiskId)>,
     /// The offset the primary chose, on the way to a secondary. None on the way in,
     /// since choosing it is the primary's job.
     pub offset: Option<u64>,
@@ -361,8 +361,8 @@ impl AppendBlock {
             .number(self.created.number());
         request.args.extend(self.holds.args());
         request = request.flag(self.offset.is_some()).number(self.offset.unwrap_or(0));
-        for en in &self.instances {
-            request = request.number(en.number());
+        for (en, disk) in &self.instances {
+            request = request.number(en.number()).number(disk.number());
         }
         request.bytes(self.bytes.clone())
     }
@@ -380,18 +380,24 @@ impl AppendBlock {
         let Some((Arg::Bytes(bytes), instances)) = instances.split_last() else {
             return Err(Error::new("an append carries bytes last"));
         };
+        if instances.len() % 2 != 0 {
+            return Err(Error::new("an append instance list must be (en, disk) pairs"));
+        }
+        let mut parsed = Vec::with_capacity(instances.len() / 2);
+        for chunk in instances.chunks_exact(2) {
+            match chunk {
+                [Arg::Number(en), Arg::Number(disk)] => {
+                    parsed.push((EnId::of_number(*en)?, DiskId::of_number(*disk)?));
+                }
+                _ => return Err(Error::new("an instance list is numbers")),
+            }
+        }
         Ok(AppendBlock {
             sn: SnId::of_number(*sn)?,
             extent: ExtentId::of_number(*extent)?,
             created: TimeSec::new(*created),
             holds,
-            instances: instances
-                .iter()
-                .map(|arg| match arg {
-                    Arg::Number(disk) => DiskId::of_number(*disk),
-                    _ => Err(Error::new("an instance list is numbers")),
-                })
-                .collect::<Result<Vec<DiskId>>>()?,
+            instances: parsed,
             offset: has_offset.then_some(*offset),
             bytes: bytes.clone(),
         })
@@ -791,7 +797,12 @@ mod tests {
                 open_record: false,
                 crc: Some(0xae8b_1486_0a79_9888),
             },
-            instances: vec![DiskId::new(2), DiskId::new(3), DiskId::new(0), DiskId::new(1)],
+            instances: vec![
+                (EnId::new(2), DiskId::new(0)),
+                (EnId::new(3), DiskId::new(0)),
+                (EnId::new(0), DiskId::new(0)),
+                (EnId::new(1), DiskId::new(0)),
+            ],
             offset: None,
             bytes: b"squeezed".to_vec(),
         };

@@ -26,7 +26,7 @@ pub const EXTENT_INSTANCES: usize = 4;
 /// to talk to goes through here, so the real mapping replaces one function rather than being
 /// hunted for (§17.29.3, #108).
 pub fn en_of(disk: DiskId) -> EnId {
-    EnId::new(disk.get())
+    EnId::new(disk.get() as u32)
 }
 
 /// How many bytes of device a stored byte actually costs (Asserted, Bob, 2026-08-20).

@@ -1,16 +1,15 @@
 //! The things this store counts, each with a type of its own.
 //!
-//! ⚠️ **A raw `u32` is suspicious and a raw `u64` more so** (Asserted, Bob, 2026-08-20). The
+//! ⚠️ **A raw integer is suspicious and a raw `u64` more so** (Asserted, Bob, 2026-08-20). The
 //! store is full of numbers that are not interchangeable — a DN, a range, an object, a
-//! stream, an extent, an SN, an EN, a disk — and a `u64` holding one of them says nothing
+//! stream, an extent, an SN, an EN, a disk — and a raw integer holding one of them says nothing
 //! about which. §8.1.6 made that argument for byte offsets and §17.32 for record offsets; this
 //! is the same argument for identity, which is the largest remaining population of bare
 //! integers.
 //!
-//! **All of them are 32 bits**, and that is a decision rather than an economy: every one is
-//! part of a 16-byte triple (§17.34) whose third component is a creation second, so an id has
-//! only to be unique among what one minter makes in one second. A `u64` id would be eight
-//! bytes buying a range nothing can reach.
+//! **Most IDs are 32 bits, with `DiskId` a 16-bit id scoped within an EN.** It is not guaranteed
+//! that all IDs will stay 32 bits for ever — for example, extreme scaling could eventually require
+//! 64 bits for `EnId` — but types encapsulate their width so widening or narrowing is localized.
 //!
 //! **The top of the range is the sentinel**, the same convention `offset` uses, and a caller
 //! looking one of these up and not finding it gets `NONE`.
@@ -33,10 +32,10 @@
 use crate::{Error, Result};
 
 macro_rules! id {
-    ($name:ident, $what:literal) => {
+    ($name:ident, $ty:ty, $what:literal) => {
         #[doc = concat!("Which ", $what, ".")]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(u32);
+        pub struct $name($ty);
 
         /// ⚠️ **`NONE`, not zero.** Zero is a real id now that the sentinel is at the top, so
         /// a derived `Default` would hand out the first slot of an arena as "unset".
@@ -49,19 +48,19 @@ macro_rules! id {
         impl $name {
             /// **No such thing** — the top of the range, so that every slot of an arena
             /// indexed by one of these is a slot a real thing can occupy (§14.6.2).
-            pub const NONE: $name = $name(u32::MAX);
+            pub const NONE: $name = $name(<$ty>::MAX);
 
             /// The largest real one, one below `NONE`.
-            pub const MAX: $name = $name(u32::MAX - 1);
+            pub const MAX: $name = $name(<$ty>::MAX - 1);
 
             /// The first one a minter hands out, which is the first slot of its arena.
             pub const FIRST: $name = $name(0);
 
-            pub const fn new(id: u32) -> $name {
+            pub const fn new(id: $ty) -> $name {
                 $name(id)
             }
 
-            pub const fn get(self) -> u32 {
+            pub const fn get(self) -> $ty {
                 self.0
             }
 
@@ -74,17 +73,17 @@ macro_rules! id {
             /// these is a caller that thinks the space is wider than it is, and silently
             /// keeping the low bits would hand back a different thing's id.
             pub fn of_number(number: u64) -> Result<$name> {
-                u32::try_from(number)
+                <$ty>::try_from(number)
                     .map($name)
                     .map_err(|_| Error::new(format!(concat!("{} is not ", $what), number)))
             }
 
             pub const fn is_none(self) -> bool {
-                self.0 == u32::MAX
+                self.0 == <$ty>::MAX
             }
 
             pub const fn is_some(self) -> bool {
-                self.0 != u32::MAX
+                self.0 != <$ty>::MAX
             }
 
             /// The next one after this, for a minter counting upward. ⚠️ Wraps to the first
@@ -92,7 +91,7 @@ macro_rules! id {
             /// #110's gate has to have been keeping honest, since a wrapped id collides.
             pub fn next(self) -> $name {
                 match self.0 + 1 {
-                    u32::MAX => $name::FIRST,
+                    <$ty>::MAX => $name::FIRST,
                     next => $name(next),
                 }
             }
@@ -104,14 +103,18 @@ macro_rules! id {
             }
         }
     };
+    ($name:ident, $what:literal) => {
+        id!($name, u32, $what);
+    };
 }
 
 id!(DnId, "a DN");
 id!(SnId, "an SN");
 id!(EnId, "an EN");
-// ⚠️ A **disk**, not the EN serving it: an EN serves several and a disk moves between them, so
-// which EN to ask is a lookup (`placement::en_of`, §17.29.3).
-id!(DiskId, "a disk");
+// ⚠️ A **disk** within an EN, scoped by `(EnId, DiskId)`. 16 bits within its EN.
+id!(DiskId, u16, "a disk");
+// ⚠️ An SN-only index into its array of all known disks across all ENs.
+id!(SnDiskId, "an SN disk index");
 // ⚠️ A **range**, not the DN serving it, for the same reason a disk is not an EN. But note what
 // #75 actually settles: the range is a **hint** and the *key* is the durable name — a range is more
 // stable than a DN and is not itself stable, because a split renames it (§17.38.1).
@@ -159,6 +162,12 @@ mod tests {
         assert!(SnId::of_number(u32::MAX as u64 + 1).is_err());
         let said = DnId::of_number(1 << 40).expect_err("too wide").to_string();
         assert!(said.contains("a DN"), "and it says which kind: {said}");
+
+        // DiskId is 16-bit
+        assert_eq!(DiskId::of_number(60_000).unwrap().get(), 60_000);
+        assert!(DiskId::of_number(u16::MAX as u64 + 1).is_err());
+        let said_disk = DiskId::of_number(1 << 20).expect_err("too wide").to_string();
+        assert!(said_disk.contains("a disk"), "and it says which kind: {said_disk}");
     }
 
     /// Counting upward never lands on the sentinel, so a minter that wraps hands out a
@@ -167,5 +176,6 @@ mod tests {
     fn counting_skips_the_sentinel() {
         assert_eq!(ObjectId::FIRST.next(), ObjectId::new(1));
         assert_eq!(ObjectId::MAX.next(), ObjectId::FIRST, "wrapped, not nothing");
+        assert_eq!(DiskId::MAX.next(), DiskId::FIRST, "wrapped 16-bit");
     }
 }

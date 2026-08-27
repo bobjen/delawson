@@ -23,11 +23,10 @@ use common::Result;
 use common::block::Holds;
 use common::config::{FEConfig, ServiceKind};
 use common::framing::Framing;
-use common::ids::{DiskId, DnId, ExtentId, SnId};
+use common::ids::{DiskId, DnId, EnId, ExtentId, SnId};
 use common::info::{Batch, Described, Expecting, Shape, StreamName, UNKNOWN, Wanted};
 use common::logw;
 use common::offset::{ERoff, ORoff, SRoff};
-use common::placement;
 use common::range::{Budget, Covered, Detail, Filled, Piece, Range, Start, Want};
 use common::routing;
 use common::server::{self, Process, Reply, Service};
@@ -84,33 +83,39 @@ struct Open {
     /// Records in it, or zero for the extent still being appended to — whose count
     /// changes with every append and is therefore not a thing to remember.
     records: u64,
-    /// The **disks** holding its instances, primary first. ⚠️ Disks rather than ENs: which
-    /// EN serves one is a lookup (`placement::en_of`), and the two are the same number only
-    /// while there is one disk per EN.
-    disks: Vec<DiskId>,
+    /// The **disks** holding its instances, primary first, each as `(EnId, DiskId)`.
+    disks: Vec<(EnId, DiskId)>,
 }
 
 impl Open {
-    /// The id, the second, the first record, then the instances, which is the order
-    /// the SN answers in.
+    /// The id, the second, the first record, how many records it holds, the count of instances,
+    /// then the (en, disk) pairs, which is the order the SN answers in.
     fn of(sn: SnId, args: &[Arg]) -> Option<Open> {
         let [
             Arg::Number(id),
             Arg::Number(created),
             Arg::Number(first_record),
             Arg::Number(records),
+            Arg::Number(count),
             instances @ ..,
         ] = args
         else {
             return None;
         };
-        let disks: Vec<DiskId> = instances
-            .iter()
-            .filter_map(|arg| match arg {
-                Arg::Number(disk) => DiskId::of_number(*disk).ok(),
-                _ => None,
-            })
-            .collect();
+        let count = *count as usize;
+        let needed = count * 2;
+        if instances.len() < needed {
+            return None;
+        }
+        let mut disks = Vec::with_capacity(count);
+        for chunk in instances[..needed].chunks_exact(2) {
+            match chunk {
+                [Arg::Number(en), Arg::Number(disk)] => {
+                    disks.push((EnId::of_number(*en).ok()?, DiskId::of_number(*disk).ok()?));
+                }
+                _ => return None,
+            }
+        }
         (!disks.is_empty()).then_some(Open {
             sn,
             id: ExtentId::of_number(*id).ok()?,
@@ -561,7 +566,7 @@ impl FE {
     /// others, and the SN is not in this path to be asked again.
     fn to_primary(self: &Arc<Self>, process: &Arc<Process>, wanting: Wanting, open: Open) {
         let Wanting { path, located, body, holds, tries, reply } = wanting;
-        let identity = format!("EN{}", placement::en_of(open.disks[0]));
+        let identity = format!("EN{}", open.disks[0].0);
         // One shape, built and read in `common`, so neither side counts positions.
         let ask = AppendBlock {
             sn: open.sn,
@@ -868,7 +873,7 @@ fn from_instance(
     budget: Budget,
     reply: Reply,
 ) {
-    let identity = format!("EN{}", placement::en_of(open.disks[0]));
+    let identity = format!("EN{}", open.disks[0].0);
     // The record number the extent knows is its own, counted from its first — and no
     // framing goes with it, because the EN will not be looking inside.
     let at = in_extent(in_stream, SRoff::new(open.first_record));
@@ -1854,7 +1859,7 @@ mod tests {
 
     use common::testing;
 
-    /// The SN answers with the id, the second, the first record, then the instances.
+    /// The SN answers with the id, the second, the first record, how many records, the count, then the instances.
     #[test]
     fn an_open_extent_is_read_out_of_the_sns_answer() {
         let args = vec![
@@ -1862,10 +1867,15 @@ mod tests {
             Arg::Number(1_000_000),
             Arg::Number(40),
             Arg::Number(90),
+            Arg::Number(4),
             Arg::Number(2),
+            Arg::Number(0),
             Arg::Number(3),
             Arg::Number(0),
+            Arg::Number(0),
+            Arg::Number(0),
             Arg::Number(1),
+            Arg::Number(0),
         ];
         let open = Open::of(SnId::new(0), &args).expect("an extent");
         assert_eq!(
@@ -1873,9 +1883,17 @@ mod tests {
             (SnId::new(0), ExtentId::new(7), TimeSec::new(1_000_000), 40)
         );
         assert_eq!(open.records, 90, "sealed, so its range is known");
-        assert_eq!(open.disks, [DiskId::new(2), DiskId::new(3), DiskId::new(0), DiskId::new(1)]);
+        assert_eq!(
+            open.disks,
+            [
+                (EnId::new(2), DiskId::new(0)),
+                (EnId::new(3), DiskId::new(0)),
+                (EnId::new(0), DiskId::new(0)),
+                (EnId::new(1), DiskId::new(0)),
+            ]
+        );
         // The primary is the first, which is the one an append is sent to.
-        assert_eq!(open.disks[0], DiskId::new(2));
+        assert_eq!(open.disks[0], (EnId::new(2), DiskId::new(0)));
     }
 
     /// An extent with nowhere to put it is not an extent.
@@ -1948,7 +1966,7 @@ mod tests {
             created: TimeSec::new(1_000_000),
             first_record: 40,
             records: 0,
-            disks: vec![DiskId::new(2), DiskId::new(3)],
+            disks: vec![(EnId::new(2), DiskId::new(0)), (EnId::new(3), DiskId::new(0))],
         };
         let from_en = Response {
             id: 0,
@@ -2003,7 +2021,7 @@ mod tests {
             created: TimeSec::new(1_000_000),
             first_record: 0,
             records: 0,
-            disks: vec![DiskId::new(2)],
+            disks: vec![(EnId::new(2), DiskId::new(0))],
         };
         let refused = Response::error(Status::Internal, "two instances would not apply it");
         assert_eq!(receipt(&located, &open, refused.clone()), refused);
@@ -2016,7 +2034,12 @@ mod tests {
             created: TimeSec::new(1_000_000),
             first_record,
             records: 0,
-            disks: vec![DiskId::new(2), DiskId::new(3), DiskId::new(0), DiskId::new(1)],
+            disks: vec![
+                (EnId::new(2), DiskId::new(0)),
+                (EnId::new(3), DiskId::new(0)),
+                (EnId::new(0), DiskId::new(0)),
+                (EnId::new(1), DiskId::new(0)),
+            ],
         }
     }
 

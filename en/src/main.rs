@@ -24,7 +24,6 @@ use common::block::Holds;
 use common::config::ENConfig;
 use common::ids::{EnId, ExtentId, SnId};
 use common::offset::{COff, ERoff, LOff};
-use common::placement;
 use common::range::{Budget, Covered, Filled, Piece, Range};
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
@@ -601,12 +600,8 @@ impl EN {
         // disks on one EN, filtering on the raw disk number would have this process send
         // itself its own append (`placement::en_of`, §17.29.3).
         let mine = EnId::new(process.entry.number());
-        let others: Vec<EnId> = appending
-            .instances
-            .iter()
-            .map(|disk| placement::en_of(*disk))
-            .filter(|en| *en != mine)
-            .collect();
+        let others: Vec<EnId> =
+            appending.instances.iter().map(|(en, _disk)| *en).filter(|en| *en != mine).collect();
 
         // ⚠️ The **logical** offset and length, which is what a writer is owed: it
         // knows what it wrote, not what that compressed to. The stored position is
