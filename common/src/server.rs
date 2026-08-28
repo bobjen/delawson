@@ -75,15 +75,15 @@ pub struct Process {
     pub run_dir: PathBuf,
     pub started: Instant,
     /// Connections to the other processes this one talks to.
-    peers: Peers,
+    pub(crate) peers: Peers,
     /// Where round-robin over a kind has got to.
-    turn: AtomicU64,
-    stopping: AtomicBool,
+    pub(crate) turn: AtomicU64,
+    pub(crate) stopping: AtomicBool,
     /// Requests answered, so a client's throughput claim can be checked against
     /// what the server thinks it did.
-    answered: AtomicU64,
+    pub(crate) answered: AtomicU64,
     /// Connections that have moved from writing directly to a batching sender.
-    senders: AtomicU64,
+    pub(crate) senders: AtomicU64,
 }
 
 /// What a machine type adds to the common lifecycle. A new type needs `serves`

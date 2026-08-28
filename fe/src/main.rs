@@ -578,7 +578,7 @@ impl FE {
             offset: None,
             bytes: body.clone(),
         }
-        .request(Op::AppendExtent);
+        .request(open.disks[0].0, open.disks[0].1, Op::AppendExtent);
         let named = identity.clone();
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
@@ -886,6 +886,8 @@ fn from_instance(
     // tail, so what the EN says about its own blocks is the whole answer.
     let sealed = open.records > 0;
     let mut ask = Request::new(Op::ReadExtent)
+        .number(open.disks[0].0.number())
+        .number(open.disks[0].1.number())
         .number(open.sn.number())
         .number(open.id.number())
         .number(open.created.number());

@@ -22,7 +22,7 @@
 
 use common::block::Holds;
 use common::config::ENConfig;
-use common::ids::{EnId, ExtentId, SnId};
+use common::ids::{DiskId, EnId, ExtentId, SnId};
 use common::offset::{COff, ERoff, LOff};
 use common::range::{Budget, Covered, Filled, Piece, Range};
 use common::server::{self, Process, Reply, Service};
@@ -473,7 +473,6 @@ impl Extents {
 }
 
 struct Disk {
-    config: ENConfig,
     held: Mutex<Extents>,
     /// Appends whose bytes are in, and whose record is not finished yet. Keyed by
     /// extent, since a later append to the same extent is what completes it.
@@ -486,57 +485,9 @@ struct Disk {
     checksummed: AtomicU64,
 }
 
-impl Service for Disk {
-    fn serves(&self) -> &'static [Op] {
-        SERVES
-    }
-
-    fn workers(&self) -> usize {
-        self.config.knobs.workers
-    }
-
-    /// An append to the primary is answered once a quorum of instances has applied
-    /// it, which is other processes' business.
-    fn defers(&self, op: Op) -> bool {
-        matches!(op, Op::AppendExtent)
-    }
-
-    /// Applying an append is a copy, and issuing the broadcast is a write, so
-    /// neither is worth a queue hop. A read parses an extent, which is not small,
-    /// so it goes to a worker.
-    fn inline(&self, op: Op) -> bool {
-        matches!(
-            op,
-            Op::AppendExtent | Op::ApplyAppend | Op::Ping | Op::Status | Op::Shutdown | Op::Sites
-        )
-    }
-
-    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Request, reply: Reply) {
-        match request.op {
-            Op::AppendExtent => self.append(process, &request, reply),
-            Op::ApplyAppend => reply.send(self.applied(&request)),
-            Op::ReadExtent => reply.send(self.read(&request)),
-            _ => reply.send(server::unbuilt(process, SERVES, &request)),
-        }
-    }
-
-    fn status(&self, _process: &Process) -> Vec<String> {
-        let extents = self.held.lock().expect("extents").extents.len();
-        vec![
-            format!("extents {extents}"),
-            format!("appends {}", self.appends.load(Ordering::Relaxed)),
-            format!("appended_bytes {}", self.bytes.load(Ordering::Relaxed)),
-            format!("sealed_extents {}", self.sealed.load(Ordering::Relaxed)),
-            format!("blocks_with_a_crc {}", self.checksummed.load(Ordering::Relaxed)),
-            format!("media_class {}", self.config.media_class),
-        ]
-    }
-}
-
 impl Disk {
-    fn new(config: ENConfig) -> Disk {
+    fn new() -> Disk {
         Disk {
-            config,
             held: Mutex::new(Extents::new()),
             waiting: Mutex::new(HashMap::new()),
             appends: AtomicU64::new(0),
@@ -549,26 +500,28 @@ impl Disk {
     /// The primary's half: take the offset, apply here, and send the same bytes at
     /// that offset to the other instances. The answer waits for a quorum of them,
     /// and waits without holding a worker.
-    fn append(self: &Arc<Self>, process: &Arc<Process>, request: &Request, mut reply: Reply) {
-        let appending = match AppendBlock::of(request) {
-            Ok(appending) => appending,
-            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
-        };
+    fn append(
+        &self,
+        process: &Arc<Process>,
+        appending: AppendBlock,
+        mut reply: Reply,
+    ) -> Result<()> {
         let length: u32 = match u32::try_from(appending.bytes.len()) {
             Ok(len) => len,
             Err(_) => {
-                return reply
-                    .send(Response::error(Status::BadRequest, "append bytes exceed 32 bits"));
+                reply.send(Response::error(Status::BadRequest, "append bytes exceed 32 bits"));
+                return Ok(());
             }
         };
         if appending.holds.logical.get() > process.cluster.extents.max_append_bytes {
-            return reply.send(Response::error(
+            reply.send(Response::error(
                 Status::BadRequest,
                 format!(
                     "append of {} logical bytes exceeds maximum {}",
                     appending.holds.logical, process.cluster.extents.max_append_bytes
                 ),
             ));
+            return Ok(());
         }
         let cap = COff::new(process.cluster.extents.seal_bytes);
         let landed = match self.take(&appending, cap) {
@@ -587,13 +540,13 @@ impl Disk {
                     came_to.logical,
                     came_to.compressed
                 ));
-                return reply.send(Response {
-                    id: 0,
-                    status: Status::Sealed,
-                    args: came_to.args(),
-                });
+                reply.send(Response { id: 0, status: Status::Sealed, args: came_to.args() });
+                return Ok(());
             }
-            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            Err(e) => {
+                reply.send(Response::error(Status::BadRequest, e.to_string()));
+                return Ok(());
+            }
         };
         reply.about(format_args!(
             "extent {} of sn {},offset {},bytes {length},records {}",
@@ -608,8 +561,8 @@ impl Disk {
         // disks on one EN, filtering on the raw disk number would have this process send
         // itself its own append (`placement::en_of`, §17.29.3).
         let mine = EnId::new(process.entry.number());
-        let others: Vec<EnId> =
-            appending.instances.iter().map(|(en, _disk)| *en).filter(|en| *en != mine).collect();
+        let others: Vec<(EnId, DiskId)> =
+            appending.instances.iter().filter(|(en, _disk)| *en != mine).cloned().collect();
 
         // ⚠️ The **logical** offset and length, which is what a writer is owed: it
         // knows what it wrote, not what that compressed to. The stored position is
@@ -644,15 +597,15 @@ impl Disk {
 
         // The same block, with the offset this primary chose and no instance list —
         // a secondary has nobody to pass it on to.
-        let apply = AppendBlock {
+        let onward = AppendBlock {
             instances: Vec::new(),
             offset: Some(landed.offset.number()),
             ..appending.clone()
-        }
-        .request(Op::ApplyAppend);
+        };
         // Issued to all of them before any of them answers: a quorum is straggler
         // tolerance only if the writes go out together.
-        for en in others {
+        for (en, disk) in others {
+            let apply = onward.request(en, disk, Op::ApplyAppend);
             let identity = format!("EN{en}");
             let waiting = Arc::clone(&quorum);
             if let Err(e) = process.ask(&identity, &apply, move |answer| {
@@ -662,6 +615,7 @@ impl Disk {
                 quorum.applied(false);
             }
         }
+        Ok(())
     }
 
     fn take(&self, appending: &AppendBlock, cap: COff) -> Result<Took> {
@@ -686,15 +640,7 @@ impl Disk {
         }
     }
 
-    /// A secondary's half: the offset came with the request, so there is nothing
-    /// here to decide. Anything the instances have to agree about arrives the same
-    /// way — the primary decided it, and an instance that worked it out for itself
-    /// would be deciding something the extent did not.
-    fn applied(&self, request: &Request) -> Response {
-        let appending = match AppendBlock::of(request) {
-            Ok(appending) => appending,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
-        };
+    fn apply(&self, appending: AppendBlock) -> Response {
         let Some(offset) = appending.offset else {
             return Response::error(Status::BadRequest, "apply-append takes an offset");
         };
@@ -721,10 +667,8 @@ impl Disk {
     /// all of which it can do and none of which this tier can (§9.1). What comes
     /// back beside the bytes is what makes that possible: the logical size, the
     /// record the block starts at, how many it holds, and the CRC.
-    fn read(&self, request: &Request) -> Response {
-        let [Arg::Number(sn), Arg::Number(extent), Arg::Number(created), rest @ ..] =
-            request.args.as_slice()
-        else {
+    fn read(&self, args: &[Arg]) -> Response {
+        let [Arg::Number(sn), Arg::Number(extent), Arg::Number(created), rest @ ..] = args else {
             return Response::error(
                 Status::BadRequest,
                 "read-extent takes an SnId, an extent, a second and a range",
@@ -806,6 +750,144 @@ impl Disk {
             );
         }
         Response { id: 0, status: Status::Ok, args }
+    }
+
+    fn status(&self, _process: &Process, config: &ENConfig) -> Vec<String> {
+        let extents = self.held.lock().expect("extents").extents.len();
+        vec![
+            format!("extents {extents}"),
+            format!("appends {}", self.appends.load(Ordering::Relaxed)),
+            format!("appended_bytes {}", self.bytes.load(Ordering::Relaxed)),
+            format!("sealed_extents {}", self.sealed.load(Ordering::Relaxed)),
+            format!("blocks_with_a_crc {}", self.checksummed.load(Ordering::Relaxed)),
+            format!("media_class {}", config.media_class),
+        ]
+    }
+}
+
+struct EN {
+    config: ENConfig,
+    disks: Vec<Arc<Disk>>,
+}
+
+impl EN {
+    fn new(config: ENConfig) -> EN {
+        EN { config, disks: vec![Arc::new(Disk::new())] }
+    }
+
+    fn disk(&self, id: DiskId) -> Result<Arc<Disk>> {
+        self.disks
+            .get(id.get() as usize)
+            .cloned()
+            .ok_or_else(|| Error::new(format!("no disk {id} here")))
+    }
+}
+
+impl Service for EN {
+    fn serves(&self) -> &'static [Op] {
+        SERVES
+    }
+
+    fn workers(&self) -> usize {
+        self.config.knobs.workers
+    }
+
+    /// An append to the primary is answered once a quorum of instances has applied
+    /// it, which is other processes' business.
+    fn defers(&self, op: Op) -> bool {
+        matches!(op, Op::AppendExtent)
+    }
+
+    /// Applying an append is a copy, and issuing the broadcast is a write, so
+    /// neither is worth a queue hop. A read parses an extent, which is not small,
+    /// so it goes to a worker.
+    fn inline(&self, op: Op) -> bool {
+        matches!(
+            op,
+            Op::AppendExtent | Op::ApplyAppend | Op::Ping | Op::Status | Op::Shutdown | Op::Sites
+        )
+    }
+
+    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Request, reply: Reply) {
+        match request.op {
+            Op::AppendExtent => self.append(process, request, reply),
+            Op::ApplyAppend => reply.send(self.apply(process, &request)),
+            Op::ReadExtent => reply.send(self.read(process, &request)),
+            _ => reply.send(server::unbuilt(process, SERVES, &request)),
+        }
+    }
+
+    fn status(&self, process: &Process) -> Vec<String> {
+        let mut lines = Vec::new();
+        for (i, disk) in self.disks.iter().enumerate() {
+            lines.push(format!("disk {i}"));
+            for line in disk.status(process, &self.config) {
+                lines.push(format!("  {line}"));
+            }
+        }
+        lines
+    }
+}
+
+impl EN {
+    fn append(self: &Arc<Self>, process: &Arc<Process>, request: Request, reply: Reply) {
+        let (en, disk_id, appending) = match AppendBlock::of(&request) {
+            Ok(res) => res,
+            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+        };
+        let mine = EnId::new(process.entry.number());
+        if en != mine {
+            return reply.send(Response::error(
+                Status::BadRequest,
+                format!("append aimed at EN{en} reached EN{mine}"),
+            ));
+        }
+        match self.disk(disk_id) {
+            Ok(disk) => {
+                if let Err(e) = disk.append(process, appending, reply) {
+                    logw!("append failed", "disk {disk_id},{e}");
+                }
+            }
+            Err(e) => reply.send(Response::error(Status::BadRequest, e.to_string())),
+        }
+    }
+
+    fn apply(&self, process: &Process, request: &Request) -> Response {
+        let (en, disk_id, appending) = match AppendBlock::of(request) {
+            Ok(res) => res,
+            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+        };
+        let mine = EnId::new(process.entry.number());
+        if en != mine {
+            return Response::error(
+                Status::BadRequest,
+                format!("apply aimed at EN{en} reached EN{mine}"),
+            );
+        }
+        match self.disk(disk_id) {
+            Ok(disk) => disk.apply(appending),
+            Err(e) => Response::error(Status::BadRequest, e.to_string()),
+        }
+    }
+
+    fn read(&self, process: &Process, request: &Request) -> Response {
+        let [Arg::Number(en), Arg::Number(disk), rest @ ..] = request.args.as_slice() else {
+            return Response::error(
+                Status::BadRequest,
+                "read-extent takes an EnId, a DiskId, an SnId, an extent, a second and a range",
+            );
+        };
+        let mine = EnId::new(process.entry.number());
+        if *en != mine.number() {
+            return Response::error(
+                Status::BadRequest,
+                format!("read aimed at EN{en} reached EN{mine}"),
+            );
+        }
+        match DiskId::of_number(*disk).and_then(|id| self.disk(id)) {
+            Ok(disk) => disk.read(rest),
+            Err(e) => Response::error(Status::BadRequest, e.to_string()),
+        }
     }
 }
 
@@ -964,7 +1046,7 @@ impl Pending {
 
 fn main() {
     let result =
-        server::main(|process| Ok(Disk::new(ENConfig::load(&process.config.service_config)?)));
+        server::main(|process| Ok(EN::new(ENConfig::load(&process.config.service_config)?)));
     if let Err(e) = result {
         eprintln!("en: {e}");
         std::process::exit(1);
@@ -1002,8 +1084,10 @@ mod tests {
         }
     }
 
-    fn append(en: &Disk, extent: u32, bytes: &[u8]) -> Landed {
-        match en.take(&block(0, extent, bytes), ROOM).expect("an append") {
+    fn append(en: &EN, extent: u32, bytes: &[u8]) -> Landed {
+        let disk_id = DiskId::FIRST;
+        let disk = en.disk(disk_id).unwrap();
+        match disk.take(&block(0, extent, bytes), ROOM).expect("an append") {
             Took::Landed(landed) => landed,
             Took::Sealed { .. } => panic!("that should have fitted"),
         }
@@ -1013,12 +1097,12 @@ mod tests {
     /// they count *stored* bytes, which is what a device holds.
     #[test]
     fn offsets_follow_one_another() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
         assert_eq!(append(&en, 1, &line("hello")).offset, COff::new(0));
         assert_eq!(append(&en, 1, &line("there")).offset, COff::new(6));
         assert_eq!(append(&en, 1, &line("!")).offset, COff::new(12));
         assert_eq!(
-            en.held.lock().unwrap().read(SnId::new(0), ExtentId::new(1)),
+            en.disk(DiskId::FIRST).unwrap().held.lock().unwrap().read(SnId::new(0), ExtentId::new(1)),
             b"hello\nthere\n!\n"
         );
     }
@@ -1026,95 +1110,106 @@ mod tests {
     /// Two extents are two byte streams, whatever order the appends arrive in.
     #[test]
     fn extents_do_not_share_offsets() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
         assert_eq!(append(&en, 1, &line("one")).offset, COff::new(0));
         assert_eq!(append(&en, 2, &line("two")).offset, COff::new(0));
         assert_eq!(append(&en, 1, &line("more")).offset, COff::new(4));
-        assert_eq!(en.held.lock().unwrap().read(SnId::new(0), ExtentId::new(1)), b"one\nmore\n");
+        assert_eq!(
+            en.disk(DiskId::FIRST).unwrap().held.lock().unwrap().read(SnId::new(0), ExtentId::new(1)),
+            b"one\nmore\n"
+        );
     }
 
     /// The same extent id from two SNs is two extents: an id is a name only
     /// alongside the SN that gave it.
     #[test]
     fn an_extent_is_named_by_its_sn_too() {
-        let en = Disk::new(testing::en_config());
-        en.take(&block(0, 1, &line("from sn0")), ROOM).unwrap();
-        en.take(&block(1, 1, &line("from sn1")), ROOM).unwrap();
-        assert_eq!(en.held.lock().unwrap().extents.len(), 2);
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
+        disk.take(&block(0, 1, &line("from sn0")), ROOM).unwrap();
+        disk.take(&block(1, 1, &line("from sn1")), ROOM).unwrap();
+        assert_eq!(disk.held.lock().unwrap().extents.len(), 2);
     }
 
     /// And the second is part of the name, so an append that disagrees about it is
     /// refused rather than added to the extent that is here.
     #[test]
     fn a_second_that_disagrees_is_refused() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
         append(&en, 1, &line("first"));
         let later =
             AppendBlock { created: TimeSec::new(1_000_001), ..block(0, 1, &line("second")) };
-        assert!(en.take(&later, ROOM).is_err());
-        assert_eq!(en.held.lock().unwrap().read(SnId::new(0), ExtentId::new(1)), b"first\n");
+        assert!(disk.take(&later, ROOM).is_err());
+        assert_eq!(disk.held.lock().unwrap().read(SnId::new(0), ExtentId::new(1)), b"first\n");
     }
 
     /// Records are numbered from zero within an extent, from the counts the writer
     /// supplied — nothing here parses a block to find them.
     #[test]
     fn an_append_is_told_the_records_it_closed() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
         let first = append(&en, 1, &line("one"));
         assert_eq!((first.first_record, first.records), (ERoff::new(0), ERoff::new(1)));
         let pair = append(&en, 1, b"two\nthree\n");
         assert_eq!((pair.first_record, pair.records), (ERoff::new(1), ERoff::new(2)));
-        assert_eq!(en.held.lock().unwrap().extents[0].records, ERoff::new(3));
+        assert_eq!(
+            en.disk(DiskId::FIRST).unwrap().held.lock().unwrap().extents[0].records,
+            ERoff::new(3)
+        );
     }
 
     /// A record spanning blocks: the first closes nothing and says a record is open,
     /// the second closes it. The Disk tracks the flag, never the bytes.
     #[test]
     fn a_record_spanning_blocks_is_a_flag_here_and_bytes_at_the_writer() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
         let opened = Holds::of(Framing::Lf, b"", b"half a rec", None).unwrap();
         let first = AppendBlock { holds: opened, ..block(0, 1, b"half a rec") };
-        assert!(matches!(en.take(&first, ROOM), Ok(Took::Landed(_))));
-        assert!(en.held.lock().unwrap().extents[0].open_record, "one is open");
+        assert!(matches!(disk.take(&first, ROOM), Ok(Took::Landed(_))));
+        assert!(disk.held.lock().unwrap().extents[0].open_record, "one is open");
 
         // The writer carried the opening bytes and measures the rest against them.
         let closed = Holds::of(Framing::Lf, b"half a rec", b"ord\n", None).unwrap();
         let second = AppendBlock { holds: closed, ..block(0, 1, b"ord\n") };
-        match en.take(&second, ROOM) {
+        match disk.take(&second, ROOM) {
             Ok(Took::Landed(landed)) => assert_eq!(landed.records, ERoff::new(1)),
             _ => panic!("the record should close"),
         }
-        assert!(!en.held.lock().unwrap().extents[0].open_record);
+        assert!(!disk.held.lock().unwrap().extents[0].open_record);
     }
 
     /// An extent with a record still open cannot seal, however full it is.
     #[test]
     fn an_open_record_keeps_an_extent_from_sealing() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
         let cap = COff::new(4);
         let opened = Holds::of(Framing::Lf, b"", b"half", None).unwrap();
         let first = AppendBlock { holds: opened, ..block(0, 1, b"half") };
-        assert!(matches!(en.take(&first, cap), Ok(Took::Landed(_))));
+        assert!(matches!(disk.take(&first, cap), Ok(Took::Landed(_))));
 
         let closed = Holds::of(Framing::Lf, b"half", b" and half\n", None).unwrap();
         let second = AppendBlock { holds: closed, ..block(0, 1, b" and half\n") };
         assert!(
-            matches!(en.take(&second, cap), Ok(Took::Landed(_))),
+            matches!(disk.take(&second, cap), Ok(Took::Landed(_))),
             "it must be allowed to finish"
         );
         // Now that nothing is open, the next block finds it full.
-        assert!(matches!(en.take(&block(0, 1, b"x\n"), cap), Ok(Took::Sealed { .. })));
+        assert!(matches!(disk.take(&block(0, 1, b"x\n"), cap), Ok(Took::Sealed { .. })));
     }
 
     /// An extent that has no room for the next block is closed rather than stretched,
     /// and the answer says what it came to.
     #[test]
     fn a_full_extent_seals_instead_of_taking_the_block() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
         let cap = COff::new(10);
-        assert!(matches!(en.take(&block(0, 1, b"one\n"), cap), Ok(Took::Landed(_))));
-        assert!(matches!(en.take(&block(0, 1, b"two\n"), cap), Ok(Took::Landed(_))));
-        match en.take(&block(0, 1, b"three\n"), cap) {
+        assert!(matches!(disk.take(&block(0, 1, b"one\n"), cap), Ok(Took::Landed(_))));
+        assert!(matches!(disk.take(&block(0, 1, b"two\n"), cap), Ok(Took::Landed(_))));
+        match disk.take(&block(0, 1, b"three\n"), cap) {
             Ok(Took::Sealed { came_to, .. }) => {
                 assert_eq!(came_to.records, 2, "what the extent came to");
                 assert_eq!(came_to.compressed, COff::new(8), "in stored bytes");
@@ -1125,14 +1220,15 @@ mod tests {
             other => panic!("should have sealed, not {:?}", other.is_ok()),
         }
         // And it stays sealed: the block that found it full does not land later.
-        assert!(matches!(en.take(&block(0, 1, b"x\n"), cap), Ok(Took::Sealed { .. })));
+        assert!(matches!(disk.take(&block(0, 1, b"x\n"), cap), Ok(Took::Sealed { .. })));
     }
 
     /// A compressed block is stored as it arrives and handed back the same way. The
     /// Disk never decompresses, so what it holds is not what the records are.
     #[test]
     fn a_compressed_block_is_stored_and_returned_untouched() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
         let records = (0..40).flat_map(|n| line(&format!("record {n}"))).collect::<Vec<u8>>();
         let holds = Holds::of(Framing::Lf, b"", &records, Some(common::crc::of(&records))).unwrap();
         let stored = common::block::squeeze(common::config::Compress::Lz4, &records)
@@ -1140,11 +1236,11 @@ mod tests {
         assert!(stored.len() < records.len());
 
         let compressed = AppendBlock { holds, bytes: stored.clone(), ..block(0, 1, b"") };
-        assert!(matches!(en.take(&compressed, ROOM), Ok(Took::Landed(_))));
+        assert!(matches!(disk.take(&compressed, ROOM), Ok(Took::Landed(_))));
 
         // Stored bytes are the compressed ones; the logical size is what the writer
         // said, and the two are different numbers for the same block.
-        let held = en.held.lock().unwrap();
+        let held = disk.held.lock().unwrap();
         assert_eq!(held.extents[0].end, COff::of_len(stored.len()).unwrap());
         assert_eq!(held.extents[0].logical_end, LOff::of_len(records.len()).unwrap());
         assert_eq!(held.read(SnId::new(0), ExtentId::new(1)), stored, "handed back as it arrived");
@@ -1154,10 +1250,11 @@ mod tests {
     /// arithmetic on the counts and returns the whole thing.
     #[test]
     fn a_read_returns_the_block_holding_the_record() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
         append(&en, 1, b"one\ntwo\n");
         append(&en, 1, b"three\nfour\nfive\n");
-        let held = en.held.lock().unwrap();
+        let held = disk.held.lock().unwrap();
         let one = |record| {
             held.range(SnId::new(0), ExtentId::new(1), record, Budget::Records(1))
                 .expect("no arithmetic to fail")
@@ -1184,10 +1281,11 @@ mod tests {
     /// names one and the answer reports all three (§9.1.3.6).
     #[test]
     fn a_budget_is_honoured_in_whichever_space_it_names() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
         append(&en, 1, b"one\ntwo\n"); // 2 records, 8 bytes
         append(&en, 1, b"three\nfour\nfive\n"); // 3 records, 16 bytes
-        let held = en.held.lock().unwrap();
+        let held = disk.held.lock().unwrap();
         let ranged = |budget| {
             held.range(SnId::new(0), ExtentId::new(1), ERoff::new(0), budget)
                 .unwrap()
@@ -1218,10 +1316,11 @@ mod tests {
     /// for ever and never learns it asked for too little.
     #[test]
     fn a_budget_smaller_than_a_block_still_gets_a_block() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
         append(&en, 1, b"one\ntwo\n");
         append(&en, 1, b"three\n");
-        let held = en.held.lock().unwrap();
+        let held = disk.held.lock().unwrap();
         for budget in [Budget::Records(0), Budget::Logical(0), Budget::Logical(1)] {
             let ranged = held
                 .range(SnId::new(0), ExtentId::new(1), ERoff::new(0), budget)
@@ -1238,15 +1337,16 @@ mod tests {
     /// arriving on the read path: a caller resuming from `next` must make progress.
     #[test]
     fn a_range_does_not_stop_in_the_middle_of_a_record() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
         append(&en, 1, b"one\n");
         // A record spanning two blocks: the first completes nothing.
         let opened = Holds::of(Framing::Lf, b"", b"half a rec", None).unwrap();
-        en.take(&AppendBlock { holds: opened, ..block(0, 1, b"half a rec") }, ROOM).unwrap();
+        disk.take(&AppendBlock { holds: opened, ..block(0, 1, b"half a rec") }, ROOM).unwrap();
         let closed = Holds::of(Framing::Lf, b"half a rec", b"ord\n", None).unwrap();
-        en.take(&AppendBlock { holds: closed, ..block(0, 1, b"ord\n") }, ROOM).unwrap();
+        disk.take(&AppendBlock { holds: closed, ..block(0, 1, b"ord\n") }, ROOM).unwrap();
 
-        let held = en.held.lock().unwrap();
+        let held = disk.held.lock().unwrap();
         // A one-record budget from record 1 cannot stop after the opening block,
         // because that block completed nothing and `next` would be 1 again.
         let ranged = held
@@ -1265,10 +1365,11 @@ mod tests {
     /// find one at all.
     #[test]
     fn a_block_completing_no_record_is_carried_anyway() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
         let opened = Holds::of(Framing::Lf, b"", b"start", None).unwrap();
-        en.take(&AppendBlock { holds: opened, ..block(0, 1, b"start") }, ROOM).unwrap();
-        let held = en.held.lock().unwrap();
+        disk.take(&AppendBlock { holds: opened, ..block(0, 1, b"start") }, ROOM).unwrap();
+        let held = disk.held.lock().unwrap();
         // Record 0 has begun and not finished, so there is nothing complete to
         // report — but the bytes that exist come back, and `more` is false because
         // the extent holds nothing further.
@@ -1285,11 +1386,13 @@ mod tests {
     /// A secondary puts the append where the primary said, and does not choose.
     #[test]
     fn an_applied_append_keeps_the_offset_it_was_given() {
-        let en = Disk::new(testing::en_config());
-        let request =
-            AppendBlock { offset: Some(64), ..block(0, 1, &line("late")) }.request(Op::ApplyAppend);
-        assert_eq!(en.applied(&request).status, Status::Ok);
-        let held = en.held.lock().unwrap();
+        let en = EN::new(testing::en_config());
+        let disk_id = DiskId::FIRST;
+        let disk = en.disk(disk_id).unwrap();
+        let request = AppendBlock { offset: Some(64), ..block(0, 1, &line("late")) }
+            .request(EnId::new(0), disk_id, Op::ApplyAppend);
+        assert_eq!(en.apply(&testing::process(), &request).status, Status::Ok);
+        let held = disk.held.lock().unwrap();
         assert_eq!(held.appends[0].offset, COff::new(64));
         // The end moves past it, or this instance could not take over as primary.
         assert_eq!(held.extents[0].end, COff::new(69));
@@ -1297,34 +1400,35 @@ mod tests {
 
     #[test]
     fn an_append_of_the_wrong_shape_is_a_bad_request() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
         let request = Request::new(Op::ApplyAppend).number(0).number(1);
-        assert_eq!(en.applied(&request).status, Status::BadRequest);
+        assert_eq!(en.apply(&testing::process(), &request).status, Status::BadRequest);
     }
 
     /// A secondary is told where the primary put it, so an apply without an offset
     /// asks this instance to decide something that is not its to decide.
     #[test]
     fn an_applied_append_needs_an_offset() {
-        let en = Disk::new(testing::en_config());
-        let request = block(0, 1, &line("x")).request(Op::ApplyAppend);
-        assert_eq!(en.applied(&request).status, Status::BadRequest);
+        let en = EN::new(testing::en_config());
+        let request = block(0, 1, &line("x")).request(EnId::new(0), DiskId::FIRST, Op::ApplyAppend);
+        assert_eq!(en.apply(&testing::process(), &request).status, Status::BadRequest);
     }
 
     /// A caller's CRC is stored with the block and not checked here: a Disk holds
     /// what the writer compressed and never decompresses it.
     #[test]
     fn a_crc_is_kept_and_not_judged() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
         append(&en, 1, &line("checksummed"));
         let mut wrong = block(0, 1, &line("also fine"));
         wrong.holds.crc = Some(0);
-        assert!(matches!(en.take(&wrong, ROOM), Ok(Took::Landed(_))));
+        assert!(matches!(disk.take(&wrong, ROOM), Ok(Took::Landed(_))));
 
-        let held = en.held.lock().unwrap();
+        let held = disk.held.lock().unwrap();
         assert_eq!(held.appends[0].holds.crc, Some(common::crc::of(&line("checksummed"))));
         assert_eq!(held.appends[1].holds.crc, Some(0), "kept, wrong or not");
-        assert_eq!(en.checksummed.load(Ordering::Relaxed), 2);
+        assert_eq!(disk.checksummed.load(Ordering::Relaxed), 2);
     }
 
     /// Three of four, so two of the three secondaries settle it and the third's
@@ -1376,8 +1480,9 @@ mod tests {
     /// damage is not repairable once both are written.
     #[test]
     fn an_offset_holds_one_plaintext_and_refuses_a_second() {
-        let en = Disk::new(testing::en_config());
-        let mut held = en.held.lock().unwrap();
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
+        let mut held = disk.held.lock().unwrap();
         assert!(matches!(held.apply(&block(0, 1, b"first\n"), COff::ZERO), Ok(Applied::Stored)));
 
         let clash = held.apply(&block(0, 1, b"other\n"), COff::ZERO);
@@ -1396,8 +1501,9 @@ mod tests {
     /// because a retry must look to the primary like the first attempt did.
     #[test]
     fn the_same_bytes_at_the_same_offset_are_a_retry_not_a_clash() {
-        let en = Disk::new(testing::en_config());
-        let mut held = en.held.lock().unwrap();
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
+        let mut held = disk.held.lock().unwrap();
         let same = block(0, 1, b"once\n");
         assert!(matches!(held.apply(&same, COff::ZERO), Ok(Applied::Stored)));
         assert!(matches!(held.apply(&same, COff::ZERO), Ok(Applied::Already)));
@@ -1409,10 +1515,11 @@ mod tests {
     /// never be handed to different bytes. This is the whole point of #83.
     #[test]
     fn a_truncation_seals_so_a_freed_offset_is_never_reused() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
         append(&en, 1, &line("keep"));
         append(&en, 1, &line("drop"));
-        let mut held = en.held.lock().unwrap();
+        let mut held = disk.held.lock().unwrap();
         assert_eq!(held.extents[0].end, COff::new(10));
 
         let cut = held.truncate(SnId::new(0), ExtentId::new(1), COff::new(5)).expect("a boundary");
@@ -1429,7 +1536,7 @@ mod tests {
         // The freed offset 5 is not handed out again, by either path.
         assert!(held.apply(&block(0, 1, &line("reuse")), COff::new(5)).is_err());
         drop(held);
-        assert!(matches!(en.take(&block(0, 1, &line("reuse")), ROOM), Ok(Took::Sealed { .. })));
+        assert!(matches!(disk.take(&block(0, 1, &line("reuse")), ROOM), Ok(Took::Sealed { .. })));
     }
 
     /// Sealing happens even when the instance had nothing above the watermark: a
@@ -1437,9 +1544,10 @@ mod tests {
     /// instance left appendable is one a new primary could get an offset from.
     #[test]
     fn a_truncation_that_discards_nothing_still_seals() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
         append(&en, 1, &line("all of it"));
-        let mut held = en.held.lock().unwrap();
+        let mut held = disk.held.lock().unwrap();
         let cut = held
             .truncate(SnId::new(0), ExtentId::new(1), COff::new(10))
             .expect("the end is a boundary");
@@ -1457,10 +1565,11 @@ mod tests {
     /// did not come from a watermark.
     #[test]
     fn a_truncation_must_land_where_a_block_ends() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
         append(&en, 1, &line("first"));
         append(&en, 1, &line("second"));
-        let mut held = en.held.lock().unwrap();
+        let mut held = disk.held.lock().unwrap();
         assert!(
             held.truncate(SnId::new(0), ExtentId::new(1), COff::new(3)).is_err(),
             "inside the first block"
@@ -1491,13 +1600,14 @@ mod tests {
     /// sealing something invalid.
     #[test]
     fn a_truncation_that_would_leave_a_record_open_is_refused() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
         let opened = Holds::of(Framing::Lf, b"", b"half a rec", None).unwrap();
-        en.take(&AppendBlock { holds: opened, ..block(0, 1, b"half a rec") }, ROOM).unwrap();
+        disk.take(&AppendBlock { holds: opened, ..block(0, 1, b"half a rec") }, ROOM).unwrap();
         let closed = Holds::of(Framing::Lf, b"half a rec", b"ord\n", None).unwrap();
-        en.take(&AppendBlock { holds: closed, ..block(0, 1, b"ord\n") }, ROOM).unwrap();
+        disk.take(&AppendBlock { holds: closed, ..block(0, 1, b"ord\n") }, ROOM).unwrap();
 
-        let mut held = en.held.lock().unwrap();
+        let mut held = disk.held.lock().unwrap();
         // Cutting between the two blocks is a block boundary and a record's middle.
         assert!(held.truncate(SnId::new(0), ExtentId::new(1), COff::new(10)).is_err());
         assert!(!held.extents[0].sealed);
@@ -1510,11 +1620,12 @@ mod tests {
     /// growing an extent the primary had closed.
     #[test]
     fn a_sealed_extent_refuses_an_apply_as_well_as_an_append() {
-        let en = Disk::new(testing::en_config());
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
         let cap = COff::new(6);
-        en.take(&block(0, 1, &line("full")), cap).unwrap();
-        assert!(matches!(en.take(&block(0, 1, &line("x")), cap), Ok(Took::Sealed { .. })));
-        let mut held = en.held.lock().unwrap();
+        disk.take(&block(0, 1, &line("full")), cap).unwrap();
+        assert!(matches!(disk.take(&block(0, 1, &line("x")), cap), Ok(Took::Sealed { .. })));
+        let mut held = disk.held.lock().unwrap();
         assert!(held.extents[0].sealed);
         assert!(held.apply(&block(0, 1, &line("x")), COff::new(5)).is_err());
     }

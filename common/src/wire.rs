@@ -354,8 +354,10 @@ pub struct AppendBlock {
 }
 
 impl AppendBlock {
-    pub fn request(&self, op: Op) -> Request {
+    pub fn request(&self, en: EnId, disk: DiskId, op: Op) -> Request {
         let mut request = Request::new(op)
+            .number(en.number())
+            .number(disk.number())
             .number(self.sn.number())
             .number(self.extent.number())
             .number(self.created.number());
@@ -367,8 +369,8 @@ impl AppendBlock {
         request.bytes(self.bytes.clone())
     }
 
-    pub fn of(request: &Request) -> Result<AppendBlock> {
-        let [Arg::Number(sn), Arg::Number(extent), Arg::Number(created), rest @ ..] =
+    pub fn of(request: &Request) -> Result<(EnId, DiskId, AppendBlock)> {
+        let [Arg::Number(en), Arg::Number(disk), Arg::Number(sn), Arg::Number(extent), Arg::Number(created), rest @ ..] =
             request.args.as_slice()
         else {
             return Err(Error::new("an append does not have the shape of one"));
@@ -392,15 +394,19 @@ impl AppendBlock {
                 _ => return Err(Error::new("an instance list is numbers")),
             }
         }
-        Ok(AppendBlock {
-            sn: SnId::of_number(*sn)?,
-            extent: ExtentId::of_number(*extent)?,
-            created: TimeSec::new(*created),
-            holds,
-            instances: parsed,
-            offset: has_offset.then_some(*offset),
-            bytes: bytes.clone(),
-        })
+        Ok((
+            EnId::of_number(*en)?,
+            DiskId::of_number(*disk)?,
+            AppendBlock {
+                sn: SnId::of_number(*sn)?,
+                extent: ExtentId::of_number(*extent)?,
+                created: TimeSec::new(*created),
+                holds,
+                instances: parsed,
+                offset: has_offset.then_some(*offset),
+                bytes: bytes.clone(),
+            },
+        ))
     }
 }
 
@@ -806,16 +812,24 @@ mod tests {
             offset: None,
             bytes: b"squeezed".to_vec(),
         };
-        assert_eq!(AppendBlock::of(&block.request(Op::AppendExtent)).unwrap(), block);
+        let en = EnId::new(2);
+        let disk = DiskId::new(1);
+        let (read_en, read_disk, read_block) = AppendBlock::of(&block.request(en, disk, Op::AppendExtent)).unwrap();
+        assert_eq!(read_en, en);
+        assert_eq!(read_disk, disk);
+        assert_eq!(read_block, block);
 
         // On the way to a secondary: an offset, and no instance list.
         let onward = AppendBlock { instances: Vec::new(), offset: Some(512), ..block.clone() };
-        assert_eq!(AppendBlock::of(&onward.request(Op::ApplyAppend)).unwrap(), onward);
+        let (read_en, read_disk, read_block) = AppendBlock::of(&onward.request(en, disk, Op::ApplyAppend)).unwrap();
+        assert_eq!(read_en, en);
+        assert_eq!(read_disk, disk);
+        assert_eq!(read_block, onward);
 
         // And no CRC, which is the caller's choice and not a tier's to invent.
         let holds = crate::block::Holds { crc: None, ..block.holds };
         let bare = AppendBlock { holds, ..block };
-        let read = AppendBlock::of(&bare.request(Op::AppendExtent)).unwrap();
+        let (_, _, read) = AppendBlock::of(&bare.request(en, disk, Op::AppendExtent)).unwrap();
         assert_eq!(read.holds.crc, None);
         assert_eq!(
             read.holds.logical,
@@ -829,16 +843,18 @@ mod tests {
         assert!(AppendBlock::of(&Request::new(Op::AppendExtent).number(1)).is_err());
         // Everything but the bytes.
         let headless = Request::new(Op::AppendExtent)
-            .number(0)
-            .number(1)
-            .number(2)
-            .number(10)
-            .number(1)
-            .flag(false)
-            .flag(false)
-            .number(0)
-            .flag(false)
-            .number(0);
+            .number(0) // en
+            .number(0) // disk
+            .number(0) // sn
+            .number(1) // extent
+            .number(2) // created
+            .number(10) // logical
+            .number(1) // records
+            .flag(false) // open_record
+            .flag(false) // crc_flag
+            .number(0) // crc
+            .flag(false) // has_offset
+            .number(0); // offset
         assert!(AppendBlock::of(&headless).is_err());
     }
 

@@ -14,6 +14,8 @@
 //! once it is deployed everywhere, and the tests exercise what the code is going to
 //! do. A test wanting the old path turns it off itself.
 
+use crate::server::Process;
+use std::sync::Arc;
 use crate::config::{
     ClusterConfig, Compress, DNConfig, ENConfig, Extents, FEConfig, FailureDomains, Knobs,
     KsBootstrap, Logging, MediaClass, Messaging, Rings, SCHEMA_VERSION, SNConfig, SendMode,
@@ -153,4 +155,27 @@ pub fn dn_config() -> DNConfig {
 
 pub fn sn_config() -> SNConfig {
     SNConfig { knobs: knobs(), stream_share: 0.333 }
+}
+
+/// A process, with the test cluster's configuration and the first EN's identity.
+pub fn process() -> Arc<Process> {
+    Arc::new(Process {
+        config: crate::config::ProcessConfig {
+            identity: "EN0".to_string(),
+            kind: ServiceKind::En,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            cluster_config: "cluster.toml".into(),
+            service_config: "en.toml".into(),
+            data_dir: "data".into(),
+        },
+        cluster: cluster(),
+        entry: entry("EN0", ServiceKind::En, Some("hdd")),
+        run_dir: ".".into(),
+        started: std::time::Instant::now(),
+        peers: crate::peer::Peers::new(messaging(), std::time::Duration::from_secs(1)),
+        turn: std::sync::atomic::AtomicU64::new(0),
+        stopping: std::sync::atomic::AtomicBool::new(false),
+        answered: std::sync::atomic::AtomicU64::new(0),
+        senders: std::sync::atomic::AtomicU64::new(0),
+    })
 }
