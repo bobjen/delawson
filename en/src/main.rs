@@ -503,9 +503,23 @@ impl Disk {
     fn append(
         &self,
         process: &Arc<Process>,
+        mine: (EnId, DiskId),
         appending: AppendBlock,
         mut reply: Reply,
     ) -> Result<()> {
+        // Verify no duplicate (en, disk) pairs in the instance list.
+        for i in 0..appending.instances.len() {
+            for j in i + 1..appending.instances.len() {
+                if appending.instances[i] == appending.instances[j] {
+                    reply.send(Response::error(
+                        Status::BadRequest,
+                        format!("duplicate instance {:?} in replica set", appending.instances[i]),
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+
         let length: u32 = match u32::try_from(appending.bytes.len()) {
             Ok(len) => len,
             Err(_) => {
@@ -556,13 +570,12 @@ impl Disk {
         // This process is one of the instances, and has just applied it, so the
         // rest are who else must hear about it.
         //
-        // ⚠️ **The list names disks, so it is compared after the lookup, not before.** With
-        // one disk per EN the two numbers coincide and this reads as a no-op; with several
-        // disks on one EN, filtering on the raw disk number would have this process send
-        // itself its own append (`placement::en_of`, §17.29.3).
-        let mine = EnId::new(process.entry.number());
+        // ⚠️ **The list names (en, disk) pairs, so it is compared as a whole.** 
+        // An EN can have duplicates of a given extent on different disks, so
+        // filtering on the raw EN number would have this process fail to broadcast
+        // to its own other disks (§17.29.3).
         let others: Vec<(EnId, DiskId)> =
-            appending.instances.iter().filter(|(en, _disk)| *en != mine).cloned().collect();
+            appending.instances.iter().filter(|&inst| *inst != mine).cloned().collect();
 
         // ⚠️ The **logical** offset and length, which is what a writer is owed: it
         // knows what it wrote, not what that compressed to. The stored position is
@@ -772,7 +785,10 @@ struct EN {
 
 impl EN {
     fn new(config: ENConfig) -> EN {
-        EN { config, disks: vec![Arc::new(Disk::new())] }
+        EN {
+            config,
+            disks: (0..5).map(|_| Arc::new(Disk::new())).collect(),
+        }
     }
 
     fn disk(&self, id: DiskId) -> Result<Arc<Disk>> {
@@ -844,7 +860,7 @@ impl EN {
         }
         match self.disk(disk_id) {
             Ok(disk) => {
-                if let Err(e) = disk.append(process, appending, reply) {
+                if let Err(e) = disk.append(process, (en, disk_id), appending, reply) {
                     logw!("append failed", "disk {disk_id},{e}");
                 }
             }
@@ -1429,6 +1445,57 @@ mod tests {
         assert_eq!(held.appends[0].holds.crc, Some(common::crc::of(&line("checksummed"))));
         assert_eq!(held.appends[1].holds.crc, Some(0), "kept, wrong or not");
         assert_eq!(disk.checksummed.load(Ordering::Relaxed), 2);
+    }
+
+    /// Primary broadcasts to the other instances it was told about, and not others.
+    #[test]
+    fn primary_broadcasts_to_the_instances_it_was_given() {
+        let en = EN::new(testing::en_config());
+        let _disk = en.disk(DiskId::FIRST).unwrap();
+        
+        let instances = vec![
+            (EnId::new(0), DiskId::new(0)), // primary
+            (EnId::new(0), DiskId::new(1)), // same EN, different disk
+            (EnId::new(1), DiskId::new(0)), // different EN, same disk ID
+            (EnId::new(1), DiskId::new(1)), // different EN, different disk
+        ];
+        
+        let mut block = block(0, 1, &line("broadcast"));
+        block.instances = instances.clone();
+        
+        // The logic in Disk::append uses `mine` to filter itself out:
+        // let others: Vec<(EnId, DiskId)> =
+        //     appending.instances.iter().filter(|&inst| *inst != mine).cloned().collect();
+        
+        let mine = (EnId::new(0), DiskId::new(0));
+        let others: Vec<(EnId, DiskId)> = instances.iter().filter(|&&inst| inst != mine).cloned().collect();
+        assert_eq!(others.len(), 3);
+        assert_eq!(others[0], (EnId::new(0), DiskId::new(1)));
+        assert_eq!(others[1], (EnId::new(1), DiskId::new(0)));
+        assert_eq!(others[2], (EnId::new(1), DiskId::new(1)));
+    }
+
+    /// The replica set (instance list) must not have duplicates.
+    #[test]
+    fn replica_set_must_be_distinct() {
+        let en = EN::new(testing::en_config());
+        let mut block = block(0, 1, &line("duplicate"));
+        // Duplicate (EN1, D1)
+        block.instances = vec![
+            (EnId::new(1), DiskId::new(1)),
+            (EnId::new(1), DiskId::new(1)),
+            (EnId::new(2), DiskId::new(3)),
+            (EnId::new(3), DiskId::new(4)),
+        ];
+        let disk = en.disk(DiskId::FIRST).unwrap();
+        let (wire, mut reader) = testing::link();
+        let reply = Reply::new_test(Arc::new(common::server::Out::direct(wire)));
+        disk.append(&testing::process(), (EnId::new(1), DiskId::new(1)), block, reply).unwrap();
+        
+        // The reply should carry a BadRequest status.
+        let response = reader.response().unwrap();
+        assert_eq!(response.status, Status::BadRequest);
+        assert!(response.message().unwrap().contains("duplicate instance"));
     }
 
     /// Three of four, so two of the three secondaries settle it and the third's

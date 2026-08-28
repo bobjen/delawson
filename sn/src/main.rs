@@ -202,17 +202,23 @@ impl From<Error> for Full {
     }
 }
 
+use std::cell::RefCell;
+
+thread_local! {
+    /// One generator per worker thread, so choosing disks needs no lock.
+    static RNG: RefCell<common::random::Rng> = RefCell::new(common::random::Rng::new());
+}
+
 /// Hands out extent names and chooses instances for them.
 struct Naming {
     next: AtomicU64,
     /// The latest second used in a name, so one cannot go backwards.
     latest: AtomicU64,
-    turn: AtomicU64,
 }
 
 impl Naming {
     fn new() -> Naming {
-        Naming { next: AtomicU64::new(1), latest: AtomicU64::new(0), turn: AtomicU64::new(0) }
+        Naming { next: AtomicU64::new(1), latest: AtomicU64::new(0) }
     }
 
     /// An id and the second to name an extent with. A second earlier than one
@@ -227,15 +233,24 @@ impl Naming {
         Ok((ExtentId::new(self.next.fetch_add(1, Ordering::Relaxed) as u32), second))
     }
 
-    /// Instances for one extent, taken in turn from the disks there are.
+    /// Instances for one extent, taken randomly from the disks there are.
     fn disks(&self, total_disks: usize, want: usize) -> Result<Vec<SnDiskId>> {
         if total_disks < want {
             return Err(Error::new(format!(
                 "an extent wants {want} instances, and there are only {total_disks} disks",
             )));
         }
-        let turn = self.turn.fetch_add(want as u64, Ordering::Relaxed) as usize;
-        Ok((0..want).map(|n| SnDiskId::new(((turn + n) % total_disks) as u32)).collect())
+        let mut picked = Vec::with_capacity(want);
+        RNG.with(|rng| {
+            let mut rng = rng.borrow_mut();
+            while picked.len() < want {
+                let id = SnDiskId::new((rng.next() % total_disks as u64) as u32);
+                if !picked.contains(&id) {
+                    picked.push(id);
+                }
+            }
+        });
+        Ok(picked)
     }
 }
 
@@ -718,11 +733,13 @@ impl SN {
 
 fn main() {
     let result = server::main(|process| {
-        let disks: Vec<(EnId, DiskId)> = process
-            .cluster
-            .services_of_kind(ServiceKind::En)
-            .map(|en| (EnId::new(en.number()), DiskId::FIRST))
-            .collect();
+        let mut disks = Vec::new();
+        for en in process.cluster.services_of_kind(ServiceKind::En) {
+            let en_id = EnId::new(en.number());
+            for d in 0..5 {
+                disks.push((en_id, DiskId::new(d)));
+            }
+        }
         Ok(SN::new(
             SNConfig::load(&process.config.service_config)?,
             SnId::new(process.entry.number()),
@@ -803,7 +820,13 @@ mod tests {
     }
 
     fn default_disks() -> Vec<(EnId, DiskId)> {
-        (0..4).map(|i| (EnId::new(i), DiskId::new(0))).collect()
+        let mut disks = Vec::new();
+        for en in 0..4 {
+            for disk in 0..5 {
+                disks.push((EnId::new(en), DiskId::new(disk)));
+            }
+        }
+        disks
     }
 
     fn sn_with_stream(range: u32, stream: u32) -> SN {
@@ -1075,7 +1098,7 @@ mod tests {
     }
 
     #[test]
-    fn instances_are_four_distinct_disks_taken_in_turn() {
+    fn instances_are_four_distinct_disks_chosen_randomly() {
         let naming = Naming::new();
         for _ in 0..20 {
             let picked = naming.disks(7, testing::extents().instances).unwrap();
@@ -1095,15 +1118,34 @@ mod tests {
         assert!(naming.disks(3, testing::extents().instances).is_err());
     }
 
-    /// The four ENs in the default roster are exactly what an extent needs.
     #[test]
-    fn the_test_roster_has_an_extent_worth_of_ens() {
+    fn disks_are_chosen_from_all_available_nodes_and_disks() {
+        let naming = Naming::new();
+        // 10 disks total (e.g., 2 ENs with 5 disks each)
+        let picked = naming.disks(10, 4).unwrap();
+        assert_eq!(picked.len(), 4);
+        let mut sorted = picked.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 4, "should be distinct");
+        // Verify they are within range
+        for id in picked {
+            assert!(id.get() < 10);
+        }
+    }
+
+    /// The four ENs in the default roster are enough for an extent.
+    #[test]
+    fn the_test_roster_has_enough_disks_for_an_extent() {
         let cluster = testing::cluster();
-        let ens: Vec<(EnId, DiskId)> = cluster
-            .services_of_kind(ServiceKind::En)
-            .map(|en| (EnId::new(en.number()), DiskId::FIRST))
-            .collect();
-        assert_eq!(ens.len(), testing::extents().instances);
-        assert!(Naming::new().disks(ens.len(), testing::extents().instances).is_ok());
+        let mut disks = Vec::new();
+        for en in cluster.services_of_kind(ServiceKind::En) {
+            let en_id = EnId::new(en.number());
+            for d in 0..5 {
+                disks.push((en_id, DiskId::new(d)));
+            }
+        }
+        assert!(disks.len() >= testing::extents().instances);
+        assert!(Naming::new().disks(disks.len(), testing::extents().instances).is_ok());
     }
 }

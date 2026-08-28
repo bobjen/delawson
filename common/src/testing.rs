@@ -157,6 +157,24 @@ pub fn sn_config() -> SNConfig {
     SNConfig { knobs: knobs(), stream_share: 0.333 }
 }
 
+/// A connected pair of wires, for testing the wire protocol without a network.
+pub fn link() -> (crate::wire::Wire, crate::wire::Reader) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = std::net::TcpStream::connect(addr).unwrap();
+    let server = listener.incoming().next().unwrap().unwrap();
+    let messaging = messaging();
+    (
+        crate::wire::connect(client, &messaging).unwrap().wire,
+        crate::wire::accept(server, &messaging).unwrap().0,
+    )
+}
+
+/// A reply that sends to a dummy wire.
+pub fn reply() -> crate::server::Reply {
+    crate::server::Reply::new_test(Arc::new(crate::server::Out::direct(link().0)))
+}
+
 /// A process, with the test cluster's configuration and the first EN's identity.
 pub fn process() -> Arc<Process> {
     Arc::new(Process {

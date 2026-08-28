@@ -526,6 +526,18 @@ pub struct Reply {
 }
 
 impl Reply {
+    #[cfg(feature = "testing")]
+    pub fn new_test(out: Arc<Out>) -> Reply {
+        Reply {
+            out,
+            id: 0,
+            op: Op::Ping,
+            settled: true,
+            started: None,
+            about: String::new(),
+        }
+    }
+
     /// Say what this request was about, where the service knows better than its
     /// first argument does.
     pub fn about(&mut self, what: impl std::fmt::Display) {
@@ -568,10 +580,10 @@ impl Reply {
 /// A connection's outgoing bytes, in two buffers: producers append to one while
 /// the sender writes the other. The next batch is whatever piled up during the
 /// last write, so batch size follows load with nothing to tune and no timer.
-struct Batch {
-    filling: Mutex<Vec<u8>>,
-    ready: Condvar,
-    open: AtomicBool,
+pub(crate) struct Batch {
+    pub(crate) filling: Mutex<Vec<u8>>,
+    pub(crate) ready: Condvar,
+    pub(crate) open: AtomicBool,
 }
 
 impl Batch {
@@ -634,20 +646,36 @@ fn run_sender(mut wire: Wire, batch: Arc<Batch>) {
 /// Where a connection's answers go. Starts as one of the two, and may move from
 /// direct to a sender exactly once — after which `batch` is set for good, so the
 /// hot path is one relaxed load.
-struct Out {
-    direct: Mutex<Option<Direct>>,
-    batch: OnceLock<Arc<Batch>>,
+pub struct Out {
+    pub(crate) direct: Mutex<Option<Direct>>,
+    pub(crate) batch: OnceLock<Arc<Batch>>,
 }
 
 /// The read loop's own writer: messages accumulate here and are sealed when it
 /// says nothing more is in hand.
-struct Direct {
-    wire: Wire,
-    plain: Vec<u8>,
+#[cfg(not(feature = "testing"))]
+pub(crate) struct Direct {
+    pub(crate) wire: Wire,
+    pub(crate) plain: Vec<u8>,
+}
+
+#[cfg(feature = "testing")]
+pub struct Direct {
+    pub(crate) wire: Wire,
+    pub(crate) plain: Vec<u8>,
 }
 
 impl Out {
-    fn direct(wire: Wire) -> Out {
+    #[cfg(feature = "testing")]
+    pub fn direct(wire: Wire) -> Out {
+        Out {
+            direct: Mutex::new(Some(Direct { wire, plain: Vec::with_capacity(BUF_BYTES) })),
+            batch: OnceLock::new(),
+        }
+    }
+
+    #[cfg(not(feature = "testing"))]
+    pub(crate) fn direct(wire: Wire) -> Out {
         Out {
             direct: Mutex::new(Some(Direct { wire, plain: Vec::with_capacity(BUF_BYTES) })),
             batch: OnceLock::new(),
