@@ -9,13 +9,13 @@
 //! **Durable means three of the four instances have applied it**, the primary
 //! included, so one slow instance costs nothing.
 //!
-//! **A caller's CRC is carried and stored, and not checked here.** An EN holds what
+//! **A caller's CRC is carried and stored, and not checked here.** A Disk holds what
 //! the writer compressed, and it never decompresses — so the logical bytes the CRC is
 //! over do not exist on this machine. Checking would work today only because nothing
 //! compresses yet, and would start failing on every append the moment something did.
 //! The check belongs where the logical bytes come back.
 //!
-//! ⚠️ **Nothing is on a disk yet.** The extent table and the appends themselves are
+//! ⚠️ **Nothing is on a real disk yet.** The extent table and the appends themselves are
 //! two vectors in memory, which is enough for the operation to work end to end and
 //! is not evidence about what a durable append costs. What replaces it is a
 //! journal of extent metadata per disk, snapshot and log.
@@ -95,7 +95,7 @@ enum Took {
     /// count of sealed extents counts extents and not refusals.
     Sealed {
         /// All three measures, because the SN records all three and a seal is the only
-        /// moment the EN is asked what the extent came to (#94, §9.1.3.6).
+        /// moment the Disk is asked what the extent came to (#94, §9.1.3.6).
         came_to: Filled,
         closing: bool,
     },
@@ -148,7 +148,7 @@ struct Landed {
     records: ERoff,
 }
 
-/// Everything this EN holds. Two vectors, with a map from an extent's name to its
+/// Everything this Disk holds. Two vectors, with a map from an extent's name to its
 /// place in the first — a scan per append would be the slowest thing in the write
 /// path long before it was the smallest.
 struct Extents {
@@ -162,8 +162,8 @@ impl Extents {
         Extents { extents: Vec::new(), at: HashMap::new(), appends: Vec::new() }
     }
 
-    /// The extent's place in the table, made if this is the first append to it. An
-    /// EN learns of an extent from the first append that names it: the SN chose the
+    /// The extent's place in the table, made if this is the first append to it. A
+    /// Disk learns of an extent from the first append that names it: the SN chose the
     /// instances and needs no round trip to say so.
     ///
     /// The second is part of the name, so an append naming a different one for an
@@ -472,7 +472,7 @@ impl Extents {
     }
 }
 
-struct EN {
+struct Disk {
     config: ENConfig,
     held: Mutex<Extents>,
     /// Appends whose bytes are in, and whose record is not finished yet. Keyed by
@@ -486,7 +486,7 @@ struct EN {
     checksummed: AtomicU64,
 }
 
-impl Service for EN {
+impl Service for Disk {
     fn serves(&self) -> &'static [Op] {
         SERVES
     }
@@ -533,9 +533,9 @@ impl Service for EN {
     }
 }
 
-impl EN {
-    fn new(config: ENConfig) -> EN {
-        EN {
+impl Disk {
+    fn new(config: ENConfig) -> Disk {
+        Disk {
             config,
             held: Mutex::new(Extents::new()),
             waiting: Mutex::new(HashMap::new()),
@@ -964,7 +964,7 @@ impl Pending {
 
 fn main() {
     let result =
-        server::main(|process| Ok(EN::new(ENConfig::load(&process.config.service_config)?)));
+        server::main(|process| Ok(Disk::new(ENConfig::load(&process.config.service_config)?)));
     if let Err(e) = result {
         eprintln!("en: {e}");
         std::process::exit(1);
@@ -987,7 +987,7 @@ mod tests {
 
     /// A block as a client would present it: measured before compressing, and here
     /// stored uncompressed, which is what a client does when compressing did not
-    /// help. What the EN does is the same either way — it never looks inside.
+    /// help. What the Disk does is the same either way — it never looks inside.
     fn block(sn: u32, extent: u32, bytes: &[u8]) -> AppendBlock {
         let holds = Holds::of(Framing::Lf, b"", bytes, Some(common::crc::of(bytes)))
             .expect("a well-formed block");
@@ -1002,7 +1002,7 @@ mod tests {
         }
     }
 
-    fn append(en: &EN, extent: u32, bytes: &[u8]) -> Landed {
+    fn append(en: &Disk, extent: u32, bytes: &[u8]) -> Landed {
         match en.take(&block(0, extent, bytes), ROOM).expect("an append") {
             Took::Landed(landed) => landed,
             Took::Sealed { .. } => panic!("that should have fitted"),
@@ -1013,7 +1013,7 @@ mod tests {
     /// they count *stored* bytes, which is what a device holds.
     #[test]
     fn offsets_follow_one_another() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         assert_eq!(append(&en, 1, &line("hello")).offset, COff::new(0));
         assert_eq!(append(&en, 1, &line("there")).offset, COff::new(6));
         assert_eq!(append(&en, 1, &line("!")).offset, COff::new(12));
@@ -1026,7 +1026,7 @@ mod tests {
     /// Two extents are two byte streams, whatever order the appends arrive in.
     #[test]
     fn extents_do_not_share_offsets() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         assert_eq!(append(&en, 1, &line("one")).offset, COff::new(0));
         assert_eq!(append(&en, 2, &line("two")).offset, COff::new(0));
         assert_eq!(append(&en, 1, &line("more")).offset, COff::new(4));
@@ -1037,7 +1037,7 @@ mod tests {
     /// alongside the SN that gave it.
     #[test]
     fn an_extent_is_named_by_its_sn_too() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         en.take(&block(0, 1, &line("from sn0")), ROOM).unwrap();
         en.take(&block(1, 1, &line("from sn1")), ROOM).unwrap();
         assert_eq!(en.held.lock().unwrap().extents.len(), 2);
@@ -1047,7 +1047,7 @@ mod tests {
     /// refused rather than added to the extent that is here.
     #[test]
     fn a_second_that_disagrees_is_refused() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         append(&en, 1, &line("first"));
         let later =
             AppendBlock { created: TimeSec::new(1_000_001), ..block(0, 1, &line("second")) };
@@ -1059,7 +1059,7 @@ mod tests {
     /// supplied — nothing here parses a block to find them.
     #[test]
     fn an_append_is_told_the_records_it_closed() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         let first = append(&en, 1, &line("one"));
         assert_eq!((first.first_record, first.records), (ERoff::new(0), ERoff::new(1)));
         let pair = append(&en, 1, b"two\nthree\n");
@@ -1068,10 +1068,10 @@ mod tests {
     }
 
     /// A record spanning blocks: the first closes nothing and says a record is open,
-    /// the second closes it. The EN tracks the flag, never the bytes.
+    /// the second closes it. The Disk tracks the flag, never the bytes.
     #[test]
     fn a_record_spanning_blocks_is_a_flag_here_and_bytes_at_the_writer() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         let opened = Holds::of(Framing::Lf, b"", b"half a rec", None).unwrap();
         let first = AppendBlock { holds: opened, ..block(0, 1, b"half a rec") };
         assert!(matches!(en.take(&first, ROOM), Ok(Took::Landed(_))));
@@ -1090,7 +1090,7 @@ mod tests {
     /// An extent with a record still open cannot seal, however full it is.
     #[test]
     fn an_open_record_keeps_an_extent_from_sealing() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         let cap = COff::new(4);
         let opened = Holds::of(Framing::Lf, b"", b"half", None).unwrap();
         let first = AppendBlock { holds: opened, ..block(0, 1, b"half") };
@@ -1110,7 +1110,7 @@ mod tests {
     /// and the answer says what it came to.
     #[test]
     fn a_full_extent_seals_instead_of_taking_the_block() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         let cap = COff::new(10);
         assert!(matches!(en.take(&block(0, 1, b"one\n"), cap), Ok(Took::Landed(_))));
         assert!(matches!(en.take(&block(0, 1, b"two\n"), cap), Ok(Took::Landed(_))));
@@ -1129,10 +1129,10 @@ mod tests {
     }
 
     /// A compressed block is stored as it arrives and handed back the same way. The
-    /// EN never decompresses, so what it holds is not what the records are.
+    /// Disk never decompresses, so what it holds is not what the records are.
     #[test]
     fn a_compressed_block_is_stored_and_returned_untouched() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         let records = (0..40).flat_map(|n| line(&format!("record {n}"))).collect::<Vec<u8>>();
         let holds = Holds::of(Framing::Lf, b"", &records, Some(common::crc::of(&records))).unwrap();
         let stored = common::block::squeeze(common::config::Compress::Lz4, &records)
@@ -1154,7 +1154,7 @@ mod tests {
     /// arithmetic on the counts and returns the whole thing.
     #[test]
     fn a_read_returns_the_block_holding_the_record() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         append(&en, 1, b"one\ntwo\n");
         append(&en, 1, b"three\nfour\nfive\n");
         let held = en.held.lock().unwrap();
@@ -1184,7 +1184,7 @@ mod tests {
     /// names one and the answer reports all three (§9.1.3.6).
     #[test]
     fn a_budget_is_honoured_in_whichever_space_it_names() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         append(&en, 1, b"one\ntwo\n"); // 2 records, 8 bytes
         append(&en, 1, b"three\nfour\nfive\n"); // 3 records, 16 bytes
         let held = en.held.lock().unwrap();
@@ -1218,7 +1218,7 @@ mod tests {
     /// for ever and never learns it asked for too little.
     #[test]
     fn a_budget_smaller_than_a_block_still_gets_a_block() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         append(&en, 1, b"one\ntwo\n");
         append(&en, 1, b"three\n");
         let held = en.held.lock().unwrap();
@@ -1238,7 +1238,7 @@ mod tests {
     /// arriving on the read path: a caller resuming from `next` must make progress.
     #[test]
     fn a_range_does_not_stop_in_the_middle_of_a_record() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         append(&en, 1, b"one\n");
         // A record spanning two blocks: the first completes nothing.
         let opened = Holds::of(Framing::Lf, b"", b"half a rec", None).unwrap();
@@ -1265,7 +1265,7 @@ mod tests {
     /// find one at all.
     #[test]
     fn a_block_completing_no_record_is_carried_anyway() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         let opened = Holds::of(Framing::Lf, b"", b"start", None).unwrap();
         en.take(&AppendBlock { holds: opened, ..block(0, 1, b"start") }, ROOM).unwrap();
         let held = en.held.lock().unwrap();
@@ -1285,7 +1285,7 @@ mod tests {
     /// A secondary puts the append where the primary said, and does not choose.
     #[test]
     fn an_applied_append_keeps_the_offset_it_was_given() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         let request =
             AppendBlock { offset: Some(64), ..block(0, 1, &line("late")) }.request(Op::ApplyAppend);
         assert_eq!(en.applied(&request).status, Status::Ok);
@@ -1297,7 +1297,7 @@ mod tests {
 
     #[test]
     fn an_append_of_the_wrong_shape_is_a_bad_request() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         let request = Request::new(Op::ApplyAppend).number(0).number(1);
         assert_eq!(en.applied(&request).status, Status::BadRequest);
     }
@@ -1306,16 +1306,16 @@ mod tests {
     /// asks this instance to decide something that is not its to decide.
     #[test]
     fn an_applied_append_needs_an_offset() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         let request = block(0, 1, &line("x")).request(Op::ApplyAppend);
         assert_eq!(en.applied(&request).status, Status::BadRequest);
     }
 
-    /// A caller's CRC is stored with the block and not checked here: an EN holds
+    /// A caller's CRC is stored with the block and not checked here: a Disk holds
     /// what the writer compressed and never decompresses it.
     #[test]
     fn a_crc_is_kept_and_not_judged() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         append(&en, 1, &line("checksummed"));
         let mut wrong = block(0, 1, &line("also fine"));
         wrong.holds.crc = Some(0);
@@ -1376,7 +1376,7 @@ mod tests {
     /// damage is not repairable once both are written.
     #[test]
     fn an_offset_holds_one_plaintext_and_refuses_a_second() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         let mut held = en.held.lock().unwrap();
         assert!(matches!(held.apply(&block(0, 1, b"first\n"), COff::ZERO), Ok(Applied::Stored)));
 
@@ -1396,7 +1396,7 @@ mod tests {
     /// because a retry must look to the primary like the first attempt did.
     #[test]
     fn the_same_bytes_at_the_same_offset_are_a_retry_not_a_clash() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         let mut held = en.held.lock().unwrap();
         let same = block(0, 1, b"once\n");
         assert!(matches!(held.apply(&same, COff::ZERO), Ok(Applied::Stored)));
@@ -1409,7 +1409,7 @@ mod tests {
     /// never be handed to different bytes. This is the whole point of #83.
     #[test]
     fn a_truncation_seals_so_a_freed_offset_is_never_reused() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         append(&en, 1, &line("keep"));
         append(&en, 1, &line("drop"));
         let mut held = en.held.lock().unwrap();
@@ -1437,7 +1437,7 @@ mod tests {
     /// instance left appendable is one a new primary could get an offset from.
     #[test]
     fn a_truncation_that_discards_nothing_still_seals() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         append(&en, 1, &line("all of it"));
         let mut held = en.held.lock().unwrap();
         let cut = held
@@ -1457,7 +1457,7 @@ mod tests {
     /// did not come from a watermark.
     #[test]
     fn a_truncation_must_land_where_a_block_ends() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         append(&en, 1, &line("first"));
         append(&en, 1, &line("second"));
         let mut held = en.held.lock().unwrap();
@@ -1491,7 +1491,7 @@ mod tests {
     /// sealing something invalid.
     #[test]
     fn a_truncation_that_would_leave_a_record_open_is_refused() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         let opened = Holds::of(Framing::Lf, b"", b"half a rec", None).unwrap();
         en.take(&AppendBlock { holds: opened, ..block(0, 1, b"half a rec") }, ROOM).unwrap();
         let closed = Holds::of(Framing::Lf, b"half a rec", b"ord\n", None).unwrap();
@@ -1510,7 +1510,7 @@ mod tests {
     /// growing an extent the primary had closed.
     #[test]
     fn a_sealed_extent_refuses_an_apply_as_well_as_an_append() {
-        let en = EN::new(testing::en_config());
+        let en = Disk::new(testing::en_config());
         let cap = COff::new(6);
         en.take(&block(0, 1, &line("full")), cap).unwrap();
         assert!(matches!(en.take(&block(0, 1, &line("x")), cap), Ok(Took::Sealed { .. })));
