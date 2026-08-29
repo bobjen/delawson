@@ -18,7 +18,7 @@
 
 use crate::config::Compress;
 use crate::framing::Framing;
-use crate::offset::LOff;
+use crate::offset::{ERoff, LOff};
 use crate::{Error, Result};
 
 /// What a block holds, as the writer knows it and as everything below has to be
@@ -29,7 +29,7 @@ pub struct Holds {
     /// numbering and what a logical offset counts.
     pub logical: LOff,
     /// Records this block completed, which is what numbers them.
-    pub records: u64,
+    pub records: ERoff,
     /// Whether the block ends inside a record. §8.2.4 permits that only for a block
     /// that closed nothing, and an extent may not seal while one is open.
     pub open_record: bool,
@@ -44,7 +44,7 @@ impl Holds {
         use crate::wire::Arg;
         vec![
             Arg::Number(self.logical.number()),
-            Arg::Number(self.records),
+            Arg::Number(self.records.number()),
             Arg::Flag(self.open_record),
             Arg::Flag(self.crc.is_some()),
             Arg::Number(self.crc.unwrap_or(0)),
@@ -68,7 +68,7 @@ impl Holds {
         Ok((
             Holds {
                 logical: LOff::of_number(*logical)?,
-                records: *records,
+                records: ERoff::of_number(*records)?,
                 open_record: *open_record,
                 crc: has_crc.then_some(*crc),
             },
@@ -81,6 +81,7 @@ impl Holds {
     pub fn of(framing: Framing, open: &[u8], block: &[u8], crc: Option<u64>) -> Result<Holds> {
         let (records, left) = framing.advance(open, block)?;
         let logical = LOff::of_len(block.len())?;
+        let records = ERoff::of_number(records)?;
         Ok(Holds { logical, records, open_record: !left.is_empty(), crc })
     }
 }
@@ -102,8 +103,8 @@ pub fn squeeze(how: Compress, block: &[u8]) -> Option<Vec<u8>> {
 /// Undo it, given how many logical bytes to expect. The length comes from the block's
 /// own record of itself rather than from the bytes, since a caller that has lost it
 /// cannot ask them.
-pub fn expand(how: Compress, stored: &[u8], logical: u64) -> Result<Vec<u8>> {
-    if stored.len() as u64 == logical {
+pub fn expand(how: Compress, stored: &[u8], logical: LOff) -> Result<Vec<u8>> {
+    if stored.len() as u64 == logical.number() {
         // Stored as it stands, because compressing it did not help.
         return Ok(stored.to_vec());
     }
@@ -113,12 +114,12 @@ pub fn expand(how: Compress, stored: &[u8], logical: u64) -> Result<Vec<u8>> {
             stored.len()
         ))),
         Compress::Lz4 => {
-            let block = lz4_flex::decompress(stored, logical as usize)
+            let block = lz4_flex::decompress(stored, logical.get() as usize)
                 .map_err(|e| Error::new(format!("a block would not decompress: {e}")))?;
             // The codec takes the length as a bound rather than a promise, so a
             // block that came out a different size is checked here — a wrong length
             // is either a corrupted one or a lying one, and both are worth saying.
-            if block.len() as u64 != logical {
+            if block.len() as u64 != logical.number() {
                 return Err(Error::new(format!(
                     "a block said {logical} logical bytes and decompressed to {}",
                     block.len()
@@ -142,7 +143,7 @@ mod tests {
         let block = lines(50);
         let stored = squeeze(Compress::Lz4, &block).expect("that should compress");
         assert!(stored.len() < block.len());
-        assert_eq!(expand(Compress::Lz4, &stored, block.len() as u64).unwrap(), block);
+        assert_eq!(expand(Compress::Lz4, &stored, LOff::of_len(block.len()).unwrap()).unwrap(), block);
     }
 
     /// The original is untouched, which is what lets the writer check it against its
@@ -163,8 +164,8 @@ mod tests {
         crate::random::Rng::new().fill(&mut noise);
         assert!(squeeze(Compress::Lz4, &noise).is_none());
         // And a block stored uncompressed reads back without a codec.
-        assert_eq!(expand(Compress::Lz4, &noise, noise.len() as u64).unwrap(), noise);
-        assert_eq!(expand(Compress::None, &noise, noise.len() as u64).unwrap(), noise);
+        assert_eq!(expand(Compress::Lz4, &noise, LOff::of_len(noise.len()).unwrap()).unwrap(), noise);
+        assert_eq!(expand(Compress::None, &noise, LOff::of_len(noise.len()).unwrap()).unwrap(), noise);
     }
 
     #[test]
@@ -178,14 +179,14 @@ mod tests {
     fn a_writer_measures_what_below_cannot_see() {
         let block = lines(3);
         let holds = Holds::of(Framing::Lf, b"", &block, Some(7)).unwrap();
-        assert_eq!(holds.records, 3);
+        assert_eq!(holds.records, ERoff::new(3));
         assert_eq!(holds.logical, LOff::of_len(block.len()).unwrap());
         assert!(!holds.open_record);
         assert_eq!(holds.crc, Some(7));
 
         // A block that leaves a record open says so, and it closed nothing.
         let partial = Holds::of(Framing::Lf, b"", b"half a rec", None).unwrap();
-        assert_eq!((partial.records, partial.open_record), (0, true));
+        assert_eq!((partial.records, partial.open_record), (ERoff::ZERO, true));
 
         // And one that closes a record then starts another is still refused here,
         // where the framing is still visible.
@@ -198,7 +199,7 @@ mod tests {
     fn a_wrong_logical_length_is_caught() {
         let block = lines(10);
         let stored = squeeze(Compress::Lz4, &block).expect("compressible");
-        assert!(expand(Compress::Lz4, &stored, 7).is_err(), "too small to be right");
-        assert!(expand(Compress::Lz4, &stored, 1 << 20).is_err(), "too large to be right");
+        assert!(expand(Compress::Lz4, &stored, LOff::new(7)).is_err(), "too small to be right");
+        assert!(expand(Compress::Lz4, &stored, LOff::new(1 << 20)).is_err(), "too large to be right");
     }
 }

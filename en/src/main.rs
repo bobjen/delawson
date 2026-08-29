@@ -225,7 +225,7 @@ impl Extents {
         extent.end = offset.plus(stored)?;
         extent.logical_end = extent.logical_end.plus(logical)?;
         let first_record = extent.records;
-        let records = ERoff::of_number(appending.holds.records)?;
+        let records = appending.holds.records;
         extent.records = first_record.plus(records)?;
         extent.open_record = appending.holds.open_record;
         self.appends.push(Append {
@@ -297,7 +297,7 @@ impl Extents {
         let first_record = extent.records;
         extent.end = extent.end.max(offset.plus(stored)?);
         extent.logical_end = extent.logical_end.plus(logical)?;
-        extent.records = extent.records.plus(ERoff::of_number(appending.holds.records)?)?;
+        extent.records = extent.records.plus(appending.holds.records)?;
         extent.open_record = appending.holds.open_record;
         self.appends.push(Append {
             extent: place,
@@ -357,7 +357,7 @@ impl Extents {
                     append.offset
                 )));
             }
-            records = records.plus(ERoff::of_number(append.holds.records)?)?;
+            records = records.plus(append.holds.records)?;
             logical = logical.plus(append.holds.logical)?;
             length = length.max(past);
             if last.is_none_or(|(at, _)| append.offset >= at) {
@@ -417,7 +417,7 @@ impl Extents {
         // it sits inside a record an earlier block began (§8.2.4), and its bytes are
         // part of that record, so a range over that record has to carry it.
         let Some(first) = blocks.iter().position(|a| {
-            a.first_record >= from || from.number() < a.first_record.number() + a.holds.records
+            a.first_record >= from || from.number() < a.first_record.number() + a.holds.records.number()
         }) else {
             return Ok(None);
         };
@@ -426,7 +426,7 @@ impl Extents {
         let mut taken: Vec<&Append> = Vec::new();
         for block in &blocks[first..] {
             covered.took(
-                block.holds.records,
+                block.holds.records.number(),
                 block.holds.logical,
                 COff::of_len(block.bytes.len())?,
             );
@@ -449,7 +449,7 @@ impl Extents {
         // asking for the same thing again.
         covered.next = taken
             .last()
-            .map_or(from.number(), |last| last.first_record.number() + last.holds.records);
+            .map_or(from.number(), |last| last.first_record.number() + last.holds.records.number());
         covered.more = first + taken.len() < blocks.len();
         Ok(Some(Ranged { blocks: taken, covered }))
     }
@@ -755,7 +755,7 @@ impl Disk {
                 Piece {
                     logical: block.holds.logical.number(),
                     first_record: block.first_record.number(),
-                    records: block.holds.records,
+                    records: block.holds.records.number(),
                     crc: block.holds.crc,
                     bytes: block.bytes.clone(),
                 }

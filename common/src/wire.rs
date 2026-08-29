@@ -799,7 +799,7 @@ mod tests {
             created: TimeSec::new(1_000_000),
             holds: crate::block::Holds {
                 logical: crate::offset::LOff::new(10),
-                records: 2,
+                records: crate::offset::ERoff::new(2),
                 open_record: false,
                 crc: Some(0xae8b_1486_0a79_9888),
             },
