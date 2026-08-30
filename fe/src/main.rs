@@ -84,7 +84,7 @@ struct Open {
     /// changes with every append and is therefore not a thing to remember.
     records: u64,
     /// The framing used for records in this extent.
-    framing: Framing,
+    _framing: Framing,
     /// The **disks** holding its instances, primary first, each as `(EnId, DiskId)`.
     disks: Vec<(EnId, DiskId)>,
 }
@@ -124,7 +124,7 @@ impl Open {
             created: TimeSec::new(*created),
             first_record: *first_record,
             records: *records,
-            framing,
+            _framing: framing,
             disks,
         })
     }
@@ -577,11 +577,8 @@ impl FE {
             extent: open.id,
             created: open.created,
             holds,
-            overhead: open.framing.overhead(),
-            first_record: 0,
-            instances: open.disks.clone(),
-            offset: None,
             logical_offset: None,
+            instances: open.disks.clone(),
             bytes: body.clone(),
         }
         .request(open.disks[0].0, open.disks[0].1, Op::AppendExtent);
@@ -1976,7 +1973,7 @@ mod tests {
             created: TimeSec::new(1_000_000),
             first_record: 40,
             records: 0,
-            framing: Framing::Lf,
+            _framing: Framing::Lf,
             disks: vec![(EnId::new(2), DiskId::new(0)), (EnId::new(3), DiskId::new(0))],
         };
         let from_en = Response {
@@ -2032,7 +2029,7 @@ mod tests {
             created: TimeSec::new(1_000_000),
             first_record: 0,
             records: 0,
-            framing: Framing::Lf,
+            _framing: Framing::Lf,
             disks: vec![(EnId::new(2), DiskId::new(0))],
         };
         let refused = Response::error(Status::Internal, "two instances would not apply it");
@@ -2046,7 +2043,7 @@ mod tests {
             created: TimeSec::new(1_000_000),
             first_record,
             records: 0,
-            framing: Framing::Lf,
+            _framing: Framing::Lf,
             disks: vec![
                 (EnId::new(2), DiskId::new(0)),
                 (EnId::new(3), DiskId::new(0)),

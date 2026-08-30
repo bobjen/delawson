@@ -246,7 +246,7 @@ fn tick() {
             std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
             SECOND.store(now_secs(), Ordering::Relaxed);
             ticks += 1;
-            if ticks % (FLUSH_MS / TICK_MS) == 0 {
+            if ticks.is_multiple_of(FLUSH_MS / TICK_MS) {
                 flush();
             }
         }
@@ -345,7 +345,7 @@ fn emit(
                 let urgent = level >= Level::Warning;
                 let _ = logger.full.lock().expect("log").write(line.as_bytes(), urgent);
                 // Everything above info, and a sampled share of the rest.
-                if level > Level::Info || stride <= 1 || seen % stride == 0 {
+                if level > Level::Info || stride <= 1 || seen.is_multiple_of(stride) {
                     let _ = logger.info.lock().expect("log").write(line.as_bytes(), urgent);
                 }
             }
@@ -397,7 +397,7 @@ fn recount() {
     let sites = SITES.lock().expect("sites");
     let mut counted: Vec<(u64, &&Site)> =
         sites.iter().map(|site| (site.count.load(Ordering::Relaxed), site)).collect();
-    counted.sort_by(|a, b| a.0.cmp(&b.0));
+    counted.sort_by_key(|a| a.0);
 
     let total: u64 = counted.iter().map(|(count, _)| count).sum();
     let target = (total as f64 * logger.config.info_share) as u64;
@@ -444,7 +444,7 @@ pub fn histogram() -> Vec<(u64, u64, String)> {
             )
         })
         .collect();
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_by_key(|b| std::cmp::Reverse(b.0));
     rows
 }
 

@@ -80,7 +80,7 @@ impl Seal {
     }
 
     /// Seal `plain` into `out` as one segment. `plain` is left usable as scratch.
-    pub fn seal(&mut self, plain: &mut Vec<u8>, out: &mut Vec<u8>) -> Result<()> {
+    pub fn seal(&mut self, plain: &mut [u8], out: &mut Vec<u8>) -> Result<()> {
         let counter = self.counter;
         self.counter += 1;
 

@@ -150,6 +150,31 @@ impl Framing {
         }
         Ok((records, carry))
     }
+
+    /// The size this block would occupy in `length` framing, which is the
+    /// canonical logical space.
+    pub fn canonical_size(self, open_len: usize, block: &[u8]) -> Result<u64> {
+        // Use dummy open bytes to find record boundaries.
+        let (records, _) = self.advance(&vec![0u8; open_len], block)?;
+        let overhead = self.overhead() as usize;
+
+        let body_len = if records > 0 {
+            block.len() - (records as usize * overhead)
+        } else {
+            match self {
+                Framing::Fixed(_) => block.len(),
+                Framing::Nul | Framing::Lf | Framing::CrLf => block.len(),
+                Framing::Length => {
+                    if open_len >= 4 {
+                        block.len()
+                    } else {
+                        block.len().saturating_sub(4 - open_len)
+                    }
+                }
+            }
+        };
+        Ok(body_len as u64 + records * 4)
+    }
 }
 
 impl std::fmt::Display for Framing {

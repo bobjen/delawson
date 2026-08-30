@@ -31,6 +31,7 @@ impl Rng {
         rng
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> u64 {
         let e = self.a.wrapping_sub(self.b.rotate_left(7));
         self.a = self.b ^ self.c.rotate_left(13);

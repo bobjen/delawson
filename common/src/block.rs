@@ -80,7 +80,7 @@ impl Holds {
     /// If `crc` is `None`, it is computed over the uncompressed block bytes.
     pub fn of(framing: Framing, open: &[u8], block: &[u8], crc: Option<u64>) -> Result<Holds> {
         let (records, left) = framing.advance(open, block)?;
-        let logical = ELoff::of_len(block.len())?;
+        let logical = ELoff::of_number(framing.canonical_size(open.len(), block)?)?;
         let records = ERoff::of_number(records)?;
         let crc = crc.unwrap_or_else(|| crate::crc::of(block));
         Ok(Holds { logical, records, open_record: !left.is_empty(), crc })
@@ -101,28 +101,28 @@ pub fn squeeze(how: Compress, block: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// Undo it, given how many logical bytes to expect. The length comes from the block's
-/// own record of itself rather than from the bytes, since a caller that has lost it
-/// cannot ask them.
-pub fn expand(how: Compress, stored: &[u8], logical: ELoff) -> Result<Vec<u8>> {
-    if stored.len() as u64 == logical.number() {
+/// Undo it, given how many uncompressed bytes to expect. The length comes from the
+/// block's own record of itself rather than from the bytes, since a caller that
+/// has lost it cannot ask them.
+pub fn expand(how: Compress, stored: &[u8], expected: usize) -> Result<Vec<u8>> {
+    if stored.len() == expected {
         // Stored as it stands, because compressing it did not help.
         return Ok(stored.to_vec());
     }
     match how {
         Compress::None => Err(Error::new(format!(
-            "{} stored bytes for {logical} logical, with nothing to have compressed them",
+            "{} stored bytes for {expected} expected, with nothing to have compressed them",
             stored.len()
         ))),
         Compress::Lz4 => {
-            let block = lz4_flex::decompress(stored, logical.get() as usize)
+            let block = lz4_flex::decompress(stored, expected)
                 .map_err(|e| Error::new(format!("a block would not decompress: {e}")))?;
             // The codec takes the length as a bound rather than a promise, so a
             // block that came out a different size is checked here — a wrong length
             // is either a corrupted one or a lying one, and both are worth saying.
-            if block.len() as u64 != logical.number() {
+            if block.len() != expected {
                 return Err(Error::new(format!(
-                    "a block said {logical} logical bytes and decompressed to {}",
+                    "a block said {expected} bytes and decompressed to {}",
                     block.len()
                 )));
             }
@@ -144,7 +144,7 @@ mod tests {
         let block = lines(50);
         let stored = squeeze(Compress::Lz4, &block).expect("that should compress");
         assert!(stored.len() < block.len());
-        assert_eq!(expand(Compress::Lz4, &stored, ELoff::of_len(block.len()).unwrap()).unwrap(), block);
+        assert_eq!(expand(Compress::Lz4, &stored, block.len()).unwrap(), block);
     }
 
     /// The original is untouched, which is what lets the writer check it against its
@@ -165,8 +165,8 @@ mod tests {
         crate::random::Rng::new().fill(&mut noise);
         assert!(squeeze(Compress::Lz4, &noise).is_none());
         // And a block stored uncompressed reads back without a codec.
-        assert_eq!(expand(Compress::Lz4, &noise, ELoff::of_len(noise.len()).unwrap()).unwrap(), noise);
-        assert_eq!(expand(Compress::None, &noise, ELoff::of_len(noise.len()).unwrap()).unwrap(), noise);
+        assert_eq!(expand(Compress::Lz4, &noise, noise.len()).unwrap(), noise);
+        assert_eq!(expand(Compress::None, &noise, noise.len()).unwrap(), noise);
     }
 
     #[test]
@@ -181,7 +181,9 @@ mod tests {
         let block = lines(3);
         let holds = Holds::of(Framing::Lf, b"", &block, Some(7)).unwrap();
         assert_eq!(holds.records, ERoff::new(3));
-        assert_eq!(holds.logical, ELoff::of_len(block.len()).unwrap());
+        // Lf overhead is 1. body is lines(3).len() - 3.
+        // canonical = (len - 3) + 3 * 4 = len + 9.
+        assert_eq!(holds.logical, ELoff::of_number((block.len() + 9) as u64).unwrap());
         assert!(!holds.open_record);
         assert_eq!(holds.crc, 7);
 
@@ -205,7 +207,7 @@ mod tests {
     fn a_wrong_logical_length_is_caught() {
         let block = lines(10);
         let stored = squeeze(Compress::Lz4, &block).expect("compressible");
-        assert!(expand(Compress::Lz4, &stored, ELoff::new(7)).is_err(), "too small to be right");
-        assert!(expand(Compress::Lz4, &stored, ELoff::new(1 << 20)).is_err(), "too large to be right");
+        assert!(expand(Compress::Lz4, &stored, 7).is_err(), "too small to be right");
+        assert!(expand(Compress::Lz4, &stored, 1 << 20).is_err(), "too large to be right");
     }
 }
