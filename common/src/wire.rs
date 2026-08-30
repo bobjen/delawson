@@ -295,6 +295,16 @@ impl Response {
         Response { id: 0, status, args: vec![Arg::Text(message.into())] }
     }
 
+    pub fn flag(mut self, b: bool) -> Response {
+        self.args.push(Arg::Flag(b));
+        self
+    }
+
+    pub fn bytes(mut self, bytes: Vec<u8>) -> Response {
+        self.args.push(Arg::Bytes(bytes));
+        self
+    }
+
     /// Answer this request, whenever the answer is ready.
     pub fn to(mut self, request: &Request) -> Response {
         self.id = request.id;
@@ -342,6 +352,11 @@ pub struct AppendBlock {
     pub created: TimeSec,
     /// What the writer says these bytes contain.
     pub holds: crate::block::Holds,
+    /// Bytes a record costs beyond its content, which is what lets an EN compute
+    /// a canonical logical offset for encryption (§17.32.3).
+    pub overhead: u32,
+    /// The extent-local number of the first record this block completed.
+    pub first_record: u64,
     /// Instances of the extent, primary first. Empty on the way to a secondary,
     /// which has nothing to broadcast to.
     /// The **(EnId, DiskId)** pairs holding it, primary first.
@@ -349,6 +364,8 @@ pub struct AppendBlock {
     /// The offset the primary chose, on the way to a secondary. None on the way in,
     /// since choosing it is the primary's job.
     pub offset: Option<u64>,
+    /// The logical offset assigned by the primary, also for secondaries.
+    pub logical_offset: Option<u64>,
     /// The block as stored: compressed, unless compressing it did not help.
     pub bytes: Vec<u8>,
 }
@@ -362,7 +379,13 @@ impl AppendBlock {
             .number(self.extent.number())
             .number(self.created.number());
         request.args.extend(self.holds.args());
-        request = request.flag(self.offset.is_some()).number(self.offset.unwrap_or(0));
+        request = request
+            .number(self.overhead as u64)
+            .number(self.first_record)
+            .flag(self.offset.is_some())
+            .number(self.offset.unwrap_or(0))
+            .flag(self.logical_offset.is_some())
+            .number(self.logical_offset.unwrap_or(0));
         for (en, disk) in &self.instances {
             request = request.number(en.number()).number(disk.number());
         }
@@ -376,8 +399,10 @@ impl AppendBlock {
             return Err(Error::new("an append does not have the shape of one"));
         };
         let (holds, rest) = crate::block::Holds::of_args(rest)?;
-        let [Arg::Flag(has_offset), Arg::Number(offset), instances @ ..] = rest else {
-            return Err(Error::new("an append says whether it has an offset"));
+        let [Arg::Number(overhead), Arg::Number(first_record), Arg::Flag(has_offset), Arg::Number(offset), Arg::Flag(has_logical), Arg::Number(logical), instances @ ..] =
+            rest
+        else {
+            return Err(Error::new("an append says what its overhead and offset are"));
         };
         let Some((Arg::Bytes(bytes), instances)) = instances.split_last() else {
             return Err(Error::new("an append carries bytes last"));
@@ -402,8 +427,11 @@ impl AppendBlock {
                 extent: ExtentId::of_number(*extent)?,
                 created: TimeSec::new(*created),
                 holds,
+                overhead: *overhead as u32,
+                first_record: *first_record,
                 instances: parsed,
                 offset: has_offset.then_some(*offset),
+                logical_offset: has_logical.then_some(*logical),
                 bytes: bytes.clone(),
             },
         ))
@@ -803,6 +831,8 @@ mod tests {
                 open_record: false,
                 crc: 0xae8b_1486_0a79_9888,
             },
+            overhead: 1,
+            first_record: 0,
             instances: vec![
                 (EnId::new(2), DiskId::new(0)),
                 (EnId::new(3), DiskId::new(0)),
@@ -810,6 +840,7 @@ mod tests {
                 (EnId::new(1), DiskId::new(0)),
             ],
             offset: None,
+            logical_offset: None,
             bytes: b"squeezed".to_vec(),
         };
         let en = EnId::new(2);

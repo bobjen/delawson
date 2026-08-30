@@ -83,6 +83,8 @@ struct Open {
     /// Records in it, or zero for the extent still being appended to — whose count
     /// changes with every append and is therefore not a thing to remember.
     records: u64,
+    /// The framing used for records in this extent.
+    framing: Framing,
     /// The **disks** holding its instances, primary first, each as `(EnId, DiskId)`.
     disks: Vec<(EnId, DiskId)>,
 }
@@ -90,7 +92,7 @@ struct Open {
 impl Open {
     /// The id, the second, the first record, how many records it holds, the count of instances,
     /// then the (en, disk) pairs, which is the order the SN answers in.
-    fn of(sn: SnId, args: &[Arg]) -> Option<Open> {
+    fn of(sn: SnId, framing: Framing, args: &[Arg]) -> Option<Open> {
         let [
             Arg::Number(id),
             Arg::Number(created),
@@ -122,6 +124,7 @@ impl Open {
             created: TimeSec::new(*created),
             first_record: *first_record,
             records: *records,
+            framing,
             disks,
         })
     }
@@ -512,7 +515,7 @@ impl FE {
         answer: Response,
     ) {
         let extent = match answer.status {
-            Status::Ok => Open::of(wanting.located.sn, &answer.args),
+            Status::Ok => Open::of(wanting.located.sn, wanting.located.framing, &answer.args),
             _ => None,
         };
         let waiting = {
@@ -574,8 +577,11 @@ impl FE {
             extent: open.id,
             created: open.created,
             holds,
+            overhead: open.framing.overhead(),
+            first_record: 0,
             instances: open.disks.clone(),
             offset: None,
+            logical_offset: None,
             bytes: body.clone(),
         }
         .request(open.disks[0].0, open.disks[0].1, Op::AppendExtent);
@@ -769,7 +775,7 @@ impl FE {
             if answer.status != Status::Ok {
                 return reply.send(answer);
             }
-            let Some(open) = Open::of(located.sn, &answer.args) else {
+            let Some(open) = Open::of(located.sn, located.framing, &answer.args) else {
                 return reply
                     .send(Response::error(Status::Internal, "that answer named no extent"));
             };
@@ -1880,7 +1886,7 @@ mod tests {
             Arg::Number(1),
             Arg::Number(0),
         ];
-        let open = Open::of(SnId::new(0), &args).expect("an extent");
+        let open = Open::of(SnId::new(0), Framing::Lf, &args).expect("an extent");
         assert_eq!(
             (open.sn, open.id, open.created, open.first_record),
             (SnId::new(0), ExtentId::new(7), TimeSec::new(1_000_000), 40)
@@ -1905,12 +1911,13 @@ mod tests {
         assert!(
             Open::of(
                 SnId::new(0),
+                Framing::Lf,
                 &[Arg::Number(7), Arg::Number(1_000_000), Arg::Number(0), Arg::Number(0)]
             )
             .is_none()
         );
-        assert!(Open::of(SnId::new(0), &[Arg::Number(7), Arg::Number(1_000_000)]).is_none());
-        assert!(Open::of(SnId::new(0), &[]).is_none());
+        assert!(Open::of(SnId::new(0), Framing::Lf, &[Arg::Number(7), Arg::Number(1_000_000)]).is_none());
+        assert!(Open::of(SnId::new(0), Framing::Lf, &[]).is_none());
     }
 
     /// The DN's answer says which stream, which SN, and how the records are framed.
@@ -1969,6 +1976,7 @@ mod tests {
             created: TimeSec::new(1_000_000),
             first_record: 40,
             records: 0,
+            framing: Framing::Lf,
             disks: vec![(EnId::new(2), DiskId::new(0)), (EnId::new(3), DiskId::new(0))],
         };
         let from_en = Response {
@@ -2024,6 +2032,7 @@ mod tests {
             created: TimeSec::new(1_000_000),
             first_record: 0,
             records: 0,
+            framing: Framing::Lf,
             disks: vec![(EnId::new(2), DiskId::new(0))],
         };
         let refused = Response::error(Status::Internal, "two instances would not apply it");
@@ -2037,6 +2046,7 @@ mod tests {
             created: TimeSec::new(1_000_000),
             first_record,
             records: 0,
+            framing: Framing::Lf,
             disks: vec![
                 (EnId::new(2), DiskId::new(0)),
                 (EnId::new(3), DiskId::new(0)),

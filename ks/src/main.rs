@@ -9,12 +9,13 @@
 //! distinguishable from a malformed one.
 
 use common::config::KsConfig;
+use common::crypto;
 use common::logn;
 use common::registry::{self, Peer};
 use common::server::{self, Process, Service};
 use common::wire::{Arg, Op, Request, Response, Status};
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 struct Ks {
@@ -25,6 +26,8 @@ struct Ks {
     unlocked: AtomicBool,
     /// In memory only, so a KS restart makes every other process re-register.
     peers: Mutex<BTreeMap<String, Peer>>,
+    /// Cached SN daily keys.
+    sn_keys: RwLock<BTreeMap<(common::ids::SnId, u64), [u8; 32]>>,
 }
 
 const SERVES: &[Op] =
@@ -45,8 +48,15 @@ impl Service for Ks {
             Op::Lookup => self.lookup(request),
             Op::Registry => registry::response(self.peers.lock().expect("peers").values().cloned()),
 
-            Op::Unlock | Op::SnMasterKey | Op::RotateMasterKey => {
-                logn!("asked for a key", "op {}", request.op);
+            Op::SnMasterKey => {
+                if !self.unlocked.load(Ordering::SeqCst) {
+                    return Response::error(Status::Locked, "KS is locked");
+                }
+                self.sn_key(request)
+            }
+
+            Op::Unlock | Op::RotateMasterKey => {
+                logn!("asked for a key op", "op {}", request.op);
                 if !self.unlocked.load(Ordering::SeqCst) && request.op != Op::Unlock {
                     return Response::error(Status::Locked, "KS is locked");
                 }
@@ -60,24 +70,57 @@ impl Service for Ks {
         match op {
             Op::Ping => self.config.inline_ping,
             Op::Status | Op::Shutdown | Op::Sites => true,
-            // A registry lookup takes a lock, so it goes to a worker.
+            // A registry lookup or key derivation takes a lock/time, so it goes to a worker.
             _ => false,
         }
     }
 
     fn status(&self, _process: &Process) -> Vec<String> {
+        let sn_keys = self.sn_keys.read().expect("sn_keys").len();
         vec![
             format!("lazy_day_keys {}", self.config.lazy_day_keys),
             format!("require_unlock {}", self.config.require_unlock),
             format!("inline_ping {}", self.config.inline_ping),
             format!("unlocked {}", self.unlocked.load(Ordering::SeqCst)),
             format!("registered {}", self.peers.lock().expect("peers").len()),
-            "master_keys 0".to_string(),
+            format!("master_keys 1"),
+            format!("sn_daily_keys {sn_keys}"),
         ]
     }
 }
 
 impl Ks {
+    fn new(config: KsConfig) -> Ks {
+        let unlocked = AtomicBool::new(!config.require_unlock);
+        Ks {
+            config,
+            unlocked,
+            peers: Mutex::new(BTreeMap::new()),
+            sn_keys: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    fn sn_key(&self, request: &Request) -> Response {
+        let [Arg::Number(sn), Arg::Number(day)] = request.args.as_slice() else {
+            return Response::error(Status::BadRequest, "sn-master-key takes an SN and a day");
+        };
+        let sn = match common::ids::SnId::of_number(*sn) {
+            Ok(sn) => sn,
+            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+        };
+
+        {
+            let keys = self.sn_keys.read().expect("sn_keys");
+            if let Some(key) = keys.get(&(sn, *day)) {
+                return Response::ok().bytes(key.to_vec());
+            }
+        }
+
+        let key = crypto::sn_daily_key(sn, *day);
+        self.sn_keys.write().expect("sn_keys").insert((sn, *day), key);
+        Response::ok().bytes(key.to_vec())
+    }
+
     /// A registration announces a port; it does not invent an identity. The
     /// roster says who may exist, so a mismatch is a misconfiguration to report
     /// rather than a peer to record.
@@ -120,8 +163,7 @@ fn main() {
         if !config.require_unlock {
             logn!("no unlock ceremony required because this is a test configuration");
         }
-        let unlocked = AtomicBool::new(!config.require_unlock);
-        Ok(Ks { config, unlocked, peers: Mutex::new(BTreeMap::new()) })
+        Ok(Ks::new(config))
     });
     if let Err(e) = result {
         eprintln!("ks: {e}");
