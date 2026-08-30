@@ -1468,9 +1468,7 @@ fn records_of(framing: Framing, pieces: &[Piece]) -> Result<Vec<(u64, Vec<u8>)>>
     let mut numbering = pieces.first().map_or(0, |piece| piece.first_record);
     for piece in pieces {
         let block = expand(Compress::Lz4, &piece.bytes, LOff::of_number(piece.logical)?)?;
-        if let Some(crc) = piece.crc
-            && crc != common::crc::of(&block)
-        {
+        if piece.crc != common::crc::of(&block) {
             return Err(Error::new(format!(
                 "{} bytes came back and do not match the CRC they were written with",
                 block.len()
@@ -1821,9 +1819,7 @@ fn build(cmd: &Cmd) -> Result<Request> {
             // ⚠️ And **not in place**, so the original survives to be checked. A
             // corruption before or during compression shows up here as a mismatch
             // rather than as durable wrong data.
-            if let Some(promised) = checksum
-                && promised != common::crc::of(&block)
-            {
+            if common::crc::of(&block) != holds.crc {
                 return Err(Error::new("this buffer changed while it was being compressed"));
             }
 
@@ -1927,5 +1923,35 @@ mod tests {
         assert_eq!(asked.detail, 0);
         assert!(asked.beyond(0).is_empty(), "so nothing is beyond what is built");
         assert_ne!(asked, Want::plain(), "but it still travels, since the limit is meant");
+    }
+
+    /// Decompressing checks the CRC over the uncompressed block bytes.
+    #[test]
+    fn records_of_verifies_crc_over_block_bytes() {
+        let framing = Framing::Lf;
+        let body1 = b"hello";
+        let body2 = b"world";
+        let block1 = frame(framing, body1).unwrap();
+        let block2 = frame(framing, body2).unwrap();
+        let piece1 = Piece {
+            logical: block1.len() as u64,
+            first_record: 0,
+            records: 1,
+            crc: common::crc::of(&block1),
+            bytes: block1.clone(),
+        };
+        let piece2 = Piece {
+            logical: block2.len() as u64,
+            first_record: 1,
+            records: 1,
+            crc: common::crc::of(&block2),
+            bytes: block2.clone(),
+        };
+        let found = records_of(framing, &[piece1.clone(), piece2]).unwrap();
+        assert_eq!(found, vec![(0, body1.to_vec()), (1, body2.to_vec())]);
+
+        // A wrong CRC is detected and refused.
+        let corrupt = Piece { crc: 0xdeadbeef, ..piece1 };
+        assert!(records_of(framing, &[corrupt]).is_err());
     }
 }

@@ -1815,7 +1815,7 @@ mod tests {
             logical: 3,
             first_record,
             records: 1,
-            crc: None,
+            crc: 0,
             bytes: b"a\n".to_vec(),
         };
         let mut args = covered.args();

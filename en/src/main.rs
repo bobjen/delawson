@@ -636,9 +636,7 @@ impl Disk {
         if let Took::Landed(_) = &took {
             self.appends.fetch_add(1, Ordering::Relaxed);
             self.bytes.fetch_add(appending.bytes.len() as u64, Ordering::Relaxed);
-            if appending.holds.crc.is_some() {
-                self.checksummed.fetch_add(1, Ordering::Relaxed);
-            }
+            self.checksummed.fetch_add(1, Ordering::Relaxed);
         }
         Ok(took)
     }
@@ -1087,7 +1085,7 @@ mod tests {
     /// stored uncompressed, which is what a client does when compressing did not
     /// help. What the Disk does is the same either way — it never looks inside.
     fn block(sn: u32, extent: u32, bytes: &[u8]) -> AppendBlock {
-        let holds = Holds::of(Framing::Lf, b"", bytes, Some(common::crc::of(bytes)))
+        let holds = Holds::of(Framing::Lf, b"", bytes, None)
             .expect("a well-formed block");
         AppendBlock {
             sn: SnId::new(sn),
@@ -1246,7 +1244,7 @@ mod tests {
         let en = EN::new(testing::en_config());
         let disk = en.disk(DiskId::FIRST).unwrap();
         let records = (0..40).flat_map(|n| line(&format!("record {n}"))).collect::<Vec<u8>>();
-        let holds = Holds::of(Framing::Lf, b"", &records, Some(common::crc::of(&records))).unwrap();
+        let holds = Holds::of(Framing::Lf, b"", &records, None).unwrap();
         let stored = common::block::squeeze(common::config::Compress::Lz4, &records)
             .expect("that should compress");
         assert!(stored.len() < records.len());
@@ -1438,12 +1436,12 @@ mod tests {
         let disk = en.disk(DiskId::FIRST).unwrap();
         append(&en, 1, &line("checksummed"));
         let mut wrong = block(0, 1, &line("also fine"));
-        wrong.holds.crc = Some(0);
+        wrong.holds.crc = 0;
         assert!(matches!(disk.take(&wrong, ROOM), Ok(Took::Landed(_))));
 
         let held = disk.held.lock().unwrap();
-        assert_eq!(held.appends[0].holds.crc, Some(common::crc::of(&line("checksummed"))));
-        assert_eq!(held.appends[1].holds.crc, Some(0), "kept, wrong or not");
+        assert_eq!(held.appends[0].holds.crc, common::crc::of(&line("checksummed")));
+        assert_eq!(held.appends[1].holds.crc, 0, "kept, wrong or not");
         assert_eq!(disk.checksummed.load(Ordering::Relaxed), 2);
     }
 

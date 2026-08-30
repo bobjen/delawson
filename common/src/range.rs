@@ -517,7 +517,7 @@ pub struct Piece {
     /// completes nothing (§8.2.4), and it is still part of the answer because its
     /// bytes are part of that record.
     pub records: u64,
-    pub crc: Option<u64>,
+    pub crc: u64,
     pub bytes: Vec<u8>,
 }
 
@@ -527,8 +527,7 @@ impl Piece {
             Arg::Number(self.logical),
             Arg::Number(self.first_record),
             Arg::Number(self.records),
-            Arg::Flag(self.crc.is_some()),
-            Arg::Number(self.crc.unwrap_or(0)),
+            Arg::Number(self.crc),
             Arg::Bytes(self.bytes.clone()),
         ]
     }
@@ -538,7 +537,6 @@ impl Piece {
             Arg::Number(logical),
             Arg::Number(first_record),
             Arg::Number(records),
-            Arg::Flag(has_crc),
             Arg::Number(crc),
             Arg::Bytes(bytes),
             rest @ ..,
@@ -551,7 +549,7 @@ impl Piece {
                 logical: *logical,
                 first_record: *first_record,
                 records: *records,
-                crc: has_crc.then_some(*crc),
+                crc: *crc,
                 bytes: bytes.clone(),
             },
             rest,
@@ -743,7 +741,7 @@ mod tests {
             logical: bytes.len() as u64,
             first_record,
             records,
-            crc: Some(7),
+            crc: 7,
             bytes: bytes.to_vec(),
         }
     }
@@ -760,26 +758,13 @@ mod tests {
         assert!(Piece::all_of_args(&[]).expect("none").is_empty());
     }
 
-    /// A block with no CRC keeps saying so, because the flag is what a reader
-    /// decides by — a zero is a CRC that happens to be zero.
-    #[test]
-    fn a_block_without_a_crc_is_not_one_with_a_zero() {
-        let bare = Piece { crc: None, ..piece(0, 1, b"x\n") };
-        let args = bare.args();
-        let (back, _) = Piece::of_args(&args).expect("a block");
-        assert_eq!(back.crc, None);
-        let zero = Piece { crc: Some(0), ..piece(0, 1, b"x\n") };
-        let args = zero.args();
-        assert_eq!(Piece::of_args(&args).expect("a block").0.crc, Some(0));
-    }
-
     /// Half a shape is an error rather than a block with defaults, and a trailing
     /// fragment does not quietly disappear.
     #[test]
     fn a_partial_block_is_refused() {
         let whole = piece(0, 1, b"x\n");
         let args = whole.args();
-        assert!(Piece::of_args(&args[..5]).is_err(), "no bytes");
+        assert!(Piece::of_args(&args[..4]).is_err(), "no bytes");
         let mut ragged = args.clone();
         ragged.push(Arg::Number(1));
         assert!(Piece::all_of_args(&ragged).is_err(), "one whole block and a fragment");

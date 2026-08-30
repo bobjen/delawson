@@ -33,12 +33,12 @@ pub struct Holds {
     /// Whether the block ends inside a record. §8.2.4 permits that only for a block
     /// that closed nothing, and an extent may not seal while one is open.
     pub open_record: bool,
-    /// The writer's CRC of the logical bytes, if it computed one.
-    pub crc: Option<u64>,
+    /// The writer's CRC of the uncompressed block bytes.
+    pub crc: u64,
 }
 
 impl Holds {
-    /// On the wire, as five arguments. Written and read here so that no two
+    /// On the wire, as four arguments. Written and read here so that no two
     /// processes count positions independently — the mistake §17.13.3 records.
     pub fn args(&self) -> Vec<crate::wire::Arg> {
         use crate::wire::Arg;
@@ -46,8 +46,7 @@ impl Holds {
             Arg::Number(self.logical.number()),
             Arg::Number(self.records.number()),
             Arg::Flag(self.open_record),
-            Arg::Flag(self.crc.is_some()),
-            Arg::Number(self.crc.unwrap_or(0)),
+            Arg::Number(self.crc),
         ]
     }
 
@@ -58,7 +57,6 @@ impl Holds {
             Arg::Number(logical),
             Arg::Number(records),
             Arg::Flag(open_record),
-            Arg::Flag(has_crc),
             Arg::Number(crc),
             rest @ ..,
         ] = args
@@ -70,7 +68,7 @@ impl Holds {
                 logical: LOff::of_number(*logical)?,
                 records: ERoff::of_number(*records)?,
                 open_record: *open_record,
-                crc: has_crc.then_some(*crc),
+                crc: *crc,
             },
             rest,
         ))
@@ -78,10 +76,13 @@ impl Holds {
 
     /// Measure a framed block, before compressing it. The writer is the only party
     /// that can: below here the bytes are compressed and the framing is invisible.
+    ///
+    /// If `crc` is `None`, it is computed over the uncompressed block bytes.
     pub fn of(framing: Framing, open: &[u8], block: &[u8], crc: Option<u64>) -> Result<Holds> {
         let (records, left) = framing.advance(open, block)?;
         let logical = LOff::of_len(block.len())?;
         let records = ERoff::of_number(records)?;
+        let crc = crc.unwrap_or_else(|| crate::crc::of(block));
         Ok(Holds { logical, records, open_record: !left.is_empty(), crc })
     }
 }
@@ -182,11 +183,16 @@ mod tests {
         assert_eq!(holds.records, ERoff::new(3));
         assert_eq!(holds.logical, LOff::of_len(block.len()).unwrap());
         assert!(!holds.open_record);
-        assert_eq!(holds.crc, Some(7));
+        assert_eq!(holds.crc, 7);
+
+        // When CRC is omitted, it is computed over the uncompressed block bytes.
+        let auto = Holds::of(Framing::Lf, b"", &block, None).unwrap();
+        assert_eq!(auto.crc, crate::crc::of(&block));
 
         // A block that leaves a record open says so, and it closed nothing.
         let partial = Holds::of(Framing::Lf, b"", b"half a rec", None).unwrap();
         assert_eq!((partial.records, partial.open_record), (ERoff::ZERO, true));
+        assert_eq!(partial.crc, crate::crc::of(b"half a rec"));
 
         // And one that closes a record then starts another is still refused here,
         // where the framing is still visible.

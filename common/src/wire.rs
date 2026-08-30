@@ -801,7 +801,7 @@ mod tests {
                 logical: crate::offset::LOff::new(10),
                 records: crate::offset::ERoff::new(2),
                 open_record: false,
-                crc: Some(0xae8b_1486_0a79_9888),
+                crc: 0xae8b_1486_0a79_9888,
             },
             instances: vec![
                 (EnId::new(2), DiskId::new(0)),
@@ -826,11 +826,10 @@ mod tests {
         assert_eq!(read_disk, disk);
         assert_eq!(read_block, onward);
 
-        // And no CRC, which is the caller's choice and not a tier's to invent.
-        let holds = crate::block::Holds { crc: None, ..block.holds };
+        let holds = crate::block::Holds { crc: 0, ..block.holds };
         let bare = AppendBlock { holds, ..block };
         let (_, _, read) = AppendBlock::of(&bare.request(en, disk, Op::AppendExtent)).unwrap();
-        assert_eq!(read.holds.crc, None);
+        assert_eq!(read.holds.crc, 0);
         assert_eq!(
             read.holds.logical,
             crate::offset::LOff::new(10),
@@ -851,7 +850,6 @@ mod tests {
             .number(10) // logical
             .number(1) // records
             .flag(false) // open_record
-            .flag(false) // crc_flag
             .number(0) // crc
             .flag(false) // has_offset
             .number(0); // offset
