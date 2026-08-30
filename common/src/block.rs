@@ -21,14 +21,21 @@ use crate::framing::Framing;
 use crate::offset::{ECoff, ELoff, ERoff};
 use crate::{Error, Result};
 
+/// The version of the extent on-disk layout.
+pub const EXTENT_VERSION: u32 = 1;
+
+/// The fixed overhead of an append block on disk:
+/// Plaintext Holds (12 bytes) + AEGIS-128X2 tag (16 bytes) + Encrypted Header (16 bytes: CRC u64 + Framing u32/u32).
+pub const APPEND_OVERHEAD: usize = 44;
+
 /// What a block holds, as the writer knows it and as everything below has to be
 /// told. None of it is recoverable from the compressed bytes without decompressing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Holds {
-    /// The compressed length of the user data.
+    /// The actual physical length of the append block on disk:
+    /// `APPEND_OVERHEAD` + the length of the compressed user data.
     pub compressed: ECoff,
-    /// Bytes before compression, which is the space it occupies in canonical
-    /// logical numbering (`body + records * 4`).
+    /// Bytes before compression, in canonical logical numbering (`body + records * 4`).
     pub logical: ELoff,
     /// Records this block completed, which is what numbers them.
     pub records: ERoff,
@@ -68,12 +75,13 @@ impl Holds {
         ))
     }
 
-    /// Measure a framed block. The writer is the only party that can: below here
-    /// the bytes are compressed and the framing is invisible.
-    pub fn of(framing: Framing, open: &[u8], block: &[u8], compressed: ECoff) -> Result<Holds> {
+    /// Measure a framed block, given the length of the compressed user data.
+    /// The physical compressed size on disk is the user data length plus `APPEND_OVERHEAD`.
+    pub fn of(framing: Framing, open: &[u8], block: &[u8], user_compressed_len: usize) -> Result<Holds> {
         let (records, _) = framing.advance(open, block)?;
         let logical = ELoff::of_number(framing.canonical_size(open.len(), block)?)?;
         let records = ERoff::of_number(records)?;
+        let compressed = ECoff::of_len(user_compressed_len + APPEND_OVERHEAD)?;
         Ok(Holds { compressed, logical, records })
     }
 }
@@ -170,20 +178,20 @@ mod tests {
     #[test]
     fn a_writer_measures_what_below_cannot_see() {
         let block = lines(3);
-        let holds = Holds::of(Framing::Lf, b"", &block, ECoff::of_len(block.len()).unwrap()).unwrap();
+        let holds = Holds::of(Framing::Lf, b"", &block, block.len()).unwrap();
         assert_eq!(holds.records, ERoff::new(3));
         // Lf overhead is 1. body is lines(3).len() - 3.
         // canonical = (len - 3) + 3 * 4 = len + 9.
         assert_eq!(holds.logical, ELoff::of_number((block.len() + 9) as u64).unwrap());
-        assert_eq!(holds.compressed, ECoff::of_len(block.len()).unwrap());
+        assert_eq!(holds.compressed, ECoff::of_len(block.len() + APPEND_OVERHEAD).unwrap());
 
         // A block that leaves a record open closes nothing.
-        let partial = Holds::of(Framing::Lf, b"", b"half a rec", ECoff::new(10)).unwrap();
+        let partial = Holds::of(Framing::Lf, b"", b"half a rec", 10).unwrap();
         assert_eq!(partial.records, ERoff::ZERO);
 
         // And one that closes a record then starts another is still refused here,
         // where the framing is still visible.
-        assert!(Holds::of(Framing::Lf, b"", b"one\ntw", ECoff::new(6)).is_err());
+        assert!(Holds::of(Framing::Lf, b"", b"one\ntw", 6).is_err());
     }
 
     /// A logical length that does not match what was stored, for a block nothing

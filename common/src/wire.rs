@@ -830,7 +830,7 @@ mod tests {
             framing: crate::framing::Framing::Lf,
             crc: 0xae8b_1486_0a79_9888,
             holds: crate::block::Holds {
-                compressed: crate::offset::ECoff::new(8),
+                compressed: crate::offset::ECoff::new(8 + crate::block::APPEND_OVERHEAD as u32),
                 logical: crate::offset::ELoff::new(10),
                 records: crate::offset::ERoff::new(2),
             },

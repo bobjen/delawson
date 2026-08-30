@@ -16,7 +16,6 @@ use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
 use common::ids::{ObjectId, RangeId, StreamId};
 use common::info::{Batch, Described, Expecting, ExtentRow, ObjectName, Shape, StreamRow, UNKNOWN};
-use common::offset::ECoff;
 use common::placement::{self, Expansion};
 
 use common::random::Rng;
@@ -1818,8 +1817,7 @@ fn build(cmd: &Cmd) -> Result<Request> {
             // compression goes, so the bytes are smaller across the internet and no
             // tier in the middle spends CPU on them.
             let stored = squeeze(Compress::Lz4, &block).unwrap_or_else(|| block.clone());
-            let compressed = ECoff::of_len(stored.len())?;
-            let holds = Holds::of(framing, b"", &block, compressed)?;
+            let holds = Holds::of(framing, b"", &block, stored.len())?;
 
             let mut request = Request::new(Op::AppendRecord).text(path);
             request.args.extend(expecting(expect)?.args());
