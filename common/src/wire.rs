@@ -351,6 +351,10 @@ pub struct AppendBlock {
     pub extent: ExtentId,
     /// The second the extent was created in, which is part of its name.
     pub created: TimeSec,
+    /// Framing of the records in this append block.
+    pub framing: crate::framing::Framing,
+    /// CRC of the uncompressed block bytes.
+    pub crc: u64,
     /// What the writer says these bytes contain.
     pub holds: crate::block::Holds,
     /// The canonical logical offset assigned by the primary, for secondaries.
@@ -363,12 +367,16 @@ pub struct AppendBlock {
 
 impl AppendBlock {
     pub fn request(&self, en: EnId, disk: DiskId, op: Op) -> Request {
+        let (kind, width) = self.framing.wire();
         let mut request = Request::new(op)
             .number(en.number())
             .number(disk.number())
             .number(self.sn.number())
             .number(self.extent.number())
-            .number(self.created.number());
+            .number(self.created.number())
+            .number(kind)
+            .number(width)
+            .number(self.crc);
         request.args.extend(self.holds.args());
         request = request
             .flag(self.logical_offset.is_some())
@@ -380,11 +388,21 @@ impl AppendBlock {
     }
 
     pub fn of(request: &Request) -> Result<(EnId, DiskId, AppendBlock)> {
-        let [Arg::Number(en), Arg::Number(disk), Arg::Number(sn), Arg::Number(extent), Arg::Number(created), rest @ ..] =
-            request.args.as_slice()
+        let [
+            Arg::Number(en),
+            Arg::Number(disk),
+            Arg::Number(sn),
+            Arg::Number(extent),
+            Arg::Number(created),
+            Arg::Number(kind),
+            Arg::Number(width),
+            Arg::Number(crc),
+            rest @ ..,
+        ] = request.args.as_slice()
         else {
             return Err(Error::new("an append does not have the shape of one"));
         };
+        let framing = crate::framing::Framing::of_wire(*kind, *width)?;
         let (holds, rest) = crate::block::Holds::of_args(rest)?;
         let [Arg::Flag(has_logical), Arg::Number(logical), instances @ ..] = rest else {
             return Err(Error::new("an append says what its logical offset is"));
@@ -411,6 +429,8 @@ impl AppendBlock {
                 sn: SnId::of_number(*sn)?,
                 extent: ExtentId::of_number(*extent)?,
                 created: TimeSec::new(*created),
+                framing,
+                crc: *crc,
                 holds,
                 instances: parsed,
                 logical_offset: has_logical.then(|| ELoff::of_number(*logical)).transpose()?,
@@ -735,7 +755,7 @@ impl Link {
 pub fn connect(stream: TcpStream, config: &Messaging) -> Result<Link> {
     stream.set_nodelay(true)?;
     let mut prefix = [0u8; 8];
-    Rng::new().fill(&mut prefix);
+    Rng::new().fill_bytes(&mut prefix);
     let mut writing = stream.try_clone()?;
     writing.write_all(&prefix)?;
     Ok(Link {
@@ -807,11 +827,12 @@ mod tests {
             sn: SnId::new(3),
             extent: ExtentId::new(17),
             created: TimeSec::new(1_000_000),
+            framing: crate::framing::Framing::Lf,
+            crc: 0xae8b_1486_0a79_9888,
             holds: crate::block::Holds {
+                compressed: crate::offset::ECoff::new(8),
                 logical: crate::offset::ELoff::new(10),
                 records: crate::offset::ERoff::new(2),
-                open_record: false,
-                crc: 0xae8b_1486_0a79_9888,
             },
             logical_offset: None,
             instances: vec![
@@ -840,10 +861,10 @@ mod tests {
         assert_eq!(read_disk, disk);
         assert_eq!(read_block, onward);
 
-        let holds = crate::block::Holds { crc: 0, ..block.holds };
+        let holds = crate::block::Holds { compressed: crate::offset::ECoff::ZERO, ..block.holds };
         let bare = AppendBlock { holds, ..block };
         let (_, _, read) = AppendBlock::of(&bare.request(en, disk, Op::AppendExtent)).unwrap();
-        assert_eq!(read.holds.crc, 0);
+        assert_eq!(read.holds.compressed, crate::offset::ECoff::ZERO);
         assert_eq!(
             read.holds.logical,
             crate::offset::ELoff::new(10),

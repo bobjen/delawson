@@ -18,35 +18,31 @@
 
 use crate::config::Compress;
 use crate::framing::Framing;
-use crate::offset::{ELoff, ERoff};
+use crate::offset::{ECoff, ELoff, ERoff};
 use crate::{Error, Result};
 
 /// What a block holds, as the writer knows it and as everything below has to be
 /// told. None of it is recoverable from the compressed bytes without decompressing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Holds {
-    /// Bytes before compression, which is the space it occupies in the writer's
-    /// numbering and what a logical offset counts.
+    /// The compressed length of the user data.
+    pub compressed: ECoff,
+    /// Bytes before compression, which is the space it occupies in canonical
+    /// logical numbering (`body + records * 4`).
     pub logical: ELoff,
     /// Records this block completed, which is what numbers them.
     pub records: ERoff,
-    /// Whether the block ends inside a record. §8.2.4 permits that only for a block
-    /// that closed nothing, and an extent may not seal while one is open.
-    pub open_record: bool,
-    /// The writer's CRC of the uncompressed block bytes.
-    pub crc: u64,
 }
 
 impl Holds {
-    /// On the wire, as four arguments. Written and read here so that no two
+    /// On the wire, as three arguments. Written and read here so that no two
     /// processes count positions independently — the mistake §17.13.3 records.
     pub fn args(&self) -> Vec<crate::wire::Arg> {
         use crate::wire::Arg;
         vec![
+            Arg::Number(self.compressed.number()),
             Arg::Number(self.logical.number()),
             Arg::Number(self.records.number()),
-            Arg::Flag(self.open_record),
-            Arg::Number(self.crc),
         ]
     }
 
@@ -54,10 +50,9 @@ impl Holds {
     pub fn of_args(args: &[crate::wire::Arg]) -> Result<(Holds, &[crate::wire::Arg])> {
         use crate::wire::Arg;
         let [
+            Arg::Number(compressed),
             Arg::Number(logical),
             Arg::Number(records),
-            Arg::Flag(open_record),
-            Arg::Number(crc),
             rest @ ..,
         ] = args
         else {
@@ -65,25 +60,21 @@ impl Holds {
         };
         Ok((
             Holds {
+                compressed: ECoff::of_number(*compressed)?,
                 logical: ELoff::of_number(*logical)?,
                 records: ERoff::of_number(*records)?,
-                open_record: *open_record,
-                crc: *crc,
             },
             rest,
         ))
     }
 
-    /// Measure a framed block, before compressing it. The writer is the only party
-    /// that can: below here the bytes are compressed and the framing is invisible.
-    ///
-    /// If `crc` is `None`, it is computed over the uncompressed block bytes.
-    pub fn of(framing: Framing, open: &[u8], block: &[u8], crc: Option<u64>) -> Result<Holds> {
-        let (records, left) = framing.advance(open, block)?;
+    /// Measure a framed block. The writer is the only party that can: below here
+    /// the bytes are compressed and the framing is invisible.
+    pub fn of(framing: Framing, open: &[u8], block: &[u8], compressed: ECoff) -> Result<Holds> {
+        let (records, _) = framing.advance(open, block)?;
         let logical = ELoff::of_number(framing.canonical_size(open.len(), block)?)?;
         let records = ERoff::of_number(records)?;
-        let crc = crc.unwrap_or_else(|| crate::crc::of(block));
-        Ok(Holds { logical, records, open_record: !left.is_empty(), crc })
+        Ok(Holds { compressed, logical, records })
     }
 }
 
@@ -162,7 +153,7 @@ mod tests {
     #[test]
     fn what_does_not_compress_is_left_alone() {
         let mut noise = vec![0u8; 4096];
-        crate::random::Rng::new().fill(&mut noise);
+        crate::random::Rng::new().fill_bytes(&mut noise);
         assert!(squeeze(Compress::Lz4, &noise).is_none());
         // And a block stored uncompressed reads back without a codec.
         assert_eq!(expand(Compress::Lz4, &noise, noise.len()).unwrap(), noise);
@@ -175,30 +166,24 @@ mod tests {
     }
 
     /// What a block holds is measured by the writer, because below it the bytes are
-    /// opaque: the records, the logical size, and whether one is left open.
+    /// opaque: the records, the logical size, and the compressed size.
     #[test]
     fn a_writer_measures_what_below_cannot_see() {
         let block = lines(3);
-        let holds = Holds::of(Framing::Lf, b"", &block, Some(7)).unwrap();
+        let holds = Holds::of(Framing::Lf, b"", &block, ECoff::of_len(block.len()).unwrap()).unwrap();
         assert_eq!(holds.records, ERoff::new(3));
         // Lf overhead is 1. body is lines(3).len() - 3.
         // canonical = (len - 3) + 3 * 4 = len + 9.
         assert_eq!(holds.logical, ELoff::of_number((block.len() + 9) as u64).unwrap());
-        assert!(!holds.open_record);
-        assert_eq!(holds.crc, 7);
+        assert_eq!(holds.compressed, ECoff::of_len(block.len()).unwrap());
 
-        // When CRC is omitted, it is computed over the uncompressed block bytes.
-        let auto = Holds::of(Framing::Lf, b"", &block, None).unwrap();
-        assert_eq!(auto.crc, crate::crc::of(&block));
-
-        // A block that leaves a record open says so, and it closed nothing.
-        let partial = Holds::of(Framing::Lf, b"", b"half a rec", None).unwrap();
-        assert_eq!((partial.records, partial.open_record), (ERoff::ZERO, true));
-        assert_eq!(partial.crc, crate::crc::of(b"half a rec"));
+        // A block that leaves a record open closes nothing.
+        let partial = Holds::of(Framing::Lf, b"", b"half a rec", ECoff::new(10)).unwrap();
+        assert_eq!(partial.records, ERoff::ZERO);
 
         // And one that closes a record then starts another is still refused here,
         // where the framing is still visible.
-        assert!(Holds::of(Framing::Lf, b"", b"one\ntw", None).is_err());
+        assert!(Holds::of(Framing::Lf, b"", b"one\ntw", ECoff::new(6)).is_err());
     }
 
     /// A logical length that does not match what was stored, for a block nothing

@@ -283,8 +283,8 @@ mod tests {
             triples.extend_from_slice(&id.to_le_bytes());
             triples.extend_from_slice(&second.to_le_bytes());
             second += u64::from(id % 3 == 0);
-            guids.extend_from_slice(&rng.next().to_le_bytes());
-            guids.extend_from_slice(&rng.next().to_le_bytes());
+            guids.extend_from_slice(&rng.next_u64().to_le_bytes());
+            guids.extend_from_slice(&rng.next_u64().to_le_bytes());
             // ⚠️ And what a GUID does *not* carry has to be stored beside it: the creating SN,
             // which §7.3.3 needs to derive the key, and the second, which selects the day's
             // master key and is the extent's age. The triple has both inside its 16 bytes.

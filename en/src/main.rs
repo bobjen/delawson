@@ -23,6 +23,7 @@
 use common::block::Holds;
 use common::config::ENConfig;
 use common::crypto;
+use common::framing::Framing;
 use common::ids::{DiskId, EnId, ExtentId, SnId};
 use common::offset::{ECoff, ELoff, ERoff};
 use common::range::{Budget, Covered, Filled, Piece, Range};
@@ -150,6 +151,12 @@ type Waiting = HashMap<(SnId, ExtentId), Vec<Arc<Pending>>>;
 /// A logical offset and a block's metadata and bytes.
 type QueuedAppend = (AppendBlock, Reply);
 
+/// The version of the extent on-disk layout.
+pub const EXTENT_VERSION: u32 = 1;
+/// The constant difference between compressed user data length and physical block size.
+/// Plaintext Holds (12 bytes) + AEGIS-128X2 tag (16 bytes) + Encrypted Header (16 bytes: CRC u64 + Framing u32/u32).
+pub const APPEND_OVERHEAD: usize = 44;
+
 /// An extent instance held here.
 struct Extent {
     sn_id: SnId,
@@ -179,7 +186,7 @@ struct Append {
     first_record: ERoff,
     /// Metadata in the clear, to avoid expensive decryption during scans.
     holds: Holds,
-    /// The encrypted bytes (metadata + compressed body + tag).
+    /// The encrypted bytes (tag + encrypted header + compressed body).
     sealed: Vec<u8>,
 }
 
@@ -193,17 +200,19 @@ impl Append {
         offset: ECoff,
         logical: ELoff,
         first_record: ERoff,
+        framing: Framing,
+        crc: u64,
         holds: Holds,
         body: &[u8],
     ) -> Result<Self> {
         let extent_key = extent_cache.get(daily_cache, process, extent.sn_id, extent.id, extent.created)?;
         let (key, nonce) = crypto::derive_block_secrets(&extent_key, logical.number());
 
-        // Header: records (u64), open_record (u8), crc (u64)
-        let mut plain = Vec::with_capacity(17 + body.len());
-        plain.extend(holds.records.number().to_le_bytes());
-        plain.push(holds.open_record as u8);
-        plain.extend(holds.crc.to_le_bytes());
+        let (kind, width) = framing.wire();
+        let mut plain = Vec::with_capacity(16 + body.len());
+        plain.extend(crc.to_le_bytes());
+        plain.extend((kind as u32).to_le_bytes());
+        plain.extend((width as u32).to_le_bytes());
         plain.extend(body);
 
         let ad = [];
@@ -219,7 +228,7 @@ impl Append {
         extent_cache: &ExtentKeyCache,
         process: &Process,
         extent: &Extent,
-    ) -> Result<(Holds, Vec<u8>)> {
+    ) -> Result<(u64, Framing, Vec<u8>)> {
         let extent_key = extent_cache.get(daily_cache, process, extent.sn_id, extent.id, extent.created)?;
         let (key, nonce) = crypto::derive_block_secrets(&extent_key, self.logical.number());
 
@@ -231,15 +240,16 @@ impl Append {
         let ad = [];
         let plain = crypto::decrypt_block(&key, &nonce, &ad, cipher, &tag)?;
 
-        if plain.len() < 17 {
+        if plain.len() < 16 {
             return Err(Error::new("decrypted block too short"));
         }
-        let records = ERoff::of_number(u64::from_le_bytes(plain[0..8].try_into().unwrap()))?;
-        let open_record = plain[8] != 0;
-        let crc = u64::from_le_bytes(plain[9..17].try_into().unwrap());
-        let body = plain[17..].to_vec();
+        let crc = u64::from_le_bytes(plain[0..8].try_into().unwrap());
+        let kind = u32::from_le_bytes(plain[8..12].try_into().unwrap());
+        let width = u32::from_le_bytes(plain[12..16].try_into().unwrap());
+        let framing = Framing::of_wire(kind as u64, width as u64)?;
+        let body = plain[16..].to_vec();
 
-        Ok((Holds { logical: self.holds.logical, records, open_record, crc }, body))
+        Ok((crc, framing, body))
     }
 }
 
@@ -345,7 +355,7 @@ impl Extents {
                         && a.logical == wanted
                         && a.holds.records == appending.holds.records
                         && a.holds.logical == appending.holds.logical
-                        && a.holds.crc == appending.holds.crc
+                        && a.holds.compressed == appending.holds.compressed
                 }) {
                     return Ok(Took::Landed(Landed {
                         offset: existing.offset,
@@ -371,6 +381,8 @@ impl Extents {
             offset,
             logical_offset,
             first_record,
+            appending.framing,
+            appending.crc,
             appending.holds,
             &appending.bytes,
         )?;
@@ -393,7 +405,11 @@ impl Extents {
         extent.logical_end = extent.logical_end.plus(logical_size)?;
         let records = appending.holds.records;
         extent.records = first_record.plus(records)?;
-        extent.open_record = appending.holds.open_record;
+        if appending.holds.records > ERoff::ZERO {
+            extent.open_record = false;
+        } else if appending.holds.logical > ELoff::ZERO {
+            extent.open_record = true;
+        }
 
         let mut append = append;
         append.extent = place;
@@ -438,6 +454,8 @@ impl Extents {
             offset,
             logical_offset,
             first_record,
+            appending.framing,
+            appending.crc,
             appending.holds,
             &appending.bytes,
         )?;
@@ -447,7 +465,11 @@ impl Extents {
         extent.end = extent.end.max(offset.plus(stored_len)?);
         extent.logical_end = extent.logical_end.max(logical_offset.plus(logical_size)?);
         extent.records = extent.records.max(first_record.plus(appending.holds.records)?);
-        extent.open_record = appending.holds.open_record;
+        if appending.holds.records > ERoff::ZERO {
+            extent.open_record = false;
+        } else if appending.holds.logical > ELoff::ZERO {
+            extent.open_record = true;
+        }
 
         append.extent = place;
         self.appends.push(append);
@@ -493,8 +515,9 @@ impl Extents {
             records = records.plus(append.holds.records)?;
             logical = logical.plus(append.holds.logical)?;
             length = length.plus(ECoff::of_len(append.sealed.len())?)?;
+            let is_open = append.holds.records == ERoff::ZERO && append.holds.logical > ELoff::ZERO;
             if last.is_none_or(|(at, _)| append.logical >= at) {
-                last = Some((append.logical, append.holds.open_record));
+                last = Some((append.logical, is_open));
             }
         }
         if !boundary {
@@ -543,16 +566,17 @@ impl Extents {
         let mut covered = Covered::default();
         let mut pieces: Vec<Piece> = Vec::new();
         for block in &blocks[first..] {
-            let (_, plain_bytes) = block.decrypt(daily_cache, extent_cache, process, extent)?;
+            let (crc, _framing, plain_bytes) = block.decrypt(daily_cache, extent_cache, process, extent)?;
             covered.took(block.holds.records.number(), block.holds.logical, ECoff::of_len(block.sealed.len())?);
             pieces.push(Piece {
                 logical: block.holds.logical.number(),
                 first_record: block.first_record.number(),
                 records: block.holds.records.number(),
-                crc: block.holds.crc,
+                crc,
                 bytes: plain_bytes,
             });
-            if budget.met(&covered) && !block.holds.open_record {
+            let is_open = block.holds.records == ERoff::ZERO && block.holds.logical > ELoff::ZERO;
+            if budget.met(&covered) && !is_open {
                 break;
             }
         }
@@ -584,7 +608,7 @@ impl Extents {
         found
             .iter()
             .flat_map(|append| {
-                append.decrypt(daily_cache, extent_cache, process, extent).unwrap().1.into_iter()
+                append.decrypt(daily_cache, extent_cache, process, extent).unwrap().2.into_iter()
             })
             .collect()
     }
@@ -643,6 +667,17 @@ impl Disk {
                     "append of {} logical bytes exceeds maximum {}",
                     appending.holds.logical, process.cluster.extents.max_append_bytes
                 ),
+            ));
+            return Ok(());
+        }
+
+        if appending.logical_offset.is_none()
+            && appending.holds.records == ERoff::ZERO
+            && appending.holds.logical > ELoff::ZERO
+        {
+            reply.send(Response::error(
+                Status::BadRequest,
+                "non-fixed-offset appends may not leave an open record",
             ));
             return Ok(());
         }
@@ -799,7 +834,7 @@ impl Disk {
         }
         self.appends.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(appending.bytes.len() as u64, Ordering::Relaxed);
-        if !appending.holds.open_record {
+        if appending.holds.records > ERoff::ZERO {
             self.finish(appending.sn, appending.extent);
         }
         Response::ok()
@@ -1167,12 +1202,14 @@ mod tests {
     }
 
     fn block(sn: u32, extent: u32, bytes: &[u8]) -> AppendBlock {
-        let holds = Holds::of(Framing::Lf, b"", bytes, None)
+        let holds = Holds::of(Framing::Lf, b"", bytes, ECoff::of_len(bytes.len()).unwrap())
             .expect("a well-formed block");
         AppendBlock {
             sn: SnId::new(sn),
             extent: ExtentId::new(extent),
             created: TimeSec::new(1_000_000),
+            framing: Framing::Lf,
+            crc: common::crc::of(bytes),
             holds,
             instances: Vec::new(),
             logical_offset: None,
@@ -1193,8 +1230,8 @@ mod tests {
     fn offsets_follow_one_another() {
         let en = EN::new(testing::en_config());
         assert_eq!(append(&en, 1, &line("hello")).offset, ECoff::new(0));
-        // header(17) + body(6) + tag(16) = 39.
-        assert_eq!(append(&en, 1, &line("there")).offset, ECoff::new(39));
+        // encrypted_header(16) + body(6) + tag(16) = 38.
+        assert_eq!(append(&en, 1, &line("there")).offset, ECoff::new(38));
     }
 
     #[test]
@@ -1202,8 +1239,8 @@ mod tests {
         let en = EN::new(testing::en_config());
         assert_eq!(append(&en, 1, &line("one")).offset, ECoff::new(0));
         assert_eq!(append(&en, 2, &line("two")).offset, ECoff::new(0));
-        // header(17) + body(4) + tag(16) = 37.
-        assert_eq!(append(&en, 1, &line("more")).offset, ECoff::new(37));
+        // encrypted_header(16) + body(4) + tag(16) = 36.
+        assert_eq!(append(&en, 1, &line("more")).offset, ECoff::new(36));
     }
 
     #[test]
@@ -1231,8 +1268,8 @@ mod tests {
     fn a_block_completing_no_record_is_carried_anyway() {
         let en = EN::new(testing::en_config());
         let disk = en.disk(DiskId::FIRST).unwrap();
-        let opened = Holds::of(Framing::Lf, b"", b"half a rec", None).unwrap();
-        match disk.take(&testing::process(), &AppendBlock { holds: opened, ..block(0, 1, b"half a rec") }, ROOM) {
+        let opened = Holds::of(Framing::Lf, b"", b"half a rec", ECoff::new(10)).unwrap();
+        match disk.take(&testing::process(), &AppendBlock { holds: opened, logical_offset: Some(ELoff::ZERO), ..block(0, 1, b"half a rec") }, ROOM) {
             Ok(Took::Landed(landed)) => assert_eq!(landed.records, ERoff::new(0)),
             other => panic!("expected landed, got {other:?}"),
         }
@@ -1243,13 +1280,14 @@ mod tests {
         let en = EN::new(testing::en_config());
         let disk = en.disk(DiskId::FIRST).unwrap();
         let cap = ECoff::new(100);
-        let opened = Holds::of(Framing::Lf, b"", b"half", None).unwrap();
-        let first = AppendBlock { holds: opened, ..block(0, 1, b"half") };
+        let opened = Holds::of(Framing::Lf, b"", b"half", ECoff::new(4)).unwrap();
+        let first = AppendBlock { holds: opened, logical_offset: Some(ELoff::ZERO), ..block(0, 1, b"half") };
         assert!(matches!(disk.take(&testing::process(), &first, cap), Ok(Took::Landed(_))));
 
-        let closed = Holds::of(Framing::Lf, b"half", b" and half\n", None).unwrap();
+        let closed = Holds::of(Framing::Lf, b"half", b" and half\n", ECoff::new(10)).unwrap();
         let mut second = block(0, 1, b" and half\n");
         second.holds = closed;
+        second.logical_offset = Some(first.holds.logical);
         assert!(matches!(disk.take(&testing::process(), &second, cap), Ok(Took::Landed(_))));
         assert!(matches!(disk.take(&testing::process(), &block(0, 1, b"x\n"), cap), Ok(Took::Sealed { .. })));
     }
@@ -1273,12 +1311,13 @@ mod tests {
         let en = EN::new(testing::en_config());
         let disk = en.disk(DiskId::FIRST).unwrap();
         let records = (0..40).flat_map(|n| line(&format!("record {n}"))).collect::<Vec<u8>>();
-        let holds = Holds::of(Framing::Lf, b"", &records, None).unwrap();
         let stored = common::block::squeeze(common::config::Compress::Lz4, &records)
             .expect("that should compress");
+        let holds = Holds::of(Framing::Lf, b"", &records, ECoff::of_len(stored.len()).unwrap()).unwrap();
 
         let mut compressed = block(0, 1, b"");
         compressed.holds = holds;
+        compressed.crc = common::crc::of(&records);
         compressed.bytes = stored.clone();
         assert!(matches!(disk.take(&testing::process(), &compressed, ROOM), Ok(Took::Landed(_))));
 
@@ -1340,11 +1379,12 @@ mod tests {
     fn a_range_does_not_stop_in_the_middle_of_a_record() {
         let en = EN::new(testing::en_config());
         let disk = en.disk(DiskId::FIRST).unwrap();
-        let opened = Holds::of(Framing::Lf, b"", b"half a rec", None).unwrap();
-        disk.take(&testing::process(), &AppendBlock { holds: opened, ..block(0, 1, b"half a rec") }, ROOM).unwrap();
-        let closed = Holds::of(Framing::Lf, b"half a rec", b"ord\n", None).unwrap();
+        let opened = Holds::of(Framing::Lf, b"", b"half a rec", ECoff::new(10)).unwrap();
+        disk.take(&testing::process(), &AppendBlock { holds: opened, logical_offset: Some(ELoff::ZERO), ..block(0, 1, b"half a rec") }, ROOM).unwrap();
+        let closed = Holds::of(Framing::Lf, b"half a rec", b"ord\n", ECoff::new(4)).unwrap();
         let mut second = block(0, 1, b"ord\n");
         second.holds = closed;
+        second.logical_offset = Some(opened.logical);
         disk.take(&testing::process(), &second, ROOM).unwrap();
 
         let ranged = disk
@@ -1357,8 +1397,9 @@ mod tests {
     #[test]
     fn a_record_spanning_blocks_is_a_flag_here_and_bytes_at_the_writer() {
         let en = EN::new(testing::en_config());
-        let _disk = en.disk(DiskId::FIRST).unwrap();
-        append(&en, 1, b"start");
+        let disk = en.disk(DiskId::FIRST).unwrap();
+        let opened = Holds::of(Framing::Lf, b"", b"start", ECoff::new(5)).unwrap();
+        disk.take(&testing::process(), &AppendBlock { holds: opened, logical_offset: Some(ELoff::ZERO), ..block(0, 1, b"start") }, ROOM).unwrap();
         assert!(en.disk(DiskId::FIRST).unwrap().held.lock().unwrap().extents[0].open_record);
     }
 
@@ -1378,7 +1419,7 @@ mod tests {
         let disk = en.disk(DiskId::FIRST).unwrap();
         append(&en, 1, &line("checksummed"));
         let mut wrong = block(0, 1, &line("also fine"));
-        wrong.holds.crc = 0;
+        wrong.crc = 0;
         assert!(matches!(disk.take(&testing::process(), &wrong, ROOM), Ok(Took::Landed(_))));
     }
 
@@ -1418,8 +1459,8 @@ mod tests {
     fn a_truncation_that_would_leave_a_record_open_is_refused() {
         let en = EN::new(testing::en_config());
         let disk = en.disk(DiskId::FIRST).unwrap();
-        let opened = Holds::of(Framing::Lf, b"", b"half a rec", None).unwrap();
-        match disk.take(&testing::process(), &AppendBlock { holds: opened, ..block(0, 1, b"half a rec") }, ROOM).unwrap() {
+        let opened = Holds::of(Framing::Lf, b"", b"half a rec", ECoff::new(10)).unwrap();
+        match disk.take(&testing::process(), &AppendBlock { holds: opened, logical_offset: Some(ELoff::ZERO), ..block(0, 1, b"half a rec") }, ROOM).unwrap() {
             Took::Landed(_landed) => (),
             _ => panic!("should have landed"),
         };

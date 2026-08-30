@@ -251,7 +251,7 @@ mod tests {
     fn incompressible_stays_plain() {
         let config = messaging(false, Compress::Lz4);
         let mut noise = vec![0u8; 4096];
-        crate::random::Rng::from_seed(1).fill(&mut noise);
+        crate::random::Rng::from_seed(1).fill_bytes(&mut noise);
         let (mut sender, _) = pair(&config);
         let mut wire = Vec::new();
         sender.seal(&mut noise.clone(), &mut wire).unwrap();
@@ -292,7 +292,7 @@ mod ratio {
     #[test]
     fn random_bodies_do_not_compress() {
         let mut block = vec![0u8; 8 << 20];
-        Rng::new().fill(&mut block);
+        Rng::new().fill_bytes(&mut block);
         for size in [1024usize, 16384] {
             let mut batch = Vec::new();
             for slot in 0..64 {
@@ -337,7 +337,7 @@ mod sampling {
 
     fn noise(bytes: usize, seed: u64) -> Vec<u8> {
         let mut noise = vec![0u8; bytes];
-        Rng::from_seed(seed).fill(&mut noise);
+        Rng::from_seed(seed).fill_bytes(&mut noise);
         noise
     }
 

@@ -141,10 +141,11 @@ impl Open {
 struct Wanting {
     path: String,
     located: Located,
+    framing: Framing,
+    crc: u64,
     body: Vec<u8>,
-    /// What the writer said the block holds: logical size, records, whether one is
-    /// left open, and the CRC. Carried, never invented and never recomputed — below
-    /// the client the bytes are compressed and none of it could be worked out again.
+    /// What the writer said the block holds: compressed size, logical size, records.
+    /// Carried, never invented and never recomputed.
     holds: Holds,
     tries: u32,
     reply: Reply,
@@ -383,15 +384,15 @@ impl FE {
     /// An append: resolve the name — making the object if it is not there — find the
     /// extent, and hand the bytes to its primary.
     fn append(self: &Arc<Self>, process: &Arc<Process>, request: &Request, mut reply: Reply) {
-        let (path, expect, framing, holds, body) = match request.args.as_slice() {
-            // The name, what the caller expects it to be, then the framing and the block.
+        let (path, expect, framing, crc, holds, body) = match request.args.as_slice() {
+            // The name, what the caller expects it to be, then the framing, CRC, and the block.
             [Arg::Text(path), rest @ ..] => {
-                let Ok((expect, [Arg::Number(kind), Arg::Number(width), rest @ ..])) =
+                let Ok((expect, [Arg::Number(kind), Arg::Number(width), Arg::Number(crc), rest @ ..])) =
                     Expecting::of_args(rest)
                 else {
                     return reply.send(Response::error(
                         Status::BadRequest,
-                        "append takes a name, what object it expects, a framing and bytes",
+                        "append takes a name, what object it expects, a framing, crc, and bytes",
                     ));
                 };
                 let framing = match Framing::of_wire(*kind, *width) {
@@ -402,12 +403,12 @@ impl FE {
                 };
                 match Holds::of_args(rest) {
                     Ok((holds, [Arg::Bytes(body)])) => {
-                        (path.clone(), expect, framing, holds, body.clone())
+                        (path.clone(), expect, framing, *crc, holds, body.clone())
                     }
                     _ => {
                         return reply.send(Response::error(
                             Status::BadRequest,
-                            "append takes a name, a framing, what the block holds, and bytes",
+                            "append takes a name, a framing, crc, what the block holds, and bytes",
                         ));
                     }
                 }
@@ -415,7 +416,7 @@ impl FE {
             _ => {
                 return reply.send(Response::error(
                     Status::BadRequest,
-                    "append takes a name, a framing, what the block holds, and bytes",
+                    "append takes a name, a framing, crc, what the block holds, and bytes",
                 ));
             }
         };
@@ -439,7 +440,7 @@ impl FE {
                         ),
                     ));
                 }
-                let wanting = Wanting { path: named, located, body, holds, tries: TRIES, reply };
+                let wanting = Wanting { path: named, located, framing, crc, body, holds, tries: TRIES, reply };
                 fe.somewhere(process, wanting, None);
             },
         );
@@ -569,13 +570,15 @@ impl FE {
     /// with them: the primary is what counts the records and what broadcasts to the
     /// others, and the SN is not in this path to be asked again.
     fn to_primary(self: &Arc<Self>, process: &Arc<Process>, wanting: Wanting, open: Open) {
-        let Wanting { path, located, body, holds, tries, reply } = wanting;
+        let Wanting { path, located, framing, crc, body, holds, tries, reply } = wanting;
         let identity = format!("EN{}", open.disks[0].0);
         // One shape, built and read in `common`, so neither side counts positions.
         let ask = AppendBlock {
             sn: open.sn,
             extent: open.id,
             created: open.created,
+            framing,
+            crc,
             holds,
             logical_offset: None,
             instances: open.disks.clone(),
@@ -587,7 +590,7 @@ impl FE {
         let onward = Arc::clone(process);
         let asked = process.ask(&identity, &ask, move |answer| {
             if answer.status == Status::Sealed {
-                let wanting = Wanting { path, located, body, holds, tries, reply };
+                let wanting = Wanting { path, located, framing, crc, body, holds, tries, reply };
                 return fe.after_seal(&onward, wanting, open, answer);
             }
             reply.send(receipt(&located, &open, answer));
@@ -638,7 +641,7 @@ impl FE {
                 "a full stream said nothing about itself",
             ));
         };
-        let Wanting { path, located, body, holds, tries, reply } = wanting;
+        let Wanting { path, located, framing, crc, body, holds, tries, reply } = wanting;
         // Nothing may hand out an extent of a stream that will take no more, and what
         // is remembered about it is no use to an append either.
         self.streams.lock().expect("streams").remove(&located.stream);
@@ -665,7 +668,7 @@ impl FE {
                     format!("{path} was extended and is still on stream {}", next.stream),
                 ));
             }
-            let wanting = Wanting { path, located: next, body, holds, tries, reply };
+            let wanting = Wanting { path, located: next, framing, crc, body, holds, tries, reply };
             fe.somewhere(&onward, wanting, None);
         });
         if let Err(e) = asked {

@@ -252,7 +252,7 @@ impl Naming {
         RNG.with(|rng| {
             let mut rng = rng.borrow_mut();
             while picked.len() < want {
-                let id = SnDiskId::new((rng.next() % total_disks as u64) as u32);
+                let id = SnDiskId::new((rng.next_u64() % total_disks as u64) as u32);
                 if !picked.contains(&id) {
                     picked.push(id);
                 }

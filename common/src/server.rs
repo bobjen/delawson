@@ -889,7 +889,7 @@ fn noise(size: usize) -> Option<Vec<u8>> {
     }
     NOISE.with(|rng| {
         let mut body = vec![0u8; size];
-        rng.borrow_mut().fill(&mut body);
+        rng.borrow_mut().fill_bytes(&mut body);
         Some(body)
     })
 }

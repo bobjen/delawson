@@ -16,6 +16,7 @@ use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
 use common::ids::{ObjectId, RangeId, StreamId};
 use common::info::{Batch, Described, Expecting, ExtentRow, ObjectName, Shape, StreamRow, UNKNOWN};
+use common::offset::ECoff;
 use common::placement::{self, Expansion};
 
 use common::random::Rng;
@@ -567,7 +568,7 @@ fn run(cli: Cli) -> Result<()> {
             let start = std::time::Instant::now();
             let mut sum = 0u64;
             for _ in 0..words {
-                sum ^= rng.next();
+                sum ^= rng.next_u64();
             }
             let bare = start.elapsed().as_secs_f64();
             println!(
@@ -582,7 +583,7 @@ fn run(cli: Cli) -> Result<()> {
             let mut done = 0;
             let start = std::time::Instant::now();
             while done < *bytes {
-                rng.fill(&mut buf);
+                rng.fill_bytes(&mut buf);
                 done += *chunk;
             }
             let filling = start.elapsed().as_secs_f64();
@@ -1074,7 +1075,7 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
                             Request::new(Op::BatchInfo)
                         };
                         for _ in 0..batch {
-                            request = request.text(format!("{prefix}{}", rng.next() % objects));
+                            request = request.text(format!("{prefix}{}", rng.next_u64() % objects));
                         }
                         let id = conn.send(&request)?;
                         sent.insert(id, std::time::Instant::now());
@@ -1811,23 +1812,18 @@ fn build(cmd: &Cmd) -> Result<Request> {
             // Over the framed block, which is the logical form — not what it will be
             // compressed to, since that is the system's representation of the data
             // rather than the data.
-            let checksum = crc.then(|| common::crc::of(&block));
-            let holds = Holds::of(framing, b"", &block, checksum)?;
+            let checksum = if *crc { common::crc::of(&block) } else { 0 };
 
             // Compressed here and nowhere below: the client is as far upstream as
             // compression goes, so the bytes are smaller across the internet and no
             // tier in the middle spends CPU on them.
             let stored = squeeze(Compress::Lz4, &block).unwrap_or_else(|| block.clone());
-            // ⚠️ And **not in place**, so the original survives to be checked. A
-            // corruption before or during compression shows up here as a mismatch
-            // rather than as durable wrong data.
-            if common::crc::of(&block) != holds.crc {
-                return Err(Error::new("this buffer changed while it was being compressed"));
-            }
+            let compressed = ECoff::of_len(stored.len())?;
+            let holds = Holds::of(framing, b"", &block, compressed)?;
 
             let mut request = Request::new(Op::AppendRecord).text(path);
             request.args.extend(expecting(expect)?.args());
-            request = request.number(kind).number(width);
+            request = request.number(kind).number(width).number(checksum);
             request.args.extend(holds.args());
             request.bytes(stored)
         }

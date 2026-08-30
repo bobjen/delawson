@@ -222,6 +222,7 @@ dependencies = [
  "hkdf",
  "libc",
  "lz4_flex",
+ "rand_core",
  "serde",
  "sha2",
  "toml",
