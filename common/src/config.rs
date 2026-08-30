@@ -14,7 +14,7 @@
 //! asks KS where its peers are — so no process's address is checked in, and no
 //! two copies of one address can disagree.
 
-use crate::offset::{COff, LOff};
+use crate::offset::{ECoff, ELoff};
 use crate::placement::Expansion;
 use crate::{Context, Error, Result};
 use serde::Deserialize;
@@ -286,7 +286,7 @@ pub struct Extents {
     /// cluster sets it low so that a stream sealing is the common path.
     pub per_stream: usize,
     /// Maximum logical bytes allowed in a single append. Default is 32 MB (33,554,432 bytes),
-    /// bounded above by LOff::MAX.
+    /// bounded above by ELoff::MAX.
     #[serde(default = "default_max_append_bytes")]
     pub max_append_bytes: u32,
     /// Bytes of device a stored byte costs, which is what billing charges for
@@ -345,7 +345,7 @@ impl Extents {
                 "extents.max_append_bytes of zero leaves no room for an append",
             ));
         }
-        if self.max_append_bytes > LOff::MAX.get() {
+        if self.max_append_bytes > ELoff::MAX.get() {
             return Err(Error::new(format!(
                 "extents.max_append_bytes {} is past what a position in an extent can name",
                 self.max_append_bytes
@@ -354,7 +354,7 @@ impl Extents {
         if self.seal_bytes == 0 {
             return Err(Error::new("extents.seal_bytes of zero seals every extent empty"));
         }
-        if self.seal_bytes > COff::MAX.get() {
+        if self.seal_bytes > ECoff::MAX.get() {
             return Err(Error::new(format!(
                 "extents.seal_bytes {} is past what a position in an extent can name",
                 self.seal_bytes
@@ -908,9 +908,9 @@ mod tests {
         };
         assert!(capped(64).is_ok());
         assert!(capped(32 << 20).is_ok());
-        assert!(capped(COff::MAX.get()).is_ok());
+        assert!(capped(ECoff::MAX.get()).is_ok());
         assert!(capped(0).is_err());
-        assert!(capped(COff::NONE.get()).is_err());
+        assert!(capped(ECoff::NONE.get()).is_err());
         // And a stream that can hold no extents can hold nothing at all.
         assert!(
             Extents {
@@ -941,9 +941,9 @@ mod tests {
         };
         assert!(check(32 * 1024 * 1024).is_ok());
         assert!(check(1).is_ok());
-        assert!(check(LOff::MAX.get()).is_ok());
+        assert!(check(ELoff::MAX.get()).is_ok());
         assert!(check(0).is_err());
-        assert!(check(LOff::NONE.get()).is_err());
+        assert!(check(ELoff::NONE.get()).is_err());
     }
 
     /// What a failure-mode seal discards, which is what makes the same rule work at

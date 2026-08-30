@@ -6,7 +6,7 @@
 //! that does — log timestamps — is not a stored fact about an object.
 //!
 //! ⚠️ **A type rather than a `u64`** (Asserted, Bob, 2026-08-20), for the same reason
-//! `LOff` is not a `COff`: the store is full of `u64`s that are counts of records,
+//! `ELoff` is not an `ECoff`: the store is full of `u64`s that are counts of records,
 //! numbers of streams, byte lengths and moments, and a moment passed where a count
 //! belongs is not a compile error unless it is a different type. It also stops the
 //! quieter version — seconds handed to something expecting milliseconds — which no

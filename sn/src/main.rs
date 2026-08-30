@@ -16,7 +16,7 @@
 use common::config::{SNConfig, ServiceKind};
 use common::ids::{DiskId, EnId, ExtentId, RangeId, SnDiskId, SnId, StreamId};
 use common::info::{ExtentRow, ExtentRun, Listing, StreamName, Totals, UNKNOWN};
-use common::offset::{COff, ERoff, LOff, SRoff};
+use common::offset::{ECoff, ELoff, ERoff, SCoff, SLoff, SRoff};
 use common::range::Filled;
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
@@ -101,8 +101,8 @@ struct Sealed {
     /// The two lengths. ⚠️ The record count is **not** here: it belongs to the extent
     /// (§17.29.1), and `Filled` is the message the EN sends rather than the shape this
     /// keeps.
-    logical: LOff,
-    compressed: COff,
+    logical: ELoff,
+    compressed: ECoff,
 }
 
 impl Sealed {
@@ -111,6 +111,14 @@ impl Sealed {
     /// extent. Written once, here, so the callers that sum it cannot get it wrong.
     fn records(&self) -> SRoff {
         SRoff::new(self.extent.records.number())
+    }
+
+    fn logical(&self) -> SLoff {
+        SLoff::new(self.logical.number())
+    }
+
+    fn compressed(&self) -> SCoff {
+        SCoff::new(self.compressed.number())
     }
 
     /// Whether a stream-local record number falls in this extent, given where the
@@ -534,8 +542,8 @@ impl SN {
                 created: sealed.extent.created,
                 first_record: at.number(),
                 records: sealed.records().number(),
-                logical: sealed.logical.number(),
-                length: sealed.compressed.number(),
+                logical: sealed.logical().number(),
+                length: sealed.compressed().number(),
                 disks: sealed
                     .extent
                     .disks
@@ -588,8 +596,8 @@ impl SN {
         // totals are exact.
         let mut totals = Totals { extents: total, logical: 0, compressed: 0 };
         for sealed in &held.sealed {
-            totals.logical += sealed.logical.number();
-            totals.compressed += sealed.compressed.number();
+            totals.logical += sealed.logical().number();
+            totals.compressed += sealed.compressed().number();
         }
         (ExtentRun { stream, totals, given: rows.len() as u64, next }, rows)
     }
@@ -759,8 +767,8 @@ mod tests {
     fn came(records: u64, compressed: u64) -> Filled {
         Filled {
             records,
-            logical: LOff::new(compressed as u32),
-            compressed: COff::new(compressed as u32),
+            logical: ELoff::new(compressed as u32),
+            compressed: ECoff::new(compressed as u32),
         }
     }
 
@@ -804,7 +812,7 @@ mod tests {
     }
 
     use super::*;
-    use common::offset::{COff, LOff};
+    use common::offset::{ECoff, ELoff};
     use common::testing;
 
     /// Extents enough that a stream does not seal in the tests that are not about

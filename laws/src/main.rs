@@ -16,7 +16,7 @@ use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
 use common::ids::{ObjectId, RangeId, StreamId};
 use common::info::{Batch, Described, Expecting, ExtentRow, ObjectName, Shape, StreamRow, UNKNOWN};
-use common::offset::LOff;
+use common::offset::ELoff;
 use common::placement::{self, Expansion};
 use common::random::Rng;
 use common::range::{Budget, Covered, Detail, Piece, Range, Start, Want};
@@ -1467,7 +1467,7 @@ fn records_of(framing: Framing, pieces: &[Piece]) -> Result<Vec<(u64, Vec<u8>)>>
     let mut carry: Vec<u8> = Vec::new();
     let mut numbering = pieces.first().map_or(0, |piece| piece.first_record);
     for piece in pieces {
-        let block = expand(Compress::Lz4, &piece.bytes, LOff::of_number(piece.logical)?)?;
+        let block = expand(Compress::Lz4, &piece.bytes, ELoff::of_number(piece.logical)?)?;
         if piece.crc != common::crc::of(&block) {
             return Err(Error::new(format!(
                 "{} bytes came back and do not match the CRC they were written with",

@@ -798,7 +798,7 @@ mod tests {
             extent: ExtentId::new(17),
             created: TimeSec::new(1_000_000),
             holds: crate::block::Holds {
-                logical: crate::offset::LOff::new(10),
+                logical: crate::offset::ELoff::new(10),
                 records: crate::offset::ERoff::new(2),
                 open_record: false,
                 crc: 0xae8b_1486_0a79_9888,
@@ -832,7 +832,7 @@ mod tests {
         assert_eq!(read.holds.crc, 0);
         assert_eq!(
             read.holds.logical,
-            crate::offset::LOff::new(10),
+            crate::offset::ELoff::new(10),
             "what it holds survives either way"
         );
     }

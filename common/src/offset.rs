@@ -130,16 +130,15 @@ macro_rules! space {
     };
 }
 
-// ⚠️ **`LOff` and `COff` are the *extent-local* byte spaces**, which their names predate and
-// do not say. Read them as `ELOff` and `ECOff`. There is deliberately no `SLOff`/`OLOff`
-// pair — see §17.32.2 for why, and for what would make them worth adding.
-//
-// ⚠️ **And they are 32-bit because an extent is capped** (Asserted, Bob, 2026-08-20): *"logical
-// and compressed in SN and DN can be u64, it's only in EN that LOff and COff are u32."* A
-// stream's or an object's byte totals are sums over extents and pass 4 GB in the second one,
-// so `info::Totals` and the DN's cache hold `u64` and **must not** be given these types.
-space!(LOff, u32, "logical bytes", "an extent");
-space!(COff, u32, "compressed bytes", "an extent");
+// The three byte spaces (logical and compressed):
+// Extent-local is 32-bit because an extent is capped at 32 MB.
+// Stream-local and object-local are 64-bit because they sum over extents and streams.
+space!(ELoff, u32, "logical bytes", "an extent");
+space!(ECoff, u32, "compressed bytes", "an extent");
+space!(SLoff, u64, "logical bytes", "a stream");
+space!(SCoff, u64, "compressed bytes", "a stream");
+space!(OLoff, u64, "logical bytes", "an object");
+space!(OCoff, u64, "compressed bytes", "an object");
 
 // The three record spaces §17.16.2 cost 139 of 200 reads by confusing (Asserted, Bob,
 // 2026-08-20). ⚠️ **Object-local and stream-local are the dangerous pair** — *"exceptionally
@@ -156,41 +155,41 @@ mod tests {
 
     #[test]
     fn a_position_moves_on_by_a_length() {
-        let at = COff::new(30);
-        assert_eq!(at.plus(COff::new(15)).unwrap(), COff::new(45));
-        assert_eq!(COff::ZERO.plus(COff::new(30)).unwrap(), at);
+        let at = ECoff::new(30);
+        assert_eq!(at.plus(ECoff::new(15)).unwrap(), ECoff::new(45));
+        assert_eq!(ECoff::ZERO.plus(ECoff::new(30)).unwrap(), at);
     }
 
     /// Running out of positions is the extent being full, not an offset wrapping
     /// to the start of one.
     #[test]
     fn running_off_the_end_is_an_error_not_a_wrap() {
-        assert!(COff::new(u32::MAX).plus(COff::new(1)).is_err());
+        assert!(ECoff::new(u32::MAX).plus(ECoff::new(1)).is_err());
         // ⚠️ And it stops one short of the ceiling, because the top value is NONE.
         // This used to be `is_ok`, which would have produced a length equal to the
         // sentinel — a full extent reporting "no value" (§8.1.6.2).
-        assert!(LOff::new(u32::MAX - 1).plus(LOff::new(1)).is_err());
-        assert_eq!(LOff::MAX.plus(LOff::ZERO).unwrap(), LOff::MAX);
+        assert!(ELoff::new(u32::MAX - 1).plus(ELoff::new(1)).is_err());
+        assert_eq!(ELoff::MAX.plus(ELoff::ZERO).unwrap(), ELoff::MAX);
     }
 
     /// The sentinel is the top of the range, not zero, because zero is a length a
     /// caller can legitimately mean.
     #[test]
     fn nothing_is_the_top_of_the_range_and_zero_is_a_real_length() {
-        assert!(COff::NONE.is_none());
-        assert!(!COff::ZERO.is_none(), "zero bytes is a length, not an absence");
-        assert!(COff::ZERO.is_some());
-        assert!(COff::MAX.is_some());
-        assert_eq!(COff::MAX.get(), u32::MAX - 1);
+        assert!(ECoff::NONE.is_none());
+        assert!(!ECoff::ZERO.is_none(), "zero bytes is a length, not an absence");
+        assert!(ECoff::ZERO.is_some());
+        assert!(ECoff::MAX.is_some());
+        assert_eq!(ECoff::MAX.get(), u32::MAX - 1);
     }
 
     /// A length equal to the sentinel is refused rather than silently becoming it,
     /// which is the whole point of reserving a value.
     #[test]
     fn a_length_may_not_be_the_sentinel() {
-        assert!(LOff::of_len(u32::MAX as usize).is_err());
+        assert!(ELoff::of_len(u32::MAX as usize).is_err());
         assert!(
-            LOff::of_len(u32::MAX as usize - 1).is_ok(),
+            ELoff::of_len(u32::MAX as usize - 1).is_ok(),
             "one below is the largest real length"
         );
     }
@@ -198,8 +197,8 @@ mod tests {
     /// But it survives the wire, since a field that may be absent has to say so.
     #[test]
     fn the_sentinel_survives_the_wire() {
-        let sent = COff::NONE;
-        let back = COff::of_number(sent.number()).expect("none is a value on the wire");
+        let sent = ECoff::NONE;
+        let back = ECoff::of_number(sent.number()).expect("none is a value on the wire");
         assert!(back.is_none());
     }
 
@@ -207,23 +206,23 @@ mod tests {
     /// from an extent is refused rather than truncated.
     #[test]
     fn a_position_off_the_wire_is_checked() {
-        assert_eq!(LOff::of_number(1024).unwrap(), LOff::new(1024));
-        assert!(LOff::of_number(u64::from(u32::MAX) + 1).is_err());
-        assert_eq!(LOff::new(1024).number(), 1024);
+        assert_eq!(ELoff::of_number(1024).unwrap(), ELoff::new(1024));
+        assert!(ELoff::of_number(u64::from(u32::MAX) + 1).is_err());
+        assert_eq!(ELoff::new(1024).number(), 1024);
     }
 
     #[test]
     fn a_length_in_hand_is_checked_too() {
-        assert_eq!(COff::of_len(30).unwrap(), COff::new(30));
-        assert!(COff::of_len(usize::MAX).is_err());
+        assert_eq!(ECoff::of_len(30).unwrap(), ECoff::new(30));
+        assert!(ECoff::of_len(usize::MAX).is_err());
     }
 
     /// The point of the exercise: the two do not mix, and this is the test that
     /// would stop compiling if they ever did.
     #[test]
     fn the_two_spaces_do_not_mix() {
-        let logical = LOff::new(100);
-        let compressed = COff::new(100);
+        let logical = ELoff::new(100);
+        let compressed = ECoff::new(100);
         assert_eq!(logical.get(), compressed.get());
         // Deliberately not written: `logical.plus(compressed)`, which is the bug
         // these types exist to refuse, and it does not compile.
@@ -244,6 +243,20 @@ mod tests {
         // And an extent's space is narrower, because an extent seals long before 2^32.
         assert!(ERoff::of_number(u32::MAX as u64 + 1).is_err());
         assert!(SRoff::of_number(u32::MAX as u64 + 1).is_ok());
+    }
+
+    /// The stream and object byte spaces are separate 64-bit types.
+    #[test]
+    fn stream_and_object_byte_spaces_are_separate() {
+        let in_obj = OLoff::new(5000);
+        let in_stream = SLoff::new(200);
+        let converted = OLoff::new(in_obj.number() + in_stream.number());
+        assert_eq!(converted, OLoff::new(5200));
+
+        let comp_obj = OCoff::new(4000);
+        let comp_stream = SCoff::new(150);
+        let comp_converted = OCoff::new(comp_obj.number() + comp_stream.number());
+        assert_eq!(comp_converted, OCoff::new(4150));
     }
 
     /// Going back further than the origin is a caller bug, and a zero says so better

@@ -23,7 +23,7 @@
 use common::block::Holds;
 use common::config::ENConfig;
 use common::ids::{DiskId, EnId, ExtentId, SnId};
-use common::offset::{COff, ERoff, LOff};
+use common::offset::{ECoff, ELoff, ERoff};
 use common::range::{Budget, Covered, Filled, Piece, Range};
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
@@ -46,10 +46,10 @@ struct Extent {
     sealed: bool,
     /// Where the next append starts, in stored bytes — what the device holds, and
     /// what the seal limit is against.
-    end: COff,
+    end: ECoff,
     /// And where it starts in the writer's numbering. The two differ by whatever
     /// compression achieved, which is why they are different types.
-    logical_end: LOff,
+    logical_end: ELoff,
     /// Records completed in this extent, which is what numbers them. **Extent-local**,
     /// and typed as such: the SN says what stream-local number the extent's first record
     /// has, and an `ERoff` cannot be handed to anything expecting that.
@@ -70,7 +70,7 @@ struct Append {
     /// an extent in order. **Offset order, not record order**, because a secondary
     /// may be told of its blocks in any order and because a block completing no
     /// record has no record to sort by (§8.2.4).
-    offset: COff,
+    offset: ECoff,
     /// The extent-local number of the first record this block completed — which is
     /// how a read finds the block holding a record **without parsing anything**.
     /// The counts came from the writer; the arithmetic is this tier's.
@@ -110,7 +110,7 @@ enum Covering {
     /// again. It changes nothing, so it is answered ok and not stored twice.
     Same,
     /// Something else is there, and the offset it starts at.
-    Taken(COff),
+    Taken(ECoff),
 }
 
 /// What an apply did. A retry must be answered ok without storing the bytes or
@@ -133,15 +133,15 @@ struct Truncated {
     /// watermark and is still sealed, because the *extent* is what sealed.
     discarded: usize,
     records: ERoff,
-    length: COff,
+    length: ECoff,
 }
 
 /// Where an append landed and what it numbered.
 struct Landed {
-    offset: COff,
+    offset: ECoff,
     /// And where it landed in the writer's numbering, which is the locator a writer
     /// is owed: a writer knows what it wrote, not what that compressed to.
-    logical: LOff,
+    logical: ELoff,
     /// The extent-local number of the first record this append completed.
     first_record: ERoff,
     /// Records it completed, which is zero for a block wholly inside one record.
@@ -181,8 +181,8 @@ impl Extents {
         self.extents.push(Extent {
             created,
             sealed: false,
-            end: COff::ZERO,
-            logical_end: LOff::ZERO,
+            end: ECoff::ZERO,
+            logical_end: ELoff::ZERO,
             records: ERoff::ZERO,
             open_record: false,
         });
@@ -197,8 +197,8 @@ impl Extents {
     /// **Nothing is parsed.** The block is compressed and its records are invisible
     /// here, so what it holds arrives with it and this is arithmetic on numbers the
     /// writer supplied.
-    fn take(&mut self, appending: &AppendBlock, cap: COff) -> Result<Took> {
-        let stored = COff::of_len(appending.bytes.len())?;
+    fn take(&mut self, appending: &AppendBlock, cap: ECoff) -> Result<Took> {
+        let stored = ECoff::of_len(appending.bytes.len())?;
         let logical = appending.holds.logical;
         let place = self.place(appending.sn, appending.extent, appending.created)?;
         let extent = &mut self.extents[place];
@@ -249,10 +249,10 @@ impl Extents {
     ///
     /// A scan of this extent's blocks, which is what the placeholder can do — the
     /// journal that replaces these vectors indexes by offset.
-    fn covering(&self, place: usize, offset: COff, stored: COff, bytes: &[u8]) -> Result<Covering> {
+    fn covering(&self, place: usize, offset: ECoff, stored: ECoff, bytes: &[u8]) -> Result<Covering> {
         let end = offset.plus(stored)?;
         for append in self.appends.iter().filter(|append| append.extent == place) {
-            let past = append.offset.plus(COff::of_len(append.bytes.len())?)?;
+            let past = append.offset.plus(ECoff::of_len(append.bytes.len())?)?;
             // Disjoint: ends at or before it starts, or starts at or after it ends.
             if end <= append.offset || offset >= past {
                 continue;
@@ -270,8 +270,8 @@ impl Extents {
     /// Put an append where another instance said. The offset is given, so this must
     /// not assign one — but the ends and counts still move, since an instance that
     /// never learns them cannot become primary.
-    fn apply(&mut self, appending: &AppendBlock, offset: COff) -> Result<Applied> {
-        let stored = COff::of_len(appending.bytes.len())?;
+    fn apply(&mut self, appending: &AppendBlock, offset: ECoff) -> Result<Applied> {
+        let stored = ECoff::of_len(appending.bytes.len())?;
         let logical = appending.holds.logical;
         let place = self.place(appending.sn, appending.extent, appending.created)?;
         // ⚠️ Both checks before anything moves, because a rejected apply must leave
@@ -325,21 +325,21 @@ impl Extents {
     /// new primary computing its end from one of those would hand out an offset
     /// another instance has already written.
     #[allow(dead_code)]
-    fn truncate(&mut self, sn: SnId, id: ExtentId, above: COff) -> Result<Truncated> {
+    fn truncate(&mut self, sn: SnId, id: ExtentId, above: ECoff) -> Result<Truncated> {
         let Some(&place) = self.at.get(&(sn, id)) else {
             return Err(Error::new(format!("no extent {id} of sn {sn} here")));
         };
 
         // One walk over this extent's blocks: what survives, what goes, and whether
         // the cut lands where a block ends.
-        let mut boundary = above == COff::ZERO;
+        let mut boundary = above == ECoff::ZERO;
         let mut records = ERoff::ZERO;
-        let mut logical = LOff::ZERO;
-        let mut length = COff::ZERO;
+        let mut logical = ELoff::ZERO;
+        let mut length = ECoff::ZERO;
         let mut discarded = 0usize;
-        let mut last: Option<(COff, bool)> = None;
+        let mut last: Option<(ECoff, bool)> = None;
         for append in self.appends.iter().filter(|append| append.extent == place) {
-            let past = append.offset.plus(COff::of_len(append.bytes.len())?)?;
+            let past = append.offset.plus(ECoff::of_len(append.bytes.len())?)?;
             if past == above {
                 boundary = true;
             }
@@ -428,7 +428,7 @@ impl Extents {
             covered.took(
                 block.holds.records.number(),
                 block.holds.logical,
-                COff::of_len(block.bytes.len())?,
+                ECoff::of_len(block.bytes.len())?,
             );
             taken.push(block);
             // ⚠️ Two rules, and the order of the test is both of them. The budget is
@@ -537,7 +537,7 @@ impl Disk {
             ));
             return Ok(());
         }
-        let cap = COff::new(process.cluster.extents.seal_bytes);
+        let cap = ECoff::new(process.cluster.extents.seal_bytes);
         let landed = match self.take(&appending, cap) {
             Ok(Took::Landed(landed)) => landed,
             // Sealed: what the extent came to, so whoever asked can tell the SN and
@@ -631,7 +631,7 @@ impl Disk {
         Ok(())
     }
 
-    fn take(&self, appending: &AppendBlock, cap: COff) -> Result<Took> {
+    fn take(&self, appending: &AppendBlock, cap: ECoff) -> Result<Took> {
         let took = self.held.lock().expect("extents").take(appending, cap)?;
         if let Took::Landed(_) = &took {
             self.appends.fetch_add(1, Ordering::Relaxed);
@@ -655,7 +655,7 @@ impl Disk {
         let Some(offset) = appending.offset else {
             return Response::error(Status::BadRequest, "apply-append takes an offset");
         };
-        let offset = match COff::of_number(offset) {
+        let offset = match ECoff::of_number(offset) {
             Ok(offset) => offset,
             Err(e) => return Response::error(Status::BadRequest, e.to_string()),
         };
@@ -1074,7 +1074,7 @@ mod tests {
     use common::testing;
 
     /// Room enough that nothing seals, for the tests not about sealing.
-    const ROOM: COff = COff::new(1 << 20);
+    const ROOM: ECoff = ECoff::new(1 << 20);
 
     /// One whole record, framed as the client would frame it.
     fn line(text: &str) -> Vec<u8> {
@@ -1112,9 +1112,9 @@ mod tests {
     #[test]
     fn offsets_follow_one_another() {
         let en = EN::new(testing::en_config());
-        assert_eq!(append(&en, 1, &line("hello")).offset, COff::new(0));
-        assert_eq!(append(&en, 1, &line("there")).offset, COff::new(6));
-        assert_eq!(append(&en, 1, &line("!")).offset, COff::new(12));
+        assert_eq!(append(&en, 1, &line("hello")).offset, ECoff::new(0));
+        assert_eq!(append(&en, 1, &line("there")).offset, ECoff::new(6));
+        assert_eq!(append(&en, 1, &line("!")).offset, ECoff::new(12));
         assert_eq!(
             en.disk(DiskId::FIRST).unwrap().held.lock().unwrap().read(SnId::new(0), ExtentId::new(1)),
             b"hello\nthere\n!\n"
@@ -1125,9 +1125,9 @@ mod tests {
     #[test]
     fn extents_do_not_share_offsets() {
         let en = EN::new(testing::en_config());
-        assert_eq!(append(&en, 1, &line("one")).offset, COff::new(0));
-        assert_eq!(append(&en, 2, &line("two")).offset, COff::new(0));
-        assert_eq!(append(&en, 1, &line("more")).offset, COff::new(4));
+        assert_eq!(append(&en, 1, &line("one")).offset, ECoff::new(0));
+        assert_eq!(append(&en, 2, &line("two")).offset, ECoff::new(0));
+        assert_eq!(append(&en, 1, &line("more")).offset, ECoff::new(4));
         assert_eq!(
             en.disk(DiskId::FIRST).unwrap().held.lock().unwrap().read(SnId::new(0), ExtentId::new(1)),
             b"one\nmore\n"
@@ -1199,7 +1199,7 @@ mod tests {
     fn an_open_record_keeps_an_extent_from_sealing() {
         let en = EN::new(testing::en_config());
         let disk = en.disk(DiskId::FIRST).unwrap();
-        let cap = COff::new(4);
+        let cap = ECoff::new(4);
         let opened = Holds::of(Framing::Lf, b"", b"half", None).unwrap();
         let first = AppendBlock { holds: opened, ..block(0, 1, b"half") };
         assert!(matches!(disk.take(&first, cap), Ok(Took::Landed(_))));
@@ -1220,16 +1220,16 @@ mod tests {
     fn a_full_extent_seals_instead_of_taking_the_block() {
         let en = EN::new(testing::en_config());
         let disk = en.disk(DiskId::FIRST).unwrap();
-        let cap = COff::new(10);
+        let cap = ECoff::new(10);
         assert!(matches!(disk.take(&block(0, 1, b"one\n"), cap), Ok(Took::Landed(_))));
         assert!(matches!(disk.take(&block(0, 1, b"two\n"), cap), Ok(Took::Landed(_))));
         match disk.take(&block(0, 1, b"three\n"), cap) {
             Ok(Took::Sealed { came_to, .. }) => {
                 assert_eq!(came_to.records, 2, "what the extent came to");
-                assert_eq!(came_to.compressed, COff::new(8), "in stored bytes");
+                assert_eq!(came_to.compressed, ECoff::new(8), "in stored bytes");
                 // ⚠️ And the logical length, which the SN had no way to learn before #94:
                 // the same eight bytes here, because nothing was compressed.
-                assert_eq!(came_to.logical, LOff::new(8), "and in the bytes the writer wrote");
+                assert_eq!(came_to.logical, ELoff::new(8), "and in the bytes the writer wrote");
             }
             other => panic!("should have sealed, not {:?}", other.is_ok()),
         }
@@ -1255,8 +1255,8 @@ mod tests {
         // Stored bytes are the compressed ones; the logical size is what the writer
         // said, and the two are different numbers for the same block.
         let held = disk.held.lock().unwrap();
-        assert_eq!(held.extents[0].end, COff::of_len(stored.len()).unwrap());
-        assert_eq!(held.extents[0].logical_end, LOff::of_len(records.len()).unwrap());
+        assert_eq!(held.extents[0].end, ECoff::of_len(stored.len()).unwrap());
+        assert_eq!(held.extents[0].logical_end, ELoff::of_len(records.len()).unwrap());
         assert_eq!(held.read(SnId::new(0), ExtentId::new(1)), stored, "handed back as it arrived");
     }
 
@@ -1407,9 +1407,9 @@ mod tests {
             .request(EnId::new(0), disk_id, Op::ApplyAppend);
         assert_eq!(en.apply(&testing::process(), &request).status, Status::Ok);
         let held = disk.held.lock().unwrap();
-        assert_eq!(held.appends[0].offset, COff::new(64));
+        assert_eq!(held.appends[0].offset, ECoff::new(64));
         // The end moves past it, or this instance could not take over as primary.
-        assert_eq!(held.extents[0].end, COff::new(69));
+        assert_eq!(held.extents[0].end, ECoff::new(69));
     }
 
     #[test]
@@ -1548,12 +1548,12 @@ mod tests {
         let en = EN::new(testing::en_config());
         let disk = en.disk(DiskId::FIRST).unwrap();
         let mut held = disk.held.lock().unwrap();
-        assert!(matches!(held.apply(&block(0, 1, b"first\n"), COff::ZERO), Ok(Applied::Stored)));
+        assert!(matches!(held.apply(&block(0, 1, b"first\n"), ECoff::ZERO), Ok(Applied::Stored)));
 
-        let clash = held.apply(&block(0, 1, b"other\n"), COff::ZERO);
+        let clash = held.apply(&block(0, 1, b"other\n"), ECoff::ZERO);
         assert!(clash.is_err(), "different bytes at a written offset");
         // Overlapping partway is the same violation, and so is straddling the start.
-        assert!(held.apply(&block(0, 1, b"xx\n"), COff::new(3)).is_err());
+        assert!(held.apply(&block(0, 1, b"xx\n"), ECoff::new(3)).is_err());
         assert_eq!(
             held.read(SnId::new(0), ExtentId::new(1)),
             b"first\n",
@@ -1570,8 +1570,8 @@ mod tests {
         let disk = en.disk(DiskId::FIRST).unwrap();
         let mut held = disk.held.lock().unwrap();
         let same = block(0, 1, b"once\n");
-        assert!(matches!(held.apply(&same, COff::ZERO), Ok(Applied::Stored)));
-        assert!(matches!(held.apply(&same, COff::ZERO), Ok(Applied::Already)));
+        assert!(matches!(held.apply(&same, ECoff::ZERO), Ok(Applied::Stored)));
+        assert!(matches!(held.apply(&same, ECoff::ZERO), Ok(Applied::Already)));
         assert_eq!(held.read(SnId::new(0), ExtentId::new(1)), b"once\n", "stored once, not twice");
         assert_eq!(held.extents[0].records, ERoff::new(1), "and counted once");
     }
@@ -1585,10 +1585,10 @@ mod tests {
         append(&en, 1, &line("keep"));
         append(&en, 1, &line("drop"));
         let mut held = disk.held.lock().unwrap();
-        assert_eq!(held.extents[0].end, COff::new(10));
+        assert_eq!(held.extents[0].end, ECoff::new(10));
 
-        let cut = held.truncate(SnId::new(0), ExtentId::new(1), COff::new(5)).expect("a boundary");
-        assert_eq!((cut.discarded, cut.records, cut.length), (1, ERoff::new(1), COff::new(5)));
+        let cut = held.truncate(SnId::new(0), ExtentId::new(1), ECoff::new(5)).expect("a boundary");
+        assert_eq!((cut.discarded, cut.records, cut.length), (1, ERoff::new(1), ECoff::new(5)));
         assert_eq!(
             held.read(SnId::new(0), ExtentId::new(1)),
             b"keep\n",
@@ -1596,10 +1596,10 @@ mod tests {
         );
         assert!(held.extents[0].sealed, "and the extent is sealed");
         assert_eq!(held.extents[0].records, ERoff::new(1), "counts rebuilt from what survived");
-        assert_eq!(held.extents[0].logical_end, LOff::new(5));
+        assert_eq!(held.extents[0].logical_end, ELoff::new(5));
 
         // The freed offset 5 is not handed out again, by either path.
-        assert!(held.apply(&block(0, 1, &line("reuse")), COff::new(5)).is_err());
+        assert!(held.apply(&block(0, 1, &line("reuse")), ECoff::new(5)).is_err());
         drop(held);
         assert!(matches!(disk.take(&block(0, 1, &line("reuse")), ROOM), Ok(Took::Sealed { .. })));
     }
@@ -1614,7 +1614,7 @@ mod tests {
         append(&en, 1, &line("all of it"));
         let mut held = disk.held.lock().unwrap();
         let cut = held
-            .truncate(SnId::new(0), ExtentId::new(1), COff::new(10))
+            .truncate(SnId::new(0), ExtentId::new(1), ECoff::new(10))
             .expect("the end is a boundary");
         assert_eq!(cut.discarded, 0);
         assert!(held.extents[0].sealed);
@@ -1636,15 +1636,15 @@ mod tests {
         append(&en, 1, &line("second"));
         let mut held = disk.held.lock().unwrap();
         assert!(
-            held.truncate(SnId::new(0), ExtentId::new(1), COff::new(3)).is_err(),
+            held.truncate(SnId::new(0), ExtentId::new(1), ECoff::new(3)).is_err(),
             "inside the first block"
         );
         assert!(
-            held.truncate(SnId::new(0), ExtentId::new(1), COff::new(9)).is_err(),
+            held.truncate(SnId::new(0), ExtentId::new(1), ECoff::new(9)).is_err(),
             "inside the second"
         );
         assert!(
-            held.truncate(SnId::new(0), ExtentId::new(1), COff::new(99)).is_err(),
+            held.truncate(SnId::new(0), ExtentId::new(1), ECoff::new(99)).is_err(),
             "past everything"
         );
         assert!(!held.extents[0].sealed, "and a refused truncation seals nothing");
@@ -1652,7 +1652,7 @@ mod tests {
 
         // Zero is always a boundary: discarding the lot is a truncation too.
         assert_eq!(
-            held.truncate(SnId::new(0), ExtentId::new(1), COff::ZERO).expect("the start").discarded,
+            held.truncate(SnId::new(0), ExtentId::new(1), ECoff::ZERO).expect("the start").discarded,
             2
         );
         assert_eq!(held.extents[0].records, ERoff::new(0));
@@ -1674,10 +1674,10 @@ mod tests {
 
         let mut held = disk.held.lock().unwrap();
         // Cutting between the two blocks is a block boundary and a record's middle.
-        assert!(held.truncate(SnId::new(0), ExtentId::new(1), COff::new(10)).is_err());
+        assert!(held.truncate(SnId::new(0), ExtentId::new(1), ECoff::new(10)).is_err());
         assert!(!held.extents[0].sealed);
         // Keeping both is fine, because the record closed.
-        assert!(held.truncate(SnId::new(0), ExtentId::new(1), COff::new(14)).is_ok());
+        assert!(held.truncate(SnId::new(0), ExtentId::new(1), ECoff::new(14)).is_ok());
     }
 
     /// A sealed extent takes nothing more by either path. `take` already answered
@@ -1687,11 +1687,11 @@ mod tests {
     fn a_sealed_extent_refuses_an_apply_as_well_as_an_append() {
         let en = EN::new(testing::en_config());
         let disk = en.disk(DiskId::FIRST).unwrap();
-        let cap = COff::new(6);
+        let cap = ECoff::new(6);
         disk.take(&block(0, 1, &line("full")), cap).unwrap();
         assert!(matches!(disk.take(&block(0, 1, &line("x")), cap), Ok(Took::Sealed { .. })));
         let mut held = disk.held.lock().unwrap();
         assert!(held.extents[0].sealed);
-        assert!(held.apply(&block(0, 1, &line("x")), COff::new(5)).is_err());
+        assert!(held.apply(&block(0, 1, &line("x")), ECoff::new(5)).is_err());
     }
 }

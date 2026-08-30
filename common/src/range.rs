@@ -16,7 +16,7 @@
 //!   for ever — back-pressure that is really a livelock.
 
 use crate::info::Expecting;
-use crate::offset::{COff, LOff};
+use crate::offset::{ECoff, ELoff};
 use crate::placement::Expansion;
 use crate::wire::Arg;
 use crate::{Error, Result};
@@ -195,13 +195,13 @@ impl Range {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Filled {
     pub records: u64,
-    /// ⚠️ **An `LOff`, and the next field a `COff`** — the type discipline #94 asked for, and
+    /// ⚠️ **An `ELoff`, and the next field an `ECoff`** — the type discipline #94 asked for, and
     /// the reason this is a shape at all. It also costs nothing: both spaces are 32-bit, so
     /// all three measures together are the 16 bytes the two of them used to take, and
     /// `Sealed` did not grow by a byte on §14.1's 1.7 × 10^9 extents. Storing them as `u64`
     /// would have been **13.6 GB of an SN's memory** for range that neither space has.
-    pub logical: LOff,
-    pub compressed: COff,
+    pub logical: ELoff,
+    pub compressed: ECoff,
 }
 
 impl Filled {
@@ -224,8 +224,8 @@ impl Filled {
         };
         let filled = Filled {
             records: *records,
-            logical: LOff::of_number(*logical)?,
-            compressed: COff::of_number(*compressed)?,
+            logical: ELoff::of_number(*logical)?,
+            compressed: ECoff::of_number(*compressed)?,
         };
         Ok((filled, rest))
     }
@@ -233,7 +233,7 @@ impl Filled {
     /// Whether the extent took nothing at all — a block that would not fit an extent even
     /// empty, rather than an extent worth replacing.
     pub fn empty(&self) -> bool {
-        self.records == 0 && self.compressed == COff::ZERO
+        self.records == 0 && self.compressed == ECoff::ZERO
     }
 
     /// Bytes the user is charged for, which is what billing reads.
@@ -278,7 +278,7 @@ pub struct Covered {
 impl Covered {
     /// Count a block in. Records are the writer's count, so this is arithmetic on
     /// numbers that arrived rather than anything read out of the bytes.
-    pub fn took(&mut self, records: u64, logical: LOff, compressed: COff) {
+    pub fn took(&mut self, records: u64, logical: ELoff, compressed: ECoff) {
         self.records += records;
         self.logical += logical.number();
         self.compressed += compressed.number();
@@ -731,8 +731,8 @@ mod tests {
     #[test]
     fn a_block_is_counted_in_all_three_spaces() {
         let mut covered = Covered::default();
-        covered.took(2, LOff::new(200), COff::new(30));
-        covered.took(1, LOff::new(100), COff::new(20));
+        covered.took(2, ELoff::new(200), ECoff::new(30));
+        covered.took(1, ELoff::new(100), ECoff::new(20));
         assert_eq!((covered.records, covered.logical, covered.compressed), (3, 300, 50));
     }
 
