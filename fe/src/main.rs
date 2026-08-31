@@ -741,7 +741,7 @@ impl FE {
             move |fe, process, located, reply| {
                 // The DN answered with the stream holding it, so the number the stream
                 // knows it by is what is left after that stream's first.
-                let at = in_stream(record, ORoff::new(located.first_record));
+                let at = in_stream(record, located.first_record);
                 fe.locate(process, located, at, range.budget, reply);
             },
         );
@@ -895,7 +895,7 @@ fn from_instance(
     // ⚠️ And the answer comes back in the extent's numbering, which is not the
     // caller's. Three numbering spaces meet here — object, stream, extent — and the
     // FE is the only party that knows all three, so it is the one that converts.
-    let base = origin(ORoff::new(located.first_record), open.first_record);
+    let base = origin(located.first_record, open.first_record);
     // A sealed extent has something after it; the one still open is the object's
     // tail, so what the EN says about its own blocks is the whole answer.
     let sealed = open.records > ERoff::ZERO;
@@ -1016,7 +1016,7 @@ fn receipt(located: &Located, open: &Open, answer: Response) -> Response {
         args: vec![
             Arg::Number(located.stream.stream.number()),
             Arg::Number(in_stream),
-            Arg::Number(located.first_record + in_stream),
+            Arg::Number(located.first_record.number() + in_stream),
             Arg::Number(*records),
             Arg::Number(*extent),
             Arg::Number(*created),
@@ -1037,7 +1037,7 @@ struct Located {
     framing: Framing,
     /// The object-local number of this stream's first record, which is what turns a
     /// record number the user gave into one the stream knows.
-    first_record: u64,
+    first_record: ORoff,
 }
 
 impl Located {
@@ -1049,7 +1049,7 @@ impl Located {
             stream: described.stream,
             sn: described.sn,
             framing: described.framing,
-            first_record: described.first_record,
+            first_record: ORoff::of_number(described.first_record).ok()?,
         })
     }
 }
@@ -1958,7 +1958,7 @@ mod tests {
             (DnId::new(3), StreamId::new(17), SnId::new(0))
         );
         assert_eq!(located.framing, Framing::CrLf);
-        assert_eq!(located.first_record, 400, "where this stream's records start");
+        assert_eq!(located.first_record, ORoff::new(400), "where this stream's records start");
         // A framing the DN could not have meant is not an object either.
         assert!(Located::of(&args[..5]).is_none());
     }
@@ -1976,7 +1976,7 @@ mod tests {
             },
             sn: SnId::new(0),
             framing: Framing::Lf,
-            first_record: 0,
+            first_record: ORoff::ZERO,
         };
         let open = Open {
             sn: SnId::new(0),
@@ -2032,7 +2032,7 @@ mod tests {
             },
             sn: SnId::new(0),
             framing: Framing::Lf,
-            first_record: 0,
+            first_record: ORoff::ZERO,
         };
         let open = Open {
             sn: SnId::new(0),
