@@ -264,7 +264,7 @@ struct Object {
 /// What an `extend-object` request turned out to be: the one doing the work, one
 /// waiting behind it, or one that can be answered on the spot.
 enum Next {
-    Ours(u64),
+    Ours(ORoff),
     Wait,
     Say(Response),
 }
@@ -422,14 +422,13 @@ impl Object {
 
     /// Records the object holds, which is also where its next stream would start.
     ///
-    /// ⚠️ **`UNKNOWN` while the last stream is open**, because how far that one reaches is
-    /// not the DN's to say (§6.3) — and a caller adding to `UNKNOWN` would get `u64::MAX`
-    /// plus a count, which §17.22.1 is the story of.
-    fn records(&self) -> u64 {
+    /// ⚠️ **`ORoff::NONE` while the last stream is open**, because how far that one reaches is
+    /// not the DN's to say (§6.3).
+    fn records(&self) -> ORoff {
         match self.streams_from().last() {
-            Some((_, last)) if last.records.is_none() => UNKNOWN,
-            Some((at, last)) => at.number() + last.records.number(),
-            None => 0,
+            Some((_, last)) if last.records.is_none() => ORoff::NONE,
+            Some((at, last)) => ORoff::new(at.number() + last.records.number()),
+            None => ORoff::ZERO,
         }
     }
 
@@ -869,7 +868,7 @@ impl DN {
         self: &Arc<Self>,
         process: &Arc<Process>,
         name: String,
-        first_record: u64,
+        first_record: ORoff,
         mut reply: Reply,
     ) {
         let created = TimeSec::now();
