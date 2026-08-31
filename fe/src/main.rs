@@ -79,10 +79,10 @@ struct Open {
     created: TimeSec,
     /// The stream-local number of this extent's first record, which is what turns an
     /// extent-local number into a durable reference.
-    first_record: u64,
+    first_record: SRoff,
     /// Records in it, or zero for the extent still being appended to — whose count
     /// changes with every append and is therefore not a thing to remember.
-    records: u64,
+    records: ERoff,
     /// The framing used for records in this extent.
     _framing: Framing,
     /// The **disks** holding its instances, primary first, each as `(EnId, DiskId)`.
@@ -122,8 +122,8 @@ impl Open {
             sn,
             id: ExtentId::of_number(*id).ok()?,
             created: TimeSec::new(*created),
-            first_record: *first_record,
-            records: *records,
+            first_record: SRoff::of_number(*first_record).ok()?,
+            records: ERoff::of_number(*records).ok()?,
             _framing: framing,
             disks,
         })
@@ -132,8 +132,9 @@ impl Open {
     /// Whether a stream-local record is in this extent. False for an extent whose
     /// count is not known, which is the one still being appended to.
     fn holds(&self, record: SRoff) -> bool {
-        let first = SRoff::new(self.first_record);
-        self.records > 0 && record >= first && record.number() < self.first_record + self.records
+        self.records > ERoff::ZERO
+            && record >= self.first_record
+            && record.number() < self.first_record.number() + self.records.number()
     }
 }
 
@@ -183,7 +184,7 @@ impl Stream {
     /// `sealed` is `(extent, records)` when the caller has just been told that extent
     /// filled up. Remembering it here rather than forgetting it is what lets a read of
     /// those records skip the SN afterwards.
-    fn plan(&mut self, sealed: Option<(ExtentId, u64)>) -> Plan {
+    fn plan(&mut self, sealed: Option<(ExtentId, ERoff)>) -> Plan {
         let stale = sealed.map(|(id, _)| id);
         if self.open.is_some() && self.open.as_ref().map(|open| open.id) != stale {
             // Either nothing has filled, or somebody has already replaced what did.
@@ -212,7 +213,7 @@ impl Stream {
     /// Keep a sealed extent, unless it is already kept. Two appends and any number of
     /// reads can each learn the same one.
     fn remember(&mut self, extent: Open) {
-        if extent.records > 0 && !self.sealed.iter().any(|kept| kept.id == extent.id) {
+        if extent.records > ERoff::ZERO && !self.sealed.iter().any(|kept| kept.id == extent.id) {
             self.sealed.push(extent);
         }
     }
@@ -470,7 +471,7 @@ impl FE {
         let (plan, open) = {
             let mut streams = self.streams.lock().expect("streams");
             let stream = streams.entry(key).or_default();
-            let plan = stream.plan(sealed.map(|(id, came_to)| (id, came_to.records)));
+            let plan = stream.plan(sealed.map(|(id, came_to)| (id, ERoff::of_number(came_to.records).unwrap_or(ERoff::ZERO))));
             if plan == Plan::Join {
                 stream
                     .getting
@@ -883,14 +884,14 @@ fn from_instance(
     let identity = format!("EN{}", open.disks[0].0);
     // The record number the extent knows is its own, counted from its first — and no
     // framing goes with it, because the EN will not be looking inside.
-    let at = in_extent(in_stream, SRoff::new(open.first_record));
+    let at = in_extent(in_stream, open.first_record);
     // ⚠️ And the answer comes back in the extent's numbering, which is not the
     // caller's. Three numbering spaces meet here — object, stream, extent — and the
     // FE is the only party that knows all three, so it is the one that converts.
-    let base = origin(ORoff::new(located.first_record), SRoff::new(open.first_record));
+    let base = origin(ORoff::new(located.first_record), open.first_record);
     // A sealed extent has something after it; the one still open is the object's
     // tail, so what the EN says about its own blocks is the whole answer.
-    let sealed = open.records > 0;
+    let sealed = open.records > ERoff::ZERO;
     let mut ask = Request::new(Op::ReadExtent)
         .number(open.disks[0].0.number())
         .number(open.disks[0].1.number())
@@ -1001,7 +1002,7 @@ fn receipt(located: &Located, open: &Open, answer: Response) -> Response {
     };
     // The stream-local record number, and then the object-local one, which is the
     // address a reader gives back.
-    let in_stream = open.first_record + first;
+    let in_stream = open.first_record.number() + first;
     Response {
         id: 0,
         status: Status::Ok,
@@ -1889,9 +1890,9 @@ mod tests {
         let open = Open::of(SnId::new(0), Framing::Lf, &args).expect("an extent");
         assert_eq!(
             (open.sn, open.id, open.created, open.first_record),
-            (SnId::new(0), ExtentId::new(7), TimeSec::new(1_000_000), 40)
+            (SnId::new(0), ExtentId::new(7), TimeSec::new(1_000_000), SRoff::new(40))
         );
-        assert_eq!(open.records, 90, "sealed, so its range is known");
+        assert_eq!(open.records, ERoff::new(90), "sealed, so its range is known");
         assert_eq!(
             open.disks,
             [
@@ -1974,8 +1975,8 @@ mod tests {
             sn: SnId::new(0),
             id: ExtentId::new(7),
             created: TimeSec::new(1_000_000),
-            first_record: 40,
-            records: 0,
+            first_record: SRoff::new(40),
+            records: ERoff::ZERO,
             _framing: Framing::Lf,
             disks: vec![(EnId::new(2), DiskId::new(0)), (EnId::new(3), DiskId::new(0))],
         };
@@ -2030,8 +2031,8 @@ mod tests {
             sn: SnId::new(0),
             id: ExtentId::new(7),
             created: TimeSec::new(1_000_000),
-            first_record: 0,
-            records: 0,
+            first_record: SRoff::ZERO,
+            records: ERoff::ZERO,
             _framing: Framing::Lf,
             disks: vec![(EnId::new(2), DiskId::new(0))],
         };
@@ -2044,8 +2045,8 @@ mod tests {
             sn: SnId::new(0),
             id: ExtentId::new(id),
             created: TimeSec::new(1_000_000),
-            first_record,
-            records: 0,
+            first_record: SRoff::new(first_record),
+            records: ERoff::ZERO,
             _framing: Framing::Lf,
             disks: vec![
                 (EnId::new(2), DiskId::new(0)),
@@ -2078,12 +2079,12 @@ mod tests {
     #[test]
     fn appends_that_all_saw_the_same_extent_fill_ask_once() {
         let mut stream = Stream { open: Some(extent(1, 0)), ..Stream::default() };
-        assert_eq!(stream.plan(Some((ExtentId::new(1), 90))), Plan::Ask, "the first to notice");
-        assert_eq!(stream.plan(Some((ExtentId::new(1), 90))), Plan::Join, "the rest of them");
-        assert_eq!(stream.plan(Some((ExtentId::new(1), 90))), Plan::Join);
+        assert_eq!(stream.plan(Some((ExtentId::new(1), ERoff::new(90)))), Plan::Ask, "the first to notice");
+        assert_eq!(stream.plan(Some((ExtentId::new(1), ERoff::new(90)))), Plan::Join, "the rest of them");
+        assert_eq!(stream.plan(Some((ExtentId::new(1), ERoff::new(90)))), Plan::Join);
         // And it was remembered on the way past, which is what a read wants.
         assert_eq!(stream.sealed.len(), 1);
-        assert_eq!(stream.sealed[0].records, 90);
+        assert_eq!(stream.sealed[0].records, ERoff::new(90));
     }
 
     /// An append that hears about an extent already replaced uses the replacement
@@ -2091,7 +2092,7 @@ mod tests {
     #[test]
     fn an_append_late_to_a_seal_uses_what_replaced_it() {
         let mut stream = Stream { open: Some(extent(2, 90)), ..Stream::default() };
-        assert_eq!(stream.plan(Some((ExtentId::new(1), 90))), Plan::Use);
+        assert_eq!(stream.plan(Some((ExtentId::new(1), ERoff::new(90)))), Plan::Use);
         assert!(stream.sealed.is_empty(), "extent 1 was not this FE's to remember");
     }
 
@@ -2101,9 +2102,9 @@ mod tests {
     #[test]
     fn a_read_finds_a_record_in_a_remembered_extent() {
         let mut stream = Stream { open: Some(extent(1, 0)), ..Stream::default() };
-        stream.plan(Some((ExtentId::new(1), 90)));
+        stream.plan(Some((ExtentId::new(1), ERoff::new(90))));
         stream.open = Some(extent(2, 90));
-        stream.plan(Some((ExtentId::new(2), 80)));
+        stream.plan(Some((ExtentId::new(2), ERoff::new(80))));
         stream.open = Some(extent(3, 170));
 
         assert_eq!(stream.holding(SRoff::new(0)).unwrap().id, ExtentId::new(1));
@@ -2125,7 +2126,7 @@ mod tests {
 
         // What a locate answers for a sealed extent: 90 records from 0.
         let mut sealed = extent(1, 0);
-        sealed.records = 90;
+        sealed.records = ERoff::new(90);
         stream.remember(sealed);
         assert_eq!(stream.holding(SRoff::new(5)).unwrap().id, ExtentId::new(1));
         assert_eq!(stream.holding(SRoff::new(89)).unwrap().id, ExtentId::new(1));
