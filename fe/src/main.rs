@@ -299,14 +299,14 @@ impl FE {
         self.resolving(process, path, None, expect, make, true, reply, then)
     }
 
-    /// The stream holding a record, rather than the one being appended to. Same
-    /// shape of answer, different question — an object is several streams and the
-    /// DN is what knows which.
+    /// Look up the specific stream holding an object-local record number (`ORoff`),
+    /// rather than the stream currently being appended to. Same shape of answer,
+    /// different question — an object is several streams and the DN is what knows which.
     fn resolve_record(
         self: &Arc<Self>,
         process: &Arc<Process>,
         path: &str,
-        record: u64,
+        record: ORoff,
         expect: Expecting,
         reply: Reply,
         then: impl FnOnce(&Arc<FE>, &Arc<Process>, Located, Reply) + Send + 'static,
@@ -314,17 +314,23 @@ impl FE {
         self.resolving(process, path, Some(record), expect, None, false, reply, then)
     }
 
-    /// `again` is the one retry a lost race gets: two appends to a name that does not
-    /// exist both try to make it, and the one that loses is told the name is taken.
-    /// That is the right answer to a create and the wrong answer to an append, so the
-    /// append looks the object up again — by then it is there, and a lookup waits for
-    /// its stream (`Op::ObjectInfo` parks at the DN).
+    /// Resolve an object path at the owning Directory Node (DN).
+    ///
+    /// Determines which DN owns the path and asks it for object and stream location:
+    /// - If `record` is `None` (for appends), asks `Op::ObjectInfo` to locate the object's
+    ///   tail stream currently taking appends. If `make` is `Some(framing)` and the object
+    ///   does not exist yet, creates it.
+    /// - If `record` is `Some(record)` (for reads), asks `Op::LocateStream` for the specific
+    ///   stream holding that object-local record number (`ORoff`).
+    ///
+    /// Once the DN describes the stream (`Located`), invokes `then`. `again` provides a single
+    /// retry if an initial create raced with another writer and lost.
     #[allow(clippy::too_many_arguments)]
     fn resolving(
         self: &Arc<Self>,
         process: &Arc<Process>,
         path: &str,
-        record: Option<u64>,
+        record: Option<ORoff>,
         expect: Expecting,
         make: Option<Framing>,
         again: bool,
@@ -347,7 +353,7 @@ impl FE {
         // only tier that can see the path point somewhere new (§17.36).
         let mut ask = match record {
             None => Request::new(Op::ObjectInfo).text(&path),
-            Some(record) => Request::new(Op::LocateStream).text(&path).number(record),
+            Some(record) => Request::new(Op::LocateStream).text(&path).number(record.number()),
         };
         // ⚠️ Only when there is an opinion, so a plain resolve is the request §17.5g measured.
         if expect.asked() {
@@ -725,6 +731,7 @@ impl FE {
             ));
         };
         reply.about(format_args!("{path},record {record},{:?}", range.budget));
+        let record = ORoff::new(record);
         self.resolve_record(
             process,
             &path,
@@ -734,7 +741,7 @@ impl FE {
             move |fe, process, located, reply| {
                 // The DN answered with the stream holding it, so the number the stream
                 // knows it by is what is left after that stream's first.
-                let at = in_stream(ORoff::new(record), ORoff::new(located.first_record));
+                let at = in_stream(record, ORoff::new(located.first_record));
                 fe.locate(process, located, at, range.budget, reply);
             },
         );
