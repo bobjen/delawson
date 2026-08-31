@@ -16,13 +16,13 @@
 
 use common::config::{DNConfig, ServiceKind};
 use common::framing::Framing;
-use common::ids::{DnId, ObjectId, RangeId, SnId, StreamId};
+use common::ids::{DnId, ExtentId, ObjectId, RangeId, SnId, StreamId};
 use common::info::{
     Batch, Described, ExtentRow, ExtentRun, Listing, ObjectName, Shape, StreamName, StreamRow,
     Totals, UNKNOWN, Wanted,
 };
 use common::logw;
-use common::offset::ORoff;
+use common::offset::{ORoff, SCoff, SLoff, SRoff};
 use common::range::{Detail, Want};
 use common::routing;
 use common::server::{self, Process, Reply, Service};
@@ -156,7 +156,7 @@ fn detailed(
                 first_record: at.number(),
                 // ⚠️ UNKNOWN, not zero: how far the stream being appended to reaches is
                 // not the DN's to say (§6.3), and a sealed stream may hold nothing.
-                records: held.records,
+                records: held.records.number(),
                 created: held.created,
                 // What the DN last learned. Exact once the stream is sealed, a point in
                 // time before that, and UNKNOWN until any SN has been asked (§17.25.1).
@@ -295,12 +295,12 @@ struct Stream {
     /// what it meant the first time its range moved. `dn` stands in for `RangeId` until
     /// ranges exist (#109).
     id: StreamId,
-    /// Records in it once sealed, and **`UNKNOWN` while it is the one being appended to**.
+    /// Records in it once sealed, and **`SRoff::NONE` while it is the one being appended to**.
     ///
     /// ⚠️ **This one does not go stale, unlike the sizes below.** §4.5's exact record count
     /// is what addressing runs on, so a stale record count is a *wrong read*, while a stale
     /// byte count is a slightly wrong listing (§17.25.1).
-    records: u64,
+    records: SRoff,
     /// The second this stream was handed out. The DN's own, so always exact — which is what
     /// a directory listing wants, and ⚠️ **which turns out to be part of the stream's name**
     /// rather than decoration: it is the third component of `(RangeId, StreamId, CreateSec)`,
@@ -308,16 +308,15 @@ struct Stream {
     created: TimeSec,
     /// Bytes the writer wrote and bytes stored, summed over the stream's extents.
     ///
-    /// ⚠️ **Exact for a sealed stream, as-of for a growing one, `UNKNOWN` until an SN has
+    /// ⚠️ **Exact for a sealed stream, as-of for a growing one, `SLoff::NONE` / `SCoff::NONE` until an SN has
     /// been asked** (Asserted, Bob, 2026-08-20). A sealed stream cannot change, so one
     /// refresh is right for ever; a growing one is only ever a point in time, and that is
     /// good enough for the listing these exist for.
-    logical: u64,
-    compressed: u64,
+    logical: SLoff,
+    compressed: SCoff,
     sn: SnId,
-    /// Extents in it. `UNKNOWN` is not representable in 32 bits alongside a real count, so
-    /// this uses `u32::MAX` and the accessor is what reads it (§8.1.6.2).
-    extents: u32,
+    /// Extents in it, or `ExtentId::NONE` if unknown (§8.1.6.2).
+    extents: ExtentId,
 }
 
 impl Stream {
@@ -325,24 +324,21 @@ impl Stream {
     fn new(id: StreamId, sn: SnId, created: TimeSec) -> Stream {
         Stream {
             id,
-            records: UNKNOWN,
+            records: SRoff::NONE,
             created,
-            logical: UNKNOWN,
-            compressed: UNKNOWN,
+            logical: SLoff::NONE,
+            compressed: SCoff::NONE,
             sn,
-            extents: u32::MAX,
+            extents: ExtentId::NONE,
         }
     }
 
     /// What this stream has come to, in the shape the wire carries.
     fn totals(&self) -> Totals {
         Totals {
-            extents: match self.extents {
-                u32::MAX => UNKNOWN,
-                extents => extents as u64,
-            },
-            logical: self.logical,
-            compressed: self.compressed,
+            extents: if self.extents.is_none() { UNKNOWN } else { self.extents.number() },
+            logical: self.logical.number(),
+            compressed: self.compressed.number(),
         }
     }
 
@@ -350,18 +346,23 @@ impl Stream {
     /// that crossed a newer one in flight must not walk the numbers back, and a sealed
     /// stream's totals are final whatever arrives afterwards.
     fn learned(&mut self, totals: Totals) {
-        if totals.extents != UNKNOWN {
-            let seen = totals.extents.min(u32::MAX as u64 - 1) as u32;
-            if self.extents == u32::MAX || seen > self.extents {
-                self.extents = seen;
-            }
-        }
-        for (mine, seen) in
-            [(&mut self.logical, totals.logical), (&mut self.compressed, totals.compressed)]
+        if totals.extents != UNKNOWN
+            && let Ok(seen) = ExtentId::of_number(totals.extents)
+            && (self.extents.is_none() || seen.get() > self.extents.get())
         {
-            if seen != UNKNOWN && (*mine == UNKNOWN || seen > *mine) {
-                *mine = seen;
-            }
+            self.extents = seen;
+        }
+        if totals.logical != UNKNOWN
+            && let Ok(seen) = SLoff::of_number(totals.logical)
+            && (self.logical.is_none() || seen.number() > self.logical.number())
+        {
+            self.logical = seen;
+        }
+        if totals.compressed != UNKNOWN
+            && let Ok(seen) = SCoff::of_number(totals.compressed)
+            && (self.compressed.is_none() || seen.number() > self.compressed.number())
+        {
+            self.compressed = seen;
         }
     }
 }
@@ -376,8 +377,8 @@ impl Object {
     fn streams_from(&self) -> impl Iterator<Item = (ORoff, &Stream)> {
         self.streams.iter().scan(ORoff::ZERO, |at, stream| {
             let first = *at;
-            if stream.records != UNKNOWN {
-                *at = ORoff::new(at.number() + stream.records);
+            if stream.records.is_some() {
+                *at = ORoff::new(at.number() + stream.records.number());
             }
             Some((first, stream))
         })
@@ -426,8 +427,8 @@ impl Object {
     /// plus a count, which §17.22.1 is the story of.
     fn records(&self) -> u64 {
         match self.streams_from().last() {
-            Some((_, last)) if last.records == UNKNOWN => UNKNOWN,
-            Some((at, last)) => at.number() + last.records,
+            Some((_, last)) if last.records.is_none() => UNKNOWN,
+            Some((at, last)) => at.number() + last.records.number(),
             None => 0,
         }
     }
@@ -441,12 +442,8 @@ impl Object {
     /// covers it, or the last, whose reach is not known here.
     fn holding(&self, record: ORoff) -> Option<(ORoff, Stream)> {
         for (at, held) in self.streams_from() {
-            match held.records {
-                // The stream still being appended to: anything past its start is
-                // routed to it, and the SN and EN say whether it is really there.
-                UNKNOWN => return Some((at, *held)),
-                records if record.number() < at.number() + records => return Some((at, *held)),
-                _ => continue,
+            if held.records.is_none() || record.number() < at.number() + held.records.number() {
+                return Some((at, *held));
             }
         }
         None
@@ -803,7 +800,11 @@ impl DN {
     fn extend(self: &Arc<Self>, process: &Arc<Process>, request: &Request, reply: Reply) {
         let (name, sealed, records) = match request.args.as_slice() {
             [Arg::Text(name), Arg::Number(sealed), Arg::Number(records)] => {
-                (name.clone(), *sealed, *records)
+                let records = match SRoff::of_number(*records) {
+                    Ok(r) => r,
+                    Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+                };
+                (name.clone(), *sealed, records)
             }
             _ => {
                 return reply.send(Response::error(
@@ -1331,7 +1332,7 @@ mod tests {
     /// positions follow.
     fn held(id: u32, sn: u32, records: Option<u64>) -> Stream {
         Stream {
-            records: records.unwrap_or(UNKNOWN),
+            records: records.map(SRoff::new).unwrap_or(SRoff::NONE),
             ..Stream::new(StreamId::new(id), SnId::new(sn), TimeSec::new(1_000_000))
         }
     }
