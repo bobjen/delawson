@@ -97,7 +97,7 @@ fn describe_at(
     object: &Object,
     range: RangeId,
     dn: DnId,
-    record: Option<u64>,
+    record: Option<ORoff>,
     want: &Want,
     limit: u64,
 ) -> Option<Answering> {
@@ -392,12 +392,12 @@ impl Object {
 
     /// What this object is, at one of its streams: the last for an append, or the one
     /// holding a record for a read.
-    fn args(&self, range: RangeId, dn: DnId, record: Option<u64>) -> Option<Vec<Arg>> {
+    fn args(&self, range: RangeId, dn: DnId, record: Option<ORoff>) -> Option<Vec<Arg>> {
         // ⚠️ The position comes back *with* the stream, because the stream does not carry
         // it (§17.33.1) — the same shape as `sn::Placed`, and for the same reason.
         let (first, held) = match record {
             None => self.last()?,
-            Some(record) => self.holding(ORoff::new(record))?,
+            Some(record) => self.holding(record)?,
         };
         Some(
             Described {
@@ -637,7 +637,10 @@ impl Service for DN {
             Op::BatchCreate => self.create_many(process, &request, reply),
             Op::ObjectInfo => self.info(process, &request, None, reply),
             Op::LocateStream => match request.args.as_slice() {
-                [_, Arg::Number(record), ..] => self.info(process, &request, Some(*record), reply),
+                [_, Arg::Number(record), ..] => match ORoff::of_number(*record) {
+                    Ok(record) => self.info(process, &request, Some(record), reply),
+                    Err(e) => reply.send(Response::error(Status::BadRequest, e.to_string())),
+                },
                 _ => reply.send(Response::error(
                     Status::BadRequest,
                     "locate-stream takes a name and a record",
@@ -937,7 +940,7 @@ impl DN {
         self: &Arc<Self>,
         process: &Arc<Process>,
         request: &Request,
-        record: Option<u64>,
+        record: Option<ORoff>,
         reply: Reply,
     ) {
         let (name, rest) = match request.args.as_slice() {
@@ -1233,7 +1236,7 @@ impl DN {
     }
 
     /// ⚠️ **Takes the name's shard lock** — see `look`.
-    fn describe(&self, name: &str, record: Option<u64>) -> Option<Vec<Arg>> {
+    fn describe(&self, name: &str, record: Option<ORoff>) -> Option<Vec<Arg>> {
         self.shards[shard_of(name)]
             .lock()
             .expect("objects")
