@@ -19,14 +19,12 @@ looking for a precedent in that tree.
 Everything in this repo must be traceable to Bob's statements in conversation,
 public sources, or reasoning done here.
 
-This is enforced, not merely requested. `~/.claude/settings.json` carries deny
-rules for those paths plus a `PreToolUse` hook,
-`~/.claude/hooks/clean-room-guard.sh`, which rejects any tool call whose input
-matches the patterns in `~/.claude/clean-room-blocklist.txt`. The guard exempts
-writes whose `file_path` is under `~/src/delawson`, `~/src/delawson-notes`, or
-`~/.claude`, so these docs can name the forbidden sources in order to forbid
-them. `Bash` has no `file_path` and is therefore always checked — meaning even
-a harmless shell command that merely mentions those names is blocked.
+This is enforced, not merely requested, by the local configuration of each
+development agent. Those configurations may deny access to the contaminated
+paths and reject tool calls whose input matches the forbidden-source patterns.
+The enforcement configuration is deliberately kept outside this repository;
+this document states the project rule, not the implementation details of any
+one agent's hooks or settings.
 
 ## Issues
 
