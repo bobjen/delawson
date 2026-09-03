@@ -17989,17 +17989,19 @@ boundary different: a cluster operator controls the servers, while a client libr
 for years. Upgrading every server therefore does not make it safe to send a new response format to
 every client.
 
-### 17.42.1 A shipped `Op::` tag is permanent
+### 17.42.1 A shipped `Op::` tag is stable until the namespace is exhausted
 
 `Op::` is one global namespace for commands and nontrivial serialized structures. A tag that has been
-released in a client-visible protocol is a permanent identifier for its original meaning and format.
-When that command or structure is retired, its number remains a tombstone and is never reused. Reusing
-it could make an old client interpret a new value as the old one, which risks silent corruption rather
-than a clean failure.
+released in a client-visible protocol remains stable while there is an unused number available at the
+end of the namespace. When that command or structure is retired, its number becomes a tombstone. New
+tags normally append, but when the namespace has no unused number left, the oldest tombstones may be
+reused after the required release gap. Do not renumber live tags or choose a newer tombstone while an
+older one is available.
 
-Only an identifier that was never released outside the upgraded software may be reused. The 16-bit
-namespace makes permanent tombstones practical; exhausting it is a release-planning problem, not a
-reason to recycle a user-visible identifier.
+Reusing a tag can make an old client send bytes intended for an unrelated format. That is treated as
+untrusted input, just like a malicious client choosing arbitrary tags. The receiver must reject it
+without crashing, hanging, exhausting resources, or performing an unauthorized action. The release
+gap gives the old meaning time to become an old, unsupported format before its number is recycled.
 
 ### 17.42.2 Capabilities select new formats
 
@@ -18020,3 +18022,24 @@ Nested structures and commands do not carry lengths when their parser is known t
 global tags select the parser, and an unknown or incompatible tag fails the command. This is
 intentional: a receiver must never skip an unrecognized value and risk losing data. Lengths remain at
 the top-level message boundary, where they frame whole commands for the transport.
+
+### 17.42.3 Serialization and deserialization are bounded infrastructure
+
+All message serialization and deserialization goes through the common wire infrastructure. Typed
+structures provide their field-level routines to that infrastructure; callers do not hand-code a
+second wire format around them. The serializer tracks the maximum tagged-structure recursion depth
+and writes it in the top-level message. The deserializer rejects a message whose advertised depth is
+outside the configured limit or whose actual nested parsing exceeds it.
+
+Deserialization allocates no more than proportionally to the bytes and bounded counts it parses.
+Variable lengths and collection counts are checked before allocation. Deserialization routines are
+linear in the message portion they parse and avoid side effects. They may leave unordered, duplicate
+input for a later normalization phase; sorting, merging, interning, authorization, cache updates,
+and other work happen afterward, where their costs can be estimated from the parsed result before
+the work begins.
+
+The parser permits only bounded lookahead and is intended to be single-pass. A parser routine may
+charge additional work after reading a parameter such as a count, but it may not perform significant
+speculative parsing and roll it back. Shared readers count parse operations against the message byte
+count. A routine that violates these rules is a software bug; process-level liveness supervision is
+the backstop for a routine that never returns.

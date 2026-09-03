@@ -158,34 +158,36 @@ impl Range {
             Start::RecordThen(record, offset) => (record, offset),
             Start::Logical(offset) => (offset, 0),
         };
-        payload.tag(Op::Range);
-        payload.number_u8(self.start.code() as u8);
-        payload.number_u64(first);
-        payload.number_u64(second);
-        payload.number_u8(self.budget.code() as u8);
-        payload.number_u64(self.budget.amount());
+        payload.nested(Op::Range, |payload| {
+            payload.number_u8(self.start.code() as u8);
+            payload.number_u64(first);
+            payload.number_u64(second);
+            payload.number_u8(self.budget.code() as u8);
+            payload.number_u64(self.budget.amount());
+        });
     }
 
     pub fn read_nested(payload: &mut StructReader<'_>) -> Result<Range> {
-        payload.tag(Op::Range, "a range")?;
-        let kind = payload.number_u8()?;
-        let first = payload.number_u64()?;
-        let second = payload.number_u64()?;
-        let measure = payload.number_u8()?;
-        let amount = payload.number_u64()?;
-        let start = match kind {
-            0 => Start::Record(first),
-            1 => Start::RecordThen(first, second),
-            2 => Start::Logical(first),
-            other => return Err(Error::new(format!("no range start of kind {other}"))),
-        };
-        let budget = match measure {
-            0 => Budget::Records(amount),
-            1 => Budget::Logical(amount),
-            2 => Budget::Compressed(amount),
-            other => return Err(Error::new(format!("no budget measured in kind {other}"))),
-        };
-        Ok(Range { start, budget })
+        payload.nested(Op::Range, "a range", |payload| {
+            let kind = payload.number_u8()?;
+            let first = payload.number_u64()?;
+            let second = payload.number_u64()?;
+            let measure = payload.number_u8()?;
+            let amount = payload.number_u64()?;
+            let start = match kind {
+                0 => Start::Record(first),
+                1 => Start::RecordThen(first, second),
+                2 => Start::Logical(first),
+                other => return Err(Error::new(format!("no range start of kind {other}"))),
+            };
+            let budget = match measure {
+                0 => Budget::Records(amount),
+                1 => Budget::Logical(amount),
+                2 => Budget::Compressed(amount),
+                other => return Err(Error::new(format!("no budget measured in kind {other}"))),
+            };
+            Ok(Range { start, budget })
+        })
     }
 
     /// And back, returning whatever followed it.

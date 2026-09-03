@@ -101,8 +101,8 @@ impl Open {
         let created = payload.number_u64().ok()?;
         let first_record = payload.number_u64().ok()?;
         let records = payload.number_u64().ok()?;
-        let count = payload.number_u32().ok()? as usize;
-        let mut disks = Vec::with_capacity(count);
+        let count = payload.number_u32().ok()?;
+        let mut disks = payload.checked_vec(count).ok()?;
         for _ in 0..count {
             disks.push((
                 EnId::of_number(payload.number_u32().ok()? as u64).ok()?,
@@ -1433,7 +1433,10 @@ impl FE {
                 Ok(count) => count as usize,
                 Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
             };
-            let mut names = Vec::with_capacity(count);
+            let mut names = match payload.checked_vec(count) {
+                Ok(names) => names,
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            };
             for _ in 0..count {
                 match payload.text() {
                     Ok(name) => names.push(name),
@@ -1528,7 +1531,10 @@ impl FE {
                 Ok(count) => count as usize,
                 Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
             };
-            let mut wanted = Vec::with_capacity(count);
+            let mut wanted = match payload.checked_vec(count) {
+                Ok(wanted) => wanted,
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            };
             for _ in 0..count {
                 match Wanted::read(&mut payload) {
                     Ok(one) => wanted.push(one),
@@ -1782,12 +1788,12 @@ fn arrived(
 fn first(request: &Req) -> String {
     match request.args.first() {
         Some(Arg::Text(name)) => name.clone(),
-        Some(Arg::Struct(Op::ObjectInfo, _bytes)) => {
+        Some(Arg::Struct(Op::ObjectInfo, _bytes, _)) => {
             structure(&request.args, Op::ObjectInfo, "an object-info request")
                 .and_then(|(mut payload, _)| payload.text())
                 .unwrap_or_default()
         }
-        Some(Arg::Struct(Op::BatchInfo, _bytes)) => {
+        Some(Arg::Struct(Op::BatchInfo, _bytes, _)) => {
             structure(&request.args, Op::BatchInfo, "a batch-object-info request")
                 .and_then(|(mut payload, _)| {
                     let _ = payload.number_u64()?;
@@ -1795,12 +1801,12 @@ fn first(request: &Req) -> String {
                 })
                 .unwrap_or_default()
         }
-        Some(Arg::Struct(Op::CreateObject, _bytes)) => {
+        Some(Arg::Struct(Op::CreateObject, _bytes, _)) => {
             structure(&request.args, Op::CreateObject, "a create-object request")
                 .and_then(|(mut payload, _)| payload.text())
                 .unwrap_or_default()
         }
-        Some(Arg::Struct(Op::BatchCreate, _bytes)) => {
+        Some(Arg::Struct(Op::BatchCreate, _bytes, _)) => {
             structure(&request.args, Op::BatchCreate, "a batch-create request")
                 .and_then(|(mut payload, _)| {
                     let _ = payload.number_u64()?;

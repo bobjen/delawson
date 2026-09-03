@@ -16,7 +16,7 @@ use crate::ids::{DiskId, DnId, EnId, ExtentId, ObjectId, RangeId, SnId, StreamId
 use crate::placement::Expansion;
 use crate::time::TimeSec;
 use crate::wire::Arg;
-use crate::wire::{Op, StructReader, StructWriter, structure};
+use crate::wire::{Op, StructReader, StructWriter, checked_vec, structure};
 use crate::{Error, Result};
 
 /// An object as the DN describes it, at one of its streams.
@@ -145,7 +145,7 @@ impl Described {
     /// The argument slices for a prefix of rows, whether they are old flat rows
     /// or new self-contained values.
     pub fn some_of_args<'a>(mut args: &'a [Arg], count: u64) -> Result<Vec<&'a [Arg]>> {
-        let mut rows = Vec::with_capacity(count as usize);
+        let mut rows = checked_vec(count, args.len())?;
         for _ in 0..count {
             let whole = args;
             let (_, rest) = Described::of_args(args)?;
@@ -320,19 +320,21 @@ impl Expecting {
     }
 
     pub fn write(&self, payload: &mut StructWriter) {
-        payload.tag(Op::Expecting);
-        payload.number_u32(self.0.range.get());
-        payload.number_u32(self.0.object.get());
-        payload.number_u64(self.0.created.number());
+        payload.nested(Op::Expecting, |payload| {
+            payload.number_u32(self.0.range.get());
+            payload.number_u32(self.0.object.get());
+            payload.number_u64(self.0.created.number());
+        });
     }
 
     pub fn read(payload: &mut StructReader<'_>) -> Result<Expecting> {
-        payload.tag(Op::Expecting, "an expectation")?;
-        Ok(Expecting(ObjectName {
-            range: RangeId::new(payload.number_u32()?),
-            object: ObjectId::new(payload.number_u32()?),
-            created: TimeSec::new(payload.number_u64()?),
-        }))
+        payload.nested(Op::Expecting, "an expectation", |payload| {
+            Ok(Expecting(ObjectName {
+                range: RangeId::new(payload.number_u32()?),
+                object: ObjectId::new(payload.number_u32()?),
+                created: TimeSec::new(payload.number_u64()?),
+            }))
+        })
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Expecting, &[Arg])> {
@@ -487,7 +489,7 @@ impl StreamRow {
 
     /// `given` rows, and whatever followed them.
     pub fn some_of_args(args: &[Arg], given: u64) -> Result<(Vec<StreamRow>, &[Arg])> {
-        let mut rows = Vec::with_capacity(given as usize);
+        let mut rows = checked_vec(given, args.len())?;
         let mut rest = args;
         for _ in 0..given {
             let (row, after) = StreamRow::of_args(rest)?;
@@ -564,8 +566,8 @@ impl ExtentRow {
         let records = payload.number_u64()?;
         let logical = payload.number_u64()?;
         let length = payload.number_u64()?;
-        let count = payload.number_u32()? as usize;
-        let mut disks = Vec::with_capacity(count);
+        let count = payload.number_u32()?;
+        let mut disks = payload.checked_vec(count)?;
         for _ in 0..count {
             disks.push((EnId::new(payload.number_u32()?), DiskId::new(payload.number_u16()?)));
         }
@@ -574,7 +576,7 @@ impl ExtentRow {
     }
 
     pub fn some_of_args(args: &[Arg], given: u64) -> Result<(Vec<ExtentRow>, &[Arg])> {
-        let mut rows = Vec::with_capacity(given as usize);
+        let mut rows = checked_vec(given, args.len())?;
         let mut rest = args;
         for _ in 0..given {
             let (row, after) = ExtentRow::of_args(rest)?;
@@ -645,7 +647,7 @@ impl Batch {
     /// with the extents *its* row says. Only for the levelled form: a batch asked for no
     /// detail at all answers with bare object rows and `Described::all_of_args` reads those.
     pub fn pieces(mut args: &[Arg], count: u64) -> Result<Vec<&[Arg]>> {
-        let mut out = Vec::with_capacity(count as usize);
+        let mut out = checked_vec(count, args.len())?;
         for _ in 0..count {
             let whole = args;
             let (shape, mut rest) = Shape::of_args(args)?;
@@ -708,8 +710,8 @@ impl Listing {
 
     pub fn read_payload(payload: &mut StructReader<'_>) -> Result<Listing> {
         let limit = payload.number_u64()?;
-        let count = payload.number_u32()? as usize;
-        let mut at = Vec::with_capacity(count);
+        let count = payload.number_u32()?;
+        let mut at = payload.checked_vec(count)?;
         for _ in 0..count {
             at.push((
                 StreamName {
@@ -727,7 +729,7 @@ impl Listing {
         let [Arg::Number(limit), Arg::Number(count), rest @ ..] = args else {
             return Err(Error::new("list-extents takes a limit and a run of streams"));
         };
-        let count = *count as usize;
+        let count = usize::try_from(*count).map_err(|_| Error::new("stream count does not fit"))?;
         let each = StreamName::ARGS + 1;
         if rest.len() != count * each {
             return Err(Error::new(format!(
@@ -735,7 +737,7 @@ impl Listing {
                 rest.len() / each
             )));
         }
-        let mut at = Vec::with_capacity(count);
+        let mut at = checked_vec(count, rest.len())?;
         let mut rest = rest;
         for _ in 0..count {
             let (name, after) = StreamName::of_args(rest)?;
@@ -885,7 +887,7 @@ mod tests {
     #[test]
     fn an_impossible_framing_is_refused() {
         let mut args = one(1).args();
-        let Arg::Struct(_, payload) = &mut args[0] else { panic!("a self-contained row") };
+        let Arg::Struct(_, payload, _) = &mut args[0] else { panic!("a self-contained row") };
         payload[41] = 99;
         assert!(Described::of_args(&args).is_err());
     }
@@ -1023,7 +1025,7 @@ mod tests {
     #[test]
     fn an_extent_lying_about_its_instances_is_refused() {
         let mut args = extent(1, 0, 40).args();
-        let Arg::Struct(_, payload) = &mut args[0] else { panic!("a self-contained extent") };
+        let Arg::Struct(_, payload, _) = &mut args[0] else { panic!("a self-contained extent") };
         payload[48..52].copy_from_slice(&99u32.to_le_bytes());
         assert!(ExtentRow::of_args(&args).is_err());
         assert!(ExtentRow::of_args(&args[..0]).is_err(), "and a short row too");

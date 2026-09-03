@@ -906,12 +906,29 @@ stays constant — `SN-NOT-IN-WRITE-PATH` in a different guise.
 
 ## Wire protocol and compatibility
 
-**`SHIPPED-OP-TAGS-ARE-PERMANENT`** — an `Op::` tag released in a client-visible protocol is never
-assigned a different meaning or format. Retiring it leaves a permanent tombstone.
-*Argued* §17.42.1 · *Enforced* **code and release review**: new tags append and retired tags remain
-documented · *Checked* release audit against the historical tag list; a uniqueness test alone is not
-enough because it cannot detect reuse across releases
-*Breaks* an old client may parse a new value as the old format and silently produce a wrong result.
+**`SHIPPED-OP-TAGS-STAY-STABLE-UNTIL-EXHAUSTION`** — an `Op::` tag released in a client-visible
+protocol is not assigned a different meaning or format while an unused number remains at the end of
+the namespace. Retiring it leaves a tombstone; only the oldest tombstones may be reused after the
+required release gap, and only when the namespace is otherwise exhausted.
+*Argued* §17.42.1 · *Enforced* **code and release review**: new tags append, retired tags remain
+documented, and exhaustion reuses tombstones oldest first · *Checked* release audit against the
+historical tag list; a uniqueness test alone cannot detect reuse across releases
+*Breaks* reuse before exhaustion can make a supported old client silently invoke an unrelated parser.
+
+**`WIRE-SERIALIZATION-USES-COMMON-INFRASTRUCTURE`** — every message and tagged structure is
+serialized through the common wire infrastructure, which records the message's maximum tagged-
+structure recursion depth.
+*Argued* §17.42.3 · *Enforced* **code** by `StructWriter::nested` and the top-level message encoders ·
+*Checked* depth-bearing request/response and nested-structure tests
+*Breaks* independently hand-coded serializers can omit resource metadata or disagree about the wire.
+
+**`WIRE-DESERIALIZATION-IS-BOUNDED-SINGLE-PASS`** — deserialization allocates at most proportionally
+to the bytes and checked counts it parses, is linear in the input it parses, uses bounded lookahead,
+and performs no side effects. Shared readers reject excessive recursion and parse operations.
+*Argued* §17.42.3 · *Enforced* **code and parser review**: bounded readers, depth checks, and parse
+operation checks · *Checked* malformed-depth, parse-count, truncation, and trailing-byte tests
+*Breaks* an ordinary message can become an allocation, CPU, or rollback attack before operation-level
+authorization and resource estimation can run.
 
 **`NEW-WIRE-FORMATS-REQUIRE-CLIENT-CAPABILITY`** — a server sends a new client-visible format only
 after the client advertises support for it; otherwise it sends the old format or an explicit
@@ -979,7 +996,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **seal** (extent) | §6 | `EXTENT-SEALS-BETWEEN-RECORDS`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATION-SEALS`, `SEALED-EXTENT-IMMUTABLE`, `RECORD-NUMBERS-DENSE`, `UNAPPENDABLE-EXTENT-SEALS`, `SEAL-CLOSES-TOP-DOWN`, `REQUESTED-SEAL-DISCARDS-NOTHING`, `SEAL-REQUESTS-ARE-IDEMPOTENT` |
 | **seal** (wire segment) | §17.5a | `NO-TWO-SEGMENTS-SHARE-A-NONCE`. ⚠️ *An unrelated sense of the word; `common/src/seal.rs` is this one.* |
 | **stream** | §4.1 | `STREAM-IDENTITY-OWNED`, `SN-NOT-IN-WRITE-PATH`, `ONE-REQUEST-IN-FLIGHT-PER-STREAM`, `EXTENT-KEY-FROM-CREATING-SN`, `READ-NAMES-THE-OBJECT`, `THE-OFFICIAL-FLAG-STAYS-PERMISSIVE-UNTIL-CLEANUP-ENDS` |
-| **`Op::` tag** | §17.42.1 | `SHIPPED-OP-TAGS-ARE-PERMANENT`, `NEW-WIRE-FORMATS-REQUIRE-CLIENT-CAPABILITY`, `UNKNOWN-NESTED-TAGS-FAIL-CLOSED` |
+| **`Op::` tag** | §17.42.1 | `SHIPPED-OP-TAGS-STAY-STABLE-UNTIL-EXHAUSTION`, `NEW-WIRE-FORMATS-REQUIRE-CLIENT-CAPABILITY`, `UNKNOWN-NESTED-TAGS-FAIL-CLOSED` |
 | **summary** | §4.5 | `TAIL-ONLY-SUMMARIES-EXACT`, `UNKEYED-COUNT-EXACT`, `COUNTS-ARE-RECOMPUTABLE` |
 | **watermark** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `SEAL-NEVER-BELOW-DURABLE`, `INCOMPLETE-RECORD-NOT-DURABLE` |
 

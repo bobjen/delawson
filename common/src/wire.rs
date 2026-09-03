@@ -41,6 +41,29 @@ use std::time::Instant;
 /// Refuse a message larger than this rather than allocating what a peer asks for.
 pub const MAX_FRAME_BYTES: usize = 1 << 20;
 
+/// Refuse a message whose tagged structures would require deeper parsing than
+/// this. The sender includes its observed maximum so this can be rejected before
+/// dispatch, while each nested reader checks the actual depth as it goes.
+pub const MAX_RECURSION_DEPTH: u8 = 64;
+
+/// Reserve a message-derived collection only when its count can fit in the
+/// available encoded bytes. The parser that knows a larger minimum item size
+/// may impose a tighter limit before calling this helper.
+pub fn checked_vec<T, N>(count: N, available_bytes: usize) -> Result<Vec<T>>
+where
+    N: TryInto<usize>,
+{
+    let count = count.try_into().map_err(|_| Error::new("collection count does not fit"))?;
+    if count > available_bytes {
+        return Err(Error::new("collection count exceeds message bytes"));
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|e| Error::new(format!("collection allocation: {e}")))?;
+    Ok(values)
+}
+
 /// And a batch of them is sealed in pieces no larger than this, so one busy
 /// connection cannot make the far side allocate without bound.
 pub const MAX_SEGMENT_BYTES: usize = 8 << 20;
@@ -77,10 +100,10 @@ macro_rules! ops {
 
 // Op codes are stable wire identifiers. This namespace contains standalone commands and
 // nontrivial serialized pieces. Append new commands or schema tags; never renumber existing
-// codes. Any code shipped in a client-visible protocol is permanent: retired codes become
-// tombstones and must never be reused for a different format or meaning, because an old client
-// could silently misread the new value as the old one. Only an identifier that was never released
-// outside the upgraded software may be reused.
+// codes. Retired codes become tombstones. Reuse an old tombstone only after the required release
+// gap, and only when no unused code remains at the end of the namespace; reuse the oldest
+// tombstones first. Old and malicious clients are untrusted input, so every parser must fail
+// boundedly rather than crash, hang, or perform an unauthorized action.
 ops! {
     // Control, answered by every machine type.
     Ping = 1, "ping";
@@ -245,7 +268,10 @@ impl std::fmt::Display for Status {
 pub enum Arg {
     /// A self-contained serialized structure. The structure owns the payload
     /// format; the wire only supplies its schema tag and length.
-    Struct(Op, Vec<u8>),
+    /// The third value is the maximum tagged-structure depth observed while
+    /// constructing this value. It is not serialized separately; the enclosing
+    /// message carries the maximum for all of its values.
+    Struct(Op, Vec<u8>, u8),
     Text(String),
     Number(u64),
     Flag(bool),
@@ -255,11 +281,13 @@ pub enum Arg {
 /// Build the self-contained payload of one tagged structure.
 pub struct StructWriter {
     bytes: Vec<u8>,
+    depth: u8,
+    maximum_depth: u8,
 }
 
 impl StructWriter {
     pub fn new() -> StructWriter {
-        StructWriter { bytes: Vec::new() }
+        StructWriter { bytes: Vec::new(), depth: 1, maximum_depth: 1 }
     }
 
     pub fn number_u64(&mut self, value: u64) {
@@ -291,15 +319,17 @@ impl StructWriter {
         self.bytes(value.as_bytes());
     }
 
-    /// Mark the start of a nested, command-owned structure. Its parser consumes
-    /// the positional fields directly from the enclosing payload; there is no
-    /// nested length because an unknown format must fail rather than be skipped.
-    pub fn tag(&mut self, op: Op) {
+    /// Write a nested tagged structure while tracking its depth in the enclosing value.
+    pub fn nested(&mut self, op: Op, write: impl FnOnce(&mut StructWriter)) {
         self.bytes.extend(op.code().to_le_bytes());
+        self.depth = self.depth.checked_add(1).expect("serialization nesting depth overflow");
+        self.maximum_depth = self.maximum_depth.max(self.depth);
+        write(self);
+        self.depth -= 1;
     }
 
     pub fn finish(self, op: Op) -> Arg {
-        Arg::Struct(op, self.bytes)
+        Arg::Struct(op, self.bytes, self.maximum_depth)
     }
 }
 
@@ -307,14 +337,22 @@ impl StructWriter {
 pub struct StructReader<'a> {
     bytes: &'a [u8],
     at: usize,
+    depth: u8,
+    maximum_depth: u8,
+    parse_count: usize,
 }
 
 impl<'a> StructReader<'a> {
-    pub fn new(bytes: &'a [u8]) -> StructReader<'a> {
-        StructReader { bytes, at: 0 }
+    pub fn new(bytes: &'a [u8], maximum_depth: u8) -> StructReader<'a> {
+        StructReader { bytes, at: 0, depth: 1, maximum_depth, parse_count: 0 }
     }
 
     fn take(&mut self, count: usize) -> Result<&'a [u8]> {
+        self.parse_count =
+            self.parse_count.checked_add(1).ok_or_else(|| Error::new("parse count overflow"))?;
+        if self.parse_count > self.bytes.len() {
+            return Err(Error::new("too many parse routines for structure size"));
+        }
         let end = self.at.checked_add(count).ok_or_else(|| Error::new("length overflow"))?;
         if end > self.bytes.len() {
             return Err(Error::new("structure payload ends mid-value"));
@@ -340,6 +378,14 @@ impl<'a> StructReader<'a> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
+    /// Allocate a collection whose count came from this structure.
+    pub fn checked_vec<T, N>(&self, count: N) -> Result<Vec<T>>
+    where
+        N: TryInto<usize>,
+    {
+        checked_vec(count, self.bytes.len() - self.at)
+    }
+
     pub fn flag(&mut self) -> Result<bool> {
         Ok(self.take(1)?[0] != 0)
     }
@@ -362,6 +408,24 @@ impl<'a> StructReader<'a> {
         }
     }
 
+    pub fn nested<T>(
+        &mut self,
+        expected: Op,
+        what: &str,
+        read: impl FnOnce(&mut StructReader<'a>) -> Result<T>,
+    ) -> Result<T> {
+        self.tag(expected, what)?;
+        let depth =
+            self.depth.checked_add(1).ok_or_else(|| Error::new("recursion depth overflow"))?;
+        if depth > self.maximum_depth {
+            return Err(Error::new("message recursion depth exceeded"));
+        }
+        self.depth = depth;
+        let result = read(self);
+        self.depth -= 1;
+        result
+    }
+
     pub fn done(&self) -> Result<()> {
         if self.at == self.bytes.len() {
             Ok(())
@@ -376,13 +440,13 @@ pub fn structure<'a>(
     expected: Op,
     what: &str,
 ) -> Result<(StructReader<'a>, &'a [Arg])> {
-    let [Arg::Struct(actual, bytes), rest @ ..] = args else {
+    let [Arg::Struct(actual, bytes, maximum_depth), rest @ ..] = args else {
         return Err(Error::new(format!("{what} is not self-contained")));
     };
     if *actual != expected {
         return Err(Error::new(format!("expected {expected}, got {actual}")));
     }
-    Ok((StructReader::new(bytes), rest))
+    Ok((StructReader::new(bytes, *maximum_depth), rest))
 }
 
 impl std::fmt::Display for Arg {
@@ -392,7 +456,7 @@ impl std::fmt::Display for Arg {
             Arg::Number(n) => write!(f, "{n}"),
             Arg::Flag(b) => write!(f, "{b}"),
             Arg::Bytes(bytes) => write!(f, "{} bytes", bytes.len()),
-            Arg::Struct(op, bytes) => write!(f, "<{op}: {} bytes>", bytes.len()),
+            Arg::Struct(op, bytes, _) => write!(f, "<{op}: {} bytes>", bytes.len()),
         }
     }
 }
@@ -454,7 +518,8 @@ impl Req {
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.extend(self.id.to_le_bytes());
         out.extend(self.op.code().to_le_bytes());
-        if let [Arg::Struct(op, bytes)] = self.args.as_slice()
+        out.push(message_depth(&self.args));
+        if let [Arg::Struct(op, bytes, _)] = self.args.as_slice()
             && *op == self.op
         {
             out.extend(COMMAND_PAYLOAD.to_le_bytes());
@@ -468,11 +533,18 @@ impl Req {
         let mut reader = Cursor::new(payload);
         let id = reader.u32()?;
         let op = Op::from_code(reader.u16()?)?;
+        let maximum_depth = reader.u8()?;
+        if maximum_depth == 0 {
+            return Err(Error::new("message recursion depth is zero"));
+        }
+        if maximum_depth > MAX_RECURSION_DEPTH {
+            return Err(Error::new("message recursion depth exceeds limit"));
+        }
         let count = reader.u16()?;
         let args = if count == COMMAND_PAYLOAD {
-            vec![Arg::Struct(op, reader.remaining().to_vec())]
+            vec![Arg::Struct(op, reader.remaining().to_vec(), maximum_depth)]
         } else {
-            reader.args_with_count(count)?
+            reader.args_with_count_and_depth(count, maximum_depth)?
         };
         Ok(Req { id, op, args })
     }
@@ -535,6 +607,7 @@ impl Resp {
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.extend(self.id.to_le_bytes());
         out.extend((self.status as u16).to_le_bytes());
+        out.push(message_depth(&self.args));
         encode_args(&self.args, out);
     }
 
@@ -542,7 +615,14 @@ impl Resp {
         let mut reader = Cursor::new(payload);
         let id = reader.u32()?;
         let status = Status::from_code(reader.u16()?)?;
-        Ok(Resp { id, status, args: reader.args()? })
+        let maximum_depth = reader.u8()?;
+        if maximum_depth == 0 {
+            return Err(Error::new("message recursion depth is zero"));
+        }
+        if maximum_depth > MAX_RECURSION_DEPTH {
+            return Err(Error::new("message recursion depth exceeds limit"));
+        }
+        Ok(Resp { id, status, args: reader.args_with_depth(maximum_depth)? })
     }
 }
 
@@ -625,8 +705,8 @@ impl AppendBlock {
         };
         let has_logical = payload.flag()?;
         let logical = payload.number_u64()?;
-        let count = payload.number_u32()? as usize;
-        let mut instances = Vec::with_capacity(count);
+        let count = payload.number_u32()?;
+        let mut instances = payload.checked_vec(count)?;
         for _ in 0..count {
             instances.push((
                 EnId::of_number(payload.number_u32()? as u64)?,
@@ -675,7 +755,7 @@ fn encode_args(args: &[Arg], out: &mut Vec<u8>) {
                 out.extend((bytes.len() as u32).to_le_bytes());
                 out.extend(bytes);
             }
-            Arg::Struct(op, bytes) => {
+            Arg::Struct(op, bytes, _) => {
                 out.push(4);
                 out.extend(op.code().to_le_bytes());
                 out.extend((bytes.len() as u32).to_le_bytes());
@@ -685,17 +765,30 @@ fn encode_args(args: &[Arg], out: &mut Vec<u8>) {
     }
 }
 
+fn message_depth(args: &[Arg]) -> u8 {
+    args.iter().fold(1, |depth, arg| match arg {
+        Arg::Struct(_, _, nested) => depth.max(*nested),
+        _ => depth,
+    })
+}
+
 struct Cursor<'a> {
     bytes: &'a [u8],
     at: usize,
+    parse_count: usize,
 }
 
 impl<'a> Cursor<'a> {
     fn new(bytes: &'a [u8]) -> Cursor<'a> {
-        Cursor { bytes, at: 0 }
+        Cursor { bytes, at: 0, parse_count: 0 }
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        self.parse_count =
+            self.parse_count.checked_add(1).ok_or_else(|| Error::new("parse count overflow"))?;
+        if self.parse_count > self.bytes.len() {
+            return Err(Error::new("too many parse routines for message size"));
+        }
         let end = self.at.checked_add(n).ok_or_else(|| Error::new("length overflow"))?;
         if end > self.bytes.len() {
             return Err(Error::new("frame ends mid-value"));
@@ -725,13 +818,13 @@ impl<'a> Cursor<'a> {
         &self.bytes[self.at..]
     }
 
-    fn args(&mut self) -> Result<Vec<Arg>> {
+    fn args_with_depth(&mut self, maximum_depth: u8) -> Result<Vec<Arg>> {
         let count = self.u16()?;
-        self.args_with_count(count)
+        self.args_with_count_and_depth(count, maximum_depth)
     }
 
-    fn args_with_count(&mut self, count: u16) -> Result<Vec<Arg>> {
-        let mut args = Vec::with_capacity(count as usize);
+    fn args_with_count_and_depth(&mut self, count: u16, maximum_depth: u8) -> Result<Vec<Arg>> {
+        let mut args = checked_vec(count, self.bytes.len() - self.at)?;
         for _ in 0..count {
             args.push(match self.u8()? {
                 0 => {
@@ -748,7 +841,7 @@ impl<'a> Cursor<'a> {
                 4 => {
                     let op = Op::from_code(self.u16()?)?;
                     let len = self.u32()? as usize;
-                    Arg::Struct(op, self.take(len)?.to_vec())
+                    Arg::Struct(op, self.take(len)?.to_vec(), maximum_depth)
                 }
                 tag => return Err(Error::new(format!("unknown argument tag {tag}"))),
             });
@@ -1054,6 +1147,45 @@ mod tests {
         assert!(
             encoded_len(&request) < encoded_len(&Req::new(Op::SnMasterKey).number(7).number(42))
         );
+    }
+
+    #[test]
+    fn a_message_carries_the_depth_seen_while_serializing() {
+        let mut payload = StructWriter::new();
+        crate::range::Range::from(7).write_nested(&mut payload);
+        let request = Req::new(Op::ReadRecord).structure(payload);
+        let mut plain = Vec::new();
+        put_request(&mut plain, &request).unwrap();
+        assert_eq!(plain[10], 2);
+    }
+
+    #[test]
+    fn a_nested_structure_may_not_exceed_the_message_depth() {
+        let mut payload = StructWriter::new();
+        crate::range::Range::from(7).write_nested(&mut payload);
+        let Arg::Struct(op, bytes, _) = payload.finish(Op::ReadRecord) else {
+            panic!("a self-contained payload")
+        };
+        let request = Req { id: 0, op, args: vec![Arg::Struct(op, bytes, 1)] };
+        let (mut reader, rest) = structure(&request.args, op, "a request").unwrap();
+        assert!(rest.is_empty());
+        assert!(crate::range::Range::read_nested(&mut reader).is_err());
+    }
+
+    #[test]
+    fn an_advertised_depth_above_the_limit_is_refused_before_dispatch() {
+        let request = Req::new(Op::Ping);
+        let mut plain = Vec::new();
+        put_request(&mut plain, &request).unwrap();
+        plain[10] = MAX_RECURSION_DEPTH + 1;
+        assert!(Req::decode(&plain[4..]).is_err());
+    }
+
+    #[test]
+    fn parsing_more_routines_than_bytes_is_refused() {
+        let mut reader = StructReader::new(&[7], 1);
+        assert_eq!(reader.number_u8().unwrap(), 7);
+        assert!(reader.number_u8().is_err());
     }
 
     #[test]

@@ -725,7 +725,10 @@ impl DN {
             Ok(count) => count as usize,
             Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
         };
-        let mut wanted = Vec::with_capacity(count);
+        let mut wanted = match payload.checked_vec(count) {
+            Ok(wanted) => wanted,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
         for _ in 0..count {
             match Wanted::read(&mut payload) {
                 Ok(one) => wanted.push(one),
@@ -1234,7 +1237,10 @@ impl DN {
                 Ok(count) => count as usize,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
-            let mut names = Vec::with_capacity(count);
+            let mut names = match payload.checked_vec(count) {
+                Ok(names) => names,
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+            };
             for _ in 0..count {
                 match payload.text() {
                     Ok(name) => names.push(name),

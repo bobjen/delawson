@@ -1628,7 +1628,7 @@ fn ranged(
 fn report(target: &Target, response: &Resp) -> Result<()> {
     for arg in &response.args {
         match arg {
-            Arg::Struct(Op::LogResp, _bytes) => {
+            Arg::Struct(Op::LogResp, _bytes, _) => {
                 let (mut payload, rest) = structure(&response.args, Op::LogResp, "a log response")?;
                 if !rest.is_empty() {
                     return Err(Error::new("a log response has trailing arguments"));
@@ -1642,7 +1642,7 @@ fn report(target: &Target, response: &Resp) -> Result<()> {
                 }
                 break;
             }
-            Arg::Struct(Op::RegistryResp, _bytes) => {
+            Arg::Struct(Op::RegistryResp, _bytes, _) => {
                 let (mut payload, rest) =
                     structure(&response.args, Op::RegistryResp, "a registry response")?;
                 if !rest.is_empty() {
