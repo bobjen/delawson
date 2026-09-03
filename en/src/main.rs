@@ -58,7 +58,7 @@ impl DailyKeyCache {
 
         // Fetch from KS.
         let mut payload = StructWriter::new();
-        payload.number_u64(sn_id.number());
+        payload.number_u32(sn_id.get());
         payload.number_u64(day);
         let ask = Req::new(Op::SnMasterKey).structure(payload);
         let key_cell = Arc::new(Mutex::new([0u8; 32]));
@@ -1046,20 +1046,20 @@ impl EN {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
-        let en = match payload.number_u64() {
-            Ok(value) => value,
+        let en = match payload.number_u32() {
+            Ok(value) => value as u64,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let disk = match payload.number_u64() {
-            Ok(value) => value,
+        let disk = match payload.number_u16() {
+            Ok(value) => value as u64,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let sn = match payload.number_u64() {
-            Ok(value) => value,
+        let sn = match payload.number_u32() {
+            Ok(value) => value as u64,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let extent = match payload.number_u64() {
-            Ok(value) => value,
+        let extent = match payload.number_u32() {
+            Ok(value) => value as u64,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let created = match payload.number_u64() {

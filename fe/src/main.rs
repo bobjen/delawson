@@ -97,16 +97,16 @@ impl Open {
         if !rest.is_empty() {
             return None;
         }
-        let id = payload.number_u64().ok()?;
+        let id = payload.number_u32().ok()? as u64;
         let created = payload.number_u64().ok()?;
         let first_record = payload.number_u64().ok()?;
         let records = payload.number_u64().ok()?;
-        let count = usize::try_from(payload.number_u64().ok()?).ok()?;
+        let count = payload.number_u32().ok()? as usize;
         let mut disks = Vec::with_capacity(count);
         for _ in 0..count {
             disks.push((
-                EnId::of_number(payload.number_u64().ok()?).ok()?,
-                DiskId::of_number(payload.number_u64().ok()?).ok()?,
+                EnId::of_number(payload.number_u32().ok()? as u64).ok()?,
+                DiskId::of_number(payload.number_u16().ok()? as u64).ok()?,
             ));
         }
         payload.done().ok()?;
@@ -711,7 +711,7 @@ impl FE {
         let dn = format!("DN{}", located.dn);
         let mut payload = StructWriter::new();
         payload.text(&path);
-        payload.number_u64(located.stream.stream.number());
+        payload.number_u32(located.stream.stream.get());
         payload.number_u64(records);
         let ask = Req::new(Op::ExtendObject).structure(payload);
         let fe = Arc::clone(self);
@@ -853,8 +853,8 @@ impl FE {
 
         let identity = format!("SN{}", located.sn);
         let mut payload = StructWriter::new();
-        payload.number_u64(located.stream.range.number());
-        payload.number_u64(located.stream.stream.number());
+        payload.number_u32(located.stream.range.get());
+        payload.number_u32(located.stream.stream.get());
         payload.number_u64(located.stream.created.number());
         payload.number_u64(record.number());
         let ask = Req::new(Op::LocateRecord).structure(payload);
@@ -890,8 +890,8 @@ impl FE {
 fn wanting_extent(key: StreamName, sealed: Option<(ExtentId, Filled)>) -> Req {
     if sealed.is_none() {
         let mut payload = StructWriter::new();
-        payload.number_u64(key.range.number());
-        payload.number_u64(key.stream.number());
+        payload.number_u32(key.range.get());
+        payload.number_u32(key.stream.get());
         payload.number_u64(key.created.number());
         return Req::new(Op::OpenExtent).structure(payload);
     }
@@ -901,8 +901,8 @@ fn wanting_extent(key: StreamName, sealed: Option<(ExtentId, Filled)>) -> Req {
     });
     if let Some((id, came_to)) = sealed {
         let mut payload = StructWriter::new();
-        payload.number_u64(key.range.number());
-        payload.number_u64(key.stream.number());
+        payload.number_u32(key.range.get());
+        payload.number_u32(key.stream.get());
         payload.number_u64(key.created.number());
         payload.number_u64(id.number());
         payload.number_u64(came_to.records);
@@ -1002,10 +1002,10 @@ fn from_instance(
     // tail, so what the EN says about its own blocks is the whole answer.
     let sealed = open.records > ERoff::ZERO;
     let mut payload = StructWriter::new();
-    payload.number_u64(open.disks[0].0.number());
-    payload.number_u64(open.disks[0].1.number());
-    payload.number_u64(open.sn.number());
-    payload.number_u64(open.id.number());
+    payload.number_u32(open.disks[0].0.get());
+    payload.number_u16(open.disks[0].1.get());
+    payload.number_u32(open.sn.get());
+    payload.number_u32(open.id.get());
     payload.number_u64(open.created.number());
     Range { start: Start::Record(at.number()), budget }.write_nested(&mut payload);
     let ask = Req::new(Op::ReadExtent).structure(payload);
@@ -2110,8 +2110,14 @@ mod tests {
     #[test]
     fn an_open_extent_is_read_out_of_the_sns_answer() {
         let mut payload = StructWriter::new();
-        for value in [7, 1_000_000, 40, 90, 4, 2, 0, 3, 0, 0, 0, 1, 0] {
-            payload.number_u64(value);
+        payload.number_u32(7);
+        payload.number_u64(1_000_000);
+        payload.number_u64(40);
+        payload.number_u64(90);
+        payload.number_u32(4);
+        for (en, disk) in [(2, 0), (3, 0), (0, 0), (1, 0)] {
+            payload.number_u32(en);
+            payload.number_u16(disk);
         }
         let response =
             Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::ExtentResp)] };

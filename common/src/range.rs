@@ -143,10 +143,10 @@ impl Range {
             Start::Logical(offset) => (offset, 0),
         };
         let mut payload = StructWriter::new();
-        payload.number_u64(self.start.code());
+        payload.number_u8(self.start.code() as u8);
         payload.number_u64(first);
         payload.number_u64(second);
-        payload.number_u64(self.budget.code());
+        payload.number_u8(self.budget.code() as u8);
         payload.number_u64(self.budget.amount());
         vec![payload.finish(Op::Range)]
     }
@@ -159,19 +159,19 @@ impl Range {
             Start::Logical(offset) => (offset, 0),
         };
         payload.tag(Op::Range);
-        payload.number_u64(self.start.code());
+        payload.number_u8(self.start.code() as u8);
         payload.number_u64(first);
         payload.number_u64(second);
-        payload.number_u64(self.budget.code());
+        payload.number_u8(self.budget.code() as u8);
         payload.number_u64(self.budget.amount());
     }
 
     pub fn read_nested(payload: &mut StructReader<'_>) -> Result<Range> {
         payload.tag(Op::Range, "a range")?;
-        let kind = payload.number_u64()?;
+        let kind = payload.number_u8()?;
         let first = payload.number_u64()?;
         let second = payload.number_u64()?;
-        let measure = payload.number_u64()?;
+        let measure = payload.number_u8()?;
         let amount = payload.number_u64()?;
         let start = match kind {
             0 => Start::Record(first),
@@ -191,10 +191,10 @@ impl Range {
     /// And back, returning whatever followed it.
     pub fn of_args(args: &[Arg]) -> Result<(Range, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::Range, "a range")?;
-        let kind = payload.number_u64()?;
+        let kind = payload.number_u8()?;
         let first = payload.number_u64()?;
         let second = payload.number_u64()?;
-        let measure = payload.number_u64()?;
+        let measure = payload.number_u8()?;
         let amount = payload.number_u64()?;
         payload.done()?;
         let start = match kind {
@@ -491,21 +491,21 @@ impl Want {
         };
         payload.number_u64(self.detail);
         payload.number_u64(self.limit);
-        payload.number_u64(kind);
+        payload.number_u8(kind as u8);
         payload.number_u64(at);
-        payload.number_u64(self.expect.0.range.number());
-        payload.number_u64(self.expect.0.object.number());
+        payload.number_u32(self.expect.0.range.get());
+        payload.number_u32(self.expect.0.object.get());
         payload.number_u64(self.expect.0.created.number());
     }
 
     pub fn read(payload: &mut StructReader<'_>) -> Result<Want> {
         let detail = payload.number_u64()?;
         let limit = payload.number_u64()?;
-        let kind = payload.number_u64()?;
+        let kind = payload.number_u8()?;
         let at = payload.number_u64()?;
         let expect = Expecting::of(ObjectName {
-            range: RangeId::of_number(payload.number_u64()?)?,
-            object: ObjectId::of_number(payload.number_u64()?)?,
+            range: RangeId::of_number(payload.number_u32()? as u64)?,
+            object: ObjectId::of_number(payload.number_u32()? as u64)?,
             created: crate::time::TimeSec::new(payload.number_u64()?),
         });
         let from = match kind {
@@ -652,10 +652,10 @@ mod tests {
     fn an_unknown_kind_is_refused() {
         let bad = |kind, measure| {
             let mut payload = StructWriter::new();
-            payload.number_u64(kind);
+            payload.number_u8(kind as u8);
             payload.number_u64(0);
             payload.number_u64(0);
-            payload.number_u64(measure);
+            payload.number_u8(measure as u8);
             payload.number_u64(1);
             let args = vec![payload.finish(Op::Range)];
             Range::of_args(&args).is_err()

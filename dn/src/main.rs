@@ -800,8 +800,8 @@ impl DN {
             }
         };
         let mut payload = StructWriter::new();
-        payload.number_u64(self.mine.number());
-        payload.number_u64(first);
+        payload.number_u32(self.mine.get());
+        payload.number_u32(first as u32);
         payload.number_u64(count);
         payload.number_u64(created.number());
         let ask = Req::new(Op::CreateStream).structure(payload);
@@ -942,8 +942,8 @@ impl DN {
         let sn_number =
             SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
         let mut payload = StructWriter::new();
-        payload.number_u64(self.mine.number());
-        payload.number_u64(stream);
+        payload.number_u32(self.mine.get());
+        payload.number_u32(stream as u32);
         payload.number_u64(1);
         payload.number_u64(created.number());
         let ask = Req::new(Op::CreateStream).structure(payload);

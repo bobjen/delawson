@@ -321,16 +321,16 @@ impl Expecting {
 
     pub fn write(&self, payload: &mut StructWriter) {
         payload.tag(Op::Expecting);
-        payload.number_u64(self.0.range.number());
-        payload.number_u64(self.0.object.number());
+        payload.number_u32(self.0.range.get());
+        payload.number_u32(self.0.object.get());
         payload.number_u64(self.0.created.number());
     }
 
     pub fn read(payload: &mut StructReader<'_>) -> Result<Expecting> {
         payload.tag(Op::Expecting, "an expectation")?;
         Ok(Expecting(ObjectName {
-            range: RangeId::of_number(payload.number_u64()?)?,
-            object: ObjectId::of_number(payload.number_u64()?)?,
+            range: RangeId::of_number(payload.number_u32()? as u64)?,
+            object: ObjectId::of_number(payload.number_u32()? as u64)?,
             created: TimeSec::new(payload.number_u64()?),
         }))
     }
@@ -367,7 +367,7 @@ impl Wanted {
         let (kind, width) = self.framing.wire();
         payload.text(&self.name);
         payload.flag(self.keyed);
-        payload.number_u64(kind);
+        payload.number_u8(kind as u8);
         payload.number_u64(width);
     }
 
@@ -375,7 +375,7 @@ impl Wanted {
         Ok(Wanted {
             name: payload.text()?,
             keyed: payload.flag()?,
-            framing: Framing::of_wire(payload.number_u64()?, payload.number_u64()?)?,
+            framing: Framing::of_wire(payload.number_u8()? as u64, payload.number_u32()? as u64)?,
         })
     }
 }
@@ -700,10 +700,10 @@ impl Listing {
 
     pub fn write_payload(&self, payload: &mut StructWriter) {
         payload.number_u64(self.limit);
-        payload.number_u64(self.at.len() as u64);
+        payload.number_u32(self.at.len() as u32);
         for (name, from) in &self.at {
-            payload.number_u64(name.range.number());
-            payload.number_u64(name.stream.number());
+            payload.number_u32(name.range.get());
+            payload.number_u32(name.stream.get());
             payload.number_u64(name.created.number());
             payload.number_u64(*from);
         }
@@ -711,14 +711,13 @@ impl Listing {
 
     pub fn read_payload(payload: &mut StructReader<'_>) -> Result<Listing> {
         let limit = payload.number_u64()?;
-        let count = usize::try_from(payload.number_u64()?)
-            .map_err(|_| Error::new("list-extents stream count is too large"))?;
+        let count = payload.number_u32()? as usize;
         let mut at = Vec::with_capacity(count);
         for _ in 0..count {
             at.push((
                 StreamName {
-                    range: RangeId::of_number(payload.number_u64()?)?,
-                    stream: StreamId::of_number(payload.number_u64()?)?,
+                    range: RangeId::of_number(payload.number_u32()? as u64)?,
+                    stream: StreamId::of_number(payload.number_u32()? as u64)?,
                     created: TimeSec::new(payload.number_u64()?),
                 },
                 payload.number_u64()?,

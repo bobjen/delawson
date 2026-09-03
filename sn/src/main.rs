@@ -35,8 +35,8 @@ const SHARDS: usize = 64;
 
 fn stream_name(payload: &mut StructReader<'_>) -> common::Result<StreamName> {
     Ok(StreamName {
-        range: RangeId::of_number(payload.number_u64()?)?,
-        stream: StreamId::of_number(payload.number_u64()?)?,
+        range: RangeId::of_number(payload.number_u32()? as u64)?,
+        stream: StreamId::of_number(payload.number_u32()? as u64)?,
         created: TimeSec::new(payload.number_u64()?),
     })
 }
@@ -182,15 +182,15 @@ impl Extent {
     /// the whole of §17.29.1 in one signature: position is the stream's to say.
     fn args(&self, first: SRoff, disk_table: &[(EnId, DiskId)]) -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        payload.number_u64(self.id.number());
+        payload.number_u32(self.id.get());
         payload.number_u64(self.created.number());
         payload.number_u64(first.number());
         payload.number_u64(self.records.number());
-        payload.number_u64(self.disks.len() as u64);
+        payload.number_u32(self.disks.len() as u32);
         for sn_disk in &self.disks {
             let (en, disk) = disk_table[sn_disk.get() as usize];
-            payload.number_u64(en.number());
-            payload.number_u64(disk.number());
+            payload.number_u32(en.get());
+            payload.number_u16(disk.get());
         }
         vec![payload.finish(Op::ExtentResp)]
     }
@@ -372,14 +372,16 @@ impl SN {
                 "a create-stream request has trailing arguments",
             );
         }
-        let range = match payload.number_u64().and_then(RangeId::of_number) {
-            Ok(value) => value,
-            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-        };
-        let first = match payload.number_u64().and_then(StreamId::of_number) {
-            Ok(value) => value,
-            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-        };
+        let range =
+            match payload.number_u32().map(|value| value as u64).and_then(RangeId::of_number) {
+                Ok(value) => value,
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+            };
+        let first =
+            match payload.number_u32().map(|value| value as u64).and_then(StreamId::of_number) {
+                Ok(value) => value,
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+            };
         let count = match payload.number_u64() {
             Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
@@ -888,8 +890,8 @@ mod tests {
         let sn = SN::new(testing::sn_config(), SnId::new(0), default_disks());
         let made = sn.create(&Req::new(Op::CreateStream).structure({
             let mut payload = StructWriter::new();
-            payload.number_u64(range as u64);
-            payload.number_u64(stream as u64);
+            payload.number_u32(range);
+            payload.number_u32(stream);
             payload.number_u64(1);
             payload.number_u64(1_000_000);
             payload
@@ -991,7 +993,7 @@ mod tests {
         let answer = next.extent.args(next.first, &sn.disks);
         let (mut payload, rest) = structure(&answer, Op::ExtentResp, "an extent").unwrap();
         assert!(rest.is_empty());
-        let _id = payload.number_u64().unwrap();
+        let _id = payload.number_u32().unwrap();
         let _created = payload.number_u64().unwrap();
         let at = payload.number_u64().unwrap();
         let records = payload.number_u64().unwrap();
@@ -1104,8 +1106,8 @@ mod tests {
         let holds = |record: u64| {
             // The whole name, built from the shape rather than three numbers in a row (#109).
             let mut payload = StructWriter::new();
-            payload.number_u64(0);
-            payload.number_u64(7);
+            payload.number_u32(0);
+            payload.number_u32(7);
             payload.number_u64(MADE.number());
             payload.number_u64(record);
             let ask = Req::new(Op::LocateRecord).structure(payload);
@@ -1114,7 +1116,7 @@ mod tests {
             let (mut payload, rest) =
                 structure(&answer.args, Op::ExtentResp, "an extent").expect("an extent");
             assert!(rest.is_empty());
-            payload.number_u64().expect("an extent id")
+            payload.number_u32().expect("an extent id") as u64
         };
         // Records 0 to 2 are in the first extent, 3 and 4 in the second, and
         // anything from 5 on is routed to the one still open.
@@ -1132,8 +1134,8 @@ mod tests {
         let sn = sn_with_stream(0, 7);
         let answer = sn.locate(&{
             let mut payload = StructWriter::new();
-            payload.number_u64(0);
-            payload.number_u64(7);
+            payload.number_u32(0);
+            payload.number_u32(7);
             payload.number_u64(MADE.number());
             payload.number_u64(0);
             Req::new(Op::LocateRecord).structure(payload)
