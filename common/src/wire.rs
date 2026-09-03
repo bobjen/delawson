@@ -171,6 +171,7 @@ ops! {
     FilledResponse = 54, "filled-response";
     CoveredResponse = 55, "covered-response";
     ExtentResponse = 56, "extent-response";
+    ReceiptResponse = 57, "receipt-response";
 }
 
 impl std::fmt::Display for Op {

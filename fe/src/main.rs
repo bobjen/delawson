@@ -1083,34 +1083,69 @@ fn receipt(located: &Located, open: &Open, answer: Resp) -> Resp {
     if answer.status != Status::Ok {
         return answer;
     }
-    let [
-        _sn,
-        Arg::Number(extent),
-        Arg::Number(created),
-        Arg::Number(offset),
-        Arg::Number(length),
-        Arg::Number(first),
-        Arg::Number(records),
-    ] = answer.args.as_slice()
-    else {
+    let (mut payload, rest) =
+        match structure(&answer.args, Op::ReceiptResponse, "an append receipt") {
+            Ok(value) => value,
+            Err(_) => {
+                return Resp::error(Status::Internal, "that append answered with no receipt");
+            }
+        };
+    if !rest.is_empty() {
         return Resp::error(Status::Internal, "that append answered with no receipt");
+    }
+    let _sn = match payload.number() {
+        Ok(value) => value,
+        Err(_) => return Resp::error(Status::Internal, "that append answered with no receipt"),
     };
+    let extent = match payload.number() {
+        Ok(value) => value,
+        Err(_) => return Resp::error(Status::Internal, "that append answered with no receipt"),
+    };
+    let created = match payload.number() {
+        Ok(value) => value,
+        Err(_) => return Resp::error(Status::Internal, "that append answered with no receipt"),
+    };
+    let offset = match payload.number() {
+        Ok(value) => value,
+        Err(_) => return Resp::error(Status::Internal, "that append answered with no receipt"),
+    };
+    let length = match payload.number() {
+        Ok(value) => value,
+        Err(_) => return Resp::error(Status::Internal, "that append answered with no receipt"),
+    };
+    let first = match payload.number() {
+        Ok(value) => value,
+        Err(_) => return Resp::error(Status::Internal, "that append answered with no receipt"),
+    };
+    let records = match payload.number() {
+        Ok(value) => value,
+        Err(_) => return Resp::error(Status::Internal, "that append answered with no receipt"),
+    };
+    if payload.done().is_err() {
+        return Resp::error(Status::Internal, "that append answered with no receipt");
+    }
     // The stream-local record number, and then the object-local one, which is the
     // address a reader gives back.
     let in_stream = open.first_record.number() + first;
     Resp {
         id: 0,
         status: Status::Ok,
-        args: vec![
-            Arg::Number(located.stream.stream.number()),
-            Arg::Number(in_stream),
-            Arg::Number(located.first_record.number() + in_stream),
-            Arg::Number(*records),
-            Arg::Number(*extent),
-            Arg::Number(*created),
-            Arg::Number(*offset),
-            Arg::Number(*length),
-        ],
+        args: {
+            let mut payload = StructWriter::new();
+            for value in [
+                located.stream.stream.number(),
+                in_stream,
+                located.first_record.number() + in_stream,
+                records,
+                extent,
+                created,
+                offset,
+                length,
+            ] {
+                payload.number(value);
+            }
+            vec![payload.finish(Op::ReceiptResponse)]
+        },
     }
 }
 
@@ -2152,36 +2187,23 @@ mod tests {
             _framing: Framing::Lf,
             disks: vec![(EnId::new(2), DiskId::new(0)), (EnId::new(3), DiskId::new(0))],
         };
+        let mut from_en_payload = StructWriter::new();
+        for value in [0, 7, 1_000_000, 512, 30, 2, 1] {
+            from_en_payload.number(value);
+        }
         let from_en = Resp {
             id: 0,
             status: Status::Ok,
-            args: vec![
-                Arg::Number(0),
-                Arg::Number(7),
-                Arg::Number(1_000_000),
-                Arg::Number(512),
-                Arg::Number(30),
-                Arg::Number(2),
-                Arg::Number(1),
-            ],
+            args: vec![from_en_payload.finish(Op::ReceiptResponse)],
         };
         let receipt = receipt(&located, &open, from_en);
         assert_eq!(receipt.status, Status::Ok);
-        assert_eq!(
-            receipt.args,
-            vec![
-                Arg::Number(17),
-                // 40 records in the extents before this one, plus its record 2.
-                Arg::Number(42),
-                // And the same again object-locally, since this stream starts at 0.
-                Arg::Number(42),
-                Arg::Number(1),
-                Arg::Number(7),
-                Arg::Number(1_000_000),
-                Arg::Number(512),
-                Arg::Number(30),
-            ]
-        );
+        let (mut payload, rest) =
+            structure(&receipt.args, Op::ReceiptResponse, "a receipt").unwrap();
+        assert!(rest.is_empty());
+        let values: Vec<_> = (0..8).map(|_| payload.number().unwrap()).collect();
+        assert_eq!(values, [17, 42, 42, 1, 7, 1_000_000, 512, 30]);
+        payload.done().unwrap();
     }
 
     /// A refusal from the EN is passed through as it stands: FE has nothing to add

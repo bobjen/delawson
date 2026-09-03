@@ -753,16 +753,20 @@ impl Disk {
         let others: Vec<(EnId, DiskId)> =
             appending.instances.iter().filter(|&inst| *inst != mine).cloned().collect();
 
-        let receipt = vec![
-            Arg::Number(appending.sn.number()),
-            Arg::Number(landed.logical.number()),
-            Arg::Number(landed.first_record.number()),
-            Arg::Number(landed.records.number()),
-            Arg::Number(appending.extent.number()),
-            Arg::Number(appending.created.number()),
-            Arg::Number(landed.offset.number()),
-            Arg::Number(length as u64),
-        ];
+        let mut receipt = StructWriter::new();
+        for value in [
+            appending.sn.number(),
+            landed.logical.number(),
+            landed.first_record.number(),
+            landed.records.number(),
+            appending.extent.number(),
+            appending.created.number(),
+            landed.offset.number(),
+            length as u64,
+        ] {
+            receipt.number(value);
+        }
+        let receipt = vec![receipt.finish(Op::ReceiptResponse)];
 
         let quorum_wants = process.cluster.extents.quorum;
         let pending = Arc::new(Pending::new(receipt, quorum_wants, reply));
