@@ -316,13 +316,7 @@ impl Service for SN {
         matches!(op, Op::Ping | Op::Status | Op::Shutdown | Op::Sites)
     }
 
-    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, mut reply: Reply) {
-        // The stream range, which is what a DN's line for the same request says.
-        if let [Arg::Number(range), Arg::Number(first), Arg::Number(count), ..] =
-            request.args.as_slice()
-        {
-            reply.about(format_args!("count {count} from {first} for range {range}"));
-        }
+    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
         reply.send(self.answer(process, &request));
     }
 

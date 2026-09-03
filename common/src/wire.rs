@@ -243,8 +243,6 @@ impl std::fmt::Display for Status {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Arg {
-    /// A schema boundary; these use Op codes but are not commands.
-    Tag(Op),
     /// A self-contained serialized structure. The structure owns the payload
     /// format; the wire only supplies its schema tag and length.
     Struct(Op, Vec<u8>),
@@ -252,16 +250,6 @@ pub enum Arg {
     Number(u64),
     Flag(bool),
     Bytes(Vec<u8>),
-}
-
-pub fn tagged<'a>(args: &'a [Arg], expected: Op, what: &str) -> Result<&'a [Arg]> {
-    let [Arg::Tag(actual), rest @ ..] = args else {
-        return Err(Error::new(format!("{what} is missing its schema tag")));
-    };
-    if *actual != expected {
-        return Err(Error::new(format!("expected {expected}, got {actual}")));
-    }
-    Ok(rest)
 }
 
 /// Build the self-contained payload of one tagged structure.
@@ -380,7 +368,6 @@ impl std::fmt::Display for Arg {
             Arg::Number(n) => write!(f, "{n}"),
             Arg::Flag(b) => write!(f, "{b}"),
             Arg::Bytes(bytes) => write!(f, "{} bytes", bytes.len()),
-            Arg::Tag(op) => write!(f, "<{op}>"),
             Arg::Struct(op, bytes) => write!(f, "<{op}: {} bytes>", bytes.len()),
         }
     }
@@ -662,12 +649,8 @@ fn encode_args(args: &[Arg], out: &mut Vec<u8>) {
                 out.extend((bytes.len() as u32).to_le_bytes());
                 out.extend(bytes);
             }
-            Arg::Tag(op) => {
-                out.push(4);
-                out.extend(op.code().to_le_bytes());
-            }
             Arg::Struct(op, bytes) => {
-                out.push(5);
+                out.push(4);
                 out.extend(op.code().to_le_bytes());
                 out.extend((bytes.len() as u32).to_le_bytes());
                 out.extend(bytes);
@@ -736,8 +719,7 @@ impl<'a> Cursor<'a> {
                     let len = self.u32()? as usize;
                     Arg::Bytes(self.take(len)?.to_vec())
                 }
-                4 => Arg::Tag(Op::from_code(self.u16()?)?),
-                5 => {
+                4 => {
                     let op = Op::from_code(self.u16()?)?;
                     let len = self.u32()? as usize;
                     Arg::Struct(op, self.take(len)?.to_vec())
@@ -1052,19 +1034,7 @@ mod tests {
     fn a_shape_is_one_self_contained_wire_argument() {
         let shape = crate::info::Shape { streams: 3, given: 2, extents: 7, entries: 9, next: 11 };
         let compact = Req { id: 7, op: Op::BatchInfo, args: shape.args() };
-        let expanded = Req {
-            id: 7,
-            op: Op::BatchInfo,
-            args: vec![
-                Arg::Tag(Op::ShapeResp),
-                Arg::Number(shape.streams),
-                Arg::Number(shape.given),
-                Arg::Number(shape.extents),
-                Arg::Number(shape.entries),
-                Arg::Number(shape.next),
-            ],
-        };
-        assert!(encoded_len(&compact) < encoded_len(&expanded));
+        assert_eq!(compact.args.len(), 1, "the shape is one self-contained value");
         assert_eq!(round_trip_request(&compact).args, compact.args);
     }
 

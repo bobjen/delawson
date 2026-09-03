@@ -16,7 +16,7 @@ use crate::ids::{DiskId, DnId, EnId, ExtentId, ObjectId, RangeId, SnId, StreamId
 use crate::placement::Expansion;
 use crate::time::TimeSec;
 use crate::wire::Arg;
-use crate::wire::{Op, StructReader, StructWriter, structure, tagged};
+use crate::wire::{Op, StructReader, StructWriter, structure};
 use crate::{Error, Result};
 
 /// An object as the DN describes it, at one of its streams.
@@ -464,53 +464,22 @@ impl StreamRow {
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(StreamRow, &[Arg])> {
-        if matches!(args.first(), Some(Arg::Struct(..))) {
-            let (mut payload, rest) = structure(args, Op::StreamRowResp, "a stream row")?;
-            let stream = StreamId::of_number(payload.number()?)?;
-            let sn = SnId::of_number(payload.number()?)?;
-            let first_record = payload.number()?;
-            let records = payload.number()?;
-            let created = TimeSec::new(payload.number()?);
-            let totals = Totals {
+        let (mut payload, rest) = structure(args, Op::StreamRowResp, "a stream row")?;
+        let row = StreamRow {
+            stream: StreamId::of_number(payload.number()?)?,
+            sn: SnId::of_number(payload.number()?)?,
+            first_record: payload.number()?,
+            records: payload.number()?,
+            created: TimeSec::new(payload.number()?),
+            totals: Totals {
                 extents: payload.number()?,
                 logical: payload.number()?,
                 compressed: payload.number()?,
-            };
-            let given = payload.number()?;
-            payload.done()?;
-            return Ok((
-                StreamRow { stream, sn, first_record, records, created, totals, given },
-                rest,
-            ));
-        }
-        let args = tagged(args, Op::StreamRowResp, "a stream row")?;
-        let [
-            Arg::Number(stream),
-            Arg::Number(sn),
-            Arg::Number(first_record),
-            Arg::Number(records),
-            Arg::Number(created),
-            rest @ ..,
-        ] = args
-        else {
-            return Err(Error::new("that answer's streams are not streams"));
-        };
-        let (totals, rest) = Totals::of_args(rest)?;
-        let [Arg::Number(given), rest @ ..] = rest else {
-            return Err(Error::new("that stream did not say how many extents follow"));
-        };
-        Ok((
-            StreamRow {
-                stream: StreamId::of_number(*stream)?,
-                sn: SnId::of_number(*sn)?,
-                first_record: *first_record,
-                records: *records,
-                created: TimeSec::new(*created),
-                totals,
-                given: *given,
             },
-            rest,
-        ))
+            given: payload.number()?,
+        };
+        payload.done()?;
+        Ok((row, rest))
     }
 
     /// `given` rows, and whatever followed them.
@@ -584,75 +553,22 @@ impl ExtentRow {
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(ExtentRow, &[Arg])> {
-        if matches!(args.first(), Some(Arg::Struct(..))) {
-            let (mut payload, rest) = structure(args, Op::ExtentRowResp, "an extent row")?;
-            let sn = SnId::of_number(payload.number()?)?;
-            let id = ExtentId::of_number(payload.number()?)?;
-            let created = TimeSec::new(payload.number()?);
-            let first_record = payload.number()?;
-            let records = payload.number()?;
-            let logical = payload.number()?;
-            let length = payload.number()?;
-            let count = payload.number()? as usize;
-            let mut disks = Vec::with_capacity(count);
-            for _ in 0..count {
-                disks.push((
-                    EnId::of_number(payload.number()?)?,
-                    DiskId::of_number(payload.number()?)?,
-                ));
-            }
-            payload.done()?;
-            return Ok((
-                ExtentRow { sn, id, created, first_record, records, logical, length, disks },
-                rest,
-            ));
-        }
-        let args = tagged(args, Op::ExtentRowResp, "an extent row")?;
-        let [
-            Arg::Number(sn),
-            Arg::Number(id),
-            Arg::Number(created),
-            Arg::Number(first_record),
-            Arg::Number(records),
-            Arg::Number(logical),
-            Arg::Number(length),
-            Arg::Number(count),
-            rest @ ..,
-        ] = args
-        else {
-            return Err(Error::new("that answer's extents are not extents"));
-        };
-        let count = *count as usize;
-        let needed = count * 2;
-        if rest.len() < needed {
-            return Err(Error::new(format!(
-                "an extent says it has {count} instances and carries {}",
-                rest.len()
-            )));
-        }
-        let (given, rest) = rest.split_at(needed);
+        let (mut payload, rest) = structure(args, Op::ExtentRowResp, "an extent row")?;
+        let sn = SnId::of_number(payload.number()?)?;
+        let id = ExtentId::of_number(payload.number()?)?;
+        let created = TimeSec::new(payload.number()?);
+        let first_record = payload.number()?;
+        let records = payload.number()?;
+        let logical = payload.number()?;
+        let length = payload.number()?;
+        let count = payload.number()? as usize;
         let mut disks = Vec::with_capacity(count);
-        for chunk in given.chunks_exact(2) {
-            match chunk {
-                [Arg::Number(en), Arg::Number(disk)] => {
-                    disks.push((EnId::of_number(*en)?, DiskId::of_number(*disk)?));
-                }
-                _ => return Err(Error::new("an instance list is numbers")),
-            }
+        for _ in 0..count {
+            disks
+                .push((EnId::of_number(payload.number()?)?, DiskId::of_number(payload.number()?)?));
         }
-        Ok((
-            ExtentRow {
-                sn: SnId::of_number(*sn)?,
-                id: ExtentId::of_number(*id)?,
-                created: TimeSec::new(*created),
-                first_record: *first_record,
-                records: *records,
-                logical: *logical,
-                length: *length,
-                disks,
-            },
-            rest,
-        ))
+        payload.done()?;
+        Ok((ExtentRow { sn, id, created, first_record, records, logical, length, disks }, rest))
     }
 
     pub fn some_of_args(args: &[Arg], given: u64) -> Result<(Vec<ExtentRow>, &[Arg])> {
@@ -701,29 +617,15 @@ impl Batch {
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Batch, &[Arg])> {
-        if matches!(args.first(), Some(Arg::Struct(..))) {
-            let (mut payload, rest) = structure(args, Op::BatchResp, "a batch")?;
-            let batch = Batch {
-                asked: payload.number()?,
-                given: payload.number()?,
-                entries: payload.number()?,
-                next: payload.number()?,
-            };
-            payload.done()?;
-            return Ok((batch, rest));
-        }
-        let args = tagged(args, Op::BatchResp, "a batch")?;
-        let [
-            Arg::Number(asked),
-            Arg::Number(given),
-            Arg::Number(entries),
-            Arg::Number(next),
-            rest @ ..,
-        ] = args
-        else {
-            return Err(Error::new("that batch answer did not say what it covered"));
+        let (mut payload, rest) = structure(args, Op::BatchResp, "a batch")?;
+        let batch = Batch {
+            asked: payload.number()?,
+            given: payload.number()?,
+            entries: payload.number()?,
+            next: payload.number()?,
         };
-        Ok((Batch { asked: *asked, given: *given, entries: *entries, next: *next }, rest))
+        payload.done()?;
+        Ok((batch, rest))
     }
 
     pub fn more(&self) -> bool {

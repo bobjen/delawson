@@ -20,7 +20,7 @@ use crate::info::{Expecting, ObjectName};
 use crate::offset::{ECoff, ELoff};
 use crate::placement::Expansion;
 use crate::wire::Arg;
-use crate::wire::{Op, StructReader, StructWriter, structure, tagged};
+use crate::wire::{Op, StructReader, StructWriter, structure};
 use crate::{Error, Result};
 
 /// Where a range starts.
@@ -190,50 +190,23 @@ impl Range {
 
     /// And back, returning whatever followed it.
     pub fn of_args(args: &[Arg]) -> Result<(Range, &[Arg])> {
-        if matches!(args.first(), Some(Arg::Struct(..))) {
-            let (mut payload, rest) = structure(args, Op::Range, "a range")?;
-            let kind = payload.number()?;
-            let first = payload.number()?;
-            let second = payload.number()?;
-            let measure = payload.number()?;
-            let amount = payload.number()?;
-            payload.done()?;
-            let start = match kind {
-                0 => Start::Record(first),
-                1 => Start::RecordThen(first, second),
-                2 => Start::Logical(first),
-                other => return Err(Error::new(format!("no range start of kind {other}"))),
-            };
-            let budget = match measure {
-                0 => Budget::Records(amount),
-                1 => Budget::Logical(amount),
-                2 => Budget::Compressed(amount),
-                other => return Err(Error::new(format!("no budget measured in kind {other}"))),
-            };
-            return Ok((Range { start, budget }, rest));
-        }
-        let args = tagged(args, Op::Range, "a range")?;
-        let [
-            Arg::Number(kind),
-            Arg::Number(first),
-            Arg::Number(second),
-            Arg::Number(measure),
-            Arg::Number(amount),
-            rest @ ..,
-        ] = args
-        else {
-            return Err(Error::new("a range takes a start and a budget"));
-        };
+        let (mut payload, rest) = structure(args, Op::Range, "a range")?;
+        let kind = payload.number()?;
+        let first = payload.number()?;
+        let second = payload.number()?;
+        let measure = payload.number()?;
+        let amount = payload.number()?;
+        payload.done()?;
         let start = match kind {
-            0 => Start::Record(*first),
-            1 => Start::RecordThen(*first, *second),
-            2 => Start::Logical(*first),
+            0 => Start::Record(first),
+            1 => Start::RecordThen(first, second),
+            2 => Start::Logical(first),
             other => return Err(Error::new(format!("no range start of kind {other}"))),
         };
         let budget = match measure {
-            0 => Budget::Records(*amount),
-            1 => Budget::Logical(*amount),
-            2 => Budget::Compressed(*amount),
+            0 => Budget::Records(amount),
+            1 => Budget::Logical(amount),
+            2 => Budget::Compressed(amount),
             other => return Err(Error::new(format!("no budget measured in kind {other}"))),
         };
         Ok((Range { start, budget }, rest))
@@ -619,40 +592,16 @@ impl Piece {
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Piece, &[Arg])> {
-        if matches!(args.first(), Some(Arg::Struct(..))) {
-            let (mut payload, rest) = structure(args, Op::PieceResp, "a piece")?;
-            let piece = Piece {
-                logical: payload.number()?,
-                first_record: payload.number()?,
-                records: payload.number()?,
-                crc: payload.number()?,
-                bytes: payload.bytes()?,
-            };
-            payload.done()?;
-            return Ok((piece, rest));
-        }
-        let args = tagged(args, Op::PieceResp, "a piece")?;
-        let [
-            Arg::Number(logical),
-            Arg::Number(first_record),
-            Arg::Number(records),
-            Arg::Number(crc),
-            Arg::Bytes(bytes),
-            rest @ ..,
-        ] = args
-        else {
-            return Err(Error::new("a block does not have the shape of one"));
+        let (mut payload, rest) = structure(args, Op::PieceResp, "a piece")?;
+        let piece = Piece {
+            logical: payload.number()?,
+            first_record: payload.number()?,
+            records: payload.number()?,
+            crc: payload.number()?,
+            bytes: payload.bytes()?,
         };
-        Ok((
-            Piece {
-                logical: *logical,
-                first_record: *first_record,
-                records: *records,
-                crc: *crc,
-                bytes: bytes.clone(),
-            },
-            rest,
-        ))
+        payload.done()?;
+        Ok((piece, rest))
     }
 
     /// Every block in an answer, in order.
@@ -702,20 +651,21 @@ mod tests {
     #[test]
     fn an_unknown_kind_is_refused() {
         let bad = |kind, measure| {
-            let args = vec![
-                Arg::Tag(Op::Range),
-                Arg::Number(kind),
-                Arg::Number(0),
-                Arg::Number(0),
-                Arg::Number(measure),
-                Arg::Number(1),
-            ];
+            let mut payload = StructWriter::new();
+            payload.number(kind);
+            payload.number(0);
+            payload.number(0);
+            payload.number(measure);
+            payload.number(1);
+            let args = vec![payload.finish(Op::Range)];
             Range::of_args(&args).is_err()
         };
         assert!(bad(9, 0), "no such start");
         assert!(bad(0, 9), "no such measure");
         assert!(!bad(0, 0));
-        assert!(Range::of_args(&[Arg::Tag(Op::Range), Arg::Number(0)]).is_err(), "and a short one");
+        let mut payload = StructWriter::new();
+        payload.number(0);
+        assert!(Range::of_args(&[payload.finish(Op::Range)]).is_err(), "and a short one");
     }
 
     /// A budget is met by the measure it names and by nothing else. This is the

@@ -13,7 +13,7 @@ use common::crypto;
 use common::logn;
 use common::registry::{self, Peer};
 use common::server::{self, Process, Service};
-use common::wire::{Arg, Op, Req, Resp, Status, structure};
+use common::wire::{Op, Req, Resp, Status, structure};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -101,37 +101,26 @@ impl Ks {
     }
 
     fn sn_key(&self, request: &Req) -> Resp {
-        if matches!(request.args.first(), Some(Arg::Struct(..))) {
-            let (mut payload, rest) =
-                match structure(&request.args, Op::SnMasterKey, "an SN master-key request") {
-                    Ok(value) => value,
-                    Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-                };
-            if !rest.is_empty() {
-                return Resp::error(
-                    Status::BadRequest,
-                    "an SN master-key request has trailing arguments",
-                );
-            }
-            let sn = match payload.number().and_then(common::ids::SnId::of_number) {
-                Ok(sn) => sn,
+        let (mut payload, rest) =
+            match structure(&request.args, Op::SnMasterKey, "an SN master-key request") {
+                Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
-            let day = match payload.number().and_then(|day| payload.done().map(|()| day)) {
-                Ok(day) => day,
-                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-            };
-            return self.sn_key_for(sn, day);
+        if !rest.is_empty() {
+            return Resp::error(
+                Status::BadRequest,
+                "an SN master-key request has trailing arguments",
+            );
         }
-        let [Arg::Number(sn), Arg::Number(day)] = request.args.as_slice() else {
-            return Resp::error(Status::BadRequest, "sn-master-key takes an SN and a day");
-        };
-        let sn = match common::ids::SnId::of_number(*sn) {
+        let sn = match payload.number().and_then(common::ids::SnId::of_number) {
             Ok(sn) => sn,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-
-        self.sn_key_for(sn, *day)
+        let day = match payload.number().and_then(|day| payload.done().map(|()| day)) {
+            Ok(day) => day,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        self.sn_key_for(sn, day)
     }
 
     fn sn_key_for(&self, sn: common::ids::SnId, day: u64) -> Resp {
