@@ -15,11 +15,12 @@
 //!   block's size must not return nothing, or a caller with a small buffer retries
 //!   for ever — back-pressure that is really a livelock.
 
-use crate::info::Expecting;
+use crate::ids::{ObjectId, RangeId};
+use crate::info::{Expecting, ObjectName};
 use crate::offset::{ECoff, ELoff};
 use crate::placement::Expansion;
 use crate::wire::Arg;
-use crate::wire::{Op, StructWriter, structure, tagged};
+use crate::wire::{Op, StructReader, StructWriter, structure, tagged};
 use crate::{Error, Result};
 
 /// Where a range starts.
@@ -486,6 +487,47 @@ impl Want {
         ];
         args.extend(self.expect.args());
         args
+    }
+
+    /// Write the want fields into a command-owned payload without per-field wire tags.
+    pub fn write(&self, payload: &mut StructWriter) {
+        let (kind, at) = match self.from {
+            Start::Record(record) => (0, record),
+            Start::RecordThen(record, _) => (1, record),
+            Start::Logical(offset) => (2, offset),
+        };
+        payload.number(self.detail);
+        payload.number(self.limit);
+        payload.number(kind);
+        payload.number(at);
+        payload.number(self.expect.0.range.number());
+        payload.number(self.expect.0.object.number());
+        payload.number(self.expect.0.created.number());
+    }
+
+    pub fn read(payload: &mut StructReader<'_>) -> Result<Want> {
+        let detail = payload.number()?;
+        let limit = payload.number()?;
+        let kind = payload.number()?;
+        let at = payload.number()?;
+        let expect = Expecting::of(ObjectName {
+            range: RangeId::of_number(payload.number()?)?,
+            object: ObjectId::of_number(payload.number()?)?,
+            created: crate::time::TimeSec::new(payload.number()?),
+        });
+        let from = match kind {
+            0 => Start::Record(at),
+            1 => Start::RecordThen(at, 0),
+            2 => Start::Logical(at),
+            other => return Err(Error::new(format!("no range start of kind {other}"))),
+        };
+        let mut want = Want { detail, limit, from, expect };
+        for one in Detail::ALL {
+            if want.wants(*one) {
+                want.detail |= one.implies();
+            }
+        }
+        Ok(want)
     }
 
     /// And back. ⚠️ **A bit nothing here defines is not an error**, which is the forward

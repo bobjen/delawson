@@ -27,7 +27,7 @@ use common::range::{Detail, Want};
 use common::routing;
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
-use common::wire::{Arg, Op, Request, Response, Status};
+use common::wire::{Arg, Op, Request, Response, Status, StructWriter, structure};
 use common::{Error, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -749,11 +749,12 @@ impl DN {
                 return reply.send(failed);
             }
         };
-        let ask = Request::new(Op::CreateStream)
-            .number(self.mine.number())
-            .number(first)
-            .number(count)
-            .number(created.number());
+        let mut payload = StructWriter::new();
+        payload.number(self.mine.number());
+        payload.number(first);
+        payload.number(count);
+        payload.number(created.number());
+        let ask = Request::new(Op::CreateStream).structure(payload);
 
         let dn = Arc::clone(self);
         let sn_number =
@@ -881,11 +882,12 @@ impl DN {
         };
         let sn_number =
             SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
-        let ask = Request::new(Op::CreateStream)
-            .number(self.mine.number())
-            .number(stream)
-            .number(1)
-            .number(created.number());
+        let mut payload = StructWriter::new();
+        payload.number(self.mine.number());
+        payload.number(stream);
+        payload.number(1);
+        payload.number(created.number());
+        let ask = Request::new(Op::CreateStream).structure(payload);
 
         let dn = Arc::clone(self);
         let named = sn.clone();
@@ -945,19 +947,61 @@ impl DN {
         record: Option<ORoff>,
         reply: Reply,
     ) {
-        let (name, rest) = match request.args.as_slice() {
-            [Arg::Text(name), rest @ ..] => (name.as_str(), rest),
-            _ => {
-                return reply.send(Response::error(Status::BadRequest, "object-info takes a name"));
+        let (name, want) = if record.is_none()
+            && matches!(request.args.first(), Some(Arg::Struct(..)))
+        {
+            let (mut payload, rest) =
+                match structure(&request.args, Op::ObjectInfo, "an object-info request") {
+                    Ok(value) => value,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+            let name = match payload.text() {
+                Ok(name) => name,
+                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            };
+            let has_want = match payload.flag() {
+                Ok(value) => value,
+                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            };
+            let want = if has_want {
+                match Want::read(&mut payload) {
+                    Ok(want) => want,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                }
+            } else {
+                Want::plain()
+            };
+            if let Err(e) = payload.done() {
+                return reply.send(Response::error(Status::BadRequest, e.to_string()));
             }
+            if !rest.is_empty() {
+                return reply.send(Response::error(
+                    Status::BadRequest,
+                    "an object-info request has trailing arguments",
+                ));
+            }
+            (name, want)
+        } else {
+            let (name, rest) = match request.args.as_slice() {
+                [Arg::Text(name), rest @ ..] => (name.as_str(), rest),
+                _ => {
+                    return reply
+                        .send(Response::error(Status::BadRequest, "object-info takes a name"));
+                }
+            };
+            // `locate-stream` puts a record number where a want field would be.
+            let rest = if record.is_some() { &rest[1..] } else { rest };
+            let want = match wanted(rest, ANSWERS) {
+                Ok(want) => want,
+                Err(e) => return reply.send(Response::error(Status::Unimplemented, e.to_string())),
+            };
+            (name.to_string(), want)
         };
-        // `locate-stream` puts a record number where a want field would be, and it asks for
-        // nothing beyond the stream holding it, so it is not read here.
-        let rest = if record.is_some() { &rest[1..] } else { rest };
-        let want = match wanted(rest, ANSWERS) {
-            Ok(want) => want,
-            Err(e) => return reply.send(Response::error(Status::Unimplemented, e.to_string())),
-        };
+        let name = name.as_str();
         let limit = self.config.info_entries;
         // Under one lock: describe, or park. Deciding to wait and then waiting must be
         // one step, or the work can finish in between and wake nobody.
@@ -1139,11 +1183,62 @@ impl DN {
     fn info_many(&self, request: &Request) -> Response {
         // The names, then one want field for all of them — a batch asks the same question about
         // every name, so carrying it per name would repeat it a thousand times (§9.1.3.11).
-        let names = request.args.iter().position(|arg| !matches!(arg, Arg::Text(_)));
-        let (names, rest) = request.args.split_at(names.unwrap_or(request.args.len()));
-        let want = match wanted(rest, BATCH_ANSWERS) {
-            Ok(want) => want,
-            Err(e) => return Response::error(Status::Unimplemented, e.to_string()),
+        let (names, want) = if matches!(request.args.first(), Some(Arg::Struct(..))) {
+            let (mut payload, rest) =
+                match structure(&request.args, Op::BatchInfo, "a batch-object-info request") {
+                    Ok(value) => value,
+                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                };
+            let count = match payload.number() {
+                Ok(count) => count as usize,
+                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            };
+            let mut names = Vec::with_capacity(count);
+            for _ in 0..count {
+                match payload.text() {
+                    Ok(name) => names.push(name),
+                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                }
+            }
+            let has_want = match payload.flag() {
+                Ok(value) => value,
+                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            };
+            let want = if has_want {
+                match Want::read(&mut payload) {
+                    Ok(want) => want,
+                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                }
+            } else {
+                Want::plain()
+            };
+            if let Err(e) = payload.done() {
+                return Response::error(Status::BadRequest, e.to_string());
+            }
+            if !rest.is_empty() {
+                return Response::error(
+                    Status::BadRequest,
+                    "a batch-object-info request has trailing arguments",
+                );
+            }
+            (names, want)
+        } else {
+            let split = request.args.iter().position(|arg| !matches!(arg, Arg::Text(_)));
+            let (names, rest) = request.args.split_at(split.unwrap_or(request.args.len()));
+            let want = match wanted(rest, BATCH_ANSWERS) {
+                Ok(want) => want,
+                Err(e) => return Response::error(Status::Unimplemented, e.to_string()),
+            };
+            (
+                names
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        Arg::Text(name) => Some(name.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                want,
+            )
         };
         let limit = match want.limit {
             0 => self.config.info_entries,
@@ -1156,13 +1251,8 @@ impl DN {
         // Whether the last name given was described completely. Only the last one can be partial:
         // an earlier one stopping short would have spent the whole limit.
         let mut whole = true;
-        for asked in names {
-            let name = match asked {
-                Arg::Text(name) => name.as_str(),
-                _ => {
-                    return Response::error(Status::BadRequest, "batch-object-info takes names");
-                }
-            };
+        for name in &names {
+            let name = name.as_str();
             // What this name will cost, before committing to it: an object, plus its streams if
             // they were asked for. ⚠️ Measured first so the answer never overruns the limit — the
             // §17.22.2 bug was spending a cap and then spending it again.

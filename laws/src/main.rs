@@ -21,7 +21,7 @@ use common::placement::{self, Expansion};
 use common::random::Rng;
 use common::range::{Budget, Covered, Detail, Piece, Range, Start, Want};
 use common::time::TimeSec;
-use common::wire::{Arg, Op, Request, Response, Status};
+use common::wire::{Arg, Op, Request, Response, Status, structure};
 use common::{Error, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -1068,14 +1068,20 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
                 let mut sent: HashMap<u32, std::time::Instant> = HashMap::new();
                 loop {
                     while sent.len() < depth && std::time::Instant::now() < end {
-                        let mut request = if batch == 1 {
-                            Request::new(Op::ObjectInfo)
+                        let request = if batch == 1 {
+                            let mut payload = common::wire::StructWriter::new();
+                            payload.text(&format!("{prefix}{}", rng.next_u64() % objects));
+                            payload.flag(false);
+                            Request::new(Op::ObjectInfo).structure(payload)
                         } else {
-                            Request::new(Op::BatchInfo)
+                            let mut payload = common::wire::StructWriter::new();
+                            payload.number(batch as u64);
+                            for _ in 0..batch {
+                                payload.text(&format!("{prefix}{}", rng.next_u64() % objects));
+                            }
+                            payload.flag(false);
+                            Request::new(Op::BatchInfo).structure(payload)
                         };
-                        for _ in 0..batch {
-                            request = request.text(format!("{prefix}{}", rng.next_u64() % objects));
-                        }
                         let id = conn.send(&request)?;
                         sent.insert(id, std::time::Instant::now());
                         asked += batch as u64;
@@ -1770,25 +1776,27 @@ fn build(cmd: &Cmd) -> Result<Request> {
             Request::new(Op::LogLines).structure(payload)
         }
         Cmd::ObjectInfo { path, want, limit, from } => {
-            let mut request = Request::new(Op::ObjectInfo).text(path);
-            // Sent only when something was asked for, so the common case is byte-for-byte the
-            // request that predates the field — which is what keeps §17.5g's baseline honest.
             let asked = asking(want, *limit, *from);
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            payload.flag(asked != Want::plain());
             if asked != Want::plain() {
-                request.args.extend(asked.args());
+                asked.write(&mut payload);
             }
-            request
+            Request::new(Op::ObjectInfo).structure(payload)
         }
         Cmd::BatchObjectInfo { paths, want, limit, from } => {
-            let mut request = Request::new(Op::BatchInfo);
-            for path in paths {
-                request = request.text(path);
-            }
             let asked = asking(want, *limit, *from);
-            if asked != Want::plain() {
-                request.args.extend(asked.args());
+            let mut payload = common::wire::StructWriter::new();
+            payload.number(paths.len() as u64);
+            for path in paths {
+                payload.text(path);
             }
-            request
+            payload.flag(asked != Want::plain());
+            if asked != Want::plain() {
+                asked.write(&mut payload);
+            }
+            Request::new(Op::BatchInfo).structure(payload)
         }
         Cmd::Mkdir { path } => Request::new(Op::MakeDirectory).text(path),
         Cmd::Rmdir { path } => Request::new(Op::RemoveDirectory).text(path),
@@ -1916,8 +1924,13 @@ mod tests {
         assert_eq!(asking(&[], 0, 0), Want::plain());
         let bare = Cmd::ObjectInfo { path: "/x".into(), want: Vec::new(), limit: 0, from: 0 };
         let request = build(&bare).expect("a request");
-        assert_eq!(request.args.len(), 1, "the name and nothing else");
-        assert_eq!(request.args[0], Arg::Text("/x".into()));
+        let (mut payload, rest) =
+            structure(&request.args, Op::ObjectInfo, "an object-info request")
+                .expect("a self-contained request");
+        assert!(rest.is_empty());
+        assert_eq!(payload.text().unwrap(), "/x");
+        assert!(!payload.flag().unwrap());
+        payload.done().unwrap();
     }
 
     /// And anything actually asked for does travel, in the four arguments `Want` defines.
@@ -1926,9 +1939,14 @@ mod tests {
         let asked =
             Cmd::ObjectInfo { path: "/x".into(), want: vec![Want1::Instances], limit: 7, from: 3 };
         let request = build(&asked).expect("a request");
-        assert_eq!(request.args.len(), 1 + Want::ARGS, "the name plus a want");
-        let (want, rest) = Want::of_args(&request.args[1..]).expect("a want");
+        let (mut payload, rest) =
+            structure(&request.args, Op::ObjectInfo, "an object-info request")
+                .expect("a self-contained request");
         assert!(rest.is_empty());
+        assert_eq!(payload.text().unwrap(), "/x");
+        assert!(payload.flag().unwrap());
+        let want = Want::read(&mut payload).expect("a want");
+        payload.done().unwrap();
         assert!(want.wants(Detail::Instances) && want.wants(Detail::Extents));
         assert_eq!((want.limit, want.from), (7, Start::Record(3)));
     }

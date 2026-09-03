@@ -31,7 +31,7 @@ use common::range::{Budget, Covered, Detail, Filled, Piece, Range, Start, Want};
 use common::routing;
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
-use common::wire::{AppendBlock, Arg, Op, Request, Response, Status};
+use common::wire::{AppendBlock, Arg, Op, Request, Response, Status, StructWriter, structure};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -351,14 +351,18 @@ impl FE {
         let path = path.to_string();
         // ⚠️ The expectation goes to the **DN**, because the DN owns the path table and is the
         // only tier that can see the path point somewhere new (§17.36).
-        let mut ask = match record {
-            None => Request::new(Op::ObjectInfo).text(&path),
+        let ask = match record {
+            None => {
+                let mut payload = StructWriter::new();
+                payload.text(&path);
+                payload.flag(expect.asked());
+                if expect.asked() {
+                    Want { expect, ..Want::plain() }.write(&mut payload);
+                }
+                Request::new(Op::ObjectInfo).structure(payload)
+            }
             Some(record) => Request::new(Op::LocateStream).text(&path).number(record.number()),
         };
-        // ⚠️ Only when there is an opinion, so a plain resolve is the request §17.5g measured.
-        if expect.asked() {
-            ask.args.extend(Want { expect, ..Want::plain() }.args());
-        }
         let named = dn.clone();
         let asked = process.ask(&dn, &ask, move |answer| {
             // An append may make the object it is appending to, which is one more
@@ -786,9 +790,12 @@ impl FE {
         }
 
         let identity = format!("SN{}", located.sn);
-        let mut ask = Request::new(Op::LocateRecord);
-        ask.args.extend(located.stream.args());
-        ask.args.push(Arg::Number(record.number()));
+        let mut payload = StructWriter::new();
+        payload.number(located.stream.range.number());
+        payload.number(located.stream.stream.number());
+        payload.number(located.stream.created.number());
+        payload.number(record.number());
+        let ask = Request::new(Op::LocateRecord).structure(payload);
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
         let named = identity.clone();
@@ -820,15 +827,29 @@ impl FE {
 /// What to ask the SN for the next extent: open one, or report the one that filled
 /// and get its replacement in the same round trip.
 fn wanting_extent(key: StreamName, sealed: Option<(ExtentId, Filled)>) -> Request {
+    if sealed.is_none() {
+        let mut payload = StructWriter::new();
+        payload.number(key.range.number());
+        payload.number(key.stream.number());
+        payload.number(key.created.number());
+        return Request::new(Op::OpenExtent).structure(payload);
+    }
     let mut request = Request::new(match sealed {
         None => Op::OpenExtent,
         Some(_) => Op::SealExtent,
     });
-    request.args.extend(key.args());
     if let Some((id, came_to)) = sealed {
-        request.args.push(Arg::Number(id.number()));
-        request.args.extend(came_to.args());
+        let mut payload = StructWriter::new();
+        payload.number(key.range.number());
+        payload.number(key.stream.number());
+        payload.number(key.created.number());
+        payload.number(id.number());
+        payload.number(came_to.records);
+        payload.number(came_to.logical.number());
+        payload.number(came_to.compressed.number());
+        return request.structure(payload);
     }
+    request.args.extend(key.args());
     request
 }
 
@@ -1297,25 +1318,75 @@ impl FE {
     /// **Round two spends the slack**, if the first DN left any, on the summaries nearest
     /// the front — sized from the exact stream counts the summaries reported.
     fn batch(self: &Arc<Self>, process: &Arc<Process>, request: &Request, mut reply: Reply) {
-        let split = request
-            .args
-            .iter()
-            .position(|arg| !matches!(arg, Arg::Text(_)))
-            .unwrap_or(request.args.len());
-        let (asked, rest) = request.args.split_at(split);
-        let names: Vec<String> = asked
-            .iter()
-            .filter_map(|arg| match arg {
-                Arg::Text(name) => Some(name.clone()),
-                _ => None,
-            })
-            .collect();
-        let want = match rest {
-            [] => Want::plain(),
-            _ => match Want::of_args(rest) {
-                Ok((want, _)) => want,
+        let (names, want) = if matches!(request.args.first(), Some(Arg::Struct(Op::BatchInfo, _))) {
+            let (mut payload, rest) =
+                match structure(&request.args, Op::BatchInfo, "a batch-object-info request") {
+                    Ok(value) => value,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+            let count = match payload.number() {
+                Ok(count) => count as usize,
                 Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
-            },
+            };
+            let mut names = Vec::with_capacity(count);
+            for _ in 0..count {
+                match payload.text() {
+                    Ok(name) => names.push(name),
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                }
+            }
+            let has_want = match payload.flag() {
+                Ok(value) => value,
+                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            };
+            let want = if has_want {
+                match Want::read(&mut payload) {
+                    Ok(want) => want,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                }
+            } else {
+                Want::plain()
+            };
+            if let Err(e) = payload.done() {
+                return reply.send(Response::error(Status::BadRequest, e.to_string()));
+            }
+            if !rest.is_empty() {
+                return reply.send(Response::error(
+                    Status::BadRequest,
+                    "a batch-object-info request has trailing arguments",
+                ));
+            }
+            (names, want)
+        } else {
+            let split = request
+                .args
+                .iter()
+                .position(|arg| !matches!(arg, Arg::Text(_)))
+                .unwrap_or(request.args.len());
+            let (asked, rest) = request.args.split_at(split);
+            let names = asked
+                .iter()
+                .filter_map(|arg| match arg {
+                    Arg::Text(name) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            let want = match rest {
+                [] => Want::plain(),
+                _ => match Want::of_args(rest) {
+                    Ok((want, _)) => want,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                },
+            };
+            (names, want)
         };
         let dns: Vec<String> =
             process.all_of(ServiceKind::Dn).iter().map(|dn| dn.to_string()).collect();
@@ -1428,12 +1499,12 @@ impl FE {
     fn destination<'a>(&self, process: &'a Process, request: &Request) -> Result<&'a str> {
         match request.op {
             Op::CreateObject | Op::ObjectInfo | Op::BatchInfo => {
-                process.owner(ServiceKind::Dn, first(request))
+                process.owner(ServiceKind::Dn, &first(request))
             }
             // A batch create reaching here is one DN's worth: `FE::create` has already
             // grouped by owner, or there was nothing to group (#98). Either way the name to
             // route by is the first one.
-            Op::BatchCreate => process.owner(ServiceKind::Dn, first(request)),
+            Op::BatchCreate => process.owner(ServiceKind::Dn, &first(request)),
             _ => process.pick(ServiceKind::Dn),
         }
     }
@@ -1536,11 +1607,14 @@ fn send(fe: &Arc<FE>, process: &Arc<Process>, spread: &Arc<Mutex<Spread>>, asks:
         held.names.clone()
     };
     for ask in asks {
-        let mut request = Request::new(Op::BatchInfo);
+        let mut payload = StructWriter::new();
+        payload.number(ask.at.len() as u64);
         for at in &ask.at {
-            request = request.text(&names[*at]);
+            payload.text(&names[*at]);
         }
-        request.args.extend(ask.want.args());
+        payload.flag(true);
+        ask.want.write(&mut payload);
+        let request = Request::new(Op::BatchInfo).structure(payload);
         let ask = Arc::new(ask);
         let (mine, onward, waiting) = (Arc::clone(fe), Arc::clone(process), Arc::clone(spread));
         let named = ask.dn.clone();
@@ -1591,10 +1665,23 @@ fn arrived(
 }
 
 /// The request's first argument, which for anything about an object is the name.
-fn first(request: &Request) -> &str {
+fn first(request: &Request) -> String {
     match request.args.first() {
-        Some(Arg::Text(name)) => name.as_str(),
-        _ => "",
+        Some(Arg::Text(name)) => name.clone(),
+        Some(Arg::Struct(Op::ObjectInfo, _bytes)) => {
+            structure(&request.args, Op::ObjectInfo, "an object-info request")
+                .and_then(|(mut payload, _)| payload.text())
+                .unwrap_or_default()
+        }
+        Some(Arg::Struct(Op::BatchInfo, _bytes)) => {
+            structure(&request.args, Op::BatchInfo, "a batch-object-info request")
+                .and_then(|(mut payload, _)| {
+                    let _ = payload.number()?;
+                    payload.text()
+                })
+                .unwrap_or_default()
+        }
+        _ => String::new(),
     }
 }
 
