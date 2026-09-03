@@ -143,11 +143,11 @@ impl Range {
             Start::Logical(offset) => (offset, 0),
         };
         let mut payload = StructWriter::new();
-        payload.number(self.start.code());
-        payload.number(first);
-        payload.number(second);
-        payload.number(self.budget.code());
-        payload.number(self.budget.amount());
+        payload.number_u64(self.start.code());
+        payload.number_u64(first);
+        payload.number_u64(second);
+        payload.number_u64(self.budget.code());
+        payload.number_u64(self.budget.amount());
         vec![payload.finish(Op::Range)]
     }
 
@@ -159,20 +159,20 @@ impl Range {
             Start::Logical(offset) => (offset, 0),
         };
         payload.tag(Op::Range);
-        payload.number(self.start.code());
-        payload.number(first);
-        payload.number(second);
-        payload.number(self.budget.code());
-        payload.number(self.budget.amount());
+        payload.number_u64(self.start.code());
+        payload.number_u64(first);
+        payload.number_u64(second);
+        payload.number_u64(self.budget.code());
+        payload.number_u64(self.budget.amount());
     }
 
     pub fn read_nested(payload: &mut StructReader<'_>) -> Result<Range> {
         payload.tag(Op::Range, "a range")?;
-        let kind = payload.number()?;
-        let first = payload.number()?;
-        let second = payload.number()?;
-        let measure = payload.number()?;
-        let amount = payload.number()?;
+        let kind = payload.number_u64()?;
+        let first = payload.number_u64()?;
+        let second = payload.number_u64()?;
+        let measure = payload.number_u64()?;
+        let amount = payload.number_u64()?;
         let start = match kind {
             0 => Start::Record(first),
             1 => Start::RecordThen(first, second),
@@ -191,11 +191,11 @@ impl Range {
     /// And back, returning whatever followed it.
     pub fn of_args(args: &[Arg]) -> Result<(Range, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::Range, "a range")?;
-        let kind = payload.number()?;
-        let first = payload.number()?;
-        let second = payload.number()?;
-        let measure = payload.number()?;
-        let amount = payload.number()?;
+        let kind = payload.number_u64()?;
+        let first = payload.number_u64()?;
+        let second = payload.number_u64()?;
+        let measure = payload.number_u64()?;
+        let amount = payload.number_u64()?;
         payload.done()?;
         let start = match kind {
             0 => Start::Record(first),
@@ -242,18 +242,18 @@ pub struct Filled {
 impl Filled {
     pub fn args(&self) -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        payload.number(self.records);
-        payload.number(self.logical.number());
-        payload.number(self.compressed.number());
+        payload.number_u64(self.records);
+        payload.number_u64(self.logical.number());
+        payload.number_u64(self.compressed.number());
         vec![payload.finish(Op::FilledResp)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Filled, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::FilledResp, "a seal report")?;
         let filled = Filled {
-            records: payload.number()?,
-            logical: ELoff::of_number(payload.number()?)?,
-            compressed: ECoff::of_number(payload.number()?)?,
+            records: payload.number_u64()?,
+            logical: ELoff::of_number(payload.number_u64()?)?,
+            compressed: ECoff::of_number(payload.number_u64()?)?,
         };
         payload.done()?;
         Ok((filled, rest))
@@ -315,10 +315,10 @@ impl Covered {
 
     pub fn args(&self) -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        payload.number(self.records);
-        payload.number(self.logical);
-        payload.number(self.compressed);
-        payload.number(self.next);
+        payload.number_u64(self.records);
+        payload.number_u64(self.logical);
+        payload.number_u64(self.compressed);
+        payload.number_u64(self.next);
         payload.flag(self.more);
         vec![payload.finish(Op::CoveredResp)]
     }
@@ -326,10 +326,10 @@ impl Covered {
     pub fn of_args(args: &[Arg]) -> Result<(Covered, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::CoveredResp, "an answer coverage")?;
         let covered = Covered {
-            records: payload.number()?,
-            logical: payload.number()?,
-            compressed: payload.number()?,
-            next: payload.number()?,
+            records: payload.number_u64()?,
+            logical: payload.number_u64()?,
+            compressed: payload.number_u64()?,
+            next: payload.number_u64()?,
             more: payload.flag()?,
         };
         payload.done()?;
@@ -489,24 +489,24 @@ impl Want {
             Start::RecordThen(record, _) => (1, record),
             Start::Logical(offset) => (2, offset),
         };
-        payload.number(self.detail);
-        payload.number(self.limit);
-        payload.number(kind);
-        payload.number(at);
-        payload.number(self.expect.0.range.number());
-        payload.number(self.expect.0.object.number());
-        payload.number(self.expect.0.created.number());
+        payload.number_u64(self.detail);
+        payload.number_u64(self.limit);
+        payload.number_u64(kind);
+        payload.number_u64(at);
+        payload.number_u64(self.expect.0.range.number());
+        payload.number_u64(self.expect.0.object.number());
+        payload.number_u64(self.expect.0.created.number());
     }
 
     pub fn read(payload: &mut StructReader<'_>) -> Result<Want> {
-        let detail = payload.number()?;
-        let limit = payload.number()?;
-        let kind = payload.number()?;
-        let at = payload.number()?;
+        let detail = payload.number_u64()?;
+        let limit = payload.number_u64()?;
+        let kind = payload.number_u64()?;
+        let at = payload.number_u64()?;
         let expect = Expecting::of(ObjectName {
-            range: RangeId::of_number(payload.number()?)?,
-            object: ObjectId::of_number(payload.number()?)?,
-            created: crate::time::TimeSec::new(payload.number()?),
+            range: RangeId::of_number(payload.number_u64()?)?,
+            object: ObjectId::of_number(payload.number_u64()?)?,
+            created: crate::time::TimeSec::new(payload.number_u64()?),
         });
         let from = match kind {
             0 => Start::Record(at),
@@ -583,10 +583,10 @@ pub struct Piece {
 impl Piece {
     pub fn args(&self) -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        payload.number(self.logical);
-        payload.number(self.first_record);
-        payload.number(self.records);
-        payload.number(self.crc);
+        payload.number_u64(self.logical);
+        payload.number_u64(self.first_record);
+        payload.number_u64(self.records);
+        payload.number_u64(self.crc);
         payload.bytes(&self.bytes);
         vec![payload.finish(Op::PieceResp)]
     }
@@ -594,10 +594,10 @@ impl Piece {
     pub fn of_args(args: &[Arg]) -> Result<(Piece, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::PieceResp, "a piece")?;
         let piece = Piece {
-            logical: payload.number()?,
-            first_record: payload.number()?,
-            records: payload.number()?,
-            crc: payload.number()?,
+            logical: payload.number_u64()?,
+            first_record: payload.number_u64()?,
+            records: payload.number_u64()?,
+            crc: payload.number_u64()?,
             bytes: payload.bytes()?,
         };
         payload.done()?;
@@ -652,11 +652,11 @@ mod tests {
     fn an_unknown_kind_is_refused() {
         let bad = |kind, measure| {
             let mut payload = StructWriter::new();
-            payload.number(kind);
-            payload.number(0);
-            payload.number(0);
-            payload.number(measure);
-            payload.number(1);
+            payload.number_u64(kind);
+            payload.number_u64(0);
+            payload.number_u64(0);
+            payload.number_u64(measure);
+            payload.number_u64(1);
             let args = vec![payload.finish(Op::Range)];
             Range::of_args(&args).is_err()
         };
@@ -664,7 +664,7 @@ mod tests {
         assert!(bad(0, 9), "no such measure");
         assert!(!bad(0, 0));
         let mut payload = StructWriter::new();
-        payload.number(0);
+        payload.number_u64(0);
         assert!(Range::of_args(&[payload.finish(Op::Range)]).is_err(), "and a short one");
     }
 

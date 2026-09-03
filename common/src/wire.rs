@@ -262,7 +262,19 @@ impl StructWriter {
         StructWriter { bytes: Vec::new() }
     }
 
-    pub fn number(&mut self, value: u64) {
+    pub fn number_u64(&mut self, value: u64) {
+        self.bytes.extend(value.to_le_bytes());
+    }
+
+    pub fn number_u8(&mut self, value: u8) {
+        self.bytes.push(value);
+    }
+
+    pub fn number_u16(&mut self, value: u16) {
+        self.bytes.extend(value.to_le_bytes());
+    }
+
+    pub fn number_u32(&mut self, value: u32) {
         self.bytes.extend(value.to_le_bytes());
     }
 
@@ -312,8 +324,20 @@ impl<'a> StructReader<'a> {
         Ok(value)
     }
 
-    pub fn number(&mut self) -> Result<u64> {
+    pub fn number_u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    pub fn number_u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    pub fn number_u16(&mut self) -> Result<u16> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
+    pub fn number_u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
     pub fn flag(&mut self) -> Result<bool> {
@@ -487,7 +511,7 @@ impl Resp {
 
     pub fn number(status: Status, number: u64) -> Resp {
         let mut payload = StructWriter::new();
-        payload.number(number);
+        payload.number_u64(number);
         Resp { id: 0, status, args: vec![payload.finish(Op::NumberResp)] }
     }
 
@@ -558,23 +582,23 @@ impl AppendBlock {
         let mut request = Req::new(op);
         let mut payload = StructWriter::new();
         let (kind, width) = self.framing.wire();
-        payload.number(en.number());
-        payload.number(disk.number());
-        payload.number(self.sn.number());
-        payload.number(self.extent.number());
-        payload.number(self.created.number());
-        payload.number(kind);
-        payload.number(width);
-        payload.number(self.crc);
-        payload.number(self.holds.compressed.number());
-        payload.number(self.holds.logical.number());
-        payload.number(self.holds.records.number());
+        payload.number_u64(en.number());
+        payload.number_u64(disk.number());
+        payload.number_u64(self.sn.number());
+        payload.number_u64(self.extent.number());
+        payload.number_u64(self.created.number());
+        payload.number_u64(kind);
+        payload.number_u64(width);
+        payload.number_u64(self.crc);
+        payload.number_u64(self.holds.compressed.number());
+        payload.number_u64(self.holds.logical.number());
+        payload.number_u64(self.holds.records.number());
         payload.flag(self.logical_offset.is_some());
-        payload.number(self.logical_offset.map(|o| o.number()).unwrap_or(0));
-        payload.number(self.instances.len() as u64);
+        payload.number_u64(self.logical_offset.map(|o| o.number()).unwrap_or(0));
+        payload.number_u64(self.instances.len() as u64);
         for (en, disk) in &self.instances {
-            payload.number(en.number());
-            payload.number(disk.number());
+            payload.number_u64(en.number());
+            payload.number_u64(disk.number());
         }
         payload.bytes(&self.bytes);
         request.args.push(payload.finish(op));
@@ -586,26 +610,28 @@ impl AppendBlock {
         if !rest.is_empty() {
             return Err(Error::new("an append block has arguments after its payload"));
         }
-        let en = EnId::of_number(payload.number()?)?;
-        let disk = DiskId::of_number(payload.number()?)?;
-        let sn = SnId::of_number(payload.number()?)?;
-        let extent = ExtentId::of_number(payload.number()?)?;
-        let created = TimeSec::new(payload.number()?);
-        let kind = payload.number()?;
-        let width = payload.number()?;
-        let crc = payload.number()?;
+        let en = EnId::of_number(payload.number_u64()?)?;
+        let disk = DiskId::of_number(payload.number_u64()?)?;
+        let sn = SnId::of_number(payload.number_u64()?)?;
+        let extent = ExtentId::of_number(payload.number_u64()?)?;
+        let created = TimeSec::new(payload.number_u64()?);
+        let kind = payload.number_u64()?;
+        let width = payload.number_u64()?;
+        let crc = payload.number_u64()?;
         let holds = crate::block::Holds {
-            compressed: crate::offset::ECoff::of_number(payload.number()?)?,
-            logical: crate::offset::ELoff::of_number(payload.number()?)?,
-            records: crate::offset::ERoff::of_number(payload.number()?)?,
+            compressed: crate::offset::ECoff::of_number(payload.number_u64()?)?,
+            logical: crate::offset::ELoff::of_number(payload.number_u64()?)?,
+            records: crate::offset::ERoff::of_number(payload.number_u64()?)?,
         };
         let has_logical = payload.flag()?;
-        let logical = payload.number()?;
-        let count = payload.number()? as usize;
+        let logical = payload.number_u64()?;
+        let count = payload.number_u64()? as usize;
         let mut instances = Vec::with_capacity(count);
         for _ in 0..count {
-            instances
-                .push((EnId::of_number(payload.number()?)?, DiskId::of_number(payload.number()?)?));
+            instances.push((
+                EnId::of_number(payload.number_u64()?)?,
+                DiskId::of_number(payload.number_u64()?)?,
+            ));
         }
         let bytes = payload.bytes()?;
         payload.done()?;
@@ -1021,8 +1047,8 @@ mod tests {
     #[test]
     fn a_command_can_use_its_op_as_a_self_contained_payload_tag() {
         let mut payload = StructWriter::new();
-        payload.number(7);
-        payload.number(42);
+        payload.number_u64(7);
+        payload.number_u64(42);
         let request = Req::new(Op::SnMasterKey).structure(payload);
         assert_eq!(round_trip_request(&request), request);
         assert!(

@@ -58,8 +58,8 @@ impl DailyKeyCache {
 
         // Fetch from KS.
         let mut payload = StructWriter::new();
-        payload.number(sn_id.number());
-        payload.number(day);
+        payload.number_u64(sn_id.number());
+        payload.number_u64(day);
         let ask = Req::new(Op::SnMasterKey).structure(payload);
         let key_cell = Arc::new(Mutex::new([0u8; 32]));
         let key_cell2 = Arc::clone(&key_cell);
@@ -764,7 +764,7 @@ impl Disk {
             landed.offset.number(),
             length as u64,
         ] {
-            receipt.number(value);
+            receipt.number_u64(value);
         }
         let receipt = vec![receipt.finish(Op::ReceiptResp)];
 
@@ -1046,23 +1046,23 @@ impl EN {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
-        let en = match payload.number() {
+        let en = match payload.number_u64() {
             Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let disk = match payload.number() {
+        let disk = match payload.number_u64() {
             Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let sn = match payload.number() {
+        let sn = match payload.number_u64() {
             Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let extent = match payload.number() {
+        let extent = match payload.number_u64() {
             Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let created = match payload.number() {
+        let created = match payload.number_u64() {
             Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };

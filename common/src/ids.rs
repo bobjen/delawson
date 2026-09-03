@@ -64,7 +64,8 @@ macro_rules! id {
                 self.0
             }
 
-            /// For the wire, where every number is 64 bits.
+            /// For the generic wire argument representation. Self-contained structures may
+            /// serialize this id in its native width with the matching `StructWriter` method.
             pub const fn number(self) -> u64 {
                 self.0 as u64
             }

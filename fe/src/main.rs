@@ -97,16 +97,16 @@ impl Open {
         if !rest.is_empty() {
             return None;
         }
-        let id = payload.number().ok()?;
-        let created = payload.number().ok()?;
-        let first_record = payload.number().ok()?;
-        let records = payload.number().ok()?;
-        let count = usize::try_from(payload.number().ok()?).ok()?;
+        let id = payload.number_u64().ok()?;
+        let created = payload.number_u64().ok()?;
+        let first_record = payload.number_u64().ok()?;
+        let records = payload.number_u64().ok()?;
+        let count = usize::try_from(payload.number_u64().ok()?).ok()?;
         let mut disks = Vec::with_capacity(count);
         for _ in 0..count {
             disks.push((
-                EnId::of_number(payload.number().ok()?).ok()?,
-                DiskId::of_number(payload.number().ok()?).ok()?,
+                EnId::of_number(payload.number_u64().ok()?).ok()?,
+                DiskId::of_number(payload.number_u64().ok()?).ok()?,
             ));
         }
         payload.done().ok()?;
@@ -356,7 +356,7 @@ impl FE {
             Some(record) => {
                 let mut payload = StructWriter::new();
                 payload.text(&path);
-                payload.number(record.number());
+                payload.number_u64(record.number());
                 Req::new(Op::LocateStream).structure(payload)
             }
         };
@@ -410,13 +410,13 @@ impl FE {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                 }
             };
-            let kind = match payload.number() {
+            let kind = match payload.number_u64() {
                 Ok(kind) => kind,
                 Err(e) => {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                 }
             };
-            let width = match payload.number() {
+            let width = match payload.number_u64() {
                 Ok(width) => width,
                 Err(e) => {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
@@ -428,7 +428,7 @@ impl FE {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                 }
             };
-            let crc = match payload.number() {
+            let crc = match payload.number_u64() {
                 Ok(crc) => crc,
                 Err(e) => {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
@@ -693,15 +693,16 @@ impl FE {
                 ));
             }
         };
-        let records = match payload.number().and_then(|records| payload.done().map(|()| records)) {
-            Ok(records) if rest.is_empty() => records,
-            _ => {
-                return wanting.reply.send(Resp::error(
-                    Status::Internal,
-                    "a full stream said nothing about itself",
-                ));
-            }
-        };
+        let records =
+            match payload.number_u64().and_then(|records| payload.done().map(|()| records)) {
+                Ok(records) if rest.is_empty() => records,
+                _ => {
+                    return wanting.reply.send(Resp::error(
+                        Status::Internal,
+                        "a full stream said nothing about itself",
+                    ));
+                }
+            };
         let Wanting { path, located, framing, crc, body, holds, tries, reply } = wanting;
         // Nothing may hand out an extent of a stream that will take no more, and what
         // is remembered about it is no use to an append either.
@@ -710,8 +711,8 @@ impl FE {
         let dn = format!("DN{}", located.dn);
         let mut payload = StructWriter::new();
         payload.text(&path);
-        payload.number(located.stream.stream.number());
-        payload.number(records);
+        payload.number_u64(located.stream.stream.number());
+        payload.number_u64(records);
         let ask = Req::new(Op::ExtendObject).structure(payload);
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
@@ -766,7 +767,7 @@ impl FE {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                 }
             };
-            let selector = match payload.number() {
+            let selector = match payload.number_u64() {
                 Ok(selector) => selector,
                 Err(e) => {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
@@ -852,10 +853,10 @@ impl FE {
 
         let identity = format!("SN{}", located.sn);
         let mut payload = StructWriter::new();
-        payload.number(located.stream.range.number());
-        payload.number(located.stream.stream.number());
-        payload.number(located.stream.created.number());
-        payload.number(record.number());
+        payload.number_u64(located.stream.range.number());
+        payload.number_u64(located.stream.stream.number());
+        payload.number_u64(located.stream.created.number());
+        payload.number_u64(record.number());
         let ask = Req::new(Op::LocateRecord).structure(payload);
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
@@ -889,9 +890,9 @@ impl FE {
 fn wanting_extent(key: StreamName, sealed: Option<(ExtentId, Filled)>) -> Req {
     if sealed.is_none() {
         let mut payload = StructWriter::new();
-        payload.number(key.range.number());
-        payload.number(key.stream.number());
-        payload.number(key.created.number());
+        payload.number_u64(key.range.number());
+        payload.number_u64(key.stream.number());
+        payload.number_u64(key.created.number());
         return Req::new(Op::OpenExtent).structure(payload);
     }
     let mut request = Req::new(match sealed {
@@ -900,13 +901,13 @@ fn wanting_extent(key: StreamName, sealed: Option<(ExtentId, Filled)>) -> Req {
     });
     if let Some((id, came_to)) = sealed {
         let mut payload = StructWriter::new();
-        payload.number(key.range.number());
-        payload.number(key.stream.number());
-        payload.number(key.created.number());
-        payload.number(id.number());
-        payload.number(came_to.records);
-        payload.number(came_to.logical.number());
-        payload.number(came_to.compressed.number());
+        payload.number_u64(key.range.number());
+        payload.number_u64(key.stream.number());
+        payload.number_u64(key.created.number());
+        payload.number_u64(id.number());
+        payload.number_u64(came_to.records);
+        payload.number_u64(came_to.logical.number());
+        payload.number_u64(came_to.compressed.number());
         return request.structure(payload);
     }
     request.args.extend(key.args());
@@ -930,8 +931,8 @@ fn make_object(
     let mut payload = StructWriter::new();
     payload.text(path);
     payload.flag(false);
-    payload.number(kind);
-    payload.number(width);
+    payload.number_u64(kind);
+    payload.number_u64(width);
     payload.text("");
     payload.flag(false);
     let ask = Req::new(Op::CreateObject).structure(payload);
@@ -1001,11 +1002,11 @@ fn from_instance(
     // tail, so what the EN says about its own blocks is the whole answer.
     let sealed = open.records > ERoff::ZERO;
     let mut payload = StructWriter::new();
-    payload.number(open.disks[0].0.number());
-    payload.number(open.disks[0].1.number());
-    payload.number(open.sn.number());
-    payload.number(open.id.number());
-    payload.number(open.created.number());
+    payload.number_u64(open.disks[0].0.number());
+    payload.number_u64(open.disks[0].1.number());
+    payload.number_u64(open.sn.number());
+    payload.number_u64(open.id.number());
+    payload.number_u64(open.created.number());
     Range { start: Start::Record(at.number()), budget }.write_nested(&mut payload);
     let ask = Req::new(Op::ReadExtent).structure(payload);
     let named = identity.clone();
@@ -1106,31 +1107,31 @@ fn receipt(located: &Located, open: &Open, answer: Resp) -> Resp {
     if !rest.is_empty() {
         return Resp::error(Status::Internal, "that append answered with no receipt");
     }
-    let _sn = match payload.number() {
+    let _sn = match payload.number_u64() {
         Ok(value) => value,
         Err(_) => return Resp::error(Status::Internal, "that append answered with no receipt"),
     };
-    let extent = match payload.number() {
+    let extent = match payload.number_u64() {
         Ok(value) => value,
         Err(_) => return Resp::error(Status::Internal, "that append answered with no receipt"),
     };
-    let created = match payload.number() {
+    let created = match payload.number_u64() {
         Ok(value) => value,
         Err(_) => return Resp::error(Status::Internal, "that append answered with no receipt"),
     };
-    let offset = match payload.number() {
+    let offset = match payload.number_u64() {
         Ok(value) => value,
         Err(_) => return Resp::error(Status::Internal, "that append answered with no receipt"),
     };
-    let length = match payload.number() {
+    let length = match payload.number_u64() {
         Ok(value) => value,
         Err(_) => return Resp::error(Status::Internal, "that append answered with no receipt"),
     };
-    let first = match payload.number() {
+    let first = match payload.number_u64() {
         Ok(value) => value,
         Err(_) => return Resp::error(Status::Internal, "that append answered with no receipt"),
     };
-    let records = match payload.number() {
+    let records = match payload.number_u64() {
         Ok(value) => value,
         Err(_) => return Resp::error(Status::Internal, "that append answered with no receipt"),
     };
@@ -1155,7 +1156,7 @@ fn receipt(located: &Located, open: &Open, answer: Resp) -> Resp {
                 offset,
                 length,
             ] {
-                payload.number(value);
+                payload.number_u64(value);
             }
             vec![payload.finish(Op::ReceiptResp)]
         },
@@ -1428,7 +1429,7 @@ impl FE {
                         return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                     }
                 };
-            let count = match payload.number() {
+            let count = match payload.number_u64() {
                 Ok(count) => count as usize,
                 Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
             };
@@ -1523,7 +1524,7 @@ impl FE {
                         return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                     }
                 };
-            let count = match payload.number() {
+            let count = match payload.number_u64() {
                 Ok(count) => count as usize,
                 Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
             };
@@ -1566,7 +1567,7 @@ impl FE {
 
         for (dn, at) in groups {
             let mut payload = StructWriter::new();
-            payload.number(at.len() as u64);
+            payload.number_u64(at.len() as u64);
             for one in at.iter().map(|at| &wanted[*at]) {
                 one.write(&mut payload);
             }
@@ -1633,7 +1634,7 @@ fn made(making: &Arc<Mutex<Making>>, answer: Resp) {
             if !rest.is_empty() {
                 return Err(common::Error::new("a number response has trailing arguments"));
             }
-            let number = payload.number()?;
+            let number = payload.number_u64()?;
             payload.done()?;
             Ok(number)
         },
@@ -1721,7 +1722,7 @@ fn send(fe: &Arc<FE>, process: &Arc<Process>, spread: &Arc<Mutex<Spread>>, asks:
     };
     for ask in asks {
         let mut payload = StructWriter::new();
-        payload.number(ask.at.len() as u64);
+        payload.number_u64(ask.at.len() as u64);
         for at in &ask.at {
             payload.text(&names[*at]);
         }
@@ -1789,7 +1790,7 @@ fn first(request: &Req) -> String {
         Some(Arg::Struct(Op::BatchInfo, _bytes)) => {
             structure(&request.args, Op::BatchInfo, "a batch-object-info request")
                 .and_then(|(mut payload, _)| {
-                    let _ = payload.number()?;
+                    let _ = payload.number_u64()?;
                     payload.text()
                 })
                 .unwrap_or_default()
@@ -1802,7 +1803,7 @@ fn first(request: &Req) -> String {
         Some(Arg::Struct(Op::BatchCreate, _bytes)) => {
             structure(&request.args, Op::BatchCreate, "a batch-create request")
                 .and_then(|(mut payload, _)| {
-                    let _ = payload.number()?;
+                    let _ = payload.number_u64()?;
                     payload.text()
                 })
                 .unwrap_or_default()
@@ -2110,7 +2111,7 @@ mod tests {
     fn an_open_extent_is_read_out_of_the_sns_answer() {
         let mut payload = StructWriter::new();
         for value in [7, 1_000_000, 40, 90, 4, 2, 0, 3, 0, 0, 0, 1, 0] {
-            payload.number(value);
+            payload.number_u64(value);
         }
         let response =
             Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::ExtentResp)] };
@@ -2212,7 +2213,7 @@ mod tests {
         };
         let mut from_en_payload = StructWriter::new();
         for value in [0, 7, 1_000_000, 512, 30, 2, 1] {
-            from_en_payload.number(value);
+            from_en_payload.number_u64(value);
         }
         let from_en =
             Resp { id: 0, status: Status::Ok, args: vec![from_en_payload.finish(Op::ReceiptResp)] };
@@ -2220,7 +2221,7 @@ mod tests {
         assert_eq!(receipt.status, Status::Ok);
         let (mut payload, rest) = structure(&receipt.args, Op::ReceiptResp, "a receipt").unwrap();
         assert!(rest.is_empty());
-        let values: Vec<_> = (0..8).map(|_| payload.number().unwrap()).collect();
+        let values: Vec<_> = (0..8).map(|_| payload.number_u64().unwrap()).collect();
         assert_eq!(values, [17, 42, 42, 1, 7, 1_000_000, 512, 30]);
         payload.done().unwrap();
     }

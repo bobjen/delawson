@@ -811,14 +811,14 @@ fn read_logs(process: &Process, request: &Req) -> Resp {
                     Ok(value) => value,
                     Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
                 };
-                let limit = match payload.number() {
+                let limit = match payload.number_u64() {
                     Ok(value) => value as usize,
                     Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
                 };
                 (Some(what), limit)
             }
             Op::LogLines => {
-                let limit = match payload.number() {
+                let limit = match payload.number_u64() {
                     Ok(value) => value as usize,
                     Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
                 };
@@ -862,7 +862,7 @@ fn read_logs(process: &Process, request: &Req) -> Resp {
         // means something different if it read nothing than if it read millions.
         Ok((seen, lines)) => {
             let mut payload = StructWriter::new();
-            payload.number(seen);
+            payload.number_u64(seen);
             payload.text(&lines.join("\n"));
             Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::LogResp)] }
         }

@@ -620,7 +620,7 @@ impl Service for DN {
                         return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                     }
                 };
-                let record = match payload.number().and_then(ORoff::of_number) {
+                let record = match payload.number_u64().and_then(ORoff::of_number) {
                     Ok(record) => record,
                     Err(e) => {
                         return reply.send(Resp::error(Status::BadRequest, e.to_string()));
@@ -684,7 +684,7 @@ impl DN {
             Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
         };
         if has_expiry {
-            if let Err(e) = payload.number() {
+            if let Err(e) = payload.number_u64() {
                 return reply.send(Resp::error(Status::BadRequest, e.to_string()));
             }
         }
@@ -721,7 +721,7 @@ impl DN {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                 }
             };
-        let count = match payload.number() {
+        let count = match payload.number_u64() {
             Ok(count) => count as usize,
             Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
         };
@@ -800,10 +800,10 @@ impl DN {
             }
         };
         let mut payload = StructWriter::new();
-        payload.number(self.mine.number());
-        payload.number(first);
-        payload.number(count);
-        payload.number(created.number());
+        payload.number_u64(self.mine.number());
+        payload.number_u64(first);
+        payload.number_u64(count);
+        payload.number_u64(created.number());
         let ask = Req::new(Op::CreateStream).structure(payload);
 
         let dn = Arc::clone(self);
@@ -863,11 +863,11 @@ impl DN {
             Ok(name) => name,
             Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
         };
-        let sealed = match payload.number() {
+        let sealed = match payload.number_u64() {
             Ok(sealed) => sealed,
             Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
         };
-        let records = match payload.number().and_then(SRoff::of_number) {
+        let records = match payload.number_u64().and_then(SRoff::of_number) {
             Ok(records) => records,
             Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
         };
@@ -942,10 +942,10 @@ impl DN {
         let sn_number =
             SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
         let mut payload = StructWriter::new();
-        payload.number(self.mine.number());
-        payload.number(stream);
-        payload.number(1);
-        payload.number(created.number());
+        payload.number_u64(self.mine.number());
+        payload.number_u64(stream);
+        payload.number_u64(1);
+        payload.number_u64(created.number());
         let ask = Req::new(Op::CreateStream).structure(payload);
 
         let dn = Arc::clone(self);
@@ -1230,7 +1230,7 @@ impl DN {
                     Ok(value) => value,
                     Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
                 };
-            let count = match payload.number() {
+            let count = match payload.number_u64() {
                 Ok(count) => count as usize,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
@@ -1785,7 +1785,7 @@ mod tests {
 
     fn batch_of(dn: &Arc<DN>, names: &[&str], want: Option<Want>) -> Resp {
         let mut payload = StructWriter::new();
-        payload.number(names.len() as u64);
+        payload.number_u64(names.len() as u64);
         for name in names {
             payload.text(name);
         }
@@ -1941,8 +1941,8 @@ mod tests {
         let mut bad = StructWriter::new();
         bad.text("/x");
         bad.flag(false);
-        bad.number(kind + 100);
-        bad.number(width);
+        bad.number_u64(kind + 100);
+        bad.number_u64(width);
         let request = Req::new(Op::CreateObject).structure(bad);
         let (mut reader, rest) = structure(&request.args, Op::CreateObject, "a create").unwrap();
         assert!(rest.is_empty());

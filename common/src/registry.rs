@@ -69,7 +69,7 @@ impl Peer {
 pub fn response(peers: impl IntoIterator<Item = Peer>) -> Resp {
     let peers: Vec<_> = peers.into_iter().collect();
     let mut payload = StructWriter::new();
-    payload.number(peers.len() as u64);
+    payload.number_u64(peers.len() as u64);
     for peer in peers {
         payload.text(&peer.line());
     }

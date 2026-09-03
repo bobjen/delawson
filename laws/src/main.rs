@@ -968,14 +968,14 @@ fn create_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result
                         at += 1;
                         let mut payload = common::wire::StructWriter::new();
                         if batch != 1 {
-                            payload.number(batch as u64);
+                            payload.number_u64(batch as u64);
                         }
                         for n in first..first + batch as u64 {
                             let name = format!("{prefix}{n}");
                             payload.text(&name);
                             payload.flag(keyed);
-                            payload.number(kind);
-                            payload.number(width);
+                            payload.number_u64(kind);
+                            payload.number_u64(width);
                         }
                         let request =
                             Req::new(if batch == 1 { Op::CreateObject } else { Op::BatchCreate })
@@ -1000,7 +1000,7 @@ fn create_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result
                         None => return Err(Error::new("unasked answer")),
                     }
                     made += match structure(&answer.args, Op::NumberResp, "a number response") {
-                        Ok((mut payload, [])) => payload.number().unwrap_or(1),
+                        Ok((mut payload, [])) => payload.number_u64().unwrap_or(1),
                         _ => 1,
                     };
                 }
@@ -1076,7 +1076,7 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
                             Req::new(Op::ObjectInfo).structure(payload)
                         } else {
                             let mut payload = common::wire::StructWriter::new();
-                            payload.number(batch as u64);
+                            payload.number_u64(batch as u64);
                             for _ in 0..batch {
                                 payload.text(&format!("{prefix}{}", rng.next_u64() % objects));
                             }
@@ -1633,7 +1633,7 @@ fn report(target: &Target, response: &Resp) -> Result<()> {
                 if !rest.is_empty() {
                     return Err(Error::new("a log response has trailing arguments"));
                 }
-                let seen = payload.number()?;
+                let seen = payload.number_u64()?;
                 let text = payload.text()?;
                 payload.done()?;
                 println!("{} {seen}", target.identity);
@@ -1648,7 +1648,7 @@ fn report(target: &Target, response: &Resp) -> Result<()> {
                 if !rest.is_empty() {
                     return Err(Error::new("a registry response has trailing arguments"));
                 }
-                let count = payload.number()? as usize;
+                let count = payload.number_u64()? as usize;
                 for _ in 0..count {
                     println!("{} {}", target.identity, payload.text()?);
                 }
@@ -1776,8 +1776,8 @@ fn build(cmd: &Cmd) -> Result<Req> {
         Cmd::Unlock => Req::new(Op::Unlock),
         Cmd::SnMasterKey { sn, day } => {
             let mut payload = common::wire::StructWriter::new();
-            payload.number(*sn);
-            payload.number(*day);
+            payload.number_u64(*sn);
+            payload.number_u64(*day);
             Req::new(Op::SnMasterKey).structure(payload)
         }
         Cmd::RotateMasterKey => Req::new(Op::RotateMasterKey),
@@ -1795,7 +1795,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
             payload.text(what);
             payload.text(from);
             payload.text(to);
-            payload.number(*limit as u64);
+            payload.number_u64(*limit as u64);
             Req::new(Op::LogGrep).structure(payload)
         }
         Cmd::LogLines { from, to, limit, which } => {
@@ -1803,7 +1803,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
             payload.text(which);
             payload.text(from);
             payload.text(to);
-            payload.number(*limit as u64);
+            payload.number_u64(*limit as u64);
             Req::new(Op::LogLines).structure(payload)
         }
         Cmd::ObjectInfo { path, want, limit, from } => {
@@ -1819,7 +1819,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
         Cmd::BatchObjectInfo { paths, want, limit, from } => {
             let asked = asking(want, *limit, *from);
             let mut payload = common::wire::StructWriter::new();
-            payload.number(paths.len() as u64);
+            payload.number_u64(paths.len() as u64);
             for path in paths {
                 payload.text(path);
             }
@@ -1855,13 +1855,13 @@ fn build(cmd: &Cmd) -> Result<Req> {
             let mut payload = common::wire::StructWriter::new();
             payload.text(path);
             payload.flag(*flavor == Flavor::Keyed);
-            payload.number(kind);
-            payload.number(width);
+            payload.number_u64(kind);
+            payload.number_u64(width);
             let media_class = media_class.clone().unwrap_or_default();
             payload.text(&media_class);
             payload.flag(expiry.is_some());
             if let Some(seconds) = expiry {
-                payload.number(*seconds);
+                payload.number_u64(*seconds);
             }
             Req::new(Op::CreateObject).structure(payload)
         }
@@ -1881,7 +1881,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
             match seconds {
                 Some(seconds) => {
                     payload.flag(true);
-                    payload.number(*seconds);
+                    payload.number_u64(*seconds);
                 }
                 None => payload.flag(false),
             }
@@ -1896,7 +1896,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
         Cmd::Concat { dst, src } => {
             let mut payload = common::wire::StructWriter::new();
             payload.text(dst);
-            payload.number(src.len() as u64);
+            payload.number_u64(src.len() as u64);
             for one in src {
                 payload.text(one);
             }
@@ -1921,9 +1921,9 @@ fn build(cmd: &Cmd) -> Result<Req> {
             let mut payload = common::wire::StructWriter::new();
             payload.text(path);
             expecting(expect)?.write(&mut payload);
-            payload.number(kind);
-            payload.number(width);
-            payload.number(checksum);
+            payload.number_u64(kind);
+            payload.number_u64(width);
+            payload.number_u64(checksum);
             holds.write(&mut payload);
             payload.bytes(&stored);
             Req::new(Op::AppendRecord).structure(payload)
@@ -1940,11 +1940,11 @@ fn build(cmd: &Cmd) -> Result<Req> {
             payload.text(path);
             match at.arg() {
                 Arg::Number(record) => {
-                    payload.number(0);
-                    payload.number(record);
+                    payload.number_u64(0);
+                    payload.number_u64(record);
                 }
                 Arg::Text(key) => {
-                    payload.number(1);
+                    payload.number_u64(1);
                     payload.text(&key);
                 }
                 _ => unreachable!(),
@@ -1957,11 +1957,11 @@ fn build(cmd: &Cmd) -> Result<Req> {
             payload.text(path);
             match at.arg() {
                 Arg::Number(record) => {
-                    payload.number(0);
-                    payload.number(record);
+                    payload.number_u64(0);
+                    payload.number_u64(record);
                 }
                 Arg::Text(key) => {
-                    payload.number(1);
+                    payload.number_u64(1);
                     payload.text(&key);
                 }
                 _ => unreachable!(),
@@ -1986,7 +1986,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
                     let mut payload = common::wire::StructWriter::new();
                     payload.text(path);
                     expecting(expect)?.write(&mut payload);
-                    payload.number(1);
+                    payload.number_u64(1);
                     if let Arg::Text(key) = key {
                         payload.text(&key);
                     } else {
@@ -2009,8 +2009,8 @@ fn build(cmd: &Cmd) -> Result<Req> {
         Cmd::TimeRange { path, from, to } => {
             let mut payload = common::wire::StructWriter::new();
             payload.text(path);
-            payload.number(*from);
-            payload.number(*to);
+            payload.number_u64(*from);
+            payload.number_u64(*to);
             Req::new(Op::TimeRange).structure(payload)
         }
 

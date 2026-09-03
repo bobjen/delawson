@@ -57,33 +57,36 @@ impl Described {
     /// position stops working and the answer has to say how many names it covered.
     pub fn missing() -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        payload.number(0);
-        payload.number(ObjectId::NONE.number());
-        for _ in 0..6 {
-            payload.number(0);
-        }
+        payload.number_u32(0);
+        payload.number_u32(ObjectId::NONE.get());
+        payload.number_u64(0);
+        payload.number_u32(0);
+        payload.number_u32(0);
+        payload.number_u32(0);
+        payload.number_u64(0);
+        payload.number_u32(0);
         payload.flag(false);
-        for _ in 0..3 {
-            payload.number(0);
-        }
+        payload.number_u8(0);
+        payload.number_u32(0);
+        payload.number_u64(0);
         vec![payload.finish(Op::DescribedResp)]
     }
 
     pub fn args(&self) -> Vec<Arg> {
         let (kind, width) = self.framing.wire();
         let mut payload = StructWriter::new();
-        payload.number(self.object.range.number());
-        payload.number(self.object.object.number());
-        payload.number(self.object.created.number());
-        payload.number(self.dn.number());
-        payload.number(self.stream.range.number());
-        payload.number(self.stream.stream.number());
-        payload.number(self.stream.created.number());
-        payload.number(self.sn.number());
+        payload.number_u32(self.object.range.get());
+        payload.number_u32(self.object.object.get());
+        payload.number_u64(self.object.created.number());
+        payload.number_u32(self.dn.get());
+        payload.number_u32(self.stream.range.get());
+        payload.number_u32(self.stream.stream.get());
+        payload.number_u64(self.stream.created.number());
+        payload.number_u32(self.sn.get());
         payload.flag(self.keyed);
-        payload.number(kind);
-        payload.number(width);
-        payload.number(self.first_record);
+        payload.number_u8(kind as u8);
+        payload.number_u32(width as u32);
+        payload.number_u64(self.first_record);
         vec![payload.finish(Op::DescribedResp)]
     }
 
@@ -93,21 +96,21 @@ impl Described {
         {
             let (mut payload, rest) = structure(args, Op::DescribedResp, "a described row")?;
             let object = ObjectName {
-                range: RangeId::of_number(payload.number()?)?,
-                object: ObjectId::of_number(payload.number()?)?,
-                created: TimeSec::new(payload.number()?),
+                range: RangeId::of_number(payload.number_u32()? as u64)?,
+                object: ObjectId::of_number(payload.number_u32()? as u64)?,
+                created: TimeSec::new(payload.number_u64()?),
             };
-            let dn = DnId::of_number(payload.number()?)?;
+            let dn = DnId::of_number(payload.number_u32()? as u64)?;
             let stream = StreamName {
-                range: RangeId::of_number(payload.number()?)?,
-                stream: StreamId::of_number(payload.number()?)?,
-                created: TimeSec::new(payload.number()?),
+                range: RangeId::of_number(payload.number_u32()? as u64)?,
+                stream: StreamId::of_number(payload.number_u32()? as u64)?,
+                created: TimeSec::new(payload.number_u64()?),
             };
-            let sn = SnId::of_number(payload.number()?)?;
+            let sn = SnId::of_number(payload.number_u32()? as u64)?;
             let keyed = payload.flag()?;
-            let kind = payload.number()?;
-            let width = payload.number()?;
-            let first_record = payload.number()?;
+            let kind = payload.number_u8()? as u64;
+            let width = payload.number_u32()? as u64;
+            let first_record = payload.number_u64()?;
             payload.done()?;
             if object.object.is_none() {
                 return Ok((None, rest));
@@ -191,7 +194,7 @@ impl Shape {
     pub fn args(&self) -> Vec<Arg> {
         let mut payload = StructWriter::new();
         for field in [self.streams, self.given, self.extents, self.entries, self.next] {
-            payload.number(field);
+            payload.number_u64(field);
         }
         vec![payload.finish(Op::ShapeResp)]
     }
@@ -200,11 +203,11 @@ impl Shape {
         {
             let (mut payload, rest) = structure(args, Op::ShapeResp, "a shape")?;
             let shape = Shape {
-                streams: payload.number()?,
-                given: payload.number()?,
-                extents: payload.number()?,
-                entries: payload.number()?,
-                next: payload.number()?,
+                streams: payload.number_u64()?,
+                given: payload.number_u64()?,
+                extents: payload.number_u64()?,
+                entries: payload.number_u64()?,
+                next: payload.number_u64()?,
             };
             payload.done()?;
             return Ok((shape, rest));
@@ -318,17 +321,17 @@ impl Expecting {
 
     pub fn write(&self, payload: &mut StructWriter) {
         payload.tag(Op::Expecting);
-        payload.number(self.0.range.number());
-        payload.number(self.0.object.number());
-        payload.number(self.0.created.number());
+        payload.number_u64(self.0.range.number());
+        payload.number_u64(self.0.object.number());
+        payload.number_u64(self.0.created.number());
     }
 
     pub fn read(payload: &mut StructReader<'_>) -> Result<Expecting> {
         payload.tag(Op::Expecting, "an expectation")?;
         Ok(Expecting(ObjectName {
-            range: RangeId::of_number(payload.number()?)?,
-            object: ObjectId::of_number(payload.number()?)?,
-            created: TimeSec::new(payload.number()?),
+            range: RangeId::of_number(payload.number_u64()?)?,
+            object: ObjectId::of_number(payload.number_u64()?)?,
+            created: TimeSec::new(payload.number_u64()?),
         }))
     }
 
@@ -364,15 +367,15 @@ impl Wanted {
         let (kind, width) = self.framing.wire();
         payload.text(&self.name);
         payload.flag(self.keyed);
-        payload.number(kind);
-        payload.number(width);
+        payload.number_u64(kind);
+        payload.number_u64(width);
     }
 
     pub fn read(payload: &mut StructReader<'_>) -> Result<Wanted> {
         Ok(Wanted {
             name: payload.text()?,
             keyed: payload.flag()?,
-            framing: Framing::of_wire(payload.number()?, payload.number()?)?,
+            framing: Framing::of_wire(payload.number_u64()?, payload.number_u64()?)?,
         })
     }
 }
@@ -451,32 +454,32 @@ impl StreamRow {
 
     pub fn args(&self) -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        payload.number(self.stream.number());
-        payload.number(self.sn.number());
-        payload.number(self.first_record);
-        payload.number(self.records);
-        payload.number(self.created.number());
-        payload.number(self.totals.extents);
-        payload.number(self.totals.logical);
-        payload.number(self.totals.compressed);
-        payload.number(self.given);
+        payload.number_u32(self.stream.get());
+        payload.number_u32(self.sn.get());
+        payload.number_u64(self.first_record);
+        payload.number_u64(self.records);
+        payload.number_u64(self.created.number());
+        payload.number_u64(self.totals.extents);
+        payload.number_u64(self.totals.logical);
+        payload.number_u64(self.totals.compressed);
+        payload.number_u64(self.given);
         vec![payload.finish(Op::StreamRowResp)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(StreamRow, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::StreamRowResp, "a stream row")?;
         let row = StreamRow {
-            stream: StreamId::of_number(payload.number()?)?,
-            sn: SnId::of_number(payload.number()?)?,
-            first_record: payload.number()?,
-            records: payload.number()?,
-            created: TimeSec::new(payload.number()?),
+            stream: StreamId::of_number(payload.number_u32()? as u64)?,
+            sn: SnId::of_number(payload.number_u32()? as u64)?,
+            first_record: payload.number_u64()?,
+            records: payload.number_u64()?,
+            created: TimeSec::new(payload.number_u64()?),
             totals: Totals {
-                extents: payload.number()?,
-                logical: payload.number()?,
-                compressed: payload.number()?,
+                extents: payload.number_u64()?,
+                logical: payload.number_u64()?,
+                compressed: payload.number_u64()?,
             },
-            given: payload.number()?,
+            given: payload.number_u64()?,
         };
         payload.done()?;
         Ok((row, rest))
@@ -537,35 +540,37 @@ impl ExtentRow {
 
     pub fn args(&self) -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        payload.number(self.sn.number());
-        payload.number(self.id.number());
-        payload.number(self.created.number());
-        payload.number(self.first_record);
-        payload.number(self.records);
-        payload.number(self.logical);
-        payload.number(self.length);
-        payload.number(self.disks.len() as u64);
+        payload.number_u32(self.sn.get());
+        payload.number_u32(self.id.get());
+        payload.number_u64(self.created.number());
+        payload.number_u64(self.first_record);
+        payload.number_u64(self.records);
+        payload.number_u64(self.logical);
+        payload.number_u64(self.length);
+        payload.number_u32(self.disks.len() as u32);
         for (en, disk) in &self.disks {
-            payload.number(en.number());
-            payload.number(disk.number());
+            payload.number_u32(en.get());
+            payload.number_u16(disk.get());
         }
         vec![payload.finish(Op::ExtentRowResp)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(ExtentRow, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::ExtentRowResp, "an extent row")?;
-        let sn = SnId::of_number(payload.number()?)?;
-        let id = ExtentId::of_number(payload.number()?)?;
-        let created = TimeSec::new(payload.number()?);
-        let first_record = payload.number()?;
-        let records = payload.number()?;
-        let logical = payload.number()?;
-        let length = payload.number()?;
-        let count = payload.number()? as usize;
+        let sn = SnId::of_number(payload.number_u32()? as u64)?;
+        let id = ExtentId::of_number(payload.number_u32()? as u64)?;
+        let created = TimeSec::new(payload.number_u64()?);
+        let first_record = payload.number_u64()?;
+        let records = payload.number_u64()?;
+        let logical = payload.number_u64()?;
+        let length = payload.number_u64()?;
+        let count = payload.number_u32()? as usize;
         let mut disks = Vec::with_capacity(count);
         for _ in 0..count {
-            disks
-                .push((EnId::of_number(payload.number()?)?, DiskId::of_number(payload.number()?)?));
+            disks.push((
+                EnId::of_number(payload.number_u32()? as u64)?,
+                DiskId::of_number(payload.number_u16()? as u64)?,
+            ));
         }
         payload.done()?;
         Ok((ExtentRow { sn, id, created, first_record, records, logical, length, disks }, rest))
@@ -609,20 +614,20 @@ pub struct Batch {
 impl Batch {
     pub fn args(&self) -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        payload.number(self.asked);
-        payload.number(self.given);
-        payload.number(self.entries);
-        payload.number(self.next);
+        payload.number_u64(self.asked);
+        payload.number_u64(self.given);
+        payload.number_u64(self.entries);
+        payload.number_u64(self.next);
         vec![payload.finish(Op::BatchResp)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Batch, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::BatchResp, "a batch")?;
         let batch = Batch {
-            asked: payload.number()?,
-            given: payload.number()?,
-            entries: payload.number()?,
-            next: payload.number()?,
+            asked: payload.number_u64()?,
+            given: payload.number_u64()?,
+            entries: payload.number_u64()?,
+            next: payload.number_u64()?,
         };
         payload.done()?;
         Ok((batch, rest))
@@ -694,29 +699,29 @@ impl Listing {
     }
 
     pub fn write_payload(&self, payload: &mut StructWriter) {
-        payload.number(self.limit);
-        payload.number(self.at.len() as u64);
+        payload.number_u64(self.limit);
+        payload.number_u64(self.at.len() as u64);
         for (name, from) in &self.at {
-            payload.number(name.range.number());
-            payload.number(name.stream.number());
-            payload.number(name.created.number());
-            payload.number(*from);
+            payload.number_u64(name.range.number());
+            payload.number_u64(name.stream.number());
+            payload.number_u64(name.created.number());
+            payload.number_u64(*from);
         }
     }
 
     pub fn read_payload(payload: &mut StructReader<'_>) -> Result<Listing> {
-        let limit = payload.number()?;
-        let count = usize::try_from(payload.number()?)
+        let limit = payload.number_u64()?;
+        let count = usize::try_from(payload.number_u64()?)
             .map_err(|_| Error::new("list-extents stream count is too large"))?;
         let mut at = Vec::with_capacity(count);
         for _ in 0..count {
             at.push((
                 StreamName {
-                    range: RangeId::of_number(payload.number()?)?,
-                    stream: StreamId::of_number(payload.number()?)?,
-                    created: TimeSec::new(payload.number()?),
+                    range: RangeId::of_number(payload.number_u64()?)?,
+                    stream: StreamId::of_number(payload.number_u64()?)?,
+                    created: TimeSec::new(payload.number_u64()?),
                 },
-                payload.number()?,
+                payload.number_u64()?,
             ));
         }
         Ok(Listing { limit, at })
@@ -769,25 +774,25 @@ pub struct ExtentRun {
 impl ExtentRun {
     pub fn args(&self) -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        payload.number(self.stream.number());
-        payload.number(self.totals.extents);
-        payload.number(self.totals.logical);
-        payload.number(self.totals.compressed);
-        payload.number(self.given);
-        payload.number(self.next);
+        payload.number_u32(self.stream.get());
+        payload.number_u64(self.totals.extents);
+        payload.number_u64(self.totals.logical);
+        payload.number_u64(self.totals.compressed);
+        payload.number_u64(self.given);
+        payload.number_u64(self.next);
         vec![payload.finish(Op::ExtentRunResp)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(ExtentRun, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::ExtentRunResp, "a run of extents")?;
-        let stream = payload.number()?;
+        let stream = payload.number_u32()? as u64;
         let totals = Totals {
-            extents: payload.number()?,
-            logical: payload.number()?,
-            compressed: payload.number()?,
+            extents: payload.number_u64()?,
+            logical: payload.number_u64()?,
+            compressed: payload.number_u64()?,
         };
-        let given = payload.number()?;
-        let next = payload.number()?;
+        let given = payload.number_u64()?;
+        let next = payload.number_u64()?;
         payload.done()?;
         Ok((ExtentRun { stream: StreamId::of_number(stream)?, totals, given, next }, rest))
     }
@@ -885,7 +890,7 @@ mod tests {
     fn an_impossible_framing_is_refused() {
         let mut args = one(1).args();
         let Arg::Struct(_, payload) = &mut args[0] else { panic!("a self-contained row") };
-        payload[65..73].copy_from_slice(&99u64.to_le_bytes());
+        payload[41] = 99;
         assert!(Described::of_args(&args).is_err());
     }
 
@@ -1023,7 +1028,7 @@ mod tests {
     fn an_extent_lying_about_its_instances_is_refused() {
         let mut args = extent(1, 0, 40).args();
         let Arg::Struct(_, payload) = &mut args[0] else { panic!("a self-contained extent") };
-        payload[56..64].copy_from_slice(&99u64.to_le_bytes());
+        payload[48..52].copy_from_slice(&99u32.to_le_bytes());
         assert!(ExtentRow::of_args(&args).is_err());
         assert!(ExtentRow::of_args(&args[..0]).is_err(), "and a short row too");
     }
