@@ -45,6 +45,10 @@ pub const MAX_FRAME_BYTES: usize = 1 << 20;
 /// connection cannot make the far side allocate without bound.
 pub const MAX_SEGMENT_BYTES: usize = 8 << 20;
 
+/// A request whose arguments are one self-contained command payload uses the
+/// request's Op as its tag, so it does not repeat that tag inside the payload.
+const COMMAND_PAYLOAD: u16 = u16::MAX;
+
 macro_rules! ops {
     ($($name:ident = $code:expr, $text:expr;)*) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +268,10 @@ impl StructWriter {
         self.bytes.extend(value);
     }
 
+    pub fn text(&mut self, value: &str) {
+        self.bytes(value.as_bytes());
+    }
+
     pub fn finish(self, op: Op) -> Arg {
         Arg::Struct(op, self.bytes)
     }
@@ -301,6 +309,10 @@ impl<'a> StructReader<'a> {
     pub fn bytes(&mut self) -> Result<Vec<u8>> {
         let length = u32::from_le_bytes(self.take(4)?.try_into().unwrap()) as usize;
         Ok(self.take(length)?.to_vec())
+    }
+
+    pub fn text(&mut self) -> Result<String> {
+        String::from_utf8(self.bytes()?).context("text in structure payload")
     }
 
     pub fn done(&self) -> Result<()> {
@@ -385,17 +397,38 @@ impl Request {
         self
     }
 
+    /// Put this command's self-contained payload in the request. The request's
+    /// `Op` is the command tag; the payload is positional and parsed by the
+    /// command, not by generic wire code.
+    pub fn structure(mut self, payload: StructWriter) -> Request {
+        self.args.push(payload.finish(self.op));
+        self
+    }
+
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.extend(self.id.to_le_bytes());
         out.extend(self.op.code().to_le_bytes());
-        encode_args(&self.args, out);
+        if let [Arg::Struct(op, bytes)] = self.args.as_slice()
+            && *op == self.op
+        {
+            out.extend(COMMAND_PAYLOAD.to_le_bytes());
+            out.extend(bytes);
+        } else {
+            encode_args(&self.args, out);
+        }
     }
 
     fn decode(payload: &[u8]) -> Result<Request> {
         let mut reader = Cursor::new(payload);
         let id = reader.u32()?;
         let op = Op::from_code(reader.u16()?)?;
-        Ok(Request { id, op, args: reader.args()? })
+        let count = reader.u16()?;
+        let args = if count == COMMAND_PAYLOAD {
+            vec![Arg::Struct(op, reader.remaining().to_vec())]
+        } else {
+            reader.args_with_count(count)?
+        };
+        Ok(Request { id, op, args })
     }
 }
 
@@ -681,8 +714,16 @@ impl<'a> Cursor<'a> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
 
+    fn remaining(&self) -> &'a [u8] {
+        &self.bytes[self.at..]
+    }
+
     fn args(&mut self) -> Result<Vec<Arg>> {
         let count = self.u16()?;
+        self.args_with_count(count)
+    }
+
+    fn args_with_count(&mut self, count: u16) -> Result<Vec<Arg>> {
         let mut args = Vec::with_capacity(count as usize);
         for _ in 0..count {
             args.push(match self.u8()? {
@@ -995,6 +1036,19 @@ mod tests {
             .flag(true)
             .bytes(vec![1, 2, 3]);
         assert_eq!(round_trip_request(&request), request);
+    }
+
+    #[test]
+    fn a_command_can_use_its_op_as_a_self_contained_payload_tag() {
+        let mut payload = StructWriter::new();
+        payload.number(7);
+        payload.number(42);
+        let request = Request::new(Op::SnMasterKey).structure(payload);
+        assert_eq!(round_trip_request(&request), request);
+        assert!(
+            encoded_len(&request)
+                < encoded_len(&Request::new(Op::SnMasterKey).number(7).number(42))
+        );
     }
 
     #[test]

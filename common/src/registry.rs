@@ -5,7 +5,7 @@
 //! way.
 
 use crate::config::ServiceKind;
-use crate::wire::{Arg, Op, Request, Response, Status};
+use crate::wire::{Arg, Op, Request, Response, Status, StructWriter, structure};
 use crate::{Error, Result};
 use std::net::SocketAddr;
 
@@ -21,28 +21,34 @@ pub struct Peer {
 impl Peer {
     /// The registration request this peer sends to KS.
     pub fn request(&self) -> Request {
-        Request::new(Op::Register)
-            .text(&self.identity)
-            .text(self.kind.as_str())
-            .text(self.address.to_string())
-            .text(self.domain.join("/"))
-            .text(self.media_class.clone().unwrap_or_default())
+        let mut payload = StructWriter::new();
+        payload.text(&self.identity);
+        payload.text(self.kind.as_str());
+        payload.text(&self.address.to_string());
+        payload.text(&self.domain.join("/"));
+        payload.text(self.media_class.as_deref().unwrap_or_default());
+        Request::new(Op::Register).structure(payload)
     }
 
     pub fn from_args(args: &[Arg]) -> Result<Peer> {
-        let text = |i: usize| match args.get(i) {
-            Some(Arg::Text(text)) => Ok(text.as_str()),
-            _ => Err(Error::new("a peer is five text arguments")),
-        };
-        let address = text(2)?;
+        let (mut payload, rest) = structure(args, Op::Register, "a peer registration")?;
+        if !rest.is_empty() {
+            return Err(Error::new("a peer registration has trailing arguments"));
+        }
+        let identity = payload.text()?;
+        let kind = ServiceKind::parse(&payload.text()?)?;
+        let address = payload.text()?;
+        let domain = payload.text()?;
+        let media_class = payload.text()?;
+        payload.done()?;
         Ok(Peer {
-            identity: text(0)?.to_string(),
-            kind: ServiceKind::parse(text(1)?)?,
+            identity,
+            kind,
             address: address
                 .parse()
                 .map_err(|_| Error::new(format!("{address:?} is not an address")))?,
-            domain: text(3)?.split('/').map(str::to_string).collect(),
-            media_class: Some(text(4)?.to_string()).filter(|s| !s.is_empty()),
+            domain: domain.split('/').map(str::to_string).collect(),
+            media_class: Some(media_class).filter(|s| !s.is_empty()),
         })
     }
 

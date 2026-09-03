@@ -29,7 +29,7 @@ use common::offset::{ECoff, ELoff, ERoff};
 use common::range::{Budget, Covered, Filled, Piece, Range};
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
-use common::wire::{AppendBlock, Arg, Op, Request, Response, Status};
+use common::wire::{AppendBlock, Arg, Op, Request, Response, Status, StructWriter};
 use common::{Error, Result, logw};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,7 +57,10 @@ impl DailyKeyCache {
         }
 
         // Fetch from KS.
-        let ask = Request::new(Op::SnMasterKey).number(sn_id.number()).number(day);
+        let mut payload = StructWriter::new();
+        payload.number(sn_id.number());
+        payload.number(day);
+        let ask = Request::new(Op::SnMasterKey).structure(payload);
         let key_cell = Arc::new(Mutex::new([0u8; 32]));
         let key_cell2 = Arc::clone(&key_cell);
         let error_cell = Arc::new(Mutex::new(None));

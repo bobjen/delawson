@@ -1693,7 +1693,9 @@ fn resolve(cluster: &ClusterConfig, cli: &Cli, kind: ServiceKind) -> Result<Targ
 fn lookup(cluster: &ClusterConfig, identity: &str) -> Result<SocketAddr> {
     let timeout = Duration::from_millis(cluster.timeouts.request_ms);
     let mut ks = Conn::open(cluster.ks.address, timeout, &cluster.messaging)?;
-    let response = ks.call(&Request::new(Op::Lookup).text(identity))?;
+    let mut payload = common::wire::StructWriter::new();
+    payload.text(identity);
+    let response = ks.call(&Request::new(Op::Lookup).structure(payload))?;
     match response.status {
         Status::Ok => response
             .message()
@@ -1735,20 +1737,37 @@ fn targets(cluster: &ClusterConfig, cli: &Cli, kind: ServiceKind) -> Result<Vec<
 fn build(cmd: &Cmd) -> Result<Request> {
     Ok(match cmd {
         Cmd::Unlock => Request::new(Op::Unlock),
-        Cmd::SnMasterKey { sn, day } => Request::new(Op::SnMasterKey).number(*sn).number(*day),
+        Cmd::SnMasterKey { sn, day } => {
+            let mut payload = common::wire::StructWriter::new();
+            payload.number(*sn);
+            payload.number(*day);
+            Request::new(Op::SnMasterKey).structure(payload)
+        }
         Cmd::RotateMasterKey => Request::new(Op::RotateMasterKey),
 
         Cmd::LogHistogram { from, to, which } => {
-            Request::new(Op::LogHistogram).text(which).text(from).text(to)
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(which);
+            payload.text(from);
+            payload.text(to);
+            Request::new(Op::LogHistogram).structure(payload)
         }
-        Cmd::LogGrep { what, from, to, limit, which } => Request::new(Op::LogGrep)
-            .text(which)
-            .text(what)
-            .text(from)
-            .text(to)
-            .number(*limit as u64),
+        Cmd::LogGrep { what, from, to, limit, which } => {
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(which);
+            payload.text(what);
+            payload.text(from);
+            payload.text(to);
+            payload.number(*limit as u64);
+            Request::new(Op::LogGrep).structure(payload)
+        }
         Cmd::LogLines { from, to, limit, which } => {
-            Request::new(Op::LogLines).text(which).text(from).text(to).number(*limit as u64)
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(which);
+            payload.text(from);
+            payload.text(to);
+            payload.number(*limit as u64);
+            Request::new(Op::LogLines).structure(payload)
         }
         Cmd::ObjectInfo { path, want, limit, from } => {
             let mut request = Request::new(Op::ObjectInfo).text(path);

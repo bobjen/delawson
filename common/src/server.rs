@@ -48,6 +48,7 @@ use crate::registry::Peer;
 use crate::routing;
 use crate::wire::{
     self, Arg, BUF_BYTES, MAX_FRAME_BYTES, Op, Request, Response, Status, Wire, put_response,
+    structure,
 };
 use crate::{Context, Error, Result};
 use crate::{logd, logi, logn, logsec, logw};
@@ -214,9 +215,11 @@ impl Process {
         if let Some(address) = self.cluster.fixed_address(identity) {
             return Ok(address);
         }
+        let mut payload = crate::wire::StructWriter::new();
+        payload.text(identity);
         let response = ask(
             self.cluster.ks.address,
-            &Request::new(Op::Lookup).text(identity),
+            &Request::new(Op::Lookup).structure(payload),
             self.timeout(),
             &self.cluster.messaging,
         )?;
@@ -781,17 +784,56 @@ fn answer_here<S: Service>(
 /// is already signed and already there — the standalone `logs` tool is the same
 /// library, for when the process is not answering.
 fn read_logs(process: &Process, request: &Request) -> Response {
-    let text = |n: usize| match request.args.get(n) {
-        Some(Arg::Text(text)) => text.as_str(),
-        _ => "",
-    };
-    let number = |n: usize, default: usize| match request.args.get(n) {
-        Some(Arg::Number(number)) => *number as usize,
-        _ => default,
+    let (which, from, to, what, limit) = {
+        let (mut payload, rest) = match structure(&request.args, request.op, "a log request") {
+            Ok(value) => value,
+            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+        };
+        if !rest.is_empty() {
+            return Response::error(Status::BadRequest, "a log request has trailing arguments");
+        }
+        let which = match payload.text() {
+            Ok(value) => value,
+            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+        };
+        let from = match payload.text() {
+            Ok(value) => value,
+            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+        };
+        let to = match payload.text() {
+            Ok(value) => value,
+            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+        };
+        let (what, limit) = match request.op {
+            Op::LogHistogram => (None, 100),
+            Op::LogGrep => {
+                let what = match payload.text() {
+                    Ok(value) => value,
+                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                };
+                let limit = match payload.number() {
+                    Ok(value) => value as usize,
+                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                };
+                (Some(what), limit)
+            }
+            Op::LogLines => {
+                let limit = match payload.number() {
+                    Ok(value) => value as usize,
+                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                };
+                (None, limit)
+            }
+            _ => return Response::error(Status::BadRequest, "not a log command"),
+        };
+        if let Err(e) = payload.done() {
+            return Response::error(Status::BadRequest, e.to_string());
+        }
+        (which, from, to, what, limit)
     };
 
     // The info log by name, so a reader can ask for the long-lived one.
-    let which = match text(0) {
+    let which = match which.as_str() {
         "info" => format!("{}-info", process.identity().to_lowercase()),
         _ => process.identity().to_lowercase(),
     };
@@ -801,10 +843,7 @@ fn read_logs(process: &Process, request: &Request) -> Response {
     crate::log::flush();
     // All of it unless the caller says otherwise: reading a log takes as long as
     // it takes, and doing it serially is how it stays out of the way of the work.
-    let budget = match request.args.last() {
-        Some(Arg::Number(budget)) if request.args.len() > 3 => *budget,
-        _ => u64::MAX,
-    };
+    let budget = u64::MAX;
     let logs = match crate::logread::Logs::open(&dir, &which, budget) {
         Ok(logs) => logs,
         Err(e) => return Response::error(Status::Internal, e.to_string()),
@@ -813,9 +852,9 @@ fn read_logs(process: &Process, request: &Request) -> Response {
     // Each of the three takes the same window: a rare thing is looked for in the
     // minute it happened.
     let read = match request.op {
-        Op::LogHistogram => logs.histogram(text(1), text(2)),
-        Op::LogGrep => logs.grep(text(1), text(2), text(3), number(4, 100)),
-        _ => logs.range(text(1), text(2), number(3, 100)),
+        Op::LogHistogram => logs.histogram(&from, &to),
+        Op::LogGrep => logs.grep(what.as_deref().unwrap_or_default(), &from, &to, limit),
+        _ => logs.range(&from, &to, limit),
     };
     match read {
         Err(e) => Response::error(Status::Internal, e.to_string()),
