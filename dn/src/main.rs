@@ -743,11 +743,7 @@ impl DN {
                 "a batch-create request has trailing arguments",
             ));
         }
-        self.record(process, wanted, reply, |_, made| Resp {
-            id: 0,
-            status: Status::Ok,
-            args: vec![Arg::Number(made)],
-        });
+        self.record(process, wanted, reply, |_, made| Resp::number(Status::Ok, made));
     }
 
     /// Take the names first, then name a stream for each one taken, then fill

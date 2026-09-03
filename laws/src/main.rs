@@ -992,15 +992,15 @@ fn create_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result
                         return Err(Error::new(format!(
                             "create answered {}: {}",
                             answer.status,
-                            answer.message().unwrap_or("")
+                            answer.message().unwrap_or_default()
                         )));
                     }
                     match sent.remove(&answer.id) {
                         Some(at) => tally.add(at.elapsed()),
                         None => return Err(Error::new("unasked answer")),
                     }
-                    made += match answer.args.first() {
-                        Some(Arg::Number(made)) => *made,
+                    made += match structure(&answer.args, Op::NumberResp, "a number response") {
+                        Ok((mut payload, [])) => payload.number().unwrap_or(1),
                         _ => 1,
                     };
                 }
@@ -1628,6 +1628,33 @@ fn ranged(
 fn report(target: &Target, response: &Resp) -> Result<()> {
     for arg in &response.args {
         match arg {
+            Arg::Struct(Op::LogResp, _bytes) => {
+                let (mut payload, rest) = structure(&response.args, Op::LogResp, "a log response")?;
+                if !rest.is_empty() {
+                    return Err(Error::new("a log response has trailing arguments"));
+                }
+                let seen = payload.number()?;
+                let text = payload.text()?;
+                payload.done()?;
+                println!("{} {seen}", target.identity);
+                for line in text.lines() {
+                    println!("{} {line}", target.identity);
+                }
+                break;
+            }
+            Arg::Struct(Op::RegistryResp, _bytes) => {
+                let (mut payload, rest) =
+                    structure(&response.args, Op::RegistryResp, "a registry response")?;
+                if !rest.is_empty() {
+                    return Err(Error::new("a registry response has trailing arguments"));
+                }
+                let count = payload.number()? as usize;
+                for _ in 0..count {
+                    println!("{} {}", target.identity, payload.text()?);
+                }
+                payload.done()?;
+                break;
+            }
             // A reply that already names its sender does not get named twice.
             Arg::Text(text) => {
                 for line in text.lines() {
@@ -1713,7 +1740,7 @@ fn lookup(cluster: &ClusterConfig, identity: &str) -> Result<SocketAddr> {
             .ok_or_else(|| Error::new(format!("KS gave no usable address for {identity}"))),
         status => Err(Error::new(format!(
             "KS answered {status} for {identity}: {}",
-            response.message().unwrap_or("no reason given")
+            response.message().unwrap_or_else(|| "no reason given".into())
         ))),
     }
 }

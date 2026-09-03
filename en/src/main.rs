@@ -741,7 +741,7 @@ impl Disk {
                     came_to.logical,
                     came_to.compressed
                 ));
-                reply.send(Resp { id: 0, status: Status::Sealed, args: came_to.args() });
+                reply.send(Resp::number(Status::Sealed, came_to.records));
                 return Ok(());
             }
         };
@@ -766,7 +766,7 @@ impl Disk {
         ] {
             receipt.number(value);
         }
-        let receipt = vec![receipt.finish(Op::ReceiptResponse)];
+        let receipt = vec![receipt.finish(Op::ReceiptResp)];
 
         let quorum_wants = process.cluster.extents.quorum;
         let pending = Arc::new(Pending::new(receipt, quorum_wants, reply));

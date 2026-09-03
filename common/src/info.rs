@@ -66,7 +66,7 @@ impl Described {
         for _ in 0..3 {
             payload.number(0);
         }
-        vec![payload.finish(Op::Described)]
+        vec![payload.finish(Op::DescribedResp)]
     }
 
     pub fn args(&self) -> Vec<Arg> {
@@ -84,14 +84,14 @@ impl Described {
         payload.number(kind);
         payload.number(width);
         payload.number(self.first_record);
-        vec![payload.finish(Op::Described)]
+        vec![payload.finish(Op::DescribedResp)]
     }
 
     /// And back, returning whatever followed it. `None` for a row marked missing,
     /// since a zero id is not an object.
     pub fn of_args(args: &[Arg]) -> Result<(Option<Described>, &[Arg])> {
         {
-            let (mut payload, rest) = structure(args, Op::Described, "a described row")?;
+            let (mut payload, rest) = structure(args, Op::DescribedResp, "a described row")?;
             let object = ObjectName {
                 range: RangeId::of_number(payload.number()?)?,
                 object: ObjectId::of_number(payload.number()?)?,
@@ -193,12 +193,12 @@ impl Shape {
         for field in [self.streams, self.given, self.extents, self.entries, self.next] {
             payload.number(field);
         }
-        vec![payload.finish(Op::Shape)]
+        vec![payload.finish(Op::ShapeResp)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Shape, &[Arg])> {
         {
-            let (mut payload, rest) = structure(args, Op::Shape, "a shape")?;
+            let (mut payload, rest) = structure(args, Op::ShapeResp, "a shape")?;
             let shape = Shape {
                 streams: payload.number()?,
                 given: payload.number()?,
@@ -460,12 +460,12 @@ impl StreamRow {
         payload.number(self.totals.logical);
         payload.number(self.totals.compressed);
         payload.number(self.given);
-        vec![payload.finish(Op::StreamRow)]
+        vec![payload.finish(Op::StreamRowResp)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(StreamRow, &[Arg])> {
         if matches!(args.first(), Some(Arg::Struct(..))) {
-            let (mut payload, rest) = structure(args, Op::StreamRow, "a stream row")?;
+            let (mut payload, rest) = structure(args, Op::StreamRowResp, "a stream row")?;
             let stream = StreamId::of_number(payload.number()?)?;
             let sn = SnId::of_number(payload.number()?)?;
             let first_record = payload.number()?;
@@ -483,7 +483,7 @@ impl StreamRow {
                 rest,
             ));
         }
-        let args = tagged(args, Op::StreamRow, "a stream row")?;
+        let args = tagged(args, Op::StreamRowResp, "a stream row")?;
         let [
             Arg::Number(stream),
             Arg::Number(sn),
@@ -580,12 +580,12 @@ impl ExtentRow {
             payload.number(en.number());
             payload.number(disk.number());
         }
-        vec![payload.finish(Op::ExtentRow)]
+        vec![payload.finish(Op::ExtentRowResp)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(ExtentRow, &[Arg])> {
         if matches!(args.first(), Some(Arg::Struct(..))) {
-            let (mut payload, rest) = structure(args, Op::ExtentRow, "an extent row")?;
+            let (mut payload, rest) = structure(args, Op::ExtentRowResp, "an extent row")?;
             let sn = SnId::of_number(payload.number()?)?;
             let id = ExtentId::of_number(payload.number()?)?;
             let created = TimeSec::new(payload.number()?);
@@ -607,7 +607,7 @@ impl ExtentRow {
                 rest,
             ));
         }
-        let args = tagged(args, Op::ExtentRow, "an extent row")?;
+        let args = tagged(args, Op::ExtentRowResp, "an extent row")?;
         let [
             Arg::Number(sn),
             Arg::Number(id),
@@ -697,12 +697,12 @@ impl Batch {
         payload.number(self.given);
         payload.number(self.entries);
         payload.number(self.next);
-        vec![payload.finish(Op::Batch)]
+        vec![payload.finish(Op::BatchResp)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Batch, &[Arg])> {
         if matches!(args.first(), Some(Arg::Struct(..))) {
-            let (mut payload, rest) = structure(args, Op::Batch, "a batch")?;
+            let (mut payload, rest) = structure(args, Op::BatchResp, "a batch")?;
             let batch = Batch {
                 asked: payload.number()?,
                 given: payload.number()?,
@@ -712,7 +712,7 @@ impl Batch {
             payload.done()?;
             return Ok((batch, rest));
         }
-        let args = tagged(args, Op::Batch, "a batch")?;
+        let args = tagged(args, Op::BatchResp, "a batch")?;
         let [
             Arg::Number(asked),
             Arg::Number(given),
@@ -866,25 +866,28 @@ pub struct ExtentRun {
 
 impl ExtentRun {
     pub fn args(&self) -> Vec<Arg> {
-        let mut args = vec![Arg::Number(self.stream.number())];
-        args.extend(self.totals.args());
-        args.push(Arg::Number(self.given));
-        args.push(Arg::Number(self.next));
-        args
+        let mut payload = StructWriter::new();
+        payload.number(self.stream.number());
+        payload.number(self.totals.extents);
+        payload.number(self.totals.logical);
+        payload.number(self.totals.compressed);
+        payload.number(self.given);
+        payload.number(self.next);
+        vec![payload.finish(Op::ExtentRunResp)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(ExtentRun, &[Arg])> {
-        let [Arg::Number(stream), rest @ ..] = args else {
-            return Err(Error::new("that run of extents does not say which stream"));
+        let (mut payload, rest) = structure(args, Op::ExtentRunResp, "a run of extents")?;
+        let stream = payload.number()?;
+        let totals = Totals {
+            extents: payload.number()?,
+            logical: payload.number()?,
+            compressed: payload.number()?,
         };
-        let (totals, rest) = Totals::of_args(rest)?;
-        let [Arg::Number(given), Arg::Number(next), rest @ ..] = rest else {
-            return Err(Error::new("that answer did not say what run of extents it was"));
-        };
-        Ok((
-            ExtentRun { stream: StreamId::of_number(*stream)?, totals, given: *given, next: *next },
-            rest,
-        ))
+        let given = payload.number()?;
+        let next = payload.number()?;
+        payload.done()?;
+        Ok((ExtentRun { stream: StreamId::of_number(stream)?, totals, given, next }, rest))
     }
 
     /// Every run in a batch answer, each followed by its own rows.

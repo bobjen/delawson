@@ -47,7 +47,8 @@ use crate::random::Rng;
 use crate::registry::Peer;
 use crate::routing;
 use crate::wire::{
-    self, Arg, BUF_BYTES, MAX_FRAME_BYTES, Op, Req, Resp, Status, Wire, put_response, structure,
+    self, Arg, BUF_BYTES, MAX_FRAME_BYTES, Op, Req, Resp, Status, StructWriter, Wire, put_response,
+    structure,
 };
 use crate::{Context, Error, Result};
 use crate::{logd, logi, logn, logsec, logw};
@@ -312,7 +313,7 @@ impl Process {
             Status::Ok => Ok(()),
             status => Err(Error::new(format!(
                 "KS refused the registration: {status}, {}",
-                response.message().unwrap_or("no reason given")
+                response.message().unwrap_or_else(|| "no reason given".into())
             ))),
         }
     }
@@ -859,11 +860,12 @@ fn read_logs(process: &Process, request: &Req) -> Resp {
         Err(e) => Resp::error(Status::Internal, e.to_string()),
         // The count of lines scanned comes back too: an answer with nothing in it
         // means something different if it read nothing than if it read millions.
-        Ok((seen, lines)) => Resp {
-            id: 0,
-            status: Status::Ok,
-            args: vec![Arg::Number(seen), Arg::Text(lines.join("\n"))],
-        },
+        Ok((seen, lines)) => {
+            let mut payload = StructWriter::new();
+            payload.number(seen);
+            payload.text(&lines.join("\n"));
+            Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::LogResp)] }
+        }
     }
 }
 
@@ -889,7 +891,7 @@ fn ping(process: &Process, request: &Req) -> Resp {
     // compression something to find.
     let dull = matches!(request.args.get(1), Some(Arg::Flag(true)));
     match if dull { repetition(size) } else { noise(size) } {
-        Some(bytes) => Resp { id: 0, status: Status::Ok, args: vec![Arg::Bytes(bytes)] },
+        Some(bytes) => Resp::bytes(bytes),
         None => Resp::error(
             Status::BadRequest,
             format!("a {size}-byte reply is over the {MAX_FRAME_BYTES}-byte frame limit"),

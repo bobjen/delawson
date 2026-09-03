@@ -154,24 +154,32 @@ ops! {
     Count = 43, "count";
     TimeRange = 44, "time-range";
 
-    // Schema identifiers share the Op namespace with commands.
+    // Structure and response identifiers share the Op namespace with commands.
     Range = 45, "range";
-    Shape = 46, "shape";
-    Batch = 47, "batch";
-    Described = 48, "described";
-    StreamRow = 49, "stream-row";
-    ExtentRow = 50, "extent-row";
-    Piece = 51, "piece";
+    ShapeResp = 46, "shape-response";
+    BatchResp = 47, "batch-response";
+    DescribedResp = 48, "described-response";
+    StreamRowResp = 49, "stream-row-response";
+    ExtentRowResp = 50, "extent-row-response";
+    PieceResp = 51, "piece-response";
     AppendBlock = 52, "append-block";
     Expecting = 53, "expecting";
     // Resp payloads have their own identifiers so their formats can evolve
     // independently of the requests that caused them. This also leaves the door
     // open to batching both directions in one stream without making request and
     // response formats ambiguous.
-    FilledResponse = 54, "filled-response";
-    CoveredResponse = 55, "covered-response";
-    ExtentResponse = 56, "extent-response";
-    ReceiptResponse = 57, "receipt-response";
+    FilledResp = 54, "filled-response";
+    CoveredResp = 55, "covered-response";
+    ExtentResp = 56, "extent-response";
+    ReceiptResp = 57, "receipt-response";
+    LogResp = 58, "log-response";
+    RegistryResp = 59, "registry-response";
+    ExtentRunResp = 60, "extent-run-response";
+    EmptyResp = 61, "empty-response";
+    TextResp = 62, "text-response";
+    BytesResp = 63, "bytes-response";
+    NumberResp = 64, "number-response";
+    FlagResp = 65, "flag-response";
 }
 
 impl std::fmt::Display for Op {
@@ -394,8 +402,6 @@ pub struct Resp {
     pub args: Vec<Arg>,
 }
 
-/// Short names for the two wire directions. They are aliases, not new types.
-
 impl Req {
     pub fn new(op: Op) -> Req {
         Req { id: 0, op, args: Vec::new() }
@@ -463,25 +469,39 @@ impl Req {
 
 impl Resp {
     pub fn ok() -> Resp {
-        Resp { id: 0, status: Status::Ok, args: Vec::new() }
+        Resp { id: 0, status: Status::Ok, args: vec![StructWriter::new().finish(Op::EmptyResp)] }
     }
 
     pub fn text(text: impl Into<String>) -> Resp {
-        Resp { id: 0, status: Status::Ok, args: vec![Arg::Text(text.into())] }
+        let text = text.into();
+        let mut payload = StructWriter::new();
+        payload.text(&text);
+        Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::TextResp)] }
     }
 
     pub fn error(status: Status, message: impl Into<String>) -> Resp {
-        Resp { id: 0, status, args: vec![Arg::Text(message.into())] }
+        let message = message.into();
+        let mut payload = StructWriter::new();
+        payload.text(&message);
+        Resp { id: 0, status, args: vec![payload.finish(Op::TextResp)] }
     }
 
-    pub fn flag(mut self, b: bool) -> Resp {
-        self.args.push(Arg::Flag(b));
-        self
+    pub fn flag(b: bool) -> Resp {
+        let mut payload = StructWriter::new();
+        payload.flag(b);
+        Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::FlagResp)] }
     }
 
-    pub fn bytes(mut self, bytes: Vec<u8>) -> Resp {
-        self.args.push(Arg::Bytes(bytes));
-        self
+    pub fn bytes(bytes: Vec<u8>) -> Resp {
+        let mut payload = StructWriter::new();
+        payload.bytes(&bytes);
+        Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::BytesResp)] }
+    }
+
+    pub fn number(status: Status, number: u64) -> Resp {
+        let mut payload = StructWriter::new();
+        payload.number(number);
+        Resp { id: 0, status, args: vec![payload.finish(Op::NumberResp)] }
     }
 
     /// Answer this request, whenever the answer is ready.
@@ -491,11 +511,14 @@ impl Resp {
     }
 
     /// The single text argument, if the response is one message.
-    pub fn message(&self) -> Option<&str> {
-        match self.args.first() {
-            Some(Arg::Text(text)) => Some(text),
-            _ => None,
+    pub fn message(&self) -> Option<String> {
+        let (mut payload, rest) = structure(&self.args, Op::TextResp, "text response").ok()?;
+        if !rest.is_empty() {
+            return None;
         }
+        let text = payload.text().ok()?;
+        payload.done().ok()?;
+        Some(text)
     }
 
     pub fn encode(&self, out: &mut Vec<u8>) {
@@ -1033,7 +1056,7 @@ mod tests {
             id: 7,
             op: Op::BatchInfo,
             args: vec![
-                Arg::Tag(Op::Shape),
+                Arg::Tag(Op::ShapeResp),
                 Arg::Number(shape.streams),
                 Arg::Number(shape.given),
                 Arg::Number(shape.extents),

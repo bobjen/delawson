@@ -65,11 +65,13 @@ impl Peer {
     }
 }
 
-/// Every peer KS knows, one text argument each.
+/// Every peer KS knows, in one tagged response payload.
 pub fn response(peers: impl IntoIterator<Item = Peer>) -> Resp {
-    Resp {
-        id: 0,
-        status: Status::Ok,
-        args: peers.into_iter().map(|peer| Arg::Text(peer.line())).collect(),
+    let peers: Vec<_> = peers.into_iter().collect();
+    let mut payload = StructWriter::new();
+    payload.number(peers.len() as u64);
+    for peer in peers {
+        payload.text(&peer.line());
     }
+    Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::RegistryResp)] }
 }

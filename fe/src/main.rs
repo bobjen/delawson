@@ -93,7 +93,7 @@ impl Open {
     /// The id, the second, the first record, how many records it holds, the count of instances,
     /// then the (en, disk) pairs, which is the order the SN answers in.
     fn of(sn: SnId, framing: Framing, args: &[Arg]) -> Option<Open> {
-        let (mut payload, rest) = structure(args, Op::ExtentResponse, "an extent response").ok()?;
+        let (mut payload, rest) = structure(args, Op::ExtentResp, "an extent response").ok()?;
         if !rest.is_empty() {
             return None;
         }
@@ -683,10 +683,24 @@ impl FE {
     /// The stream is full. The DN gives the object another, carrying on from where
     /// this one stopped, and the append starts again there.
     fn after_stream(self: &Arc<Self>, process: &Arc<Process>, wanting: Wanting, answer: Resp) {
-        let [Arg::Number(records)] = answer.args.as_slice() else {
-            return wanting
-                .reply
-                .send(Resp::error(Status::Internal, "a full stream said nothing about itself"));
+        let (mut payload, rest) = match structure(&answer.args, Op::NumberResp, "a sealed response")
+        {
+            Ok(value) => value,
+            Err(_) => {
+                return wanting.reply.send(Resp::error(
+                    Status::Internal,
+                    "a full stream said nothing about itself",
+                ));
+            }
+        };
+        let records = match payload.number().and_then(|records| payload.done().map(|()| records)) {
+            Ok(records) if rest.is_empty() => records,
+            _ => {
+                return wanting.reply.send(Resp::error(
+                    Status::Internal,
+                    "a full stream said nothing about itself",
+                ));
+            }
         };
         let Wanting { path, located, framing, crc, body, holds, tries, reply } = wanting;
         // Nothing may hand out an extent of a stream that will take no more, and what
@@ -697,7 +711,7 @@ impl FE {
         let mut payload = StructWriter::new();
         payload.text(&path);
         payload.number(located.stream.stream.number());
-        payload.number(*records);
+        payload.number(records);
         let ask = Req::new(Op::ExtendObject).structure(payload);
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
@@ -1083,13 +1097,12 @@ fn receipt(located: &Located, open: &Open, answer: Resp) -> Resp {
     if answer.status != Status::Ok {
         return answer;
     }
-    let (mut payload, rest) =
-        match structure(&answer.args, Op::ReceiptResponse, "an append receipt") {
-            Ok(value) => value,
-            Err(_) => {
-                return Resp::error(Status::Internal, "that append answered with no receipt");
-            }
-        };
+    let (mut payload, rest) = match structure(&answer.args, Op::ReceiptResp, "an append receipt") {
+        Ok(value) => value,
+        Err(_) => {
+            return Resp::error(Status::Internal, "that append answered with no receipt");
+        }
+    };
     if !rest.is_empty() {
         return Resp::error(Status::Internal, "that append answered with no receipt");
     }
@@ -1144,7 +1157,7 @@ fn receipt(located: &Located, open: &Open, answer: Resp) -> Resp {
             ] {
                 payload.number(value);
             }
-            vec![payload.finish(Op::ReceiptResponse)]
+            vec![payload.finish(Op::ReceiptResp)]
         },
     }
 }
@@ -1615,8 +1628,18 @@ struct Making {
 /// One DN's count. The last one in answers.
 fn made(making: &Arc<Mutex<Making>>, answer: Resp) {
     let mut held = making.lock().expect("making");
-    match (answer.status, answer.args.first()) {
-        (Status::Ok, Some(Arg::Number(made))) => held.made += made,
+    let number = structure(&answer.args, Op::NumberResp, "a number response").and_then(
+        |(mut payload, rest)| {
+            if !rest.is_empty() {
+                return Err(common::Error::new("a number response has trailing arguments"));
+            }
+            let number = payload.number()?;
+            payload.done()?;
+            Ok(number)
+        },
+    );
+    match (answer.status, number) {
+        (Status::Ok, Ok(made)) => held.made += made,
         (Status::Ok, _) => {
             held.failed.get_or_insert(Resp::error(
                 Status::Internal,
@@ -1634,7 +1657,7 @@ fn made(making: &Arc<Mutex<Making>>, answer: Resp) {
     let Some(reply) = held.reply.take() else { return };
     match held.failed.take() {
         Some(failed) => reply.send(failed),
-        None => reply.send(Resp { id: 0, status: Status::Ok, args: vec![Arg::Number(held.made)] }),
+        None => reply.send(Resp::number(Status::Ok, held.made)),
     }
 }
 
@@ -2090,7 +2113,7 @@ mod tests {
             payload.number(value);
         }
         let response =
-            Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::ExtentResponse)] };
+            Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::ExtentResp)] };
         let open = Open::of(SnId::new(0), Framing::Lf, &response.args).expect("an extent");
         assert_eq!(
             (open.sn, open.id, open.created, open.first_record),
@@ -2191,15 +2214,11 @@ mod tests {
         for value in [0, 7, 1_000_000, 512, 30, 2, 1] {
             from_en_payload.number(value);
         }
-        let from_en = Resp {
-            id: 0,
-            status: Status::Ok,
-            args: vec![from_en_payload.finish(Op::ReceiptResponse)],
-        };
+        let from_en =
+            Resp { id: 0, status: Status::Ok, args: vec![from_en_payload.finish(Op::ReceiptResp)] };
         let receipt = receipt(&located, &open, from_en);
         assert_eq!(receipt.status, Status::Ok);
-        let (mut payload, rest) =
-            structure(&receipt.args, Op::ReceiptResponse, "a receipt").unwrap();
+        let (mut payload, rest) = structure(&receipt.args, Op::ReceiptResp, "a receipt").unwrap();
         assert!(rest.is_empty());
         let values: Vec<_> = (0..8).map(|_| payload.number().unwrap()).collect();
         assert_eq!(values, [17, 42, 42, 1, 7, 1_000_000, 512, 30]);

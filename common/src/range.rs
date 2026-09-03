@@ -272,11 +272,11 @@ impl Filled {
         payload.number(self.records);
         payload.number(self.logical.number());
         payload.number(self.compressed.number());
-        vec![payload.finish(Op::FilledResponse)]
+        vec![payload.finish(Op::FilledResp)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Filled, &[Arg])> {
-        let (mut payload, rest) = structure(args, Op::FilledResponse, "a seal report")?;
+        let (mut payload, rest) = structure(args, Op::FilledResp, "a seal report")?;
         let filled = Filled {
             records: payload.number()?,
             logical: ELoff::of_number(payload.number()?)?,
@@ -347,11 +347,11 @@ impl Covered {
         payload.number(self.compressed);
         payload.number(self.next);
         payload.flag(self.more);
-        vec![payload.finish(Op::CoveredResponse)]
+        vec![payload.finish(Op::CoveredResp)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Covered, &[Arg])> {
-        let (mut payload, rest) = structure(args, Op::CoveredResponse, "an answer coverage")?;
+        let (mut payload, rest) = structure(args, Op::CoveredResp, "an answer coverage")?;
         let covered = Covered {
             records: payload.number()?,
             logical: payload.number()?,
@@ -615,12 +615,12 @@ impl Piece {
         payload.number(self.records);
         payload.number(self.crc);
         payload.bytes(&self.bytes);
-        vec![payload.finish(Op::Piece)]
+        vec![payload.finish(Op::PieceResp)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Piece, &[Arg])> {
         if matches!(args.first(), Some(Arg::Struct(..))) {
-            let (mut payload, rest) = structure(args, Op::Piece, "a piece")?;
+            let (mut payload, rest) = structure(args, Op::PieceResp, "a piece")?;
             let piece = Piece {
                 logical: payload.number()?,
                 first_record: payload.number()?,
@@ -631,7 +631,7 @@ impl Piece {
             payload.done()?;
             return Ok((piece, rest));
         }
-        let args = tagged(args, Op::Piece, "a piece")?;
+        let args = tagged(args, Op::PieceResp, "a piece")?;
         let [
             Arg::Number(logical),
             Arg::Number(first_record),

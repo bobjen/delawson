@@ -138,13 +138,13 @@ impl Ks {
         {
             let keys = self.sn_keys.read().expect("sn_keys");
             if let Some(key) = keys.get(&(sn, day)) {
-                return Resp::ok().bytes(key.to_vec());
+                return Resp::bytes(key.to_vec());
             }
         }
 
         let key = crypto::sn_daily_key(sn, day);
         self.sn_keys.write().expect("sn_keys").insert((sn, day), key);
-        Resp::ok().bytes(key.to_vec())
+        Resp::bytes(key.to_vec())
     }
 
     /// A registration announces a port; it does not invent an identity. The

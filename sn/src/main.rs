@@ -192,7 +192,7 @@ impl Extent {
             payload.number(en.number());
             payload.number(disk.number());
         }
-        vec![payload.finish(Op::ExtentResponse)]
+        vec![payload.finish(Op::ExtentResp)]
     }
 }
 
@@ -449,9 +449,7 @@ impl SN {
                 status: Status::Ok,
                 args: placed.extent.args(placed.first, &self.disks),
             },
-            Err(Full { records, why: None }) => {
-                Resp { id: 0, status: Status::Sealed, args: vec![Arg::Number(records)] }
-            }
+            Err(Full { records, why: None }) => Resp::number(Status::Sealed, records),
             Err(Full { why: Some(why), .. }) => Resp::error(Status::Internal, why.to_string()),
         }
     }
@@ -698,9 +696,7 @@ impl SN {
             },
             // The stream is full, which is the DN's business: it says what the
             // stream came to so the object's next stream can carry on from there.
-            Err(Full { records, why: None }) => {
-                Resp { id: 0, status: Status::Sealed, args: vec![Arg::Number(records)] }
-            }
+            Err(Full { records, why: None }) => Resp::number(Status::Sealed, records),
             Err(Full { why: Some(why), .. }) => Resp::error(Status::Internal, why.to_string()),
         }
     }
@@ -999,7 +995,7 @@ mod tests {
         // And the answer on the wire says so, which is the argument that was wrong: third
         // field is the first record, fourth is the count.
         let answer = next.extent.args(next.first, &sn.disks);
-        let (mut payload, rest) = structure(&answer, Op::ExtentResponse, "an extent").unwrap();
+        let (mut payload, rest) = structure(&answer, Op::ExtentResp, "an extent").unwrap();
         assert!(rest.is_empty());
         let _id = payload.number().unwrap();
         let _created = payload.number().unwrap();
@@ -1122,7 +1118,7 @@ mod tests {
             let answer = sn.locate(&ask);
             assert_eq!(answer.status, Status::Ok, "record {record}");
             let (mut payload, rest) =
-                structure(&answer.args, Op::ExtentResponse, "an extent").expect("an extent");
+                structure(&answer.args, Op::ExtentResp, "an extent").expect("an extent");
             assert!(rest.is_empty());
             payload.number().expect("an extent id")
         };
