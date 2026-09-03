@@ -96,17 +96,17 @@ impl Described {
         {
             let (mut payload, rest) = structure(args, Op::DescribedResp, "a described row")?;
             let object = ObjectName {
-                range: RangeId::of_number(payload.number_u32()? as u64)?,
-                object: ObjectId::of_number(payload.number_u32()? as u64)?,
+                range: RangeId::new(payload.number_u32()?),
+                object: ObjectId::new(payload.number_u32()?),
                 created: TimeSec::new(payload.number_u64()?),
             };
-            let dn = DnId::of_number(payload.number_u32()? as u64)?;
+            let dn = DnId::new(payload.number_u32()?);
             let stream = StreamName {
-                range: RangeId::of_number(payload.number_u32()? as u64)?,
-                stream: StreamId::of_number(payload.number_u32()? as u64)?,
+                range: RangeId::new(payload.number_u32()?),
+                stream: StreamId::new(payload.number_u32()?),
                 created: TimeSec::new(payload.number_u64()?),
             };
-            let sn = SnId::of_number(payload.number_u32()? as u64)?;
+            let sn = SnId::new(payload.number_u32()?);
             let keyed = payload.flag()?;
             let kind = payload.number_u8()?;
             let width = payload.number_u32()?;
@@ -329,8 +329,8 @@ impl Expecting {
     pub fn read(payload: &mut StructReader<'_>) -> Result<Expecting> {
         payload.tag(Op::Expecting, "an expectation")?;
         Ok(Expecting(ObjectName {
-            range: RangeId::of_number(payload.number_u32()? as u64)?,
-            object: ObjectId::of_number(payload.number_u32()? as u64)?,
+            range: RangeId::new(payload.number_u32()?),
+            object: ObjectId::new(payload.number_u32()?),
             created: TimeSec::new(payload.number_u64()?),
         }))
     }
@@ -469,8 +469,8 @@ impl StreamRow {
     pub fn of_args(args: &[Arg]) -> Result<(StreamRow, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::StreamRowResp, "a stream row")?;
         let row = StreamRow {
-            stream: StreamId::of_number(payload.number_u32()? as u64)?,
-            sn: SnId::of_number(payload.number_u32()? as u64)?,
+            stream: StreamId::new(payload.number_u32()?),
+            sn: SnId::new(payload.number_u32()?),
             first_record: payload.number_u64()?,
             records: payload.number_u64()?,
             created: TimeSec::new(payload.number_u64()?),
@@ -557,8 +557,8 @@ impl ExtentRow {
 
     pub fn of_args(args: &[Arg]) -> Result<(ExtentRow, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::ExtentRowResp, "an extent row")?;
-        let sn = SnId::of_number(payload.number_u32()? as u64)?;
-        let id = ExtentId::of_number(payload.number_u32()? as u64)?;
+        let sn = SnId::new(payload.number_u32()?);
+        let id = ExtentId::new(payload.number_u32()?);
         let created = TimeSec::new(payload.number_u64()?);
         let first_record = payload.number_u64()?;
         let records = payload.number_u64()?;
@@ -567,10 +567,7 @@ impl ExtentRow {
         let count = payload.number_u32()? as usize;
         let mut disks = Vec::with_capacity(count);
         for _ in 0..count {
-            disks.push((
-                EnId::of_number(payload.number_u32()? as u64)?,
-                DiskId::of_number(payload.number_u16()? as u64)?,
-            ));
+            disks.push((EnId::new(payload.number_u32()?), DiskId::new(payload.number_u16()?)));
         }
         payload.done()?;
         Ok((ExtentRow { sn, id, created, first_record, records, logical, length, disks }, rest))
@@ -716,8 +713,8 @@ impl Listing {
         for _ in 0..count {
             at.push((
                 StreamName {
-                    range: RangeId::of_number(payload.number_u32()? as u64)?,
-                    stream: StreamId::of_number(payload.number_u32()? as u64)?,
+                    range: RangeId::new(payload.number_u32()?),
+                    stream: StreamId::new(payload.number_u32()?),
                     created: TimeSec::new(payload.number_u64()?),
                 },
                 payload.number_u64()?,
@@ -784,7 +781,7 @@ impl ExtentRun {
 
     pub fn of_args(args: &[Arg]) -> Result<(ExtentRun, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::ExtentRunResp, "a run of extents")?;
-        let stream = payload.number_u32()? as u64;
+        let stream = payload.number_u32()?;
         let totals = Totals {
             extents: payload.number_u64()?,
             logical: payload.number_u64()?,
@@ -793,7 +790,7 @@ impl ExtentRun {
         let given = payload.number_u64()?;
         let next = payload.number_u64()?;
         payload.done()?;
-        Ok((ExtentRun { stream: StreamId::of_number(stream)?, totals, given, next }, rest))
+        Ok((ExtentRun { stream: StreamId::new(stream), totals, given, next }, rest))
     }
 
     /// Every run in a batch answer, each followed by its own rows.
