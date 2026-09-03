@@ -19,7 +19,7 @@ use crate::info::Expecting;
 use crate::offset::{ECoff, ELoff};
 use crate::placement::Expansion;
 use crate::wire::Arg;
-use crate::wire::{Op, tagged};
+use crate::wire::{Op, StructWriter, structure, tagged};
 use crate::{Error, Result};
 
 /// Where a range starts.
@@ -141,18 +141,39 @@ impl Range {
             Start::RecordThen(record, offset) => (record, offset),
             Start::Logical(offset) => (offset, 0),
         };
-        vec![
-            Arg::Tag(Op::Range),
-            Arg::Number(self.start.code()),
-            Arg::Number(first),
-            Arg::Number(second),
-            Arg::Number(self.budget.code()),
-            Arg::Number(self.budget.amount()),
-        ]
+        let mut payload = StructWriter::new();
+        payload.number(self.start.code());
+        payload.number(first);
+        payload.number(second);
+        payload.number(self.budget.code());
+        payload.number(self.budget.amount());
+        vec![payload.finish(Op::Range)]
     }
 
     /// And back, returning whatever followed it.
     pub fn of_args(args: &[Arg]) -> Result<(Range, &[Arg])> {
+        if matches!(args.first(), Some(Arg::Struct(..))) {
+            let (mut payload, rest) = structure(args, Op::Range, "a range")?;
+            let kind = payload.number()?;
+            let first = payload.number()?;
+            let second = payload.number()?;
+            let measure = payload.number()?;
+            let amount = payload.number()?;
+            payload.done()?;
+            let start = match kind {
+                0 => Start::Record(first),
+                1 => Start::RecordThen(first, second),
+                2 => Start::Logical(first),
+                other => return Err(Error::new(format!("no range start of kind {other}"))),
+            };
+            let budget = match measure {
+                0 => Budget::Records(amount),
+                1 => Budget::Logical(amount),
+                2 => Budget::Compressed(amount),
+                other => return Err(Error::new(format!("no budget measured in kind {other}"))),
+            };
+            return Ok((Range { start, budget }, rest));
+        }
         let args = tagged(args, Op::Range, "a range")?;
         let [
             Arg::Number(kind),
@@ -526,17 +547,28 @@ pub struct Piece {
 
 impl Piece {
     pub fn args(&self) -> Vec<Arg> {
-        vec![
-            Arg::Tag(Op::Piece),
-            Arg::Number(self.logical),
-            Arg::Number(self.first_record),
-            Arg::Number(self.records),
-            Arg::Number(self.crc),
-            Arg::Bytes(self.bytes.clone()),
-        ]
+        let mut payload = StructWriter::new();
+        payload.number(self.logical);
+        payload.number(self.first_record);
+        payload.number(self.records);
+        payload.number(self.crc);
+        payload.bytes(&self.bytes);
+        vec![payload.finish(Op::Piece)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Piece, &[Arg])> {
+        if matches!(args.first(), Some(Arg::Struct(..))) {
+            let (mut payload, rest) = structure(args, Op::Piece, "a piece")?;
+            let piece = Piece {
+                logical: payload.number()?,
+                first_record: payload.number()?,
+                records: payload.number()?,
+                crc: payload.number()?,
+                bytes: payload.bytes()?,
+            };
+            payload.done()?;
+            return Ok((piece, rest));
+        }
         let args = tagged(args, Op::Piece, "a piece")?;
         let [
             Arg::Number(logical),
@@ -764,7 +796,7 @@ mod tests {
     fn a_partial_block_is_refused() {
         let whole = piece(0, 1, b"x\n");
         let args = whole.args();
-        assert!(Piece::of_args(&args[..4]).is_err(), "no bytes");
+        assert!(Piece::of_args(&args[..0]).is_err(), "no payload");
         let mut ragged = args.clone();
         ragged.push(Arg::Number(1));
         assert!(Piece::all_of_args(&ragged).is_err(), "one whole block and a fragment");

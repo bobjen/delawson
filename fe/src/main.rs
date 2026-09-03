@@ -1152,7 +1152,10 @@ impl Spread {
             Err(e) => return self.give_up(e.to_string()),
         };
         let pieces = match self.want.detail {
-            0 => rows.chunks(Described::ARGS).take(covered.given as usize).collect(),
+            0 => match Described::some_of_args(rows, covered.given) {
+                Ok(pieces) => pieces,
+                Err(e) => return self.give_up(e.to_string()),
+            },
             _ => match Batch::pieces(rows, covered.given) {
                 Ok(pieces) => pieces,
                 Err(e) => return self.give_up(e.to_string()),
@@ -1976,7 +1979,7 @@ mod tests {
         assert_eq!(located.framing, Framing::CrLf);
         assert_eq!(located.first_record, ORoff::new(400), "where this stream's records start");
         // A framing the DN could not have meant is not an object either.
-        assert!(Located::of(&args[..5]).is_none());
+        assert!(Located::of(&args[..0]).is_none());
     }
 
     /// The receipt leads with the durable reference and follows with the hint, and

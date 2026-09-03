@@ -1312,7 +1312,10 @@ fn batch(
             Ok(pieces) => pieces,
             Err(_) => return report(target, response),
         },
-        false => rows.chunks(Described::ARGS).take(covered.given as usize).collect(),
+        false => match Described::some_of_args(rows, covered.given) {
+            Ok(pieces) => pieces,
+            Err(_) => return report(target, response),
+        },
     };
     for (n, piece) in pieces.iter().enumerate() {
         let name = paths.get(n).map(String::as_str).unwrap_or("?");

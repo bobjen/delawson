@@ -16,7 +16,7 @@ use crate::ids::{DiskId, DnId, EnId, ExtentId, ObjectId, RangeId, SnId, StreamId
 use crate::placement::Expansion;
 use crate::time::TimeSec;
 use crate::wire::Arg;
-use crate::wire::{Op, tagged};
+use crate::wire::{Op, StructWriter, structure, tagged};
 use crate::{Error, Result};
 
 /// An object as the DN describes it, at one of its streams.
@@ -48,46 +48,83 @@ pub struct Described {
 impl Described {
     /// Fields per row on the wire. Public because a caller sizing a buffer wants it,
     /// and derived from the shape rather than written down twice.
-    pub const ARGS: usize = 7 + ObjectName::ARGS + StreamName::ARGS;
+    /// A described row is one self-contained argument on the wire.
+    pub const ARGS: usize = 1;
     /// A row meaning "there is no such object", for a batch answer that must line up
     /// with the names it was asked about. A zero id is what marks it.
     ///
     /// ⚠️ §9.1.3.7 will retire this: once an answer may be short, lining up by
     /// position stops working and the answer has to say how many names it covered.
     pub fn missing() -> Vec<Arg> {
-        let mut args = vec![Arg::Tag(Op::Described)];
-        args.extend(ObjectName::default().args());
-        args.push(Arg::Number(0));
-        args.extend(StreamName::default().args());
-        args.extend([
-            Arg::Number(0),
-            Arg::Flag(false),
-            Arg::Number(0),
-            Arg::Number(0),
-            Arg::Number(0),
-        ]);
-        args
+        let mut payload = StructWriter::new();
+        payload.number(0);
+        payload.number(ObjectId::NONE.number());
+        for _ in 0..6 {
+            payload.number(0);
+        }
+        payload.flag(false);
+        for _ in 0..3 {
+            payload.number(0);
+        }
+        vec![payload.finish(Op::Described)]
     }
 
     pub fn args(&self) -> Vec<Arg> {
         let (kind, width) = self.framing.wire();
-        let mut args = vec![Arg::Tag(Op::Described)];
-        args.extend(self.object.args());
-        args.push(Arg::Number(self.dn.number()));
-        args.extend(self.stream.args());
-        args.extend([
-            Arg::Number(self.sn.number()),
-            Arg::Flag(self.keyed),
-            Arg::Number(kind),
-            Arg::Number(width),
-            Arg::Number(self.first_record),
-        ]);
-        args
+        let mut payload = StructWriter::new();
+        payload.number(self.object.range.number());
+        payload.number(self.object.object.number());
+        payload.number(self.object.created.number());
+        payload.number(self.dn.number());
+        payload.number(self.stream.range.number());
+        payload.number(self.stream.stream.number());
+        payload.number(self.stream.created.number());
+        payload.number(self.sn.number());
+        payload.flag(self.keyed);
+        payload.number(kind);
+        payload.number(width);
+        payload.number(self.first_record);
+        vec![payload.finish(Op::Described)]
     }
 
     /// And back, returning whatever followed it. `None` for a row marked missing,
     /// since a zero id is not an object.
     pub fn of_args(args: &[Arg]) -> Result<(Option<Described>, &[Arg])> {
+        if matches!(args.first(), Some(Arg::Struct(..))) {
+            let (mut payload, rest) = structure(args, Op::Described, "a described row")?;
+            let object = ObjectName {
+                range: RangeId::of_number(payload.number()?)?,
+                object: ObjectId::of_number(payload.number()?)?,
+                created: TimeSec::new(payload.number()?),
+            };
+            let dn = DnId::of_number(payload.number()?)?;
+            let stream = StreamName {
+                range: RangeId::of_number(payload.number()?)?,
+                stream: StreamId::of_number(payload.number()?)?,
+                created: TimeSec::new(payload.number()?),
+            };
+            let sn = SnId::of_number(payload.number()?)?;
+            let keyed = payload.flag()?;
+            let kind = payload.number()?;
+            let width = payload.number()?;
+            let first_record = payload.number()?;
+            payload.done()?;
+            if object.object.is_none() {
+                return Ok((None, rest));
+            }
+            return Ok((
+                Some(Described {
+                    object,
+                    dn,
+                    stream,
+                    sn,
+                    keyed,
+                    framing: Framing::of_wire(kind, width)?,
+                    first_record,
+                }),
+                rest,
+            ));
+        }
         let args = tagged(args, Op::Described, "a described row")?;
         let (object, after) = ObjectName::of_args(args)?;
         let [Arg::Number(dn), after @ ..] = after else {
@@ -135,6 +172,19 @@ impl Described {
         }
         Ok(rows)
     }
+
+    /// The argument slices for a prefix of rows, whether they are old flat rows
+    /// or new self-contained values.
+    pub fn some_of_args<'a>(mut args: &'a [Arg], count: u64) -> Result<Vec<&'a [Arg]>> {
+        let mut rows = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let whole = args;
+            let (_, rest) = Described::of_args(args)?;
+            rows.push(&whole[..whole.len() - rest.len()]);
+            args = rest;
+        }
+        Ok(rows)
+    }
 }
 
 /// **No value given**, for the counts in an answer that may or may not know them.
@@ -173,34 +223,25 @@ impl Shape {
     }
 
     pub fn args(&self) -> Vec<Arg> {
-        let mut bytes = Vec::with_capacity(5 * std::mem::size_of::<u64>());
+        let mut payload = StructWriter::new();
         for field in [self.streams, self.given, self.extents, self.entries, self.next] {
-            bytes.extend(field.to_le_bytes());
+            payload.number(field);
         }
-        vec![Arg::Struct(Op::Shape, bytes)]
+        vec![payload.finish(Op::Shape)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Shape, &[Arg])> {
-        if let [Arg::Struct(op, bytes), rest @ ..] = args {
-            if *op != Op::Shape {
-                return Err(Error::new(format!("expected {}, got {op}", Op::Shape)));
-            }
-            if bytes.len() != 5 * std::mem::size_of::<u64>() {
-                return Err(Error::new("a shape has the wrong payload length"));
-            }
-            let mut fields = bytes
-                .chunks_exact(8)
-                .map(|field| u64::from_le_bytes(field.try_into().expect("eight-byte shape field")));
-            return Ok((
-                Shape {
-                    streams: fields.next().unwrap(),
-                    given: fields.next().unwrap(),
-                    extents: fields.next().unwrap(),
-                    entries: fields.next().unwrap(),
-                    next: fields.next().unwrap(),
-                },
-                rest,
-            ));
+        if matches!(args.first(), Some(Arg::Struct(..))) {
+            let (mut payload, rest) = structure(args, Op::Shape, "a shape")?;
+            let shape = Shape {
+                streams: payload.number()?,
+                given: payload.number()?,
+                extents: payload.number()?,
+                entries: payload.number()?,
+                next: payload.number()?,
+            };
+            payload.done()?;
+            return Ok((shape, rest));
         }
         let args = tagged(args, Op::Shape, "a shape")?;
         let [
@@ -472,20 +513,39 @@ impl StreamRow {
     pub const ARGS: usize = 6 + Totals::ARGS;
 
     pub fn args(&self) -> Vec<Arg> {
-        let mut args = vec![
-            Arg::Tag(Op::StreamRow),
-            Arg::Number(self.stream.number()),
-            Arg::Number(self.sn.number()),
-            Arg::Number(self.first_record),
-            Arg::Number(self.records),
-            Arg::Number(self.created.number()),
-        ];
-        args.extend(self.totals.args());
-        args.push(Arg::Number(self.given));
-        args
+        let mut payload = StructWriter::new();
+        payload.number(self.stream.number());
+        payload.number(self.sn.number());
+        payload.number(self.first_record);
+        payload.number(self.records);
+        payload.number(self.created.number());
+        payload.number(self.totals.extents);
+        payload.number(self.totals.logical);
+        payload.number(self.totals.compressed);
+        payload.number(self.given);
+        vec![payload.finish(Op::StreamRow)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(StreamRow, &[Arg])> {
+        if matches!(args.first(), Some(Arg::Struct(..))) {
+            let (mut payload, rest) = structure(args, Op::StreamRow, "a stream row")?;
+            let stream = StreamId::of_number(payload.number()?)?;
+            let sn = SnId::of_number(payload.number()?)?;
+            let first_record = payload.number()?;
+            let records = payload.number()?;
+            let created = TimeSec::new(payload.number()?);
+            let totals = Totals {
+                extents: payload.number()?,
+                logical: payload.number()?,
+                compressed: payload.number()?,
+            };
+            let given = payload.number()?;
+            payload.done()?;
+            return Ok((
+                StreamRow { stream, sn, first_record, records, created, totals, given },
+                rest,
+            ));
+        }
         let args = tagged(args, Op::StreamRow, "a stream row")?;
         let [
             Arg::Number(stream),
@@ -570,25 +630,46 @@ impl ExtentRow {
     }
 
     pub fn args(&self) -> Vec<Arg> {
-        let mut args = vec![
-            Arg::Tag(Op::ExtentRow),
-            Arg::Number(self.sn.number()),
-            Arg::Number(self.id.number()),
-            Arg::Number(self.created.number()),
-            Arg::Number(self.first_record),
-            Arg::Number(self.records),
-            Arg::Number(self.logical),
-            Arg::Number(self.length),
-            Arg::Number(self.disks.len() as u64),
-        ];
+        let mut payload = StructWriter::new();
+        payload.number(self.sn.number());
+        payload.number(self.id.number());
+        payload.number(self.created.number());
+        payload.number(self.first_record);
+        payload.number(self.records);
+        payload.number(self.logical);
+        payload.number(self.length);
+        payload.number(self.disks.len() as u64);
         for (en, disk) in &self.disks {
-            args.push(Arg::Number(en.number()));
-            args.push(Arg::Number(disk.number()));
+            payload.number(en.number());
+            payload.number(disk.number());
         }
-        args
+        vec![payload.finish(Op::ExtentRow)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(ExtentRow, &[Arg])> {
+        if matches!(args.first(), Some(Arg::Struct(..))) {
+            let (mut payload, rest) = structure(args, Op::ExtentRow, "an extent row")?;
+            let sn = SnId::of_number(payload.number()?)?;
+            let id = ExtentId::of_number(payload.number()?)?;
+            let created = TimeSec::new(payload.number()?);
+            let first_record = payload.number()?;
+            let records = payload.number()?;
+            let logical = payload.number()?;
+            let length = payload.number()?;
+            let count = payload.number()? as usize;
+            let mut disks = Vec::with_capacity(count);
+            for _ in 0..count {
+                disks.push((
+                    EnId::of_number(payload.number()?)?,
+                    DiskId::of_number(payload.number()?)?,
+                ));
+            }
+            payload.done()?;
+            return Ok((
+                ExtentRow { sn, id, created, first_record, records, logical, length, disks },
+                rest,
+            ));
+        }
         let args = tagged(args, Op::ExtentRow, "an extent row")?;
         let [
             Arg::Number(sn),
@@ -674,16 +755,26 @@ pub struct Batch {
 
 impl Batch {
     pub fn args(&self) -> Vec<Arg> {
-        vec![
-            Arg::Tag(Op::Batch),
-            Arg::Number(self.asked),
-            Arg::Number(self.given),
-            Arg::Number(self.entries),
-            Arg::Number(self.next),
-        ]
+        let mut payload = StructWriter::new();
+        payload.number(self.asked);
+        payload.number(self.given);
+        payload.number(self.entries);
+        payload.number(self.next);
+        vec![payload.finish(Op::Batch)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Batch, &[Arg])> {
+        if matches!(args.first(), Some(Arg::Struct(..))) {
+            let (mut payload, rest) = structure(args, Op::Batch, "a batch")?;
+            let batch = Batch {
+                asked: payload.number()?,
+                given: payload.number()?,
+                entries: payload.number()?,
+                next: payload.number()?,
+            };
+            payload.done()?;
+            return Ok((batch, rest));
+        }
         let args = tagged(args, Op::Batch, "a batch")?;
         let [
             Arg::Number(asked),
@@ -717,10 +808,8 @@ impl Batch {
         for _ in 0..count {
             let whole = args;
             let (shape, mut rest) = Shape::of_args(args)?;
-            if rest.len() < Described::ARGS {
-                return Err(Error::new("a batch answer stopped inside an object row"));
-            }
-            rest = &rest[Described::ARGS..];
+            let (_, after) = Described::of_args(rest)?;
+            rest = after;
             for _ in 0..shape.given {
                 let (row, after) = StreamRow::of_args(rest)?;
                 rest = after;
@@ -892,11 +981,10 @@ mod tests {
         let rows = Described::all_of_args(&args).expect("rows");
         assert_eq!(rows.len(), 3, "three objects, not six");
         assert_eq!(rows.iter().filter(|row| row.is_some()).count(), 3);
-        // What the old arithmetic would have said, kept as the thing not to do. ⚠️ It said
-        // four when the row was eight fields and says six now the row is ten — the number is
-        // not the point, being wrong in a different way each time the shape moves is.
+        // The old arithmetic was wrong whenever the row changed. The self-contained form
+        // makes the logical row width one and leaves its payload to the row parser.
         assert_eq!(args.len(), 3 * Described::ARGS);
-        assert_ne!(args.len() / 5, 3, "chunks of five find something other than three");
+        assert_eq!(args.len() / Described::ARGS, 3);
     }
 
     /// A missing name still occupies a row, so a batch answer lines up with the
@@ -915,7 +1003,7 @@ mod tests {
     #[test]
     fn a_short_or_ragged_answer_is_refused() {
         let args = one(1).args();
-        assert!(Described::of_args(&args[..7]).is_err());
+        assert!(Described::of_args(&args[..0]).is_err());
         let mut ragged = args.clone();
         ragged.push(Arg::Number(1));
         assert!(Described::all_of_args(&ragged).is_err(), "a row and a fragment");
@@ -925,11 +1013,8 @@ mod tests {
     #[test]
     fn an_impossible_framing_is_refused() {
         let mut args = one(1).args();
-        // ⚠️ Counted back from the end rather than forward from the start: the framing is the
-        // last three fields but one, and this test broke when the stream id at the front grew
-        // into a whole name (#109). A test that hard-codes a position is a test that has to be
-        // edited every time the shape does — which is the same complaint the *next* test makes.
-        args[Described::ARGS - 3] = Arg::Number(99);
+        let Arg::Struct(_, payload) = &mut args[0] else { panic!("a self-contained row") };
+        payload[65..73].copy_from_slice(&99u64.to_le_bytes());
         assert!(Described::of_args(&args).is_err());
     }
 
@@ -1066,9 +1151,10 @@ mod tests {
     #[test]
     fn an_extent_lying_about_its_instances_is_refused() {
         let mut args = extent(1, 0, 40).args();
-        args[8] = Arg::Number(99);
+        let Arg::Struct(_, payload) = &mut args[0] else { panic!("a self-contained extent") };
+        payload[56..64].copy_from_slice(&99u64.to_le_bytes());
         assert!(ExtentRow::of_args(&args).is_err());
-        assert!(ExtentRow::of_args(&args[..7]).is_err(), "and a short row too");
+        assert!(ExtentRow::of_args(&args[..0]).is_err(), "and a short row too");
     }
 
     /// And the counts survive being complete while the detail is partial, which is

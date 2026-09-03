@@ -241,6 +241,91 @@ pub fn tagged<'a>(args: &'a [Arg], expected: Op, what: &str) -> Result<&'a [Arg]
     Ok(rest)
 }
 
+/// Build the self-contained payload of one tagged structure.
+pub struct StructWriter {
+    bytes: Vec<u8>,
+}
+
+impl StructWriter {
+    pub fn new() -> StructWriter {
+        StructWriter { bytes: Vec::new() }
+    }
+
+    pub fn number(&mut self, value: u64) {
+        self.bytes.extend(value.to_le_bytes());
+    }
+
+    pub fn flag(&mut self, value: bool) {
+        self.bytes.push(value as u8);
+    }
+
+    pub fn bytes(&mut self, value: &[u8]) {
+        self.bytes.extend((value.len() as u32).to_le_bytes());
+        self.bytes.extend(value);
+    }
+
+    pub fn finish(self, op: Op) -> Arg {
+        Arg::Struct(op, self.bytes)
+    }
+}
+
+/// Read the self-contained payload of one tagged structure.
+pub struct StructReader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> StructReader<'a> {
+    pub fn new(bytes: &'a [u8]) -> StructReader<'a> {
+        StructReader { bytes, at: 0 }
+    }
+
+    fn take(&mut self, count: usize) -> Result<&'a [u8]> {
+        let end = self.at.checked_add(count).ok_or_else(|| Error::new("length overflow"))?;
+        if end > self.bytes.len() {
+            return Err(Error::new("structure payload ends mid-value"));
+        }
+        let value = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(value)
+    }
+
+    pub fn number(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    pub fn flag(&mut self) -> Result<bool> {
+        Ok(self.take(1)?[0] != 0)
+    }
+
+    pub fn bytes(&mut self) -> Result<Vec<u8>> {
+        let length = u32::from_le_bytes(self.take(4)?.try_into().unwrap()) as usize;
+        Ok(self.take(length)?.to_vec())
+    }
+
+    pub fn done(&self) -> Result<()> {
+        if self.at == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(Error::new("trailing bytes in structure payload"))
+        }
+    }
+}
+
+pub fn structure<'a>(
+    args: &'a [Arg],
+    expected: Op,
+    what: &str,
+) -> Result<(StructReader<'a>, &'a [Arg])> {
+    let [Arg::Struct(actual, bytes), rest @ ..] = args else {
+        return Err(Error::new(format!("{what} is not self-contained")));
+    };
+    if *actual != expected {
+        return Err(Error::new(format!("expected {expected}, got {actual}")));
+    }
+    Ok((StructReader::new(bytes), rest))
+}
+
 impl std::fmt::Display for Arg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -399,29 +484,78 @@ pub struct AppendBlock {
 impl AppendBlock {
     pub fn request(&self, en: EnId, disk: DiskId, op: Op) -> Request {
         let mut request = Request::new(op);
-        request.args.push(Arg::Tag(Op::AppendBlock));
+        let mut payload = StructWriter::new();
         let (kind, width) = self.framing.wire();
-        request.args.extend([
-            Arg::Number(en.number()),
-            Arg::Number(disk.number()),
-            Arg::Number(self.sn.number()),
-            Arg::Number(self.extent.number()),
-            Arg::Number(self.created.number()),
-            Arg::Number(kind),
-            Arg::Number(width),
-            Arg::Number(self.crc),
-        ]);
-        request.args.extend(self.holds.args());
-        request = request
-            .flag(self.logical_offset.is_some())
-            .number(self.logical_offset.map(|o| o.number()).unwrap_or(0));
+        payload.number(en.number());
+        payload.number(disk.number());
+        payload.number(self.sn.number());
+        payload.number(self.extent.number());
+        payload.number(self.created.number());
+        payload.number(kind);
+        payload.number(width);
+        payload.number(self.crc);
+        payload.number(self.holds.compressed.number());
+        payload.number(self.holds.logical.number());
+        payload.number(self.holds.records.number());
+        payload.flag(self.logical_offset.is_some());
+        payload.number(self.logical_offset.map(|o| o.number()).unwrap_or(0));
+        payload.number(self.instances.len() as u64);
         for (en, disk) in &self.instances {
-            request = request.number(en.number()).number(disk.number());
+            payload.number(en.number());
+            payload.number(disk.number());
         }
-        request.bytes(self.bytes.clone())
+        payload.bytes(&self.bytes);
+        request.args.push(payload.finish(Op::AppendBlock));
+        request
     }
 
     pub fn of(request: &Request) -> Result<(EnId, DiskId, AppendBlock)> {
+        if matches!(request.args.first(), Some(Arg::Struct(..))) {
+            let (mut payload, rest) = structure(&request.args, Op::AppendBlock, "an append block")?;
+            if !rest.is_empty() {
+                return Err(Error::new("an append block has arguments after its payload"));
+            }
+            let en = EnId::of_number(payload.number()?)?;
+            let disk = DiskId::of_number(payload.number()?)?;
+            let sn = SnId::of_number(payload.number()?)?;
+            let extent = ExtentId::of_number(payload.number()?)?;
+            let created = TimeSec::new(payload.number()?);
+            let kind = payload.number()?;
+            let width = payload.number()?;
+            let crc = payload.number()?;
+            let holds = crate::block::Holds {
+                compressed: crate::offset::ECoff::of_number(payload.number()?)?,
+                logical: crate::offset::ELoff::of_number(payload.number()?)?,
+                records: crate::offset::ERoff::of_number(payload.number()?)?,
+            };
+            let has_logical = payload.flag()?;
+            let logical = payload.number()?;
+            let count = payload.number()? as usize;
+            let mut instances = Vec::with_capacity(count);
+            for _ in 0..count {
+                instances.push((
+                    EnId::of_number(payload.number()?)?,
+                    DiskId::of_number(payload.number()?)?,
+                ));
+            }
+            let bytes = payload.bytes()?;
+            payload.done()?;
+            return Ok((
+                en,
+                disk,
+                AppendBlock {
+                    sn,
+                    extent,
+                    created,
+                    framing: crate::framing::Framing::of_wire(kind, width)?,
+                    crc,
+                    holds,
+                    instances,
+                    logical_offset: has_logical.then(|| ELoff::of_number(logical)).transpose()?,
+                    bytes,
+                },
+            ));
+        }
         let args = tagged(&request.args, Op::AppendBlock, "an append block")?;
         let [
             Arg::Number(en),
