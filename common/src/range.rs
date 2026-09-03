@@ -267,28 +267,22 @@ pub struct Filled {
 }
 
 impl Filled {
-    pub const ARGS: usize = 3;
-
     pub fn args(&self) -> Vec<Arg> {
-        vec![
-            Arg::Number(self.records),
-            Arg::Number(self.logical.number()),
-            Arg::Number(self.compressed.number()),
-        ]
+        let mut payload = StructWriter::new();
+        payload.number(self.records);
+        payload.number(self.logical.number());
+        payload.number(self.compressed.number());
+        vec![payload.finish(Op::FilledResponse)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Filled, &[Arg])> {
-        let [Arg::Number(records), Arg::Number(logical), Arg::Number(compressed), rest @ ..] = args
-        else {
-            return Err(Error::new(
-                "a seal report takes a record count, a logical length and a compressed length",
-            ));
-        };
+        let (mut payload, rest) = structure(args, Op::FilledResponse, "a seal report")?;
         let filled = Filled {
-            records: *records,
-            logical: ELoff::of_number(*logical)?,
-            compressed: ECoff::of_number(*compressed)?,
+            records: payload.number()?,
+            logical: ELoff::of_number(payload.number()?)?,
+            compressed: ECoff::of_number(payload.number()?)?,
         };
+        payload.done()?;
         Ok((filled, rest))
     }
 
@@ -347,37 +341,26 @@ impl Covered {
     }
 
     pub fn args(&self) -> Vec<Arg> {
-        vec![
-            Arg::Number(self.records),
-            Arg::Number(self.logical),
-            Arg::Number(self.compressed),
-            Arg::Number(self.next),
-            Arg::Flag(self.more),
-        ]
+        let mut payload = StructWriter::new();
+        payload.number(self.records);
+        payload.number(self.logical);
+        payload.number(self.compressed);
+        payload.number(self.next);
+        payload.flag(self.more);
+        vec![payload.finish(Op::CoveredResponse)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Covered, &[Arg])> {
-        let [
-            Arg::Number(records),
-            Arg::Number(logical),
-            Arg::Number(compressed),
-            Arg::Number(next),
-            Arg::Flag(more),
-            rest @ ..,
-        ] = args
-        else {
-            return Err(Error::new("an answer does not say what it covered"));
+        let (mut payload, rest) = structure(args, Op::CoveredResponse, "an answer coverage")?;
+        let covered = Covered {
+            records: payload.number()?,
+            logical: payload.number()?,
+            compressed: payload.number()?,
+            next: payload.number()?,
+            more: payload.flag()?,
         };
-        Ok((
-            Covered {
-                records: *records,
-                logical: *logical,
-                compressed: *compressed,
-                next: *next,
-                more: *more,
-            },
-            rest,
-        ))
+        payload.done()?;
+        Ok((covered, rest))
     }
 }
 

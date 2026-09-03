@@ -164,6 +164,13 @@ ops! {
     Piece = 51, "piece";
     AppendBlock = 52, "append-block";
     Expecting = 53, "expecting";
+    // Response payloads have their own identifiers so their formats can evolve
+    // independently of the requests that caused them. This also leaves the door
+    // open to batching both directions in one stream without making request and
+    // response formats ambiguous.
+    FilledResponse = 54, "filled-response";
+    CoveredResponse = 55, "covered-response";
+    ExtentResponse = 56, "extent-response";
 }
 
 impl std::fmt::Display for Op {
@@ -386,6 +393,10 @@ pub struct Response {
     pub args: Vec<Arg>,
 }
 
+/// Short names for the two wire directions. They are aliases, not new types.
+pub type Req = Request;
+pub type Resp = Response;
+
 impl Request {
     pub fn new(op: Op) -> Request {
         Request { id: 0, op, args: Vec::new() }
@@ -562,100 +573,46 @@ impl AppendBlock {
     }
 
     pub fn of(request: &Request) -> Result<(EnId, DiskId, AppendBlock)> {
-        if matches!(request.args.first(), Some(Arg::Struct(..))) {
-            let (mut payload, rest) = structure(&request.args, request.op, "an append request")?;
-            if !rest.is_empty() {
-                return Err(Error::new("an append block has arguments after its payload"));
-            }
-            let en = EnId::of_number(payload.number()?)?;
-            let disk = DiskId::of_number(payload.number()?)?;
-            let sn = SnId::of_number(payload.number()?)?;
-            let extent = ExtentId::of_number(payload.number()?)?;
-            let created = TimeSec::new(payload.number()?);
-            let kind = payload.number()?;
-            let width = payload.number()?;
-            let crc = payload.number()?;
-            let holds = crate::block::Holds {
-                compressed: crate::offset::ECoff::of_number(payload.number()?)?,
-                logical: crate::offset::ELoff::of_number(payload.number()?)?,
-                records: crate::offset::ERoff::of_number(payload.number()?)?,
-            };
-            let has_logical = payload.flag()?;
-            let logical = payload.number()?;
-            let count = payload.number()? as usize;
-            let mut instances = Vec::with_capacity(count);
-            for _ in 0..count {
-                instances.push((
-                    EnId::of_number(payload.number()?)?,
-                    DiskId::of_number(payload.number()?)?,
-                ));
-            }
-            let bytes = payload.bytes()?;
-            payload.done()?;
-            return Ok((
-                en,
-                disk,
-                AppendBlock {
-                    sn,
-                    extent,
-                    created,
-                    framing: crate::framing::Framing::of_wire(kind, width)?,
-                    crc,
-                    holds,
-                    instances,
-                    logical_offset: has_logical.then(|| ELoff::of_number(logical)).transpose()?,
-                    bytes,
-                },
-            ));
+        let (mut payload, rest) = structure(&request.args, request.op, "an append request")?;
+        if !rest.is_empty() {
+            return Err(Error::new("an append block has arguments after its payload"));
         }
-        let args = tagged(&request.args, Op::AppendBlock, "an append block")?;
-        let [
-            Arg::Number(en),
-            Arg::Number(disk),
-            Arg::Number(sn),
-            Arg::Number(extent),
-            Arg::Number(created),
-            Arg::Number(kind),
-            Arg::Number(width),
-            Arg::Number(crc),
-            rest @ ..,
-        ] = args
-        else {
-            return Err(Error::new("an append does not have the shape of one"));
+        let en = EnId::of_number(payload.number()?)?;
+        let disk = DiskId::of_number(payload.number()?)?;
+        let sn = SnId::of_number(payload.number()?)?;
+        let extent = ExtentId::of_number(payload.number()?)?;
+        let created = TimeSec::new(payload.number()?);
+        let kind = payload.number()?;
+        let width = payload.number()?;
+        let crc = payload.number()?;
+        let holds = crate::block::Holds {
+            compressed: crate::offset::ECoff::of_number(payload.number()?)?,
+            logical: crate::offset::ELoff::of_number(payload.number()?)?,
+            records: crate::offset::ERoff::of_number(payload.number()?)?,
         };
-        let framing = crate::framing::Framing::of_wire(*kind, *width)?;
-        let (holds, rest) = crate::block::Holds::of_args(rest)?;
-        let [Arg::Flag(has_logical), Arg::Number(logical), instances @ ..] = rest else {
-            return Err(Error::new("an append says what its logical offset is"));
-        };
-        let Some((Arg::Bytes(bytes), instances)) = instances.split_last() else {
-            return Err(Error::new("an append carries bytes last"));
-        };
-        if instances.len() % 2 != 0 {
-            return Err(Error::new("an append instance list must be (en, disk) pairs"));
+        let has_logical = payload.flag()?;
+        let logical = payload.number()?;
+        let count = payload.number()? as usize;
+        let mut instances = Vec::with_capacity(count);
+        for _ in 0..count {
+            instances
+                .push((EnId::of_number(payload.number()?)?, DiskId::of_number(payload.number()?)?));
         }
-        let mut parsed = Vec::with_capacity(instances.len() / 2);
-        for chunk in instances.chunks_exact(2) {
-            match chunk {
-                [Arg::Number(en), Arg::Number(disk)] => {
-                    parsed.push((EnId::of_number(*en)?, DiskId::of_number(*disk)?));
-                }
-                _ => return Err(Error::new("an instance list is numbers")),
-            }
-        }
+        let bytes = payload.bytes()?;
+        payload.done()?;
         Ok((
-            EnId::of_number(*en)?,
-            DiskId::of_number(*disk)?,
+            en,
+            disk,
             AppendBlock {
-                sn: SnId::of_number(*sn)?,
-                extent: ExtentId::of_number(*extent)?,
-                created: TimeSec::new(*created),
-                framing,
-                crc: *crc,
+                sn,
+                extent,
+                created,
+                framing: crate::framing::Framing::of_wire(kind, width)?,
+                crc,
                 holds,
-                instances: parsed,
-                logical_offset: has_logical.then(|| ELoff::of_number(*logical)).transpose()?,
-                bytes: bytes.clone(),
+                instances,
+                logical_offset: has_logical.then(|| ELoff::of_number(logical)).transpose()?,
+                bytes,
             },
         ))
     }

@@ -181,19 +181,18 @@ impl Extent {
     /// ⚠️ **The caller supplies `first`**, because the extent does not know it. That is
     /// the whole of §17.29.1 in one signature: position is the stream's to say.
     fn args(&self, first: SRoff, disk_table: &[(EnId, DiskId)]) -> Vec<Arg> {
-        let mut args = vec![
-            Arg::Number(self.id.number()),
-            Arg::Number(self.created.number()),
-            Arg::Number(first.number()),
-            Arg::Number(self.records.number()),
-            Arg::Number(self.disks.len() as u64),
-        ];
+        let mut payload = StructWriter::new();
+        payload.number(self.id.number());
+        payload.number(self.created.number());
+        payload.number(first.number());
+        payload.number(self.records.number());
+        payload.number(self.disks.len() as u64);
         for sn_disk in &self.disks {
             let (en, disk) = disk_table[sn_disk.get() as usize];
-            args.push(Arg::Number(en.number()));
-            args.push(Arg::Number(disk.number()));
+            payload.number(en.number());
+            payload.number(disk.number());
         }
-        args
+        vec![payload.finish(Op::ExtentResponse)]
     }
 }
 
@@ -530,32 +529,24 @@ impl SN {
     /// converts them to the object's numbering, because it is the tier that holds each
     /// stream's first record (§17.22).
     fn list(&self, request: &Request) -> Response {
-        let asked = if matches!(request.args.first(), Some(Arg::Struct(Op::ListExtents, _))) {
-            let (mut payload, rest) =
-                match structure(&request.args, Op::ListExtents, "a list-extents request") {
-                    Ok(value) => value,
-                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
-                };
-            let asked = match Listing::read_payload(&mut payload) {
-                Ok(asked) => asked,
+        let (mut payload, rest) =
+            match structure(&request.args, Op::ListExtents, "a list-extents request") {
+                Ok(value) => value,
                 Err(e) => return Response::error(Status::BadRequest, e.to_string()),
             };
-            if let Err(e) = payload.done() {
-                return Response::error(Status::BadRequest, e.to_string());
-            }
-            if !rest.is_empty() {
-                return Response::error(
-                    Status::BadRequest,
-                    "a list-extents request has trailing arguments",
-                );
-            }
-            asked
-        } else {
-            match Listing::of_args(&request.args) {
-                Ok(asked) => asked,
-                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
-            }
+        let asked = match Listing::read_payload(&mut payload) {
+            Ok(asked) => asked,
+            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
         };
+        if let Err(e) = payload.done() {
+            return Response::error(Status::BadRequest, e.to_string());
+        }
+        if !rest.is_empty() {
+            return Response::error(
+                Status::BadRequest,
+                "a list-extents request has trailing arguments",
+            );
+        }
         let mut args = Vec::new();
         let mut room = asked.limit;
         for (name, from) in &asked.at {

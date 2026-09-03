@@ -28,7 +28,6 @@ use common::routing;
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::wire::{Arg, Op, Request, Response, Status, StructWriter, structure};
-use common::{Error, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -55,38 +54,13 @@ const SERVES: &[Op] = &[
 
 const SHARDS: usize = 64;
 
+const BATCH_ANSWERS: u64 = Detail::Streams.bit() | Detail::Counts.bit();
+
 /// Which `Detail` bits this build actually answers.
 ///
 /// **Streams and counts locally; extents and instances by asking the SNs** (§17.22). Capabilities
 /// need the key of #82 and the stream flags of §4.1.1 do not exist — so a caller asking for those is
 /// told which by name rather than handed an answer that quietly omits what it asked for.
-const ANSWERS: u64 =
-    Detail::Streams.bit() | Detail::Counts.bit() | Detail::Extents.bit() | Detail::Instances.bit();
-
-/// And what a *batch* answers, which is less.
-///
-/// ⚠️ **Extents are missing on purpose rather than by oversight.** One object's extents cost one ask per
-/// SN (§17.22); a batch of a thousand names would want them grouped across *every* object at once, which
-/// is the same gather over a wider set. Until that exists a batch says so by name, because an answer
-/// that quietly dropped the level asked for is the failure §17's rule exists to prevent.
-const BATCH_ANSWERS: u64 = Detail::Streams.bit() | Detail::Counts.bit();
-
-/// What a lookup wants, and a refusal naming the parts of it this build cannot supply.
-///
-/// **A request with no want field is `Want::plain()`**, which is exactly today's answer — so every
-/// caller that predates the field keeps working and keeps costing what it cost (§9.1.3.11).
-fn wanted(args: &[Arg], answers: u64) -> Result<Want> {
-    let want = match args {
-        [] => Want::plain(),
-        _ => Want::of_args(args)?.0,
-    };
-    let beyond = want.beyond(answers);
-    if !beyond.is_empty() {
-        return Err(Error::new(format!("object-info cannot yet return {}", beyond.join(", "))));
-    }
-    Ok(want)
-}
-
 /// The answer for a lookup: the plain row when a record was named or no detail was
 /// asked for, and the levelled answer otherwise.
 ///
@@ -661,8 +635,10 @@ impl Service for DN {
                         "a locate-stream request has trailing arguments",
                     ));
                 }
-                let mut request = Request::new(Op::ObjectInfo);
-                request.args.push(Arg::Text(path));
+                let mut payload = StructWriter::new();
+                payload.text(&path);
+                payload.flag(false);
+                let request = Request::new(Op::ObjectInfo).structure(payload);
                 self.info(process, &request, Some(record), reply)
             }
             Op::ExtendObject => self.extend(process, &request, reply),
@@ -686,50 +662,41 @@ impl DN {
     fn create(self: &Arc<Self>, process: &Arc<Process>, request: &Request, reply: Reply) {
         // Only the first few arguments are the object; a create may carry more —
         // media class, an expiry — that nothing here reads yet.
-        let wanted = if matches!(request.args.first(), Some(Arg::Struct(Op::CreateObject, _))) {
-            let (mut payload, rest) =
-                match structure(&request.args, Op::CreateObject, "a create-object request") {
-                    Ok(value) => value,
-                    Err(e) => {
-                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
-                    }
-                };
-            let wanted = match Wanted::read(&mut payload) {
-                Ok(wanted) => wanted,
-                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
-            };
-            // These fields are currently accepted for the CLI's create options but are not
-            // interpreted by the DN yet. Keep them inside the command payload so the parser
-            // still validates the complete value.
-            if let Err(e) = payload.text() {
-                return reply.send(Response::error(Status::BadRequest, e.to_string()));
-            }
-            let has_expiry = match payload.flag() {
-                Ok(has_expiry) => has_expiry,
-                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
-            };
-            if has_expiry {
-                if let Err(e) = payload.number() {
+        let (mut payload, rest) =
+            match structure(&request.args, Op::CreateObject, "a create-object request") {
+                Ok(value) => value,
+                Err(e) => {
                     return reply.send(Response::error(Status::BadRequest, e.to_string()));
                 }
-            }
-            if let Err(e) = payload.done() {
+            };
+        let wanted = match Wanted::read(&mut payload) {
+            Ok(wanted) => wanted,
+            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+        };
+        // These fields are currently accepted for the CLI's create options but are not
+        // interpreted by the DN yet. Keep them inside the command payload so the parser
+        // still validates the complete value.
+        if let Err(e) = payload.text() {
+            return reply.send(Response::error(Status::BadRequest, e.to_string()));
+        }
+        let has_expiry = match payload.flag() {
+            Ok(has_expiry) => has_expiry,
+            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+        };
+        if has_expiry {
+            if let Err(e) = payload.number() {
                 return reply.send(Response::error(Status::BadRequest, e.to_string()));
             }
-            if !rest.is_empty() {
-                return reply.send(Response::error(
-                    Status::BadRequest,
-                    "a create-object request has trailing arguments",
-                ));
-            }
-            wanted
-        } else {
-            let head = request.args.get(..Wanted::ARGS).unwrap_or_default();
-            match Wanted::of_args(head) {
-                Ok(wanted) => wanted,
-                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
-            }
-        };
+        }
+        if let Err(e) = payload.done() {
+            return reply.send(Response::error(Status::BadRequest, e.to_string()));
+        }
+        if !rest.is_empty() {
+            return reply.send(Response::error(
+                Status::BadRequest,
+                "a create-object request has trailing arguments",
+            ));
+        }
         let name = wanted.name.clone();
         self.record(process, vec![wanted], reply, move |dn, made| {
             if made == 0 {
@@ -747,43 +714,35 @@ impl DN {
     /// A run of `(name, keyed)` pairs, which costs one stream request and one
     /// answer however many objects it holds.
     fn create_many(self: &Arc<Self>, process: &Arc<Process>, request: &Request, reply: Reply) {
-        let wanted = if matches!(request.args.first(), Some(Arg::Struct(Op::BatchCreate, _))) {
-            let (mut payload, rest) =
-                match structure(&request.args, Op::BatchCreate, "a batch-create request") {
-                    Ok(value) => value,
-                    Err(e) => {
-                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
-                    }
-                };
-            let count = match payload.number() {
-                Ok(count) => count as usize,
-                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+        let (mut payload, rest) =
+            match structure(&request.args, Op::BatchCreate, "a batch-create request") {
+                Ok(value) => value,
+                Err(e) => {
+                    return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                }
             };
-            let mut wanted = Vec::with_capacity(count);
-            for _ in 0..count {
-                match Wanted::read(&mut payload) {
-                    Ok(one) => wanted.push(one),
-                    Err(e) => {
-                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
-                    }
+        let count = match payload.number() {
+            Ok(count) => count as usize,
+            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+        };
+        let mut wanted = Vec::with_capacity(count);
+        for _ in 0..count {
+            match Wanted::read(&mut payload) {
+                Ok(one) => wanted.push(one),
+                Err(e) => {
+                    return reply.send(Response::error(Status::BadRequest, e.to_string()));
                 }
             }
-            if let Err(e) = payload.done() {
-                return reply.send(Response::error(Status::BadRequest, e.to_string()));
-            }
-            if !rest.is_empty() {
-                return reply.send(Response::error(
-                    Status::BadRequest,
-                    "a batch-create request has trailing arguments",
-                ));
-            }
-            wanted
-        } else {
-            match Wanted::all_of_args(&request.args) {
-                Ok(wanted) => wanted,
-                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
-            }
-        };
+        }
+        if let Err(e) = payload.done() {
+            return reply.send(Response::error(Status::BadRequest, e.to_string()));
+        }
+        if !rest.is_empty() {
+            return reply.send(Response::error(
+                Status::BadRequest,
+                "a batch-create request has trailing arguments",
+            ));
+        }
         self.record(process, wanted, reply, |_, made| Response {
             id: 0,
             status: Status::Ok,
@@ -1051,9 +1010,7 @@ impl DN {
         record: Option<ORoff>,
         reply: Reply,
     ) {
-        let (name, want) = if record.is_none()
-            && matches!(request.args.first(), Some(Arg::Struct(..)))
-        {
+        let (name, want) = if matches!(request.args.first(), Some(Arg::Struct(..))) {
             let (mut payload, rest) =
                 match structure(&request.args, Op::ObjectInfo, "an object-info request") {
                     Ok(value) => value,
@@ -1090,20 +1047,10 @@ impl DN {
             }
             (name, want)
         } else {
-            let (name, rest) = match request.args.as_slice() {
-                [Arg::Text(name), rest @ ..] => (name.as_str(), rest),
-                _ => {
-                    return reply
-                        .send(Response::error(Status::BadRequest, "object-info takes a name"));
-                }
-            };
-            // `locate-stream` puts a record number where a want field would be.
-            let rest = if record.is_some() { &rest[1..] } else { rest };
-            let want = match wanted(rest, ANSWERS) {
-                Ok(want) => want,
-                Err(e) => return reply.send(Response::error(Status::Unimplemented, e.to_string())),
-            };
-            (name.to_string(), want)
+            return reply.send(Response::error(
+                Status::BadRequest,
+                "object-info requires a structured payload",
+            ));
         };
         let name = name.as_str();
         let limit = self.config.info_entries;
@@ -1287,7 +1234,7 @@ impl DN {
     fn info_many(&self, request: &Request) -> Response {
         // The names, then one want field for all of them — a batch asks the same question about
         // every name, so carrying it per name would repeat it a thousand times (§9.1.3.11).
-        let (names, want) = if matches!(request.args.first(), Some(Arg::Struct(..))) {
+        let (names, want) = {
             let (mut payload, rest) =
                 match structure(&request.args, Op::BatchInfo, "a batch-object-info request") {
                     Ok(value) => value,
@@ -1326,24 +1273,14 @@ impl DN {
                 );
             }
             (names, want)
-        } else {
-            let split = request.args.iter().position(|arg| !matches!(arg, Arg::Text(_)));
-            let (names, rest) = request.args.split_at(split.unwrap_or(request.args.len()));
-            let want = match wanted(rest, BATCH_ANSWERS) {
-                Ok(want) => want,
-                Err(e) => return Response::error(Status::Unimplemented, e.to_string()),
-            };
-            (
-                names
-                    .iter()
-                    .filter_map(|arg| match arg {
-                        Arg::Text(name) => Some(name.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-                want,
-            )
         };
+        let beyond = want.beyond(BATCH_ANSWERS);
+        if !beyond.is_empty() {
+            return Response::error(
+                Status::Unimplemented,
+                format!("object-info cannot yet return {}", beyond.join(", ")),
+            );
+        }
         let limit = match want.limit {
             0 => self.config.info_entries,
             asked => asked.min(self.config.info_entries),
@@ -1857,13 +1794,18 @@ mod tests {
     }
 
     fn batch_of(dn: &Arc<DN>, names: &[&str], want: Option<Want>) -> Response {
-        let mut request = Request::new(Op::BatchInfo);
+        let mut payload = StructWriter::new();
+        payload.number(names.len() as u64);
         for name in names {
-            request = request.text(*name);
+            payload.text(name);
         }
         if let Some(want) = want {
-            request.args.extend(want.args());
+            payload.flag(true);
+            want.write(&mut payload);
+        } else {
+            payload.flag(false);
         }
+        let request = Request::new(Op::BatchInfo).structure(payload);
         dn.info_many(&request)
     }
 
@@ -1996,19 +1938,24 @@ mod tests {
     #[test]
     fn a_create_reads_its_first_four_arguments() {
         let (kind, width) = Framing::CrLf.wire();
-        let args =
-            vec![Arg::Text("/x".into()), Arg::Flag(true), Arg::Number(kind), Arg::Number(width)];
-        let wanted = Wanted::of_args(&args).expect("an object");
+        let wanted = Wanted { name: "/x".into(), keyed: true, framing: Framing::CrLf };
+        let mut payload = StructWriter::new();
+        wanted.write(&mut payload);
+        let request = Request::new(Op::CreateObject).structure(payload);
+        let (mut reader, rest) = structure(&request.args, Op::CreateObject, "a create").unwrap();
+        assert!(rest.is_empty());
+        let wanted = Wanted::read(&mut reader).expect("an object");
         assert_eq!((wanted.name.as_str(), wanted.keyed), ("/x", true));
         assert_eq!(wanted.framing, Framing::CrLf);
 
-        // A media class after the framing is not this tier's business, and the head
-        // of the request still parses.
-        let mut more = args.clone();
-        more.push(Arg::Text("ssd".into()));
-        assert!(Wanted::of_args(&more[..Wanted::ARGS]).is_ok());
-        // But a framing that means nothing is a bad request.
-        let bad = vec![Arg::Text("/x".into()), Arg::Flag(false), Arg::Number(9), Arg::Number(0)];
-        assert!(Wanted::of_args(&bad).is_err());
+        let mut bad = StructWriter::new();
+        bad.text("/x");
+        bad.flag(false);
+        bad.number(kind + 100);
+        bad.number(width);
+        let request = Request::new(Op::CreateObject).structure(bad);
+        let (mut reader, rest) = structure(&request.args, Op::CreateObject, "a create").unwrap();
+        assert!(rest.is_empty());
+        assert!(Wanted::read(&mut reader).is_err());
     }
 }

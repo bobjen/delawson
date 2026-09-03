@@ -1044,87 +1044,53 @@ impl EN {
     }
 
     fn read(&self, process: &Process, request: &Request) -> Response {
-        if matches!(request.args.first(), Some(Arg::Struct(Op::ReadExtent, _))) {
-            let (mut payload, rest) =
-                match structure(&request.args, Op::ReadExtent, "a read-extent request") {
-                    Ok(value) => value,
-                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
-                };
-            let en = match payload.number() {
+        let (mut payload, rest) =
+            match structure(&request.args, Op::ReadExtent, "a read-extent request") {
                 Ok(value) => value,
                 Err(e) => return Response::error(Status::BadRequest, e.to_string()),
             };
-            let disk = match payload.number() {
-                Ok(value) => value,
-                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
-            };
-            let sn = match payload.number() {
-                Ok(value) => value,
-                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
-            };
-            let extent = match payload.number() {
-                Ok(value) => value,
-                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
-            };
-            let created = match payload.number() {
-                Ok(value) => value,
-                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
-            };
-            let range = match Range::read_nested(&mut payload) {
-                Ok(range) => range,
-                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
-            };
-            if let Err(e) = payload.done() {
-                return Response::error(Status::BadRequest, e.to_string());
-            }
-            if !rest.is_empty() {
-                return Response::error(
-                    Status::BadRequest,
-                    "a read-extent request has trailing arguments",
-                );
-            }
-            let mine = EnId::new(process.entry.number());
-            if en != mine.number() {
-                return Response::error(
-                    Status::BadRequest,
-                    format!("read aimed at EN{en} reached EN{mine}"),
-                );
-            }
-            return match DiskId::of_number(disk).and_then(|id| self.disk(id)) {
-                Ok(disk) => disk.read(process, sn, extent, created, range),
-                Err(e) => Response::error(Status::BadRequest, e.to_string()),
-            };
+        let en = match payload.number() {
+            Ok(value) => value,
+            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+        };
+        let disk = match payload.number() {
+            Ok(value) => value,
+            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+        };
+        let sn = match payload.number() {
+            Ok(value) => value,
+            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+        };
+        let extent = match payload.number() {
+            Ok(value) => value,
+            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+        };
+        let created = match payload.number() {
+            Ok(value) => value,
+            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+        };
+        let range = match Range::read_nested(&mut payload) {
+            Ok(range) => range,
+            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+        };
+        if let Err(e) = payload.done() {
+            return Response::error(Status::BadRequest, e.to_string());
         }
-        let [Arg::Number(en), Arg::Number(disk), rest @ ..] = request.args.as_slice() else {
+        if !rest.is_empty() {
             return Response::error(
                 Status::BadRequest,
-                "read-extent takes an EnId, a DiskId, an SnId, an extent, a second and a range",
+                "a read-extent request has trailing arguments",
             );
-        };
+        }
         let mine = EnId::new(process.entry.number());
-        if *en != mine.number() {
+        if en != mine.number() {
             return Response::error(
                 Status::BadRequest,
                 format!("read aimed at EN{en} reached EN{mine}"),
             );
         }
-        match DiskId::of_number(*disk).and_then(|id| self.disk(id)) {
-            Ok(disk) => {
-                let [Arg::Number(sn), Arg::Number(extent), Arg::Number(created), rest @ ..] = rest
-                else {
-                    return Response::error(
-                        Status::BadRequest,
-                        "read-extent takes an SnId, an extent, a second and a range",
-                    );
-                };
-                match Range::of_args(rest) {
-                    Ok((range, [])) => disk.read(process, *sn, *extent, *created, range),
-                    _ => Response::error(
-                        Status::BadRequest,
-                        "read-extent takes an SnId, an extent, a second and a range",
-                    ),
-                }
-            }
+        match DiskId::of_number(disk).and_then(|id| self.disk(id)) {
+            Ok(disk) => disk.read(process, sn, extent, created, range),
             Err(e) => Response::error(Status::BadRequest, e.to_string()),
         }
     }

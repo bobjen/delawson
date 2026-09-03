@@ -90,7 +90,7 @@ impl Described {
     /// And back, returning whatever followed it. `None` for a row marked missing,
     /// since a zero id is not an object.
     pub fn of_args(args: &[Arg]) -> Result<(Option<Described>, &[Arg])> {
-        if matches!(args.first(), Some(Arg::Struct(..))) {
+        {
             let (mut payload, rest) = structure(args, Op::Described, "a described row")?;
             let object = ObjectName {
                 range: RangeId::of_number(payload.number()?)?,
@@ -125,40 +125,6 @@ impl Described {
                 rest,
             ));
         }
-        let args = tagged(args, Op::Described, "a described row")?;
-        let (object, after) = ObjectName::of_args(args)?;
-        let [Arg::Number(dn), after @ ..] = after else {
-            return Err(Error::new("that answer did not describe an object"));
-        };
-        let (stream, after) = StreamName::of_args(after)?;
-        let [
-            Arg::Number(sn),
-            Arg::Flag(keyed),
-            Arg::Number(kind),
-            Arg::Number(width),
-            Arg::Number(first_record),
-            rest @ ..,
-        ] = after
-        else {
-            return Err(Error::new("that answer did not describe an object"));
-        };
-        // ⚠️ A zero *object id* is what marks a missing name, not a zero range: range 0 is a real
-        // range, and an id is minted from one so it is never zero for a thing that exists.
-        if object.object.is_none() {
-            return Ok((None, rest));
-        }
-        Ok((
-            Some(Described {
-                object,
-                dn: DnId::of_number(*dn)?,
-                stream,
-                sn: SnId::of_number(*sn)?,
-                keyed: *keyed,
-                framing: Framing::of_wire(*kind, *width)?,
-                first_record: *first_record,
-            }),
-            rest,
-        ))
     }
 
     /// Every row in an answer, in the order asked about. `None` where the name was
@@ -231,7 +197,7 @@ impl Shape {
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Shape, &[Arg])> {
-        if matches!(args.first(), Some(Arg::Struct(..))) {
+        {
             let (mut payload, rest) = structure(args, Op::Shape, "a shape")?;
             let shape = Shape {
                 streams: payload.number()?,
@@ -243,28 +209,6 @@ impl Shape {
             payload.done()?;
             return Ok((shape, rest));
         }
-        let args = tagged(args, Op::Shape, "a shape")?;
-        let [
-            Arg::Number(streams),
-            Arg::Number(given),
-            Arg::Number(extents),
-            Arg::Number(entries),
-            Arg::Number(next),
-            rest @ ..,
-        ] = args
-        else {
-            return Err(Error::new("that answer did not say what shape it was"));
-        };
-        Ok((
-            Shape {
-                streams: *streams,
-                given: *given,
-                extents: *extents,
-                entries: *entries,
-                next: *next,
-            },
-            rest,
-        ))
     }
 }
 
@@ -415,46 +359,6 @@ pub struct Wanted {
 }
 
 impl Wanted {
-    /// Arguments per object, which is what a batch is cut into.
-    pub const ARGS: usize = 4;
-
-    pub fn args(&self) -> Vec<Arg> {
-        let (kind, width) = self.framing.wire();
-        vec![
-            Arg::Text(self.name.clone()),
-            Arg::Flag(self.keyed),
-            Arg::Number(kind),
-            Arg::Number(width),
-        ]
-    }
-
-    pub fn of_args(args: &[Arg]) -> Result<Wanted> {
-        match args {
-            [Arg::Text(name), Arg::Flag(keyed), Arg::Number(kind), Arg::Number(width)] => {
-                Ok(Wanted {
-                    name: name.clone(),
-                    keyed: *keyed,
-                    framing: Framing::of_wire(*kind, *width)?,
-                })
-            }
-            _ => Err(Error::new("a create takes a name, a flavour and a framing")),
-        }
-    }
-
-    /// Every object in a batch. ⚠️ **A trailing part-object is an error, not a truncation**:
-    /// a batch that does not divide is a batch somebody built wrong, and creating the whole
-    /// ones would make a caller's list and the objects that exist disagree silently.
-    pub fn all_of_args(args: &[Arg]) -> Result<Vec<Wanted>> {
-        if !args.len().is_multiple_of(Wanted::ARGS) {
-            return Err(Error::new(format!(
-                "a batch create of {} arguments does not divide into objects of {}",
-                args.len(),
-                Wanted::ARGS
-            )));
-        }
-        args.chunks(Wanted::ARGS).map(Wanted::of_args).collect()
-    }
-
     /// Write one create record into a command-owned payload.
     pub fn write(&self, payload: &mut StructWriter) {
         let (kind, width) = self.framing.wire();
