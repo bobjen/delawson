@@ -26,8 +26,8 @@
 //! the messages are just length-prefixed.
 
 use crate::config::Messaging;
-use crate::ids::{DiskId, EnId, ExtentId, SnId};
-use crate::offset::ELoff;
+use crate::ids::{DiskId, EnId, ExtentId, SnId, StreamId};
+use crate::offset::{ELoff, ERoff, ORoff, SRoff};
 use crate::random::Rng;
 use crate::seal::{self, Seal};
 use crate::time::TimeSec;
@@ -655,6 +655,100 @@ pub struct AppendBlock {
     pub instances: Vec<(EnId, DiskId)>,
     /// The block as stored: compressed, unless compressing it did not help.
     pub bytes: Vec<u8>,
+}
+
+/// The receipt a primary EN returns to FE after an append is durable. FE turns
+/// the extent-local record number into the stream- and object-local numbers
+/// visible to the writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnReceipt {
+    pub sn: SnId,
+    pub logical: ELoff,
+    pub first_record: ERoff,
+    pub records: ERoff,
+    pub extent: ExtentId,
+    pub created: TimeSec,
+    pub length: ELoff,
+}
+
+impl EnReceipt {
+    pub fn write(self) -> Arg {
+        let mut payload = StructWriter::new();
+        payload.number_u32(self.sn.get());
+        payload.number_u32(self.logical.get());
+        payload.number_u32(self.first_record.get());
+        payload.number_u32(self.records.get());
+        payload.number_u32(self.extent.get());
+        payload.number_u64(self.created.number());
+        payload.number_u32(self.length.get());
+        payload.finish(Op::ReceiptResp)
+    }
+
+    pub fn read(args: &[Arg]) -> Result<EnReceipt> {
+        let (mut payload, rest) = structure(args, Op::ReceiptResp, "an EN append receipt")?;
+        let receipt = EnReceipt {
+            sn: SnId::new(payload.number_u32()?),
+            logical: ELoff::new(payload.number_u32()?),
+            first_record: ERoff::new(payload.number_u32()?),
+            records: ERoff::new(payload.number_u32()?),
+            extent: ExtentId::new(payload.number_u32()?),
+            created: TimeSec::new(payload.number_u64()?),
+            length: ELoff::new(payload.number_u32()?),
+        };
+        if !rest.is_empty() {
+            return Err(Error::new("an EN append receipt has trailing arguments"));
+        }
+        payload.done()?;
+        Ok(receipt)
+    }
+}
+
+/// The append receipt exposed to a writer after FE has converted the EN's
+/// extent-local record number into durable stream- and object-local numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Receipt {
+    pub stream: StreamId,
+    pub record: SRoff,
+    pub object_record: ORoff,
+    pub records: ERoff,
+    pub extent: ExtentId,
+    pub created: TimeSec,
+    pub offset: ELoff,
+    pub length: ELoff,
+}
+
+impl Receipt {
+    pub fn write(self) -> Arg {
+        let mut payload = StructWriter::new();
+        payload.number_u32(self.stream.get());
+        payload.number_u64(self.record.number());
+        payload.number_u64(self.object_record.number());
+        payload.number_u32(self.records.get());
+        payload.number_u32(self.extent.get());
+        payload.number_u64(self.created.number());
+        payload.number_u32(self.offset.get());
+        payload.number_u32(self.length.get());
+        payload.finish(Op::ReceiptResp)
+    }
+
+    pub fn read(args: &[Arg]) -> Result<Receipt> {
+        let (mut payload, rest) = structure(args, Op::ReceiptResp, "an append receipt")?;
+        let receipt = Receipt {
+            stream: StreamId::new(payload.number_u32()?),
+            record: SRoff::new(payload.number_u64()?),
+            object_record: ORoff::new(payload.number_u64()?),
+            records: ERoff::new(payload.number_u32()?),
+            extent: ExtentId::new(payload.number_u32()?),
+            created: TimeSec::new(payload.number_u64()?),
+            offset: ELoff::new(payload.number_u32()?),
+            length: ELoff::new(payload.number_u32()?),
+        };
+        if !rest.is_empty() {
+            return Err(Error::new("an append receipt has trailing arguments"));
+        }
+        payload.done()?;
+        Ok(receipt)
+    }
 }
 
 impl AppendBlock {

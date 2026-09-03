@@ -29,7 +29,7 @@ use common::offset::{ECoff, ELoff, ERoff};
 use common::range::{Budget, Covered, Filled, Piece, Range};
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
-use common::wire::{AppendBlock, Arg, Op, Req, Resp, Status, StructWriter, structure};
+use common::wire::{AppendBlock, Arg, EnReceipt, Op, Req, Resp, Status, StructWriter, structure};
 use common::{Error, Result, logw};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -756,20 +756,18 @@ impl Disk {
         let others: Vec<(EnId, DiskId)> =
             appending.instances.iter().filter(|&inst| *inst != mine).cloned().collect();
 
-        let mut receipt = StructWriter::new();
-        for value in [
-            appending.sn.number(),
-            landed.logical.number(),
-            landed.first_record.number(),
-            landed.records.number(),
-            appending.extent.number(),
-            appending.created.number(),
-            landed.offset.number(),
-            length as u64,
-        ] {
-            receipt.number_u64(value);
-        }
-        let receipt = vec![receipt.finish(Op::ReceiptResp)];
+        let receipt = vec![
+            EnReceipt {
+                sn: appending.sn,
+                logical: landed.logical,
+                first_record: landed.first_record,
+                records: landed.records,
+                extent: appending.extent,
+                created: appending.created,
+                length: appending.holds.logical,
+            }
+            .write(),
+        ];
 
         let quorum_wants = process.cluster.extents.quorum;
         let pending = Arc::new(Pending::new(receipt, quorum_wants, reply));
@@ -872,7 +870,14 @@ impl Disk {
         held.range(&self.daily_cache, &self.extent_cache, process, place, from, budget)
     }
 
-    fn read(&self, process: &Process, sn: u64, extent: u64, created: u64, range: Range) -> Resp {
+    fn read(
+        &self,
+        process: &Process,
+        sn: SnId,
+        extent: ExtentId,
+        created: TimeSec,
+        range: Range,
+    ) -> Resp {
         let Some(from) = range.start.record() else {
             return Resp::error(
                 Status::Unimplemented,
@@ -881,14 +886,14 @@ impl Disk {
         };
 
         let held = self.held.lock().expect("extents");
-        match held.created(SnId::new(sn as u32), ExtentId::new(extent as u32)) {
+        match held.created(sn, extent) {
             None => {
                 return Resp::error(
                     Status::NotFound,
                     format!("no extent {extent} of sn {sn} here"),
                 );
             }
-            Some(second) if second != TimeSec::new(created) => {
+            Some(second) if second != created => {
                 return Resp::error(
                     Status::NotFound,
                     format!("extent {extent} of sn {sn} was made in second {second}"),
@@ -900,13 +905,7 @@ impl Disk {
             Ok(from) => from,
             Err(e) => return Resp::error(Status::NotFound, e.to_string()),
         };
-        let ranged = match self.range(
-            process,
-            SnId::new(sn as u32),
-            ExtentId::new(extent as u32),
-            from,
-            range.budget,
-        ) {
+        let ranged = match self.range(process, sn, extent, from, range.budget) {
             Ok(Some(ranged)) => ranged,
             Ok(None) => {
                 return Resp::error(
@@ -1050,23 +1049,23 @@ impl EN {
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
         let en = match payload.number_u32() {
-            Ok(value) => value as u64,
+            Ok(value) => EnId::new(value),
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let disk = match payload.number_u16() {
-            Ok(value) => value as u64,
+            Ok(value) => DiskId::new(value),
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let sn = match payload.number_u32() {
-            Ok(value) => value as u64,
+            Ok(value) => SnId::new(value),
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let extent = match payload.number_u32() {
-            Ok(value) => value as u64,
+            Ok(value) => ExtentId::new(value),
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let created = match payload.number_u64() {
-            Ok(value) => value,
+            Ok(value) => TimeSec::new(value),
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let range = match Range::read_nested(&mut payload) {
@@ -1080,13 +1079,13 @@ impl EN {
             return Resp::error(Status::BadRequest, "a read-extent request has trailing arguments");
         }
         let mine = EnId::new(process.entry.number());
-        if en != mine.number() {
+        if en != mine {
             return Resp::error(
                 Status::BadRequest,
                 format!("read aimed at EN{en} reached EN{mine}"),
             );
         }
-        match DiskId::of_number(disk).and_then(|id| self.disk(id)) {
+        match self.disk(disk) {
             Ok(disk) => disk.read(process, sn, extent, created, range),
             Err(e) => Resp::error(Status::BadRequest, e.to_string()),
         }

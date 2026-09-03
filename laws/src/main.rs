@@ -14,14 +14,14 @@ use common::block::{Holds, expand, squeeze};
 use common::config::Compress;
 use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
-use common::ids::{ObjectId, RangeId, StreamId};
+use common::ids::{ObjectId, RangeId};
 use common::info::{Batch, Described, Expecting, ExtentRow, ObjectName, Shape, StreamRow, UNKNOWN};
 use common::placement::{self, Expansion};
 
 use common::random::Rng;
 use common::range::{Budget, Covered, Detail, Piece, Range, Start, Want};
 use common::time::TimeSec;
-use common::wire::{Arg, Op, Req, Resp, Status, structure};
+use common::wire::{Arg, Op, Receipt, Req, Resp, Status, structure};
 use common::{Error, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -1214,33 +1214,36 @@ fn frame(framing: Framing, record: &[u8]) -> Result<Vec<u8>> {
 /// What an append answers: where the bytes went, once a quorum of instances had
 /// them. Five numbers read as one line rather than five.
 fn receipt(target: &Target, response: &Resp) -> Result<()> {
-    if let [
-        Arg::Number(stream),
-        Arg::Number(record),
-        Arg::Number(object_record),
-        Arg::Number(records),
-        Arg::Number(extent),
-        Arg::Number(created),
-        Arg::Number(offset),
-        Arg::Number(length),
-    ] = response.args.as_slice()
-    {
-        let stream = StreamId::of_number(*stream)?;
+    if let Ok(receipt) = Receipt::read(&response.args) {
         // The record number to read it back by comes first, then the durable
         // reference it is made of, then where the bytes went.
-        match records {
+        match receipt.records.get() {
             0 => println!(
-                "{} stream {stream}, no record finished yet, {length} bytes at offset {offset} of extent {extent}",
-                target.identity
+                "{} stream {}, no record finished yet, {} bytes at offset {} of extent {}",
+                target.identity, receipt.stream, receipt.length, receipt.offset, receipt.extent
             ),
             1 => println!(
-                "{} record {object_record} (stream {stream} record {record}), {length} logical bytes at logical offset {offset} of extent {extent} made in second {created}",
-                target.identity
+                "{} record {} (stream {} record {}), {} logical bytes at logical offset {} of extent {} made in second {}",
+                target.identity,
+                receipt.object_record,
+                receipt.stream,
+                receipt.record,
+                receipt.length,
+                receipt.offset,
+                receipt.extent,
+                receipt.created
             ),
             _ => println!(
-                "{} records {object_record} to {} (stream {stream} from record {record}), {length} bytes at offset {offset} of extent {extent} made in second {created}",
+                "{} records {} to {} (stream {} from record {}), {} bytes at offset {} of extent {} made in second {}",
                 target.identity,
-                object_record + records - 1
+                receipt.object_record,
+                receipt.object_record.number() + receipt.records.get() as u64 - 1,
+                receipt.stream,
+                receipt.record,
+                receipt.length,
+                receipt.offset,
+                receipt.extent,
+                receipt.created
             ),
         }
         return Ok(());
