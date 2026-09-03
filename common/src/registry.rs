@@ -5,7 +5,7 @@
 //! way.
 
 use crate::config::ServiceKind;
-use crate::wire::{Arg, Op, Request, Response, Status, StructWriter, structure};
+use crate::wire::{Arg, Op, Req, Resp, Status, StructWriter, structure};
 use crate::{Error, Result};
 use std::net::SocketAddr;
 
@@ -20,14 +20,14 @@ pub struct Peer {
 
 impl Peer {
     /// The registration request this peer sends to KS.
-    pub fn request(&self) -> Request {
+    pub fn request(&self) -> Req {
         let mut payload = StructWriter::new();
         payload.text(&self.identity);
         payload.text(self.kind.as_str());
         payload.text(&self.address.to_string());
         payload.text(&self.domain.join("/"));
         payload.text(self.media_class.as_deref().unwrap_or_default());
-        Request::new(Op::Register).structure(payload)
+        Req::new(Op::Register).structure(payload)
     }
 
     pub fn from_args(args: &[Arg]) -> Result<Peer> {
@@ -66,8 +66,8 @@ impl Peer {
 }
 
 /// Every peer KS knows, one text argument each.
-pub fn response(peers: impl IntoIterator<Item = Peer>) -> Response {
-    Response {
+pub fn response(peers: impl IntoIterator<Item = Peer>) -> Resp {
+    Resp {
         id: 0,
         status: Status::Ok,
         args: peers.into_iter().map(|peer| Arg::Text(peer.line())).collect(),

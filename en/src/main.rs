@@ -29,7 +29,7 @@ use common::offset::{ECoff, ELoff, ERoff};
 use common::range::{Budget, Covered, Filled, Piece, Range};
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
-use common::wire::{AppendBlock, Arg, Op, Request, Response, Status, StructWriter, structure};
+use common::wire::{AppendBlock, Arg, Op, Req, Resp, Status, StructWriter, structure};
 use common::{Error, Result, logw};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,7 +60,7 @@ impl DailyKeyCache {
         let mut payload = StructWriter::new();
         payload.number(sn_id.number());
         payload.number(day);
-        let ask = Request::new(Op::SnMasterKey).structure(payload);
+        let ask = Req::new(Op::SnMasterKey).structure(payload);
         let key_cell = Arc::new(Mutex::new([0u8; 32]));
         let key_cell2 = Arc::clone(&key_cell);
         let error_cell = Arc::new(Mutex::new(None));
@@ -661,7 +661,7 @@ impl Disk {
         for i in 0..appending.instances.len() {
             for j in i + 1..appending.instances.len() {
                 if appending.instances[i] == appending.instances[j] {
-                    reply.send(Response::error(
+                    reply.send(Resp::error(
                         Status::BadRequest,
                         format!("duplicate instance {:?} in replica set", appending.instances[i]),
                     ));
@@ -671,7 +671,7 @@ impl Disk {
         }
 
         if appending.holds.logical.get() > process.cluster.extents.max_append_bytes {
-            reply.send(Response::error(
+            reply.send(Resp::error(
                 Status::BadRequest,
                 format!(
                     "append of {} logical bytes exceeds maximum {}",
@@ -685,7 +685,7 @@ impl Disk {
             && appending.holds.records == ERoff::ZERO
             && appending.holds.logical > ELoff::ZERO
         {
-            reply.send(Response::error(
+            reply.send(Resp::error(
                 Status::BadRequest,
                 "non-fixed-offset appends may not leave an open record",
             ));
@@ -705,7 +705,7 @@ impl Disk {
         let length: u32 = match u32::try_from(appending.bytes.len()) {
             Ok(len) => len,
             Err(_) => {
-                reply.send(Response::error(Status::BadRequest, "append bytes exceed 32 bits"));
+                reply.send(Resp::error(Status::BadRequest, "append bytes exceed 32 bits"));
                 return Ok(());
             }
         };
@@ -741,7 +741,7 @@ impl Disk {
                     came_to.logical,
                     came_to.compressed
                 ));
-                reply.send(Response { id: 0, status: Status::Sealed, args: came_to.args() });
+                reply.send(Resp { id: 0, status: Status::Sealed, args: came_to.args() });
                 return Ok(());
             }
         };
@@ -833,15 +833,15 @@ impl Disk {
         }
     }
 
-    fn apply(&self, process: &Process, appending: AppendBlock) -> Response {
+    fn apply(&self, process: &Process, appending: AppendBlock) -> Resp {
         match self.held.lock().expect("extents").apply(
             &self.daily_cache,
             &self.extent_cache,
             process,
             &appending,
         ) {
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
-            Ok(Applied::Already) => return Response::ok(),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+            Ok(Applied::Already) => return Resp::ok(),
             Ok(Applied::Stored) => {}
         }
         self.appends.fetch_add(1, Ordering::Relaxed);
@@ -849,7 +849,7 @@ impl Disk {
         if appending.holds.records > ERoff::ZERO {
             self.finish(appending.sn, appending.extent);
         }
-        Response::ok()
+        Resp::ok()
     }
 
     fn range(
@@ -865,16 +865,9 @@ impl Disk {
         held.range(&self.daily_cache, &self.extent_cache, process, place, from, budget)
     }
 
-    fn read(
-        &self,
-        process: &Process,
-        sn: u64,
-        extent: u64,
-        created: u64,
-        range: Range,
-    ) -> Response {
+    fn read(&self, process: &Process, sn: u64, extent: u64, created: u64, range: Range) -> Resp {
         let Some(from) = range.start.record() else {
-            return Response::error(
+            return Resp::error(
                 Status::Unimplemented,
                 "starting from a logical offset needs a prefix sum nothing keeps yet",
             );
@@ -883,13 +876,13 @@ impl Disk {
         let held = self.held.lock().expect("extents");
         match held.created(SnId::new(sn as u32), ExtentId::new(extent as u32)) {
             None => {
-                return Response::error(
+                return Resp::error(
                     Status::NotFound,
                     format!("no extent {extent} of sn {sn} here"),
                 );
             }
             Some(second) if second != TimeSec::new(created) => {
-                return Response::error(
+                return Resp::error(
                     Status::NotFound,
                     format!("extent {extent} of sn {sn} was made in second {second}"),
                 );
@@ -898,7 +891,7 @@ impl Disk {
         }
         let from = match ERoff::of_number(from) {
             Ok(from) => from,
-            Err(e) => return Response::error(Status::NotFound, e.to_string()),
+            Err(e) => return Resp::error(Status::NotFound, e.to_string()),
         };
         let ranged = match self.range(
             process,
@@ -909,19 +902,19 @@ impl Disk {
         ) {
             Ok(Some(ranged)) => ranged,
             Ok(None) => {
-                return Response::error(
+                return Resp::error(
                     Status::NotFound,
                     format!("{extent} of sn {sn} has no record {from}"),
                 );
             }
-            Err(e) => return Response::error(Status::Internal, e.to_string()),
+            Err(e) => return Resp::error(Status::Internal, e.to_string()),
         };
 
         let mut args = ranged.covered.args();
         for piece in ranged.pieces {
             args.extend(piece.args());
         }
-        Response { id: 0, status: Status::Ok, args }
+        Resp { id: 0, status: Status::Ok, args }
     }
 
     fn status(&self, _process: &Process, config: &ENConfig) -> Vec<String> {
@@ -981,7 +974,7 @@ impl Service for EN {
         )
     }
 
-    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Request, reply: Reply) {
+    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
         match request.op {
             Op::AppendExtent => self.append(process, request, reply),
             Op::ApplyAppend => reply.send(self.apply(process, request)),
@@ -1003,14 +996,14 @@ impl Service for EN {
 }
 
 impl EN {
-    fn append(self: &Arc<Self>, process: &Arc<Process>, request: Request, reply: Reply) {
+    fn append(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
         let (en, disk_id, appending) = match AppendBlock::of(&request) {
             Ok(res) => res,
-            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
         };
         let mine = EnId::new(process.entry.number());
         if en != mine {
-            return reply.send(Response::error(
+            return reply.send(Resp::error(
                 Status::BadRequest,
                 format!("append aimed at EN{en} reached EN{mine}"),
             ));
@@ -1021,77 +1014,74 @@ impl EN {
                     logw!("append failed", "disk {disk_id},{e}");
                 }
             }
-            Err(e) => reply.send(Response::error(Status::BadRequest, e.to_string())),
+            Err(e) => reply.send(Resp::error(Status::BadRequest, e.to_string())),
         }
     }
 
-    fn apply(&self, process: &Process, request: Request) -> Response {
+    fn apply(&self, process: &Process, request: Req) -> Resp {
         let (en, disk_id, appending) = match AppendBlock::of(&request) {
             Ok(res) => res,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let mine = EnId::new(process.entry.number());
         if en != mine {
-            return Response::error(
+            return Resp::error(
                 Status::BadRequest,
                 format!("apply aimed at EN{en} reached EN{mine}"),
             );
         }
         match self.disk(disk_id) {
             Ok(disk) => disk.apply(process, appending),
-            Err(e) => Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => Resp::error(Status::BadRequest, e.to_string()),
         }
     }
 
-    fn read(&self, process: &Process, request: &Request) -> Response {
+    fn read(&self, process: &Process, request: &Req) -> Resp {
         let (mut payload, rest) =
             match structure(&request.args, Op::ReadExtent, "a read-extent request") {
                 Ok(value) => value,
-                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
         let en = match payload.number() {
             Ok(value) => value,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let disk = match payload.number() {
             Ok(value) => value,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let sn = match payload.number() {
             Ok(value) => value,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let extent = match payload.number() {
             Ok(value) => value,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let created = match payload.number() {
             Ok(value) => value,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let range = match Range::read_nested(&mut payload) {
             Ok(range) => range,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         if let Err(e) = payload.done() {
-            return Response::error(Status::BadRequest, e.to_string());
+            return Resp::error(Status::BadRequest, e.to_string());
         }
         if !rest.is_empty() {
-            return Response::error(
-                Status::BadRequest,
-                "a read-extent request has trailing arguments",
-            );
+            return Resp::error(Status::BadRequest, "a read-extent request has trailing arguments");
         }
         let mine = EnId::new(process.entry.number());
         if en != mine.number() {
-            return Response::error(
+            return Resp::error(
                 Status::BadRequest,
                 format!("read aimed at EN{en} reached EN{mine}"),
             );
         }
         match DiskId::of_number(disk).and_then(|id| self.disk(id)) {
             Ok(disk) => disk.read(process, sn, extent, created, range),
-            Err(e) => Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => Resp::error(Status::BadRequest, e.to_string()),
         }
     }
 }
@@ -1200,14 +1190,14 @@ impl Pending {
             return;
         }
         if let Some(reply) = gates.reply.take() {
-            reply.send(Response { id: 0, status: Status::Ok, args: self.receipt.clone() });
+            reply.send(Resp { id: 0, status: Status::Ok, args: self.receipt.clone() });
         }
     }
 
     fn lost(&self) {
         let mut gates = self.gates.lock().expect("pending");
         if let Some(reply) = gates.reply.take() {
-            reply.send(Response::error(
+            reply.send(Resp::error(
                 Status::Internal,
                 format!("could not reach a quorum of {} instances", self.quorum),
             ));

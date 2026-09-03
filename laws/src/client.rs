@@ -9,7 +9,7 @@
 //! request is separate and independently answerable; only the transport coalesces.
 
 use common::config::Messaging;
-use common::wire::{self, Link, Request, Response, Status, put_request};
+use common::wire::{self, Link, Req, Resp, Status, put_request};
 use common::{Context, Error, Result};
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream};
@@ -31,7 +31,7 @@ impl Conn {
 
     /// Buffer a request without waiting for it, and return the id to expect back.
     /// Nothing goes out until a flush, which seals whatever has piled up.
-    pub fn send(&mut self, request: &Request) -> Result<u32> {
+    pub fn send(&mut self, request: &Req) -> Result<u32> {
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
         put_request(&mut self.link.plain, &request.clone().id(id))?;
@@ -43,11 +43,11 @@ impl Conn {
         wire.send(plain)
     }
 
-    pub fn recv(&mut self) -> Result<Response> {
+    pub fn recv(&mut self) -> Result<Resp> {
         self.link.reader.response()
     }
 
-    pub fn call(&mut self, request: &Request) -> Result<Response> {
+    pub fn call(&mut self, request: &Req) -> Result<Resp> {
         let id = self.send(request)?;
         self.flush()?;
         let response = self.recv()?;
@@ -59,7 +59,7 @@ impl Conn {
 
     /// One request, timed. The work inside a `ping` is a few hundred
     /// instructions, so what this measures is almost entirely message overhead.
-    pub fn timed(&mut self, request: &Request) -> Result<(Response, Duration)> {
+    pub fn timed(&mut self, request: &Req) -> Result<(Resp, Duration)> {
         let start = Instant::now();
         let response = self.call(request)?;
         Ok((response, start.elapsed()))
@@ -73,7 +73,7 @@ impl Conn {
     /// throughput.
     pub fn press(
         &mut self,
-        request: &Request,
+        request: &Req,
         depth: usize,
         until: Instant,
         tally: &mut Tally,

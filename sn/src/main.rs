@@ -20,7 +20,7 @@ use common::offset::{ECoff, ELoff, ERoff, SCoff, SLoff, SRoff};
 use common::range::Filled;
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
-use common::wire::{Arg, Op, Request, Response, Status, StructReader, StructWriter, structure};
+use common::wire::{Arg, Op, Req, Resp, Status, StructReader, StructWriter, structure};
 use common::{Error, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -316,7 +316,7 @@ impl Service for SN {
         matches!(op, Op::Ping | Op::Status | Op::Shutdown | Op::Sites)
     }
 
-    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Request, mut reply: Reply) {
+    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, mut reply: Reply) {
         // The stream range, which is what a DN's line for the same request says.
         if let [Arg::Number(range), Arg::Number(first), Arg::Number(count), ..] =
             request.args.as_slice()
@@ -326,7 +326,7 @@ impl Service for SN {
         reply.send(self.answer(process, &request));
     }
 
-    fn answer(&self, process: &Process, request: &Request) -> Response {
+    fn answer(&self, process: &Process, request: &Req) -> Resp {
         match request.op {
             Op::CreateStream => self.create(request),
             Op::OpenExtent => self.open_extent(process, request),
@@ -366,43 +366,43 @@ impl SN {
     /// `(RangeId, first StreamId, count, creation second)`. A DN creating many
     /// objects at once names a run of streams in one request, and they share the second —
     /// so it is the consecutive ids that keep the names apart (#110).
-    fn create(&self, request: &Request) -> Response {
+    fn create(&self, request: &Req) -> Resp {
         let (mut payload, rest) =
             match structure(&request.args, Op::CreateStream, "a create-stream request") {
                 Ok(value) => value,
-                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
         if !rest.is_empty() {
-            return Response::error(
+            return Resp::error(
                 Status::BadRequest,
                 "a create-stream request has trailing arguments",
             );
         }
         let range = match payload.number().and_then(RangeId::of_number) {
             Ok(value) => value,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let first = match payload.number().and_then(StreamId::of_number) {
             Ok(value) => value,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let count = match payload.number() {
             Ok(value) => value,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let created = match payload.number() {
             Ok(value) => TimeSec::new(value),
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         if let Err(e) = payload.done() {
-            return Response::error(Status::BadRequest, e.to_string());
+            return Resp::error(Status::BadRequest, e.to_string());
         }
 
         for n in 0..count {
             // Every stream of the run shares the second, which is what makes the ids have to
             // differ — and they do, being consecutive (#110).
             let Ok(stream) = StreamId::of_number(first.number() + n) else {
-                return Response::error(
+                return Resp::error(
                     Status::BadRequest,
                     format!("{} is not a stream", first.number() + n),
                 );
@@ -422,37 +422,37 @@ impl SN {
             );
         }
         self.streams.fetch_add(count, Ordering::Relaxed);
-        Response::ok()
+        Resp::ok()
     }
 
     /// A stream's name, and back comes the extent to append to. The ENs are taken from the
     /// roster, and the second from the clock.
-    fn open_extent(&self, process: &Process, request: &Request) -> Response {
+    fn open_extent(&self, process: &Process, request: &Req) -> Resp {
         let (mut payload, rest) =
             match structure(&request.args, Op::OpenExtent, "an open-extent request") {
                 Ok(value) => value,
-                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
         if !rest.is_empty() {
-            return Response::error(
+            return Resp::error(
                 Status::BadRequest,
                 "an open-extent request has trailing arguments",
             );
         }
         let name = match stream_name(&mut payload).and_then(|name| payload.done().map(|()| name)) {
             Ok(name) => name,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         match self.open(name, TimeSec::now(), process.cluster.extents.instances) {
-            Ok(placed) => Response {
+            Ok(placed) => Resp {
                 id: 0,
                 status: Status::Ok,
                 args: placed.extent.args(placed.first, &self.disks),
             },
             Err(Full { records, why: None }) => {
-                Response { id: 0, status: Status::Sealed, args: vec![Arg::Number(records)] }
+                Resp { id: 0, status: Status::Sealed, args: vec![Arg::Number(records)] }
             }
-            Err(Full { why: Some(why), .. }) => Response::error(Status::Internal, why.to_string()),
+            Err(Full { why: Some(why), .. }) => Resp::error(Status::Internal, why.to_string()),
         }
     }
 
@@ -460,21 +460,21 @@ impl SN {
     /// starts at or before that record. Whether the record is actually there is
     /// the EN's to say: an SN keeps its byte and record totals lazily, so it
     /// routes a read and does not bound it.
-    fn locate(&self, request: &Request) -> Response {
+    fn locate(&self, request: &Req) -> Resp {
         let (mut payload, rest) =
             match structure(&request.args, Op::LocateRecord, "a locate-record request") {
                 Ok(value) => value,
-                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
         if !rest.is_empty() {
-            return Response::error(
+            return Resp::error(
                 Status::BadRequest,
                 "a locate-record request has trailing arguments",
             );
         }
         let name = match stream_name(&mut payload) {
             Ok(name) => name,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let record = match payload
             .number()
@@ -482,17 +482,17 @@ impl SN {
             .and_then(|record| payload.done().map(|()| record))
         {
             Ok(record) => record,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let shard = self.shards[shard_of(name)].lock().expect("streams");
         let Some(held) = shard.get(&name) else {
-            return Response::error(Status::NotFound, format!("no {name}"));
+            return Resp::error(Status::NotFound, format!("no {name}"));
         };
         // The sealed extents are in record order, so this is a walk over a sorted run,
         // accumulating each extent's start as it goes (§17.29.1).
         if let Some((first, sealed)) = held.sealed_from().find(|(first, s)| s.holds(*first, record))
         {
-            return Response {
+            return Resp {
                 id: 0,
                 status: Status::Ok,
                 args: sealed.extent.args(first, &self.disks),
@@ -502,12 +502,12 @@ impl SN {
             // How far the open extent reaches is not known here — an SN keeps its
             // record totals lazily — so anything at or past its first record is
             // routed to it and the EN says whether it is there.
-            Some(extent) if record >= held.sealed_records => Response {
+            Some(extent) if record >= held.sealed_records => Resp {
                 id: 0,
                 status: Status::Ok,
                 args: extent.args(held.sealed_records, &self.disks),
             },
-            Some(_) | None => Response::error(
+            Some(_) | None => Resp::error(
                 Status::NotFound,
                 format!("{name} has no extent holding record {record}"),
             ),
@@ -528,21 +528,21 @@ impl SN {
     /// ⚠️ **Record numbers here are stream-local**, which is what an SN knows. The DN
     /// converts them to the object's numbering, because it is the tier that holds each
     /// stream's first record (§17.22).
-    fn list(&self, request: &Request) -> Response {
+    fn list(&self, request: &Req) -> Resp {
         let (mut payload, rest) =
             match structure(&request.args, Op::ListExtents, "a list-extents request") {
                 Ok(value) => value,
-                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
         let asked = match Listing::read_payload(&mut payload) {
             Ok(asked) => asked,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         if let Err(e) = payload.done() {
-            return Response::error(Status::BadRequest, e.to_string());
+            return Resp::error(Status::BadRequest, e.to_string());
         }
         if !rest.is_empty() {
-            return Response::error(
+            return Resp::error(
                 Status::BadRequest,
                 "a list-extents request has trailing arguments",
             );
@@ -552,7 +552,7 @@ impl SN {
         for (name, from) in &asked.at {
             let shard = self.shards[shard_of(*name)].lock().expect("streams");
             let Some(held) = shard.get(name) else {
-                return Response::error(Status::NotFound, format!("no {name}"));
+                return Resp::error(Status::NotFound, format!("no {name}"));
             };
             let (run, rows) = self.run_of(held, name.stream, *from, room);
             room = room.saturating_sub(rows.len() as u64);
@@ -561,7 +561,7 @@ impl SN {
                 args.extend(row.args());
             }
         }
-        Response { id: 0, status: Status::Ok, args }
+        Resp { id: 0, status: Status::Ok, args }
     }
 
     /// One stream's run, up to `room` rows.
@@ -653,25 +653,22 @@ impl SN {
 
     /// A stream's name, the sealed extent and what it came to: record it and open the next
     /// one, which is one round trip rather than two because whoever saw the seal wants both.
-    fn seal(&self, process: &Process, request: &Request) -> Response {
+    fn seal(&self, process: &Process, request: &Req) -> Resp {
         let (mut payload, rest) =
             match structure(&request.args, Op::SealExtent, "a seal-extent request") {
                 Ok(value) => value,
-                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
         if !rest.is_empty() {
-            return Response::error(
-                Status::BadRequest,
-                "a seal-extent request has trailing arguments",
-            );
+            return Resp::error(Status::BadRequest, "a seal-extent request has trailing arguments");
         }
         let name = match stream_name(&mut payload) {
             Ok(name) => name,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let id = match payload.number().and_then(ExtentId::of_number) {
             Ok(id) => id,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let came_to = match (
             payload.number(),
@@ -680,14 +677,11 @@ impl SN {
         ) {
             (Ok(records), Ok(logical), Ok(compressed)) => Filled { records, logical, compressed },
             _ => {
-                return Response::error(
-                    Status::BadRequest,
-                    "seal-extent has invalid extent totals",
-                );
+                return Resp::error(Status::BadRequest, "seal-extent has invalid extent totals");
             }
         };
         if let Err(e) = payload.done() {
-            return Response::error(Status::BadRequest, e.to_string());
+            return Resp::error(Status::BadRequest, e.to_string());
         }
         match self.close(
             name,
@@ -697,7 +691,7 @@ impl SN {
             process.cluster.extents.instances,
             process.cluster.extents.per_stream,
         ) {
-            Ok(placed) => Response {
+            Ok(placed) => Resp {
                 id: 0,
                 status: Status::Ok,
                 args: placed.extent.args(placed.first, &self.disks),
@@ -705,9 +699,9 @@ impl SN {
             // The stream is full, which is the DN's business: it says what the
             // stream came to so the object's next stream can carry on from there.
             Err(Full { records, why: None }) => {
-                Response { id: 0, status: Status::Sealed, args: vec![Arg::Number(records)] }
+                Resp { id: 0, status: Status::Sealed, args: vec![Arg::Number(records)] }
             }
-            Err(Full { why: Some(why), .. }) => Response::error(Status::Internal, why.to_string()),
+            Err(Full { why: Some(why), .. }) => Resp::error(Status::Internal, why.to_string()),
         }
     }
 
@@ -902,7 +896,7 @@ mod tests {
 
     fn sn_with_stream(range: u32, stream: u32) -> SN {
         let sn = SN::new(testing::sn_config(), SnId::new(0), default_disks());
-        let made = sn.create(&Request::new(Op::CreateStream).structure({
+        let made = sn.create(&Req::new(Op::CreateStream).structure({
             let mut payload = StructWriter::new();
             payload.number(range as u64);
             payload.number(stream as u64);
@@ -1005,10 +999,13 @@ mod tests {
         // And the answer on the wire says so, which is the argument that was wrong: third
         // field is the first record, fourth is the count.
         let answer = next.extent.args(next.first, &sn.disks);
-        let [_, _, Arg::Number(at), Arg::Number(records), ..] = answer.as_slice() else {
-            panic!("an extent answers with an id, a second, a first record and a count")
-        };
-        assert_eq!((*at, *records), (12, 0), "starts at 12, holds nothing yet");
+        let (mut payload, rest) = structure(&answer, Op::ExtentResponse, "an extent").unwrap();
+        assert!(rest.is_empty());
+        let _id = payload.number().unwrap();
+        let _created = payload.number().unwrap();
+        let at = payload.number().unwrap();
+        let records = payload.number().unwrap();
+        assert_eq!((at, records), (12, 0), "starts at 12, holds nothing yet");
     }
 
     /// An extent already sealed by somebody else does not fail: the caller wanted
@@ -1121,13 +1118,13 @@ mod tests {
             payload.number(7);
             payload.number(MADE.number());
             payload.number(record);
-            let ask = Request::new(Op::LocateRecord).structure(payload);
+            let ask = Req::new(Op::LocateRecord).structure(payload);
             let answer = sn.locate(&ask);
             assert_eq!(answer.status, Status::Ok, "record {record}");
-            match answer.args.first() {
-                Some(Arg::Number(id)) => *id,
-                _ => panic!("no extent"),
-            }
+            let (mut payload, rest) =
+                structure(&answer.args, Op::ExtentResponse, "an extent").expect("an extent");
+            assert!(rest.is_empty());
+            payload.number().expect("an extent id")
         };
         // Records 0 to 2 are in the first extent, 3 and 4 in the second, and
         // anything from 5 on is routed to the one still open.
@@ -1149,7 +1146,7 @@ mod tests {
             payload.number(7);
             payload.number(MADE.number());
             payload.number(0);
-            Request::new(Op::LocateRecord).structure(payload)
+            Req::new(Op::LocateRecord).structure(payload)
         });
         assert_eq!(answer.status, Status::NotFound);
     }

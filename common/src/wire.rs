@@ -164,7 +164,7 @@ ops! {
     Piece = 51, "piece";
     AppendBlock = 52, "append-block";
     Expecting = 53, "expecting";
-    // Response payloads have their own identifiers so their formats can evolve
+    // Resp payloads have their own identifiers so their formats can evolve
     // independently of the requests that caused them. This also leaves the door
     // open to batching both directions in one stream without making request and
     // response formats ambiguous.
@@ -378,7 +378,7 @@ impl std::fmt::Display for Arg {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Request {
+pub struct Req {
     /// Chosen by the caller, echoed by the response. Unique among that caller's
     /// outstanding requests, and nothing more.
     pub id: u32,
@@ -387,42 +387,40 @@ pub struct Request {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Response {
+pub struct Resp {
     pub id: u32,
     pub status: Status,
     pub args: Vec<Arg>,
 }
 
 /// Short names for the two wire directions. They are aliases, not new types.
-pub type Req = Request;
-pub type Resp = Response;
 
-impl Request {
-    pub fn new(op: Op) -> Request {
-        Request { id: 0, op, args: Vec::new() }
+impl Req {
+    pub fn new(op: Op) -> Req {
+        Req { id: 0, op, args: Vec::new() }
     }
 
-    pub fn id(mut self, id: u32) -> Request {
+    pub fn id(mut self, id: u32) -> Req {
         self.id = id;
         self
     }
 
-    pub fn text(mut self, text: impl Into<String>) -> Request {
+    pub fn text(mut self, text: impl Into<String>) -> Req {
         self.args.push(Arg::Text(text.into()));
         self
     }
 
-    pub fn number(mut self, n: u64) -> Request {
+    pub fn number(mut self, n: u64) -> Req {
         self.args.push(Arg::Number(n));
         self
     }
 
-    pub fn flag(mut self, b: bool) -> Request {
+    pub fn flag(mut self, b: bool) -> Req {
         self.args.push(Arg::Flag(b));
         self
     }
 
-    pub fn bytes(mut self, bytes: Vec<u8>) -> Request {
+    pub fn bytes(mut self, bytes: Vec<u8>) -> Req {
         self.args.push(Arg::Bytes(bytes));
         self
     }
@@ -430,7 +428,7 @@ impl Request {
     /// Put this command's self-contained payload in the request. The request's
     /// `Op` is the command tag; the payload is positional and parsed by the
     /// command, not by generic wire code.
-    pub fn structure(mut self, payload: StructWriter) -> Request {
+    pub fn structure(mut self, payload: StructWriter) -> Req {
         self.args.push(payload.finish(self.op));
         self
     }
@@ -448,7 +446,7 @@ impl Request {
         }
     }
 
-    fn decode(payload: &[u8]) -> Result<Request> {
+    fn decode(payload: &[u8]) -> Result<Req> {
         let mut reader = Cursor::new(payload);
         let id = reader.u32()?;
         let op = Op::from_code(reader.u16()?)?;
@@ -458,35 +456,35 @@ impl Request {
         } else {
             reader.args_with_count(count)?
         };
-        Ok(Request { id, op, args })
+        Ok(Req { id, op, args })
     }
 }
 
-impl Response {
-    pub fn ok() -> Response {
-        Response { id: 0, status: Status::Ok, args: Vec::new() }
+impl Resp {
+    pub fn ok() -> Resp {
+        Resp { id: 0, status: Status::Ok, args: Vec::new() }
     }
 
-    pub fn text(text: impl Into<String>) -> Response {
-        Response { id: 0, status: Status::Ok, args: vec![Arg::Text(text.into())] }
+    pub fn text(text: impl Into<String>) -> Resp {
+        Resp { id: 0, status: Status::Ok, args: vec![Arg::Text(text.into())] }
     }
 
-    pub fn error(status: Status, message: impl Into<String>) -> Response {
-        Response { id: 0, status, args: vec![Arg::Text(message.into())] }
+    pub fn error(status: Status, message: impl Into<String>) -> Resp {
+        Resp { id: 0, status, args: vec![Arg::Text(message.into())] }
     }
 
-    pub fn flag(mut self, b: bool) -> Response {
+    pub fn flag(mut self, b: bool) -> Resp {
         self.args.push(Arg::Flag(b));
         self
     }
 
-    pub fn bytes(mut self, bytes: Vec<u8>) -> Response {
+    pub fn bytes(mut self, bytes: Vec<u8>) -> Resp {
         self.args.push(Arg::Bytes(bytes));
         self
     }
 
     /// Answer this request, whenever the answer is ready.
-    pub fn to(mut self, request: &Request) -> Response {
+    pub fn to(mut self, request: &Req) -> Resp {
         self.id = request.id;
         self
     }
@@ -505,11 +503,11 @@ impl Response {
         encode_args(&self.args, out);
     }
 
-    fn decode(payload: &[u8]) -> Result<Response> {
+    fn decode(payload: &[u8]) -> Result<Resp> {
         let mut reader = Cursor::new(payload);
         let id = reader.u32()?;
         let status = Status::from_code(reader.u16()?)?;
-        Ok(Response { id, status, args: reader.args()? })
+        Ok(Resp { id, status, args: reader.args()? })
     }
 }
 
@@ -545,8 +543,8 @@ pub struct AppendBlock {
 }
 
 impl AppendBlock {
-    pub fn request(&self, en: EnId, disk: DiskId, op: Op) -> Request {
-        let mut request = Request::new(op);
+    pub fn request(&self, en: EnId, disk: DiskId, op: Op) -> Req {
+        let mut request = Req::new(op);
         let mut payload = StructWriter::new();
         let (kind, width) = self.framing.wire();
         payload.number(en.number());
@@ -572,7 +570,7 @@ impl AppendBlock {
         request
     }
 
-    pub fn of(request: &Request) -> Result<(EnId, DiskId, AppendBlock)> {
+    pub fn of(request: &Req) -> Result<(EnId, DiskId, AppendBlock)> {
         let (mut payload, rest) = structure(&request.args, request.op, "an append request")?;
         if !rest.is_empty() {
             return Err(Error::new("an append block has arguments after its payload"));
@@ -833,12 +831,12 @@ impl Reader {
         self.seal.open(&header, &sealed, &mut self.open)
     }
 
-    pub fn request(&mut self) -> Result<Request> {
-        Request::decode(self.next()?)
+    pub fn request(&mut self) -> Result<Req> {
+        Req::decode(self.next()?)
     }
 
-    pub fn response(&mut self) -> Result<Response> {
-        Response::decode(self.next()?)
+    pub fn response(&mut self) -> Result<Resp> {
+        Resp::decode(self.next()?)
     }
 }
 
@@ -928,11 +926,11 @@ impl Outbox {
 }
 
 /// Append a message to a plain buffer, to be sealed with whatever else is there.
-pub fn put_request(plain: &mut Vec<u8>, request: &Request) -> Result<()> {
+pub fn put_request(plain: &mut Vec<u8>, request: &Req) -> Result<()> {
     frame_into(plain, |buf| request.encode(buf))
 }
 
-pub fn put_response(plain: &mut Vec<u8>, response: &Response) -> Result<()> {
+pub fn put_response(plain: &mut Vec<u8>, response: &Resp) -> Result<()> {
     frame_into(plain, |buf| response.encode(buf))
 }
 
@@ -944,7 +942,7 @@ pub struct Link {
 }
 
 impl Link {
-    pub fn call(&mut self, request: &Request) -> Result<Response> {
+    pub fn call(&mut self, request: &Req) -> Result<Resp> {
         put_request(&mut self.plain, request)?;
         self.wire.send(&mut self.plain)?;
         self.reader.response()
@@ -995,17 +993,17 @@ pub fn accept(stream: TcpStream, config: &Messaging) -> Result<(Reader, Wire)> {
 mod tests {
     use super::*;
 
-    fn round_trip_request(request: &Request) -> Request {
+    fn round_trip_request(request: &Req) -> Req {
         let mut plain = Vec::new();
         put_request(&mut plain, request).unwrap();
         let length = u32::from_le_bytes(plain[..4].try_into().unwrap()) as usize;
         assert_eq!(length + 4, plain.len());
-        Request::decode(&plain[4..]).unwrap()
+        Req::decode(&plain[4..]).unwrap()
     }
 
     #[test]
     fn req_round_trip() {
-        let request = Request::new(Op::AppendRecord)
+        let request = Req::new(Op::AppendRecord)
             .id(7)
             .text("/bob/notes")
             .number(17)
@@ -1019,19 +1017,18 @@ mod tests {
         let mut payload = StructWriter::new();
         payload.number(7);
         payload.number(42);
-        let request = Request::new(Op::SnMasterKey).structure(payload);
+        let request = Req::new(Op::SnMasterKey).structure(payload);
         assert_eq!(round_trip_request(&request), request);
         assert!(
-            encoded_len(&request)
-                < encoded_len(&Request::new(Op::SnMasterKey).number(7).number(42))
+            encoded_len(&request) < encoded_len(&Req::new(Op::SnMasterKey).number(7).number(42))
         );
     }
 
     #[test]
     fn a_shape_is_one_self_contained_wire_argument() {
         let shape = crate::info::Shape { streams: 3, given: 2, extents: 7, entries: 9, next: 11 };
-        let compact = Request { id: 7, op: Op::BatchInfo, args: shape.args() };
-        let expanded = Request {
+        let compact = Req { id: 7, op: Op::BatchInfo, args: shape.args() };
+        let expanded = Req {
             id: 7,
             op: Op::BatchInfo,
             args: vec![
@@ -1047,7 +1044,7 @@ mod tests {
         assert_eq!(round_trip_request(&compact).args, compact.args);
     }
 
-    fn encoded_len(request: &Request) -> usize {
+    fn encoded_len(request: &Req) -> usize {
         let mut plain = Vec::new();
         put_request(&mut plain, request).unwrap();
         plain.len()
@@ -1055,10 +1052,10 @@ mod tests {
 
     #[test]
     fn resp_round_trip() {
-        let response = Response::error(Status::Unimplemented, "no FE yet");
+        let response = Resp::error(Status::Unimplemented, "no FE yet");
         let mut plain = Vec::new();
         put_response(&mut plain, &response).unwrap();
-        assert_eq!(Response::decode(&plain[4..]).unwrap(), response);
+        assert_eq!(Resp::decode(&plain[4..]).unwrap(), response);
     }
 
     /// The shape both an FE and an EN read, so neither counts positions.
@@ -1117,9 +1114,9 @@ mod tests {
 
     #[test]
     fn an_append_of_the_wrong_shape_is_refused() {
-        assert!(AppendBlock::of(&Request::new(Op::AppendExtent).number(1)).is_err());
+        assert!(AppendBlock::of(&Req::new(Op::AppendExtent).number(1)).is_err());
         // Everything but the bytes.
-        let headless = Request::new(Op::AppendExtent)
+        let headless = Req::new(Op::AppendExtent)
             .number(0) // en
             .number(0) // disk
             .number(0) // sn
@@ -1151,19 +1148,19 @@ mod tests {
     #[test]
     fn truncated_frame_errs() {
         let mut plain = Vec::new();
-        put_request(&mut plain, &Request::new(Op::Ping).text("hello")).unwrap();
+        put_request(&mut plain, &Req::new(Op::Ping).text("hello")).unwrap();
         plain.truncate(plain.len() - 2);
-        assert!(Request::decode(&plain[4..]).is_err());
+        assert!(Req::decode(&plain[4..]).is_err());
     }
 
     #[test]
     fn no_trailing_bytes() {
         let mut plain = Vec::new();
         frame_into(&mut plain, |buf| {
-            Request::new(Op::Ping).encode(buf);
+            Req::new(Op::Ping).encode(buf);
             buf.push(0xff);
         })
         .unwrap();
-        assert!(Request::decode(&plain[4..]).is_err());
+        assert!(Req::decode(&plain[4..]).is_err());
     }
 }

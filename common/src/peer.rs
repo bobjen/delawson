@@ -12,7 +12,7 @@
 //! for startup paths where there is nothing else to get on with.
 
 use crate::config::Messaging;
-use crate::wire::{self, Outbox, Request, Response, put_request};
+use crate::wire::{self, Outbox, Req, Resp, put_request};
 use crate::{Error, Result};
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream};
@@ -21,7 +21,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 struct Slot {
-    answer: Mutex<Option<Response>>,
+    answer: Mutex<Option<Resp>>,
     arrived: Condvar,
 }
 
@@ -33,7 +33,7 @@ thread_local! {
         Arc::new(Slot { answer: Mutex::new(None), arrived: Condvar::new() });
 }
 
-type Then = Box<dyn FnOnce(Response) + Send>;
+type Then = Box<dyn FnOnce(Resp) + Send>;
 
 pub struct Peer {
     sending: Arc<Outbox>,
@@ -71,7 +71,7 @@ impl Peer {
         Ok(peer)
     }
 
-    fn deliver(&self, response: Response) {
+    fn deliver(&self, response: Resp) {
         let then = self.waiting.lock().expect("peer").remove(&response.id);
         if let Some(then) = then {
             then(response);
@@ -82,11 +82,7 @@ impl Peer {
     /// handled on this connection's reader thread, so whatever asked is free to
     /// get on with something else — a request waiting on another process must not
     /// hold a worker while it waits.
-    pub fn ask(
-        &self,
-        request: &Request,
-        then: impl FnOnce(Response) + Send + 'static,
-    ) -> Result<()> {
+    pub fn ask(&self, request: &Req, then: impl FnOnce(Resp) + Send + 'static) -> Result<()> {
         if self.broken.load(Ordering::SeqCst) {
             return Err(Error::new("the connection to that process has ended"));
         }
@@ -111,7 +107,7 @@ impl Peer {
     /// Ask and wait. For a startup path with nothing else to get on with; a
     /// request being served uses `ask`, or it holds a thread while another
     /// process works.
-    pub fn call(&self, request: &Request) -> Result<Response> {
+    pub fn call(&self, request: &Req) -> Result<Resp> {
         let slot = SLOT.with(Arc::clone);
         *slot.answer.lock().expect("slot") = None;
         let waiting = Arc::clone(&slot);

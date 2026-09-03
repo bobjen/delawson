@@ -47,8 +47,7 @@ use crate::random::Rng;
 use crate::registry::Peer;
 use crate::routing;
 use crate::wire::{
-    self, Arg, BUF_BYTES, MAX_FRAME_BYTES, Op, Request, Response, Status, Wire, put_response,
-    structure,
+    self, Arg, BUF_BYTES, MAX_FRAME_BYTES, Op, Req, Resp, Status, Wire, put_response, structure,
 };
 use crate::{Context, Error, Result};
 use crate::{logd, logi, logn, logsec, logw};
@@ -102,14 +101,14 @@ pub trait Service: Send + Sync + Sized + 'static {
     /// Everything but the control operations, which are answered here. The
     /// default is for a type that answers on the spot; override `handle` to
     /// answer later.
-    fn answer(&self, process: &Process, request: &Request) -> Response {
+    fn answer(&self, process: &Process, request: &Req) -> Resp {
         unbuilt(process, self.serves(), request)
     }
 
     /// Answer, now or later. Whoever takes the `Reply` owes exactly one answer,
     /// whenever it has one — taking `Arc<Self>` so a handler can carry itself into
     /// the answer it is waiting for.
-    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Request, reply: Reply) {
+    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
         reply.send(self.answer(process, &request));
     }
 
@@ -219,7 +218,7 @@ impl Process {
         payload.text(identity);
         let response = ask(
             self.cluster.ks.address,
-            &Request::new(Op::Lookup).structure(payload),
+            &Req::new(Op::Lookup).structure(payload),
             self.timeout(),
             &self.cluster.messaging,
         )?;
@@ -239,15 +238,15 @@ impl Process {
     pub fn ask(
         &self,
         identity: &str,
-        request: &Request,
-        then: impl FnOnce(Response) + Send + 'static,
+        request: &Req,
+        then: impl FnOnce(Resp) + Send + 'static,
     ) -> Result<()> {
         let peer = self.peers.get(identity, || self.peer(identity))?;
         peer.ask(request, then)
     }
 
     /// Ask and wait, for a startup path with nothing else to get on with.
-    pub fn call(&self, identity: &str, request: &Request) -> Result<Response> {
+    pub fn call(&self, identity: &str, request: &Req) -> Result<Resp> {
         let peer = self.peers.get(identity, || self.peer(identity))?;
         peer.call(request)
     }
@@ -365,10 +364,10 @@ impl Pool {
 /// One request on a fresh connection, for the few calls a daemon makes itself.
 pub fn ask(
     address: SocketAddr,
-    request: &Request,
+    request: &Req,
     timeout: Duration,
     config: &Messaging,
-) -> Result<Response> {
+) -> Result<Resp> {
     let stream =
         TcpStream::connect_timeout(&address, timeout).context(format!("connecting {address}"))?;
     stream.set_read_timeout(Some(timeout))?;
@@ -377,11 +376,11 @@ pub fn ask(
 
 /// The answer for an operation this machine type has not built, or should never
 /// have been sent.
-pub fn unbuilt(process: &Process, serves: &[Op], request: &Request) -> Response {
+pub fn unbuilt(process: &Process, serves: &[Op], request: &Req) -> Resp {
     if serves.contains(&request.op) {
-        Response::error(Status::Unimplemented, format!("{} is not built yet", request.op))
+        Resp::error(Status::Unimplemented, format!("{} is not built yet", request.op))
     } else {
-        Response::error(
+        Resp::error(
             Status::BadRequest,
             format!("{} does not serve {}", process.entry.kind.as_str().to_uppercase(), request.op),
         )
@@ -542,9 +541,9 @@ impl Reply {
         }
     }
 
-    pub fn send(self, response: Response) {
+    pub fn send(self, response: Resp) {
         let status = response.status;
-        let response = Response { id: self.id, ..response };
+        let response = Resp { id: self.id, ..response };
         if let Err(e) = self.out.put(&response, self.settled) {
             logw!("could not answer", "op {},{e}", self.op);
         }
@@ -593,7 +592,7 @@ impl Batch {
 
     /// Frame outside the lock, then hold it only for the copy. Wake the sender
     /// only when it has something to wake for.
-    fn put(&self, response: &Response) -> Result<()> {
+    fn put(&self, response: &Resp) -> Result<()> {
         SCRATCH.with(|scratch| {
             let mut framed = scratch.borrow_mut();
             framed.clear();
@@ -702,7 +701,7 @@ impl Out {
     /// `settled` means the caller knows nothing more is coming right now, so a
     /// direct writer should flush. It means nothing to a sender, which decides
     /// for itself.
-    fn put(&self, response: &Response, settled: bool) -> Result<()> {
+    fn put(&self, response: &Resp, settled: bool) -> Result<()> {
         if let Some(batch) = self.batch.get() {
             return batch.put(response);
         }
@@ -735,7 +734,7 @@ fn answer_here<S: Service>(
     process: &Arc<Process>,
     service: &Arc<S>,
     out: &Arc<Out>,
-    request: Request,
+    request: Req,
     settled: bool,
     arrived: Instant,
 ) {
@@ -757,10 +756,10 @@ fn answer_here<S: Service>(
     }
     match op {
         Op::Ping => reply.send(ping(process, &request)),
-        Op::Status => reply.send(Response::text(status(process, &**service))),
-        Op::Shutdown => reply.send(Response::ok()),
+        Op::Status => reply.send(Resp::text(status(process, &**service))),
+        Op::Shutdown => reply.send(Resp::ok()),
         Op::LogHistogram | Op::LogGrep | Op::LogLines => reply.send(read_logs(process, &request)),
-        Op::Sites => reply.send(Response::text(
+        Op::Sites => reply.send(Resp::text(
             crate::log::histogram()
                 .iter()
                 .map(|(count, stride, where_)| {
@@ -783,51 +782,51 @@ fn answer_here<S: Service>(
 /// here because the machine holding the files runs signed code, and this process
 /// is already signed and already there — the standalone `logs` tool is the same
 /// library, for when the process is not answering.
-fn read_logs(process: &Process, request: &Request) -> Response {
+fn read_logs(process: &Process, request: &Req) -> Resp {
     let (which, from, to, what, limit) = {
         let (mut payload, rest) = match structure(&request.args, request.op, "a log request") {
             Ok(value) => value,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         if !rest.is_empty() {
-            return Response::error(Status::BadRequest, "a log request has trailing arguments");
+            return Resp::error(Status::BadRequest, "a log request has trailing arguments");
         }
         let which = match payload.text() {
             Ok(value) => value,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let from = match payload.text() {
             Ok(value) => value,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let to = match payload.text() {
             Ok(value) => value,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let (what, limit) = match request.op {
             Op::LogHistogram => (None, 100),
             Op::LogGrep => {
                 let what = match payload.text() {
                     Ok(value) => value,
-                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                    Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
                 };
                 let limit = match payload.number() {
                     Ok(value) => value as usize,
-                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                    Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
                 };
                 (Some(what), limit)
             }
             Op::LogLines => {
                 let limit = match payload.number() {
                     Ok(value) => value as usize,
-                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                    Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
                 };
                 (None, limit)
             }
-            _ => return Response::error(Status::BadRequest, "not a log command"),
+            _ => return Resp::error(Status::BadRequest, "not a log command"),
         };
         if let Err(e) = payload.done() {
-            return Response::error(Status::BadRequest, e.to_string());
+            return Resp::error(Status::BadRequest, e.to_string());
         }
         (which, from, to, what, limit)
     };
@@ -846,7 +845,7 @@ fn read_logs(process: &Process, request: &Request) -> Response {
     let budget = u64::MAX;
     let logs = match crate::logread::Logs::open(&dir, &which, budget) {
         Ok(logs) => logs,
-        Err(e) => return Response::error(Status::Internal, e.to_string()),
+        Err(e) => return Resp::error(Status::Internal, e.to_string()),
     };
 
     // Each of the three takes the same window: a rare thing is looked for in the
@@ -857,10 +856,10 @@ fn read_logs(process: &Process, request: &Request) -> Response {
         _ => logs.range(&from, &to, limit),
     };
     match read {
-        Err(e) => Response::error(Status::Internal, e.to_string()),
+        Err(e) => Resp::error(Status::Internal, e.to_string()),
         // The count of lines scanned comes back too: an answer with nothing in it
         // means something different if it read nothing than if it read millions.
-        Ok((seen, lines)) => Response {
+        Ok((seen, lines)) => Resp {
             id: 0,
             status: Status::Ok,
             args: vec![Arg::Number(seen), Arg::Text(lines.join("\n"))],
@@ -870,12 +869,12 @@ fn read_logs(process: &Process, request: &Request) -> Response {
 
 /// A ping asks for a reply of a given size, so that message size is a knob and
 /// not a constant. Bare, it answers in words.
-fn ping(process: &Process, request: &Request) -> Response {
+fn ping(process: &Process, request: &Req) -> Resp {
     let size = match request.args.first() {
         None => 0,
         Some(Arg::Number(size)) => *size as usize,
         Some(other) => {
-            return Response::error(Status::BadRequest, format!("ping takes a size, not {other}"));
+            return Resp::error(Status::BadRequest, format!("ping takes a size, not {other}"));
         }
     };
     if size == 0 {
@@ -884,14 +883,14 @@ fn ping(process: &Process, request: &Request) -> Response {
         logd!("pinged", "reply size {size}");
         // And once a second regardless, which says the same thing for nothing.
         logsec!("pinged", "reply size {size}");
-        return Response::text(format!("{} is alive", process.identity()));
+        return Resp::text(format!("{} is alive", process.identity()));
     }
     // Random padding is the honest default; the repetitive kind exists to give
     // compression something to find.
     let dull = matches!(request.args.get(1), Some(Arg::Flag(true)));
     match if dull { repetition(size) } else { noise(size) } {
-        Some(bytes) => Response { id: 0, status: Status::Ok, args: vec![Arg::Bytes(bytes)] },
-        None => Response::error(
+        Some(bytes) => Resp { id: 0, status: Status::Ok, args: vec![Arg::Bytes(bytes)] },
+        None => Resp::error(
             Status::BadRequest,
             format!("a {size}-byte reply is over the {MAX_FRAME_BYTES}-byte frame limit"),
         ),

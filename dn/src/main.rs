@@ -27,7 +27,7 @@ use common::range::{Detail, Want};
 use common::routing;
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
-use common::wire::{Arg, Op, Request, Response, Status, StructWriter, structure};
+use common::wire::{Arg, Op, Req, Resp, Status, StructWriter, structure};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -240,7 +240,7 @@ struct Object {
 enum Next {
     Ours(ORoff),
     Wait,
-    Say(Response),
+    Say(Resp),
 }
 
 /// One of an object's streams, and what it has come to.
@@ -428,7 +428,7 @@ impl Object {
 /// ⚠️ **Refusals are kept and the whole answer fails**, rather than being dropped so that the answer
 /// silently lacks extents the caller asked for. §17's rule: a well-formed request for something that
 /// did not work says so.
-fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Response) {
+fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Resp) {
     let ready = {
         let mut held = gather.lock().expect("gather");
         held.left -= 1;
@@ -442,7 +442,7 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Response) {
                     }
                 }
                 Err(e) => {
-                    held.failed.get_or_insert(Response::error(Status::Internal, e.to_string()));
+                    held.failed.get_or_insert(Resp::error(Status::Internal, e.to_string()));
                 }
             }
         }
@@ -503,7 +503,7 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Response) {
         head: std::mem::take(&mut held.head),
         rows: std::mem::take(&mut held.rows),
     };
-    reply.send(Response { id: 0, status: Status::Ok, args: levelled.args(converted) });
+    reply.send(Resp { id: 0, status: Status::Ok, args: levelled.args(converted) });
 }
 
 /// Several asks outstanding at once, answered when the last of them returns.
@@ -519,7 +519,7 @@ struct Gather {
     runs: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)>,
     /// Set when any SN refused, so the whole answer fails rather than silently omitting extents
     /// the caller asked for.
-    failed: Option<Response>,
+    failed: Option<Resp>,
     reply: Option<Reply>,
     /// What the object looked like when the asks went out, so the answer is built from one
     /// consistent view rather than re-read after the streams may have changed.
@@ -601,7 +601,7 @@ impl Service for DN {
         )
     }
 
-    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Request, reply: Reply) {
+    fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
         match request.op {
             Op::CreateObject => self.create(process, &request, reply),
             Op::BatchCreate => self.create_many(process, &request, reply),
@@ -611,26 +611,26 @@ impl Service for DN {
                     match structure(&request.args, Op::LocateStream, "a locate-stream request") {
                         Ok(value) => value,
                         Err(e) => {
-                            return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                            return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                         }
                     };
                 let path = match payload.text() {
                     Ok(path) => path,
                     Err(e) => {
-                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                        return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                     }
                 };
                 let record = match payload.number().and_then(ORoff::of_number) {
                     Ok(record) => record,
                     Err(e) => {
-                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                        return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                     }
                 };
                 if let Err(e) = payload.done() {
-                    return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                 }
                 if !rest.is_empty() {
-                    return reply.send(Response::error(
+                    return reply.send(Resp::error(
                         Status::BadRequest,
                         "a locate-stream request has trailing arguments",
                     ));
@@ -638,7 +638,7 @@ impl Service for DN {
                 let mut payload = StructWriter::new();
                 payload.text(&path);
                 payload.flag(false);
-                let request = Request::new(Op::ObjectInfo).structure(payload);
+                let request = Req::new(Op::ObjectInfo).structure(payload);
                 self.info(process, &request, Some(record), reply)
             }
             Op::ExtendObject => self.extend(process, &request, reply),
@@ -659,40 +659,40 @@ impl Service for DN {
 
 impl DN {
     /// `(name, keyed, framing kind, framing width)`, and one stream to go with it.
-    fn create(self: &Arc<Self>, process: &Arc<Process>, request: &Request, reply: Reply) {
+    fn create(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Reply) {
         // Only the first few arguments are the object; a create may carry more —
         // media class, an expiry — that nothing here reads yet.
         let (mut payload, rest) =
             match structure(&request.args, Op::CreateObject, "a create-object request") {
                 Ok(value) => value,
                 Err(e) => {
-                    return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                 }
             };
         let wanted = match Wanted::read(&mut payload) {
             Ok(wanted) => wanted,
-            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
         };
         // These fields are currently accepted for the CLI's create options but are not
         // interpreted by the DN yet. Keep them inside the command payload so the parser
         // still validates the complete value.
         if let Err(e) = payload.text() {
-            return reply.send(Response::error(Status::BadRequest, e.to_string()));
+            return reply.send(Resp::error(Status::BadRequest, e.to_string()));
         }
         let has_expiry = match payload.flag() {
             Ok(has_expiry) => has_expiry,
-            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
         };
         if has_expiry {
             if let Err(e) = payload.number() {
-                return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                return reply.send(Resp::error(Status::BadRequest, e.to_string()));
             }
         }
         if let Err(e) = payload.done() {
-            return reply.send(Response::error(Status::BadRequest, e.to_string()));
+            return reply.send(Resp::error(Status::BadRequest, e.to_string()));
         }
         if !rest.is_empty() {
-            return reply.send(Response::error(
+            return reply.send(Resp::error(
                 Status::BadRequest,
                 "a create-object request has trailing arguments",
             ));
@@ -700,50 +700,50 @@ impl DN {
         let name = wanted.name.clone();
         self.record(process, vec![wanted], reply, move |dn, made| {
             if made == 0 {
-                return Response::error(Status::BadRequest, format!("{name} exists already"));
+                return Resp::error(Status::BadRequest, format!("{name} exists already"));
             }
             // The object it just made, in the same shape object-info answers, so an
             // append that had to create one needs no second lookup to go on with.
             match dn.look(&name) {
-                Some(args) => Response { id: 0, status: Status::Ok, args },
-                None => Response::error(Status::Internal, format!("{name} went missing")),
+                Some(args) => Resp { id: 0, status: Status::Ok, args },
+                None => Resp::error(Status::Internal, format!("{name} went missing")),
             }
         });
     }
 
     /// A run of `(name, keyed)` pairs, which costs one stream request and one
     /// answer however many objects it holds.
-    fn create_many(self: &Arc<Self>, process: &Arc<Process>, request: &Request, reply: Reply) {
+    fn create_many(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Reply) {
         let (mut payload, rest) =
             match structure(&request.args, Op::BatchCreate, "a batch-create request") {
                 Ok(value) => value,
                 Err(e) => {
-                    return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                 }
             };
         let count = match payload.number() {
             Ok(count) => count as usize,
-            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
         };
         let mut wanted = Vec::with_capacity(count);
         for _ in 0..count {
             match Wanted::read(&mut payload) {
                 Ok(one) => wanted.push(one),
                 Err(e) => {
-                    return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                 }
             }
         }
         if let Err(e) = payload.done() {
-            return reply.send(Response::error(Status::BadRequest, e.to_string()));
+            return reply.send(Resp::error(Status::BadRequest, e.to_string()));
         }
         if !rest.is_empty() {
-            return reply.send(Response::error(
+            return reply.send(Resp::error(
                 Status::BadRequest,
                 "a batch-create request has trailing arguments",
             ));
         }
-        self.record(process, wanted, reply, |_, made| Response {
+        self.record(process, wanted, reply, |_, made| Resp {
             id: 0,
             status: Status::Ok,
             args: vec![Arg::Number(made)],
@@ -761,7 +761,7 @@ impl DN {
         process: &Arc<Process>,
         wanted: Vec<Wanted>,
         mut reply: Reply,
-        say: impl FnOnce(&DN, u64) -> Response + Send + 'static,
+        say: impl FnOnce(&DN, u64) -> Resp + Send + 'static,
     ) {
         let created = TimeSec::now();
 
@@ -808,7 +808,7 @@ impl DN {
         payload.number(first);
         payload.number(count);
         payload.number(created.number());
-        let ask = Request::new(Op::CreateStream).structure(payload);
+        let ask = Req::new(Op::CreateStream).structure(payload);
 
         let dn = Arc::clone(self);
         let sn_number =
@@ -851,32 +851,32 @@ impl DN {
     /// **One request does the work.** Several appends find the stream full at once,
     /// so the first to arrive asks an SN and the rest park behind it — and because
     /// asking an SN is a round trip, they park rather than hold a worker.
-    fn extend(self: &Arc<Self>, process: &Arc<Process>, request: &Request, reply: Reply) {
+    fn extend(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Reply) {
         let (mut payload, rest) =
             match structure(&request.args, Op::ExtendObject, "an extend-object request") {
                 Ok(value) => value,
-                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
             };
         if !rest.is_empty() {
-            return reply.send(Response::error(
+            return reply.send(Resp::error(
                 Status::BadRequest,
                 "an extend-object request has trailing arguments",
             ));
         }
         let name = match payload.text() {
             Ok(name) => name,
-            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
         };
         let sealed = match payload.number() {
             Ok(sealed) => sealed,
-            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
         };
         let records = match payload.number().and_then(SRoff::of_number) {
             Ok(records) => records,
-            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
         };
         if let Err(e) = payload.done() {
-            return reply.send(Response::error(Status::BadRequest, e.to_string()));
+            return reply.send(Resp::error(Status::BadRequest, e.to_string()));
         };
 
         // ⚠️ One lock, and everything decided inside it. An earlier version released
@@ -887,7 +887,7 @@ impl DN {
         let next = {
             let mut shard = self.shards[shard_of(&name)].lock().expect("objects");
             match shard.get_mut(name.as_str()) {
-                None => Next::Say(Response::error(Status::NotFound, format!("no object {name}"))),
+                None => Next::Say(Resp::error(Status::NotFound, format!("no object {name}"))),
                 Some(object) => {
                     // Whoever names the stream that filled is the one that seals it in
                     // the list; the rest are late and have nothing to record.
@@ -908,8 +908,8 @@ impl DN {
                         // Somebody else extended past it already, so whatever is last
                         // now is the answer.
                         match object.args(self.mine, self.dn, None) {
-                            Some(args) => Next::Say(Response { id: 0, status: Status::Ok, args }),
-                            None => Next::Say(Response::error(
+                            Some(args) => Next::Say(Resp { id: 0, status: Status::Ok, args }),
+                            None => Next::Say(Resp::error(
                                 Status::Internal,
                                 format!("{name} has no stream"),
                             )),
@@ -950,7 +950,7 @@ impl DN {
         payload.number(stream);
         payload.number(1);
         payload.number(created.number());
-        let ask = Request::new(Op::CreateStream).structure(payload);
+        let ask = Req::new(Op::CreateStream).structure(payload);
 
         let dn = Arc::clone(self);
         let named = sn.clone();
@@ -975,8 +975,8 @@ impl DN {
             }
             dn.streams.fetch_add(1, Ordering::Relaxed);
             let answer = match dn.describe(&name, None) {
-                Some(args) => Response { id: 0, status: Status::Ok, args },
-                None => Response::error(Status::Internal, format!("{name} has no stream")),
+                Some(args) => Resp { id: 0, status: Status::Ok, args },
+                None => Resp::error(Status::Internal, format!("{name} has no stream")),
             };
             dn.wake(std::slice::from_ref(&name), None);
             reply.send(answer);
@@ -988,25 +988,25 @@ impl DN {
 
     /// An extension that could not be made: stop claiming one is in flight, or
     /// everything waiting behind it waits for ever.
-    fn gave_up(&self, name: &str, status: Status, why: String) -> Response {
+    fn gave_up(&self, name: &str, status: Status, why: String) -> Resp {
         if let Some(object) = self.shards[shard_of(name)].lock().expect("objects").get_mut(name) {
             object.extending = false;
         }
-        Response::error(status, why)
+        Resp::error(status, why)
     }
 
     /// Release names taken for objects that could not be given a stream.
-    fn give_back(&self, names: &[String], status: Status, why: String) -> Response {
+    fn give_back(&self, names: &[String], status: Status, why: String) -> Resp {
         for name in names {
             self.shards[shard_of(name)].lock().expect("objects").remove(name.as_str());
         }
-        Response::error(status, why)
+        Resp::error(status, why)
     }
 
     fn info(
         self: &Arc<Self>,
         process: &Arc<Process>,
-        request: &Request,
+        request: &Req,
         record: Option<ORoff>,
         reply: Reply,
     ) {
@@ -1015,39 +1015,39 @@ impl DN {
                 match structure(&request.args, Op::ObjectInfo, "an object-info request") {
                     Ok(value) => value,
                     Err(e) => {
-                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                        return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                     }
                 };
             let name = match payload.text() {
                 Ok(name) => name,
-                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
             };
             let has_want = match payload.flag() {
                 Ok(value) => value,
-                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
             };
             let want = if has_want {
                 match Want::read(&mut payload) {
                     Ok(want) => want,
                     Err(e) => {
-                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                        return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                     }
                 }
             } else {
                 Want::plain()
             };
             if let Err(e) = payload.done() {
-                return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                return reply.send(Resp::error(Status::BadRequest, e.to_string()));
             }
             if !rest.is_empty() {
-                return reply.send(Response::error(
+                return reply.send(Resp::error(
                     Status::BadRequest,
                     "an object-info request has trailing arguments",
                 ));
             }
             (name, want)
         } else {
-            return reply.send(Response::error(
+            return reply.send(Resp::error(
                 Status::BadRequest,
                 "object-info requires a structured payload",
             ));
@@ -1060,14 +1060,14 @@ impl DN {
         let described = {
             let mut shard = self.shards[shard_of(name)].lock().expect("objects");
             match shard.get_mut(name) {
-                None => Some(Err(Response::error(Status::NotFound, format!("no object {name}")))),
+                None => Some(Err(Resp::error(Status::NotFound, format!("no object {name}")))),
                 // ⚠️ **The check goes here and nowhere else**, because the DN owns the path
                 // table and is the only tier that can see a path point somewhere new. A read
                 // answers with blocks and an append with a receipt; neither says which object
                 // it was about, so without this a caller is answered about a different one and
                 // cannot tell (§17.36).
                 Some(object) if !want.expect.holds(object.named(self.mine)) => {
-                    Some(Err(Response::error(
+                    Some(Err(Resp::error(
                         Status::Replaced,
                         format!("{name} is {} and not {}", object.named(self.mine), want.expect.0),
                     )))
@@ -1080,25 +1080,21 @@ impl DN {
                         self.parked.fetch_add(1, Ordering::Relaxed);
                         None
                     }
-                    None => {
-                        Some(Err(Response::error(Status::NotFound, format!("no object {name}"))))
-                    }
+                    None => Some(Err(Resp::error(Status::NotFound, format!("no object {name}")))),
                 },
             }
         };
         let (Some(described), Some(reply)) = (described, carry) else { return };
         match described {
             Err(refused) => reply.send(refused),
-            Ok(Answering::Plain(args)) => reply.send(Response { id: 0, status: Status::Ok, args }),
+            Ok(Answering::Plain(args)) => reply.send(Resp { id: 0, status: Status::Ok, args }),
             // Extents were asked for, so the SNs holding those streams have to be asked.
             Ok(Answering::Levelled(levelled)) if want.wants(Detail::Extents) => {
                 self.spread(process, name, levelled, limit, reply)
             }
-            Ok(Answering::Levelled(levelled)) => reply.send(Response {
-                id: 0,
-                status: Status::Ok,
-                args: levelled.args(HashMap::new()),
-            }),
+            Ok(Answering::Levelled(levelled)) => {
+                reply.send(Resp { id: 0, status: Status::Ok, args: levelled.args(HashMap::new()) })
+            }
         }
     }
 
@@ -1128,7 +1124,7 @@ impl DN {
             by_sn.entry(row.sn).or_default().push((name, 0));
         }
         if by_sn.is_empty() {
-            return reply.send(Response {
+            return reply.send(Resp {
                 id: 0,
                 status: Status::Ok,
                 args: levelled.args(HashMap::new()),
@@ -1157,7 +1153,7 @@ impl DN {
             let ask = {
                 let mut payload = StructWriter::new();
                 Listing { limit: room, at }.write_payload(&mut payload);
-                Request::new(Op::ListExtents).structure(payload)
+                Req::new(Op::ListExtents).structure(payload)
             };
             let waiting = Arc::clone(&gather);
             let named = identity.clone();
@@ -1169,7 +1165,7 @@ impl DN {
                 arrived(
                     self,
                     &gather,
-                    Response::error(Status::Internal, format!("could not reach {named}")),
+                    Resp::error(Status::Internal, format!("could not reach {named}")),
                 );
             }
         }
@@ -1195,7 +1191,7 @@ impl DN {
     /// Answer everything parked on these names, now that their streams exist. A name
     /// whose create failed is answered too, with whatever the failure was, so nothing
     /// waits for an answer that is never coming.
-    fn wake(&self, names: &[String], failed: Option<&Response>) {
+    fn wake(&self, names: &[String], failed: Option<&Resp>) {
         for name in names {
             let (waiters, args) = {
                 let mut shard = self.shards[shard_of(name)].lock().expect("objects");
@@ -1209,12 +1205,10 @@ impl DN {
             self.parked.fetch_sub(waiters.len() as u64, Ordering::Relaxed);
             for reply in waiters {
                 reply.send(match (failed, &args) {
-                    (None, Some(args)) => {
-                        Response { id: 0, status: Status::Ok, args: args.clone() }
-                    }
+                    (None, Some(args)) => Resp { id: 0, status: Status::Ok, args: args.clone() },
                     (Some(failed), _) => failed.clone(),
                     (None, None) => {
-                        Response::error(Status::Internal, format!("{name} was made and then lost"))
+                        Resp::error(Status::Internal, format!("{name} was made and then lost"))
                     }
                 });
             }
@@ -1231,43 +1225,43 @@ impl DN {
     /// object alone exceeds the limit, and at the levels a batch answers today an object is one entry —
     /// so that case cannot arise and every answer is a **prefix** of the request. Which is what makes
     /// the continuation an index: the caller slices its own list and asks again.
-    fn info_many(&self, request: &Request) -> Response {
+    fn info_many(&self, request: &Req) -> Resp {
         // The names, then one want field for all of them — a batch asks the same question about
         // every name, so carrying it per name would repeat it a thousand times (§9.1.3.11).
         let (names, want) = {
             let (mut payload, rest) =
                 match structure(&request.args, Op::BatchInfo, "a batch-object-info request") {
                     Ok(value) => value,
-                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                    Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
                 };
             let count = match payload.number() {
                 Ok(count) => count as usize,
-                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
             let mut names = Vec::with_capacity(count);
             for _ in 0..count {
                 match payload.text() {
                     Ok(name) => names.push(name),
-                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                    Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
                 }
             }
             let has_want = match payload.flag() {
                 Ok(value) => value,
-                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
             let want = if has_want {
                 match Want::read(&mut payload) {
                     Ok(want) => want,
-                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                    Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
                 }
             } else {
                 Want::plain()
             };
             if let Err(e) = payload.done() {
-                return Response::error(Status::BadRequest, e.to_string());
+                return Resp::error(Status::BadRequest, e.to_string());
             }
             if !rest.is_empty() {
-                return Response::error(
+                return Resp::error(
                     Status::BadRequest,
                     "a batch-object-info request has trailing arguments",
                 );
@@ -1276,7 +1270,7 @@ impl DN {
         };
         let beyond = want.beyond(BATCH_ANSWERS);
         if !beyond.is_empty() {
-            return Response::error(
+            return Resp::error(
                 Status::Unimplemented,
                 format!("object-info cannot yet return {}", beyond.join(", ")),
             );
@@ -1335,7 +1329,7 @@ impl DN {
         let covered = Batch { asked: names.len() as u64, given, entries: spent, next };
         let mut out = covered.args();
         out.append(&mut args);
-        Response { id: 0, status: Status::Ok, args: out }
+        Resp { id: 0, status: Status::Ok, args: out }
     }
 
     /// One name's worth of a batch answer, and what it costs in entries.
@@ -1793,7 +1787,7 @@ mod tests {
         dn
     }
 
-    fn batch_of(dn: &Arc<DN>, names: &[&str], want: Option<Want>) -> Response {
+    fn batch_of(dn: &Arc<DN>, names: &[&str], want: Option<Want>) -> Resp {
         let mut payload = StructWriter::new();
         payload.number(names.len() as u64);
         for name in names {
@@ -1805,7 +1799,7 @@ mod tests {
         } else {
             payload.flag(false);
         }
-        let request = Request::new(Op::BatchInfo).structure(payload);
+        let request = Req::new(Op::BatchInfo).structure(payload);
         dn.info_many(&request)
     }
 
@@ -1941,7 +1935,7 @@ mod tests {
         let wanted = Wanted { name: "/x".into(), keyed: true, framing: Framing::CrLf };
         let mut payload = StructWriter::new();
         wanted.write(&mut payload);
-        let request = Request::new(Op::CreateObject).structure(payload);
+        let request = Req::new(Op::CreateObject).structure(payload);
         let (mut reader, rest) = structure(&request.args, Op::CreateObject, "a create").unwrap();
         assert!(rest.is_empty());
         let wanted = Wanted::read(&mut reader).expect("an object");
@@ -1953,7 +1947,7 @@ mod tests {
         bad.flag(false);
         bad.number(kind + 100);
         bad.number(width);
-        let request = Request::new(Op::CreateObject).structure(bad);
+        let request = Req::new(Op::CreateObject).structure(bad);
         let (mut reader, rest) = structure(&request.args, Op::CreateObject, "a create").unwrap();
         assert!(rest.is_empty());
         assert!(Wanted::read(&mut reader).is_err());

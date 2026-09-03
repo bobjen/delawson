@@ -13,7 +13,7 @@ use common::crypto;
 use common::logn;
 use common::registry::{self, Peer};
 use common::server::{self, Process, Service};
-use common::wire::{Arg, Op, Request, Response, Status, structure};
+use common::wire::{Arg, Op, Req, Resp, Status, structure};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -42,7 +42,7 @@ impl Service for Ks {
         self.config.knobs.workers
     }
 
-    fn answer(&self, process: &Process, request: &Request) -> Response {
+    fn answer(&self, process: &Process, request: &Req) -> Resp {
         match request.op {
             Op::Register => self.enroll(process, request),
             Op::Lookup => self.lookup(request),
@@ -50,7 +50,7 @@ impl Service for Ks {
 
             Op::SnMasterKey => {
                 if !self.unlocked.load(Ordering::SeqCst) {
-                    return Response::error(Status::Locked, "KS is locked");
+                    return Resp::error(Status::Locked, "KS is locked");
                 }
                 self.sn_key(request)
             }
@@ -58,7 +58,7 @@ impl Service for Ks {
             Op::Unlock | Op::RotateMasterKey => {
                 logn!("asked for a key op", "op {}", request.op);
                 if !self.unlocked.load(Ordering::SeqCst) && request.op != Op::Unlock {
-                    return Response::error(Status::Locked, "KS is locked");
+                    return Resp::error(Status::Locked, "KS is locked");
                 }
                 server::unbuilt(process, SERVES, request)
             }
@@ -100,93 +100,93 @@ impl Ks {
         }
     }
 
-    fn sn_key(&self, request: &Request) -> Response {
+    fn sn_key(&self, request: &Req) -> Resp {
         if matches!(request.args.first(), Some(Arg::Struct(..))) {
             let (mut payload, rest) =
                 match structure(&request.args, Op::SnMasterKey, "an SN master-key request") {
                     Ok(value) => value,
-                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                    Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
                 };
             if !rest.is_empty() {
-                return Response::error(
+                return Resp::error(
                     Status::BadRequest,
                     "an SN master-key request has trailing arguments",
                 );
             }
             let sn = match payload.number().and_then(common::ids::SnId::of_number) {
                 Ok(sn) => sn,
-                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
             let day = match payload.number().and_then(|day| payload.done().map(|()| day)) {
                 Ok(day) => day,
-                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
             return self.sn_key_for(sn, day);
         }
         let [Arg::Number(sn), Arg::Number(day)] = request.args.as_slice() else {
-            return Response::error(Status::BadRequest, "sn-master-key takes an SN and a day");
+            return Resp::error(Status::BadRequest, "sn-master-key takes an SN and a day");
         };
         let sn = match common::ids::SnId::of_number(*sn) {
             Ok(sn) => sn,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
 
         self.sn_key_for(sn, *day)
     }
 
-    fn sn_key_for(&self, sn: common::ids::SnId, day: u64) -> Response {
+    fn sn_key_for(&self, sn: common::ids::SnId, day: u64) -> Resp {
         {
             let keys = self.sn_keys.read().expect("sn_keys");
             if let Some(key) = keys.get(&(sn, day)) {
-                return Response::ok().bytes(key.to_vec());
+                return Resp::ok().bytes(key.to_vec());
             }
         }
 
         let key = crypto::sn_daily_key(sn, day);
         self.sn_keys.write().expect("sn_keys").insert((sn, day), key);
-        Response::ok().bytes(key.to_vec())
+        Resp::ok().bytes(key.to_vec())
     }
 
     /// A registration announces a port; it does not invent an identity. The
     /// roster says who may exist, so a mismatch is a misconfiguration to report
     /// rather than a peer to record.
-    fn enroll(&self, process: &Process, request: &Request) -> Response {
+    fn enroll(&self, process: &Process, request: &Req) -> Resp {
         let peer = match Peer::from_args(&request.args) {
             Ok(peer) => peer,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let Some(entry) = process.cluster.service(&peer.identity) else {
-            return Response::error(
+            return Resp::error(
                 Status::NotFound,
                 format!("{} is not in the roster", peer.identity),
             );
         };
         if entry.kind != peer.kind {
-            return Response::error(
+            return Resp::error(
                 Status::BadRequest,
                 format!("{} is a {} in the roster, not a {}", peer.identity, entry.kind, peer.kind),
             );
         }
         logn!("registered a peer", "identity {},at {}", peer.identity, peer.address);
         self.peers.lock().expect("peers").insert(peer.identity.clone(), peer);
-        Response::ok()
+        Resp::ok()
     }
 
-    fn lookup(&self, request: &Request) -> Response {
+    fn lookup(&self, request: &Req) -> Resp {
         let (mut payload, rest) = match structure(&request.args, Op::Lookup, "a lookup request") {
             Ok(value) => value,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         if !rest.is_empty() {
-            return Response::error(Status::BadRequest, "a lookup request has trailing arguments");
+            return Resp::error(Status::BadRequest, "a lookup request has trailing arguments");
         }
         let identity = match payload.text().and_then(|identity| payload.done().map(|()| identity)) {
             Ok(identity) => identity,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         match self.peers.lock().expect("peers").get(&identity) {
-            Some(peer) => Response::text(peer.address.to_string()),
-            None => Response::error(Status::NotFound, format!("{identity} has not registered")),
+            Some(peer) => Resp::text(peer.address.to_string()),
+            None => Resp::error(Status::NotFound, format!("{identity} has not registered")),
         }
     }
 }
