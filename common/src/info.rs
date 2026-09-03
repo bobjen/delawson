@@ -84,8 +84,8 @@ impl Described {
         payload.number_u64(self.stream.created.number());
         payload.number_u32(self.sn.get());
         payload.flag(self.keyed);
-        payload.number_u8(kind as u8);
-        payload.number_u32(width as u32);
+        payload.number_u8(kind);
+        payload.number_u32(width);
         payload.number_u64(self.first_record);
         vec![payload.finish(Op::DescribedResp)]
     }
@@ -108,8 +108,8 @@ impl Described {
             };
             let sn = SnId::of_number(payload.number_u32()? as u64)?;
             let keyed = payload.flag()?;
-            let kind = payload.number_u8()? as u64;
-            let width = payload.number_u32()? as u64;
+            let kind = payload.number_u8()?;
+            let width = payload.number_u32()?;
             let first_record = payload.number_u64()?;
             payload.done()?;
             if object.object.is_none() {
@@ -367,15 +367,15 @@ impl Wanted {
         let (kind, width) = self.framing.wire();
         payload.text(&self.name);
         payload.flag(self.keyed);
-        payload.number_u8(kind as u8);
-        payload.number_u64(width);
+        payload.number_u8(kind);
+        payload.number_u32(width);
     }
 
     pub fn read(payload: &mut StructReader<'_>) -> Result<Wanted> {
         Ok(Wanted {
             name: payload.text()?,
             keyed: payload.flag()?,
-            framing: Framing::of_wire(payload.number_u8()? as u64, payload.number_u32()? as u64)?,
+            framing: Framing::of_wire(payload.number_u8()?, payload.number_u32()?)?,
         })
     }
 }

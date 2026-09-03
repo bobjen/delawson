@@ -1941,8 +1941,8 @@ mod tests {
         let mut bad = StructWriter::new();
         bad.text("/x");
         bad.flag(false);
-        bad.number_u64(kind + 100);
-        bad.number_u64(width);
+        bad.number_u8(kind + 100);
+        bad.number_u32(width);
         let request = Req::new(Op::CreateObject).structure(bad);
         let (mut reader, rest) = structure(&request.args, Op::CreateObject, "a create").unwrap();
         assert!(rest.is_empty());

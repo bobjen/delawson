@@ -974,8 +974,8 @@ fn create_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result
                             let name = format!("{prefix}{n}");
                             payload.text(&name);
                             payload.flag(keyed);
-                            payload.number_u64(kind);
-                            payload.number_u64(width);
+                            payload.number_u8(kind);
+                            payload.number_u32(width);
                         }
                         let request =
                             Req::new(if batch == 1 { Op::CreateObject } else { Op::BatchCreate })
@@ -1855,8 +1855,8 @@ fn build(cmd: &Cmd) -> Result<Req> {
             let mut payload = common::wire::StructWriter::new();
             payload.text(path);
             payload.flag(*flavor == Flavor::Keyed);
-            payload.number_u64(kind);
-            payload.number_u64(width);
+            payload.number_u8(kind);
+            payload.number_u32(width);
             let media_class = media_class.clone().unwrap_or_default();
             payload.text(&media_class);
             payload.flag(expiry.is_some());
@@ -1921,8 +1921,8 @@ fn build(cmd: &Cmd) -> Result<Req> {
             let mut payload = common::wire::StructWriter::new();
             payload.text(path);
             expecting(expect)?.write(&mut payload);
-            payload.number_u64(kind);
-            payload.number_u64(width);
+            payload.number_u8(kind);
+            payload.number_u32(width);
             payload.number_u64(checksum);
             holds.write(&mut payload);
             payload.bytes(&stored);

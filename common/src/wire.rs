@@ -587,8 +587,8 @@ impl AppendBlock {
         payload.number_u32(self.sn.get());
         payload.number_u32(self.extent.get());
         payload.number_u64(self.created.number());
-        payload.number_u8(kind as u8);
-        payload.number_u32(width as u32);
+        payload.number_u8(kind);
+        payload.number_u32(width);
         payload.number_u64(self.crc);
         payload.number_u64(self.holds.compressed.number());
         payload.number_u64(self.holds.logical.number());
@@ -615,8 +615,8 @@ impl AppendBlock {
         let sn = SnId::of_number(payload.number_u32()? as u64)?;
         let extent = ExtentId::of_number(payload.number_u32()? as u64)?;
         let created = TimeSec::new(payload.number_u64()?);
-        let kind = payload.number_u8()? as u64;
-        let width = payload.number_u32()? as u64;
+        let kind = payload.number_u8()?;
+        let width = payload.number_u32()?;
         let crc = payload.number_u64()?;
         let holds = crate::block::Holds {
             compressed: crate::offset::ECoff::of_number(payload.number_u64()?)?,

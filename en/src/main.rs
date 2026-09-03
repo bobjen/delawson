@@ -219,7 +219,7 @@ impl Append {
         let mut plain = Vec::with_capacity(16 + body.len());
         plain.extend(crc.to_le_bytes());
         plain.extend((kind as u32).to_le_bytes());
-        plain.extend((width as u32).to_le_bytes());
+        plain.extend(width.to_le_bytes());
         plain.extend(body);
 
         let ad = [];
@@ -254,7 +254,10 @@ impl Append {
         let crc = u64::from_le_bytes(plain[0..8].try_into().unwrap());
         let kind = u32::from_le_bytes(plain[8..12].try_into().unwrap());
         let width = u32::from_le_bytes(plain[12..16].try_into().unwrap());
-        let framing = Framing::of_wire(kind as u64, width as u64)?;
+        let framing = Framing::of_wire(
+            u8::try_from(kind).map_err(|_| Error::new(format!("unknown framing {kind}")))?,
+            width,
+        )?;
         let body = plain[16..].to_vec();
 
         Ok((crc, framing, body))

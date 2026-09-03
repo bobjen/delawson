@@ -410,13 +410,13 @@ impl FE {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                 }
             };
-            let kind = match payload.number_u64() {
+            let kind = match payload.number_u8() {
                 Ok(kind) => kind,
                 Err(e) => {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                 }
             };
-            let width = match payload.number_u64() {
+            let width = match payload.number_u32() {
                 Ok(width) => width,
                 Err(e) => {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
@@ -931,8 +931,8 @@ fn make_object(
     let mut payload = StructWriter::new();
     payload.text(path);
     payload.flag(false);
-    payload.number_u64(kind);
-    payload.number_u64(width);
+    payload.number_u8(kind);
+    payload.number_u32(width);
     payload.text("");
     payload.flag(false);
     let ask = Req::new(Op::CreateObject).structure(payload);

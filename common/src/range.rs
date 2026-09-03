@@ -64,7 +64,7 @@ impl Start {
         }
     }
 
-    fn code(self) -> u64 {
+    fn code(self) -> u8 {
         match self {
             Start::Record(_) => 0,
             Start::RecordThen(..) => 1,
@@ -93,7 +93,7 @@ pub enum Budget {
 }
 
 impl Budget {
-    fn code(self) -> u64 {
+    fn code(self) -> u8 {
         match self {
             Budget::Records(_) => 0,
             Budget::Logical(_) => 1,

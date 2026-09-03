@@ -71,9 +71,9 @@ impl Framing {
 
     /// Two numbers, so a framing can travel with a request. A width of zero for
     /// the framings that have no width.
-    pub fn wire(self) -> (u64, u64) {
+    pub fn wire(self) -> (u8, u32) {
         match self {
-            Framing::Fixed(width) => (0, width as u64),
+            Framing::Fixed(width) => (0, width),
             Framing::Nul => (1, 0),
             Framing::Lf => (2, 0),
             Framing::CrLf => (3, 0),
@@ -81,14 +81,10 @@ impl Framing {
         }
     }
 
-    pub fn of_wire(kind: u64, width: u64) -> Result<Framing> {
+    pub fn of_wire(kind: u8, width: u32) -> Result<Framing> {
         Ok(match kind {
-            0 => Framing::Fixed(
-                u32::try_from(width)
-                    .ok()
-                    .filter(|width| *width > 0)
-                    .ok_or_else(|| Error::new(format!("{width} is not a record width")))?,
-            ),
+            0 if width > 0 => Framing::Fixed(width),
+            0 => return Err(Error::new(format!("{width} is not a record width"))),
             1 => Framing::Nul,
             2 => Framing::Lf,
             3 => Framing::CrLf,
