@@ -71,78 +71,92 @@ macro_rules! ops {
     };
 }
 
+// Op codes are stable wire identifiers. This namespace contains standalone commands and
+// nontrivial serialized pieces. Append new commands or schema tags; never renumber existing
+// codes. Retired codes become tombstones. Reuse an Op tombstone only after the next release,
+// so a new format can receive a new tag while readers still accept the old one.
 ops! {
     // Control, answered by every machine type.
-    Ping = 0x0001, "ping";
-    Status = 0x0002, "status";
-    Shutdown = 0x0003, "shutdown";
+    Ping = 1, "ping";
+    Status = 2, "status";
+    Shutdown = 3, "shutdown";
     // Sites is the live counters, per logging site in the code; the three below
     // read what was written to the files.
-    Sites = 0x0004, "sites";
-    LogHistogram = 0x0005, "log-histogram";
-    LogGrep = 0x0006, "log-grep";
-    LogLines = 0x0007, "log-lines";
+    Sites = 4, "sites";
+    LogHistogram = 5, "log-histogram";
+    LogGrep = 6, "log-grep";
+    LogLines = 7, "log-lines";
 
     // KS: the registry, then the keys.
-    Register = 0x0110, "register";
-    Lookup = 0x0111, "lookup";
-    Registry = 0x0112, "registry";
+    Register = 8, "register";
+    Lookup = 9, "lookup";
+    Registry = 10, "registry";
 
-    Unlock = 0x0101, "unlock";
-    SnMasterKey = 0x0102, "sn-master-key";
-    RotateMasterKey = 0x0103, "rotate-master-key";
+    Unlock = 11, "unlock";
+    SnMasterKey = 12, "sn-master-key";
+    RotateMasterKey = 13, "rotate-master-key";
 
     // Namespace.
-    MakeDirectory = 0x0201, "mkdir";
-    RemoveDirectory = 0x0202, "rmdir";
-    List = 0x0203, "ls";
-    Stat = 0x0204, "stat";
+    MakeDirectory = 14, "mkdir";
+    RemoveDirectory = 15, "rmdir";
+    List = 16, "ls";
+    Stat = 17, "stat";
 
     // Objects.
-    CreateObject = 0x0301, "create";
-    DeleteObject = 0x0302, "delete";
-    UndeleteObject = 0x0303, "undelete";
-    SetExpiry = 0x0304, "set-expiry";
-    CloneObject = 0x0305, "clone";
-    ConcatObjects = 0x0306, "concat";
-    ObjectInfo = 0x0307, "object-info";
-    BatchCreate = 0x0308, "batch-create";
-    BatchInfo = 0x0309, "batch-object-info";
+    CreateObject = 18, "create";
+    DeleteObject = 19, "delete";
+    UndeleteObject = 20, "undelete";
+    SetExpiry = 21, "set-expiry";
+    CloneObject = 22, "clone";
+    ConcatObjects = 23, "concat";
+    ObjectInfo = 24, "object-info";
+    BatchCreate = 25, "batch-create";
+    BatchInfo = 26, "batch-object-info";
 
     // SN, from a DN: a stream is named by the DN that owns it.
-    CreateStream = 0x0501, "create-stream";
+    CreateStream = 27, "create-stream";
     // And from an FE: the extent a stream is currently appendable at, opened if
     // there is not one already, and which extent holds a given record.
-    OpenExtent = 0x0502, "open-extent";
-    LocateRecord = 0x0503, "locate-record";
+    OpenExtent = 28, "open-extent";
+    LocateRecord = 29, "locate-record";
     // Sealing is reported to the SN, which records what the extent came to and
     // opens the next one in the same breath.
-    SealExtent = 0x0504, "seal-extent";
+    SealExtent = 30, "seal-extent";
     // And a run of a stream's extents, for a caller building hints (§9.1.3.7). The
     // plural of locate-record, and the first thing to ask an SN that is not about
     // finding one place to read or write.
-    ListExtents = 0x0505, "list-extents";
+    ListExtents = 31, "list-extents";
 
     // DN, about an object's streams: which one holds a record, and another one
     // when the last has sealed.
-    LocateStream = 0x030a, "locate-stream";
-    ExtendObject = 0x030b, "extend-object";
+    LocateStream = 32, "locate-stream";
+    ExtendObject = 33, "extend-object";
 
     // EN. An append arrives from an FE at the primary; the primary broadcasts the
     // same bytes at a fixed offset to the other three instances.
-    AppendExtent = 0x0601, "append-extent";
-    ApplyAppend = 0x0602, "apply-append";
-    ReadExtent = 0x0603, "read-extent";
+    AppendExtent = 34, "append-extent";
+    ApplyAppend = 35, "apply-append";
+    ReadExtent = 36, "read-extent";
 
     // Records.
-    AppendRecord = 0x0401, "append";
-    InsertRecord = 0x0402, "insert";
-    UpdateRecord = 0x0403, "update";
-    DeleteRecord = 0x0404, "delete-record";
-    ReadRecord = 0x0405, "read";
-    Scan = 0x0406, "scan";
-    Count = 0x0407, "count";
-    TimeRange = 0x0408, "time-range";
+    AppendRecord = 37, "append";
+    InsertRecord = 38, "insert";
+    UpdateRecord = 39, "update";
+    DeleteRecord = 40, "delete-record";
+    ReadRecord = 41, "read";
+    Scan = 42, "scan";
+    Count = 43, "count";
+    TimeRange = 44, "time-range";
+
+    // Schema identifiers share the Op namespace with commands.
+    Range = 45, "range";
+    Shape = 46, "shape";
+    Batch = 47, "batch";
+    Described = 48, "described";
+    StreamRow = 49, "stream-row";
+    ExtentRow = 50, "extent-row";
+    Piece = 51, "piece";
+    AppendBlock = 52, "append-block";
 }
 
 impl std::fmt::Display for Op {
@@ -206,10 +220,22 @@ impl std::fmt::Display for Status {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Arg {
+    /// A schema boundary; these use Op codes but are not commands.
+    Tag(Op),
     Text(String),
     Number(u64),
     Flag(bool),
     Bytes(Vec<u8>),
+}
+
+pub fn tagged<'a>(args: &'a [Arg], expected: Op, what: &str) -> Result<&'a [Arg]> {
+    let [Arg::Tag(actual), rest @ ..] = args else {
+        return Err(Error::new(format!("{what} is missing its schema tag")));
+    };
+    if *actual != expected {
+        return Err(Error::new(format!("expected {expected}, got {actual}")));
+    }
+    Ok(rest)
 }
 
 impl std::fmt::Display for Arg {
@@ -219,6 +245,7 @@ impl std::fmt::Display for Arg {
             Arg::Number(n) => write!(f, "{n}"),
             Arg::Flag(b) => write!(f, "{b}"),
             Arg::Bytes(bytes) => write!(f, "{} bytes", bytes.len()),
+            Arg::Tag(op) => write!(f, "<{op}>"),
         }
     }
 }
@@ -367,16 +394,19 @@ pub struct AppendBlock {
 
 impl AppendBlock {
     pub fn request(&self, en: EnId, disk: DiskId, op: Op) -> Request {
+        let mut request = Request::new(op);
+        request.args.push(Arg::Tag(Op::AppendBlock));
         let (kind, width) = self.framing.wire();
-        let mut request = Request::new(op)
-            .number(en.number())
-            .number(disk.number())
-            .number(self.sn.number())
-            .number(self.extent.number())
-            .number(self.created.number())
-            .number(kind)
-            .number(width)
-            .number(self.crc);
+        request.args.extend([
+            Arg::Number(en.number()),
+            Arg::Number(disk.number()),
+            Arg::Number(self.sn.number()),
+            Arg::Number(self.extent.number()),
+            Arg::Number(self.created.number()),
+            Arg::Number(kind),
+            Arg::Number(width),
+            Arg::Number(self.crc),
+        ]);
         request.args.extend(self.holds.args());
         request = request
             .flag(self.logical_offset.is_some())
@@ -388,6 +418,7 @@ impl AppendBlock {
     }
 
     pub fn of(request: &Request) -> Result<(EnId, DiskId, AppendBlock)> {
+        let args = tagged(&request.args, Op::AppendBlock, "an append block")?;
         let [
             Arg::Number(en),
             Arg::Number(disk),
@@ -398,7 +429,7 @@ impl AppendBlock {
             Arg::Number(width),
             Arg::Number(crc),
             rest @ ..,
-        ] = request.args.as_slice()
+        ] = args
         else {
             return Err(Error::new("an append does not have the shape of one"));
         };
@@ -462,6 +493,10 @@ fn encode_args(args: &[Arg], out: &mut Vec<u8>) {
                 out.extend((bytes.len() as u32).to_le_bytes());
                 out.extend(bytes);
             }
+            Arg::Tag(op) => {
+                out.push(4);
+                out.extend(op.code().to_le_bytes());
+            }
         }
     }
 }
@@ -518,6 +553,7 @@ impl<'a> Cursor<'a> {
                     let len = self.u32()? as usize;
                     Arg::Bytes(self.take(len)?.to_vec())
                 }
+                4 => Arg::Tag(Op::from_code(self.u16()?)?),
                 tag => return Err(Error::new(format!("unknown argument tag {tag}"))),
             });
         }
@@ -845,7 +881,8 @@ mod tests {
         };
         let en = EnId::new(2);
         let disk = DiskId::new(1);
-        let (read_en, read_disk, read_block) = AppendBlock::of(&block.request(en, disk, Op::AppendExtent)).unwrap();
+        let (read_en, read_disk, read_block) =
+            AppendBlock::of(&block.request(en, disk, Op::AppendExtent)).unwrap();
         assert_eq!(read_en, en);
         assert_eq!(read_disk, disk);
         assert_eq!(read_block, block);
@@ -856,7 +893,8 @@ mod tests {
             logical_offset: Some(ELoff::new(512)),
             ..block.clone()
         };
-        let (read_en, read_disk, read_block) = AppendBlock::of(&onward.request(en, disk, Op::ApplyAppend)).unwrap();
+        let (read_en, read_disk, read_block) =
+            AppendBlock::of(&onward.request(en, disk, Op::ApplyAppend)).unwrap();
         assert_eq!(read_en, en);
         assert_eq!(read_disk, disk);
         assert_eq!(read_block, onward);

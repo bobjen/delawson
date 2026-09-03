@@ -24,7 +24,12 @@ pub fn sn_daily_key(sn_id: SnId, day: u64) -> [u8; 32] {
     okm
 }
 
-pub fn extent_key(sn_daily_key: &[u8; 32], sn_id: SnId, extent_id: ExtentId, ts: TimeSec) -> [u8; 32] {
+pub fn extent_key(
+    sn_daily_key: &[u8; 32],
+    sn_id: SnId,
+    extent_id: ExtentId,
+    ts: TimeSec,
+) -> [u8; 32] {
     let mut info = [0u8; 16];
     info[..4].copy_from_slice(&sn_id.get().to_le_bytes());
     info[4..8].copy_from_slice(&extent_id.get().to_le_bytes());
@@ -35,10 +40,7 @@ pub fn extent_key(sn_daily_key: &[u8; 32], sn_id: SnId, extent_id: ExtentId, ts:
     okm
 }
 
-pub fn derive_block_secrets(
-    extent_key: &[u8; 32],
-    offset: u64,
-) -> ([u8; 16], [u8; 16]) {
+pub fn derive_block_secrets(extent_key: &[u8; 32], offset: u64) -> ([u8; 16], [u8; 16]) {
     let mut info = [0u8; 8];
     info.copy_from_slice(&offset.to_le_bytes());
     let hk = Hkdf::<Sha256>::new(None, extent_key);
@@ -69,7 +71,5 @@ pub fn decrypt_block(
     tag: &[u8; 16],
 ) -> Result<Vec<u8>> {
     let cipher = Aegis128X2::<16>::new(key, nonce);
-    cipher
-        .decrypt(sealed, tag, ad)
-        .map_err(|e| Error::new(format!("decryption failed: {e}")))
+    cipher.decrypt(sealed, tag, ad).map_err(|e| Error::new(format!("decryption failed: {e}")))
 }

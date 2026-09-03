@@ -19,6 +19,7 @@ use crate::info::Expecting;
 use crate::offset::{ECoff, ELoff};
 use crate::placement::Expansion;
 use crate::wire::Arg;
+use crate::wire::{Op, tagged};
 use crate::{Error, Result};
 
 /// Where a range starts.
@@ -141,6 +142,7 @@ impl Range {
             Start::Logical(offset) => (offset, 0),
         };
         vec![
+            Arg::Tag(Op::Range),
             Arg::Number(self.start.code()),
             Arg::Number(first),
             Arg::Number(second),
@@ -151,6 +153,7 @@ impl Range {
 
     /// And back, returning whatever followed it.
     pub fn of_args(args: &[Arg]) -> Result<(Range, &[Arg])> {
+        let args = tagged(args, Op::Range, "a range")?;
         let [
             Arg::Number(kind),
             Arg::Number(first),
@@ -524,6 +527,7 @@ pub struct Piece {
 impl Piece {
     pub fn args(&self) -> Vec<Arg> {
         vec![
+            Arg::Tag(Op::Piece),
             Arg::Number(self.logical),
             Arg::Number(self.first_record),
             Arg::Number(self.records),
@@ -533,6 +537,7 @@ impl Piece {
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Piece, &[Arg])> {
+        let args = tagged(args, Op::Piece, "a piece")?;
         let [
             Arg::Number(logical),
             Arg::Number(first_record),
@@ -604,6 +609,7 @@ mod tests {
     fn an_unknown_kind_is_refused() {
         let bad = |kind, measure| {
             let args = vec![
+                Arg::Tag(Op::Range),
                 Arg::Number(kind),
                 Arg::Number(0),
                 Arg::Number(0),
@@ -615,7 +621,7 @@ mod tests {
         assert!(bad(9, 0), "no such start");
         assert!(bad(0, 9), "no such measure");
         assert!(!bad(0, 0));
-        assert!(Range::of_args(&[Arg::Number(0)]).is_err(), "and a short one");
+        assert!(Range::of_args(&[Arg::Tag(Op::Range), Arg::Number(0)]).is_err(), "and a short one");
     }
 
     /// A budget is met by the measure it names and by nothing else. This is the
@@ -737,13 +743,7 @@ mod tests {
     }
 
     fn piece(first_record: u64, records: u64, bytes: &[u8]) -> Piece {
-        Piece {
-            logical: bytes.len() as u64,
-            first_record,
-            records,
-            crc: 7,
-            bytes: bytes.to_vec(),
-        }
+        Piece { logical: bytes.len() as u64, first_record, records, crc: 7, bytes: bytes.to_vec() }
     }
 
     /// A run of blocks reads back as the same run, which is the whole reason the

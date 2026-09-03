@@ -394,8 +394,10 @@ impl FE {
         let (path, expect, framing, crc, holds, body) = match request.args.as_slice() {
             // The name, what the caller expects it to be, then the framing, CRC, and the block.
             [Arg::Text(path), rest @ ..] => {
-                let Ok((expect, [Arg::Number(kind), Arg::Number(width), Arg::Number(crc), rest @ ..])) =
-                    Expecting::of_args(rest)
+                let Ok((
+                    expect,
+                    [Arg::Number(kind), Arg::Number(width), Arg::Number(crc), rest @ ..],
+                )) = Expecting::of_args(rest)
                 else {
                     return reply.send(Response::error(
                         Status::BadRequest,
@@ -447,7 +449,16 @@ impl FE {
                         ),
                     ));
                 }
-                let wanting = Wanting { path: named, located, framing, crc, body, holds, tries: TRIES, reply };
+                let wanting = Wanting {
+                    path: named,
+                    located,
+                    framing,
+                    crc,
+                    body,
+                    holds,
+                    tries: TRIES,
+                    reply,
+                };
                 fe.somewhere(process, wanting, None);
             },
         );
@@ -477,7 +488,9 @@ impl FE {
         let (plan, open) = {
             let mut streams = self.streams.lock().expect("streams");
             let stream = streams.entry(key).or_default();
-            let plan = stream.plan(sealed.map(|(id, came_to)| (id, ERoff::of_number(came_to.records).unwrap_or(ERoff::ZERO))));
+            let plan = stream.plan(sealed.map(|(id, came_to)| {
+                (id, ERoff::of_number(came_to.records).unwrap_or(ERoff::ZERO))
+            }));
             if plan == Plan::Join {
                 stream
                     .getting
@@ -1924,7 +1937,10 @@ mod tests {
             )
             .is_none()
         );
-        assert!(Open::of(SnId::new(0), Framing::Lf, &[Arg::Number(7), Arg::Number(1_000_000)]).is_none());
+        assert!(
+            Open::of(SnId::new(0), Framing::Lf, &[Arg::Number(7), Arg::Number(1_000_000)])
+                .is_none()
+        );
         assert!(Open::of(SnId::new(0), Framing::Lf, &[]).is_none());
     }
 
@@ -2086,8 +2102,16 @@ mod tests {
     #[test]
     fn appends_that_all_saw_the_same_extent_fill_ask_once() {
         let mut stream = Stream { open: Some(extent(1, 0)), ..Stream::default() };
-        assert_eq!(stream.plan(Some((ExtentId::new(1), ERoff::new(90)))), Plan::Ask, "the first to notice");
-        assert_eq!(stream.plan(Some((ExtentId::new(1), ERoff::new(90)))), Plan::Join, "the rest of them");
+        assert_eq!(
+            stream.plan(Some((ExtentId::new(1), ERoff::new(90)))),
+            Plan::Ask,
+            "the first to notice"
+        );
+        assert_eq!(
+            stream.plan(Some((ExtentId::new(1), ERoff::new(90)))),
+            Plan::Join,
+            "the rest of them"
+        );
         assert_eq!(stream.plan(Some((ExtentId::new(1), ERoff::new(90)))), Plan::Join);
         // And it was remembered on the way past, which is what a read wants.
         assert_eq!(stream.sealed.len(), 1);

@@ -528,14 +528,7 @@ pub struct Reply {
 impl Reply {
     #[cfg(feature = "testing")]
     pub fn new_test(out: Arc<Out>) -> Reply {
-        Reply {
-            out,
-            id: 0,
-            op: Op::Ping,
-            settled: true,
-            started: None,
-            about: String::new(),
-        }
+        Reply { out, id: 0, op: Op::Ping, settled: true, started: None, about: String::new() }
     }
 
     /// Say what this request was about, where the service knows better than its

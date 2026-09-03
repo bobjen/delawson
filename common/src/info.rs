@@ -16,6 +16,7 @@ use crate::ids::{DiskId, DnId, EnId, ExtentId, ObjectId, RangeId, SnId, StreamId
 use crate::placement::Expansion;
 use crate::time::TimeSec;
 use crate::wire::Arg;
+use crate::wire::{Op, tagged};
 use crate::{Error, Result};
 
 /// An object as the DN describes it, at one of its streams.
@@ -46,16 +47,16 @@ pub struct Described {
 
 impl Described {
     /// Fields per row on the wire. Public because a caller sizing a buffer wants it,
-    /// and **derived from the shape rather than written down twice**.
-    pub const ARGS: usize = 6 + ObjectName::ARGS + StreamName::ARGS;
-
+    /// and derived from the shape rather than written down twice.
+    pub const ARGS: usize = 7 + ObjectName::ARGS + StreamName::ARGS;
     /// A row meaning "there is no such object", for a batch answer that must line up
     /// with the names it was asked about. A zero id is what marks it.
     ///
     /// ⚠️ §9.1.3.7 will retire this: once an answer may be short, lining up by
     /// position stops working and the answer has to say how many names it covered.
     pub fn missing() -> Vec<Arg> {
-        let mut args = ObjectName::default().args();
+        let mut args = vec![Arg::Tag(Op::Described)];
+        args.extend(ObjectName::default().args());
         args.push(Arg::Number(0));
         args.extend(StreamName::default().args());
         args.extend([
@@ -70,7 +71,8 @@ impl Described {
 
     pub fn args(&self) -> Vec<Arg> {
         let (kind, width) = self.framing.wire();
-        let mut args = self.object.args();
+        let mut args = vec![Arg::Tag(Op::Described)];
+        args.extend(self.object.args());
         args.push(Arg::Number(self.dn.number()));
         args.extend(self.stream.args());
         args.extend([
@@ -86,6 +88,7 @@ impl Described {
     /// And back, returning whatever followed it. `None` for a row marked missing,
     /// since a zero id is not an object.
     pub fn of_args(args: &[Arg]) -> Result<(Option<Described>, &[Arg])> {
+        let args = tagged(args, Op::Described, "a described row")?;
         let (object, after) = ObjectName::of_args(args)?;
         let [Arg::Number(dn), after @ ..] = after else {
             return Err(Error::new("that answer did not describe an object"));
@@ -171,6 +174,7 @@ impl Shape {
 
     pub fn args(&self) -> Vec<Arg> {
         vec![
+            Arg::Tag(Op::Shape),
             Arg::Number(self.streams),
             Arg::Number(self.given),
             Arg::Number(self.extents),
@@ -180,6 +184,7 @@ impl Shape {
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Shape, &[Arg])> {
+        let args = tagged(args, Op::Shape, "a shape")?;
         let [
             Arg::Number(streams),
             Arg::Number(given),
@@ -446,10 +451,11 @@ pub struct StreamRow {
 }
 
 impl StreamRow {
-    pub const ARGS: usize = 5 + Totals::ARGS;
+    pub const ARGS: usize = 6 + Totals::ARGS;
 
     pub fn args(&self) -> Vec<Arg> {
         let mut args = vec![
+            Arg::Tag(Op::StreamRow),
             Arg::Number(self.stream.number()),
             Arg::Number(self.sn.number()),
             Arg::Number(self.first_record),
@@ -462,6 +468,7 @@ impl StreamRow {
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(StreamRow, &[Arg])> {
+        let args = tagged(args, Op::StreamRow, "a stream row")?;
         let [
             Arg::Number(stream),
             Arg::Number(sn),
@@ -546,6 +553,7 @@ impl ExtentRow {
 
     pub fn args(&self) -> Vec<Arg> {
         let mut args = vec![
+            Arg::Tag(Op::ExtentRow),
             Arg::Number(self.sn.number()),
             Arg::Number(self.id.number()),
             Arg::Number(self.created.number()),
@@ -563,6 +571,7 @@ impl ExtentRow {
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(ExtentRow, &[Arg])> {
+        let args = tagged(args, Op::ExtentRow, "an extent row")?;
         let [
             Arg::Number(sn),
             Arg::Number(id),
@@ -648,6 +657,7 @@ pub struct Batch {
 impl Batch {
     pub fn args(&self) -> Vec<Arg> {
         vec![
+            Arg::Tag(Op::Batch),
             Arg::Number(self.asked),
             Arg::Number(self.given),
             Arg::Number(self.entries),
@@ -656,6 +666,7 @@ impl Batch {
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Batch, &[Arg])> {
+        let args = tagged(args, Op::Batch, "a batch")?;
         let [
             Arg::Number(asked),
             Arg::Number(given),
@@ -1037,7 +1048,7 @@ mod tests {
     #[test]
     fn an_extent_lying_about_its_instances_is_refused() {
         let mut args = extent(1, 0, 40).args();
-        args[7] = Arg::Number(99);
+        args[8] = Arg::Number(99);
         assert!(ExtentRow::of_args(&args).is_err());
         assert!(ExtentRow::of_args(&args[..7]).is_err(), "and a short row too");
     }

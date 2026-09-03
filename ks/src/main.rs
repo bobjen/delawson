@@ -15,8 +15,8 @@ use common::registry::{self, Peer};
 use common::server::{self, Process, Service};
 use common::wire::{Arg, Op, Request, Response, Status};
 use std::collections::BTreeMap;
-use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, RwLock};
 
 struct Ks {
     config: KsConfig,

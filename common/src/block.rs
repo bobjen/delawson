@@ -56,12 +56,7 @@ impl Holds {
     /// And back, returning whatever followed it.
     pub fn of_args(args: &[crate::wire::Arg]) -> Result<(Holds, &[crate::wire::Arg])> {
         use crate::wire::Arg;
-        let [
-            Arg::Number(compressed),
-            Arg::Number(logical),
-            Arg::Number(records),
-            rest @ ..,
-        ] = args
+        let [Arg::Number(compressed), Arg::Number(logical), Arg::Number(records), rest @ ..] = args
         else {
             return Err(Error::new("a block does not say what it holds"));
         };
@@ -77,7 +72,12 @@ impl Holds {
 
     /// Measure a framed block, given the length of the compressed user data.
     /// The physical compressed size on disk is the user data length plus `APPEND_OVERHEAD`.
-    pub fn of(framing: Framing, open: &[u8], block: &[u8], user_compressed_len: usize) -> Result<Holds> {
+    pub fn of(
+        framing: Framing,
+        open: &[u8],
+        block: &[u8],
+        user_compressed_len: usize,
+    ) -> Result<Holds> {
         let (records, _) = framing.advance(open, block)?;
         let logical = ELoff::of_number(framing.canonical_size(open.len(), block)?)?;
         let records = ERoff::of_number(records)?;

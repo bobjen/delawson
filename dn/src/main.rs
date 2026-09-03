@@ -801,7 +801,9 @@ impl DN {
             [Arg::Text(name), Arg::Number(sealed), Arg::Number(records)] => {
                 let records = match SRoff::of_number(*records) {
                     Ok(r) => r,
-                    Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
                 };
                 (name.clone(), *sealed, records)
             }

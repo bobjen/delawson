@@ -65,33 +65,36 @@ impl DailyKeyCache {
         let cvar = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let cvar2 = Arc::clone(&cvar);
 
-        process.ask("KS", &ask, move |answer| {
-            let mut guard = cvar2.0.lock().expect("cvar");
-            if answer.status == Status::Ok {
-                if let [Arg::Bytes(bytes)] = answer.args.as_slice() {
-                    if bytes.len() == 32 {
-                        let mut key_guard = key_cell2.lock().expect("key_cell");
-                        key_guard.copy_from_slice(bytes);
-                        *guard = true;
+        process
+            .ask("KS", &ask, move |answer| {
+                let mut guard = cvar2.0.lock().expect("cvar");
+                if answer.status == Status::Ok {
+                    if let [Arg::Bytes(bytes)] = answer.args.as_slice() {
+                        if bytes.len() == 32 {
+                            let mut key_guard = key_cell2.lock().expect("key_cell");
+                            key_guard.copy_from_slice(bytes);
+                            *guard = true;
+                        } else {
+                            let mut error_guard = error_cell2.lock().expect("error_cell");
+                            *error_guard = Some(Error::new("KS returned wrong key size"));
+                        }
                     } else {
                         let mut error_guard = error_cell2.lock().expect("error_cell");
-                        *error_guard = Some(Error::new("KS returned wrong key size"));
+                        *error_guard = Some(Error::new("KS returned wrong argument shape"));
                     }
                 } else {
                     let mut error_guard = error_cell2.lock().expect("error_cell");
-                    *error_guard = Some(Error::new("KS returned wrong argument shape"));
+                    *error_guard =
+                        Some(Error::new(format!("KS returned error: {}", answer.status)));
                 }
-            } else {
-                let mut error_guard = error_cell2.lock().expect("error_cell");
-                *error_guard = Some(Error::new(format!("KS returned error: {}", answer.status)));
-            }
-            *guard = true;
-            cvar2.1.notify_one();
-        }).unwrap_or_else(|_| {
-            let mut guard = cvar.0.lock().expect("cvar");
-            *guard = true;
-            cvar.1.notify_one();
-        });
+                *guard = true;
+                cvar2.1.notify_one();
+            })
+            .unwrap_or_else(|_| {
+                let mut guard = cvar.0.lock().expect("cvar");
+                *guard = true;
+                cvar.1.notify_one();
+            });
 
         let mut guard = cvar.0.lock().expect("cvar");
         while !*guard {
@@ -205,7 +208,8 @@ impl Append {
         holds: Holds,
         body: &[u8],
     ) -> Result<Self> {
-        let extent_key = extent_cache.get(daily_cache, process, extent.sn_id, extent.id, extent.created)?;
+        let extent_key =
+            extent_cache.get(daily_cache, process, extent.sn_id, extent.id, extent.created)?;
         let (key, nonce) = crypto::derive_block_secrets(&extent_key, logical.number());
 
         let (kind, width) = framing.wire();
@@ -229,7 +233,8 @@ impl Append {
         process: &Process,
         extent: &Extent,
     ) -> Result<(u64, Framing, Vec<u8>)> {
-        let extent_key = extent_cache.get(daily_cache, process, extent.sn_id, extent.id, extent.created)?;
+        let extent_key =
+            extent_cache.get(daily_cache, process, extent.sn_id, extent.id, extent.created)?;
         let (key, nonce) = crypto::derive_block_secrets(&extent_key, self.logical.number());
 
         if self.sealed.len() < 16 {
@@ -389,7 +394,8 @@ impl Extents {
         let stored_len = appending.holds.compressed;
 
         let sealable = !extent.open_record;
-        let full = extent.end.plus(stored_len)? > cap || extent.logical_end.plus(logical_size).is_err();
+        let full =
+            extent.end.plus(stored_len)? > cap || extent.logical_end.plus(logical_size).is_err();
         if extent.sealed || (sealable && full) {
             let closing = !extent.sealed;
             extent.sealed = true;
@@ -434,10 +440,10 @@ impl Extents {
             )));
         }
 
-        let logical_offset = appending.logical_offset.ok_or_else(|| {
-            Error::new("apply-append to EN must carry a logical offset")
-        })?;
-        
+        let logical_offset = appending
+            .logical_offset
+            .ok_or_else(|| Error::new("apply-append to EN must carry a logical offset"))?;
+
         let offset = self.extents[place].end;
         let first_record = self.extents[place].records;
 
@@ -566,7 +572,8 @@ impl Extents {
         let mut covered = Covered::default();
         let mut pieces: Vec<Piece> = Vec::new();
         for block in &blocks[first..] {
-            let (crc, _framing, plain_bytes) = block.decrypt(daily_cache, extent_cache, process, extent)?;
+            let (crc, _framing, plain_bytes) =
+                block.decrypt(daily_cache, extent_cache, process, extent)?;
             covered.took(block.holds.records.number(), block.holds.logical, block.holds.compressed);
             pieces.push(Piece {
                 logical: block.holds.logical.number(),
@@ -788,9 +795,11 @@ impl Disk {
         }
 
         let next_lo = landed.logical.number() + appending.holds.logical.number();
-        if let Some((next_app, next_reply)) =
-            self.pending_fixed.lock().expect("queue").remove(&(appending.sn, appending.extent, next_lo))
-        {
+        if let Some((next_app, next_reply)) = self.pending_fixed.lock().expect("queue").remove(&(
+            appending.sn,
+            appending.extent,
+            next_lo,
+        )) {
             self.try_append(process, mine, next_app, next_reply)?;
         }
 
@@ -896,7 +905,13 @@ impl Disk {
             Ok(from) => from,
             Err(e) => return Response::error(Status::NotFound, e.to_string()),
         };
-        let ranged = match self.range(process, SnId::new(*sn as u32), ExtentId::new(*extent as u32), from, range.budget) {
+        let ranged = match self.range(
+            process,
+            SnId::new(*sn as u32),
+            ExtentId::new(*extent as u32),
+            from,
+            range.budget,
+        ) {
             Ok(Some(ranged)) => ranged,
             Ok(None) => {
                 return Response::error(
@@ -1070,13 +1085,7 @@ enum Verdict {
 
 impl Counting {
     fn new(others: usize, quorum: usize) -> Counting {
-        Counting {
-            others,
-            wanted: quorum.saturating_sub(1),
-            applied: 0,
-            failed: 0,
-            settled: false,
-        }
+        Counting { others, wanted: quorum.saturating_sub(1), applied: 0, failed: 0, settled: false }
     }
 
     fn answer(&mut self, applied: bool) -> Option<Verdict> {
@@ -1202,8 +1211,7 @@ mod tests {
     }
 
     fn block(sn: u32, extent: u32, bytes: &[u8]) -> AppendBlock {
-        let holds = Holds::of(Framing::Lf, b"", bytes, bytes.len())
-            .expect("a well-formed block");
+        let holds = Holds::of(Framing::Lf, b"", bytes, bytes.len()).expect("a well-formed block");
         AppendBlock {
             sn: SnId::new(sn),
             extent: ExtentId::new(extent),
@@ -1248,7 +1256,13 @@ mod tests {
         let en = EN::new(testing::en_config());
         assert_eq!(append(&en, 1, &line("one")).offset, ECoff::new(0));
         let disk = en.disk(DiskId::FIRST).unwrap();
-        match disk.take(&testing::process(), &AppendBlock { sn: SnId::new(1), ..block(0, 1, &line("two")) }, ROOM).unwrap()
+        match disk
+            .take(
+                &testing::process(),
+                &AppendBlock { sn: SnId::new(1), ..block(0, 1, &line("two")) },
+                ROOM,
+            )
+            .unwrap()
         {
             Took::Landed(landed) => assert_eq!(landed.offset, ECoff::new(0)),
             _ => panic!("should have landed"),
@@ -1269,7 +1283,15 @@ mod tests {
         let en = EN::new(testing::en_config());
         let disk = en.disk(DiskId::FIRST).unwrap();
         let opened = Holds::of(Framing::Lf, b"", b"half a rec", 10).unwrap();
-        match disk.take(&testing::process(), &AppendBlock { holds: opened, logical_offset: Some(ELoff::ZERO), ..block(0, 1, b"half a rec") }, ROOM) {
+        match disk.take(
+            &testing::process(),
+            &AppendBlock {
+                holds: opened,
+                logical_offset: Some(ELoff::ZERO),
+                ..block(0, 1, b"half a rec")
+            },
+            ROOM,
+        ) {
             Ok(Took::Landed(landed)) => assert_eq!(landed.records, ERoff::new(0)),
             other => panic!("expected landed, got {other:?}"),
         }
@@ -1281,7 +1303,11 @@ mod tests {
         let disk = en.disk(DiskId::FIRST).unwrap();
         let cap = ECoff::new(100);
         let opened = Holds::of(Framing::Lf, b"", b"half", 4).unwrap();
-        let first = AppendBlock { holds: opened, logical_offset: Some(ELoff::ZERO), ..block(0, 1, b"half") };
+        let first = AppendBlock {
+            holds: opened,
+            logical_offset: Some(ELoff::ZERO),
+            ..block(0, 1, b"half")
+        };
         assert!(matches!(disk.take(&testing::process(), &first, cap), Ok(Took::Landed(_))));
 
         let closed = Holds::of(Framing::Lf, b"half", b" and half\n", 10).unwrap();
@@ -1289,7 +1315,10 @@ mod tests {
         second.holds = closed;
         second.logical_offset = Some(first.holds.logical);
         assert!(matches!(disk.take(&testing::process(), &second, cap), Ok(Took::Landed(_))));
-        assert!(matches!(disk.take(&testing::process(), &block(0, 1, b"x\n"), cap), Ok(Took::Sealed { .. })));
+        assert!(matches!(
+            disk.take(&testing::process(), &block(0, 1, b"x\n"), cap),
+            Ok(Took::Sealed { .. })
+        ));
     }
 
     #[test]
@@ -1297,7 +1326,10 @@ mod tests {
         let en = EN::new(testing::en_config());
         let disk = en.disk(DiskId::FIRST).unwrap();
         let cap = ECoff::new(60);
-        assert!(matches!(disk.take(&testing::process(), &block(0, 1, b"one\n"), cap), Ok(Took::Landed(_))));
+        assert!(matches!(
+            disk.take(&testing::process(), &block(0, 1, b"one\n"), cap),
+            Ok(Took::Landed(_))
+        ));
         match disk.take(&testing::process(), &block(0, 1, b"two\n"), cap) {
             Ok(Took::Sealed { came_to, .. }) => {
                 assert_eq!(came_to.records, 1);
@@ -1323,7 +1355,13 @@ mod tests {
 
         let held = disk.held.lock().unwrap();
         assert_eq!(
-            held.read(&en._daily_cache, &disk.extent_cache, &testing::process(), SnId::new(0), ExtentId::new(1)),
+            held.read(
+                &en._daily_cache,
+                &disk.extent_cache,
+                &testing::process(),
+                SnId::new(0),
+                ExtentId::new(1)
+            ),
             stored
         );
     }
@@ -1336,9 +1374,15 @@ mod tests {
         append(&en, 1, b"three\nfour\nfive\n");
 
         let one = |record| {
-            disk.range(&testing::process(), SnId::new(0), ExtentId::new(1), ERoff::new(record), Budget::Records(1))
-                .unwrap()
-                .map(|ranged| ranged.pieces[0].bytes.clone())
+            disk.range(
+                &testing::process(),
+                SnId::new(0),
+                ExtentId::new(1),
+                ERoff::new(record),
+                Budget::Records(1),
+            )
+            .unwrap()
+            .map(|ranged| ranged.pieces[0].bytes.clone())
         };
         assert_eq!(one(0).unwrap(), b"one\ntwo\n");
         assert_eq!(one(2).unwrap(), b"three\nfour\nfive\n");
@@ -1369,7 +1413,13 @@ mod tests {
         let disk = en.disk(DiskId::FIRST).unwrap();
         append(&en, 1, &b"x".repeat(100));
         let ranged = disk
-            .range(&testing::process(), SnId::new(0), ExtentId::new(1), ERoff::new(0), Budget::Records(0))
+            .range(
+                &testing::process(),
+                SnId::new(0),
+                ExtentId::new(1),
+                ERoff::new(0),
+                Budget::Records(0),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(ranged.pieces.len(), 1);
@@ -1380,7 +1430,16 @@ mod tests {
         let en = EN::new(testing::en_config());
         let disk = en.disk(DiskId::FIRST).unwrap();
         let opened = Holds::of(Framing::Lf, b"", b"half a rec", 10).unwrap();
-        disk.take(&testing::process(), &AppendBlock { holds: opened, logical_offset: Some(ELoff::ZERO), ..block(0, 1, b"half a rec") }, ROOM).unwrap();
+        disk.take(
+            &testing::process(),
+            &AppendBlock {
+                holds: opened,
+                logical_offset: Some(ELoff::ZERO),
+                ..block(0, 1, b"half a rec")
+            },
+            ROOM,
+        )
+        .unwrap();
         let closed = Holds::of(Framing::Lf, b"half a rec", b"ord\n", 4).unwrap();
         let mut second = block(0, 1, b"ord\n");
         second.holds = closed;
@@ -1388,7 +1447,13 @@ mod tests {
         disk.take(&testing::process(), &second, ROOM).unwrap();
 
         let ranged = disk
-            .range(&testing::process(), SnId::new(0), ExtentId::new(1), ERoff::new(0), Budget::Records(1))
+            .range(
+                &testing::process(),
+                SnId::new(0),
+                ExtentId::new(1),
+                ERoff::new(0),
+                Budget::Records(1),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(ranged.pieces.len(), 2);
@@ -1399,7 +1464,16 @@ mod tests {
         let en = EN::new(testing::en_config());
         let disk = en.disk(DiskId::FIRST).unwrap();
         let opened = Holds::of(Framing::Lf, b"", b"start", 5).unwrap();
-        disk.take(&testing::process(), &AppendBlock { holds: opened, logical_offset: Some(ELoff::ZERO), ..block(0, 1, b"start") }, ROOM).unwrap();
+        disk.take(
+            &testing::process(),
+            &AppendBlock {
+                holds: opened,
+                logical_offset: Some(ELoff::ZERO),
+                ..block(0, 1, b"start")
+            },
+            ROOM,
+        )
+        .unwrap();
         assert!(en.disk(DiskId::FIRST).unwrap().held.lock().unwrap().extents[0].open_record);
     }
 
@@ -1441,8 +1515,14 @@ mod tests {
         let mut held = disk.held.lock().unwrap();
         let mut same = block(0, 1, b"once\n");
         same.logical_offset = Some(ELoff::ZERO);
-        assert!(matches!(held.apply(&en._daily_cache, &disk.extent_cache, &testing::process(), &same), Ok(Applied::Stored)));
-        assert!(matches!(held.apply(&en._daily_cache, &disk.extent_cache, &testing::process(), &same), Ok(Applied::Already)));
+        assert!(matches!(
+            held.apply(&en._daily_cache, &disk.extent_cache, &testing::process(), &same),
+            Ok(Applied::Stored)
+        ));
+        assert!(matches!(
+            held.apply(&en._daily_cache, &disk.extent_cache, &testing::process(), &same),
+            Ok(Applied::Already)
+        ));
     }
 
     #[test]
@@ -1452,7 +1532,15 @@ mod tests {
         append(&en, 1, &line("keep"));
         let mut held = disk.held.lock().unwrap();
         let end = ELoff::of_number(held.extents[0].logical_end.number()).unwrap();
-        held.truncate(&en._daily_cache, &disk.extent_cache, &testing::process(), SnId::new(0), ExtentId::new(1), end).unwrap();
+        held.truncate(
+            &en._daily_cache,
+            &disk.extent_cache,
+            &testing::process(),
+            SnId::new(0),
+            ExtentId::new(1),
+            end,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1460,13 +1548,34 @@ mod tests {
         let en = EN::new(testing::en_config());
         let disk = en.disk(DiskId::FIRST).unwrap();
         let opened = Holds::of(Framing::Lf, b"", b"half a rec", 10).unwrap();
-        match disk.take(&testing::process(), &AppendBlock { holds: opened, logical_offset: Some(ELoff::ZERO), ..block(0, 1, b"half a rec") }, ROOM).unwrap() {
+        match disk
+            .take(
+                &testing::process(),
+                &AppendBlock {
+                    holds: opened,
+                    logical_offset: Some(ELoff::ZERO),
+                    ..block(0, 1, b"half a rec")
+                },
+                ROOM,
+            )
+            .unwrap()
+        {
             Took::Landed(_landed) => (),
             _ => panic!("should have landed"),
         };
         let mut held = disk.held.lock().unwrap();
         let mid = held.extents[0].logical_end;
-        assert!(held.truncate(&en._daily_cache, &disk.extent_cache, &testing::process(), SnId::new(0), ExtentId::new(1), mid).is_err());
+        assert!(
+            held.truncate(
+                &en._daily_cache,
+                &disk.extent_cache,
+                &testing::process(),
+                SnId::new(0),
+                ExtentId::new(1),
+                mid
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1476,6 +1585,12 @@ mod tests {
         let instances = vec![(EnId::new(0), DiskId::new(0)), (EnId::new(0), DiskId::new(0))];
         let mut appending = block(0, 1, &line("x"));
         appending.instances = instances;
-        disk.append(&testing::process(), (EnId::new(0), DiskId::FIRST), appending, testing::reply()).unwrap();
+        disk.append(
+            &testing::process(),
+            (EnId::new(0), DiskId::FIRST),
+            appending,
+            testing::reply(),
+        )
+        .unwrap();
     }
 }

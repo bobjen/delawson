@@ -14,13 +14,13 @@
 //! once it is deployed everywhere, and the tests exercise what the code is going to
 //! do. A test wanting the old path turns it off itself.
 
-use crate::server::Process;
-use std::sync::Arc;
 use crate::config::{
     ClusterConfig, Compress, DNConfig, ENConfig, Extents, FEConfig, FailureDomains, Knobs,
     KsBootstrap, Logging, MediaClass, Messaging, Rings, SCHEMA_VERSION, SNConfig, SendMode,
     ServiceEntry, ServiceKind, Timeouts,
 };
+use crate::server::Process;
+use std::sync::Arc;
 
 /// One of everything, four ENs because that is an extent's instance count, all in
 /// one failure domain. The single-box shape, which is what a test wants too.
