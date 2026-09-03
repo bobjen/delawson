@@ -203,6 +203,7 @@ ops! {
     BytesResp = 63, "bytes-response";
     NumberResp = 64, "number-response";
     FlagResp = 65, "flag-response";
+    SnKeyResp = 66, "sn-key-response";
 }
 
 impl std::fmt::Display for Op {
@@ -715,6 +716,50 @@ pub struct Receipt {
     pub created: TimeSec,
     pub offset: ELoff,
     pub length: ELoff,
+}
+
+/// The SN key answer. `next` is supplied whenever a planned key change is
+/// known, so an EN can cache the current key only until that exact second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnKey {
+    pub current: [u8; 32],
+    pub next: Option<(TimeSec, [u8; 32])>,
+}
+
+impl SnKey {
+    pub fn write(self) -> Arg {
+        let mut payload = StructWriter::new();
+        payload.bytes(&self.current);
+        payload.flag(self.next.is_some());
+        if let Some((at, key)) = self.next {
+            payload.number_u64(at.number());
+            payload.bytes(&key);
+        }
+        payload.finish(Op::SnKeyResp)
+    }
+
+    pub fn read(args: &[Arg]) -> Result<SnKey> {
+        let (mut payload, rest) = structure(args, Op::SnKeyResp, "an SN key response")?;
+        let current: [u8; 32] = payload
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::new("SN returned a current key of the wrong size"))?;
+        let next = if payload.flag()? {
+            let at = TimeSec::new(payload.number_u64()?);
+            let key: [u8; 32] = payload
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::new("SN returned a next key of the wrong size"))?;
+            Some((at, key))
+        } else {
+            None
+        };
+        if !rest.is_empty() {
+            return Err(Error::new("an SN key response has trailing arguments"));
+        }
+        payload.done()?;
+        Ok(SnKey { current, next })
+    }
 }
 
 impl Receipt {

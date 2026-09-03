@@ -4,6 +4,10 @@
 # A day that creates no extents needs no master key.
 lazy_day_keys = true
 
+# Delay before a newly generated master key takes effect, allowing ENs to cache
+# the current derived key safely.
+master_key_delay_secs = 3600
+
 # No operator secrets and no hardware devices on a test box, so KS comes up
 # already unlocked. Nothing but a test configuration may say false here.
 require_unlock = false

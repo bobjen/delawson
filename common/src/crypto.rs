@@ -5,20 +5,21 @@ use aegis::aegis128x2::Aegis128X2;
 use hkdf::Hkdf;
 use sha2::Sha256;
 
-/// The daily master key, 256 bits.
+/// The initial master key, 256 bits. KS assigns master keys effective times;
+/// this key is the initial epoch.
 pub const MASTER_KEY: [u8; 32] = [
     0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
     0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef, 0xde, 0xad, 0xbe, 0xef,
 ];
 
-/// SnMasterKey request AD, for SN daily keys derived from the master key.
+/// SnMasterKey request AD, for SN keys derived from a master-key epoch.
 pub const MASTER_KEY_AD: &[u8] = b"sn-master-key";
 
-pub fn sn_daily_key(sn_id: SnId, day: u64) -> [u8; 32] {
+pub fn sn_key(master_key: &[u8; 32], sn_id: SnId, day_start: TimeSec) -> [u8; 32] {
     let mut info = [0u8; 12];
     info[..4].copy_from_slice(&sn_id.get().to_le_bytes());
-    info[4..].copy_from_slice(&day.to_le_bytes());
-    let hk = Hkdf::<Sha256>::new(None, &MASTER_KEY);
+    info[4..].copy_from_slice(&day_start.number().to_le_bytes());
+    let hk = Hkdf::<Sha256>::new(None, master_key);
     let mut okm = [0u8; 32];
     hk.expand(&info, &mut okm).expect("32 bytes is valid for HKDF-SHA256");
     okm

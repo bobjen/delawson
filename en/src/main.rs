@@ -29,39 +29,48 @@ use common::offset::{ECoff, ELoff, ERoff};
 use common::range::{Budget, Covered, Filled, Piece, Range};
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
-use common::wire::{AppendBlock, Arg, EnReceipt, Op, Req, Resp, Status, StructWriter, structure};
+use common::wire::{
+    AppendBlock, Arg, EnReceipt, Op, Req, Resp, SnKey, Status, StructWriter, structure,
+};
 use common::{Error, Result, logw};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 const SERVES: &[Op] = &[Op::AppendExtent, Op::ApplyAppend, Op::ReadExtent];
 
-/// Cached SN daily keys.
+/// Cached SN keys, addressed by the exact extent creation second. The exact
+/// time matters because KS may install an emergency key epoch mid-day.
 struct DailyKeyCache {
-    keys: RwLock<HashMap<(SnId, u64), [u8; 32]>>,
+    keys: RwLock<BTreeMap<(SnId, TimeSec), CachedSnKey>>,
+}
+
+struct CachedSnKey {
+    key: [u8; 32],
+    until: TimeSec,
 }
 
 impl DailyKeyCache {
     fn new() -> Self {
-        Self { keys: RwLock::new(HashMap::new()) }
+        Self { keys: RwLock::new(BTreeMap::new()) }
     }
 
     fn get(&self, process: &Process, sn_id: SnId, ts: TimeSec) -> Result<[u8; 32]> {
-        let day = ts.day();
         {
             let keys = self.keys.read().expect("keys");
-            if let Some(key) = keys.get(&(sn_id, day)) {
-                return Ok(*key);
+            if let Some((_, cached)) = keys.range((sn_id, TimeSec::EPOCH)..=(sn_id, ts)).next_back()
+                && ts < cached.until
+            {
+                return Ok(cached.key);
             }
         }
 
         // Fetch from KS.
         let mut payload = StructWriter::new();
         payload.number_u32(sn_id.get());
-        payload.number_u64(day);
+        payload.number_u64(ts.number());
         let ask = Req::new(Op::SnMasterKey).structure(payload);
-        let key_cell = Arc::new(Mutex::new([0u8; 32]));
+        let key_cell = Arc::new(Mutex::new(None::<SnKey>));
         let key_cell2 = Arc::clone(&key_cell);
         let error_cell = Arc::new(Mutex::new(None));
         let error_cell2 = Arc::clone(&error_cell);
@@ -72,18 +81,16 @@ impl DailyKeyCache {
             .ask("KS", &ask, move |answer| {
                 let mut guard = cvar2.0.lock().expect("cvar");
                 if answer.status == Status::Ok {
-                    if let [Arg::Bytes(bytes)] = answer.args.as_slice() {
-                        if bytes.len() == 32 {
+                    match common::wire::SnKey::read(&answer.args) {
+                        Ok(response) => {
                             let mut key_guard = key_cell2.lock().expect("key_cell");
-                            key_guard.copy_from_slice(bytes);
+                            *key_guard = Some(response);
                             *guard = true;
-                        } else {
-                            let mut error_guard = error_cell2.lock().expect("error_cell");
-                            *error_guard = Some(Error::new("KS returned wrong key size"));
                         }
-                    } else {
-                        let mut error_guard = error_cell2.lock().expect("error_cell");
-                        *error_guard = Some(Error::new("KS returned wrong argument shape"));
+                        Err(e) => {
+                            let mut error_guard = error_cell2.lock().expect("error_cell");
+                            *error_guard = Some(e);
+                        }
                     }
                 } else {
                     let mut error_guard = error_cell2.lock().expect("error_cell");
@@ -108,13 +115,23 @@ impl DailyKeyCache {
             return Err(e);
         }
 
-        let key = *key_cell.lock().expect("key_cell");
-        if key == [0u8; 32] {
-            let key = crypto::sn_daily_key(sn_id, day);
-            self.keys.write().expect("keys").insert((sn_id, day), key);
-            return Ok(key);
+        let Some(response) = key_cell.lock().expect("key_cell").take() else {
+            #[cfg(test)]
+            {
+                return Ok(crypto::sn_key(&crypto::MASTER_KEY, sn_id, ts.day_start()));
+            }
+            #[cfg(not(test))]
+            {
+                return Err(Error::new("KS returned no key"));
+            }
+        };
+        let until = response.next.map_or(TimeSec::NONE, |(at, _)| at);
+        let key = response.current;
+        let mut keys = self.keys.write().expect("keys");
+        keys.insert((sn_id, ts), CachedSnKey { key, until });
+        if let Some((at, key)) = response.next {
+            keys.insert((sn_id, at), CachedSnKey { key, until: TimeSec::NONE });
         }
-        self.keys.write().expect("keys").insert((sn_id, day), key);
         Ok(key)
     }
 }

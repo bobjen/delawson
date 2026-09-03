@@ -87,6 +87,11 @@ impl TimeSec {
         self.0 / 86_400
     }
 
+    /// Midnight at the start of this moment's UTC day.
+    pub fn day_start(self) -> TimeSec {
+        TimeSec::new(self.day() * 86_400)
+    }
+
     /// ⚠️ **Refuses a clock that went backwards**, which is the check §7.3.3 needs
     /// before an extent's creation second selects its key: two extents made in the same
     /// second are fine, one made *before* the last one is a machine to stop trusting.

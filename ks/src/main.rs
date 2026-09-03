@@ -13,10 +13,28 @@ use common::crypto;
 use common::logn;
 use common::registry::{self, Peer};
 use common::server::{self, Process, Service};
-use common::wire::{Op, Req, Resp, Status, structure};
+use common::time::TimeSec;
+use common::wire::{Op, Req, Resp, SnKey, Status, structure};
+use common::{Context, Result};
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
+
+struct MasterEpoch {
+    since: TimeSec,
+    key: [u8; 32],
+}
+
+fn random_master_key() -> Result<[u8; 32]> {
+    let mut key = [0u8; 32];
+    File::open("/dev/urandom")
+        .context("opening the operating system random source")?
+        .read_exact(&mut key)
+        .context("reading a master key from the operating system random source")?;
+    Ok(key)
+}
 
 struct Ks {
     config: KsConfig,
@@ -26,8 +44,11 @@ struct Ks {
     unlocked: AtomicBool,
     /// In memory only, so a KS restart makes every other process re-register.
     peers: Mutex<BTreeMap<String, Peer>>,
-    /// Cached SN daily keys.
-    sn_keys: RwLock<BTreeMap<(common::ids::SnId, u64), [u8; 32]>>,
+    /// Cached SN keys, addressed by the exact time requested. An emergency
+    /// master-key epoch can therefore change the answer within one day.
+    sn_keys: RwLock<BTreeMap<(common::ids::SnId, TimeSec), SnKey>>,
+    /// Master keys sorted by the second at which each becomes effective.
+    master_keys: RwLock<Vec<MasterEpoch>>,
 }
 
 const SERVES: &[Op] =
@@ -55,11 +76,18 @@ impl Service for Ks {
                 self.sn_key(request)
             }
 
-            Op::Unlock | Op::RotateMasterKey => {
-                logn!("asked for a key op", "op {}", request.op);
-                if !self.unlocked.load(Ordering::SeqCst) && request.op != Op::Unlock {
+            Op::RotateMasterKey => {
+                if !self.unlocked.load(Ordering::SeqCst) {
                     return Resp::error(Status::Locked, "KS is locked");
                 }
+                match self.rotate_master_key(request) {
+                    Ok(()) => Resp::ok(),
+                    Err(e) => Resp::error(Status::BadRequest, e.to_string()),
+                }
+            }
+
+            Op::Unlock => {
+                logn!("asked for a key op", "op {}", request.op);
                 server::unbuilt(process, SERVES, request)
             }
             _ => server::unbuilt(process, SERVES, request),
@@ -83,8 +111,8 @@ impl Service for Ks {
             format!("inline_ping {}", self.config.inline_ping),
             format!("unlocked {}", self.unlocked.load(Ordering::SeqCst)),
             format!("registered {}", self.peers.lock().expect("peers").len()),
-            format!("master_keys 1"),
-            format!("sn_daily_keys {sn_keys}"),
+            format!("master_keys {}", self.master_keys.read().expect("master_keys").len()),
+            format!("sn_keys {sn_keys}"),
         ]
     }
 }
@@ -97,6 +125,10 @@ impl Ks {
             unlocked,
             peers: Mutex::new(BTreeMap::new()),
             sn_keys: RwLock::new(BTreeMap::new()),
+            master_keys: RwLock::new(vec![MasterEpoch {
+                since: TimeSec::EPOCH,
+                key: random_master_key().expect("OS randomness for initial master key"),
+            }]),
         }
     }
 
@@ -116,24 +148,70 @@ impl Ks {
             Ok(sn) => sn,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let day = match payload.number_u64().and_then(|day| payload.done().map(|()| day)) {
-            Ok(day) => day,
+        let at = match payload.number_u64().and_then(|at| payload.done().map(|()| TimeSec::new(at)))
+        {
+            Ok(at) => at,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        self.sn_key_for(sn, day)
+        match self.sn_key_for(sn, at) {
+            Ok(key) => Resp { id: 0, status: Status::Ok, args: vec![key.write()] },
+            Err(e) => Resp::error(Status::Internal, e.to_string()),
+        }
     }
 
-    fn sn_key_for(&self, sn: common::ids::SnId, day: u64) -> Resp {
+    fn sn_key_for(&self, sn: common::ids::SnId, at: TimeSec) -> Result<SnKey> {
+        self.ensure_day(at.day_start())?;
+        let horizon = at.plus_secs(self.config.master_key_delay_secs);
+        self.ensure_day(horizon.day_start())?;
         {
             let keys = self.sn_keys.read().expect("sn_keys");
-            if let Some(key) = keys.get(&(sn, day)) {
-                return Resp::bytes(key.to_vec());
+            if let Some(key) = keys.get(&(sn, at)) {
+                return Ok(key.clone());
             }
         }
 
-        let key = crypto::sn_daily_key(sn, day);
-        self.sn_keys.write().expect("sn_keys").insert((sn, day), key);
-        Resp::bytes(key.to_vec())
+        let epochs = self.master_keys.read().expect("master_keys");
+        let count = epochs.partition_point(|epoch| epoch.since <= at);
+        let current = &epochs[count - 1];
+        let current_key = crypto::sn_key(&current.key, sn, current.since);
+        let next = epochs
+            .get(count)
+            .map(|epoch| (epoch.since, crypto::sn_key(&epoch.key, sn, epoch.since)));
+        let result = SnKey { current: current_key, next };
+        drop(epochs);
+        self.sn_keys.write().expect("sn_keys").insert((sn, at), result.clone());
+        Ok(result)
+    }
+
+    fn ensure_day(&self, day: TimeSec) -> Result<()> {
+        let mut epochs = self.master_keys.write().expect("master_keys");
+        if epochs.iter().any(|epoch| epoch.since == day) {
+            return Ok(());
+        }
+        let key = random_master_key()?;
+        let at = epochs.partition_point(|epoch| epoch.since < day);
+        epochs.insert(at, MasterEpoch { since: day, key });
+        Ok(())
+    }
+
+    fn rotate_master_key(&self, request: &Req) -> Result<()> {
+        let (payload, rest) =
+            structure(&request.args, Op::RotateMasterKey, "a rotate-master-key request")?;
+        payload.done()?;
+        if !rest.is_empty() {
+            return Err(common::Error::new("a rotate-master-key request has trailing arguments"));
+        }
+        let since = TimeSec::now().plus_secs(self.config.master_key_delay_secs);
+        let mut epochs = self.master_keys.write().expect("master_keys");
+        let key = random_master_key()?;
+        let at = epochs.partition_point(|epoch| epoch.since < since);
+        if epochs.get(at).is_some_and(|epoch| epoch.since == since) {
+            epochs[at] = MasterEpoch { since, key };
+        } else {
+            epochs.insert(at, MasterEpoch { since, key });
+        }
+        self.sn_keys.write().expect("sn_keys").clear();
+        Ok(())
     }
 
     /// A registration announces a port; it does not invent an identity. The

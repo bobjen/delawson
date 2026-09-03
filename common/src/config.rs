@@ -600,6 +600,9 @@ pub struct KsConfig {
     /// key per elapsed day through a long dormancy would take the store from
     /// megabytes to terabytes.
     pub lazy_day_keys: bool,
+    /// Delay between generating a replacement master key and making it
+    /// effective, so ENs can cache the current derived key safely.
+    pub master_key_delay_secs: u64,
     /// Whether the operator-and-hardware unlocking ceremony is required before
     /// KS will answer key requests. False on a test box — and `status` says so
     /// rather than staying quiet about it.

@@ -6233,9 +6233,9 @@ None of those can live in a consensus ring. So the hierarchy stores almost nothi
 and derives the rest:
 
 ```
-daily master key         randomly generated, one per day
+master-key epoch         randomly generated, normally one per day
                          lives ONLY in KS; on KS disk, encrypted at rest
-  → daily SN-master key  = derive(daily master key, SN)
+  → daily SN-master key  = derive(selected master-key epoch, SN)
                          cached on ENs
     → extent key         = derive(the correct daily SN-master key, extent)
       → block IV         = f(extent id, block index)        (§7.2)
@@ -6243,6 +6243,14 @@ daily master key         randomly generated, one per day
 
 Master keys are **random, not derived** — there is no key above them, which is
 what makes the layer below unrecoverable without KS.
+
+An epoch is selected by the extent's exact creation `TimeSec`, not by an integer
+day number. KS prepares the next ordinary day-boundary key during the configured
+delay before midnight, and a forced rotation likewise generates a key immediately
+but makes it effective only after that delay. A key request can therefore return
+the current SN key and a pending SN key with its effective second. EN may cache
+the current key until that second; at the boundary the exact `TimeSec` alone
+selects the new key.
 
 **The authoritative key store is kilobytes.** One random key per day:
 
@@ -6265,14 +6273,14 @@ the store must be sparse and populated on demand.
 
 #### 7.3.1 Two-dimensional scoping bounds the blast radius
 
-**ENs cache daily SN-master keys.** This corrects §5.9.1: ENs are not keyless, and
+**ENs cache SN-master keys.** This corrects §5.9.1: ENs are not keyless, and
 an EN compromise is not limited to ciphertext.
 
 But the exposure is bounded on two axes at once:
 
 | Axis | Bounded by | Effect of a compromise |
 |---|---|---|
-| Time | daily rotation | only the days whose keys are cached |
+| Time | delayed epoch rotation | only the key epochs whose keys are cached |
 | Space | per-SN derivation | only extents of the SNs whose keys are cached |
 
 And critically, **the master keys never leave KS**, so no number of compromised ENs

@@ -156,9 +156,9 @@ enum Cmd {
     SnMasterKey {
         #[arg(long)]
         sn: u64,
-        /// Days since the epoch, which is the creation second over 86,400.
+        /// Creation second whose effective master-key epoch should be used.
         #[arg(long)]
-        day: u64,
+        at: u64,
     },
     /// Generate today's master key.
     RotateMasterKey,
@@ -1777,10 +1777,11 @@ fn targets(cluster: &ClusterConfig, cli: &Cli, kind: ServiceKind) -> Result<Vec<
 fn build(cmd: &Cmd) -> Result<Req> {
     Ok(match cmd {
         Cmd::Unlock => Req::new(Op::Unlock),
-        Cmd::SnMasterKey { sn, day } => {
+        Cmd::SnMasterKey { sn, at } => {
             let mut payload = common::wire::StructWriter::new();
-            payload.number_u64(*sn);
-            payload.number_u64(*day);
+            payload
+                .number_u32(u32::try_from(*sn).map_err(|_| Error::new("SN id exceeds 32 bits"))?);
+            payload.number_u64(TimeSec::new(*at).number());
             Req::new(Op::SnMasterKey).structure(payload)
         }
         Cmd::RotateMasterKey => Req::new(Op::RotateMasterKey),
