@@ -90,7 +90,7 @@ impl Logs {
         for path in &self.paths {
             let mut file = std::fs::File::open(path).context(path.display())?;
             let mut text = String::new();
-            if path.extension().is_some_and(|kind| kind == "logz") {
+            if path.extension().is_some_and(|kind| kind == "zst") {
                 // Blocks, each a pair of lengths and the bytes. A torn last block
                 // is a process that died mid-write: it ends the walk rather than
                 // failing the answer, since the rest is still worth reading.
@@ -108,7 +108,8 @@ impl Logs {
                     if file.read_exact(&mut block).is_err() {
                         break;
                     }
-                    let Ok(loosened) = lz4_flex::decompress(&block, loose) else { break };
+                    let loosened = zstd::bulk::decompress(&block, loose).map_err(|_| ());
+                    let Ok(loosened) = loosened else { break };
                     text.clear();
                     text.push_str(&String::from_utf8_lossy(&loosened));
                     for line in text.lines() {
@@ -232,13 +233,13 @@ const MAX_ROWS: usize = 10_000;
 /// for one. A writer with more than this pending cuts it at a line boundary.
 pub const MAX_BLOCK: usize = 8 << 20;
 
-/// Compress one block of lines for a log file: the loose length, the tight
-/// length, then the bytes. Lengths first, so a reader can walk without a table.
-pub fn pack(lines: &[u8], out: &mut Vec<u8>) -> Result<()> {
+/// Compress one block of lines: the loose length, the tight length, then the
+/// bytes. Lengths first, so a reader can walk without a table.
+pub fn pack_zstd(lines: &[u8], out: &mut Vec<u8>) -> Result<()> {
     if lines.len() > MAX_BLOCK {
         return Err(Error::new(format!("a log block of {} bytes", lines.len())));
     }
-    let tight = lz4_flex::compress(lines);
+    let tight = zstd::bulk::compress(lines, 1).map_err(|e| Error::new(e.to_string()))?;
     out.extend((lines.len() as u32).to_le_bytes());
     out.extend((tight.len() as u32).to_le_bytes());
     out.extend(tight);
@@ -267,11 +268,11 @@ n,2026-08-17 01:00:01.000000,pid=1,tid=1,file=common/src/server.rs,line=99,liste
         std::fs::create_dir_all(&dir).unwrap();
         let mut bytes = Vec::new();
         if packed {
-            pack(SAMPLE.as_bytes(), &mut bytes).unwrap();
+            pack_zstd(SAMPLE.as_bytes(), &mut bytes).unwrap();
         } else {
             bytes.extend(SAMPLE.as_bytes());
         }
-        let kind = if packed { "logz" } else { "log" };
+        let kind = if packed { "zst" } else { "log" };
         std::fs::write(dir.join(format!("dn0-0000000.{kind}")), bytes).unwrap();
         Logs::open(&dir, "dn0", u64::MAX).unwrap()
     }

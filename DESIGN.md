@@ -14889,7 +14889,7 @@ hour. Nothing about it is parallel, and that is the design rather than an omissi
 
 **And the files are compressed**, which follows from nobody reading them directly: the only consumer
 is a tool that can decompress. Each block is independent, so a torn last block from a process that
-died ends a walk instead of failing an answer, and the extension says which a file is — `.logz`
+died ends a walk instead of failing an answer, and the extension says which a file is — `.zst`
 compressed, `.log` not. **Measured: 74 MB of lines in 9.9 MB of file, 7.5x** (Bob's guess of "more
 than 6x" was right), and `status` reports the ratio a run achieved rather than leaving it a guess.
 28 MB/s of lines becomes 3.7 MB/s on the disk, which turns §17.5g.1's 18 seconds of full log into a

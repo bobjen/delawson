@@ -144,6 +144,12 @@ pub struct Logging {
     pub recount: usize,
 }
 
+#[derive(Clone, Copy)]
+enum Compression {
+    Plain,
+    Zstd,
+}
+
 struct Logger {
     config: Logging,
     full: Mutex<Rotating>,
@@ -188,14 +194,14 @@ pub fn open(dir: &Path, identity: &str, config: Logging) -> Result<()> {
         host(),
         env!("CARGO_PKG_VERSION"),
     );
-    let packed = config.compress;
+    let compression = if config.compress { Compression::Zstd } else { Compression::Plain };
     let full = Rotating::new(
         dir,
         &name,
         config.size,
         config.full_files,
         header.clone(),
-        packed,
+        compression,
         config.block,
     )?;
     let info = Rotating::new(
@@ -204,7 +210,7 @@ pub fn open(dir: &Path, identity: &str, config: Logging) -> Result<()> {
         config.size,
         config.info_files,
         header,
-        packed,
+        compression,
         config.block,
     )?;
     FLOOR.store(config.level as u8, Ordering::Relaxed);
@@ -482,7 +488,7 @@ struct Rotating {
     pending: Vec<u8>,
     /// How many bytes of lines to gather first.
     block: usize,
-    packed: bool,
+    compression: Compression,
 }
 
 impl Rotating {
@@ -492,7 +498,7 @@ impl Rotating {
         size: u64,
         keep: usize,
         header: String,
-        packed: bool,
+        compression: Compression,
         block: usize,
     ) -> Result<Rotating> {
         std::fs::create_dir_all(dir).context(dir.display())?;
@@ -503,11 +509,11 @@ impl Rotating {
             keep: keep.max(1),
             seq: 0,
             written: 0,
-            file: File::create(path(dir, name, 0, packed)).context(dir.display())?,
+            file: File::create(path(dir, name, 0, compression)).context(dir.display())?,
             header,
             pending: Vec::with_capacity(block),
             block,
-            packed,
+            compression,
         };
         let header = rotating.header.clone();
         let _ = rotating.write(header.as_bytes(), true);
@@ -538,13 +544,18 @@ impl Rotating {
         let mut at = 0;
         let mut packed = Vec::new();
         while at < pending.len() {
-            let end = if self.packed { block_end(&pending, at) } else { pending.len() };
+            let end = if !matches!(self.compression, Compression::Plain) {
+                block_end(&pending, at)
+            } else {
+                pending.len()
+            };
             let piece = &pending[at..end];
             at = end;
 
-            let bytes: &[u8] = if self.packed {
+            let bytes: &[u8] = if !matches!(self.compression, Compression::Plain) {
                 packed.clear();
-                match crate::logread::pack(piece, &mut packed) {
+                let result = crate::logread::pack_zstd(piece, &mut packed);
+                match result {
                     Ok(()) => &packed,
                     // Written as it stands rather than lost; the file says per
                     // block which it is.
@@ -570,13 +581,14 @@ impl Rotating {
     fn roll(&mut self) -> std::io::Result<()> {
         self.file.flush()?;
         self.seq += 1;
-        self.file = File::create(path(&self.dir, &self.name, self.seq, self.packed))?;
+        self.file = File::create(path(&self.dir, &self.name, self.seq, self.compression))?;
         self.written = 0;
         // The header goes at the top of the new file as its own block.
         let header = self.header.clone();
         let mut first = Vec::new();
-        let bytes: &[u8] = if self.packed {
-            match crate::logread::pack(header.as_bytes(), &mut first) {
+        let bytes: &[u8] = if !matches!(self.compression, Compression::Plain) {
+            let result = crate::logread::pack_zstd(header.as_bytes(), &mut first);
+            match result {
                 Ok(()) => &first,
                 Err(_) => header.as_bytes(),
             }
@@ -586,7 +598,7 @@ impl Rotating {
         self.file.write_all(bytes)?;
         self.written = bytes.len() as u64;
         if let Some(gone) = self.seq.checked_sub(self.keep) {
-            let _ = std::fs::remove_file(path(&self.dir, &self.name, gone, self.packed));
+            let _ = std::fs::remove_file(path(&self.dir, &self.name, gone, self.compression));
         }
         Ok(())
     }
@@ -616,11 +628,11 @@ pub fn files(dir: &Path, name: &str) -> crate::Result<Vec<PathBuf>> {
     for entry in listing.flatten() {
         let path = entry.path();
         let file = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
-        // `<name>-0000000.log` or `.logz`, and not `<name>-info-0000000.log` when
+        // `<name>-0000000.log` or `.zst`, and not `<name>-info-0000000.log` when
         // asked for `<name>`.
         if let Some(tail) = file.strip_prefix(&format!("{name}-")) {
             let numbered = tail.split('.').next().is_some_and(|n| n.len() == 7);
-            if numbered && (tail.ends_with(".log") || tail.ends_with(".logz")) {
+            if numbered && (tail.ends_with(".log") || tail.ends_with(".zst")) {
                 found.push(path);
             }
         }
@@ -634,10 +646,13 @@ pub fn dir_of(run_dir: &Path) -> PathBuf {
     run_dir.join("logs")
 }
 
-fn path(dir: &Path, name: &str, seq: usize, packed: bool) -> PathBuf {
+fn path(dir: &Path, name: &str, seq: usize, compression: Compression) -> PathBuf {
     // The extension says which, because a compressed file that claims to be text
     // is a trap for whoever tries to read it with the wrong thing.
-    let kind = if packed { "logz" } else { "log" };
+    let kind = match compression {
+        Compression::Plain => "log",
+        Compression::Zstd => "zst",
+    };
     dir.join(format!("{name}-{seq:07}.{kind}"))
 }
 
@@ -826,7 +841,8 @@ mod tests {
     fn rotation_keeps_the_last_few() {
         let dir = std::env::temp_dir().join(format!("laws-log-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut rotating = Rotating::new(&dir, "test", 64, 3, String::new(), false, 1).unwrap();
+        let mut rotating =
+            Rotating::new(&dir, "test", 64, 3, String::new(), Compression::Plain, 1).unwrap();
         for n in 0..40 {
             rotating.write(format!("line {n} of some length\n").as_bytes(), true).unwrap();
         }
@@ -898,7 +914,8 @@ mod blocks {
         // 14 MB of text asks for.
         let block = crate::logread::MAX_BLOCK * 3;
         let mut rotating =
-            Rotating::new(&dir, "dn0", u64::MAX, 4, String::new(), true, block).unwrap();
+            Rotating::new(&dir, "dn0", u64::MAX, 4, String::new(), Compression::Zstd, block)
+                .unwrap();
 
         let line = "i,2026-08-17 01:00:00.000001,pid=1,tid=1,file=x.rs,line=1,said,value 1\n";
         let count = block / line.len() + 10;
