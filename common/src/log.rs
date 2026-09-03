@@ -44,6 +44,7 @@
 //! what they are looking for.
 
 use crate::{Context, Result};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Write as _;
@@ -102,6 +103,13 @@ pub struct Site {
     listed: AtomicBool,
     /// The start of the first line this site produced, for reading histograms.
     text: OnceLock<String>,
+    /// The histogram key, built once because file, line, level, and constant are
+    /// all fixed for a logging call site.
+    key: OnceLock<String>,
+    full_file_count: AtomicU64,
+    info_file_count: AtomicU64,
+    full_pending_count: AtomicU64,
+    info_pending_count: AtomicU64,
 }
 
 impl Site {
@@ -115,7 +123,16 @@ impl Site {
             skipped: AtomicU64::new(0),
             listed: AtomicBool::new(false),
             text: OnceLock::new(),
+            key: OnceLock::new(),
+            full_file_count: AtomicU64::new(0),
+            info_file_count: AtomicU64::new(0),
+            full_pending_count: AtomicU64::new(0),
+            info_pending_count: AtomicU64::new(0),
         }
+    }
+
+    fn histogram_key(&self) -> Option<&str> {
+        self.key.get().map(String::as_str)
     }
 }
 
@@ -203,6 +220,7 @@ pub fn open(dir: &Path, identity: &str, config: Logging) -> Result<()> {
         header.clone(),
         compression,
         config.block,
+        false,
     )?;
     let info = Rotating::new(
         dir,
@@ -212,6 +230,7 @@ pub fn open(dir: &Path, identity: &str, config: Logging) -> Result<()> {
         header,
         compression,
         config.block,
+        true,
     )?;
     FLOOR.store(config.level as u8, Ordering::Relaxed);
     let _ = LOGGER.set(Logger { config, full: Mutex::new(full), info: Mutex::new(info) });
@@ -320,13 +339,13 @@ fn emit(
         line.clear();
         let pid = PID.get_or_init(std::process::id);
         let tid = TID.with(|tid| *tid);
+        let time = stamp();
         // The constant, then the values: two fields, so a reader can group on the
         // first without cutting into the second.
         let _ = write!(
             line,
-            "{},{},pid={pid},tid={tid},file={},line={},{what},",
+            "{},{time},pid={pid},tid={tid},file={},line={},{what},",
             level.letter(),
-            stamp(),
             site.file,
             site.line
         );
@@ -340,6 +359,13 @@ fn emit(
 
         if site.text.get().is_none() {
             let _ = site.text.set(what.to_string());
+            let _ = site.key.set(format!(
+                "{},file={},line={},{}",
+                level.letter(),
+                site.file,
+                site.line,
+                what
+            ));
         }
 
         match LOGGER.get() {
@@ -349,10 +375,20 @@ fn emit(
                 // waits for the buffer to fill or for the flusher to come round,
                 // because a write per line costs more than the line does.
                 let urgent = level >= Level::Warning;
-                let _ = logger.full.lock().expect("log").write(line.as_bytes(), urgent);
+                let _ = logger.full.lock().expect("log").write(
+                    line.as_bytes(),
+                    urgent,
+                    Some(site),
+                    Some(&time),
+                );
                 // Everything above info, and a sampled share of the rest.
                 if level > Level::Info || stride <= 1 || seen.is_multiple_of(stride) {
-                    let _ = logger.info.lock().expect("log").write(line.as_bytes(), urgent);
+                    let _ = logger.info.lock().expect("log").write(
+                        line.as_bytes(),
+                        urgent,
+                        Some(site),
+                        Some(&time),
+                    );
                 }
             }
         }
@@ -486,9 +522,16 @@ struct Rotating {
     /// Lines waiting to be written. With compression they are a block; without,
     /// they are just the next write.
     pending: Vec<u8>,
+    pending_first: String,
+    pending_last: String,
     /// How many bytes of lines to gather first.
     block: usize,
     compression: Compression,
+    /// The histogram for the file currently being filled. It becomes durable
+    /// only when rotation closes this file.
+    first: String,
+    last: String,
+    info: bool,
 }
 
 impl Rotating {
@@ -500,6 +543,7 @@ impl Rotating {
         header: String,
         compression: Compression,
         block: usize,
+        info: bool,
     ) -> Result<Rotating> {
         std::fs::create_dir_all(dir).context(dir.display())?;
         let mut rotating = Rotating {
@@ -512,17 +556,39 @@ impl Rotating {
             file: File::create(path(dir, name, 0, compression)).context(dir.display())?,
             header,
             pending: Vec::with_capacity(block),
+            pending_first: String::new(),
+            pending_last: String::new(),
             block,
             compression,
+            first: String::new(),
+            last: String::new(),
+            info,
         };
         let header = rotating.header.clone();
-        let _ = rotating.write(header.as_bytes(), true);
+        let _ = rotating.write(header.as_bytes(), true, None, None);
+        rotating.set_time(&header);
         Ok(rotating)
     }
 
-    fn write(&mut self, bytes: &[u8], urgent: bool) -> std::io::Result<()> {
+    fn write(
+        &mut self,
+        bytes: &[u8],
+        urgent: bool,
+        site: Option<&'static Site>,
+        time: Option<&str>,
+    ) -> std::io::Result<()> {
         LINE_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        if let Some(time) = time {
+            if self.pending_first.is_empty() {
+                self.pending_first.push_str(time);
+            }
+            self.pending_last.clear();
+            self.pending_last.push_str(time);
+        }
         self.pending.extend_from_slice(bytes);
+        if let Some(site) = site {
+            self.pending_counter(site).fetch_add(1, Ordering::Relaxed);
+        }
         if urgent || self.pending.len() >= self.block {
             self.flush()?;
         }
@@ -539,10 +605,15 @@ impl Rotating {
         if self.pending.is_empty() {
             return Ok(());
         }
+        // A pending buffer is assigned wholly to one file. It may overshoot by
+        // one buffer, but that removes a per-line file-assignment table.
+        if self.written + self.pending.len() as u64 > self.size {
+            self.roll()?;
+        }
         // Taken out of `self` so the file can be rolled while it is held.
         let pending = std::mem::take(&mut self.pending);
-        let mut at = 0;
         let mut packed = Vec::new();
+        let mut at = 0;
         while at < pending.len() {
             let end = if !matches!(self.compression, Compression::Plain) {
                 block_end(&pending, at)
@@ -565,9 +636,6 @@ impl Rotating {
                 piece
             };
 
-            if self.written + bytes.len() as u64 > self.size {
-                self.roll()?;
-            }
             self.file.write_all(bytes)?;
             FILE_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
             self.written += bytes.len() as u64;
@@ -575,11 +643,27 @@ impl Rotating {
         let mut pending = pending;
         pending.clear();
         self.pending = pending;
+        self.transfer_pending();
+        if !self.pending_first.is_empty() {
+            if self.first.is_empty() {
+                self.first = std::mem::take(&mut self.pending_first);
+                self.last = std::mem::take(&mut self.pending_last);
+            } else {
+                self.last = std::mem::take(&mut self.pending_last);
+                self.pending_first.clear();
+            }
+        }
         Ok(())
     }
 
     fn roll(&mut self) -> std::io::Result<()> {
         self.file.flush()?;
+        let histogram = self.histogram();
+        crate::logread::write_histogram(
+            &histogram_path(&self.dir, &self.name, self.seq, self.compression),
+            &histogram,
+        )
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
         self.seq += 1;
         self.file = File::create(path(&self.dir, &self.name, self.seq, self.compression))?;
         self.written = 0;
@@ -597,10 +681,66 @@ impl Rotating {
         };
         self.file.write_all(bytes)?;
         self.written = bytes.len() as u64;
+        self.first.clear();
+        self.last.clear();
+        if !header.is_empty() {
+            self.set_time(&header);
+        }
         if let Some(gone) = self.seq.checked_sub(self.keep) {
             let _ = std::fs::remove_file(path(&self.dir, &self.name, gone, self.compression));
+            let _ =
+                std::fs::remove_file(histogram_path(&self.dir, &self.name, gone, self.compression));
         }
         Ok(())
+    }
+
+    fn set_time(&mut self, line: &str) {
+        let Some((_, rest)) = line.split_once(',') else { return };
+        let Some((time, _)) = rest.split_once(',') else { return };
+        if self.first.is_empty() {
+            self.first.push_str(time);
+        }
+        self.last.clear();
+        self.last.push_str(time);
+    }
+
+    fn pending_counter(&self, site: &'static Site) -> &AtomicU64 {
+        if self.info { &site.info_pending_count } else { &site.full_pending_count }
+    }
+
+    fn current_counter(&self, site: &'static Site) -> &AtomicU64 {
+        if self.info { &site.info_file_count } else { &site.full_file_count }
+    }
+
+    fn transfer_pending(&self) {
+        for site in SITES.lock().expect("sites").iter() {
+            let count = self.pending_counter(site).swap(0, Ordering::Relaxed);
+            self.current_counter(site).fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    fn histogram(&self) -> crate::logread::FileHistogram {
+        let mut rows = HashMap::new();
+        let mut seen = 0;
+        if !self.header.is_empty() {
+            rows.insert("h,file=,line=0,opened".to_string(), 1);
+            seen += 1;
+        }
+        for site in SITES.lock().expect("sites").iter() {
+            let count = self.current_counter(site).swap(0, Ordering::Relaxed);
+            if count != 0 {
+                seen += count;
+                if let Some(key) = site.histogram_key() {
+                    rows.insert(key.to_owned(), count);
+                }
+            }
+        }
+        crate::logread::FileHistogram {
+            seen,
+            first: self.first.clone(),
+            last: self.last.clone(),
+            rows,
+        }
     }
 }
 
@@ -654,6 +794,12 @@ fn path(dir: &Path, name: &str, seq: usize, compression: Compression) -> PathBuf
         Compression::Zstd => "zst",
     };
     dir.join(format!("{name}-{seq:07}.{kind}"))
+}
+
+fn histogram_path(dir: &Path, name: &str, seq: usize, compression: Compression) -> PathBuf {
+    let mut path = path(dir, name, seq, compression);
+    path.set_extension("hist");
+    path
 }
 
 /// `2026-08-16 15:04:05.123`, from the epoch, without pulling in a calendar.
@@ -841,13 +987,43 @@ mod tests {
     fn rotation_keeps_the_last_few() {
         let dir = std::env::temp_dir().join(format!("laws-log-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        static TEST_SITE: Site = Site::new("x.rs", 1);
+        SITES.lock().unwrap().push(&TEST_SITE);
+        TEST_SITE.key.set("i,file=x.rs,line=1,said".to_string()).unwrap();
         let mut rotating =
-            Rotating::new(&dir, "test", 64, 3, String::new(), Compression::Plain, 1).unwrap();
+            Rotating::new(&dir, "test", 64, 3, String::new(), Compression::Plain, 1, false)
+                .unwrap();
         for n in 0..40 {
-            rotating.write(format!("line {n} of some length\n").as_bytes(), true).unwrap();
+            let line = format!(
+                "i,2026-08-17 01:00:00.000001,pid=1,tid=1,file=x.rs,line=1,said,value {n}\n"
+            );
+            rotating
+                .write(line.as_bytes(), true, Some(&TEST_SITE), Some("2026-08-17 01:00:00.000001"))
+                .unwrap();
         }
         let left: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
-        assert_eq!(left.len(), 3, "should keep three files");
+        assert_eq!(
+            left.iter().filter(|e| e.path().extension().is_some_and(|x| x == "log")).count(),
+            3,
+            "should keep three log files"
+        );
+        assert_eq!(
+            left.iter().filter(|e| e.path().extension().is_some_and(|x| x == "hist")).count(),
+            2,
+            "only complete logs should have sidecars"
+        );
+        let logs = crate::logread::Logs::open(&dir, "test", u64::MAX).unwrap();
+        let scanned = logs.scan(|_| {}).unwrap();
+        assert!(scanned > 0);
+        assert_eq!(logs.histogram("", "").unwrap().0, scanned);
+        let missing = left
+            .iter()
+            .find(|entry| entry.path().extension().is_some_and(|x| x == "hist"))
+            .unwrap()
+            .path();
+        std::fs::remove_file(&missing).unwrap();
+        assert_eq!(logs.histogram("", "").unwrap().0, scanned);
+        assert!(missing.exists(), "a missing complete-file sidecar should be rebuilt");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -914,13 +1090,13 @@ mod blocks {
         // 14 MB of text asks for.
         let block = crate::logread::MAX_BLOCK * 3;
         let mut rotating =
-            Rotating::new(&dir, "dn0", u64::MAX, 4, String::new(), Compression::Zstd, block)
+            Rotating::new(&dir, "dn0", u64::MAX, 4, String::new(), Compression::Zstd, block, false)
                 .unwrap();
 
         let line = "i,2026-08-17 01:00:00.000001,pid=1,tid=1,file=x.rs,line=1,said,value 1\n";
         let count = block / line.len() + 10;
         for _ in 0..count {
-            rotating.write(line.as_bytes(), false).unwrap();
+            rotating.write(line.as_bytes(), false, None, None).unwrap();
         }
         rotating.flush().unwrap();
 

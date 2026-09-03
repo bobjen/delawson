@@ -24,7 +24,7 @@
 use crate::log::files;
 use crate::{Context, Error, Result};
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// A parsed line. Fields are as written: level, time, pid, tid, file, line, then
@@ -55,6 +55,11 @@ impl<'a> Line<'a> {
         let what = fields.next().unwrap_or("");
         let values = fields.next().unwrap_or("");
         Line { level, time, file, at, what, values }
+    }
+
+    /// The stable part of a line, exactly what a histogram groups on.
+    pub fn key(&self) -> String {
+        format!("{},file={},line={},{}", self.level, self.file, self.at, self.what)
     }
 }
 
@@ -88,42 +93,7 @@ impl Logs {
     pub fn scan(&self, mut each: impl FnMut(&str)) -> Result<u64> {
         let mut seen = 0;
         for path in &self.paths {
-            let mut file = std::fs::File::open(path).context(path.display())?;
-            let mut text = String::new();
-            if path.extension().is_some_and(|kind| kind == "zst") {
-                // Blocks, each a pair of lengths and the bytes. A torn last block
-                // is a process that died mid-write: it ends the walk rather than
-                // failing the answer, since the rest is still worth reading.
-                loop {
-                    let mut sizes = [0u8; 8];
-                    if file.read_exact(&mut sizes).is_err() {
-                        break;
-                    }
-                    let loose = u32::from_le_bytes(sizes[..4].try_into().unwrap()) as usize;
-                    let tight = u32::from_le_bytes(sizes[4..].try_into().unwrap()) as usize;
-                    if loose > MAX_BLOCK || tight > MAX_BLOCK {
-                        break;
-                    }
-                    let mut block = vec![0u8; tight];
-                    if file.read_exact(&mut block).is_err() {
-                        break;
-                    }
-                    let loosened = zstd::bulk::decompress(&block, loose).map_err(|_| ());
-                    let Ok(loosened) = loosened else { break };
-                    text.clear();
-                    text.push_str(&String::from_utf8_lossy(&loosened));
-                    for line in text.lines() {
-                        seen += 1;
-                        each(line);
-                    }
-                }
-            } else {
-                file.read_to_string(&mut text).context(path.display())?;
-                for line in text.lines() {
-                    seen += 1;
-                    each(line);
-                }
-            }
+            seen += scan_file(path, |line| each(line))?;
         }
         Ok(seen)
     }
@@ -143,31 +113,37 @@ impl Logs {
     /// leaves on screen is the end of it, and the end should be the summary.
     pub fn histogram(&self, from: &str, to: &str) -> Result<(u64, Vec<String>)> {
         let mut counts: HashMap<String, u64> = HashMap::new();
-        let mut key = String::new();
-        let seen = self.scan(|whole| {
-            let line = Line::of(whole);
-            if !within(line.time, from, to) {
-                return;
-            }
-            key.clear();
-            key.push_str(line.level);
-            key.push_str(",file=");
-            key.push_str(line.file);
-            key.push_str(",line=");
-            key.push_str(line.at);
-            key.push(',');
-            key.push_str(line.what);
-            match counts.get_mut(&key) {
-                Some(count) => *count += 1,
-                None => {
-                    // A log of nothing but unique lines would be a histogram of
-                    // itself, so there is a stop — said out loud when it is hit.
-                    if counts.len() < MAX_ROWS {
-                        counts.insert(key.clone(), 1);
+        let mut seen = 0;
+        for (index, path) in self.paths.iter().enumerate() {
+            let histogram = if index + 1 == self.paths.len() {
+                None
+            } else {
+                let sidecar = histogram_path(path);
+                Some(match read_histogram(&sidecar) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        let value = make_histogram(path)?;
+                        write_histogram(&sidecar, &value)?;
+                        value
                     }
+                })
+            };
+            if let Some(histogram) = histogram {
+                let complete = (from.is_empty() || histogram.first.as_str() >= from)
+                    && (to.is_empty() || histogram.last.as_str() <= to);
+                if complete {
+                    seen += histogram.seen;
+                    merge(&mut counts, histogram.rows);
+                    continue;
                 }
             }
-        })?;
+            seen += scan_file(path, |whole| {
+                let line = Line::of(whole);
+                if within(line.time, from, to) {
+                    add(&mut counts, line.key());
+                }
+            })?;
+        }
 
         let full = counts.len() >= MAX_ROWS;
         let mut counted: Vec<String> =
@@ -220,6 +196,171 @@ impl Logs {
     }
 }
 
+/// A completed file's histogram, including its time span for range queries.
+pub struct FileHistogram {
+    pub seen: u64,
+    pub first: String,
+    pub last: String,
+    pub rows: HashMap<String, u64>,
+}
+
+fn add(counts: &mut HashMap<String, u64>, key: String) {
+    let room = counts.len() < MAX_ROWS;
+    match counts.get_mut(&key) {
+        Some(count) => *count += 1,
+        None if room => {
+            counts.insert(key, 1);
+        }
+        None => {}
+    }
+}
+
+fn merge(into: &mut HashMap<String, u64>, rows: HashMap<String, u64>) {
+    for (key, count) in rows {
+        let room = into.len() < MAX_ROWS;
+        match into.get_mut(&key) {
+            Some(total) => *total += count,
+            None if room => {
+                into.insert(key, count);
+            }
+            None => {}
+        }
+    }
+}
+
+fn scan_file(path: &Path, mut each: impl FnMut(&str)) -> Result<u64> {
+    let mut file = std::fs::File::open(path).context(path.display())?;
+    let mut seen = 0;
+    let mut visit = |text: &str| {
+        for line in text.lines() {
+            seen += 1;
+            each(line);
+        }
+    };
+    if path.extension().is_some_and(|kind| kind == "zst") {
+        loop {
+            let mut sizes = [0u8; 8];
+            if file.read_exact(&mut sizes).is_err() {
+                break;
+            }
+            let loose = u32::from_le_bytes(sizes[..4].try_into().unwrap()) as usize;
+            let tight = u32::from_le_bytes(sizes[4..].try_into().unwrap()) as usize;
+            if loose > MAX_BLOCK || tight > MAX_BLOCK {
+                break;
+            }
+            let mut block = vec![0u8; tight];
+            if file.read_exact(&mut block).is_err() {
+                break;
+            }
+            let Ok(loosened) = zstd::bulk::decompress(&block, loose) else { break };
+            visit(&String::from_utf8_lossy(&loosened));
+        }
+    } else {
+        let mut text = String::new();
+        file.read_to_string(&mut text).context(path.display())?;
+        visit(&text);
+    }
+    Ok(seen)
+}
+
+pub fn make_histogram(path: &Path) -> Result<FileHistogram> {
+    let mut rows = HashMap::new();
+    let mut first = String::new();
+    let mut last = String::new();
+    let seen = scan_file(path, |whole| {
+        let line = Line::of(whole);
+        if first.is_empty() {
+            first.push_str(line.time);
+        }
+        last.clear();
+        last.push_str(line.time);
+        add(&mut rows, line.key());
+    })?;
+    Ok(FileHistogram { seen, first, last, rows })
+}
+
+pub fn histogram_path(path: &Path) -> PathBuf {
+    let mut sidecar = path.to_path_buf();
+    sidecar.set_extension("hist");
+    sidecar
+}
+
+const HIST_MAGIC: &[u8; 4] = b"DLH1";
+
+pub fn write_histogram(path: &Path, histogram: &FileHistogram) -> Result<()> {
+    let mut file = std::fs::File::create(path).context(path.display())?;
+    file.write_all(HIST_MAGIC).context(path.display())?;
+    file.write_all(&histogram.seen.to_le_bytes()).context(path.display())?;
+    file.write_all(&(histogram.first.len() as u16).to_le_bytes()).context(path.display())?;
+    file.write_all(histogram.first.as_bytes()).context(path.display())?;
+    file.write_all(&(histogram.last.len() as u16).to_le_bytes()).context(path.display())?;
+    file.write_all(histogram.last.as_bytes()).context(path.display())?;
+    file.write_all(&(histogram.rows.len() as u32).to_le_bytes()).context(path.display())?;
+    for (key, count) in &histogram.rows {
+        let bytes = key.as_bytes();
+        file.write_all(&(bytes.len() as u32).to_le_bytes()).context(path.display())?;
+        file.write_all(bytes).context(path.display())?;
+        file.write_all(&count.to_le_bytes()).context(path.display())?;
+    }
+    file.flush().context(path.display())?;
+    Ok(())
+}
+
+fn read_histogram(path: &Path) -> Result<FileHistogram> {
+    let bytes = std::fs::read(path).context(path.display())?;
+    if bytes.len() < 20 || &bytes[..4] != HIST_MAGIC {
+        return Err(Error::new(format!("invalid histogram {}", path.display())));
+    }
+    let seen = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+    let mut at = 12;
+    let first = read_text(&bytes, &mut at, path)?;
+    let last = read_text(&bytes, &mut at, path)?;
+    if at + 4 > bytes.len() {
+        return Err(Error::new(format!("truncated histogram {}", path.display())));
+    }
+    let rows = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    at += 4;
+    if rows > MAX_ROWS {
+        return Err(Error::new(format!("too many histogram rows in {}", path.display())));
+    }
+    let mut result = HashMap::with_capacity(rows);
+    for _ in 0..rows {
+        if at + 4 > bytes.len() {
+            return Err(Error::new(format!("truncated histogram {}", path.display())));
+        }
+        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        at += 4;
+        if at + len + 8 > bytes.len() {
+            return Err(Error::new(format!("truncated histogram {}", path.display())));
+        }
+        let key = String::from_utf8(bytes[at..at + len].to_vec())
+            .map_err(|_| Error::new(format!("invalid histogram {}", path.display())))?;
+        at += len;
+        let count = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        at += 8;
+        result.insert(key, count);
+    }
+    if at != bytes.len() {
+        return Err(Error::new(format!("trailing histogram bytes in {}", path.display())));
+    }
+    Ok(FileHistogram { seen, first, last, rows: result })
+}
+
+fn read_text(bytes: &[u8], at: &mut usize, path: &Path) -> Result<String> {
+    if *at + 2 > bytes.len() {
+        return Err(Error::new(format!("truncated histogram {}", path.display())));
+    }
+    let len = u16::from_le_bytes(bytes[*at..*at + 2].try_into().unwrap()) as usize;
+    *at += 2;
+    if *at + len > bytes.len() {
+        return Err(Error::new(format!("truncated histogram {}", path.display())));
+    }
+    let value = String::from_utf8(bytes[*at..*at + len].to_vec())
+        .map_err(|_| Error::new(format!("invalid histogram {}", path.display())))?;
+    *at += len;
+    Ok(value)
+}
+
 /// Whether a line's time is in the window. Times are written so that comparing
 /// the text is comparing the instant, and an empty end is no bound.
 fn within(time: &str, from: &str, to: &str) -> bool {
@@ -227,7 +368,7 @@ fn within(time: &str, from: &str, to: &str) -> bool {
 }
 
 /// A histogram of a log that is all unique lines would be as large as the log.
-const MAX_ROWS: usize = 10_000;
+pub const MAX_ROWS: usize = 10_000;
 
 /// The largest block a writer may emit, and so the largest a reader will allocate
 /// for one. A writer with more than this pending cuts it at a line boundary.
