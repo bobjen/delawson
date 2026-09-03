@@ -904,6 +904,29 @@ asks and the rest join it.
 *Breaks* the request rate to the tier below climbs towards the append rate while the work it does
 stays constant — `SN-NOT-IN-WRITE-PATH` in a different guise.
 
+## Wire protocol and compatibility
+
+**`SHIPPED-OP-TAGS-ARE-PERMANENT`** — an `Op::` tag released in a client-visible protocol is never
+assigned a different meaning or format. Retiring it leaves a permanent tombstone.
+*Argued* §17.42.1 · *Enforced* **code and release review**: new tags append and retired tags remain
+documented · *Checked* release audit against the historical tag list; a uniqueness test alone is not
+enough because it cannot detect reuse across releases
+*Breaks* an old client may parse a new value as the old format and silently produce a wrong result.
+
+**`NEW-WIRE-FORMATS-REQUIRE-CLIENT-CAPABILITY`** — a server sends a new client-visible format only
+after the client advertises support for it; otherwise it sends the old format or an explicit
+upgrade-required failure.
+*Argued* §13.2.5, §17.42.2 · *Enforced* design only · *Checked* a compatibility matrix covering old
+and new clients during rollout
+*Breaks* upgrading the servers alone makes old clients unable to parse responses, even though every
+server is running the new software.
+
+**`UNKNOWN-NESTED-TAGS-FAIL-CLOSED`** — a receiver that does not recognize a nested command or
+structure tag fails the command and never skips the value as though its length were known.
+*Argued* §17.42.2 · *Enforced* **code** by positional nested parsing without nested lengths · *Checked*
+malformed and unknown-tag tests
+*Breaks* a receiver could consume the wrong following fields or silently discard data.
+
 ---
 
 # Part 2 — Term index
@@ -956,6 +979,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **seal** (extent) | §6 | `EXTENT-SEALS-BETWEEN-RECORDS`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATION-SEALS`, `SEALED-EXTENT-IMMUTABLE`, `RECORD-NUMBERS-DENSE`, `UNAPPENDABLE-EXTENT-SEALS`, `SEAL-CLOSES-TOP-DOWN`, `REQUESTED-SEAL-DISCARDS-NOTHING`, `SEAL-REQUESTS-ARE-IDEMPOTENT` |
 | **seal** (wire segment) | §17.5a | `NO-TWO-SEGMENTS-SHARE-A-NONCE`. ⚠️ *An unrelated sense of the word; `common/src/seal.rs` is this one.* |
 | **stream** | §4.1 | `STREAM-IDENTITY-OWNED`, `SN-NOT-IN-WRITE-PATH`, `ONE-REQUEST-IN-FLIGHT-PER-STREAM`, `EXTENT-KEY-FROM-CREATING-SN`, `READ-NAMES-THE-OBJECT`, `THE-OFFICIAL-FLAG-STAYS-PERMISSIVE-UNTIL-CLEANUP-ENDS` |
+| **`Op::` tag** | §17.42.1 | `SHIPPED-OP-TAGS-ARE-PERMANENT`, `NEW-WIRE-FORMATS-REQUIRE-CLIENT-CAPABILITY`, `UNKNOWN-NESTED-TAGS-FAIL-CLOSED` |
 | **summary** | §4.5 | `TAIL-ONLY-SUMMARIES-EXACT`, `UNKEYED-COUNT-EXACT`, `COUNTS-ARE-RECOMPUTABLE` |
 | **watermark** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `SEAL-NEVER-BELOW-DURABLE`, `INCOMPLETE-RECORD-NOT-DURABLE` |
 

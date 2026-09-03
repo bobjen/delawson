@@ -17981,3 +17981,42 @@ not change.
 object may be compacted and rebalanced at will, and one that is not accumulates tombstones as the price
 of being pointed at. That is the same trade as §17.40.4's virtual directories, made per object instead
 of per node (§16.159).
+
+## 17.42 Client-visible wire formats and the upgrade boundary
+
+The rollout rule in §13.2.5 applies to wire formats as well as to stored data, but clients make the
+boundary different: a cluster operator controls the servers, while a client library may remain in use
+for years. Upgrading every server therefore does not make it safe to send a new response format to
+every client.
+
+### 17.42.1 A shipped `Op::` tag is permanent
+
+`Op::` is one global namespace for commands and nontrivial serialized structures. A tag that has been
+released in a client-visible protocol is a permanent identifier for its original meaning and format.
+When that command or structure is retired, its number remains a tombstone and is never reused. Reusing
+it could make an old client interpret a new value as the old one, which risks silent corruption rather
+than a clean failure.
+
+Only an identifier that was never released outside the upgraded software may be reused. The 16-bit
+namespace makes permanent tombstones practical; exhausting it is a release-planning problem, not a
+reason to recycle a user-visible identifier.
+
+### 17.42.2 Capabilities select new formats
+
+A new format may be enabled for clients that advertise the required capability or protocol version.
+The server selects the response format from that negotiated capability, not merely from the fact that
+the server has been upgraded. An old client continues to receive the old format while the old format
+is supported; once support is deliberately withdrawn, it receives an explicit upgrade-required
+failure rather than an unrecognized value that might be misread.
+
+The rollout is therefore:
+
+1. deploy code that understands both formats, with the new behavior defaulting to the old behavior;
+2. upgrade clients or establish the capability negotiation;
+3. enable the new behavior;
+4. remove the old path only after the supported upgrade graph no longer needs it.
+
+Nested structures and commands do not carry lengths when their parser is known to the receiver. Their
+global tags select the parser, and an unknown or incompatible tag fails the command. This is
+intentional: a receiver must never skip an unrecognized value and risk losing data. Lengths remain at
+the top-level message boundary, where they frame whole commands for the transport.

@@ -400,28 +400,105 @@ impl FE {
     /// An append: resolve the name — making the object if it is not there — find the
     /// extent, and hand the bytes to its primary.
     fn append(self: &Arc<Self>, process: &Arc<Process>, request: &Request, mut reply: Reply) {
-        let (path, expect, framing, crc, holds, body) = match request.args.as_slice() {
-            // The name, what the caller expects it to be, then the framing, CRC, and the block.
-            [Arg::Text(path), rest @ ..] => {
-                let Ok((
-                    expect,
-                    [Arg::Number(kind), Arg::Number(width), Arg::Number(crc), rest @ ..],
-                )) = Expecting::of_args(rest)
-                else {
-                    return reply.send(Response::error(
-                        Status::BadRequest,
-                        "append takes a name, what object it expects, a framing, crc, and bytes",
-                    ));
+        let (path, expect, framing, crc, holds, body) =
+            if matches!(request.args.first(), Some(Arg::Struct(Op::AppendRecord, _))) {
+                let (mut payload, rest) =
+                    match structure(&request.args, Op::AppendRecord, "an append request") {
+                        Ok(value) => value,
+                        Err(e) => {
+                            return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                        }
+                    };
+                let path = match payload.text() {
+                    Ok(path) => path,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
                 };
-                let framing = match Framing::of_wire(*kind, *width) {
+                let expect = match Expecting::read(&mut payload) {
+                    Ok(expect) => expect,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+                let kind = match payload.number() {
+                    Ok(kind) => kind,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+                let width = match payload.number() {
+                    Ok(width) => width,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+                let framing = match Framing::of_wire(kind, width) {
                     Ok(framing) => framing,
                     Err(e) => {
                         return reply.send(Response::error(Status::BadRequest, e.to_string()));
                     }
                 };
-                match Holds::of_args(rest) {
-                    Ok((holds, [Arg::Bytes(body)])) => {
-                        (path.clone(), expect, framing, *crc, holds, body.clone())
+                let crc = match payload.number() {
+                    Ok(crc) => crc,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+                let holds = match Holds::read(&mut payload) {
+                    Ok(holds) => holds,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+                let body = match payload.bytes() {
+                    Ok(body) => body,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+                if let Err(e) = payload.done() {
+                    return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                }
+                if !rest.is_empty() {
+                    return reply.send(Response::error(
+                        Status::BadRequest,
+                        "an append request has trailing arguments",
+                    ));
+                }
+                (path, expect, framing, crc, holds, body)
+            } else {
+                match request.args.as_slice() {
+                    // The name, what the caller expects it to be, then the framing, CRC, and the block.
+                    [Arg::Text(path), rest @ ..] => {
+                        let Ok((
+                            expect,
+                            [Arg::Number(kind), Arg::Number(width), Arg::Number(crc), rest @ ..],
+                        )) = Expecting::of_args(rest)
+                        else {
+                            return reply.send(Response::error(
+                        Status::BadRequest,
+                        "append takes a name, what object it expects, a framing, crc, and bytes",
+                    ));
+                        };
+                        let framing = match Framing::of_wire(*kind, *width) {
+                            Ok(framing) => framing,
+                            Err(e) => {
+                                return reply
+                                    .send(Response::error(Status::BadRequest, e.to_string()));
+                            }
+                        };
+                        match Holds::of_args(rest) {
+                            Ok((holds, [Arg::Bytes(body)])) => {
+                                (path.clone(), expect, framing, *crc, holds, body.clone())
+                            }
+                            _ => {
+                                return reply.send(Response::error(
+                            Status::BadRequest,
+                            "append takes a name, a framing, crc, what the block holds, and bytes",
+                        ));
+                            }
+                        }
                     }
                     _ => {
                         return reply.send(Response::error(
@@ -430,14 +507,7 @@ impl FE {
                         ));
                     }
                 }
-            }
-            _ => {
-                return reply.send(Response::error(
-                    Status::BadRequest,
-                    "append takes a name, a framing, crc, what the block holds, and bytes",
-                ));
-            }
-        };
+            };
         reply.about(format_args!("{path},bytes {},logical {}", body.len(), holds.logical));
         let named = path.clone();
         self.resolve(
@@ -715,35 +785,76 @@ impl FE {
     /// conversion happens here — a bug in one of them shows up as a read that works
     /// until the first seal and then does not.
     fn read(self: &Arc<Self>, process: &Arc<Process>, request: &Request, mut reply: Reply) {
-        let (path, expect, range) = match request.args.as_slice() {
-            // A key rather than a record number is a keyed read, which needs the
-            // key ordering nothing has built.
-            [Arg::Text(_), Arg::Text(_)] => {
-                return reply.send(Response::error(
-                    Status::Unimplemented,
-                    "reading by key is not built yet",
-                ));
-            }
-            // The name, what the caller expects it to be, then the range.
-            [Arg::Text(path), rest @ ..] => match Expecting::of_args(rest) {
-                Ok((expect, rest)) => match Range::of_args(rest) {
-                    Ok((range, [])) => (path.clone(), expect, range),
+        let (path, expect, range) =
+            if matches!(request.args.first(), Some(Arg::Struct(Op::ReadRecord, _))) {
+                let (mut payload, rest) =
+                    match structure(&request.args, Op::ReadRecord, "a read request") {
+                        Ok(value) => value,
+                        Err(e) => {
+                            return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                        }
+                    };
+                let path = match payload.text() {
+                    Ok(path) => path,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+                let expect = match Expecting::read(&mut payload) {
+                    Ok(expect) => expect,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+                let range = match Range::read_nested(&mut payload) {
+                    Ok(range) => range,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+                if let Err(e) = payload.done() {
+                    return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                }
+                if !rest.is_empty() {
+                    return reply.send(Response::error(
+                        Status::BadRequest,
+                        "a read request has trailing arguments",
+                    ));
+                }
+                (path, expect, range)
+            } else {
+                match request.args.as_slice() {
+                    // A key rather than a record number is a keyed read, which needs the
+                    // key ordering nothing has built.
+                    [Arg::Text(_), Arg::Text(_)] => {
+                        return reply.send(Response::error(
+                            Status::Unimplemented,
+                            "reading by key is not built yet",
+                        ));
+                    }
+                    // The name, what the caller expects it to be, then the range.
+                    [Arg::Text(path), rest @ ..] => match Expecting::of_args(rest) {
+                        Ok((expect, rest)) => match Range::of_args(rest) {
+                            Ok((range, [])) => (path.clone(), expect, range),
+                            _ => {
+                                return reply.send(Response::error(
+                                    Status::BadRequest,
+                                    "read takes a name, what object it expects, and a range",
+                                ));
+                            }
+                        },
+                        Err(e) => {
+                            return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                        }
+                    },
                     _ => {
                         return reply.send(Response::error(
                             Status::BadRequest,
                             "read takes a name, what object it expects, and a range",
                         ));
                     }
-                },
-                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
-            },
-            _ => {
-                return reply.send(Response::error(
-                    Status::BadRequest,
-                    "read takes a name, what object it expects, and a range",
-                ));
-            }
-        };
+                }
+            };
         // The start has to be a record for now: the other two forms need a prefix sum
         // of logical lengths, which §4.5 keeps lazily and nothing here can ask for
         // (§9.1.3.4). A well-formed request for something unbuilt.

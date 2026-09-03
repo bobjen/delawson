@@ -19,6 +19,7 @@
 use crate::config::Compress;
 use crate::framing::Framing;
 use crate::offset::{ECoff, ELoff, ERoff};
+use crate::wire::{StructReader, StructWriter};
 use crate::{Error, Result};
 
 /// The version of the extent on-disk layout.
@@ -68,6 +69,22 @@ impl Holds {
             },
             rest,
         ))
+    }
+
+    pub fn write(&self, payload: &mut StructWriter) {
+        payload.tag(crate::wire::Op::AppendBlock);
+        payload.number(self.compressed.number());
+        payload.number(self.logical.number());
+        payload.number(self.records.number());
+    }
+
+    pub fn read(payload: &mut StructReader<'_>) -> Result<Holds> {
+        payload.tag(crate::wire::Op::AppendBlock, "block holds")?;
+        Ok(Holds {
+            compressed: ECoff::of_number(payload.number()?)?,
+            logical: ELoff::of_number(payload.number()?)?,
+            records: ERoff::of_number(payload.number()?)?,
+        })
     }
 
     /// Measure a framed block, given the length of the compressed user data.

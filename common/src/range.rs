@@ -151,6 +151,43 @@ impl Range {
         vec![payload.finish(Op::Range)]
     }
 
+    /// Write this range as a nested value in a command-owned payload.
+    pub fn write_nested(&self, payload: &mut StructWriter) {
+        let (first, second) = match self.start {
+            Start::Record(record) => (record, 0),
+            Start::RecordThen(record, offset) => (record, offset),
+            Start::Logical(offset) => (offset, 0),
+        };
+        payload.tag(Op::Range);
+        payload.number(self.start.code());
+        payload.number(first);
+        payload.number(second);
+        payload.number(self.budget.code());
+        payload.number(self.budget.amount());
+    }
+
+    pub fn read_nested(payload: &mut StructReader<'_>) -> Result<Range> {
+        payload.tag(Op::Range, "a range")?;
+        let kind = payload.number()?;
+        let first = payload.number()?;
+        let second = payload.number()?;
+        let measure = payload.number()?;
+        let amount = payload.number()?;
+        let start = match kind {
+            0 => Start::Record(first),
+            1 => Start::RecordThen(first, second),
+            2 => Start::Logical(first),
+            other => return Err(Error::new(format!("no range start of kind {other}"))),
+        };
+        let budget = match measure {
+            0 => Budget::Records(amount),
+            1 => Budget::Logical(amount),
+            2 => Budget::Compressed(amount),
+            other => return Err(Error::new(format!("no budget measured in kind {other}"))),
+        };
+        Ok(Range { start, budget })
+    }
+
     /// And back, returning whatever followed it.
     pub fn of_args(args: &[Arg]) -> Result<(Range, &[Arg])> {
         if matches!(args.first(), Some(Arg::Struct(..))) {

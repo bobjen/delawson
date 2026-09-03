@@ -1551,8 +1551,11 @@ fn scan(
         if before.is_some_and(|stop| at >= stop) {
             break;
         }
-        let mut request = Request::new(Op::ReadRecord).text(path);
-        request.args.extend(Range { start: Start::Record(at), budget }.args());
+        let mut payload = common::wire::StructWriter::new();
+        payload.text(path);
+        Expecting::whatever().write(&mut payload);
+        Range { start: Start::Record(at), budget }.write_nested(&mut payload);
+        let request = Request::new(Op::ReadRecord).structure(payload);
         let answer = conn.call(&request)?;
         asked += 1;
         // Running off the end is how a scan of an object whose length it does not
@@ -1856,11 +1859,15 @@ fn build(cmd: &Cmd) -> Result<Request> {
             let stored = squeeze(Compress::Lz4, &block).unwrap_or_else(|| block.clone());
             let holds = Holds::of(framing, b"", &block, stored.len())?;
 
-            let mut request = Request::new(Op::AppendRecord).text(path);
-            request.args.extend(expecting(expect)?.args());
-            request = request.number(kind).number(width).number(checksum);
-            request.args.extend(holds.args());
-            request.bytes(stored)
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            expecting(expect)?.write(&mut payload);
+            payload.number(kind);
+            payload.number(width);
+            payload.number(checksum);
+            holds.write(&mut payload);
+            payload.bytes(&stored);
+            Request::new(Op::AppendRecord).structure(payload)
         }
         Cmd::Insert { path, key, body } => {
             Request::new(Op::InsertRecord).text(path).text(key).bytes(body.bytes()?)
@@ -1876,20 +1883,26 @@ fn build(cmd: &Cmd) -> Result<Request> {
             request
         }
         Cmd::Read { path, at, expect, .. } => {
-            let mut request = Request::new(Op::ReadRecord).text(path);
-            request.args.extend(expecting(expect)?.args());
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            expecting(expect)?.write(&mut payload);
             match at.arg() {
                 // A point read is a range of one record (§9.1.3.6): the block
                 // holding it comes back whole either way, and asking this way means
                 // there is one shape on the read path rather than two.
-                Arg::Number(record) => request.args.extend(
-                    Range { start: Start::Record(record), budget: Budget::Records(1) }.args(),
-                ),
+                Arg::Number(record) => {
+                    Range { start: Start::Record(record), budget: Budget::Records(1) }
+                        .write_nested(&mut payload)
+                }
                 // A key, which is a keyed read and unbuilt. Sent as it stands so the
                 // answer says so rather than the client guessing.
-                key => request.args.push(key),
+                key => {
+                    let mut request = Request::new(Op::ReadRecord).text(path);
+                    request.args.push(key);
+                    return Ok(request);
+                }
             }
-            request
+            Request::new(Op::ReadRecord).structure(payload)
         }
 
         // Scan is a loop over range reads rather than one request, so it is driven

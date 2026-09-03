@@ -77,8 +77,10 @@ macro_rules! ops {
 
 // Op codes are stable wire identifiers. This namespace contains standalone commands and
 // nontrivial serialized pieces. Append new commands or schema tags; never renumber existing
-// codes. Retired codes become tombstones. Reuse an Op tombstone only after the next release,
-// so a new format can receive a new tag while readers still accept the old one.
+// codes. Any code shipped in a client-visible protocol is permanent: retired codes become
+// tombstones and must never be reused for a different format or meaning, because an old client
+// could silently misread the new value as the old one. Only an identifier that was never released
+// outside the upgraded software may be reused.
 ops! {
     // Control, answered by every machine type.
     Ping = 1, "ping";
@@ -161,6 +163,7 @@ ops! {
     ExtentRow = 50, "extent-row";
     Piece = 51, "piece";
     AppendBlock = 52, "append-block";
+    Expecting = 53, "expecting";
 }
 
 impl std::fmt::Display for Op {
@@ -272,6 +275,13 @@ impl StructWriter {
         self.bytes(value.as_bytes());
     }
 
+    /// Mark the start of a nested, command-owned structure. Its parser consumes
+    /// the positional fields directly from the enclosing payload; there is no
+    /// nested length because an unknown format must fail rather than be skipped.
+    pub fn tag(&mut self, op: Op) {
+        self.bytes.extend(op.code().to_le_bytes());
+    }
+
     pub fn finish(self, op: Op) -> Arg {
         Arg::Struct(op, self.bytes)
     }
@@ -313,6 +323,15 @@ impl<'a> StructReader<'a> {
 
     pub fn text(&mut self) -> Result<String> {
         String::from_utf8(self.bytes()?).context("text in structure payload")
+    }
+
+    pub fn tag(&mut self, expected: Op, what: &str) -> Result<()> {
+        let actual = Op::from_code(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))?;
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(Error::new(format!("{what} expected {expected}, got {actual}")))
+        }
     }
 
     pub fn done(&self) -> Result<()> {

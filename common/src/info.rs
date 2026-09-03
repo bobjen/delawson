@@ -372,6 +372,22 @@ impl Expecting {
         self.0.args()
     }
 
+    pub fn write(&self, payload: &mut StructWriter) {
+        payload.tag(Op::Expecting);
+        payload.number(self.0.range.number());
+        payload.number(self.0.object.number());
+        payload.number(self.0.created.number());
+    }
+
+    pub fn read(payload: &mut StructReader<'_>) -> Result<Expecting> {
+        payload.tag(Op::Expecting, "an expectation")?;
+        Ok(Expecting(ObjectName {
+            range: RangeId::of_number(payload.number()?)?,
+            object: ObjectId::of_number(payload.number()?)?,
+            created: TimeSec::new(payload.number()?),
+        }))
+    }
+
     pub fn of_args(args: &[Arg]) -> Result<(Expecting, &[Arg])> {
         let (name, rest) = ObjectName::of_args(args)?;
         Ok((Expecting(name), rest))
