@@ -222,6 +222,9 @@ impl std::fmt::Display for Status {
 pub enum Arg {
     /// A schema boundary; these use Op codes but are not commands.
     Tag(Op),
+    /// A self-contained serialized structure. The structure owns the payload
+    /// format; the wire only supplies its schema tag and length.
+    Struct(Op, Vec<u8>),
     Text(String),
     Number(u64),
     Flag(bool),
@@ -246,6 +249,7 @@ impl std::fmt::Display for Arg {
             Arg::Flag(b) => write!(f, "{b}"),
             Arg::Bytes(bytes) => write!(f, "{} bytes", bytes.len()),
             Arg::Tag(op) => write!(f, "<{op}>"),
+            Arg::Struct(op, bytes) => write!(f, "<{op}: {} bytes>", bytes.len()),
         }
     }
 }
@@ -497,6 +501,12 @@ fn encode_args(args: &[Arg], out: &mut Vec<u8>) {
                 out.push(4);
                 out.extend(op.code().to_le_bytes());
             }
+            Arg::Struct(op, bytes) => {
+                out.push(5);
+                out.extend(op.code().to_le_bytes());
+                out.extend((bytes.len() as u32).to_le_bytes());
+                out.extend(bytes);
+            }
         }
     }
 }
@@ -554,6 +564,11 @@ impl<'a> Cursor<'a> {
                     Arg::Bytes(self.take(len)?.to_vec())
                 }
                 4 => Arg::Tag(Op::from_code(self.u16()?)?),
+                5 => {
+                    let op = Op::from_code(self.u16()?)?;
+                    let len = self.u32()? as usize;
+                    Arg::Struct(op, self.take(len)?.to_vec())
+                }
                 tag => return Err(Error::new(format!("unknown argument tag {tag}"))),
             });
         }
@@ -846,6 +861,32 @@ mod tests {
             .flag(true)
             .bytes(vec![1, 2, 3]);
         assert_eq!(round_trip_request(&request), request);
+    }
+
+    #[test]
+    fn a_shape_is_one_self_contained_wire_argument() {
+        let shape = crate::info::Shape { streams: 3, given: 2, extents: 7, entries: 9, next: 11 };
+        let compact = Request { id: 7, op: Op::BatchInfo, args: shape.args() };
+        let expanded = Request {
+            id: 7,
+            op: Op::BatchInfo,
+            args: vec![
+                Arg::Tag(Op::Shape),
+                Arg::Number(shape.streams),
+                Arg::Number(shape.given),
+                Arg::Number(shape.extents),
+                Arg::Number(shape.entries),
+                Arg::Number(shape.next),
+            ],
+        };
+        assert!(encoded_len(&compact) < encoded_len(&expanded));
+        assert_eq!(round_trip_request(&compact).args, compact.args);
+    }
+
+    fn encoded_len(request: &Request) -> usize {
+        let mut plain = Vec::new();
+        put_request(&mut plain, request).unwrap();
+        plain.len()
     }
 
     #[test]

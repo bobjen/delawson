@@ -173,17 +173,35 @@ impl Shape {
     }
 
     pub fn args(&self) -> Vec<Arg> {
-        vec![
-            Arg::Tag(Op::Shape),
-            Arg::Number(self.streams),
-            Arg::Number(self.given),
-            Arg::Number(self.extents),
-            Arg::Number(self.entries),
-            Arg::Number(self.next),
-        ]
+        let mut bytes = Vec::with_capacity(5 * std::mem::size_of::<u64>());
+        for field in [self.streams, self.given, self.extents, self.entries, self.next] {
+            bytes.extend(field.to_le_bytes());
+        }
+        vec![Arg::Struct(Op::Shape, bytes)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Shape, &[Arg])> {
+        if let [Arg::Struct(op, bytes), rest @ ..] = args {
+            if *op != Op::Shape {
+                return Err(Error::new(format!("expected {}, got {op}", Op::Shape)));
+            }
+            if bytes.len() != 5 * std::mem::size_of::<u64>() {
+                return Err(Error::new("a shape has the wrong payload length"));
+            }
+            let mut fields = bytes
+                .chunks_exact(8)
+                .map(|field| u64::from_le_bytes(field.try_into().expect("eight-byte shape field")));
+            return Ok((
+                Shape {
+                    streams: fields.next().unwrap(),
+                    given: fields.next().unwrap(),
+                    extents: fields.next().unwrap(),
+                    entries: fields.next().unwrap(),
+                    next: fields.next().unwrap(),
+                },
+                rest,
+            ));
+        }
         let args = tagged(args, Op::Shape, "a shape")?;
         let [
             Arg::Number(streams),
