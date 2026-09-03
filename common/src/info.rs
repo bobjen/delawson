@@ -16,7 +16,7 @@ use crate::ids::{DiskId, DnId, EnId, ExtentId, ObjectId, RangeId, SnId, StreamId
 use crate::placement::Expansion;
 use crate::time::TimeSec;
 use crate::wire::Arg;
-use crate::wire::{Op, StructWriter, structure, tagged};
+use crate::wire::{Op, StructReader, StructWriter, structure, tagged};
 use crate::{Error, Result};
 
 /// An object as the DN describes it, at one of its streams.
@@ -437,6 +437,23 @@ impl Wanted {
             )));
         }
         args.chunks(Wanted::ARGS).map(Wanted::of_args).collect()
+    }
+
+    /// Write one create record into a command-owned payload.
+    pub fn write(&self, payload: &mut StructWriter) {
+        let (kind, width) = self.framing.wire();
+        payload.text(&self.name);
+        payload.flag(self.keyed);
+        payload.number(kind);
+        payload.number(width);
+    }
+
+    pub fn read(payload: &mut StructReader<'_>) -> Result<Wanted> {
+        Ok(Wanted {
+            name: payload.text()?,
+            keyed: payload.flag()?,
+            framing: Framing::of_wire(payload.number()?, payload.number()?)?,
+        })
     }
 }
 

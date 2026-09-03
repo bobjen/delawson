@@ -967,18 +967,23 @@ fn create_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result
                     while sent.len() < depth && at < mine.len() {
                         let first = mine[at] * batch as u64;
                         at += 1;
-                        let mut request = if batch == 1 {
-                            Request::new(Op::CreateObject)
-                        } else {
-                            Request::new(Op::BatchCreate)
-                        };
-                        for n in first..first + batch as u64 {
-                            request = request
-                                .text(format!("{prefix}{n}"))
-                                .flag(keyed)
-                                .number(kind)
-                                .number(width);
+                        let mut payload = common::wire::StructWriter::new();
+                        if batch != 1 {
+                            payload.number(batch as u64);
                         }
+                        for n in first..first + batch as u64 {
+                            let name = format!("{prefix}{n}");
+                            payload.text(&name);
+                            payload.flag(keyed);
+                            payload.number(kind);
+                            payload.number(width);
+                        }
+                        let request = Request::new(if batch == 1 {
+                            Op::CreateObject
+                        } else {
+                            Op::BatchCreate
+                        })
+                        .structure(payload);
                         let id = conn.send(&request)?;
                         sent.insert(id, std::time::Instant::now());
                     }
@@ -1805,16 +1810,18 @@ fn build(cmd: &Cmd) -> Result<Request> {
 
         Cmd::Create { path, flavor, framing, media_class, expiry } => {
             let (kind, width) = Framing::parse(framing)?.wire();
-            let mut request = Request::new(Op::CreateObject)
-                .text(path)
-                .flag(*flavor == Flavor::Keyed)
-                .number(kind)
-                .number(width)
-                .text(media_class.clone().unwrap_or_default());
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            payload.flag(*flavor == Flavor::Keyed);
+            payload.number(kind);
+            payload.number(width);
+            let media_class = media_class.clone().unwrap_or_default();
+            payload.text(&media_class);
+            payload.flag(expiry.is_some());
             if let Some(seconds) = expiry {
-                request = request.number(*seconds);
+                payload.number(*seconds);
             }
-            request
+            Request::new(Op::CreateObject).structure(payload)
         }
         Cmd::Delete { path } => Request::new(Op::DeleteObject).text(path),
         Cmd::Undelete { path } => Request::new(Op::UndeleteObject).text(path),

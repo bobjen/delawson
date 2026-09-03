@@ -632,16 +632,39 @@ impl Service for DN {
             Op::CreateObject => self.create(process, &request, reply),
             Op::BatchCreate => self.create_many(process, &request, reply),
             Op::ObjectInfo => self.info(process, &request, None, reply),
-            Op::LocateStream => match request.args.as_slice() {
-                [_, Arg::Number(record), ..] => match ORoff::of_number(*record) {
-                    Ok(record) => self.info(process, &request, Some(record), reply),
-                    Err(e) => reply.send(Response::error(Status::BadRequest, e.to_string())),
-                },
-                _ => reply.send(Response::error(
-                    Status::BadRequest,
-                    "locate-stream takes a name and a record",
-                )),
-            },
+            Op::LocateStream => {
+                let (mut payload, rest) =
+                    match structure(&request.args, Op::LocateStream, "a locate-stream request") {
+                        Ok(value) => value,
+                        Err(e) => {
+                            return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                        }
+                    };
+                let path = match payload.text() {
+                    Ok(path) => path,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+                let record = match payload.number().and_then(ORoff::of_number) {
+                    Ok(record) => record,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+                if let Err(e) = payload.done() {
+                    return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                }
+                if !rest.is_empty() {
+                    return reply.send(Response::error(
+                        Status::BadRequest,
+                        "a locate-stream request has trailing arguments",
+                    ));
+                }
+                let mut request = Request::new(Op::ObjectInfo);
+                request.args.push(Arg::Text(path));
+                self.info(process, &request, Some(record), reply)
+            }
             Op::ExtendObject => self.extend(process, &request, reply),
             Op::BatchInfo => reply.send(self.info_many(&request)),
             _ => reply.send(server::unbuilt(process, SERVES, &request)),
@@ -663,10 +686,49 @@ impl DN {
     fn create(self: &Arc<Self>, process: &Arc<Process>, request: &Request, reply: Reply) {
         // Only the first few arguments are the object; a create may carry more —
         // media class, an expiry — that nothing here reads yet.
-        let head = request.args.get(..Wanted::ARGS).unwrap_or_default();
-        let wanted = match Wanted::of_args(head) {
-            Ok(wanted) => wanted,
-            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+        let wanted = if matches!(request.args.first(), Some(Arg::Struct(Op::CreateObject, _))) {
+            let (mut payload, rest) =
+                match structure(&request.args, Op::CreateObject, "a create-object request") {
+                    Ok(value) => value,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+            let wanted = match Wanted::read(&mut payload) {
+                Ok(wanted) => wanted,
+                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            };
+            // These fields are currently accepted for the CLI's create options but are not
+            // interpreted by the DN yet. Keep them inside the command payload so the parser
+            // still validates the complete value.
+            if let Err(e) = payload.text() {
+                return reply.send(Response::error(Status::BadRequest, e.to_string()));
+            }
+            let has_expiry = match payload.flag() {
+                Ok(has_expiry) => has_expiry,
+                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            };
+            if has_expiry {
+                if let Err(e) = payload.number() {
+                    return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                }
+            }
+            if let Err(e) = payload.done() {
+                return reply.send(Response::error(Status::BadRequest, e.to_string()));
+            }
+            if !rest.is_empty() {
+                return reply.send(Response::error(
+                    Status::BadRequest,
+                    "a create-object request has trailing arguments",
+                ));
+            }
+            wanted
+        } else {
+            let head = request.args.get(..Wanted::ARGS).unwrap_or_default();
+            match Wanted::of_args(head) {
+                Ok(wanted) => wanted,
+                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            }
         };
         let name = wanted.name.clone();
         self.record(process, vec![wanted], reply, move |dn, made| {
@@ -685,9 +747,42 @@ impl DN {
     /// A run of `(name, keyed)` pairs, which costs one stream request and one
     /// answer however many objects it holds.
     fn create_many(self: &Arc<Self>, process: &Arc<Process>, request: &Request, reply: Reply) {
-        let wanted = match Wanted::all_of_args(&request.args) {
-            Ok(wanted) => wanted,
-            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+        let wanted = if matches!(request.args.first(), Some(Arg::Struct(Op::BatchCreate, _))) {
+            let (mut payload, rest) =
+                match structure(&request.args, Op::BatchCreate, "a batch-create request") {
+                    Ok(value) => value,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+            let count = match payload.number() {
+                Ok(count) => count as usize,
+                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            };
+            let mut wanted = Vec::with_capacity(count);
+            for _ in 0..count {
+                match Wanted::read(&mut payload) {
+                    Ok(one) => wanted.push(one),
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                }
+            }
+            if let Err(e) = payload.done() {
+                return reply.send(Response::error(Status::BadRequest, e.to_string()));
+            }
+            if !rest.is_empty() {
+                return reply.send(Response::error(
+                    Status::BadRequest,
+                    "a batch-create request has trailing arguments",
+                ));
+            }
+            wanted
+        } else {
+            match Wanted::all_of_args(&request.args) {
+                Ok(wanted) => wanted,
+                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            }
         };
         self.record(process, wanted, reply, |_, made| Response {
             id: 0,
@@ -798,22 +893,31 @@ impl DN {
     /// so the first to arrive asks an SN and the rest park behind it — and because
     /// asking an SN is a round trip, they park rather than hold a worker.
     fn extend(self: &Arc<Self>, process: &Arc<Process>, request: &Request, reply: Reply) {
-        let (name, sealed, records) = match request.args.as_slice() {
-            [Arg::Text(name), Arg::Number(sealed), Arg::Number(records)] => {
-                let records = match SRoff::of_number(*records) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
-                    }
-                };
-                (name.clone(), *sealed, records)
-            }
-            _ => {
-                return reply.send(Response::error(
-                    Status::BadRequest,
-                    "extend-object takes a name, the sealed stream and its record count",
-                ));
-            }
+        let (mut payload, rest) =
+            match structure(&request.args, Op::ExtendObject, "an extend-object request") {
+                Ok(value) => value,
+                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            };
+        if !rest.is_empty() {
+            return reply.send(Response::error(
+                Status::BadRequest,
+                "an extend-object request has trailing arguments",
+            ));
+        }
+        let name = match payload.text() {
+            Ok(name) => name,
+            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+        };
+        let sealed = match payload.number() {
+            Ok(sealed) => sealed,
+            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+        };
+        let records = match payload.number().and_then(SRoff::of_number) {
+            Ok(records) => records,
+            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+        };
+        if let Err(e) = payload.done() {
+            return reply.send(Response::error(Status::BadRequest, e.to_string()));
         };
 
         // ⚠️ One lock, and everything decided inside it. An earlier version released

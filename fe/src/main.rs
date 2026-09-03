@@ -361,7 +361,12 @@ impl FE {
                 }
                 Request::new(Op::ObjectInfo).structure(payload)
             }
-            Some(record) => Request::new(Op::LocateStream).text(&path).number(record.number()),
+            Some(record) => {
+                let mut payload = StructWriter::new();
+                payload.text(&path);
+                payload.number(record.number());
+                Request::new(Op::LocateStream).structure(payload)
+            }
         };
         let named = dn.clone();
         let asked = process.ask(&dn, &ask, move |answer| {
@@ -671,10 +676,11 @@ impl FE {
         self.streams.lock().expect("streams").remove(&located.stream);
 
         let dn = format!("DN{}", located.dn);
-        let ask = Request::new(Op::ExtendObject)
-            .text(&path)
-            .number(located.stream.stream.number())
-            .number(*records);
+        let mut payload = StructWriter::new();
+        payload.text(&path);
+        payload.number(located.stream.stream.number());
+        payload.number(*records);
+        let ask = Request::new(Op::ExtendObject).structure(payload);
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
         let named = dn.clone();
@@ -867,7 +873,14 @@ fn make_object(
     let (kind, width) = framing.wire();
     // Unkeyed: a record number is what an append gets back, and a keyed object is
     // addressed by key instead.
-    let ask = Request::new(Op::CreateObject).text(path).flag(false).number(kind).number(width);
+    let mut payload = StructWriter::new();
+    payload.text(path);
+    payload.flag(false);
+    payload.number(kind);
+    payload.number(width);
+    payload.text("");
+    payload.flag(false);
+    let ask = Request::new(Op::CreateObject).structure(payload);
     let fe = Arc::clone(fe);
     let onward = Arc::clone(process);
     let named = dn.to_string();
@@ -1437,9 +1450,42 @@ impl FE {
     /// true of one DN; spreading over several makes it worse, which is why a DN that refuses
     /// fails the whole batch rather than being quietly subtracted (§17.31.1).
     fn create(self: &Arc<Self>, process: &Arc<Process>, request: &Request, mut reply: Reply) {
-        let wanted = match Wanted::all_of_args(&request.args) {
-            Ok(wanted) => wanted,
-            Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+        let wanted = if matches!(request.args.first(), Some(Arg::Struct(Op::BatchCreate, _))) {
+            let (mut payload, rest) =
+                match structure(&request.args, Op::BatchCreate, "a batch-create request") {
+                    Ok(value) => value,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+            let count = match payload.number() {
+                Ok(count) => count as usize,
+                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            };
+            let mut wanted = Vec::with_capacity(count);
+            for _ in 0..count {
+                match Wanted::read(&mut payload) {
+                    Ok(one) => wanted.push(one),
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                }
+            }
+            if let Err(e) = payload.done() {
+                return reply.send(Response::error(Status::BadRequest, e.to_string()));
+            }
+            if !rest.is_empty() {
+                return reply.send(Response::error(
+                    Status::BadRequest,
+                    "a batch-create request has trailing arguments",
+                ));
+            }
+            wanted
+        } else {
+            match Wanted::all_of_args(&request.args) {
+                Ok(wanted) => wanted,
+                Err(e) => return reply.send(Response::error(Status::BadRequest, e.to_string())),
+            }
         };
         let dns: Vec<String> =
             process.all_of(ServiceKind::Dn).iter().map(|dn| dn.to_string()).collect();
@@ -1459,10 +1505,12 @@ impl FE {
         }));
 
         for (dn, at) in groups {
-            let mut ask = Request::new(Op::BatchCreate);
+            let mut payload = StructWriter::new();
+            payload.number(at.len() as u64);
             for one in at.iter().map(|at| &wanted[*at]) {
-                ask.args.extend(one.args());
+                one.write(&mut payload);
             }
+            let ask = Request::new(Op::BatchCreate).structure(payload);
             let identity = dns[dn].clone();
             let waiting = Arc::clone(&making);
             let named = identity.clone();
@@ -1675,6 +1723,19 @@ fn first(request: &Request) -> String {
         }
         Some(Arg::Struct(Op::BatchInfo, _bytes)) => {
             structure(&request.args, Op::BatchInfo, "a batch-object-info request")
+                .and_then(|(mut payload, _)| {
+                    let _ = payload.number()?;
+                    payload.text()
+                })
+                .unwrap_or_default()
+        }
+        Some(Arg::Struct(Op::CreateObject, _bytes)) => {
+            structure(&request.args, Op::CreateObject, "a create-object request")
+                .and_then(|(mut payload, _)| payload.text())
+                .unwrap_or_default()
+        }
+        Some(Arg::Struct(Op::BatchCreate, _bytes)) => {
+            structure(&request.args, Op::BatchCreate, "a batch-create request")
                 .and_then(|(mut payload, _)| {
                     let _ = payload.number()?;
                     payload.text()
