@@ -289,15 +289,15 @@ enum Cmd {
     },
     /// Create many objects, and time it. Paths are `<prefix><n>`.
     BenchCreate {
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 20_000_000)]
         objects: u64,
         /// Objects per request. One is a create apiece; more is a batch.
         #[arg(long, default_value_t = 1000)]
         batch: usize,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 16)]
         clients: usize,
         /// Requests in flight per client.
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 16)]
         depth: usize,
         #[arg(long, default_value = "/bench/")]
         prefix: String,
@@ -311,14 +311,14 @@ enum Cmd {
     /// same count and prefix.
     BenchInfo {
         /// How many objects exist to be looked up.
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 20_000_000)]
         objects: u64,
         /// Names per request. One is `object-info`; more is `batch-object-info`.
         #[arg(long, default_value_t = 1)]
         batch: usize,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 16)]
         clients: usize,
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 16)]
         depth: usize,
         #[arg(long, default_value_t = 5)]
         seconds: u64,
