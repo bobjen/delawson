@@ -530,9 +530,31 @@ impl SN {
     /// converts them to the object's numbering, because it is the tier that holds each
     /// stream's first record (§17.22).
     fn list(&self, request: &Request) -> Response {
-        let asked = match Listing::of_args(&request.args) {
-            Ok(asked) => asked,
-            Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+        let asked = if matches!(request.args.first(), Some(Arg::Struct(Op::ListExtents, _))) {
+            let (mut payload, rest) =
+                match structure(&request.args, Op::ListExtents, "a list-extents request") {
+                    Ok(value) => value,
+                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                };
+            let asked = match Listing::read_payload(&mut payload) {
+                Ok(asked) => asked,
+                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            };
+            if let Err(e) = payload.done() {
+                return Response::error(Status::BadRequest, e.to_string());
+            }
+            if !rest.is_empty() {
+                return Response::error(
+                    Status::BadRequest,
+                    "a list-extents request has trailing arguments",
+                );
+            }
+            asked
+        } else {
+            match Listing::of_args(&request.args) {
+                Ok(asked) => asked,
+                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            }
         };
         let mut args = Vec::new();
         let mut room = asked.limit;

@@ -1806,10 +1806,26 @@ fn build(cmd: &Cmd) -> Result<Request> {
             }
             Request::new(Op::BatchInfo).structure(payload)
         }
-        Cmd::Mkdir { path } => Request::new(Op::MakeDirectory).text(path),
-        Cmd::Rmdir { path } => Request::new(Op::RemoveDirectory).text(path),
-        Cmd::Ls { path } => Request::new(Op::List).text(path),
-        Cmd::Stat { path } => Request::new(Op::Stat).text(path),
+        Cmd::Mkdir { path } => {
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            Request::new(Op::MakeDirectory).structure(payload)
+        }
+        Cmd::Rmdir { path } => {
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            Request::new(Op::RemoveDirectory).structure(payload)
+        }
+        Cmd::Ls { path } => {
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            Request::new(Op::List).structure(payload)
+        }
+        Cmd::Stat { path } => {
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            Request::new(Op::Stat).structure(payload)
+        }
 
         Cmd::Create { path, flavor, framing, media_class, expiry } => {
             let (kind, width) = Framing::parse(framing)?.wire();
@@ -1826,22 +1842,42 @@ fn build(cmd: &Cmd) -> Result<Request> {
             }
             Request::new(Op::CreateObject).structure(payload)
         }
-        Cmd::Delete { path } => Request::new(Op::DeleteObject).text(path),
-        Cmd::Undelete { path } => Request::new(Op::UndeleteObject).text(path),
-        Cmd::SetExpiry { path, seconds } => {
-            let request = Request::new(Op::SetExpiry).text(path);
-            match seconds {
-                Some(seconds) => request.number(*seconds),
-                None => request.flag(false),
-            }
+        Cmd::Delete { path } => {
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            Request::new(Op::DeleteObject).structure(payload)
         }
-        Cmd::Clone { src, dst } => Request::new(Op::CloneObject).text(src).text(dst),
-        Cmd::Concat { dst, src } => {
-            let mut request = Request::new(Op::ConcatObjects).text(dst);
-            for one in src {
-                request = request.text(one);
+        Cmd::Undelete { path } => {
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            Request::new(Op::UndeleteObject).structure(payload)
+        }
+        Cmd::SetExpiry { path, seconds } => {
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            match seconds {
+                Some(seconds) => {
+                    payload.flag(true);
+                    payload.number(*seconds);
+                }
+                None => payload.flag(false),
             }
-            request
+            Request::new(Op::SetExpiry).structure(payload)
+        }
+        Cmd::Clone { src, dst } => {
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(src);
+            payload.text(dst);
+            Request::new(Op::CloneObject).structure(payload)
+        }
+        Cmd::Concat { dst, src } => {
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(dst);
+            payload.number(src.len() as u64);
+            for one in src {
+                payload.text(one);
+            }
+            Request::new(Op::ConcatObjects).structure(payload)
         }
 
         Cmd::Append { path, framing, crc, body, expect } => {
@@ -1870,17 +1906,44 @@ fn build(cmd: &Cmd) -> Result<Request> {
             Request::new(Op::AppendRecord).structure(payload)
         }
         Cmd::Insert { path, key, body } => {
-            Request::new(Op::InsertRecord).text(path).text(key).bytes(body.bytes()?)
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            payload.text(key);
+            payload.bytes(&body.bytes()?);
+            Request::new(Op::InsertRecord).structure(payload)
         }
         Cmd::Update { path, at, body } => {
-            let mut request = Request::new(Op::UpdateRecord).text(path);
-            request.args.push(at.arg());
-            request.bytes(body.bytes()?)
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            match at.arg() {
+                Arg::Number(record) => {
+                    payload.number(0);
+                    payload.number(record);
+                }
+                Arg::Text(key) => {
+                    payload.number(1);
+                    payload.text(&key);
+                }
+                _ => unreachable!(),
+            }
+            payload.bytes(&body.bytes()?);
+            Request::new(Op::UpdateRecord).structure(payload)
         }
         Cmd::DeleteRecord { path, at } => {
-            let mut request = Request::new(Op::DeleteRecord).text(path);
-            request.args.push(at.arg());
-            request
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            match at.arg() {
+                Arg::Number(record) => {
+                    payload.number(0);
+                    payload.number(record);
+                }
+                Arg::Text(key) => {
+                    payload.number(1);
+                    payload.text(&key);
+                }
+                _ => unreachable!(),
+            }
+            Request::new(Op::DeleteRecord).structure(payload)
         }
         Cmd::Read { path, at, expect, .. } => {
             let mut payload = common::wire::StructWriter::new();
@@ -1897,9 +1960,16 @@ fn build(cmd: &Cmd) -> Result<Request> {
                 // A key, which is a keyed read and unbuilt. Sent as it stands so the
                 // answer says so rather than the client guessing.
                 key => {
-                    let mut request = Request::new(Op::ReadRecord).text(path);
-                    request.args.push(key);
-                    return Ok(request);
+                    let mut payload = common::wire::StructWriter::new();
+                    payload.text(path);
+                    expecting(expect)?.write(&mut payload);
+                    payload.number(1);
+                    if let Arg::Text(key) = key {
+                        payload.text(&key);
+                    } else {
+                        unreachable!();
+                    }
+                    return Ok(Request::new(Op::ReadRecord).structure(payload));
                 }
             }
             Request::new(Op::ReadRecord).structure(payload)
@@ -1908,9 +1978,17 @@ fn build(cmd: &Cmd) -> Result<Request> {
         // Scan is a loop over range reads rather than one request, so it is driven
         // in `scan` and never reaches here.
         Cmd::Scan { .. } => return Err(Error::new("a scan is many requests")),
-        Cmd::Count { path } => Request::new(Op::Count).text(path),
+        Cmd::Count { path } => {
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            Request::new(Op::Count).structure(payload)
+        }
         Cmd::TimeRange { path, from, to } => {
-            Request::new(Op::TimeRange).text(path).number(*from).number(*to)
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            payload.number(*from);
+            payload.number(*to);
+            Request::new(Op::TimeRange).structure(payload)
         }
 
         // The commands above are the ones with a request to build; the rest are

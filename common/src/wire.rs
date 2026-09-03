@@ -557,13 +557,13 @@ impl AppendBlock {
             payload.number(disk.number());
         }
         payload.bytes(&self.bytes);
-        request.args.push(payload.finish(Op::AppendBlock));
+        request.args.push(payload.finish(op));
         request
     }
 
     pub fn of(request: &Request) -> Result<(EnId, DiskId, AppendBlock)> {
         if matches!(request.args.first(), Some(Arg::Struct(..))) {
-            let (mut payload, rest) = structure(&request.args, Op::AppendBlock, "an append block")?;
+            let (mut payload, rest) = structure(&request.args, request.op, "an append request")?;
             if !rest.is_empty() {
                 return Err(Error::new("an append block has arguments after its payload"));
             }

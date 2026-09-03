@@ -806,6 +806,24 @@ impl FE {
                         return reply.send(Response::error(Status::BadRequest, e.to_string()));
                     }
                 };
+                let selector = match payload.number() {
+                    Ok(selector) => selector,
+                    Err(e) => {
+                        return reply.send(Response::error(Status::BadRequest, e.to_string()));
+                    }
+                };
+                if selector == 1 {
+                    return reply.send(Response::error(
+                        Status::Unimplemented,
+                        "reading by key is not built yet",
+                    ));
+                }
+                if selector != 0 {
+                    return reply.send(Response::error(
+                        Status::BadRequest,
+                        format!("unknown read selector {selector}"),
+                    ));
+                }
                 let range = match Range::read_nested(&mut payload) {
                     Ok(range) => range,
                     Err(e) => {
@@ -1057,13 +1075,14 @@ fn from_instance(
     // A sealed extent has something after it; the one still open is the object's
     // tail, so what the EN says about its own blocks is the whole answer.
     let sealed = open.records > ERoff::ZERO;
-    let mut ask = Request::new(Op::ReadExtent)
-        .number(open.disks[0].0.number())
-        .number(open.disks[0].1.number())
-        .number(open.sn.number())
-        .number(open.id.number())
-        .number(open.created.number());
-    ask.args.extend(Range { start: Start::Record(at.number()), budget }.args());
+    let mut payload = StructWriter::new();
+    payload.number(open.disks[0].0.number());
+    payload.number(open.disks[0].1.number());
+    payload.number(open.sn.number());
+    payload.number(open.id.number());
+    payload.number(open.created.number());
+    Range { start: Start::Record(at.number()), budget }.write_nested(&mut payload);
+    let ask = Request::new(Op::ReadExtent).structure(payload);
     let named = identity.clone();
     // The blocks come back whole and are passed on whole: the reader decompresses
     // them, checks the CRC against what it wrote, and takes the records it wanted.

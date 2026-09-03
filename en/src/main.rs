@@ -29,7 +29,7 @@ use common::offset::{ECoff, ELoff, ERoff};
 use common::range::{Budget, Covered, Filled, Piece, Range};
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
-use common::wire::{AppendBlock, Arg, Op, Request, Response, Status, StructWriter};
+use common::wire::{AppendBlock, Arg, Op, Request, Response, Status, StructWriter, structure};
 use common::{Error, Result, logw};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -865,22 +865,14 @@ impl Disk {
         held.range(&self.daily_cache, &self.extent_cache, process, place, from, budget)
     }
 
-    fn read(&self, process: &Process, args: &[Arg]) -> Response {
-        let [Arg::Number(sn), Arg::Number(extent), Arg::Number(created), rest @ ..] = args else {
-            return Response::error(
-                Status::BadRequest,
-                "read-extent takes an SnId, an extent, a second and a range",
-            );
-        };
-        let range = match Range::of_args(rest) {
-            Ok((range, [])) => range,
-            _ => {
-                return Response::error(
-                    Status::BadRequest,
-                    "read-extent takes an SnId, an extent, a second and a range",
-                );
-            }
-        };
+    fn read(
+        &self,
+        process: &Process,
+        sn: u64,
+        extent: u64,
+        created: u64,
+        range: Range,
+    ) -> Response {
         let Some(from) = range.start.record() else {
             return Response::error(
                 Status::Unimplemented,
@@ -889,14 +881,14 @@ impl Disk {
         };
 
         let held = self.held.lock().expect("extents");
-        match held.created(SnId::new(*sn as u32), ExtentId::new(*extent as u32)) {
+        match held.created(SnId::new(sn as u32), ExtentId::new(extent as u32)) {
             None => {
                 return Response::error(
                     Status::NotFound,
                     format!("no extent {extent} of sn {sn} here"),
                 );
             }
-            Some(second) if second != TimeSec::new(*created) => {
+            Some(second) if second != TimeSec::new(created) => {
                 return Response::error(
                     Status::NotFound,
                     format!("extent {extent} of sn {sn} was made in second {second}"),
@@ -910,8 +902,8 @@ impl Disk {
         };
         let ranged = match self.range(
             process,
-            SnId::new(*sn as u32),
-            ExtentId::new(*extent as u32),
+            SnId::new(sn as u32),
+            ExtentId::new(extent as u32),
             from,
             range.budget,
         ) {
@@ -1052,6 +1044,57 @@ impl EN {
     }
 
     fn read(&self, process: &Process, request: &Request) -> Response {
+        if matches!(request.args.first(), Some(Arg::Struct(Op::ReadExtent, _))) {
+            let (mut payload, rest) =
+                match structure(&request.args, Op::ReadExtent, "a read-extent request") {
+                    Ok(value) => value,
+                    Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+                };
+            let en = match payload.number() {
+                Ok(value) => value,
+                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            };
+            let disk = match payload.number() {
+                Ok(value) => value,
+                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            };
+            let sn = match payload.number() {
+                Ok(value) => value,
+                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            };
+            let extent = match payload.number() {
+                Ok(value) => value,
+                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            };
+            let created = match payload.number() {
+                Ok(value) => value,
+                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            };
+            let range = match Range::read_nested(&mut payload) {
+                Ok(range) => range,
+                Err(e) => return Response::error(Status::BadRequest, e.to_string()),
+            };
+            if let Err(e) = payload.done() {
+                return Response::error(Status::BadRequest, e.to_string());
+            }
+            if !rest.is_empty() {
+                return Response::error(
+                    Status::BadRequest,
+                    "a read-extent request has trailing arguments",
+                );
+            }
+            let mine = EnId::new(process.entry.number());
+            if en != mine.number() {
+                return Response::error(
+                    Status::BadRequest,
+                    format!("read aimed at EN{en} reached EN{mine}"),
+                );
+            }
+            return match DiskId::of_number(disk).and_then(|id| self.disk(id)) {
+                Ok(disk) => disk.read(process, sn, extent, created, range),
+                Err(e) => Response::error(Status::BadRequest, e.to_string()),
+            };
+        }
         let [Arg::Number(en), Arg::Number(disk), rest @ ..] = request.args.as_slice() else {
             return Response::error(
                 Status::BadRequest,
@@ -1066,7 +1109,22 @@ impl EN {
             );
         }
         match DiskId::of_number(*disk).and_then(|id| self.disk(id)) {
-            Ok(disk) => disk.read(process, rest),
+            Ok(disk) => {
+                let [Arg::Number(sn), Arg::Number(extent), Arg::Number(created), rest @ ..] = rest
+                else {
+                    return Response::error(
+                        Status::BadRequest,
+                        "read-extent takes an SnId, an extent, a second and a range",
+                    );
+                };
+                match Range::of_args(rest) {
+                    Ok((range, [])) => disk.read(process, *sn, *extent, *created, range),
+                    _ => Response::error(
+                        Status::BadRequest,
+                        "read-extent takes an SnId, an extent, a second and a range",
+                    ),
+                }
+            }
             Err(e) => Response::error(Status::BadRequest, e.to_string()),
         }
     }

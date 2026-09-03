@@ -887,6 +887,35 @@ impl Listing {
         args
     }
 
+    pub fn write_payload(&self, payload: &mut StructWriter) {
+        payload.number(self.limit);
+        payload.number(self.at.len() as u64);
+        for (name, from) in &self.at {
+            payload.number(name.range.number());
+            payload.number(name.stream.number());
+            payload.number(name.created.number());
+            payload.number(*from);
+        }
+    }
+
+    pub fn read_payload(payload: &mut StructReader<'_>) -> Result<Listing> {
+        let limit = payload.number()?;
+        let count = usize::try_from(payload.number()?)
+            .map_err(|_| Error::new("list-extents stream count is too large"))?;
+        let mut at = Vec::with_capacity(count);
+        for _ in 0..count {
+            at.push((
+                StreamName {
+                    range: RangeId::of_number(payload.number()?)?,
+                    stream: StreamId::of_number(payload.number()?)?,
+                    created: TimeSec::new(payload.number()?),
+                },
+                payload.number()?,
+            ));
+        }
+        Ok(Listing { limit, at })
+    }
+
     pub fn of_args(args: &[Arg]) -> Result<Listing> {
         let [Arg::Number(limit), Arg::Number(count), rest @ ..] = args else {
             return Err(Error::new("list-extents takes a limit and a run of streams"));

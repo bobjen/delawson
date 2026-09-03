@@ -1208,9 +1208,9 @@ impl DN {
         for (sn, at) in by_sn {
             let identity = format!("SN{sn}");
             let ask = {
-                let mut request = Request::new(Op::ListExtents);
-                request.args = Listing { limit: room, at }.args();
-                request
+                let mut payload = StructWriter::new();
+                Listing { limit: room, at }.write_payload(&mut payload);
+                Request::new(Op::ListExtents).structure(payload)
             };
             let waiting = Arc::clone(&gather);
             let named = identity.clone();
