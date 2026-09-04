@@ -101,17 +101,14 @@ impl Open {
         if !rest.is_empty() {
             return None;
         }
-        let id = ExtentId::new(payload.number_u32().ok()?);
-        let created = TimeSec::new(payload.number_u64().ok()?);
+        let id = payload.extent_id().ok()?;
+        let created = payload.time_sec().ok()?;
         let first_record = payload.sroff().ok()?;
         let records = payload.eroff().ok()?;
         let count = payload.number_u32().ok()?;
         let mut disks = payload.checked_vec(count).ok()?;
         for _ in 0..count {
-            disks.push((
-                EnId::new(payload.number_u32().ok()?),
-                DiskId::new(payload.number_u16().ok()?),
-            ));
+            disks.push((payload.en_id().ok()?, payload.disk_id().ok()?));
         }
         payload.done().ok()?;
         (!disks.is_empty()).then_some(Open {
@@ -364,7 +361,7 @@ impl FE {
             Some(record) => {
                 let mut payload = StructWriter::new();
                 payload.text(&path);
-                payload.number_u64(record.number());
+                payload.oroff(record);
                 Req::new(Op::LocateStream).structure(payload)
             }
         };
@@ -717,8 +714,8 @@ impl FE {
         let dn = format!("DN{}", located.dn);
         let mut payload = StructWriter::new();
         payload.text(&path);
-        payload.number_u32(located.stream.stream.get());
-        payload.number_u64(records);
+        payload.stream_id(located.stream.stream);
+        payload.sroff(SRoff::new(records));
         let ask = Req::new(Op::ExtendObject).structure(payload);
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
@@ -859,10 +856,10 @@ impl FE {
 
         let identity = format!("SN{}", located.sn);
         let mut payload = StructWriter::new();
-        payload.number_u32(located.stream.range.get());
-        payload.number_u32(located.stream.stream.get());
-        payload.number_u64(located.stream.created.number());
-        payload.number_u64(record.number());
+        payload.range_id(located.stream.range);
+        payload.stream_id(located.stream.stream);
+        payload.time_sec(located.stream.created);
+        payload.sroff(record);
         let ask = Req::new(Op::LocateRecord).structure(payload);
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
@@ -896,9 +893,9 @@ impl FE {
 fn wanting_extent(key: StreamName, sealed: Option<(ExtentId, Filled)>) -> Req {
     if sealed.is_none() {
         let mut payload = StructWriter::new();
-        payload.number_u32(key.range.get());
-        payload.number_u32(key.stream.get());
-        payload.number_u64(key.created.number());
+        payload.range_id(key.range);
+        payload.stream_id(key.stream);
+        payload.time_sec(key.created);
         return Req::new(Op::OpenExtent).structure(payload);
     }
     let mut request = Req::new(match sealed {
@@ -907,13 +904,13 @@ fn wanting_extent(key: StreamName, sealed: Option<(ExtentId, Filled)>) -> Req {
     });
     if let Some((id, came_to)) = sealed {
         let mut payload = StructWriter::new();
-        payload.number_u32(key.range.get());
-        payload.number_u32(key.stream.get());
-        payload.number_u64(key.created.number());
-        payload.number_u64(id.number());
-        payload.number_u64(came_to.records.number());
-        payload.number_u64(came_to.logical.number());
-        payload.number_u64(came_to.compressed.number());
+        payload.range_id(key.range);
+        payload.stream_id(key.stream);
+        payload.time_sec(key.created);
+        payload.extent_id(id);
+        payload.eroff(came_to.records);
+        payload.eloff(came_to.logical);
+        payload.ecoff(came_to.compressed);
         return request.structure(payload);
     }
     request.args.extend(key.args());
@@ -1008,11 +1005,11 @@ fn from_instance(
     // tail, so what the EN says about its own blocks is the whole answer.
     let sealed = open.records > ERoff::ZERO;
     let mut payload = StructWriter::new();
-    payload.number_u32(open.disks[0].0.get());
-    payload.number_u16(open.disks[0].1.get());
-    payload.number_u32(open.sn.get());
-    payload.number_u32(open.id.get());
-    payload.number_u64(open.created.number());
+    payload.en_id(open.disks[0].0);
+    payload.disk_id(open.disks[0].1);
+    payload.sn_id(open.sn);
+    payload.extent_id(open.id);
+    payload.time_sec(open.created);
     Range { start: Start::Record(at.number()), budget }.write_nested(&mut payload);
     let ask = Req::new(Op::ReadExtent).structure(payload);
     let named = identity.clone();
@@ -2117,14 +2114,14 @@ mod tests {
     #[test]
     fn an_open_extent_is_read_out_of_the_sns_answer() {
         let mut payload = StructWriter::new();
-        payload.number_u32(7);
-        payload.number_u64(1_000_000);
+        payload.extent_id(ExtentId::new(7));
+        payload.time_sec(TimeSec::new(1_000_000));
         payload.sroff(SRoff::new(40));
         payload.eroff(ERoff::new(90));
         payload.number_u32(4);
         for (en, disk) in [(2, 0), (3, 0), (0, 0), (1, 0)] {
-            payload.number_u32(en);
-            payload.number_u16(disk);
+            payload.en_id(EnId::new(en));
+            payload.disk_id(DiskId::new(disk));
         }
         let response =
             Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::ExtentResp)] };

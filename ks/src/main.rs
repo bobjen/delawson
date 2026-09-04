@@ -144,12 +144,11 @@ impl Ks {
                 "an SN master-key request has trailing arguments",
             );
         }
-        let sn = match payload.number_u32().map(common::ids::SnId::new) {
+        let sn = match payload.sn_id() {
             Ok(sn) => sn,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let at = match payload.number_u64().and_then(|at| payload.done().map(|()| TimeSec::new(at)))
-        {
+        let at = match payload.time_sec().and_then(|at| payload.done().map(|()| at)) {
             Ok(at) => at,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };

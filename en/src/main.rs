@@ -67,8 +67,8 @@ impl DailyKeyCache {
 
         // Fetch from KS.
         let mut payload = StructWriter::new();
-        payload.number_u32(sn_id.get());
-        payload.number_u64(ts.number());
+        payload.sn_id(sn_id);
+        payload.time_sec(ts);
         let ask = Req::new(Op::SnMasterKey).structure(payload);
         let key_cell = Arc::new(Mutex::new(None::<SnKey>));
         let key_cell2 = Arc::clone(&key_cell);
@@ -1066,24 +1066,24 @@ impl EN {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
-        let en = match payload.number_u32() {
-            Ok(value) => EnId::new(value),
+        let en = match payload.en_id() {
+            Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let disk = match payload.number_u16() {
-            Ok(value) => DiskId::new(value),
+        let disk = match payload.disk_id() {
+            Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let sn = match payload.number_u32() {
-            Ok(value) => SnId::new(value),
+        let sn = match payload.sn_id() {
+            Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let extent = match payload.number_u32() {
-            Ok(value) => ExtentId::new(value),
+        let extent = match payload.extent_id() {
+            Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let created = match payload.number_u64() {
-            Ok(value) => TimeSec::new(value),
+        let created = match payload.time_sec() {
+            Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let range = match Range::read_nested(&mut payload) {
