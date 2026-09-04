@@ -17,7 +17,7 @@
 
 use crate::ids::{ObjectId, RangeId};
 use crate::info::{Expecting, ObjectName};
-use crate::offset::{ECoff, ELoff};
+use crate::offset::{ECoff, ELoff, ERoff, ORoff};
 use crate::placement::Expansion;
 use crate::wire::Arg;
 use crate::wire::{Op, StructReader, StructWriter, structure};
@@ -60,6 +60,14 @@ impl Start {
     pub fn record(self) -> Option<u64> {
         match self {
             Start::Record(record) | Start::RecordThen(record, _) => Some(record),
+            Start::Logical(_) => None,
+        }
+    }
+
+    /// The object-local record position, when this start names one.
+    pub fn object_record(self) -> Option<ORoff> {
+        match self {
+            Start::Record(record) | Start::RecordThen(record, _) => Some(ORoff::new(record)),
             Start::Logical(_) => None,
         }
     }
@@ -231,7 +239,7 @@ impl Range {
 /// class is what the expansion factor belongs to. See §17.25.3.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Filled {
-    pub records: u64,
+    pub records: ERoff,
     /// ⚠️ **An `ELoff`, and the next field an `ECoff`** — the type discipline #94 asked for, and
     /// the reason this is a shape at all. It also costs nothing: both spaces are 32-bit, so
     /// all three measures together are the 16 bytes the two of them used to take, and
@@ -244,7 +252,7 @@ pub struct Filled {
 impl Filled {
     pub fn args(&self) -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        payload.number_u64(self.records);
+        payload.number_u64(self.records.number());
         payload.number_u64(self.logical.number());
         payload.number_u64(self.compressed.number());
         vec![payload.finish(Op::FilledResp)]
@@ -253,7 +261,7 @@ impl Filled {
     pub fn of_args(args: &[Arg]) -> Result<(Filled, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::FilledResp, "a seal report")?;
         let filled = Filled {
-            records: payload.number_u64()?,
+            records: ERoff::of_number(payload.number_u64()?)?,
             logical: ELoff::of_number(payload.number_u64()?)?,
             compressed: ECoff::of_number(payload.number_u64()?)?,
         };
@@ -264,7 +272,7 @@ impl Filled {
     /// Whether the extent took nothing at all — a block that would not fit an extent even
     /// empty, rather than an extent worth replacing.
     pub fn empty(&self) -> bool {
-        self.records == 0 && self.compressed == ECoff::ZERO
+        self.records == ERoff::ZERO && self.compressed == ECoff::ZERO
     }
 
     /// Bytes the user is charged for, which is what billing reads.

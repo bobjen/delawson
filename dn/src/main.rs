@@ -108,12 +108,15 @@ fn detailed(
         return None;
     }
 
-    let total = object.streams.len() as u64;
-    let from = want.from.record().unwrap_or(0);
+    // This is an object-stream count, not an SN id. It uses SnId's width for now because
+    // both limits come from the amount of stream metadata a machine can hold; the two
+    // resource limits remain conceptually independent.
+    let total = SnId::of_number(object.streams.len() as u64)
+        .expect("an object's stream count fits the SN id space");
+    let from = want.from.object_record().unwrap_or(ORoff::ZERO);
     // Streams are in record order, so the first to describe is the last one starting
     // at or before `from` — the same rule a read uses to pick a stream.
-    let first =
-        object.streams_from().filter(|(at, _)| at.number() <= from).count().saturating_sub(1);
+    let first = object.streams_from().filter(|(at, _)| *at <= from).count().saturating_sub(1);
 
     // One entry for the object, then one per stream, against whichever cap is smaller.
     let cap = match want.limit {
@@ -127,10 +130,10 @@ fn detailed(
             rows.push(StreamRow {
                 stream: held.id,
                 sn: held.sn,
-                first_record: at.number(),
+                first_record: at,
                 // ⚠️ UNKNOWN, not zero: how far the stream being appended to reaches is
                 // not the DN's to say (§6.3), and a sealed stream may hold nothing.
-                records: held.records.number(),
+                records: held.records,
                 created: held.created,
                 // What the DN last learned. Exact once the stream is sealed, a point in
                 // time before that, and UNKNOWN until any SN has been asked (§17.25.1).
@@ -143,9 +146,9 @@ fn detailed(
     // Where to carry on: the first record of the stream after the last one described,
     // and nothing when the last stream described is the object's last.
     let after = first + rows.len();
-    let next = object.streams_from().nth(after).map_or(UNKNOWN, |(at, _)| at.number());
+    let next = object.streams_from().nth(after).map_or(ORoff::NONE, |(at, _)| at);
     let shape = Shape {
-        streams: if want.wants(Detail::Counts) { total } else { UNKNOWN },
+        streams: if want.wants(Detail::Counts) { total.number() } else { UNKNOWN },
         given: rows.len() as u64,
         extents: UNKNOWN,
         entries: 1 + rows.len() as u64,
@@ -158,7 +161,7 @@ fn detailed(
         next: if want.wants(Detail::Counts) || want.wants(Detail::Streams) {
             next
         } else {
-            UNKNOWN
+            ORoff::NONE
         },
     };
 
@@ -382,7 +385,7 @@ impl Object {
                 sn: held.sn,
                 keyed: self.keyed,
                 framing: self.framing,
-                first_record: first.number(),
+                first_record: first,
             }
             .args(),
         )
@@ -479,7 +482,13 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Resp) {
         let moved = rows
             .into_iter()
             .map(|extent| ExtentRow {
-                first_record: extent.first_record + row.first_record,
+                // SN supplies an extent-local position. Add it to the stream's
+                // object-local start, then reduce only because ExtentRow is the
+                // context-dependent shape shared by SN and DN.
+                first_record: ORoff::from_stream(SRoff::new(extent.first_record))
+                    .plus(row.first_record)
+                    .expect("object record position fits")
+                    .get(),
                 ..extent
             })
             .collect();
@@ -495,7 +504,11 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Resp) {
         // ⚠️ `then`, not `then_some`: `then_some` evaluates its argument **eagerly**, so it
         // computed `UNKNOWN + first_record` — `u64::MAX` plus a record number — and
         // overflowed. It reads like a guard and is not one (§17.22.1).
-        (short && run.next != UNKNOWN).then(|| run.next + row.first_record)
+        (short && run.next != UNKNOWN).then(|| {
+            ORoff::from_stream(SRoff::new(run.next))
+                .plus(row.first_record)
+                .expect("object record position fits")
+        })
     });
     let next = cut.unwrap_or(held.shape.next);
     let levelled = Levelled {
@@ -1676,7 +1689,7 @@ mod tests {
         assert_eq!(shape.streams, 3, "how many there are");
         assert_eq!((shape.given, rows.len()), (1, 1), "how many are described");
         assert_eq!(shape.entries, 2, "the object and one stream");
-        assert_eq!(shape.next, 100, "and where to carry on");
+        assert_eq!(shape.next, ORoff::new(100), "and where to carry on");
         assert!(shape.more());
     }
 
@@ -1686,7 +1699,7 @@ mod tests {
     fn resuming_from_the_continuation_makes_progress() {
         let want = Want::plain().with(Detail::Streams).with(Detail::Counts);
         let object = grown();
-        let mut at = 0;
+        let mut at = ORoff::ZERO;
         let mut seen = Vec::new();
         for _ in 0..8 {
             let args = flat(
@@ -1694,7 +1707,7 @@ mod tests {
                     &object,
                     RangeId::new(0),
                     DnId::new(0),
-                    &Want { limit: 2, from: Start::Record(at), ..want },
+                    &Want { limit: 2, from: Start::Record(at.get()), ..want },
                     100,
                 )
                 .expect("an answer"),
@@ -1748,9 +1761,9 @@ mod tests {
                 .expect("an answer"),
         );
         let (_, rows) = read_back(&args);
-        assert_eq!(rows[0].records, 100);
-        assert_eq!(rows[2].records, UNKNOWN, "the one being appended to");
-        assert_ne!(rows[2].records, 0, "which is not a count of none");
+        assert_eq!(rows[0].records, SRoff::new(100));
+        assert_eq!(rows[2].records, SRoff::NONE, "the one being appended to");
+        assert_ne!(rows[2].records, SRoff::ZERO, "which is not a count of none");
     }
 
     /// Counts without streams is a legitimate question: how big is this object,
@@ -1765,7 +1778,7 @@ mod tests {
         assert_eq!((shape.streams, shape.given, shape.entries), (3, 0, 1));
         assert!(rows.is_empty());
         assert!(shape.more(), "three streams it did not describe is not nothing more");
-        assert_eq!(shape.next, 0, "and a listing would start at the first of them");
+        assert_eq!(shape.next, ORoff::ZERO, "and a listing would start at the first of them");
     }
 
     /// A DN holding `count` objects named `/n0`, `/n1`, and so on.

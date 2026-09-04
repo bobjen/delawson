@@ -100,7 +100,7 @@ impl Open {
             return None;
         }
         let id = payload.number_u32().ok()? as u64;
-        let created = payload.number_u64().ok()?;
+        let created = TimeSec::new(payload.number_u64().ok()?);
         let first_record = payload.number_u64().ok()?;
         let records = payload.number_u64().ok()?;
         let count = payload.number_u32().ok()?;
@@ -115,7 +115,7 @@ impl Open {
         (!disks.is_empty()).then_some(Open {
             sn,
             id: ExtentId::of_number(id).ok()?,
-            created: TimeSec::new(created),
+            created,
             first_record: SRoff::of_number(first_record).ok()?,
             records: ERoff::of_number(records).ok()?,
             _framing: framing,
@@ -518,9 +518,7 @@ impl FE {
         let (plan, open) = {
             let mut streams = self.streams.lock().expect("streams");
             let stream = streams.entry(key).or_default();
-            let plan = stream.plan(sealed.map(|(id, came_to)| {
-                (id, ERoff::of_number(came_to.records).unwrap_or(ERoff::ZERO))
-            }));
+            let plan = stream.plan(sealed.map(|(id, came_to)| (id, came_to.records)));
             if plan == Plan::Join {
                 stream
                     .getting
@@ -907,7 +905,7 @@ fn wanting_extent(key: StreamName, sealed: Option<(ExtentId, Filled)>) -> Req {
         payload.number_u32(key.stream.get());
         payload.number_u64(key.created.number());
         payload.number_u64(id.number());
-        payload.number_u64(came_to.records);
+        payload.number_u64(came_to.records.number());
         payload.number_u64(came_to.logical.number());
         payload.number_u64(came_to.compressed.number());
         return request.structure(payload);
@@ -1150,7 +1148,7 @@ impl Located {
             stream: described.stream,
             sn: described.sn,
             framing: described.framing,
-            first_record: ORoff::of_number(described.first_record).ok()?,
+            first_record: described.first_record,
         })
     }
 }
@@ -1868,7 +1866,8 @@ mod tests {
 
     /// One name's worth of a levelled answer, as a DN would send it.
     fn described(streams: u64, given: u64, next: u64) -> Vec<Arg> {
-        let shape = Shape { streams, given, extents: UNKNOWN, entries: 1 + given, next };
+        let shape =
+            Shape { streams, given, extents: UNKNOWN, entries: 1 + given, next: ORoff::new(next) };
         let mut args = shape.args();
         args.extend(
             Described {
@@ -1886,7 +1885,7 @@ mod tests {
                 sn: SnId::new(0),
                 keyed: false,
                 framing: Framing::Lf,
-                first_record: 0,
+                first_record: ORoff::ZERO,
             }
             .args(),
         );
@@ -1895,8 +1894,8 @@ mod tests {
                 StreamRow {
                     stream: StreamId::new(1),
                     sn: SnId::new(0),
-                    first_record: 0,
-                    records: 3,
+                    first_record: ORoff::ZERO,
+                    records: SRoff::new(3),
                     created: TimeSec::new(1_000_000),
                     totals: Totals::unknown(),
                     given: 0,
@@ -2149,7 +2148,7 @@ mod tests {
             sn: SnId::new(0),
             keyed: false,
             framing: Framing::CrLf,
-            first_record: 400,
+            first_record: ORoff::new(400),
         }
         .args();
         let located = Located::of(&args).expect("an object");

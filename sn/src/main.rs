@@ -91,7 +91,7 @@ impl Stream {
     fn sealed_from(&self) -> impl Iterator<Item = (SRoff, &Sealed)> {
         self.sealed.iter().scan(SRoff::ZERO, |at, sealed| {
             let first = *at;
-            *at = SRoff::new(at.number() + sealed.records().number());
+            *at = at.plus(sealed.records()).expect("stream record position fits");
             Some((first, sealed))
         })
     }
@@ -118,7 +118,7 @@ impl Sealed {
     /// a conversion and not a cast, since the two spaces are only equal for a stream of one
     /// extent. Written once, here, so the callers that sum it cannot get it wrong.
     fn records(&self) -> SRoff {
-        SRoff::new(self.extent.records.number())
+        SRoff::from_extent(self.extent.records)
     }
 
     fn logical(&self) -> SLoff {
@@ -132,7 +132,7 @@ impl Sealed {
     /// Whether a stream-local record number falls in this extent, given where the
     /// extent starts — which the *stream* knows and the extent does not.
     fn holds(&self, first: SRoff, record: SRoff) -> bool {
-        record >= first && record.number() < first.number() + self.records().number()
+        record >= first && record < first.plus(self.records()).expect("stream record position fits")
     }
 }
 
@@ -200,20 +200,20 @@ impl Extent {
 /// failure: whoever asked needs another stream, and the DN is what makes those.
 #[derive(Debug)]
 struct Full {
-    records: u64,
+    records: SRoff,
     /// Set when the stream could not be extended for an ordinary reason instead.
     why: Option<Error>,
 }
 
 impl Full {
-    fn records(records: u64) -> Full {
+    fn records(records: SRoff) -> Full {
         Full { records, why: None }
     }
 }
 
 impl From<Error> for Full {
     fn from(why: Error) -> Full {
-        Full { records: 0, why: Some(why) }
+        Full { records: SRoff::ZERO, why: Some(why) }
     }
 }
 
@@ -445,7 +445,7 @@ impl SN {
                 status: Status::Ok,
                 args: placed.extent.args(placed.first, &self.disks),
             },
-            Err(Full { records, why: None }) => Resp::number(Status::Sealed, records),
+            Err(Full { records, why: None }) => Resp::number(Status::Sealed, records.number()),
             Err(Full { why: Some(why), .. }) => Resp::error(Status::Internal, why.to_string()),
         }
     }
@@ -584,9 +584,9 @@ impl SN {
                 id: sealed.extent.id,
                 created: sealed.extent.created,
                 first_record: at.number(),
-                records: sealed.records().number(),
-                logical: sealed.logical().number(),
-                length: sealed.compressed().number(),
+                records: ERoff::of_number(sealed.records().number()).expect("extent records fit"),
+                logical: ELoff::of_number(sealed.logical().number()).expect("extent bytes fit"),
+                length: ECoff::of_number(sealed.compressed().number()).expect("extent bytes fit"),
                 disks: sealed
                     .extent
                     .disks
@@ -609,9 +609,9 @@ impl SN {
                 id: open.id,
                 created: open.created,
                 first_record: held.sealed_records.number(),
-                records: UNKNOWN,
-                logical: UNKNOWN,
-                length: UNKNOWN,
+                records: ERoff::NONE,
+                logical: ELoff::NONE,
+                length: ECoff::NONE,
                 disks: open
                     .disks
                     .iter()
@@ -669,7 +669,10 @@ impl SN {
             payload.number_u64().and_then(ELoff::of_number),
             payload.number_u64().and_then(ECoff::of_number),
         ) {
-            (Ok(records), Ok(logical), Ok(compressed)) => Filled { records, logical, compressed },
+            (Ok(records), Ok(logical), Ok(compressed)) => match ERoff::of_number(records) {
+                Ok(records) => Filled { records, logical, compressed },
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+            },
             _ => {
                 return Resp::error(Status::BadRequest, "seal-extent has invalid extent totals");
             }
@@ -692,7 +695,7 @@ impl SN {
             },
             // The stream is full, which is the DN's business: it says what the
             // stream came to so the object's next stream can carry on from there.
-            Err(Full { records, why: None }) => Resp::number(Status::Sealed, records),
+            Err(Full { records, why: None }) => Resp::number(Status::Sealed, records.number()),
             Err(Full { why: Some(why), .. }) => Resp::error(Status::Internal, why.to_string()),
         }
     }
@@ -720,8 +723,11 @@ impl SN {
             let extent = held.open.take().expect("an open extent");
             // ⚠️ Accumulated rather than computed from a stored base, which is the same
             // change one level down: the running total is the stream's (§17.29.1).
-            held.sealed_records = SRoff::new(held.sealed_records.number() + came_to.records);
-            let extent = Extent { records: ERoff::of_number(came_to.records)?, ..extent };
+            held.sealed_records = held
+                .sealed_records
+                .plus(SRoff::from_extent(came_to.records))
+                .expect("stream record position fits");
+            let extent = Extent { records: came_to.records, ..extent };
             held.sealed.push(Sealed {
                 extent,
                 logical: came_to.logical,
@@ -734,7 +740,7 @@ impl SN {
             }
         }
         if held.sealed_stream {
-            return Err(Full::records(held.sealed_records.number()));
+            return Err(Full::records(held.sealed_records));
         }
         self.appendable(held, second, instances).map_err(Full::from)
     }
@@ -751,7 +757,7 @@ impl SN {
             return Err(Full::from(Error::new(format!("no {name}"))));
         };
         if held.sealed_stream {
-            return Err(Full::records(held.sealed_records.number()));
+            return Err(Full::records(held.sealed_records));
         }
         self.appendable(held, second, instances).map_err(Full::from)
     }
@@ -815,7 +821,7 @@ mod tests {
     /// a logical length and a compressed one. Anything testing #94's distinction says both.
     fn came(records: u64, compressed: u64) -> Filled {
         Filled {
-            records,
+            records: ERoff::new(records as u32),
             logical: ELoff::new(compressed as u32),
             compressed: ECoff::new(compressed as u32),
         }
@@ -1080,12 +1086,12 @@ mod tests {
             .close(named(0, 7), second.extent.id, came(7, 70), TimeSec::new(1_000_002), want, two)
             .expect_err("the stream should be full");
         assert!(full.why.is_none(), "full is not a failure");
-        assert_eq!(full.records, 17, "what the whole stream came to");
+        assert_eq!(full.records, SRoff::new(17), "what the whole stream came to");
         assert_eq!(sn.sealed_streams.load(Ordering::Relaxed), 1);
 
         // And it stays sealed: nothing opens another extent on it.
         let again = sn.open(named(0, 7), TimeSec::new(1_000_003), want).expect_err("sealed");
-        assert_eq!(again.records, 17);
+        assert_eq!(again.records, SRoff::new(17));
         assert!(again.why.is_none());
     }
 

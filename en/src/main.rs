@@ -423,7 +423,7 @@ impl Extents {
             let closing = !extent.sealed;
             extent.sealed = true;
             let came_to = Filled {
-                records: extent.records.number(),
+                records: extent.records,
                 logical: extent.logical_end,
                 compressed: extent.end,
             };
@@ -653,7 +653,7 @@ struct Disk {
     checksummed: AtomicU64,
     daily_cache: Arc<DailyKeyCache>,
     extent_cache: Arc<ExtentKeyCache>,
-    pending_fixed: Mutex<HashMap<(SnId, ExtentId, u64), QueuedAppend>>,
+    pending_fixed: Mutex<HashMap<(SnId, ExtentId, ELoff), QueuedAppend>>,
 }
 
 impl Disk {
@@ -742,7 +742,7 @@ impl Disk {
         let landed = match took {
             Took::Landed(landed) => landed,
             Took::Queued => {
-                let lo = appending.logical_offset.unwrap().number();
+                let lo = appending.logical_offset.unwrap();
                 self.pending_fixed
                     .lock()
                     .expect("queue")
@@ -761,7 +761,7 @@ impl Disk {
                     came_to.logical,
                     came_to.compressed
                 ));
-                reply.send(Resp::number(Status::Sealed, came_to.records));
+                reply.send(Resp::number(Status::Sealed, came_to.records.number()));
                 return Ok(());
             }
         };
@@ -819,7 +819,7 @@ impl Disk {
             }
         }
 
-        let next_lo = landed.logical.number() + appending.holds.logical.number();
+        let next_lo = landed.logical.plus(appending.holds.logical)?;
         if let Some((next_app, next_reply)) = self.pending_fixed.lock().expect("queue").remove(&(
             appending.sn,
             appending.extent,
@@ -1372,7 +1372,7 @@ mod tests {
         ));
         match disk.take(&testing::process(), &block(0, 1, b"two\n"), cap) {
             Ok(Took::Sealed { came_to, .. }) => {
-                assert_eq!(came_to.records, 1);
+                assert_eq!(came_to.records, ERoff::new(1));
             }
             other => panic!("should have sealed, not {:?}", other),
         }

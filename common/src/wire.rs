@@ -1329,7 +1329,13 @@ mod tests {
 
     #[test]
     fn a_shape_is_one_self_contained_wire_argument() {
-        let shape = crate::info::Shape { streams: 3, given: 2, extents: 7, entries: 9, next: 11 };
+        let shape = crate::info::Shape {
+            streams: 3,
+            given: 2,
+            extents: 7,
+            entries: 9,
+            next: crate::offset::ORoff::new(11),
+        };
         let compact = Req { id: 7, op: Op::BatchInfo, args: shape.args() };
         assert_eq!(compact.args.len(), 1, "the shape is one self-contained value");
         assert_eq!(round_trip_request(&compact).args, compact.args);

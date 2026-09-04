@@ -16,6 +16,7 @@ use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
 use common::ids::{ObjectId, RangeId};
 use common::info::{Batch, Described, Expecting, ExtentRow, ObjectName, Shape, StreamRow, UNKNOWN};
+use common::offset::{ERoff, ORoff, SRoff};
 use common::placement::{self, Expansion};
 
 use common::random::Rng;
@@ -1398,7 +1399,7 @@ fn say(
     for (row, extents) in streams {
         // UNKNOWN is "nobody asked" or "not knowable here", never a count of zero.
         let records = match row.records {
-            UNKNOWN => "still growing".to_string(),
+            SRoff::NONE => "still growing".to_string(),
             n => format!("{n} records"),
         };
         let of = match row.totals.extents {
@@ -1409,7 +1410,7 @@ fn say(
         // still growing, because then they are a point in time rather than a total
         // (§17.25.1) — a listing that cannot tell the difference is a listing that quietly
         // under-reports every object still being written.
-        let asof = if row.records == UNKNOWN { " so far" } else { "" };
+        let asof = if row.records == SRoff::NONE { " so far" } else { "" };
         let sizes = match (row.totals.logical, row.totals.compressed) {
             (UNKNOWN, _) | (_, UNKNOWN) => String::new(),
             (logical, compressed) => format!(
@@ -1423,7 +1424,7 @@ fn say(
         );
         for extent in extents {
             let held = match extent.records {
-                UNKNOWN => "still growing".to_string(),
+                ERoff::NONE => "still growing".to_string(),
                 n => format!("{n} records, {} stored", extent.length),
             };
             // The whole name, since that is what a hint is built from (§8.1.1a-10).
@@ -1446,7 +1447,7 @@ fn say(
     let s = if shape.given == 1 { "" } else { "s" };
     let e = if shape.entries == 1 { "y" } else { "ies" };
     match shape.next {
-        UNKNOWN => println!(
+        ORoff::NONE => println!(
             "{} {} stream{s}{of} described, {} entr{e}, nothing more",
             target.identity, shape.given, shape.entries
         ),

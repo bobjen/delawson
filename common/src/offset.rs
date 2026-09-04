@@ -149,6 +149,21 @@ space!(ORoff, u64, "records", "an object");
 space!(SRoff, u64, "records", "a stream");
 space!(ERoff, u32, "records", "an extent");
 
+/// Explicitly move a record position between its nesting levels. These are not wire
+/// conversions: naming the source and destination keeps a record in one space from
+/// being silently used in another.
+impl SRoff {
+    pub const fn from_extent(value: ERoff) -> SRoff {
+        SRoff::new(value.get() as u64)
+    }
+}
+
+impl ORoff {
+    pub const fn from_stream(value: SRoff) -> ORoff {
+        ORoff::new(value.get())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
