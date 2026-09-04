@@ -35,8 +35,8 @@ const SHARDS: usize = 64;
 
 fn stream_name(payload: &mut StructReader<'_>) -> common::Result<StreamName> {
     Ok(StreamName {
-        range: RangeId::of_number(payload.number_u32()? as u64)?,
-        stream: StreamId::of_number(payload.number_u32()? as u64)?,
+        range: RangeId::new(payload.number_u32()?),
+        stream: StreamId::new(payload.number_u32()?),
         created: TimeSec::new(payload.number_u64()?),
     })
 }
@@ -372,16 +372,14 @@ impl SN {
                 "a create-stream request has trailing arguments",
             );
         }
-        let range =
-            match payload.number_u32().map(|value| value as u64).and_then(RangeId::of_number) {
-                Ok(value) => value,
-                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-            };
-        let first =
-            match payload.number_u32().map(|value| value as u64).and_then(StreamId::of_number) {
-                Ok(value) => value,
-                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-            };
+        let range = match payload.number_u32() {
+            Ok(value) => RangeId::new(value),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        let first = match payload.number_u32() {
+            Ok(value) => StreamId::new(value),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
         let count = match payload.number_u64() {
             Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),

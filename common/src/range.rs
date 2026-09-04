@@ -17,7 +17,7 @@
 
 use crate::ids::{ObjectId, RangeId};
 use crate::info::{Expecting, ObjectName};
-use crate::offset::{ECoff, ELoff, ERoff, ORoff};
+use crate::offset::{ECoff, ELoff, ERoff, OCoff, OLoff, ORoff};
 use crate::placement::Expansion;
 use crate::wire::Arg;
 use crate::wire::{Op, StructReader, StructWriter, structure};
@@ -117,11 +117,11 @@ impl Budget {
 
     /// Whether what has been gathered so far has met it. Asked **after** a block is
     /// taken, never before, which is what makes the first block unconditional.
-    pub fn met(self, so_far: &Covered) -> bool {
+    pub fn met(self, so_far: &ExtentCovered) -> bool {
         match self {
-            Budget::Records(n) => so_far.records >= n,
-            Budget::Logical(n) => so_far.logical >= n,
-            Budget::Compressed(n) => so_far.compressed >= n,
+            Budget::Records(n) => so_far.records.number() >= n,
+            Budget::Logical(n) => so_far.logical.number() >= n,
+            Budget::Compressed(n) => so_far.compressed.number() >= n,
         }
     }
 }
@@ -252,18 +252,18 @@ pub struct Filled {
 impl Filled {
     pub fn args(&self) -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        payload.number_u64(self.records.number());
-        payload.number_u64(self.logical.number());
-        payload.number_u64(self.compressed.number());
+        payload.eroff(self.records);
+        payload.eloff(self.logical);
+        payload.ecoff(self.compressed);
         vec![payload.finish(Op::FilledResp)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Filled, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::FilledResp, "a seal report")?;
         let filled = Filled {
-            records: ERoff::of_number(payload.number_u64()?)?,
-            logical: ELoff::of_number(payload.number_u64()?)?,
-            compressed: ECoff::of_number(payload.number_u64()?)?,
+            records: payload.eroff()?,
+            logical: payload.eloff()?,
+            compressed: payload.ecoff()?,
         };
         payload.done()?;
         Ok((filled, rest))
@@ -296,14 +296,14 @@ impl Filled {
 /// What an answer actually covered — **all three measures, whichever one was asked
 /// for** (§9.1.3.6) — and where to carry on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Covered {
-    pub records: u64,
-    pub logical: u64,
-    pub compressed: u64,
+pub struct ExtentCovered {
+    pub records: ERoff,
+    pub logical: ELoff,
+    pub compressed: ECoff,
     /// The record to ask for next, and the reason the whole scheme works: the
     /// continuation is a **record number the system computed**, never an offset the
     /// caller has to derive from where the bytes stopped (§9.1.3).
-    pub next: u64,
+    pub next: ERoff,
     /// **Whether there is more where this came from**, which is deliberately about
     /// the tier that answered rather than about the object.
     ///
@@ -314,32 +314,67 @@ pub struct Covered {
     pub more: bool,
 }
 
-impl Covered {
+impl ExtentCovered {
     /// Count a block in. Records are the writer's count, so this is arithmetic on
     /// numbers that arrived rather than anything read out of the bytes.
-    pub fn took(&mut self, records: u64, logical: ELoff, compressed: ECoff) {
-        self.records += records;
-        self.logical += logical.number();
-        self.compressed += compressed.number();
+    pub fn took(&mut self, records: ERoff, logical: ELoff, compressed: ECoff) {
+        self.records = self.records.plus(records).expect("extent record count fits");
+        self.logical = self.logical.plus(logical).expect("extent logical bytes fit");
+        self.compressed = self.compressed.plus(compressed).expect("extent bytes fit");
     }
 
     pub fn args(&self) -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        payload.number_u64(self.records);
-        payload.number_u64(self.logical);
-        payload.number_u64(self.compressed);
-        payload.number_u64(self.next);
+        payload.eroff(self.records);
+        payload.eloff(self.logical);
+        payload.ecoff(self.compressed);
+        payload.eroff(self.next);
         payload.flag(self.more);
-        vec![payload.finish(Op::CoveredResp)]
+        vec![payload.finish(Op::ExtentCoveredResp)]
     }
 
-    pub fn of_args(args: &[Arg]) -> Result<(Covered, &[Arg])> {
-        let (mut payload, rest) = structure(args, Op::CoveredResp, "an answer coverage")?;
-        let covered = Covered {
-            records: payload.number_u64()?,
-            logical: payload.number_u64()?,
-            compressed: payload.number_u64()?,
-            next: payload.number_u64()?,
+    pub fn of_args(args: &[Arg]) -> Result<(ExtentCovered, &[Arg])> {
+        let (mut payload, rest) = structure(args, Op::ExtentCoveredResp, "extent answer coverage")?;
+        let covered = ExtentCovered {
+            records: payload.eroff()?,
+            logical: payload.eloff()?,
+            compressed: payload.ecoff()?,
+            next: payload.eroff()?,
+            more: payload.flag()?,
+        };
+        payload.done()?;
+        Ok((covered, rest))
+    }
+}
+
+/// What FE reports after translating one or more extent responses into object coordinates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObjectCovered {
+    pub records: ORoff,
+    pub logical: OLoff,
+    pub compressed: OCoff,
+    pub next: ORoff,
+    pub more: bool,
+}
+
+impl ObjectCovered {
+    pub fn args(&self) -> Vec<Arg> {
+        let mut payload = StructWriter::new();
+        payload.oroff(self.records);
+        payload.oloff(self.logical);
+        payload.ocoff(self.compressed);
+        payload.oroff(self.next);
+        payload.flag(self.more);
+        vec![payload.finish(Op::ObjectCoveredResp)]
+    }
+
+    pub fn of_args(args: &[Arg]) -> Result<(ObjectCovered, &[Arg])> {
+        let (mut payload, rest) = structure(args, Op::ObjectCoveredResp, "object answer coverage")?;
+        let covered = ObjectCovered {
+            records: payload.oroff()?,
+            logical: payload.oloff()?,
+            compressed: payload.ocoff()?,
+            next: payload.oroff()?,
             more: payload.flag()?,
         };
         payload.done()?;
@@ -577,15 +612,15 @@ impl Want {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Piece {
     /// Bytes before compression, which is what to decompress to.
-    pub logical: u64,
+    pub logical: ELoff,
     /// The number of the first record this block **completed**, in whatever numbering
     /// the tier that answered counts in — an EN's is extent-local, and the FE is what
     /// converts it (§17.16.2).
-    pub first_record: u64,
+    pub first_record: ERoff,
     /// Records it completed. **Zero is ordinary**: a block wholly inside one record
     /// completes nothing (§8.2.4), and it is still part of the answer because its
     /// bytes are part of that record.
-    pub records: u64,
+    pub records: ERoff,
     pub crc: u64,
     pub bytes: Vec<u8>,
 }
@@ -593,9 +628,9 @@ pub struct Piece {
 impl Piece {
     pub fn args(&self) -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        payload.number_u64(self.logical);
-        payload.number_u64(self.first_record);
-        payload.number_u64(self.records);
+        payload.eloff(self.logical);
+        payload.eroff(self.first_record);
+        payload.eroff(self.records);
         payload.number_u64(self.crc);
         payload.bytes(&self.bytes);
         vec![payload.finish(Op::PieceResp)]
@@ -604,9 +639,9 @@ impl Piece {
     pub fn of_args(args: &[Arg]) -> Result<(Piece, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::PieceResp, "a piece")?;
         let piece = Piece {
-            logical: payload.number_u64()?,
-            first_record: payload.number_u64()?,
-            records: payload.number_u64()?,
+            logical: payload.eloff()?,
+            first_record: payload.eroff()?,
+            records: payload.eroff()?,
             crc: payload.number_u64()?,
             bytes: payload.bytes()?,
         };
@@ -682,7 +717,13 @@ mod tests {
     /// arithmetic that decides when to stop, so it is worth a test of its own.
     #[test]
     fn a_budget_is_met_only_in_its_own_space() {
-        let so_far = Covered { records: 5, logical: 500, compressed: 50, next: 5, more: true };
+        let so_far = ExtentCovered {
+            records: ERoff::new(5),
+            logical: ELoff::new(500),
+            compressed: ECoff::new(50),
+            next: ERoff::new(5),
+            more: true,
+        };
         assert!(Budget::Records(5).met(&so_far));
         assert!(!Budget::Records(6).met(&so_far));
         assert!(Budget::Logical(500).met(&so_far));
@@ -704,9 +745,15 @@ mod tests {
 
     #[test]
     fn what_an_answer_covered_survives_the_wire() {
-        let covered = Covered { records: 3, logical: 300, compressed: 42, next: 10, more: true };
+        let covered = ExtentCovered {
+            records: ERoff::new(3),
+            logical: ELoff::new(300),
+            compressed: ECoff::new(42),
+            next: ERoff::new(10),
+            more: true,
+        };
         let args = covered.args();
-        let (back, rest) = Covered::of_args(&args).expect("an answer");
+        let (back, rest) = ExtentCovered::of_args(&args).expect("an answer");
         assert_eq!(back, covered);
         assert!(rest.is_empty());
     }
@@ -790,14 +837,23 @@ mod tests {
     /// caller named one and is told all of them.
     #[test]
     fn a_block_is_counted_in_all_three_spaces() {
-        let mut covered = Covered::default();
-        covered.took(2, ELoff::new(200), ECoff::new(30));
-        covered.took(1, ELoff::new(100), ECoff::new(20));
-        assert_eq!((covered.records, covered.logical, covered.compressed), (3, 300, 50));
+        let mut covered = ExtentCovered::default();
+        covered.took(ERoff::new(2), ELoff::new(200), ECoff::new(30));
+        covered.took(ERoff::new(1), ELoff::new(100), ECoff::new(20));
+        assert_eq!(
+            (covered.records, covered.logical, covered.compressed),
+            (ERoff::new(3), ELoff::new(300), ECoff::new(50))
+        );
     }
 
     fn piece(first_record: u64, records: u64, bytes: &[u8]) -> Piece {
-        Piece { logical: bytes.len() as u64, first_record, records, crc: 7, bytes: bytes.to_vec() }
+        Piece {
+            logical: ELoff::of_len(bytes.len()).unwrap(),
+            first_record: ERoff::new(first_record as u32),
+            records: ERoff::new(records as u32),
+            crc: 7,
+            bytes: bytes.to_vec(),
+        }
     }
 
     /// A run of blocks reads back as the same run, which is the whole reason the

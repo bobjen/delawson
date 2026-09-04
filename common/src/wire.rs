@@ -27,7 +27,7 @@
 
 use crate::config::Messaging;
 use crate::ids::{DiskId, EnId, ExtentId, SnId, StreamId};
-use crate::offset::{ELoff, ERoff, ORoff, SRoff};
+use crate::offset::{ECoff, ELoff, ERoff, OCoff, OLoff, ORoff, SCoff, SLoff, SRoff};
 use crate::random::Rng;
 use crate::seal::{self, Seal};
 use crate::time::TimeSec;
@@ -204,6 +204,8 @@ ops! {
     NumberResp = 64, "number-response";
     FlagResp = 65, "flag-response";
     SnKeyResp = 66, "sn-key-response";
+    ExtentCoveredResp = 67, "extent-covered-response";
+    ObjectCoveredResp = 68, "object-covered-response";
 }
 
 impl std::fmt::Display for Op {
@@ -307,6 +309,42 @@ impl StructWriter {
         self.bytes.extend(value.to_le_bytes());
     }
 
+    pub fn eroff(&mut self, value: ERoff) {
+        self.number_u32(value.get());
+    }
+
+    pub fn eloff(&mut self, value: ELoff) {
+        self.number_u32(value.get());
+    }
+
+    pub fn ecoff(&mut self, value: ECoff) {
+        self.number_u32(value.get());
+    }
+
+    pub fn oroff(&mut self, value: ORoff) {
+        self.number_u64(value.get());
+    }
+
+    pub fn sroff(&mut self, value: SRoff) {
+        self.number_u64(value.get());
+    }
+
+    pub fn oloff(&mut self, value: OLoff) {
+        self.number_u64(value.get());
+    }
+
+    pub fn sloff(&mut self, value: SLoff) {
+        self.number_u64(value.get());
+    }
+
+    pub fn ocoff(&mut self, value: OCoff) {
+        self.number_u64(value.get());
+    }
+
+    pub fn scoff(&mut self, value: SCoff) {
+        self.number_u64(value.get());
+    }
+
     pub fn flag(&mut self, value: bool) {
         self.bytes.push(value as u8);
     }
@@ -377,6 +415,42 @@ impl<'a> StructReader<'a> {
 
     pub fn number_u32(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    pub fn eroff(&mut self) -> Result<ERoff> {
+        Ok(ERoff::new(self.number_u32()?))
+    }
+
+    pub fn eloff(&mut self) -> Result<ELoff> {
+        Ok(ELoff::new(self.number_u32()?))
+    }
+
+    pub fn ecoff(&mut self) -> Result<ECoff> {
+        Ok(ECoff::new(self.number_u32()?))
+    }
+
+    pub fn oroff(&mut self) -> Result<ORoff> {
+        Ok(ORoff::new(self.number_u64()?))
+    }
+
+    pub fn sroff(&mut self) -> Result<SRoff> {
+        Ok(SRoff::new(self.number_u64()?))
+    }
+
+    pub fn oloff(&mut self) -> Result<OLoff> {
+        Ok(OLoff::new(self.number_u64()?))
+    }
+
+    pub fn sloff(&mut self) -> Result<SLoff> {
+        Ok(SLoff::new(self.number_u64()?))
+    }
+
+    pub fn ocoff(&mut self) -> Result<OCoff> {
+        Ok(OCoff::new(self.number_u64()?))
+    }
+
+    pub fn scoff(&mut self) -> Result<SCoff> {
+        Ok(SCoff::new(self.number_u64()?))
     }
 
     /// Allocate a collection whose count came from this structure.

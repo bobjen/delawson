@@ -26,8 +26,10 @@ use common::framing::Framing;
 use common::ids::{DiskId, DnId, EnId, ExtentId, SnId};
 use common::info::{Batch, Described, Expecting, Shape, StreamName, UNKNOWN, Wanted};
 use common::logw;
-use common::offset::{ERoff, ORoff, SRoff};
-use common::range::{Budget, Covered, Detail, Filled, Piece, Range, Start, Want};
+use common::offset::{ELoff, ERoff, OCoff, OLoff, ORoff, SRoff};
+use common::range::{
+    Budget, Detail, ExtentCovered, Filled, ObjectCovered, Piece, Range, Start, Want,
+};
 use common::routing;
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
@@ -1075,17 +1077,30 @@ fn in_the_callers_numbering(answer: Resp, base: ORoff, sealed: bool) -> Resp {
     if answer.status != Status::Ok {
         return answer;
     }
-    let Ok((mut covered, rest)) = Covered::of_args(&answer.args) else {
+    let Ok((extent, rest)) = ExtentCovered::of_args(&answer.args) else {
         return Resp::error(Status::Internal, "that answer did not say what it covered");
     };
     let Ok(pieces) = Piece::all_of_args(rest) else {
         return Resp::error(Status::Internal, "that answer's blocks are not blocks");
     };
-    covered.next += base.number();
-    covered.more = covered.more || sealed;
+    let mut covered = ObjectCovered {
+        records: ORoff::from_stream(SRoff::from_extent(extent.records)),
+        logical: OLoff::from_extent(extent.logical),
+        compressed: OCoff::from_extent(extent.compressed),
+        next: ORoff::NONE,
+        more: extent.more || sealed,
+    };
+    if extent.next != ERoff::NONE {
+        covered.next = ORoff::from_stream(SRoff::from_extent(extent.next))
+            .plus(base)
+            .expect("object record position fits");
+    }
     let mut args = covered.args();
     for piece in pieces {
-        args.extend(Piece { first_record: piece.first_record + base.number(), ..piece }.args());
+        let first_record = ORoff::from_stream(SRoff::from_extent(piece.first_record))
+            .plus(base)
+            .expect("object record position fits");
+        args.extend(Piece { first_record: ERoff::new(first_record.get() as u32), ..piece }.args());
     }
     Resp { id: 0, status: Status::Ok, args }
 }
@@ -2023,17 +2038,23 @@ mod tests {
         // what it covered, index 1 became a byte count — so the test would have gone
         // on passing while the code corrupted a measure and reported record numbers
         // unconverted. Reading the shape is what makes the test about the meaning.
-        let covered = Covered { records: 3, logical: 9, compressed: 9, next: 3, more: false };
-        let piece = |first_record| Piece {
-            logical: 3,
+        let covered = ExtentCovered {
+            records: ERoff::new(3),
+            logical: ELoff::new(9),
+            compressed: common::offset::ECoff::new(9),
+            next: ERoff::new(3),
+            more: false,
+        };
+        let piece = |first_record: ERoff| Piece {
+            logical: ELoff::new(3),
             first_record,
-            records: 1,
+            records: ERoff::new(1),
             crc: 0,
             bytes: b"a\n".to_vec(),
         };
         let mut args = covered.args();
         for first_record in [0, 1, 2] {
-            args.extend(piece(first_record).args());
+            args.extend(piece(ERoff::new(first_record)).args());
         }
         let told = in_the_callers_numbering(
             Resp { id: 0, status: Status::Ok, args },
@@ -2041,14 +2062,18 @@ mod tests {
             true,
         );
 
-        let (back, rest) = Covered::of_args(&told.args).expect("what it covered");
-        assert_eq!(back.next, 743, "the continuation, made the caller's");
-        assert_eq!((back.records, back.logical, back.compressed), (3, 9, 9), "measures untouched");
+        let (back, rest) = ObjectCovered::of_args(&told.args).expect("what it covered");
+        assert_eq!(back.next, ORoff::new(743), "the continuation, made the caller's");
+        assert_eq!(
+            (back.records, back.logical, back.compressed),
+            (ORoff::new(3), OLoff::new(9), OCoff::new(9)),
+            "measures untouched"
+        );
         assert!(back.more, "and a sealed extent has something after it");
         let pieces = Piece::all_of_args(rest).expect("blocks");
-        let numbers: Vec<u64> = pieces.iter().map(|piece| piece.first_record).collect();
+        let numbers: Vec<u64> = pieces.iter().map(|piece| piece.first_record.number()).collect();
         assert_eq!(numbers, [740, 741, 742], "every block, not just the first");
-        assert!(pieces.iter().all(|piece| piece.logical == 3), "and not their sizes");
+        assert!(pieces.iter().all(|piece| piece.logical == ELoff::new(3)), "and not their sizes");
     }
 
     /// A read of the extent still open is the object's tail, so what the EN says
@@ -2056,13 +2081,22 @@ mod tests {
     /// it, which only the FE knows.
     #[test]
     fn only_the_fe_can_say_whether_the_object_has_more() {
-        let covered = Covered { records: 1, logical: 2, compressed: 2, next: 1, more: false };
+        let covered = ExtentCovered {
+            records: ERoff::new(1),
+            logical: ELoff::new(2),
+            compressed: common::offset::ECoff::new(2),
+            next: ERoff::new(1),
+            more: false,
+        };
         let answer = || Resp { id: 0, status: Status::Ok, args: covered.args() };
 
         let tail = in_the_callers_numbering(answer(), ORoff::new(0), false);
-        assert!(!Covered::of_args(&tail.args).unwrap().0.more, "the open extent ends the object");
+        assert!(
+            !ObjectCovered::of_args(&tail.args).unwrap().0.more,
+            "the open extent ends the object"
+        );
         let sealed = in_the_callers_numbering(answer(), ORoff::new(0), true);
-        assert!(Covered::of_args(&sealed.args).unwrap().0.more, "a sealed one does not");
+        assert!(ObjectCovered::of_args(&sealed.args).unwrap().0.more, "a sealed one does not");
     }
 
     /// A refusal is passed through untouched: there are no record numbers in it to

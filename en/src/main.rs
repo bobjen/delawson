@@ -26,7 +26,7 @@ use common::crypto;
 use common::framing::Framing;
 use common::ids::{DiskId, EnId, ExtentId, SnId};
 use common::offset::{ECoff, ELoff, ERoff};
-use common::range::{Budget, Covered, Filled, Piece, Range};
+use common::range::{Budget, ExtentCovered, Filled, Piece, Range};
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::wire::{
@@ -284,7 +284,7 @@ impl Append {
 /// The blocks a range read is answered with, and what they came to.
 struct Ranged {
     pieces: Vec<Piece>,
-    covered: Covered,
+    covered: ExtentCovered,
 }
 
 /// What became of an append.
@@ -592,16 +592,16 @@ impl Extents {
             return Ok(None);
         };
 
-        let mut covered = Covered::default();
+        let mut covered = ExtentCovered::default();
         let mut pieces: Vec<Piece> = Vec::new();
         for block in &blocks[first..] {
             let (crc, _framing, plain_bytes) =
                 block.decrypt(daily_cache, extent_cache, process, extent)?;
-            covered.took(block.holds.records.number(), block.holds.logical, block.holds.compressed);
+            covered.took(block.holds.records, block.holds.logical, block.holds.compressed);
             pieces.push(Piece {
-                logical: block.holds.logical.number(),
-                first_record: block.first_record.number(),
-                records: block.holds.records.number(),
+                logical: block.holds.logical,
+                first_record: block.first_record,
+                records: block.holds.records,
                 crc,
                 bytes: plain_bytes,
             });
@@ -612,7 +612,8 @@ impl Extents {
         }
 
         let last_piece = pieces.last().unwrap();
-        covered.next = last_piece.first_record + last_piece.records;
+        covered.next =
+            last_piece.first_record.plus(last_piece.records).expect("extent record position fits");
         covered.more = first + pieces.len() < blocks.len();
         Ok(Some(Ranged { pieces, covered }))
     }

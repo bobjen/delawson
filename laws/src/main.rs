@@ -16,11 +16,11 @@ use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
 use common::ids::{ExtentId, ObjectId, RangeId};
 use common::info::{Batch, Described, Expecting, ExtentRow, ObjectName, Shape, StreamRow, UNKNOWN};
-use common::offset::{ERoff, ORoff, SCoff, SLoff, SRoff};
+use common::offset::{ELoff, ERoff, ORoff, SCoff, SLoff, SRoff};
 use common::placement::{self, Expansion};
 
 use common::random::Rng;
-use common::range::{Budget, Covered, Detail, Piece, Range, Start, Want};
+use common::range::{Budget, Detail, ObjectCovered, Piece, Range, Start, Want};
 use common::time::TimeSec;
 use common::wire::{Arg, Op, Receipt, Req, Resp, Status, structure};
 use common::{Error, Result};
@@ -1479,10 +1479,10 @@ fn records_of(framing: Framing, pieces: &[Piece]) -> Result<Vec<(u64, Vec<u8>)>>
     // the next rather than parsed on its own. A block that completed no record
     // contributes only carry.
     let mut carry: Vec<u8> = Vec::new();
-    let mut numbering = pieces.first().map_or(0, |piece| piece.first_record);
+    let mut numbering = pieces.first().map_or(0, |piece| piece.first_record.number());
     for piece in pieces {
-        let body_len = piece.logical - piece.records * 4;
-        let expected = body_len + piece.records * framing.overhead() as u64;
+        let body_len = piece.logical.get() - piece.records.get() * 4;
+        let expected = body_len + piece.records.get() * framing.overhead() as u32;
         let block = expand(Compress::Lz4, &piece.bytes, expected as usize)?;
         if piece.crc != common::crc::of(&block) {
             return Err(Error::new(format!(
@@ -1506,7 +1506,7 @@ fn records_of(framing: Framing, pieces: &[Piece]) -> Result<Vec<(u64, Vec<u8>)>>
 
 /// One record out of a range answer, which is what a point read asks for.
 fn record(target: &Target, framing: Framing, want: u64, response: &Resp) -> Result<()> {
-    let Ok((_covered, rest)) = Covered::of_args(&response.args) else {
+    let Ok((_covered, rest)) = ObjectCovered::of_args(&response.args) else {
         return report(target, response);
     };
     let pieces = Piece::all_of_args(rest)?;
@@ -1544,7 +1544,7 @@ fn scan(
     rounds: usize,
 ) -> Result<()> {
     let mut at = from;
-    let mut total = Covered::default();
+    let mut total = ObjectCovered::default();
     let mut asked = 0;
     let mut printed = 0u64;
     for _ in 0..rounds {
@@ -1567,17 +1567,17 @@ fn scan(
             return report(target, &answer);
         }
         let (covered, shown) = ranged(target, framing, &answer, before)?;
-        total.records += covered.records;
-        total.logical += covered.logical;
-        total.compressed += covered.compressed;
+        total.records = total.records.plus(covered.records)?;
+        total.logical = total.logical.plus(covered.logical)?;
+        total.compressed = total.compressed.plus(covered.compressed)?;
         printed += shown;
         // ⚠️ No progress means stop, whatever the answer said. A continuation that
         // does not advance would otherwise be an unbounded loop, and this is the one
         // place a client can defend itself against one.
-        if covered.next <= at || !covered.more {
+        if covered.next.get() <= at || !covered.more {
             break;
         }
-        at = covered.next;
+        at = covered.next.get();
     }
     // The stored figure is the one that costs, since §12.3 bills compressed bytes —
     // so it is reported whatever the budget was named in. **The record count is very
@@ -1589,7 +1589,7 @@ fn scan(
     // `shown` differs from `records` only when `--before` trimmed the display, which
     // is a convenience rather than a saving: the blocks came back either way.
     let trimmed =
-        if printed == total.records { String::new() } else { format!(", {printed} shown") };
+        if printed == total.records.get() { String::new() } else { format!(", {printed} shown") };
     println!(
         "{} {} records{trimmed}, {} logical bytes, {} stored, in {asked} requests",
         target.identity, total.records, total.logical, total.compressed
@@ -1603,8 +1603,8 @@ fn ranged(
     framing: Framing,
     response: &Resp,
     before: Option<u64>,
-) -> Result<(Covered, u64)> {
-    let Ok((covered, rest)) = Covered::of_args(&response.args) else {
+) -> Result<(ObjectCovered, u64)> {
+    let Ok((covered, rest)) = ObjectCovered::of_args(&response.args) else {
         report(target, response)?;
         return Err(Error::new("that answer did not say what it covered"));
     };
@@ -2096,16 +2096,16 @@ mod tests {
         let block1 = frame(framing, body1).unwrap();
         let block2 = frame(framing, body2).unwrap();
         let piece1 = Piece {
-            logical: framing.canonical_size(0, &block1).unwrap(),
-            first_record: 0,
-            records: 1,
+            logical: ELoff::new(framing.canonical_size(0, &block1).unwrap() as u32),
+            first_record: ERoff::ZERO,
+            records: ERoff::new(1),
             crc: common::crc::of(&block1),
             bytes: block1.clone(),
         };
         let piece2 = Piece {
-            logical: framing.canonical_size(0, &block2).unwrap(),
-            first_record: 1,
-            records: 1,
+            logical: ELoff::new(framing.canonical_size(0, &block2).unwrap() as u32),
+            first_record: ERoff::new(1),
+            records: ERoff::new(1),
             crc: common::crc::of(&block2),
             bytes: block2.clone(),
         };
