@@ -76,18 +76,18 @@ impl Described {
     pub fn args(&self) -> Vec<Arg> {
         let (kind, width) = self.framing.wire();
         let mut payload = StructWriter::new();
-        payload.number_u32(self.object.range.get());
-        payload.number_u32(self.object.object.get());
-        payload.number_u64(self.object.created.number());
-        payload.number_u32(self.dn.get());
-        payload.number_u32(self.stream.range.get());
-        payload.number_u32(self.stream.stream.get());
-        payload.number_u64(self.stream.created.number());
-        payload.number_u32(self.sn.get());
+        payload.range_id(self.object.range);
+        payload.object_id(self.object.object);
+        payload.time_sec(self.object.created);
+        payload.dn_id(self.dn);
+        payload.range_id(self.stream.range);
+        payload.stream_id(self.stream.stream);
+        payload.time_sec(self.stream.created);
+        payload.sn_id(self.sn);
         payload.flag(self.keyed);
         payload.number_u8(kind);
         payload.number_u32(width);
-        payload.number_u64(self.first_record.number());
+        payload.oroff(self.first_record);
         vec![payload.finish(Op::DescribedResp)]
     }
 
@@ -97,21 +97,21 @@ impl Described {
         {
             let (mut payload, rest) = structure(args, Op::DescribedResp, "a described row")?;
             let object = ObjectName {
-                range: RangeId::new(payload.number_u32()?),
-                object: ObjectId::new(payload.number_u32()?),
-                created: TimeSec::new(payload.number_u64()?),
+                range: payload.range_id()?,
+                object: payload.object_id()?,
+                created: payload.time_sec()?,
             };
-            let dn = DnId::new(payload.number_u32()?);
+            let dn = payload.dn_id()?;
             let stream = StreamName {
-                range: RangeId::new(payload.number_u32()?),
-                stream: StreamId::new(payload.number_u32()?),
-                created: TimeSec::new(payload.number_u64()?),
+                range: payload.range_id()?,
+                stream: payload.stream_id()?,
+                created: payload.time_sec()?,
             };
-            let sn = SnId::new(payload.number_u32()?);
+            let sn = payload.sn_id()?;
             let keyed = payload.flag()?;
             let kind = payload.number_u8()?;
             let width = payload.number_u32()?;
-            let first_record = ORoff::of_number(payload.number_u64()?)?;
+            let first_record = payload.oroff()?;
             payload.done()?;
             if object.object.is_none() {
                 return Ok((None, rest));
@@ -323,18 +323,18 @@ impl Expecting {
 
     pub fn write(&self, payload: &mut StructWriter) {
         payload.nested(Op::Expecting, |payload| {
-            payload.number_u32(self.0.range.get());
-            payload.number_u32(self.0.object.get());
-            payload.number_u64(self.0.created.number());
+            payload.range_id(self.0.range);
+            payload.object_id(self.0.object);
+            payload.time_sec(self.0.created);
         });
     }
 
     pub fn read(payload: &mut StructReader<'_>) -> Result<Expecting> {
         payload.nested(Op::Expecting, "an expectation", |payload| {
             Ok(Expecting(ObjectName {
-                range: RangeId::new(payload.number_u32()?),
-                object: ObjectId::new(payload.number_u32()?),
-                created: TimeSec::new(payload.number_u64()?),
+                range: payload.range_id()?,
+                object: payload.object_id()?,
+                created: payload.time_sec()?,
             }))
         })
     }
@@ -469,14 +469,14 @@ impl StreamRow {
 
     pub fn args(&self) -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        payload.number_u32(self.stream.get());
-        payload.number_u32(self.sn.get());
-        payload.number_u64(self.first_record.number());
-        payload.number_u64(self.records.number());
-        payload.number_u64(self.created.number());
-        payload.number_u64(self.totals.extents.number());
-        payload.number_u64(self.totals.logical.number());
-        payload.number_u64(self.totals.compressed.number());
+        payload.stream_id(self.stream);
+        payload.sn_id(self.sn);
+        payload.oroff(self.first_record);
+        payload.sroff(self.records);
+        payload.time_sec(self.created);
+        payload.extent_id(self.totals.extents);
+        payload.sloff(self.totals.logical);
+        payload.scoff(self.totals.compressed);
         payload.number_u64(self.given);
         vec![payload.finish(Op::StreamRowResp)]
     }
@@ -484,15 +484,15 @@ impl StreamRow {
     pub fn of_args(args: &[Arg]) -> Result<(StreamRow, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::StreamRowResp, "a stream row")?;
         let row = StreamRow {
-            stream: StreamId::new(payload.number_u32()?),
-            sn: SnId::new(payload.number_u32()?),
-            first_record: ORoff::of_number(payload.number_u64()?)?,
-            records: SRoff::of_number(payload.number_u64()?)?,
-            created: TimeSec::new(payload.number_u64()?),
+            stream: payload.stream_id()?,
+            sn: payload.sn_id()?,
+            first_record: payload.oroff()?,
+            records: payload.sroff()?,
+            created: payload.time_sec()?,
             totals: Totals {
-                extents: ExtentId::of_number(payload.number_u64()?)?,
-                logical: SLoff::of_number(payload.number_u64()?)?,
-                compressed: SCoff::of_number(payload.number_u64()?)?,
+                extents: payload.extent_id()?,
+                logical: payload.sloff()?,
+                compressed: payload.scoff()?,
             },
             given: payload.number_u64()?,
         };
@@ -555,34 +555,34 @@ impl ExtentRow {
 
     pub fn args(&self) -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        payload.number_u32(self.sn.get());
-        payload.number_u32(self.id.get());
-        payload.number_u64(self.created.number());
+        payload.sn_id(self.sn);
+        payload.extent_id(self.id);
+        payload.time_sec(self.created);
         payload.number_u64(self.first_record);
-        payload.number_u64(self.records.number());
-        payload.number_u64(self.logical.number());
-        payload.number_u64(self.length.number());
+        payload.eroff(self.records);
+        payload.eloff(self.logical);
+        payload.ecoff(self.length);
         payload.number_u32(self.disks.len() as u32);
         for (en, disk) in &self.disks {
-            payload.number_u32(en.get());
-            payload.number_u16(disk.get());
+            payload.en_id(*en);
+            payload.disk_id(*disk);
         }
         vec![payload.finish(Op::ExtentRowResp)]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(ExtentRow, &[Arg])> {
         let (mut payload, rest) = structure(args, Op::ExtentRowResp, "an extent row")?;
-        let sn = SnId::new(payload.number_u32()?);
-        let id = ExtentId::new(payload.number_u32()?);
-        let created = TimeSec::new(payload.number_u64()?);
+        let sn = payload.sn_id()?;
+        let id = payload.extent_id()?;
+        let created = payload.time_sec()?;
         let first_record = payload.number_u64()?;
-        let records = ERoff::of_number(payload.number_u64()?)?;
-        let logical = ELoff::of_number(payload.number_u64()?)?;
-        let length = ECoff::of_number(payload.number_u64()?)?;
+        let records = payload.eroff()?;
+        let logical = payload.eloff()?;
+        let length = payload.ecoff()?;
         let count = payload.number_u32()?;
         let mut disks = payload.checked_vec(count)?;
         for _ in 0..count {
-            disks.push((EnId::new(payload.number_u32()?), DiskId::new(payload.number_u16()?)));
+            disks.push((payload.en_id()?, payload.disk_id()?));
         }
         payload.done()?;
         Ok((ExtentRow { sn, id, created, first_record, records, logical, length, disks }, rest))
@@ -1056,7 +1056,7 @@ mod tests {
     fn an_extent_lying_about_its_instances_is_refused() {
         let mut args = extent(1, 0, 40).args();
         let Arg::Struct(_, payload, _) = &mut args[0] else { panic!("a self-contained extent") };
-        payload[48..52].copy_from_slice(&99u32.to_le_bytes());
+        payload[36..40].copy_from_slice(&99u32.to_le_bytes());
         assert!(ExtentRow::of_args(&args).is_err());
         assert!(ExtentRow::of_args(&args[..0]).is_err(), "and a short row too");
     }

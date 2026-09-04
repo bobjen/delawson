@@ -101,25 +101,25 @@ impl Open {
         if !rest.is_empty() {
             return None;
         }
-        let id = payload.number_u32().ok()? as u64;
+        let id = ExtentId::new(payload.number_u32().ok()?);
         let created = TimeSec::new(payload.number_u64().ok()?);
-        let first_record = payload.number_u64().ok()?;
-        let records = payload.number_u64().ok()?;
+        let first_record = payload.sroff().ok()?;
+        let records = payload.eroff().ok()?;
         let count = payload.number_u32().ok()?;
         let mut disks = payload.checked_vec(count).ok()?;
         for _ in 0..count {
             disks.push((
-                EnId::of_number(payload.number_u32().ok()? as u64).ok()?,
-                DiskId::of_number(payload.number_u16().ok()? as u64).ok()?,
+                EnId::new(payload.number_u32().ok()?),
+                DiskId::new(payload.number_u16().ok()?),
             ));
         }
         payload.done().ok()?;
         (!disks.is_empty()).then_some(Open {
             sn,
-            id: ExtentId::of_number(id).ok()?,
+            id,
             created,
-            first_record: SRoff::of_number(first_record).ok()?,
-            records: ERoff::of_number(records).ok()?,
+            first_record,
+            records,
             _framing: framing,
             disks,
         })
@@ -130,7 +130,11 @@ impl Open {
     fn holds(&self, record: SRoff) -> bool {
         self.records > ERoff::ZERO
             && record >= self.first_record
-            && record.number() < self.first_record.number() + self.records.number()
+            && record
+                < self
+                    .first_record
+                    .plus(SRoff::from_extent(self.records))
+                    .expect("extent record range fits")
     }
 }
 
@@ -2115,8 +2119,8 @@ mod tests {
         let mut payload = StructWriter::new();
         payload.number_u32(7);
         payload.number_u64(1_000_000);
-        payload.number_u64(40);
-        payload.number_u64(90);
+        payload.sroff(SRoff::new(40));
+        payload.eroff(ERoff::new(90));
         payload.number_u32(4);
         for (en, disk) in [(2, 0), (3, 0), (0, 0), (1, 0)] {
             payload.number_u32(en);

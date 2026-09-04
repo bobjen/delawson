@@ -26,7 +26,7 @@
 //! the messages are just length-prefixed.
 
 use crate::config::Messaging;
-use crate::ids::{DiskId, EnId, ExtentId, SnId, StreamId};
+use crate::ids::{DiskId, DnId, EnId, ExtentId, ObjectId, RangeId, SnId, StreamId};
 use crate::offset::{ECoff, ELoff, ERoff, OCoff, OLoff, ORoff, SCoff, SLoff, SRoff};
 use crate::random::Rng;
 use crate::seal::{self, Seal};
@@ -309,6 +309,42 @@ impl StructWriter {
         self.bytes.extend(value.to_le_bytes());
     }
 
+    pub fn dn_id(&mut self, value: DnId) {
+        self.number_u32(value.get());
+    }
+
+    pub fn sn_id(&mut self, value: SnId) {
+        self.number_u32(value.get());
+    }
+
+    pub fn en_id(&mut self, value: EnId) {
+        self.number_u32(value.get());
+    }
+
+    pub fn disk_id(&mut self, value: DiskId) {
+        self.number_u16(value.get());
+    }
+
+    pub fn range_id(&mut self, value: RangeId) {
+        self.number_u32(value.get());
+    }
+
+    pub fn object_id(&mut self, value: ObjectId) {
+        self.number_u32(value.get());
+    }
+
+    pub fn stream_id(&mut self, value: StreamId) {
+        self.number_u32(value.get());
+    }
+
+    pub fn extent_id(&mut self, value: ExtentId) {
+        self.number_u32(value.get());
+    }
+
+    pub fn time_sec(&mut self, value: TimeSec) {
+        self.number_u64(value.number());
+    }
+
     pub fn eroff(&mut self, value: ERoff) {
         self.number_u32(value.get());
     }
@@ -415,6 +451,42 @@ impl<'a> StructReader<'a> {
 
     pub fn number_u32(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    pub fn dn_id(&mut self) -> Result<DnId> {
+        Ok(DnId::new(self.number_u32()?))
+    }
+
+    pub fn sn_id(&mut self) -> Result<SnId> {
+        Ok(SnId::new(self.number_u32()?))
+    }
+
+    pub fn en_id(&mut self) -> Result<EnId> {
+        Ok(EnId::new(self.number_u32()?))
+    }
+
+    pub fn disk_id(&mut self) -> Result<DiskId> {
+        Ok(DiskId::new(self.number_u16()?))
+    }
+
+    pub fn range_id(&mut self) -> Result<RangeId> {
+        Ok(RangeId::new(self.number_u32()?))
+    }
+
+    pub fn object_id(&mut self) -> Result<ObjectId> {
+        Ok(ObjectId::new(self.number_u32()?))
+    }
+
+    pub fn stream_id(&mut self) -> Result<StreamId> {
+        Ok(StreamId::new(self.number_u32()?))
+    }
+
+    pub fn extent_id(&mut self) -> Result<ExtentId> {
+        Ok(ExtentId::new(self.number_u32()?))
+    }
+
+    pub fn time_sec(&mut self) -> Result<TimeSec> {
+        Ok(TimeSec::new(self.number_u64()?))
     }
 
     pub fn eroff(&mut self) -> Result<ERoff> {
