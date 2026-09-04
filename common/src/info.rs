@@ -13,7 +13,7 @@
 
 use crate::framing::Framing;
 use crate::ids::{DiskId, DnId, EnId, ExtentId, ObjectId, RangeId, SnId, StreamId};
-use crate::offset::{ECoff, ELoff, ERoff, ORoff, SRoff};
+use crate::offset::{ECoff, ELoff, ERoff, ORoff, SCoff, SLoff, SRoff};
 use crate::placement::Expansion;
 use crate::time::TimeSec;
 use crate::wire::Arg;
@@ -397,9 +397,9 @@ impl Wanted {
 /// stale byte count is only a slightly wrong listing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Totals {
-    pub extents: u64,
-    pub logical: u64,
-    pub compressed: u64,
+    pub extents: ExtentId,
+    pub logical: SLoff,
+    pub compressed: SCoff,
 }
 
 impl Totals {
@@ -407,11 +407,15 @@ impl Totals {
 
     /// Nothing known yet: a stream nobody has asked an SN about.
     pub fn unknown() -> Totals {
-        Totals { extents: UNKNOWN, logical: UNKNOWN, compressed: UNKNOWN }
+        Totals { extents: ExtentId::NONE, logical: SLoff::NONE, compressed: SCoff::NONE }
     }
 
     pub fn args(&self) -> Vec<Arg> {
-        vec![Arg::Number(self.extents), Arg::Number(self.logical), Arg::Number(self.compressed)]
+        vec![
+            Arg::Number(self.extents.number()),
+            Arg::Number(self.logical.number()),
+            Arg::Number(self.compressed.number()),
+        ]
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Totals, &[Arg])> {
@@ -419,15 +423,22 @@ impl Totals {
         else {
             return Err(Error::new("that answer's totals are not totals"));
         };
-        Ok((Totals { extents: *extents, logical: *logical, compressed: *compressed }, rest))
+        Ok((
+            Totals {
+                extents: ExtentId::of_number(*extents)?,
+                logical: SLoff::of_number(*logical)?,
+                compressed: SCoff::of_number(*compressed)?,
+            },
+            rest,
+        ))
     }
 
     /// Bytes the user is charged for. ⚠️ See `Filled::physical`: `expansion` is the storage
     /// class's ratio, never a count of the copies that happen to exist.
     pub fn physical(&self, expansion: Expansion) -> u64 {
         match self.compressed {
-            UNKNOWN => UNKNOWN,
-            compressed => expansion.bytes(compressed),
+            SCoff::NONE => UNKNOWN,
+            compressed => expansion.bytes(compressed.number()),
         }
     }
 }
@@ -463,9 +474,9 @@ impl StreamRow {
         payload.number_u64(self.first_record.number());
         payload.number_u64(self.records.number());
         payload.number_u64(self.created.number());
-        payload.number_u64(self.totals.extents);
-        payload.number_u64(self.totals.logical);
-        payload.number_u64(self.totals.compressed);
+        payload.number_u64(self.totals.extents.number());
+        payload.number_u64(self.totals.logical.number());
+        payload.number_u64(self.totals.compressed.number());
         payload.number_u64(self.given);
         vec![payload.finish(Op::StreamRowResp)]
     }
@@ -479,9 +490,9 @@ impl StreamRow {
             records: SRoff::of_number(payload.number_u64()?)?,
             created: TimeSec::new(payload.number_u64()?),
             totals: Totals {
-                extents: payload.number_u64()?,
-                logical: payload.number_u64()?,
-                compressed: payload.number_u64()?,
+                extents: ExtentId::of_number(payload.number_u64()?)?,
+                logical: SLoff::of_number(payload.number_u64()?)?,
+                compressed: SCoff::of_number(payload.number_u64()?)?,
             },
             given: payload.number_u64()?,
         };
@@ -765,21 +776,21 @@ pub struct ExtentRun {
     /// (§17.25.1). Includes the extent count, whether or not the rows are all here.
     pub totals: Totals,
     /// Rows that follow.
-    pub given: u64,
+    pub given: ExtentId,
     /// The **stream-local** record to ask from next, or `UNKNOWN` when nothing
     /// follows.
-    pub next: u64,
+    pub next: SRoff,
 }
 
 impl ExtentRun {
     pub fn args(&self) -> Vec<Arg> {
         let mut payload = StructWriter::new();
         payload.number_u32(self.stream.get());
-        payload.number_u64(self.totals.extents);
-        payload.number_u64(self.totals.logical);
-        payload.number_u64(self.totals.compressed);
-        payload.number_u64(self.given);
-        payload.number_u64(self.next);
+        payload.number_u64(self.totals.extents.number());
+        payload.number_u64(self.totals.logical.number());
+        payload.number_u64(self.totals.compressed.number());
+        payload.number_u64(self.given.number());
+        payload.number_u64(self.next.number());
         vec![payload.finish(Op::ExtentRunResp)]
     }
 
@@ -787,12 +798,12 @@ impl ExtentRun {
         let (mut payload, rest) = structure(args, Op::ExtentRunResp, "a run of extents")?;
         let stream = payload.number_u32()?;
         let totals = Totals {
-            extents: payload.number_u64()?,
-            logical: payload.number_u64()?,
-            compressed: payload.number_u64()?,
+            extents: ExtentId::of_number(payload.number_u64()?)?,
+            logical: SLoff::of_number(payload.number_u64()?)?,
+            compressed: SCoff::of_number(payload.number_u64()?)?,
         };
-        let given = payload.number_u64()?;
-        let next = payload.number_u64()?;
+        let given = ExtentId::of_number(payload.number_u64()?)?;
+        let next = SRoff::of_number(payload.number_u64()?)?;
         payload.done()?;
         Ok((ExtentRun { stream: StreamId::new(stream), totals, given, next }, rest))
     }
@@ -802,7 +813,7 @@ impl ExtentRun {
         let mut runs = Vec::new();
         while !args.is_empty() {
             let (run, rest) = ExtentRun::of_args(args)?;
-            let (rows, rest) = ExtentRow::some_of_args(rest, run.given)?;
+            let (rows, rest) = ExtentRow::some_of_args(rest, run.given.number())?;
             runs.push((run, rows));
             args = rest;
         }
@@ -981,8 +992,17 @@ mod tests {
     /// may later carry a different number than an open one.
     #[test]
     fn a_run_of_extents_survives_the_wire() {
-        let totals = Totals { extents: 5, logical: 900, compressed: 300 };
-        let run = ExtentRun { stream: StreamId::new(7), totals, given: 2, next: 90 };
+        let totals = Totals {
+            extents: ExtentId::new(5),
+            logical: SLoff::new(900),
+            compressed: SCoff::new(300),
+        };
+        let run = ExtentRun {
+            stream: StreamId::new(7),
+            totals,
+            given: ExtentId::new(2),
+            next: SRoff::new(90),
+        };
         let rows = vec![extent(1, 0, 40), extent(2, 40, 50)];
         let mut args = run.args();
         for row in &rows {
@@ -990,7 +1010,7 @@ mod tests {
         }
         let (back, rest) = ExtentRun::of_args(&args).expect("a run");
         assert_eq!(back, run);
-        let (given, rest) = ExtentRow::some_of_args(rest, back.given).expect("extents");
+        let (given, rest) = ExtentRow::some_of_args(rest, back.given.number()).expect("extents");
         assert_eq!(given, rows);
         assert!(rest.is_empty());
         assert_eq!(

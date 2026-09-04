@@ -14,9 +14,9 @@ use common::block::{Holds, expand, squeeze};
 use common::config::Compress;
 use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
-use common::ids::{ObjectId, RangeId};
+use common::ids::{ExtentId, ObjectId, RangeId};
 use common::info::{Batch, Described, Expecting, ExtentRow, ObjectName, Shape, StreamRow, UNKNOWN};
-use common::offset::{ERoff, ORoff, SRoff};
+use common::offset::{ERoff, ORoff, SCoff, SLoff, SRoff};
 use common::placement::{self, Expansion};
 
 use common::random::Rng;
@@ -1403,7 +1403,7 @@ fn say(
             n => format!("{n} records"),
         };
         let of = match row.totals.extents {
-            UNKNOWN => String::new(),
+            ExtentId::NONE => String::new(),
             n => format!(", {n} extents"),
         };
         // The sizes, which is what a listing is for. ⚠️ Marked *so far* when the stream is
@@ -1412,7 +1412,7 @@ fn say(
         // under-reports every object still being written.
         let asof = if row.records == SRoff::NONE { " so far" } else { "" };
         let sizes = match (row.totals.logical, row.totals.compressed) {
-            (UNKNOWN, _) | (_, UNKNOWN) => String::new(),
+            (SLoff::NONE, _) | (_, SCoff::NONE) => String::new(),
             (logical, compressed) => format!(
                 ", {logical} bytes{asof}, {compressed} stored, {} billed",
                 row.totals.physical(expansion)

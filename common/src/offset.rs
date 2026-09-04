@@ -158,6 +158,18 @@ impl SRoff {
     }
 }
 
+impl SLoff {
+    pub const fn from_extent(value: ELoff) -> SLoff {
+        SLoff::new(value.get() as u64)
+    }
+}
+
+impl SCoff {
+    pub const fn from_extent(value: ECoff) -> SCoff {
+        SCoff::new(value.get() as u64)
+    }
+}
+
 impl ORoff {
     pub const fn from_stream(value: SRoff) -> ORoff {
         ORoff::new(value.get())

@@ -15,7 +15,7 @@
 
 use common::config::{SNConfig, ServiceKind};
 use common::ids::{DiskId, EnId, ExtentId, RangeId, SnDiskId, SnId, StreamId};
-use common::info::{ExtentRow, ExtentRun, Listing, StreamName, Totals, UNKNOWN};
+use common::info::{ExtentRow, ExtentRun, Listing, StreamName, Totals};
 use common::offset::{ECoff, ELoff, ERoff, SCoff, SLoff, SRoff};
 use common::range::Filled;
 use common::server::{self, Process, Reply, Service};
@@ -122,11 +122,11 @@ impl Sealed {
     }
 
     fn logical(&self) -> SLoff {
-        SLoff::new(self.logical.number())
+        SLoff::from_extent(self.logical)
     }
 
     fn compressed(&self) -> SCoff {
-        SCoff::new(self.compressed.number())
+        SCoff::from_extent(self.compressed)
     }
 
     /// Whether a stream-local record number falls in this extent, given where the
@@ -583,7 +583,7 @@ impl SN {
                 sn: held.creator,
                 id: sealed.extent.id,
                 created: sealed.extent.created,
-                first_record: at.number(),
+                first_record: at.get(),
                 records: ERoff::of_number(sealed.records().number()).expect("extent records fit"),
                 logical: ELoff::of_number(sealed.logical().number()).expect("extent bytes fit"),
                 length: ECoff::of_number(sealed.compressed().number()).expect("extent bytes fit"),
@@ -608,7 +608,7 @@ impl SN {
                 sn: held.creator,
                 id: open.id,
                 created: open.created,
-                first_record: held.sealed_records.number(),
+                first_record: held.sealed_records.get(),
                 records: ERoff::NONE,
                 logical: ELoff::NONE,
                 length: ECoff::NONE,
@@ -623,11 +623,11 @@ impl SN {
         // Where to carry on: the first record of the next extent not described.
         let after = first + rows.len();
         let next = match held.sealed.get(after) {
-            Some(_) => held.sealed_from().nth(after).map_or(UNKNOWN, |(at, _)| at.number()),
+            Some(_) => held.sealed_from().nth(after).map_or(SRoff::NONE, |(at, _)| at),
             None if after < total as usize => {
-                held.open.as_ref().map_or(UNKNOWN, |_| held.sealed_records.number())
+                held.open.as_ref().map_or(SRoff::NONE, |_| held.sealed_records)
             }
-            None => UNKNOWN,
+            None => SRoff::NONE,
         };
         // What the stream has come to, which only the SN can say: it owns the extent list.
         //
@@ -637,12 +637,17 @@ impl SN {
         // growing stream's totals are *behind*, which is exactly the staleness the DN's
         // cache is allowed (§17.25.1) — and a sealed stream has no open extent, so its
         // totals are exact.
-        let mut totals = Totals { extents: total, logical: 0, compressed: 0 };
+        let mut totals = Totals {
+            extents: ExtentId::new(total as u32),
+            logical: SLoff::ZERO,
+            compressed: SCoff::ZERO,
+        };
         for sealed in &held.sealed {
-            totals.logical += sealed.logical().number();
-            totals.compressed += sealed.compressed().number();
+            totals.logical = totals.logical.plus(sealed.logical()).expect("stream bytes fit");
+            totals.compressed =
+                totals.compressed.plus(sealed.compressed()).expect("stream bytes fit");
         }
-        (ExtentRun { stream, totals, given: rows.len() as u64, next }, rows)
+        (ExtentRun { stream, totals, given: ExtentId::new(rows.len() as u32), next }, rows)
     }
 
     /// A stream's name, the sealed extent and what it came to: record it and open the next

@@ -312,32 +312,28 @@ impl Stream {
 
     /// What this stream has come to, in the shape the wire carries.
     fn totals(&self) -> Totals {
-        Totals {
-            extents: if self.extents.is_none() { UNKNOWN } else { self.extents.number() },
-            logical: self.logical.number(),
-            compressed: self.compressed.number(),
-        }
+        Totals { extents: self.extents, logical: self.logical, compressed: self.compressed }
     }
 
     /// What an SN said the stream has come to. ⚠️ **Only ever moves forward**: an answer
     /// that crossed a newer one in flight must not walk the numbers back, and a sealed
     /// stream's totals are final whatever arrives afterwards.
     fn learned(&mut self, totals: Totals) {
-        if totals.extents != UNKNOWN
-            && let Ok(seen) = ExtentId::of_number(totals.extents)
+        if totals.extents != ExtentId::NONE
+            && let seen = totals.extents
             && (self.extents.is_none() || seen.get() > self.extents.get())
         {
             self.extents = seen;
         }
-        if totals.logical != UNKNOWN
-            && let Ok(seen) = SLoff::of_number(totals.logical)
-            && (self.logical.is_none() || seen.number() > self.logical.number())
+        if totals.logical != SLoff::NONE
+            && let seen = totals.logical
+            && (self.logical.is_none() || seen > self.logical)
         {
             self.logical = seen;
         }
-        if totals.compressed != UNKNOWN
-            && let Ok(seen) = SCoff::of_number(totals.compressed)
-            && (self.compressed.is_none() || seen.number() > self.compressed.number())
+        if totals.compressed != SCoff::NONE
+            && let seen = totals.compressed
+            && (self.compressed.is_none() || seen > self.compressed)
         {
             self.compressed = seen;
         }
@@ -355,7 +351,9 @@ impl Object {
         self.streams.iter().scan(ORoff::ZERO, |at, stream| {
             let first = *at;
             if stream.records.is_some() {
-                *at = ORoff::new(at.number() + stream.records.number());
+                *at = at
+                    .plus(ORoff::from_stream(stream.records))
+                    .expect("object record position fits");
             }
             Some((first, stream))
         })
@@ -404,7 +402,9 @@ impl Object {
     fn records(&self) -> ORoff {
         match self.streams_from().last() {
             Some((_, last)) if last.records.is_none() => ORoff::NONE,
-            Some((at, last)) => ORoff::new(at.number() + last.records.number()),
+            Some((at, last)) => {
+                at.plus(ORoff::from_stream(last.records)).expect("object record position fits")
+            }
             None => ORoff::ZERO,
         }
     }
@@ -418,7 +418,9 @@ impl Object {
     /// covers it, or the last, whose reach is not known here.
     fn holding(&self, record: ORoff) -> Option<(ORoff, Stream)> {
         for (at, held) in self.streams_from() {
-            if held.records.is_none() || record.number() < at.number() + held.records.number() {
+            if held.records.is_none()
+                || record < at.plus(ORoff::from_stream(held.records)).expect("record fits")
+            {
                 return Some((at, *held));
             }
         }
@@ -476,7 +478,8 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Resp) {
     let mut converted: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)> = HashMap::new();
     for row in &held.rows {
         let Some((run, rows)) = runs.remove(&row.stream) else { continue };
-        extents += if run.totals.extents == UNKNOWN { 0 } else { run.totals.extents };
+        extents +=
+            if run.totals.extents == ExtentId::NONE { 0 } else { run.totals.extents.number() };
         given += rows.len() as u64;
         // Stream-local to object-local, by adding where this stream starts in the object.
         let moved = rows
@@ -500,12 +503,13 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Resp) {
     // continuation stand. Without this an answer that truncated extents reported `nothing more`.
     let cut = held.rows.iter().find_map(|row| {
         let (run, rows) = converted.get(&row.stream)?;
-        let short = run.totals.extents != UNKNOWN && (rows.len() as u64) < run.totals.extents;
+        let short = run.totals.extents != ExtentId::NONE
+            && rows.len() < run.totals.extents.number() as usize;
         // ⚠️ `then`, not `then_some`: `then_some` evaluates its argument **eagerly**, so it
         // computed `UNKNOWN + first_record` — `u64::MAX` plus a record number — and
         // overflowed. It reads like a guard and is not one (§17.22.1).
-        (short && run.next != UNKNOWN).then(|| {
-            ORoff::from_stream(SRoff::new(run.next))
+        (short && run.next != SRoff::NONE).then(|| {
+            ORoff::from_stream(run.next)
                 .plus(row.first_record)
                 .expect("object record position fits")
         })
