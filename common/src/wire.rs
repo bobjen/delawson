@@ -821,26 +821,26 @@ pub struct EnReceipt {
 impl EnReceipt {
     pub fn write(self) -> Arg {
         let mut payload = StructWriter::new();
-        payload.number_u32(self.sn.get());
-        payload.number_u32(self.logical.get());
-        payload.number_u32(self.first_record.get());
-        payload.number_u32(self.records.get());
-        payload.number_u32(self.extent.get());
-        payload.number_u64(self.created.number());
-        payload.number_u32(self.length.get());
+        payload.sn_id(self.sn);
+        payload.eloff(self.logical);
+        payload.eroff(self.first_record);
+        payload.eroff(self.records);
+        payload.extent_id(self.extent);
+        payload.time_sec(self.created);
+        payload.eloff(self.length);
         payload.finish(Op::ReceiptResp)
     }
 
     pub fn read(args: &[Arg]) -> Result<EnReceipt> {
         let (mut payload, rest) = structure(args, Op::ReceiptResp, "an EN append receipt")?;
         let receipt = EnReceipt {
-            sn: SnId::new(payload.number_u32()?),
-            logical: ELoff::new(payload.number_u32()?),
-            first_record: ERoff::new(payload.number_u32()?),
-            records: ERoff::new(payload.number_u32()?),
-            extent: ExtentId::new(payload.number_u32()?),
-            created: TimeSec::new(payload.number_u64()?),
-            length: ELoff::new(payload.number_u32()?),
+            sn: payload.sn_id()?,
+            logical: payload.eloff()?,
+            first_record: payload.eroff()?,
+            records: payload.eroff()?,
+            extent: payload.extent_id()?,
+            created: payload.time_sec()?,
+            length: payload.eloff()?,
         };
         if !rest.is_empty() {
             return Err(Error::new("an EN append receipt has trailing arguments"));
@@ -878,7 +878,7 @@ impl SnKey {
         payload.bytes(&self.current);
         payload.flag(self.next.is_some());
         if let Some((at, key)) = self.next {
-            payload.number_u64(at.number());
+            payload.time_sec(at);
             payload.bytes(&key);
         }
         payload.finish(Op::SnKeyResp)
@@ -891,7 +891,7 @@ impl SnKey {
             .try_into()
             .map_err(|_| Error::new("SN returned a current key of the wrong size"))?;
         let next = if payload.flag()? {
-            let at = TimeSec::new(payload.number_u64()?);
+            let at = payload.time_sec()?;
             let key: [u8; 32] = payload
                 .bytes()?
                 .try_into()
@@ -911,28 +911,28 @@ impl SnKey {
 impl Receipt {
     pub fn write(self) -> Arg {
         let mut payload = StructWriter::new();
-        payload.number_u32(self.stream.get());
-        payload.number_u64(self.record.number());
-        payload.number_u64(self.object_record.number());
-        payload.number_u32(self.records.get());
-        payload.number_u32(self.extent.get());
-        payload.number_u64(self.created.number());
-        payload.number_u32(self.offset.get());
-        payload.number_u32(self.length.get());
+        payload.stream_id(self.stream);
+        payload.sroff(self.record);
+        payload.oroff(self.object_record);
+        payload.eroff(self.records);
+        payload.extent_id(self.extent);
+        payload.time_sec(self.created);
+        payload.eloff(self.offset);
+        payload.eloff(self.length);
         payload.finish(Op::ReceiptResp)
     }
 
     pub fn read(args: &[Arg]) -> Result<Receipt> {
         let (mut payload, rest) = structure(args, Op::ReceiptResp, "an append receipt")?;
         let receipt = Receipt {
-            stream: StreamId::new(payload.number_u32()?),
-            record: SRoff::new(payload.number_u64()?),
-            object_record: ORoff::new(payload.number_u64()?),
-            records: ERoff::new(payload.number_u32()?),
-            extent: ExtentId::new(payload.number_u32()?),
-            created: TimeSec::new(payload.number_u64()?),
-            offset: ELoff::new(payload.number_u32()?),
-            length: ELoff::new(payload.number_u32()?),
+            stream: payload.stream_id()?,
+            record: payload.sroff()?,
+            object_record: payload.oroff()?,
+            records: payload.eroff()?,
+            extent: payload.extent_id()?,
+            created: payload.time_sec()?,
+            offset: payload.eloff()?,
+            length: payload.eloff()?,
         };
         if !rest.is_empty() {
             return Err(Error::new("an append receipt has trailing arguments"));
@@ -947,23 +947,23 @@ impl AppendBlock {
         let mut request = Req::new(op);
         let mut payload = StructWriter::new();
         let (kind, width) = self.framing.wire();
-        payload.number_u32(en.get());
-        payload.number_u16(disk.get());
-        payload.number_u32(self.sn.get());
-        payload.number_u32(self.extent.get());
-        payload.number_u64(self.created.number());
+        payload.en_id(en);
+        payload.disk_id(disk);
+        payload.sn_id(self.sn);
+        payload.extent_id(self.extent);
+        payload.time_sec(self.created);
         payload.number_u8(kind);
         payload.number_u32(width);
         payload.number_u64(self.crc);
-        payload.number_u64(self.holds.compressed.number());
-        payload.number_u64(self.holds.logical.number());
-        payload.number_u64(self.holds.records.number());
+        payload.ecoff(self.holds.compressed);
+        payload.eloff(self.holds.logical);
+        payload.eroff(self.holds.records);
         payload.flag(self.logical_offset.is_some());
-        payload.number_u64(self.logical_offset.map(|o| o.number()).unwrap_or(0));
+        payload.eloff(self.logical_offset.unwrap_or(ELoff::ZERO));
         payload.number_u32(self.instances.len() as u32);
         for (en, disk) in &self.instances {
-            payload.number_u32(en.get());
-            payload.number_u16(disk.get());
+            payload.en_id(*en);
+            payload.disk_id(*disk);
         }
         payload.bytes(&self.bytes);
         request.args.push(payload.finish(op));
@@ -975,28 +975,25 @@ impl AppendBlock {
         if !rest.is_empty() {
             return Err(Error::new("an append block has arguments after its payload"));
         }
-        let en = EnId::of_number(payload.number_u32()? as u64)?;
-        let disk = DiskId::of_number(payload.number_u16()? as u64)?;
-        let sn = SnId::of_number(payload.number_u32()? as u64)?;
-        let extent = ExtentId::of_number(payload.number_u32()? as u64)?;
-        let created = TimeSec::new(payload.number_u64()?);
+        let en = payload.en_id()?;
+        let disk = payload.disk_id()?;
+        let sn = payload.sn_id()?;
+        let extent = payload.extent_id()?;
+        let created = payload.time_sec()?;
         let kind = payload.number_u8()?;
         let width = payload.number_u32()?;
         let crc = payload.number_u64()?;
         let holds = crate::block::Holds {
-            compressed: crate::offset::ECoff::of_number(payload.number_u64()?)?,
-            logical: crate::offset::ELoff::of_number(payload.number_u64()?)?,
-            records: crate::offset::ERoff::of_number(payload.number_u64()?)?,
+            compressed: payload.ecoff()?,
+            logical: payload.eloff()?,
+            records: payload.eroff()?,
         };
         let has_logical = payload.flag()?;
-        let logical = payload.number_u64()?;
+        let logical = payload.eloff()?;
         let count = payload.number_u32()?;
         let mut instances = payload.checked_vec(count)?;
         for _ in 0..count {
-            instances.push((
-                EnId::of_number(payload.number_u32()? as u64)?,
-                DiskId::of_number(payload.number_u16()? as u64)?,
-            ));
+            instances.push((payload.en_id()?, payload.disk_id()?));
         }
         let bytes = payload.bytes()?;
         payload.done()?;
@@ -1011,7 +1008,7 @@ impl AppendBlock {
                 crc,
                 holds,
                 instances,
-                logical_offset: has_logical.then(|| ELoff::of_number(logical)).transpose()?,
+                logical_offset: has_logical.then_some(logical),
                 bytes,
             },
         ))

@@ -73,18 +73,18 @@ impl Holds {
 
     pub fn write(&self, payload: &mut StructWriter) {
         payload.nested(crate::wire::Op::AppendBlock, |payload| {
-            payload.number_u64(self.compressed.number());
-            payload.number_u64(self.logical.number());
-            payload.number_u64(self.records.number());
+            payload.ecoff(self.compressed);
+            payload.eloff(self.logical);
+            payload.eroff(self.records);
         });
     }
 
     pub fn read(payload: &mut StructReader<'_>) -> Result<Holds> {
         payload.nested(crate::wire::Op::AppendBlock, "block holds", |payload| {
             Ok(Holds {
-                compressed: ECoff::of_number(payload.number_u64()?)?,
-                logical: ELoff::of_number(payload.number_u64()?)?,
-                records: ERoff::of_number(payload.number_u64()?)?,
+                compressed: payload.ecoff()?,
+                logical: payload.eloff()?,
+                records: payload.eroff()?,
             })
         })
     }
