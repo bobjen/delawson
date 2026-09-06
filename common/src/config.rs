@@ -634,6 +634,13 @@ pub struct DNConfig {
     /// object evade the total. A request may name a smaller cap; a larger one is
     /// capped rather than refused.
     pub info_entries: u64,
+    /// Maximum number of sealed objects one concatenate request may name.
+    #[serde(default = "default_max_concat_sources")]
+    pub max_concat_sources: u64,
+}
+
+fn default_max_concat_sources() -> u64 {
+    1024
 }
 
 /// SN's own configuration.

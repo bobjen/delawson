@@ -26,8 +26,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-const SERVES: &[Op] =
-    &[Op::CreateStream, Op::OpenExtent, Op::LocateRecord, Op::SealExtent, Op::ListExtents];
+const SERVES: &[Op] = &[
+    Op::CreateStream,
+    Op::ConcatStreams,
+    Op::SealStream,
+    Op::OpenExtent,
+    Op::LocateRecord,
+    Op::SealExtent,
+    Op::ListExtents,
+];
 
 /// Locks over the stream table. Enough that sixteen cores rarely collide,
 /// few enough to walk when something wants a total.
@@ -41,6 +48,7 @@ fn stream_name(payload: &mut StructReader<'_>) -> common::Result<StreamName> {
     })
 }
 
+#[derive(Clone)]
 struct Stream {
     /// When it was made. Nothing reads it yet; whether a stream needs a creation
     /// timestamp of its own at all is an open question.
@@ -323,6 +331,8 @@ impl Service for SN {
     fn answer(&self, process: &Process, request: &Req) -> Resp {
         match request.op {
             Op::CreateStream => self.create(request),
+            Op::ConcatStreams => self.concat_streams(request),
+            Op::SealStream => self.seal_stream(request),
             Op::OpenExtent => self.open_extent(process, request),
             Op::LocateRecord => self.locate(request),
             Op::ListExtents => self.list(request),
@@ -416,6 +426,146 @@ impl SN {
             );
         }
         self.streams.fetch_add(count, Ordering::Relaxed);
+        Resp::ok()
+    }
+
+    /// Copy two sealed streams' extent references into an already-created destination
+    /// stream. The destination remains open, so a caller can append after the copied
+    /// data. Extents themselves are immutable references here; no EN data is copied.
+    fn concat_streams(&self, request: &Req) -> Resp {
+        let (mut payload, rest) =
+            match structure(&request.args, Op::ConcatStreams, "a concat-streams request") {
+                Ok(value) => value,
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+            };
+        if !rest.is_empty() {
+            return Resp::error(
+                Status::BadRequest,
+                "a concat-streams request has trailing arguments",
+            );
+        }
+        let destination = match stream_name(&mut payload) {
+            Ok(name) => name,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        let left = match stream_name(&mut payload) {
+            Ok(name) => name,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        let right = match stream_name(&mut payload) {
+            Ok(name) => name,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        let require_exists = match payload.flag() {
+            Ok(value) => value,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        let require_absent = match payload.flag() {
+            Ok(value) => value,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        if let Err(e) = payload.done() {
+            return Resp::error(Status::BadRequest, e.to_string());
+        }
+        if require_exists && require_absent {
+            return Resp::error(
+                Status::BadRequest,
+                "concat-streams cannot require both an existing and an absent destination",
+            );
+        }
+        if destination == left || destination == right {
+            return Resp::error(Status::BadRequest, "concat-streams needs a distinct destination");
+        }
+        if destination.range != left.range || destination.range != right.range {
+            return Resp::error(Status::BadRequest, "concat-streams streams have different ranges");
+        }
+
+        {
+            let shard = self.shards[shard_of(destination)].lock().expect("streams");
+            if let Some(destination_stream) = shard.get(&destination) {
+                if destination_stream.sealed_stream
+                    || destination_stream.open.is_some()
+                    || !destination_stream.sealed.is_empty()
+                {
+                    return Resp::error(
+                        Status::BadRequest,
+                        "destination stream is not empty and open",
+                    );
+                }
+            } else if require_exists {
+                return Resp::error(Status::NotFound, format!("no {destination}"));
+            } else if require_absent {
+                // The destination is absent, which is exactly what this flag requires.
+            }
+        }
+        // Different streams normally hash to different table shards, so copy the
+        // source state out before taking the destination shard for mutation.
+        let left_stream = match self.shards[shard_of(left)].lock().expect("streams").get(&left) {
+            Some(stream) => stream.clone(),
+            None => return Resp::error(Status::NotFound, format!("no {left}")),
+        };
+        let right_stream = match self.shards[shard_of(right)].lock().expect("streams").get(&right) {
+            Some(stream) => stream.clone(),
+            None => return Resp::error(Status::NotFound, format!("no {right}")),
+        };
+        if !left_stream.sealed_stream
+            || left_stream.open.is_some()
+            || !right_stream.sealed_stream
+            || right_stream.open.is_some()
+        {
+            return Resp::error(Status::BadRequest, "only sealed streams may be concatenated");
+        }
+        let extent_count = left_stream
+            .sealed
+            .len()
+            .checked_add(right_stream.sealed.len())
+            .ok_or_else(|| Error::new("concat-streams extent reference count overflow"));
+        let extent_count = match extent_count {
+            Ok(count) if (count as u64) <= ExtentId::MAX.number() => count,
+            _ => {
+                return Resp::error(
+                    Status::BadRequest,
+                    "concat-streams would exceed the extent-reference limit",
+                );
+            }
+        };
+        let records = match left_stream.sealed_records.plus(right_stream.sealed_records) {
+            Ok(records) => records,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+
+        // Clone only after all validation has succeeded. The source streams remain
+        // sealed and independently usable; the destination receives its own list.
+        let mut copied = Vec::with_capacity(extent_count);
+        copied.extend(left_stream.sealed.iter().cloned());
+        copied.extend(right_stream.sealed.iter().cloned());
+        let mut shard = self.shards[shard_of(destination)].lock().expect("streams");
+        if require_absent && shard.contains_key(&destination) {
+            return Resp::error(
+                Status::BadRequest,
+                format!("destination {destination} already exists"),
+            );
+        }
+        if require_exists && !shard.contains_key(&destination) {
+            return Resp::error(Status::NotFound, format!("no {destination}"));
+        }
+        let destination_stream = shard.entry(destination).or_insert_with(|| Stream {
+            created: destination.created,
+            creator: self.mine,
+            sealed: Vec::new(),
+            open: None,
+            sealed_records: SRoff::ZERO,
+            sealed_stream: false,
+        });
+        if destination_stream.sealed_stream
+            || destination_stream.open.is_some()
+            || !destination_stream.sealed.is_empty()
+        {
+            return Resp::error(Status::BadRequest, "destination stream is not empty and open");
+        }
+        destination_stream.sealed = copied;
+        destination_stream.sealed_records = records;
+        self.sealed.fetch_add(extent_count as u64, Ordering::Relaxed);
         Resp::ok()
     }
 
@@ -692,6 +842,55 @@ impl SN {
         }
     }
 
+    fn seal_stream(&self, request: &Req) -> Resp {
+        let (mut payload, rest) =
+            match structure(&request.args, Op::SealStream, "a seal-stream request") {
+                Ok(value) => value,
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+            };
+        let name = match stream_name(&mut payload) {
+            Ok(name) => name,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        let id = match payload.extent_id() {
+            Ok(id) => id,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        let came_to = match (payload.eroff(), payload.eloff(), payload.ecoff()) {
+            (Ok(records), Ok(logical), Ok(compressed)) => Filled { records, logical, compressed },
+            _ => return Resp::error(Status::BadRequest, "seal-stream has invalid extent totals"),
+        };
+        if !rest.is_empty() || payload.done().is_err() {
+            return Resp::error(Status::BadRequest, "seal-stream has trailing arguments");
+        }
+        let mut shard = self.shards[shard_of(name)].lock().expect("streams");
+        let Some(stream) = shard.get_mut(&name) else {
+            return Resp::error(Status::NotFound, format!("no {name}"));
+        };
+        if stream.sealed_stream {
+            return Resp::number(Status::Ok, stream.sealed_records.number());
+        }
+        let Some(open) = stream.open.take() else {
+            return Resp::error(Status::BadRequest, "stream has no open extent");
+        };
+        if open.id != id {
+            return Resp::error(Status::BadRequest, "seal-stream named a stale extent");
+        }
+        stream.sealed_records = stream
+            .sealed_records
+            .plus(SRoff::from_extent(came_to.records))
+            .expect("stream record position fits");
+        stream.sealed.push(Sealed {
+            extent: Extent { records: came_to.records, ..open },
+            logical: came_to.logical,
+            compressed: came_to.compressed,
+        });
+        stream.sealed_stream = true;
+        self.sealed.fetch_add(1, Ordering::Relaxed);
+        self.sealed_streams.fetch_add(1, Ordering::Relaxed);
+        Resp::number(Status::Ok, stream.sealed_records.number())
+    }
+
     /// Seal the stream's open extent and name the next one, both under the stream's
     /// lock, so a request that finds the extent already sealed gets the extent that
     /// replaced it rather than an error.
@@ -896,6 +1095,136 @@ mod tests {
         }));
         assert_eq!(made.status, Status::Ok);
         sn
+    }
+
+    fn add_stream(sn: &SN, range: u32, stream: u32) {
+        let made = sn.create(&Req::new(Op::CreateStream).structure({
+            let mut payload = StructWriter::new();
+            payload.range_id(RangeId::new(range));
+            payload.stream_id(StreamId::new(stream));
+            payload.number_u64(1);
+            payload.time_sec(MADE);
+            payload
+        }));
+        assert_eq!(made.status, Status::Ok);
+    }
+
+    fn concat_request(destination: StreamName, left: StreamName, right: StreamName) -> Req {
+        concat_request_with_flags(destination, left, right, false, false)
+    }
+
+    fn concat_request_with_flags(
+        destination: StreamName,
+        left: StreamName,
+        right: StreamName,
+        require_exists: bool,
+        require_absent: bool,
+    ) -> Req {
+        Req::new(Op::ConcatStreams).structure({
+            let mut payload = StructWriter::new();
+            for name in [destination, left, right] {
+                payload.range_id(name.range);
+                payload.stream_id(name.stream);
+                payload.time_sec(name.created);
+            }
+            payload.flag(require_exists);
+            payload.flag(require_absent);
+            payload
+        })
+    }
+
+    fn seal_for_concat(sn: &SN, name: StreamName) {
+        let extent = sn.open(name, MADE, testing::extents().instances).unwrap();
+        let sealed =
+            sn.close(name, extent.extent.id, came(12, 400), MADE, testing::extents().instances, 1);
+        assert!(sealed.is_err(), "a per-stream limit of one seals the source");
+    }
+
+    #[test]
+    fn self_concat_copies_extent_references_and_leaves_destination_open() {
+        let sn = sn_with_stream(0, 7);
+        seal_for_concat(&sn, named(0, 7));
+
+        let answer = sn.concat_streams(&concat_request(named(0, 9), named(0, 7), named(0, 7)));
+        assert_eq!(answer.status, Status::Ok, "{}", answer.message().unwrap_or_default());
+
+        let shard = sn.shards[shard_of(named(0, 9))].lock().unwrap();
+        let destination = &shard[&named(0, 9)];
+        assert_eq!(destination.sealed.len(), 2, "A || A has two extent references");
+        assert_eq!(destination.sealed_records, SRoff::new(24));
+        assert!(destination.open.is_none(), "concatenation does not open an extent");
+        assert!(!destination.sealed_stream, "the result remains appendable");
+        assert_eq!(
+            destination.sealed[0].extent.id, destination.sealed[1].extent.id,
+            "self-concat shares the same immutable extent"
+        );
+    }
+
+    #[test]
+    fn stream_concat_requires_sealed_sources() {
+        let sn = sn_with_stream(0, 7);
+
+        let answer = sn.concat_streams(&concat_request(named(0, 9), named(0, 7), named(0, 7)));
+        assert_eq!(answer.status, Status::BadRequest, "{}", answer.message().unwrap_or_default());
+        assert!(answer.message().unwrap_or_default().contains("sealed"));
+    }
+
+    #[test]
+    fn stream_concat_rejects_a_nonempty_destination() {
+        let sn = sn_with_stream(0, 7);
+        add_stream(&sn, 0, 9);
+        seal_for_concat(&sn, named(0, 7));
+        seal_for_concat(&sn, named(0, 9));
+
+        let answer = sn.concat_streams(&concat_request(named(0, 9), named(0, 7), named(0, 7)));
+        assert_eq!(answer.status, Status::BadRequest);
+        assert!(answer.message().unwrap_or_default().contains("destination"));
+    }
+
+    #[test]
+    fn stream_concat_destination_flags_control_creation() {
+        let sn = sn_with_stream(0, 7);
+        seal_for_concat(&sn, named(0, 7));
+
+        let missing_required = sn.concat_streams(&concat_request_with_flags(
+            named(0, 9),
+            named(0, 7),
+            named(0, 7),
+            true,
+            false,
+        ));
+        assert_eq!(missing_required.status, Status::NotFound);
+
+        let created = sn.concat_streams(&concat_request_with_flags(
+            named(0, 9),
+            named(0, 7),
+            named(0, 7),
+            false,
+            true,
+        ));
+        assert_eq!(created.status, Status::Ok);
+
+        let existing_required_absent = sn.concat_streams(&concat_request_with_flags(
+            named(0, 9),
+            named(0, 7),
+            named(0, 7),
+            false,
+            true,
+        ));
+        assert_eq!(existing_required_absent.status, Status::BadRequest);
+    }
+
+    #[test]
+    fn stream_concat_rejects_conflicting_destination_flags() {
+        let sn = sn_with_stream(0, 7);
+        let answer = sn.concat_streams(&concat_request_with_flags(
+            named(0, 9),
+            named(0, 7),
+            named(0, 7),
+            true,
+            true,
+        ));
+        assert_eq!(answer.status, Status::BadRequest);
     }
 
     #[test]

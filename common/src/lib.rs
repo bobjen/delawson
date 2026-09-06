@@ -16,6 +16,7 @@ pub mod placement;
 pub mod random;
 pub mod range;
 pub mod registry;
+pub mod retry;
 pub mod routing;
 pub mod seal;
 pub mod server;

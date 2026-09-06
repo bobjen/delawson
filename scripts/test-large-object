@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Expensive, opt-in end-to-end large-object test. It intentionally uses a temporary
+# configuration and run directory, and leaves the checked-in test cluster untouched.
+set -euo pipefail
+
+phase=all
+if [[ ${1:-} == --extent-only ]]; then
+    phase=extent
+    shift
+fi
+[[ $# == 0 ]] || { echo "usage: $0 [--extent-only]" >&2; exit 2; }
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/delawson-large-object.XXXXXX")
+config=$tmp/config
+run=$tmp/run
+mkdir -p "$config"
+cp -a "$root/config/." "$config/"
+sed -i \
+    -e 's/^seal_bytes = .*/seal_bytes = 33554432/' \
+    -e 's/^per_stream = .*/per_stream = 1048576/' \
+    "$config/cluster.toml"
+sed -i '/^seal_bytes = /a max_append_bytes = 33554432' "$config/cluster.toml"
+
+cleanup() {
+    status=$?
+    if ((status != 0)); then
+        echo "large-object: failed; recent FE/EN logs:" >&2
+        for log in "$run"/FE*/stderr.log "$run"/EN*/stderr.log; do
+            [[ -f $log ]] || continue
+            echo "--- $log" >&2
+            tail -n 20 "$log" >&2 || true
+        done
+    fi
+    "$root/scripts/stop-laws" --run-dir "$run" --clean >/dev/null 2>&1 || true
+    rm -rf "$tmp"
+}
+trap cleanup EXIT
+
+"$root/scripts/start-laws" --release --run-dir "$run" --config "$config"
+laws=$root/target/release/laws
+block=$tmp/block
+python3 - "$block" <<'PY'
+import sys
+record = b"Doctor, sometimes I think all I do is take up space.\0"
+target = 32 * 1024 * 1024
+with open(sys.argv[1], "wb") as output:
+    # Canonical logical length is body bytes plus four bytes per completed
+    # record, so leave room for the record framing as well as the NUL marker.
+    count = (target - 1) // (len(record) + 4)
+    output.write(record * count)
+PY
+
+path=/large-object
+block_bytes=$(stat -c '%s' "$block")
+blocks=$(( ((1 << 32) - 1) / block_bytes ))
+blocks=${LARGE_BLOCKS:-$blocks}
+for ((n = 0; n < blocks; n++)); do
+    "$laws" --config "$config/cluster.toml" append-block "$path" --file "$block"
+done
+
+if [[ $phase == extent ]]; then
+    echo "large-object: one-extent phase complete; inspecting the object"
+    "$laws" --config "$config/cluster.toml" object-info "$path" --want extents
+    exit 0
+fi
+
+# The final block is deliberately followed by the explicit forced seal, since the
+# extent is full by logical size while per_stream is intentionally very large.
+"$laws" --config "$config/cluster.toml" seal "$path"
+
+source=$path
+for ((n = 0; n < 16; n++)); do
+    destination=/large-object-$((n + 1))
+    if ! "$laws" --config "$config/cluster.toml" concat "$destination" "$source" "$source"; then
+        echo "large-object: concat stopped at iteration $n (the expected size limit)" >&2
+        exit 0
+    fi
+    "$laws" --config "$config/cluster.toml" seal "$destination"
+    source=$destination
+done
+echo "large-object: reached the script's concat iteration bound without an error" >&2

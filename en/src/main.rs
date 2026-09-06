@@ -30,14 +30,14 @@ use common::range::{Budget, ExtentCovered, Filled, Piece, Range};
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::wire::{
-    AppendBlock, Arg, EnReceipt, Op, Req, Resp, SnKey, Status, StructWriter, structure,
+    AppendBlock, AppendPiece, Arg, EnReceipt, Op, Req, Resp, SnKey, Status, StructWriter, structure,
 };
 use common::{Error, Result, logw};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-const SERVES: &[Op] = &[Op::AppendExtent, Op::ApplyAppend, Op::ReadExtent];
+const SERVES: &[Op] = &[Op::AppendExtent, Op::ApplyAppend, Op::ReadExtent, Op::ForceSealExtent];
 
 /// Cached SN keys, addressed by the exact extent creation second. The exact
 /// time matters because KS may install an emergency key epoch mid-day.
@@ -209,18 +209,27 @@ struct Append {
     first_record: ERoff,
     /// Metadata in the clear, to avoid expensive decryption during scans.
     holds: Holds,
+    /// Independently encrypted blocks in this append. The extent does not index
+    /// these yet; reads walk them in order.
+    blocks: Vec<Encrypted>,
+}
+
+struct Encrypted {
+    logical: ELoff,
+    first_record: ERoff,
+    holds: Holds,
     /// The encrypted bytes (tag + encrypted header + compressed body).
     sealed: Vec<u8>,
 }
 
-impl Append {
+impl Encrypted {
     #[allow(clippy::too_many_arguments)]
     fn encrypt(
         daily_cache: &DailyKeyCache,
         extent_cache: &ExtentKeyCache,
         process: &Process,
         extent: &Extent,
-        offset: ECoff,
+        _offset: ECoff,
         logical: ELoff,
         first_record: ERoff,
         framing: Framing,
@@ -243,7 +252,7 @@ impl Append {
         let (mut sealed, tag) = crypto::encrypt_block(&key, &nonce, &ad, &plain);
         sealed.extend(tag);
 
-        Ok(Self { extent: 0, offset, logical, first_record, holds, sealed })
+        Ok(Self { logical, first_record, holds, sealed })
     }
 
     fn decrypt(
@@ -401,19 +410,6 @@ impl Extents {
             }
         }
 
-        let append = Append::encrypt(
-            daily_cache,
-            extent_cache,
-            process,
-            extent,
-            offset,
-            logical_offset,
-            first_record,
-            appending.framing,
-            appending.crc,
-            appending.holds,
-            &appending.bytes,
-        )?;
         let stored_len = appending.holds.compressed;
 
         let sealable = !extent.open_record;
@@ -440,8 +436,43 @@ impl Extents {
             extent.open_record = true;
         }
 
-        let mut append = append;
-        append.extent = place;
+        let pieces = if appending.pieces.is_empty() {
+            vec![AppendPiece {
+                holds: appending.holds,
+                crc: appending.crc,
+                bytes: appending.bytes.clone(),
+            }]
+        } else {
+            appending.pieces.clone()
+        };
+        let mut encrypted = Vec::with_capacity(pieces.len());
+        let mut piece_logical = logical_offset;
+        let mut piece_records = first_record;
+        for piece in pieces {
+            encrypted.push(Encrypted::encrypt(
+                daily_cache,
+                extent_cache,
+                process,
+                extent,
+                offset,
+                piece_logical,
+                piece_records,
+                appending.framing,
+                piece.crc,
+                piece.holds,
+                &piece.bytes,
+            )?);
+            piece_logical = piece_logical.plus(piece.holds.logical)?;
+            piece_records = piece_records.plus(piece.holds.records)?;
+        }
+        let append = Append {
+            extent: place,
+            offset,
+            logical: logical_offset,
+            first_record,
+            holds: appending.holds,
+            blocks: encrypted,
+        };
         self.appends.push(append);
 
         Ok(Took::Landed(Landed { offset, logical: logical_offset, first_record, records }))
@@ -475,20 +506,37 @@ impl Extents {
         }
 
         let extent = &mut self.extents[place];
-        let mut append = Append::encrypt(
-            daily_cache,
-            extent_cache,
-            process,
-            extent,
-            offset,
-            logical_offset,
-            first_record,
-            appending.framing,
-            appending.crc,
-            appending.holds,
-            &appending.bytes,
-        )?;
         let stored_len = appending.holds.compressed;
+
+        let pieces = if appending.pieces.is_empty() {
+            vec![AppendPiece {
+                holds: appending.holds,
+                crc: appending.crc,
+                bytes: appending.bytes.clone(),
+            }]
+        } else {
+            appending.pieces.clone()
+        };
+        let mut encrypted = Vec::with_capacity(pieces.len());
+        let mut piece_logical = logical_offset;
+        let mut piece_records = first_record;
+        for piece in pieces {
+            encrypted.push(Encrypted::encrypt(
+                daily_cache,
+                extent_cache,
+                process,
+                extent,
+                offset,
+                piece_logical,
+                piece_records,
+                appending.framing,
+                piece.crc,
+                piece.holds,
+                &piece.bytes,
+            )?);
+            piece_logical = piece_logical.plus(piece.holds.logical)?;
+            piece_records = piece_records.plus(piece.holds.records)?;
+        }
 
         let extent = &mut self.extents[place];
         extent.end = extent.end.max(offset.plus(stored_len)?);
@@ -500,7 +548,14 @@ impl Extents {
             extent.open_record = true;
         }
 
-        append.extent = place;
+        let append = Append {
+            extent: place,
+            offset,
+            logical: logical_offset,
+            first_record,
+            holds: appending.holds,
+            blocks: encrypted,
+        };
         self.appends.push(append);
 
         Ok(Applied::Stored)
@@ -594,27 +649,31 @@ impl Extents {
 
         let mut covered = ExtentCovered::default();
         let mut pieces: Vec<Piece> = Vec::new();
-        for block in &blocks[first..] {
-            let (crc, _framing, plain_bytes) =
-                block.decrypt(daily_cache, extent_cache, process, extent)?;
-            covered.took(block.holds.records, block.holds.logical, block.holds.compressed);
-            pieces.push(Piece {
-                logical: block.holds.logical,
-                first_record: block.first_record,
-                records: block.holds.records,
-                crc,
-                bytes: plain_bytes,
-            });
-            let is_open = block.holds.records == ERoff::ZERO && block.holds.logical > ELoff::ZERO;
-            if budget.met(&covered) && !is_open {
-                break;
+        'append: for append in &blocks[first..] {
+            for block in &append.blocks {
+                let (crc, _framing, plain_bytes) =
+                    block.decrypt(daily_cache, extent_cache, process, extent)?;
+                covered.took(block.holds.records, block.holds.logical, block.holds.compressed);
+                pieces.push(Piece {
+                    logical: block.holds.logical,
+                    first_record: block.first_record,
+                    records: block.holds.records,
+                    crc,
+                    bytes: plain_bytes,
+                });
+                let is_open =
+                    block.holds.records == ERoff::ZERO && block.holds.logical > ELoff::ZERO;
+                if budget.met(&covered) && !is_open {
+                    break 'append;
+                }
             }
         }
 
         let last_piece = pieces.last().unwrap();
         covered.next =
             last_piece.first_record.plus(last_piece.records).expect("extent record position fits");
-        covered.more = first + pieces.len() < blocks.len();
+        let total_blocks: usize = blocks.iter().map(|append| append.blocks.len()).sum();
+        covered.more = first + pieces.len() < total_blocks;
         Ok(Some(Ranged { pieces, covered }))
     }
 
@@ -639,7 +698,9 @@ impl Extents {
         found
             .iter()
             .flat_map(|append| {
-                append.decrypt(daily_cache, extent_cache, process, extent).unwrap().2.into_iter()
+                append.blocks.iter().flat_map(|block| {
+                    block.decrypt(daily_cache, extent_cache, process, extent).unwrap().2.into_iter()
+                })
             })
             .collect()
     }
@@ -691,6 +752,8 @@ impl Disk {
             }
         }
 
+        // Holds.logical is canonical length-format size, so this limit is a
+        // format-independent upper bound on the decompressed append buffer.
         if appending.holds.logical.get() > process.cluster.extents.max_append_bytes {
             reply.send(Resp::error(
                 Status::BadRequest,
@@ -714,6 +777,27 @@ impl Disk {
         }
 
         self.try_append(process, mine, appending, reply)
+    }
+
+    fn force_seal(&self, sn: SnId, extent: ExtentId, created: TimeSec) -> Result<Filled> {
+        let mut held = self.held.lock().expect("extents");
+        let place = *held
+            .at
+            .get(&(sn, extent))
+            .ok_or_else(|| Error::new(format!("no extent {extent} of sn {sn}")))?;
+        let current = &mut held.extents[place];
+        if current.created != created {
+            return Err(Error::new("force-seal extent has the wrong creation second"));
+        }
+        if !current.sealed {
+            current.sealed = true;
+            self.sealed.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Filled {
+            records: current.records,
+            logical: current.logical_end,
+            compressed: current.end,
+        })
     }
 
     fn try_append(
@@ -1003,6 +1087,7 @@ impl Service for EN {
             Op::AppendExtent => self.append(process, request, reply),
             Op::ApplyAppend => reply.send(self.apply(process, request)),
             Op::ReadExtent => reply.send(self.read(process, &request)),
+            Op::ForceSealExtent => reply.send(self.force_seal(process, &request)),
             _ => reply.send(server::unbuilt(process, SERVES, &request)),
         }
     }
@@ -1039,6 +1124,44 @@ impl EN {
                 }
             }
             Err(e) => reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        }
+    }
+
+    fn force_seal(&self, process: &Process, request: &Req) -> Resp {
+        let (mut payload, rest) =
+            match structure(&request.args, Op::ForceSealExtent, "a force-seal request") {
+                Ok(value) => value,
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+            };
+        let en = match payload.en_id() {
+            Ok(value) => value,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        let disk = match payload.disk_id() {
+            Ok(value) => value,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        let sn = match payload.sn_id() {
+            Ok(value) => value,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        let extent = match payload.extent_id() {
+            Ok(value) => value,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        let created = match payload.time_sec() {
+            Ok(value) => value,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        if !rest.is_empty() || payload.done().is_err() {
+            return Resp::error(Status::BadRequest, "force-seal request has trailing arguments");
+        }
+        if en != EnId::new(process.entry.number()) {
+            return Resp::error(Status::BadRequest, "force-seal request reached the wrong EN");
+        }
+        match self.disk(disk).and_then(|disk| disk.force_seal(sn, extent, created)) {
+            Ok(filled) => Resp { id: 0, status: Status::Ok, args: filled.args() },
+            Err(e) => Resp::error(Status::BadRequest, e.to_string()),
         }
     }
 
@@ -1263,6 +1386,7 @@ mod tests {
             instances: Vec::new(),
             logical_offset: None,
             bytes: bytes.to_vec(),
+            pieces: Vec::new(),
         }
     }
 
@@ -1273,6 +1397,58 @@ mod tests {
             Took::Landed(landed) => landed,
             _ => panic!("should have landed"),
         }
+    }
+
+    #[test]
+    fn one_append_holds_multiple_encrypted_blocks() {
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
+        let first = b"one\n";
+        let second = b"two\n";
+        let first_holds = Holds::of(Framing::Lf, b"", first, first.len()).unwrap();
+        let second_holds = Holds::of(Framing::Lf, b"", second, second.len()).unwrap();
+        let total = Holds {
+            compressed: first_holds.compressed.plus(second_holds.compressed).unwrap(),
+            logical: first_holds.logical.plus(second_holds.logical).unwrap(),
+            records: first_holds.records.plus(second_holds.records).unwrap(),
+        };
+        let mut batch = block(0, 1, first);
+        batch.holds = total;
+        batch.pieces = vec![
+            common::wire::AppendPiece { holds: first_holds, crc: 0, bytes: first.to_vec() },
+            common::wire::AppendPiece { holds: second_holds, crc: 0, bytes: second.to_vec() },
+        ];
+        assert!(matches!(disk.take(&testing::process(), &batch, ROOM), Ok(Took::Landed(_))));
+        let held = disk.held.lock().unwrap();
+        assert_eq!(held.appends.len(), 1);
+        assert_eq!(held.appends[0].blocks.len(), 2);
+    }
+
+    #[test]
+    fn multi_block_append_is_all_or_nothing_when_extent_is_full() {
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
+        let first = b"one\n";
+        let second = b"two\n";
+        let first_holds = Holds::of(Framing::Lf, b"", first, first.len()).unwrap();
+        let second_holds = Holds::of(Framing::Lf, b"", second, second.len()).unwrap();
+        let batch = AppendBlock {
+            holds: Holds {
+                compressed: first_holds.compressed.plus(second_holds.compressed).unwrap(),
+                logical: first_holds.logical.plus(second_holds.logical).unwrap(),
+                records: first_holds.records.plus(second_holds.records).unwrap(),
+            },
+            pieces: vec![
+                common::wire::AppendPiece { holds: first_holds, crc: 0, bytes: first.to_vec() },
+                common::wire::AppendPiece { holds: second_holds, crc: 0, bytes: second.to_vec() },
+            ],
+            ..block(0, 2, first)
+        };
+        assert!(matches!(
+            disk.take(&testing::process(), &batch, ECoff::new(1)),
+            Ok(Took::Sealed { .. })
+        ));
+        assert!(disk.held.lock().unwrap().appends.is_empty());
     }
 
     #[test]

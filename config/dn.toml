@@ -10,6 +10,9 @@ self_hosted = true
 # rather than the rare one.
 info_entries = 10000
 
+# Maximum number of sealed source objects in one concatenate request.
+max_concat_sources = 1024
+
 # Threads answering requests off the read loop. Zero means one per core.
 [knobs]
 workers = 0

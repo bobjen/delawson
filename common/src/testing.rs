@@ -150,7 +150,7 @@ pub fn fe_config() -> FEConfig {
 pub fn dn_config() -> DNConfig {
     // Small on purpose, so §15.3.2's default exercises paging rather than the one
     // answer that fits everything.
-    DNConfig { knobs: knobs(), self_hosted: false, info_entries: 8 }
+    DNConfig { knobs: knobs(), self_hosted: false, info_entries: 8, max_concat_sources: 1024 }
 }
 
 pub fn sn_config() -> SNConfig {

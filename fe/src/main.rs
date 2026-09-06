@@ -34,7 +34,8 @@ use common::routing;
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::wire::{
-    AppendBlock, Arg, EnReceipt, Op, Receipt, Req, Resp, Status, StructWriter, structure,
+    AppendBlock, AppendPiece, Arg, EnReceipt, Op, Receipt, Req, Resp, Status, StructWriter,
+    structure,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -53,6 +54,7 @@ const SERVES: &[Op] = &[
     Op::SetExpiry,
     Op::CloneObject,
     Op::ConcatObjects,
+    Op::SealObject,
     Op::AppendRecord,
     Op::InsertRecord,
     Op::UpdateRecord,
@@ -65,7 +67,8 @@ const SERVES: &[Op] = &[
 
 /// What a DN can answer on its own. The rest of `SERVES` is here so that a client
 /// sending it is told it is unbuilt rather than misdirected.
-const FORWARDED: &[Op] = &[Op::CreateObject, Op::BatchCreate, Op::ObjectInfo, Op::BatchInfo];
+const FORWARDED: &[Op] =
+    &[Op::CreateObject, Op::BatchCreate, Op::ObjectInfo, Op::BatchInfo, Op::ConcatObjects];
 
 /// How many sealed extents an append will step over before giving up. More than one
 /// because other writers are filling extents at the same time; bounded because
@@ -145,8 +148,16 @@ struct Wanting {
     /// What the writer said the block holds: compressed size, logical size, records.
     /// Carried, never invented and never recomputed.
     holds: Holds,
+    tail: Vec<AppendPart>,
     tries: u32,
     reply: Reply,
+}
+
+#[derive(Clone)]
+struct AppendPart {
+    holds: Holds,
+    crc: u64,
+    body: Vec<u8>,
 }
 
 /// What the FE remembers about one stream. Nothing here is state in the sense that
@@ -250,6 +261,7 @@ impl Service for FE {
         match request.op {
             Op::AppendRecord => return self.append(process, &request, reply),
             Op::ReadRecord => return self.read(process, &request, reply),
+            Op::SealObject => return self.seal_object(process, &request, reply),
             _ => {}
         }
         if !FORWARDED.contains(&request.op) {
@@ -278,6 +290,155 @@ impl Service for FE {
 }
 
 impl FE {
+    /// Force the current tail extent closed, then close its stream and record the
+    /// final stream count at the DN. This is deliberately separate from extent
+    /// filling: an object may be closed while its last extent is only partly full.
+    fn seal_object(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Reply) {
+        let (mut payload, rest) =
+            match structure(&request.args, Op::SealObject, "a seal-object request") {
+                Ok(value) => value,
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            };
+        let path = match payload.text() {
+            Ok(path) => path,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        if !rest.is_empty() || payload.done().is_err() {
+            return reply
+                .send(Resp::error(Status::BadRequest, "seal-object has trailing arguments"));
+        }
+        let lookup_path = path.clone();
+        self.resolve(
+            process,
+            &lookup_path,
+            Expecting::whatever(),
+            None,
+            reply,
+            move |fe, process, located, reply| {
+                let cached = fe
+                    .streams
+                    .lock()
+                    .expect("streams")
+                    .get(&located.stream)
+                    .and_then(|s| s.open.clone());
+                if let Some(open) = cached {
+                    fe.force_seal(process, path, located, open, reply);
+                    return;
+                }
+                let mut payload = StructWriter::new();
+                payload.range_id(located.stream.range);
+                payload.stream_id(located.stream.stream);
+                payload.time_sec(located.stream.created);
+                let ask = Req::new(Op::OpenExtent).structure(payload);
+                let sn = format!("SN{}", located.sn);
+                let fe2 = Arc::clone(fe);
+                let path2 = path.clone();
+                let onward = Arc::clone(process);
+                let callback_process = Arc::clone(&onward);
+                if let Err(e) = onward.ask(&sn, &ask, move |answer| {
+                    let Some(open) = (answer.status == Status::Ok)
+                        .then(|| Open::of(located.sn, located.framing, &answer.args))
+                        .flatten()
+                    else {
+                        return reply.send(answer);
+                    };
+                    fe2.force_seal(&callback_process, path2, located, open, reply);
+                }) {
+                    logw!("could not reach an SN", "sn {sn},{e}");
+                }
+            },
+        );
+    }
+
+    fn force_seal(
+        self: &Arc<Self>,
+        process: &Arc<Process>,
+        path: String,
+        located: Located,
+        open: Open,
+        reply: Reply,
+    ) {
+        let Some(&(en, disk)) = open.disks.first() else {
+            return reply.send(Resp::error(Status::Internal, "the open extent has no primary"));
+        };
+        let mut payload = StructWriter::new();
+        payload.en_id(en);
+        payload.disk_id(disk);
+        payload.sn_id(open.sn);
+        payload.extent_id(open.id);
+        payload.time_sec(open.created);
+        let ask = Req::new(Op::ForceSealExtent).structure(payload);
+        let fe = Arc::clone(self);
+        let onward = Arc::clone(process);
+        let callback_process = Arc::clone(&onward);
+        if let Err(e) = onward.ask(&format!("EN{en}"), &ask, move |answer| {
+            if answer.status != Status::Ok {
+                return reply.send(answer);
+            }
+            let (filled, _rest) = match Filled::of_args(&answer.args) {
+                Ok(value) if value.1.is_empty() => value,
+                _ => {
+                    return reply
+                        .send(Resp::error(Status::Internal, "force-seal returned no totals"));
+                }
+            };
+            let mut payload = StructWriter::new();
+            payload.range_id(located.stream.range);
+            payload.stream_id(located.stream.stream);
+            payload.time_sec(located.stream.created);
+            payload.extent_id(open.id);
+            payload.eroff(filled.records);
+            payload.eloff(filled.logical);
+            payload.ecoff(filled.compressed);
+            let seal = Req::new(Op::SealStream).structure(payload);
+            let stream = located.stream;
+            let fe2 = Arc::clone(&fe);
+            let sn = format!("SN{}", located.sn);
+            let onward = Arc::clone(&callback_process);
+            let stream_process = Arc::clone(&onward);
+            if let Err(e) = onward.ask(&sn, &seal, move |answer| {
+                if answer.status != Status::Ok {
+                    return reply.send(answer);
+                }
+                let (mut payload, rest) =
+                    match structure(&answer.args, Op::NumberResp, "a sealed-stream response") {
+                        Ok(value) => value,
+                        Err(e) => return reply.send(Resp::error(Status::Internal, e.to_string())),
+                    };
+                let records = match payload.number_u64().and_then(SRoff::of_number) {
+                    Ok(records) if rest.is_empty() && payload.done().is_ok() => records,
+                    _ => {
+                        return reply.send(Resp::error(
+                            Status::Internal,
+                            "sealed-stream returned no record count",
+                        ));
+                    }
+                };
+                if let Some(state) = fe2.streams.lock().expect("streams").get_mut(&stream) {
+                    if let Some(mut old) = state.open.take() {
+                        old.records =
+                            ERoff::of_number(records.number()).expect("stream records fit");
+                        state.remember(old);
+                    }
+                }
+                let mut payload = StructWriter::new();
+                payload.text(&path);
+                payload.stream_id(stream.stream);
+                payload.sroff(records);
+                let ask = Req::new(Op::SealObject).structure(payload);
+                if let Err(e) =
+                    stream_process
+                        .ask(&format!("DN{}", located.dn), &ask, move |answer| reply.send(answer))
+                {
+                    logw!("could not reach a DN", "dn {},{e}", located.dn);
+                }
+            }) {
+                logw!("could not reach an SN", "sn {sn},{e}");
+            }
+        }) {
+            logw!("could not reach an EN", "en {en},{e}");
+        }
+    }
     fn new(config: FEConfig) -> FE {
         FE { config, streams: Mutex::new(HashMap::new()) }
     }
@@ -395,7 +556,7 @@ impl FE {
     /// An append: resolve the name — making the object if it is not there — find the
     /// extent, and hand the bytes to its primary.
     fn append(self: &Arc<Self>, process: &Arc<Process>, request: &Req, mut reply: Reply) {
-        let (path, expect, framing, crc, holds, body) = {
+        let (path, expect, framing, crc, holds, body, tail) = {
             let (mut payload, rest) =
                 match structure(&request.args, Op::AppendRecord, "an append request") {
                     Ok(value) => value,
@@ -439,18 +600,29 @@ impl FE {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                 }
             };
-            let holds = match Holds::read(&mut payload) {
-                Ok(holds) => holds,
-                Err(e) => {
-                    return reply.send(Resp::error(Status::BadRequest, e.to_string()));
+            let count = match payload.number_u32() {
+                Ok(count) if count > 0 => count,
+                Ok(_) => {
+                    return reply.send(Resp::error(Status::BadRequest, "an append has no blocks"));
                 }
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
             };
-            let body = match payload.bytes() {
-                Ok(body) => body,
-                Err(e) => {
-                    return reply.send(Resp::error(Status::BadRequest, e.to_string()));
-                }
-            };
+            let mut parts = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let holds = match Holds::read(&mut payload) {
+                    Ok(holds) => holds,
+                    Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+                };
+                let crc = match payload.number_u64() {
+                    Ok(crc) => crc,
+                    Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+                };
+                let body = match payload.bytes() {
+                    Ok(body) => body,
+                    Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+                };
+                parts.push(AppendPart { holds, crc, body });
+            }
             if let Err(e) = payload.done() {
                 return reply.send(Resp::error(Status::BadRequest, e.to_string()));
             }
@@ -460,7 +632,8 @@ impl FE {
                     "an append request has trailing arguments",
                 ));
             }
-            (path, expect, framing, crc, holds, body)
+            let first = parts.remove(0);
+            (path, expect, framing, crc, first.holds, first.body, parts)
         };
         reply.about(format_args!("{path},bytes {},logical {}", body.len(), holds.logical));
         let named = path.clone();
@@ -489,6 +662,7 @@ impl FE {
                     crc,
                     body,
                     holds,
+                    tail,
                     tries: TRIES,
                     reply,
                 };
@@ -621,9 +795,19 @@ impl FE {
     /// with them: the primary is what counts the records and what broadcasts to the
     /// others, and the SN is not in this path to be asked again.
     fn to_primary(self: &Arc<Self>, process: &Arc<Process>, wanting: Wanting, open: Open) {
-        let Wanting { path, located, framing, crc, body, holds, tries, reply } = wanting;
+        let Wanting { path, located, framing, crc, body, holds, tail, tries, reply } = wanting;
         let identity = format!("EN{}", open.disks[0].0);
         // One shape, built and read in `common`, so neither side counts positions.
+        let mut pieces = vec![AppendPiece {
+            holds,
+            crc: if crc == 0 { 0 } else { common::crc::of(&body) },
+            bytes: body.clone(),
+        }];
+        pieces.extend(tail.iter().cloned().map(|part| AppendPiece {
+            holds: part.holds,
+            crc: part.crc,
+            bytes: part.body,
+        }));
         let ask = AppendBlock {
             sn: open.sn,
             extent: open.id,
@@ -634,6 +818,7 @@ impl FE {
             logical_offset: None,
             instances: open.disks.clone(),
             bytes: body.clone(),
+            pieces,
         }
         .request(open.disks[0].0, open.disks[0].1, Op::AppendExtent);
         let named = identity.clone();
@@ -641,9 +826,11 @@ impl FE {
         let onward = Arc::clone(process);
         let asked = process.ask(&identity, &ask, move |answer| {
             if answer.status == Status::Sealed {
-                let wanting = Wanting { path, located, framing, crc, body, holds, tries, reply };
+                let wanting =
+                    Wanting { path, located, framing, crc, body, holds, tail, tries, reply };
                 return fe.after_seal(&onward, wanting, open, answer);
             }
+            let _ = (path, framing, crc, tries, onward, fe);
             reply.send(receipt(&located, &open, answer));
         });
         if let Err(e) = asked {
@@ -706,7 +893,7 @@ impl FE {
                     ));
                 }
             };
-        let Wanting { path, located, framing, crc, body, holds, tries, reply } = wanting;
+        let Wanting { path, located, framing, crc, body, holds, tail, tries, reply } = wanting;
         // Nothing may hand out an extent of a stream that will take no more, and what
         // is remembered about it is no use to an append either.
         self.streams.lock().expect("streams").remove(&located.stream);
@@ -733,7 +920,8 @@ impl FE {
                     format!("{path} was extended and is still on stream {}", next.stream),
                 ));
             }
-            let wanting = Wanting { path, located: next, framing, crc, body, holds, tries, reply };
+            let wanting =
+                Wanting { path, located: next, framing, crc, body, holds, tail, tries, reply };
             fe.somewhere(&onward, wanting, None);
         });
         if let Err(e) = asked {
@@ -1588,7 +1776,7 @@ impl FE {
     /// one DN is invisible and with two loses half the objects.
     fn destination<'a>(&self, process: &'a Process, request: &Req) -> Result<&'a str> {
         match request.op {
-            Op::CreateObject | Op::ObjectInfo | Op::BatchInfo => {
+            Op::CreateObject | Op::ObjectInfo | Op::BatchInfo | Op::ConcatObjects => {
                 process.owner(ServiceKind::Dn, &first(request))
             }
             // A batch create reaching here is one DN's worth: `FE::create` has already
@@ -1790,6 +1978,11 @@ fn first(request: &Req) -> String {
                     let _ = payload.number_u64()?;
                     payload.text()
                 })
+                .unwrap_or_default()
+        }
+        Some(Arg::Struct(Op::ConcatObjects, _bytes, _)) => {
+            structure(&request.args, Op::ConcatObjects, "a concat-objects request")
+                .and_then(|(mut payload, _)| payload.text())
                 .unwrap_or_default()
         }
         _ => String::new(),
@@ -2401,6 +2594,7 @@ mod tests {
         assert!(fe.defers(Op::CreateObject));
         assert!(fe.defers(Op::BatchInfo));
         assert!(fe.defers(Op::BatchCreate));
+        assert!(fe.defers(Op::ConcatObjects));
         assert!(!fe.defers(Op::Ping));
         // Only control operations are inline; everything that talks to another process goes to workers.
         assert!(fe.inline(Op::Ping));
@@ -2411,6 +2605,7 @@ mod tests {
         assert!(!fe.inline(Op::CreateObject));
         assert!(!fe.inline(Op::BatchInfo));
         assert!(!fe.inline(Op::BatchCreate));
+        assert!(!fe.inline(Op::ConcatObjects));
     }
 
     /// An unbuilt operation is still one FE is the right place to send.

@@ -213,6 +213,28 @@ mod tests {
         assert!(Holds::of(Framing::Lf, b"", b"one\ntw", 6).is_err());
     }
 
+    #[test]
+    fn logical_limit_uses_the_default_length_format_for_every_framing() {
+        let blocks = [
+            (Framing::Nul, b"one\0two\0three\0".as_slice()),
+            (Framing::Lf, b"one\ntwo\nthree\n".as_slice()),
+            (Framing::CrLf, b"one\r\ntwo\r\nthree\r\n".as_slice()),
+            (
+                Framing::Length,
+                &[
+                    3, 0, 0, 0, b'o', b'n', b'e', 3, 0, 0, 0, b't', b'w', b'o', 5, 0, 0, 0, b't',
+                    b'h', b'r', b'e', b'e',
+                ],
+            ),
+        ];
+        let logical: Vec<_> = blocks
+            .iter()
+            .map(|(framing, block)| Holds::of(*framing, b"", block, block.len()).unwrap().logical)
+            .collect();
+        assert!(logical.iter().all(|size| *size == logical[0]));
+        assert_eq!(logical[0], ELoff::new(23));
+    }
+
     /// A logical length that does not match what was stored, for a block nothing
     /// compressed, is a claim the bytes contradict.
     #[test]

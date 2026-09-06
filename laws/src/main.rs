@@ -10,7 +10,7 @@ mod client;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use client::{Conn, Stats, Tally};
-use common::block::{Holds, expand, squeeze};
+use common::block::{APPEND_OVERHEAD, Holds, expand, squeeze};
 use common::config::Compress;
 use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
@@ -361,8 +361,21 @@ enum Cmd {
         /// answering about something else (§17.36).
         #[arg(long)]
         expect: Option<String>,
+        /// Force the object closed after this append becomes durable.
+        #[arg(long)]
+        seal: bool,
         #[command(flatten)]
         body: Body,
+    },
+    /// Force an object's current tail stream closed, including its partial extent.
+    Seal { path: String },
+    /// Append an already framed block from a file. Intended for large-object tests.
+    AppendBlock {
+        path: String,
+        #[arg(long, default_value = "nul")]
+        framing: String,
+        #[arg(long)]
+        file: PathBuf,
     },
     /// Insert a record into a keyed object.
     Insert {
@@ -714,6 +727,17 @@ fn run(cli: Cli) -> Result<()> {
             let target = resolve(&cluster, &cli, serves(cmd))?;
             let answer = open(&target, timeout, &cluster.messaging)?.call(&request)?;
             match (cmd, request.op) {
+                (Cmd::Append { path, seal: true, .. }, Op::AppendRecord) => {
+                    receipt(&target, &answer)?;
+                    if answer.status == Status::Ok {
+                        let mut payload = common::wire::StructWriter::new();
+                        payload.text(path);
+                        let closed = Req::new(Op::SealObject).structure(payload);
+                        let answer = open(&target, timeout, &cluster.messaging)?.call(&closed)?;
+                        report(&target, &answer)?;
+                    }
+                    Ok(())
+                }
                 (_, Op::AppendRecord) => receipt(&target, &answer),
                 // The client asked for a record and gets the block holding it, so it
                 // needs its own question back to find the record in it.
@@ -1210,6 +1234,79 @@ fn frame(framing: Framing, record: &[u8]) -> Result<Vec<u8>> {
     let mut framed = record.to_vec();
     framed.extend_from_slice(mark);
     Ok(framed)
+}
+
+/// Compress one logical append into independently readable pieces. The enclosing
+/// request may be large, but no stored piece exceeds EN's one-megabyte read unit.
+fn append_parts(framing: Framing, block: &[u8]) -> Result<Vec<(Holds, Vec<u8>, u64)>> {
+    const COMPRESSED_TARGET: usize = 1 << 20;
+    let logical_target = estimated_logical_target(block, COMPRESSED_TARGET);
+    if block.len() > logical_target && likely_fits(block, COMPRESSED_TARGET) {
+        let stored = squeeze(Compress::Lz4, block).unwrap_or_else(|| block.to_vec());
+        if stored.len() + APPEND_OVERHEAD <= COMPRESSED_TARGET {
+            return Ok(vec![(
+                Holds::of(framing, b"", block, stored.len())?,
+                stored,
+                common::crc::of(block),
+            )]);
+        }
+    }
+    let mut parts = Vec::new();
+    let mut at = 0;
+    while at < block.len() {
+        let mut end = (at + logical_target).min(block.len());
+        let mut used = framing.measure(&block[at..end]).1;
+        // If the estimate landed inside a record, include bytes through the next
+        // boundary. A large record is therefore kept whole rather than forcing a
+        // later reader to reconstruct it from adjacent pieces.
+        while used == 0 && end < block.len() {
+            end = (end + logical_target / 4).min(block.len());
+            used = framing.measure(&block[at..end]).1;
+        }
+        if used == 0 {
+            return Err(Error::new("append does not end on a complete record"));
+        }
+        end = at + used;
+        let plain = &block[at..end];
+        let stored = squeeze(Compress::Lz4, plain).unwrap_or_else(|| plain.to_vec());
+        let holds = Holds::of(framing, b"", plain, stored.len())?;
+        parts.push((holds, stored, common::crc::of(plain)));
+        at = end;
+    }
+    Ok(parts)
+}
+
+fn likely_fits(block: &[u8], limit: usize) -> bool {
+    const SAMPLE: usize = 64 * 1024;
+    if block.len() <= SAMPLE {
+        return true;
+    }
+    let piece = SAMPLE / 8;
+    let mut sample = Vec::with_capacity(SAMPLE);
+    for n in 0..8 {
+        let at = n * (block.len() - piece) / 7;
+        sample.extend_from_slice(&block[at..at + piece]);
+    }
+    let compressed = squeeze(Compress::Lz4, &sample).map_or(sample.len(), |bytes| bytes.len());
+    compressed.saturating_mul(block.len()) / sample.len() + APPEND_OVERHEAD <= limit
+}
+
+fn estimated_logical_target(block: &[u8], compressed_target: usize) -> usize {
+    const SAMPLE: usize = 64 * 1024;
+    const MINIMUM: usize = 256 * 1024;
+    const MAXIMUM: usize = 8 * 1024 * 1024;
+    if block.len() <= SAMPLE {
+        return block.len();
+    }
+    let piece = SAMPLE / 8;
+    let mut sample = Vec::with_capacity(SAMPLE);
+    for n in 0..8 {
+        let at = n * (block.len() - piece) / 7;
+        sample.extend_from_slice(&block[at..at + piece]);
+    }
+    let compressed = squeeze(Compress::Lz4, &sample).map_or(sample.len(), |bytes| bytes.len());
+    let target = compressed_target.saturating_mul(sample.len()) / compressed.max(1);
+    target.clamp(MINIMUM, MAXIMUM)
 }
 
 /// What an append answers: where the bytes went, once a quorum of instances had
@@ -1908,7 +2005,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
             Req::new(Op::ConcatObjects).structure(payload)
         }
 
-        Cmd::Append { path, framing, crc, body, expect } => {
+        Cmd::Append { path, framing, crc, body, expect, .. } => {
             let framing = Framing::parse(framing)?;
             let (kind, width) = framing.wire();
             let block = frame(framing, &body.bytes()?)?;
@@ -1920,8 +2017,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
             // Compressed here and nowhere below: the client is as far upstream as
             // compression goes, so the bytes are smaller across the internet and no
             // tier in the middle spends CPU on them.
-            let stored = squeeze(Compress::Lz4, &block).unwrap_or_else(|| block.clone());
-            let holds = Holds::of(framing, b"", &block, stored.len())?;
+            let parts = append_parts(framing, &block)?;
 
             let mut payload = common::wire::StructWriter::new();
             payload.text(path);
@@ -1929,8 +2025,38 @@ fn build(cmd: &Cmd) -> Result<Req> {
             payload.number_u8(kind);
             payload.number_u32(width);
             payload.number_u64(checksum);
-            holds.write(&mut payload);
-            payload.bytes(&stored);
+            payload.number_u32(parts.len() as u32);
+            for (holds, stored, piece_crc) in parts {
+                holds.write(&mut payload);
+                payload.number_u64(if *crc { piece_crc } else { 0 });
+                payload.bytes(&stored);
+            }
+            Req::new(Op::AppendRecord).structure(payload)
+        }
+        Cmd::Seal { path } => {
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            Req::new(Op::SealObject).structure(payload)
+        }
+        Cmd::AppendBlock { path, framing, file } => {
+            let framing = Framing::parse(framing)?;
+            let block = std::fs::read(file)
+                .map_err(|e| Error::new(format!("reading append block {}: {e}", file.display())))?;
+            framing.whole(&block)?;
+            let (kind, width) = framing.wire();
+            let parts = append_parts(framing, &block)?;
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(path);
+            expecting(&None)?.write(&mut payload);
+            payload.number_u8(kind);
+            payload.number_u32(width);
+            payload.number_u64(0);
+            payload.number_u32(parts.len() as u32);
+            for (holds, stored, _piece_crc) in parts {
+                holds.write(&mut payload);
+                payload.number_u64(0);
+                payload.bytes(&stored);
+            }
             Req::new(Op::AppendRecord).structure(payload)
         }
         Cmd::Insert { path, key, body } => {

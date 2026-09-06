@@ -39,7 +39,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 /// Refuse a message larger than this rather than allocating what a peer asks for.
-pub const MAX_FRAME_BYTES: usize = 1 << 20;
+/// Large enough for one 32 MiB logical append plus its per-piece wire metadata.
+/// Append payloads still contain independently compressed pieces so EN never
+/// has to read a compressed block larger than its 1 MiB read unit.
+pub const MAX_FRAME_BYTES: usize = 64 << 20;
 
 /// Refuse a message whose tagged structures would require deeper parsing than
 /// this. The sender includes its observed maximum so this can be rejected before
@@ -66,7 +69,7 @@ where
 
 /// And a batch of them is sealed in pieces no larger than this, so one busy
 /// connection cannot make the far side allocate without bound.
-pub const MAX_SEGMENT_BYTES: usize = 8 << 20;
+pub const MAX_SEGMENT_BYTES: usize = 64 << 20;
 
 /// A request whose arguments are one self-contained command payload uses the
 /// request's Op as its tag, so it does not repeat that tag inside the payload.
@@ -206,6 +209,12 @@ ops! {
     SnKeyResp = 66, "sn-key-response";
     ExtentCoveredResp = 67, "extent-covered-response";
     ObjectCoveredResp = 68, "object-covered-response";
+    // Copy two sealed streams' extent references into an already-created destination stream.
+    ConcatStreams = 69, "concat-streams";
+    // Explicitly close the current object tail, including its partially filled extent.
+    ForceSealExtent = 70, "force-seal-extent";
+    SealStream = 71, "seal-stream";
+    SealObject = 72, "seal-object";
 }
 
 impl std::fmt::Display for Op {
@@ -802,6 +811,16 @@ pub struct AppendBlock {
     pub instances: Vec<(EnId, DiskId)>,
     /// The block as stored: compressed, unless compressing it did not help.
     pub bytes: Vec<u8>,
+    /// Compressed pieces belonging to this atomic append. Empty means the
+    /// legacy single-piece fields above are being used.
+    pub pieces: Vec<AppendPiece>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendPiece {
+    pub holds: crate::block::Holds,
+    pub crc: u64,
+    pub bytes: Vec<u8>,
 }
 
 /// The receipt a primary EN returns to FE after an append is durable. FE turns
@@ -965,7 +984,17 @@ impl AppendBlock {
             payload.en_id(*en);
             payload.disk_id(*disk);
         }
-        payload.bytes(&self.bytes);
+        let pieces = if self.pieces.is_empty() {
+            vec![AppendPiece { holds: self.holds, crc: self.crc, bytes: self.bytes.clone() }]
+        } else {
+            self.pieces.clone()
+        };
+        payload.number_u32(pieces.len() as u32);
+        for piece in pieces {
+            piece.holds.write(&mut payload);
+            payload.number_u64(piece.crc);
+            payload.bytes(&piece.bytes);
+        }
         request.args.push(payload.finish(op));
         request
     }
@@ -983,7 +1012,7 @@ impl AppendBlock {
         let kind = payload.number_u8()?;
         let width = payload.number_u32()?;
         let crc = payload.number_u64()?;
-        let holds = crate::block::Holds {
+        let _legacy_holds = crate::block::Holds {
             compressed: payload.ecoff()?,
             logical: payload.eloff()?,
             records: payload.eroff()?,
@@ -995,8 +1024,28 @@ impl AppendBlock {
         for _ in 0..count {
             instances.push((payload.en_id()?, payload.disk_id()?));
         }
-        let bytes = payload.bytes()?;
+        let count = payload.number_u32()?;
+        if count == 0 {
+            return Err(Error::new("an append block has no pieces"));
+        }
+        let mut pieces = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            pieces.push(AppendPiece {
+                holds: crate::block::Holds::read(&mut payload)?,
+                crc: payload.number_u64()?,
+                bytes: payload.bytes()?,
+            });
+        }
         payload.done()?;
+        let mut pieces_iter = pieces.iter();
+        let first = pieces_iter.next().expect("piece count checked").holds;
+        let holds = pieces_iter.try_fold(first, |total, piece| -> Result<crate::block::Holds> {
+            Ok(crate::block::Holds {
+                compressed: total.compressed.plus(piece.holds.compressed)?,
+                logical: total.logical.plus(piece.holds.logical)?,
+                records: total.records.plus(piece.holds.records)?,
+            })
+        })?;
         Ok((
             en,
             disk,
@@ -1009,7 +1058,8 @@ impl AppendBlock {
                 holds,
                 instances,
                 logical_offset: has_logical.then_some(logical),
-                bytes,
+                bytes: pieces.first().map_or_else(Vec::new, |piece| piece.bytes.clone()),
+                pieces,
             },
         ))
     }
@@ -1520,6 +1570,15 @@ mod tests {
                 (EnId::new(1), DiskId::new(0)),
             ],
             bytes: b"squeezed".to_vec(),
+            pieces: vec![AppendPiece {
+                holds: crate::block::Holds {
+                    compressed: crate::offset::ECoff::new(8 + crate::block::APPEND_OVERHEAD as u32),
+                    logical: crate::offset::ELoff::new(10),
+                    records: crate::offset::ERoff::new(2),
+                },
+                crc: 0xae8b_1486_0a79_9888,
+                bytes: b"squeezed".to_vec(),
+            }],
         };
         let en = EnId::new(2);
         let disk = DiskId::new(1);
@@ -1542,7 +1601,15 @@ mod tests {
         assert_eq!(read_block, onward);
 
         let holds = crate::block::Holds { compressed: crate::offset::ECoff::ZERO, ..block.holds };
-        let bare = AppendBlock { holds, ..block };
+        let bare = AppendBlock {
+            holds,
+            pieces: vec![AppendPiece {
+                holds,
+                crc: 0xae8b_1486_0a79_9888,
+                bytes: b"squeezed".to_vec(),
+            }],
+            ..block
+        };
         let (_, _, read) = AppendBlock::of(&bare.request(en, disk, Op::AppendExtent)).unwrap();
         assert_eq!(read.holds.compressed, crate::offset::ECoff::ZERO);
         assert_eq!(
@@ -1550,6 +1617,44 @@ mod tests {
             crate::offset::ELoff::new(10),
             "what it holds survives either way"
         );
+    }
+
+    #[test]
+    fn multiple_append_pieces_survive_the_wire() {
+        let first = crate::block::Holds {
+            compressed: crate::offset::ECoff::new(50),
+            logical: crate::offset::ELoff::new(12),
+            records: crate::offset::ERoff::new(2),
+        };
+        let second = crate::block::Holds {
+            compressed: crate::offset::ECoff::new(60),
+            logical: crate::offset::ELoff::new(16),
+            records: crate::offset::ERoff::new(3),
+        };
+        let block = AppendBlock {
+            sn: SnId::new(3),
+            extent: ExtentId::new(17),
+            created: TimeSec::new(1_000_000),
+            framing: crate::framing::Framing::Lf,
+            crc: 99,
+            holds: crate::block::Holds {
+                compressed: crate::offset::ECoff::new(110),
+                logical: crate::offset::ELoff::new(28),
+                records: crate::offset::ERoff::new(5),
+            },
+            logical_offset: Some(crate::offset::ELoff::new(7)),
+            instances: Vec::new(),
+            bytes: b"one".to_vec(),
+            pieces: vec![
+                AppendPiece { holds: first, crc: 11, bytes: b"one".to_vec() },
+                AppendPiece { holds: second, crc: 22, bytes: b"two".to_vec() },
+            ],
+        };
+        let (_, _, read) =
+            AppendBlock::of(&block.request(EnId::new(2), DiskId::new(1), Op::ApplyAppend)).unwrap();
+        assert_eq!(read, block);
+        assert_eq!(read.pieces.len(), 2);
+        assert_eq!(read.holds.compressed, crate::offset::ECoff::new(110));
     }
 
     #[test]

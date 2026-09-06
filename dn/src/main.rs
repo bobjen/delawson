@@ -48,11 +48,17 @@ const SERVES: &[Op] = &[
     Op::SetExpiry,
     Op::CloneObject,
     Op::ConcatObjects,
+    Op::SealObject,
     Op::Count,
     Op::TimeRange,
 ];
 
 const SHARDS: usize = 64;
+
+/// A single open stream can grow to just under 2^62 records. Do not create one
+/// above this point, so the object's record offset remains representable even
+/// though the stream itself does not need to know the object's total.
+const OPEN_STREAM_RECORD_LIMIT: u64 = 3 * (1u64 << 62);
 
 const BATCH_ANSWERS: u64 = Detail::Streams.bit() | Detail::Counts.bit();
 
@@ -599,6 +605,8 @@ impl Service for DN {
                 | Op::BatchInfo
                 | Op::LocateStream
                 | Op::ExtendObject
+                | Op::ConcatObjects
+                | Op::SealObject
         )
     }
 
@@ -659,6 +667,8 @@ impl Service for DN {
                 self.info(process, &request, Some(record), reply)
             }
             Op::ExtendObject => self.extend(process, &request, reply),
+            Op::ConcatObjects => self.concat_objects(process, &request, reply),
+            Op::SealObject => self.seal_object(&request, reply),
             Op::BatchInfo => reply.send(self.info_many(&request)),
             _ => reply.send(server::unbuilt(process, SERVES, &request)),
         }
@@ -675,6 +685,250 @@ impl Service for DN {
 }
 
 impl DN {
+    fn seal_object(&self, request: &Req, reply: Reply) {
+        let (mut payload, rest) =
+            match structure(&request.args, Op::SealObject, "a seal-object request") {
+                Ok(value) => value,
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            };
+        let name = match payload.text() {
+            Ok(name) => name,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        let stream = match payload.stream_id() {
+            Ok(stream) => stream,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        let records = match payload.sroff() {
+            Ok(records) => records,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        if !rest.is_empty() || payload.done().is_err() {
+            return reply
+                .send(Resp::error(Status::BadRequest, "seal-object has trailing arguments"));
+        }
+        let mut shard = self.shards[shard_of(&name)].lock().expect("objects");
+        let Some(object) = shard.get_mut(name.as_str()) else {
+            return reply.send(Resp::error(Status::NotFound, format!("no object {name}")));
+        };
+        let Some(last) = object.streams.last_mut() else {
+            return reply.send(Resp::error(Status::BadRequest, "object has no stream"));
+        };
+        if last.id != stream {
+            return reply
+                .send(Resp::error(Status::BadRequest, "seal-object named a non-tail stream"));
+        }
+        if last.records.is_none() {
+            last.records = records;
+        } else if last.records != records {
+            return reply
+                .send(Resp::error(Status::BadRequest, "seal-object record count disagrees"));
+        }
+        match object.args(self.mine, self.dn, None) {
+            Some(args) => reply.send(Resp { id: 0, status: Status::Ok, args }),
+            None => reply.send(Resp::error(Status::Internal, "sealed object has no description")),
+        }
+    }
+    /// Make a new object from sealed source objects. Source stream rows are copied
+    /// by reference; the new object gets one fresh, empty stream at the end so it
+    /// is immediately appendable but is not sealed.
+    fn concat_objects(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Reply) {
+        let (mut payload, rest) =
+            match structure(&request.args, Op::ConcatObjects, "a concat-objects request") {
+                Ok(value) => value,
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            };
+        let destination = match payload.text() {
+            Ok(name) => name,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        let count = match payload.number_u64() {
+            Ok(count) => count,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        if count < 2 {
+            return reply.send(Resp::error(
+                Status::BadRequest,
+                "concat requires at least two source objects",
+            ));
+        }
+        if count > self.config.max_concat_sources {
+            return reply.send(Resp::error(
+                Status::BadRequest,
+                format!(
+                    "concat has {count} sources, above the configured limit of {}",
+                    self.config.max_concat_sources
+                ),
+            ));
+        }
+        let count = match usize::try_from(count) {
+            Ok(count) => count,
+            Err(_) => {
+                return reply.send(Resp::error(
+                    Status::BadRequest,
+                    "concat source count does not fit this machine",
+                ));
+            }
+        };
+        let mut sources = match payload.checked_vec(count) {
+            Ok(sources) => sources,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        for _ in 0..count {
+            match payload.text() {
+                Ok(name) => sources.push(name),
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            }
+        }
+        if let Err(e) = payload.done() {
+            return reply.send(Resp::error(Status::BadRequest, e.to_string()));
+        }
+        if !rest.is_empty() {
+            return reply.send(Resp::error(
+                Status::BadRequest,
+                "a concat-objects request has trailing arguments",
+            ));
+        }
+
+        let destination_shard = shard_of(&destination);
+        let mut copied = Vec::new();
+        let mut records = ORoff::ZERO;
+        let mut framing = None;
+        let mut keyed = None;
+        for source in &sources {
+            if source == &destination {
+                return reply.send(Resp::error(
+                    Status::BadRequest,
+                    "concat destination must differ from its sources",
+                ));
+            }
+            let shard = self.shards[shard_of(source)].lock().expect("objects");
+            let Some(object) = shard.get(source.as_str()) else {
+                return reply.send(Resp::error(Status::NotFound, format!("no object {source}")));
+            };
+            if object.streams.is_empty()
+                || object.streams.iter().any(|stream| stream.records.is_none())
+            {
+                return reply.send(Resp::error(
+                    Status::BadRequest,
+                    format!("cannot concatenate open object {source}"),
+                ));
+            }
+            if let Some(expected) = framing {
+                if expected != object.framing {
+                    return reply.send(Resp::error(
+                        Status::BadRequest,
+                        "concat sources have different framing",
+                    ));
+                }
+            } else {
+                framing = Some(object.framing);
+            }
+            if let Some(expected) = keyed {
+                if expected != object.keyed {
+                    return reply.send(Resp::error(
+                        Status::BadRequest,
+                        "concat sources have different flavors",
+                    ));
+                }
+            } else {
+                keyed = Some(object.keyed);
+            }
+            let stream_count = copied.len().checked_add(object.streams.len());
+            if stream_count.map_or(true, |count| count as u64 > u32::MAX as u64) {
+                return reply.send(Resp::error(
+                    Status::BadRequest,
+                    "concat would exceed the stream-reference limit",
+                ));
+            }
+            records = match records.plus(object.records()) {
+                Ok(records) => records,
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            };
+            copied.extend(object.streams.iter().copied());
+        }
+        if records.number() >= OPEN_STREAM_RECORD_LIMIT {
+            return reply.send(Resp::error(
+                Status::BadRequest,
+                "concat would leave no representable room for its open stream",
+            ));
+        }
+
+        let sn = match process.pick(ServiceKind::Sn) {
+            Ok(sn) => sn.to_string(),
+            Err(e) => return reply.send(Resp::error(Status::Internal, e.to_string())),
+        };
+        let sn_number =
+            SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
+        let stream = StreamId::new(self.next_stream.fetch_add(1, Ordering::Relaxed) as u32);
+        let created = TimeSec::now();
+        {
+            let mut shard = self.shards[destination_shard].lock().expect("objects");
+            if shard.contains_key(destination.as_str()) {
+                return reply.send(Resp::error(
+                    Status::BadRequest,
+                    format!("{destination} exists already"),
+                ));
+            }
+            let object = Object {
+                id: ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32),
+                framing: framing.expect("at least two sources"),
+                streams: copied,
+                extending: true,
+                waiting: vec![reply],
+                keyed: keyed.expect("at least two sources"),
+                created,
+            };
+            shard.insert(destination.clone().into_boxed_str(), object);
+        }
+
+        let mut create = StructWriter::new();
+        create.number_u32(self.mine.get());
+        create.number_u32(stream.get());
+        create.number_u64(1);
+        create.number_u64(created.number());
+        let ask = Req::new(Op::CreateStream).structure(create);
+        let dn = Arc::clone(self);
+        let named = sn.clone();
+        let destination_name = destination.clone();
+        if let Err(e) = process.ask(&sn, &ask, move |answer| {
+            if answer.status != Status::Ok {
+                return dn.fail_concat(
+                    &destination_name,
+                    Resp::error(answer.status, format!("{named} would not make concat stream")),
+                );
+            }
+            dn.finish_concat(&destination_name, stream, sn_number);
+        }) {
+            self.fail_concat(&destination, Resp::error(Status::Internal, e.to_string()));
+        }
+    }
+
+    /// Complete the asynchronous stream creation behind an object concat.
+    fn finish_concat(&self, name: &str, stream: StreamId, sn: SnId) {
+        let mut shard = self.shards[shard_of(name)].lock().expect("objects");
+        let Some(object) = shard.get_mut(name) else { return };
+        object.streams.push(Stream::new(stream, sn, object.created));
+        object.extending = false;
+        self.objects.fetch_add(1, Ordering::Relaxed);
+        drop(shard);
+        self.wake(&[name.to_string()], None);
+    }
+
+    /// Remove a concat object that could not obtain its final stream and answer all
+    /// readers that were parked behind its creation.
+    fn fail_concat(&self, name: &str, failure: Resp) {
+        let waiters = self.shards[shard_of(name)]
+            .lock()
+            .expect("objects")
+            .remove(name)
+            .map(|object| object.waiting)
+            .unwrap_or_default();
+        for waiter in waiters {
+            waiter.send(failure.clone());
+        }
+    }
+
     /// `(name, keyed, framing kind, framing width)`, and one stream to go with it.
     fn create(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Reply) {
         // Only the first few arguments are the object; a create may carry more —
@@ -916,10 +1170,19 @@ impl DN {
                         self.parked.fetch_add(1, Ordering::Relaxed);
                         Next::Wait
                     } else if ours {
-                        object.extending = true;
                         // The sealed stream's count was just recorded above, so the object's
-                        // total is known and is where the next stream starts.
-                        Next::Ours(object.records())
+                        // total is known and is where the next stream starts. Reserve enough
+                        // headroom for the one open stream that is about to be added.
+                        let first_record = object.records();
+                        if first_record.number() >= OPEN_STREAM_RECORD_LIMIT {
+                            Next::Say(Resp::error(
+                                Status::BadRequest,
+                                "object has reached the open-stream record limit",
+                            ))
+                        } else {
+                            object.extending = true;
+                            Next::Ours(first_record)
+                        }
                     } else {
                         // Somebody else extended past it already, so whatever is last
                         // now is the answer.
