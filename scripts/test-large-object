@@ -42,7 +42,7 @@ laws=$root/target/release/laws
 block=$tmp/block
 python3 - "$block" <<'PY'
 import sys
-record = b"Doctor, sometimes I think all I do is take up space.\0"
+record = b"Doctor, sometimes I have the feeling that I'm not accomplishing anything other than taking up space\0"
 target = 32 * 1024 * 1024
 with open(sys.argv[1], "wb") as output:
     # Canonical logical length is body bytes plus four bytes per completed
@@ -55,9 +55,18 @@ path=/large-object
 block_bytes=$(stat -c '%s' "$block")
 blocks=$(( ((1 << 32) - 1) / block_bytes ))
 blocks=${LARGE_BLOCKS:-$blocks}
+parallel=${LARGE_PARALLEL:-4}
+((parallel > 0)) || { echo "large-object: LARGE_PARALLEL must be positive" >&2; exit 2; }
+running=0
 for ((n = 0; n < blocks; n++)); do
-    "$laws" --config "$config/cluster.toml" append-block "$path" --file "$block"
+    "$laws" --config "$config/cluster.toml" append-block "$path" --file "$block" &
+    running=$((running + 1))
+    if ((running >= parallel)); then
+        wait -n
+        running=$((running - 1))
+    fi
 done
+wait
 
 if [[ $phase == extent ]]; then
     echo "large-object: one-extent phase complete; inspecting the object"
@@ -68,15 +77,82 @@ fi
 # The final block is deliberately followed by the explicit forced seal, since the
 # extent is full by logical size while per_stream is intentionally very large.
 "$laws" --config "$config/cluster.toml" seal "$path"
+"$laws" --config "$config/cluster.toml" object-info "$path" --want extents >/dev/null
 
 source=$path
-for ((n = 0; n < 16; n++)); do
-    destination=/large-object-$((n + 1))
+destinations=(
+    /large-object/concat-2
+    /large-object/concat-6
+    /large-object/concat-7
+    /large-object/concat-9
+    /large-object/concat-10
+    /large-object/concat-11
+    /large-object/concat-12
+    /large-object/concat-22
+    /large-object/concat-28
+    /large-object/concat-32
+    /large-object/concat-37
+    /large-object/concat-38
+    /large-object/concat-53
+    /large-object/concat-60
+    /large-object/concat-61
+    /large-object/concat-62
+    /large-object/concat-63
+    /large-object/concat-66
+    /large-object/concat-71
+    /large-object/concat-73
+    /large-object/concat-75
+    /large-object/concat-83
+    /large-object/concat-85
+    /large-object/concat-87
+    /large-object/concat-89
+    /large-object/concat-91
+    /large-object/concat-95
+    /large-object/concat-96
+    /large-object/concat-97
+    /large-object/concat-102
+    /large-object/concat-104
+    /large-object/concat-105
+    /large-object/concat-107
+    /large-object/concat-111
+    /large-object/concat-113
+    /large-object/concat-116
+    /large-object/concat-120
+    /large-object/concat-124
+    /large-object/concat-125
+    /large-object/concat-126
+    /large-object/concat-128
+    /large-object/concat-130
+    /large-object/concat-131
+    /large-object/concat-132
+    /large-object/concat-133
+    /large-object/concat-135
+    /large-object/concat-136
+    /large-object/concat-138
+    /large-object/concat-140
+    /large-object/concat-141
+    /large-object/concat-145
+    /large-object/concat-149
+    /large-object/concat-150
+    /large-object/concat-154
+    /large-object/concat-155
+    /large-object/concat-156
+    /large-object/concat-157
+    /large-object/concat-165
+    /large-object/concat-173
+    /large-object/concat-175
+    /large-object/concat-179
+    /large-object/concat-181
+    /large-object/concat-182
+    /large-object/concat-184
+)
+for ((n = 0; n < ${#destinations[@]}; n++)); do
+    destination=${destinations[n]}
     if ! "$laws" --config "$config/cluster.toml" concat "$destination" "$source" "$source"; then
-        echo "large-object: concat stopped at iteration $n (the expected size limit)" >&2
+        echo "large-object: concat stopped at iteration $n (first error)" >&2
         exit 0
     fi
     "$laws" --config "$config/cluster.toml" seal "$destination"
     source=$destination
 done
-echo "large-object: reached the script's concat iteration bound without an error" >&2
+echo "large-object: reached the script's same-DN name bound without an error" >&2

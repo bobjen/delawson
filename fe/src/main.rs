@@ -372,14 +372,20 @@ impl FE {
         let onward = Arc::clone(process);
         let callback_process = Arc::clone(&onward);
         if let Err(e) = onward.ask(&format!("EN{en}"), &ask, move |answer| {
-            if answer.status != Status::Ok {
+            let empty = answer.status == Status::BadRequest
+                && answer.message().is_some_and(|message| message.starts_with("no extent "));
+            if answer.status != Status::Ok && !empty {
                 return reply.send(answer);
             }
-            let (filled, _rest) = match Filled::of_args(&answer.args) {
-                Ok(value) if value.1.is_empty() => value,
-                _ => {
-                    return reply
-                        .send(Resp::error(Status::Internal, "force-seal returned no totals"));
+            let filled = if empty {
+                Filled::default()
+            } else {
+                match Filled::of_args(&answer.args) {
+                    Ok((filled, [])) => filled,
+                    _ => {
+                        return reply
+                            .send(Resp::error(Status::Internal, "force-seal returned no totals"));
+                    }
                 }
             };
             let mut payload = StructWriter::new();

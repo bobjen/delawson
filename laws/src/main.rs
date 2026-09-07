@@ -1772,7 +1772,12 @@ fn report(target: &Target, response: &Resp) -> Result<()> {
     if response.status == Status::Ok {
         Ok(())
     } else {
-        Err(Error::new(format!("{} answered {}", target.identity, response.status)))
+        Err(Error::new(format!(
+            "{} answered {}: {}",
+            target.identity,
+            response.status,
+            response.message().unwrap_or_else(|| "no reason given".into())
+        )))
     }
 }
 

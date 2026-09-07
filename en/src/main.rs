@@ -70,6 +70,7 @@ impl DailyKeyCache {
         payload.sn_id(sn_id);
         payload.time_sec(ts);
         let ask = Req::new(Op::SnMasterKey).structure(payload);
+        let registrar = process.cluster.registrar()?.identity.clone();
         let key_cell = Arc::new(Mutex::new(None::<SnKey>));
         let key_cell2 = Arc::clone(&key_cell);
         let error_cell = Arc::new(Mutex::new(None));
@@ -78,7 +79,7 @@ impl DailyKeyCache {
         let cvar2 = Arc::clone(&cvar);
 
         process
-            .ask("KS", &ask, move |answer| {
+            .ask(&registrar, &ask, move |answer| {
                 let mut guard = cvar2.0.lock().expect("cvar");
                 if answer.status == Status::Ok {
                     match common::wire::SnKey::read(&answer.args) {

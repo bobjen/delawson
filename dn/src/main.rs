@@ -795,7 +795,8 @@ impl DN {
         let mut records = ORoff::ZERO;
         let mut framing = None;
         let mut keyed = None;
-        for source in &sources {
+        let mut single_streams = [None; 2];
+        for (source_number, source) in sources.iter().enumerate() {
             if source == &destination {
                 return reply.send(Resp::error(
                     Status::BadRequest,
@@ -834,6 +835,9 @@ impl DN {
             } else {
                 keyed = Some(object.keyed);
             }
+            if source_number < single_streams.len() && object.streams.len() == 1 {
+                single_streams[source_number] = Some(object.streams[0]);
+            }
             let stream_count = copied.len().checked_add(object.streams.len());
             if stream_count.map_or(true, |count| count as u64 > u32::MAX as u64) {
                 return reply.send(Resp::error(
@@ -850,8 +854,108 @@ impl DN {
         if records.number() >= OPEN_STREAM_RECORD_LIMIT {
             return reply.send(Resp::error(
                 Status::BadRequest,
-                "concat would leave no representable room for its open stream",
+                "concat would exceed the object record limit",
             ));
+        }
+
+        // Two one-stream objects on one SN can be represented by one new SN stream.
+        // This keeps the DN metadata bounded while the SN owns the growing extent list.
+        let optimized = if sources.len() == 2 {
+            match (single_streams[0], single_streams[1]) {
+                (Some(left), Some(right))
+                    if left.sn == right.sn
+                        && left.extents.is_some()
+                        && right.extents.is_some()
+                        && left.logical.is_some()
+                        && right.logical.is_some()
+                        && left.compressed.is_some()
+                        && right.compressed.is_some() =>
+                {
+                    let extents = left.extents.number().checked_add(right.extents.number());
+                    let logical = left.logical.plus(right.logical).ok();
+                    let compressed = left.compressed.plus(right.compressed).ok();
+                    match (extents, logical, compressed) {
+                        (Some(extents), Some(logical), Some(compressed))
+                            if extents < process.cluster.extents.per_stream as u64
+                                && extents <= ExtentId::MAX.number() =>
+                        {
+                            Some((left, right, ExtentId::new(extents as u32), logical, compressed))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some((left, right, extents, logical, compressed)) = optimized {
+            let sn = format!("SN{}", left.sn);
+            let sn_number = left.sn;
+            let stream = StreamId::new(self.next_stream.fetch_add(1, Ordering::Relaxed) as u32);
+            let created = TimeSec::now();
+            {
+                let mut shard = self.shards[destination_shard].lock().expect("objects");
+                if shard.contains_key(destination.as_str()) {
+                    return reply.send(Resp::error(
+                        Status::BadRequest,
+                        format!("{destination} exists already"),
+                    ));
+                }
+                shard.insert(
+                    destination.clone().into_boxed_str(),
+                    Object {
+                        id: ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32),
+                        framing: framing.expect("at least two sources"),
+                        streams: Vec::new(),
+                        extending: true,
+                        waiting: vec![reply],
+                        keyed: keyed.expect("at least two sources"),
+                        created,
+                    },
+                );
+            }
+
+            let destination_stream = StreamName { range: self.mine, stream, created };
+            let left_stream =
+                StreamName { range: self.mine, stream: left.id, created: left.created };
+            let right_stream =
+                StreamName { range: self.mine, stream: right.id, created: right.created };
+            let mut payload = StructWriter::new();
+            for name in [destination_stream, left_stream, right_stream] {
+                payload.range_id(name.range);
+                payload.stream_id(name.stream);
+                payload.time_sec(name.created);
+            }
+            payload.flag(false);
+            payload.flag(false);
+            let ask = Req::new(Op::ConcatStreams).structure(payload);
+            let dn = Arc::clone(self);
+            let destination_name = destination.clone();
+            let named = sn.clone();
+            if let Err(e) = process.ask(&sn, &ask, move |answer| {
+                if answer.status != Status::Ok {
+                    return dn.fail_concat(
+                        &destination_name,
+                        Resp::error(
+                            answer.status,
+                            format!("{named} would not concatenate streams"),
+                        ),
+                    );
+                }
+                dn.finish_concat_stream(
+                    &destination_name,
+                    stream,
+                    sn_number,
+                    extents,
+                    logical,
+                    compressed,
+                );
+            }) {
+                self.fail_concat(&destination, Resp::error(Status::Internal, e.to_string()));
+            }
+            return;
         }
 
         let sn = match process.pick(ServiceKind::Sn) {
@@ -909,6 +1013,33 @@ impl DN {
         let mut shard = self.shards[shard_of(name)].lock().expect("objects");
         let Some(object) = shard.get_mut(name) else { return };
         object.streams.push(Stream::new(stream, sn, object.created));
+        object.extending = false;
+        self.objects.fetch_add(1, Ordering::Relaxed);
+        drop(shard);
+        self.wake(&[name.to_string()], None);
+    }
+
+    /// Complete an object concat whose two source streams were combined by their SN.
+    fn finish_concat_stream(
+        &self,
+        name: &str,
+        stream: StreamId,
+        sn: SnId,
+        extents: ExtentId,
+        logical: SLoff,
+        compressed: SCoff,
+    ) {
+        let mut shard = self.shards[shard_of(name)].lock().expect("objects");
+        let Some(object) = shard.get_mut(name) else { return };
+        object.streams.push(Stream {
+            id: stream,
+            records: SRoff::NONE,
+            created: object.created,
+            logical,
+            compressed,
+            sn,
+            extents,
+        });
         object.extending = false;
         self.objects.fetch_add(1, Ordering::Relaxed);
         drop(shard);
@@ -1177,7 +1308,7 @@ impl DN {
                         if first_record.number() >= OPEN_STREAM_RECORD_LIMIT {
                             Next::Say(Resp::error(
                                 Status::BadRequest,
-                                "object has reached the open-stream record limit",
+                                "append would exceed the object record limit",
                             ))
                         } else {
                             object.extending = true;

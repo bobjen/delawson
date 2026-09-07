@@ -279,6 +279,9 @@ impl Naming {
 
 struct SN {
     config: SNConfig,
+    /// Maximum sealed extents one stream may hold, including extent references made by
+    /// concatenation rather than by appending.
+    per_stream: usize,
     /// This SN's own number, which every extent it creates records as its creator.
     ///
     /// ⚠️ **Held here rather than threaded through**, because §8.1.6.1 flags `close`'s
@@ -353,9 +356,10 @@ impl Service for SN {
 }
 
 impl SN {
-    fn new(config: SNConfig, mine: SnId, disks: Vec<(EnId, DiskId)>) -> SN {
+    fn new(config: SNConfig, per_stream: usize, mine: SnId, disks: Vec<(EnId, DiskId)>) -> SN {
         SN {
             config,
+            per_stream,
             mine,
             disks,
             shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
@@ -521,7 +525,15 @@ impl SN {
             .checked_add(right_stream.sealed.len())
             .ok_or_else(|| Error::new("concat-streams extent reference count overflow"));
         let extent_count = match extent_count {
-            Ok(count) if (count as u64) <= ExtentId::MAX.number() => count,
+            Ok(count) if count <= self.per_stream && (count as u64) <= ExtentId::MAX.number() => {
+                count
+            }
+            Ok(_) => {
+                return Resp::error(
+                    Status::BadRequest,
+                    "concat-streams would exceed the per-stream extent limit",
+                );
+            }
             _ => {
                 return Resp::error(
                     Status::BadRequest,
@@ -996,6 +1008,7 @@ fn main() {
         }
         Ok(SN::new(
             SNConfig::load(&process.config.service_config)?,
+            process.cluster.extents.per_stream,
             SnId::new(process.entry.number()),
             disks,
         ))
@@ -1084,7 +1097,12 @@ mod tests {
     }
 
     fn sn_with_stream(range: u32, stream: u32) -> SN {
-        let sn = SN::new(testing::sn_config(), SnId::new(0), default_disks());
+        let sn = SN::new(
+            testing::sn_config(),
+            testing::extents().per_stream,
+            SnId::new(0),
+            default_disks(),
+        );
         let made = sn.create(&Req::new(Op::CreateStream).structure({
             let mut payload = StructWriter::new();
             payload.range_id(RangeId::new(range));
@@ -1157,6 +1175,19 @@ mod tests {
         assert_eq!(
             destination.sealed[0].extent.id, destination.sealed[1].extent.id,
             "self-concat shares the same immutable extent"
+        );
+    }
+
+    #[test]
+    fn stream_concat_rejects_the_configured_per_stream_limit() {
+        let mut sn = sn_with_stream(0, 7);
+        sn.per_stream = 1;
+        seal_for_concat(&sn, named(0, 7));
+        let answer = sn.concat_streams(&concat_request(named(0, 9), named(0, 7), named(0, 7)));
+        assert_eq!(answer.status, Status::BadRequest);
+        assert_eq!(
+            answer.message().as_deref(),
+            Some("concat-streams would exceed the per-stream extent limit")
         );
     }
 
@@ -1240,7 +1271,12 @@ mod tests {
 
     #[test]
     fn an_extent_on_a_stream_that_does_not_exist_is_refused() {
-        let sn = SN::new(testing::sn_config(), SnId::new(0), default_disks());
+        let sn = SN::new(
+            testing::sn_config(),
+            testing::extents().per_stream,
+            SnId::new(0),
+            default_disks(),
+        );
         assert!(sn.open(named(0, 7), TimeSec::new(1_000_000), 4).is_err());
     }
 
