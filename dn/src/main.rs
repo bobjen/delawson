@@ -607,6 +607,14 @@ struct Gather {
     name: String,
 }
 
+struct BatchCountGather {
+    left: usize,
+    reply: Option<Reply>,
+    base: Vec<Arg>,
+    runs: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)>,
+    failed: Option<Resp>,
+}
+
 struct DN {
     config: DNConfig,
     /// This DN's own identity.
@@ -721,7 +729,7 @@ impl Service for DN {
             Op::ExtendObject => self.extend(process, &request, reply),
             Op::ConcatObjects => self.concat_objects(process, &request, reply),
             Op::SealObject => self.seal_object(&request, reply),
-            Op::BatchInfo => reply.send(self.info_many(&request)),
+            Op::BatchInfo => self.begin_info_many(process, &request, reply),
             _ => reply.send(server::unbuilt(process, SERVES, &request)),
         }
     }
@@ -1746,6 +1754,122 @@ impl DN {
         }
     }
 
+    /// Parse one batch-info request.
+    fn read_batch_info(request: &Req) -> Result<(Vec<String>, Want), Resp> {
+        let (mut payload, rest) =
+            structure(&request.args, Op::BatchInfo, "a batch-object-info request")
+                .map_err(|e| Resp::error(Status::BadRequest, e.to_string()))?;
+        let count =
+            payload.number_u64().map_err(|e| Resp::error(Status::BadRequest, e.to_string()))?
+                as usize;
+        let mut names = payload
+            .checked_vec(count)
+            .map_err(|e| Resp::error(Status::BadRequest, e.to_string()))?;
+        for _ in 0..count {
+            names.push(payload.text().map_err(|e| Resp::error(Status::BadRequest, e.to_string()))?);
+        }
+        let has_want =
+            payload.flag().map_err(|e| Resp::error(Status::BadRequest, e.to_string()))?;
+        let want = if has_want {
+            Want::read(&mut payload).map_err(|e| Resp::error(Status::BadRequest, e.to_string()))?
+        } else {
+            Want::plain()
+        };
+        payload.done().map_err(|e| Resp::error(Status::BadRequest, e.to_string()))?;
+        if !rest.is_empty() {
+            return Err(Resp::error(
+                Status::BadRequest,
+                "a batch-object-info request has trailing arguments",
+            ));
+        }
+        Ok((names, want))
+    }
+
+    /// Start a rich batch-info scatter.  The replies are intentionally not interpreted yet.
+    fn begin_info_many(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Reply) {
+        let (names, want) = match Self::read_batch_info(request) {
+            Ok(value) => value,
+            Err(answer) => return reply.send(answer),
+        };
+        let beyond = want.beyond(BATCH_ANSWERS);
+        if beyond.is_empty() {
+            return reply.send(self.info_many(request));
+        }
+
+        let mut by_sn: HashMap<SnId, Vec<(StreamName, u64)>> = HashMap::new();
+        for name in &names {
+            let shard = self.shards[shard_of(&name)].lock().expect("objects");
+            let Some(object) = shard.get(name.as_str()) else { continue };
+            for stream in &object.streams {
+                by_sn.entry(stream.sn).or_default().push((
+                    StreamName { range: self.mine, stream: stream.id, created: stream.created },
+                    0,
+                ));
+            }
+        }
+
+        // First construct the object and stream rows. The SN responses will fill in the
+        // authoritative extent runs and totals without making this fan-out hold DN locks.
+        let mut base_payload = StructWriter::new();
+        base_payload.number_u64(names.len() as u64);
+        for name in &names {
+            base_payload.text(name);
+        }
+        base_payload.flag(true);
+        Want { detail: want.detail & BATCH_ANSWERS, ..want }.write(&mut base_payload);
+        let base = self.info_many(&Req::new(Op::BatchInfo).structure(base_payload));
+        if base.status != Status::Ok {
+            return reply.send(base);
+        }
+        if by_sn.is_empty() {
+            return reply.send(base);
+        }
+        let gather = Arc::new(Mutex::new(BatchCountGather {
+            left: by_sn.len(),
+            reply: Some(reply),
+            base: base.args,
+            runs: HashMap::new(),
+            failed: None,
+        }));
+        for (sn, at) in by_sn {
+            let identity = format!("SN{sn}");
+            let mut payload = StructWriter::new();
+            Listing { limit: 0, at }.write_payload(&mut payload);
+            let ask = Req::new(Op::ListExtents).structure(payload);
+            let waiting = Arc::clone(&gather);
+            if let Err(e) = process.ask(&identity, &ask, move |answer| {
+                let mut gather = waiting.lock().expect("batch-info gather");
+                if answer.status != Status::Ok {
+                    gather.failed.get_or_insert(answer);
+                } else {
+                    match ExtentRun::all_of_args(&answer.args) {
+                        Ok(runs) => {
+                            for (run, rows) in runs {
+                                gather.runs.insert(run.stream, (run, rows));
+                            }
+                        }
+                        Err(e) => {
+                            gather
+                                .failed
+                                .get_or_insert(Resp::error(Status::Internal, e.to_string()));
+                        }
+                    }
+                }
+                gather.left -= 1;
+                if gather.left == 0 {
+                    let failed = gather.failed.take();
+                    let base = std::mem::take(&mut gather.base);
+                    let runs = std::mem::take(&mut gather.runs);
+                    let reply = gather.reply.take().expect("the last response owns the reply");
+                    drop(gather);
+                    reply.send(failed.unwrap_or_else(|| merge_batch_info(base, runs)));
+                }
+            }) {
+                logw!("could not reach an SN", "sn {identity},{e}");
+            }
+        }
+    }
+
     /// One answer for many names, in the order asked, up to the entry limit.
     ///
     /// **A name that is not there still occupies a row**, with a zero id, so that the rows a caller
@@ -1759,48 +1883,9 @@ impl DN {
     fn info_many(&self, request: &Req) -> Resp {
         // The names, then one want field for all of them — a batch asks the same question about
         // every name, so carrying it per name would repeat it a thousand times (§9.1.3.11).
-        let (names, want) = {
-            let (mut payload, rest) =
-                match structure(&request.args, Op::BatchInfo, "a batch-object-info request") {
-                    Ok(value) => value,
-                    Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-                };
-            let count = match payload.number_u64() {
-                Ok(count) => count as usize,
-                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-            };
-            let mut names = match payload.checked_vec(count) {
-                Ok(names) => names,
-                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-            };
-            for _ in 0..count {
-                match payload.text() {
-                    Ok(name) => names.push(name),
-                    Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-                }
-            }
-            let has_want = match payload.flag() {
-                Ok(value) => value,
-                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-            };
-            let want = if has_want {
-                match Want::read(&mut payload) {
-                    Ok(want) => want,
-                    Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-                }
-            } else {
-                Want::plain()
-            };
-            if let Err(e) = payload.done() {
-                return Resp::error(Status::BadRequest, e.to_string());
-            }
-            if !rest.is_empty() {
-                return Resp::error(
-                    Status::BadRequest,
-                    "a batch-object-info request has trailing arguments",
-                );
-            }
-            (names, want)
+        let (names, want) = match Self::read_batch_info(request) {
+            Ok(value) => value,
+            Err(answer) => return answer,
         };
         let beyond = want.beyond(BATCH_ANSWERS);
         if !beyond.is_empty() {
@@ -1922,6 +2007,81 @@ impl DN {
             next_stream: AtomicU64::new(0),
         }
     }
+}
+
+/// Merge SN extent runs into the already-built batch body. SN positions are stream-local; the
+/// DN adds each stream's object-local starting record before putting the rows on the wire.
+fn merge_batch_info(
+    mut args: Vec<Arg>,
+    mut runs: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)>,
+) -> Resp {
+    let (mut batch, rest) = match Batch::of_args(&args) {
+        Ok(value) => value,
+        Err(e) => return Resp::error(Status::Internal, e.to_string()),
+    };
+    let pieces = match Batch::pieces(rest, batch.given) {
+        Ok(pieces) => pieces,
+        Err(e) => return Resp::error(Status::Internal, e.to_string()),
+    };
+    let mut body = Vec::new();
+    let mut entries = 0;
+    for piece in pieces {
+        let (mut shape, mut after) = match Shape::of_args(piece) {
+            Ok(value) => value,
+            Err(e) => return Resp::error(Status::Internal, e.to_string()),
+        };
+        let (described, after_described) = match Described::of_args(after) {
+            Ok(value) => value,
+            Err(e) => return Resp::error(Status::Internal, e.to_string()),
+        };
+        after = after_described;
+        let mut stream_args = Vec::new();
+        let mut extent_count = 0;
+        for _ in 0..shape.given {
+            let (mut row, rest) = match StreamRow::of_args(after) {
+                Ok(value) => value,
+                Err(e) => return Resp::error(Status::Internal, e.to_string()),
+            };
+            after = rest;
+            if let Some((run, extent_rows)) = runs.remove(&row.stream) {
+                row.totals = run.totals;
+                row.given = extent_rows.len() as u64;
+                extent_count += extent_rows.len() as u64;
+                stream_args.extend(row.args());
+                for extent in extent_rows {
+                    stream_args.extend(
+                        ExtentRow {
+                            first_record: ORoff::from_stream(SRoff::new(extent.first_record))
+                                .plus(row.first_record)
+                                .expect("object record position fits")
+                                .get(),
+                            ..extent
+                        }
+                        .args(),
+                    );
+                }
+            } else {
+                stream_args.extend(row.args());
+            }
+        }
+        if !after.is_empty() {
+            return Resp::error(
+                Status::Internal,
+                "batch-object-info response was not self-contained",
+            );
+        }
+        shape.extents = extent_count;
+        shape.entries = 1 + shape.given + extent_count;
+        entries += shape.entries;
+        body.extend(shape.args());
+        body.extend(described.map_or_else(Described::missing, |row| row.args()));
+        body.extend(stream_args);
+    }
+    batch.entries = entries;
+    args.clear();
+    args.extend(batch.args());
+    args.extend(body);
+    Resp { id: 0, status: Status::Ok, args }
 }
 
 /// One name's worth of a batch answer: what it cost, whether it is all of that
