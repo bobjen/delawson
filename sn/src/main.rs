@@ -704,7 +704,7 @@ impl SN {
             let Some(held) = shard.get(name) else {
                 return Resp::error(Status::NotFound, format!("no {name}"));
             };
-            let (run, rows) = self.run_of(held, name.stream, *from, room);
+            let (run, rows) = self.run_of(held, name.stream, *from, room, asked.instances);
             room = room.saturating_sub(rows.len() as u64);
             args.extend(run.args());
             for row in rows {
@@ -721,6 +721,7 @@ impl SN {
         stream: StreamId,
         from: u64,
         room: u64,
+        instances: bool,
     ) -> (ExtentRun, Vec<ExtentRow>) {
         // The sealed extents are in record order, so the first to describe is the last
         // one starting at or before `from` — the same rule locate uses to pick one.
@@ -743,12 +744,16 @@ impl SN {
                 records: ERoff::of_number(sealed.records().number()).expect("extent records fit"),
                 logical: ELoff::of_number(sealed.logical().number()).expect("extent bytes fit"),
                 length: ECoff::of_number(sealed.compressed().number()).expect("extent bytes fit"),
-                disks: sealed
-                    .extent
-                    .disks
-                    .iter()
-                    .map(|sn_disk| self.disks[sn_disk.get() as usize])
-                    .collect(),
+                disks: if instances {
+                    sealed
+                        .extent
+                        .disks
+                        .iter()
+                        .map(|sn_disk| self.disks[sn_disk.get() as usize])
+                        .collect()
+                } else {
+                    Vec::new()
+                },
             })
             .collect();
 
@@ -768,11 +773,11 @@ impl SN {
                 records: ERoff::NONE,
                 logical: ELoff::NONE,
                 length: ECoff::NONE,
-                disks: open
-                    .disks
-                    .iter()
-                    .map(|sn_disk| self.disks[sn_disk.get() as usize])
-                    .collect(),
+                disks: if instances {
+                    open.disks.iter().map(|sn_disk| self.disks[sn_disk.get() as usize]).collect()
+                } else {
+                    Vec::new()
+                },
             });
         }
 

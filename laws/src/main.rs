@@ -338,6 +338,9 @@ enum Cmd {
         /// use `--flags 0` for the old plain object row.
         #[arg(long, default_value_t = BENCH_RICH_FLAGS)]
         flags: u64,
+        /// Create one object by append-and-seal, then direct every lookup to it.
+        #[arg(long)]
+        one_object: bool,
     },
 
     /// A second name for an object, sharing its bytes.
@@ -709,6 +712,7 @@ fn run(cli: Cli) -> Result<()> {
             trials,
             trial,
             flags,
+            one_object,
         } => {
             let target = resolve(&cluster, &cli, ServiceKind::Fe)?;
             let plan = Objects {
@@ -722,7 +726,7 @@ fn run(cli: Cli) -> Result<()> {
                 trials: *trials,
                 timeout,
             };
-            bench_info(&target, &plan, &cluster.messaging, *trial, *flags)
+            bench_info(&target, &plan, &cluster.messaging, *trial, *flags, *one_object)
         }
         Cmd::Scan { path, framing, from, before, budget, rounds } => {
             let target = resolve(&cluster, &cli, ServiceKind::Fe)?;
@@ -1085,11 +1089,54 @@ fn bench_info(
     messaging: &Messaging,
     trial: usize,
     flags: u64,
+    one_object: bool,
 ) -> Result<()> {
     // Every trial reads the same objects — looking up is not destructive, so unlike
     // creating there is no reason for each trial to want its own names.
     let mine = Objects { prefix: trial_prefix(&plan.prefix, trial), ..plan.clone() };
+    if one_object {
+        let path = format!("{}0", mine.prefix);
+        create_one_extent(target, &path, plan.timeout, messaging)?;
+        let one = Objects { objects: 1, ..mine };
+        return trials(&target.identity, plan.trials, || info_once(target, &one, messaging, flags));
+    }
     trials(&target.identity, plan.trials, || info_once(target, &mine, messaging, flags))
+}
+
+/// Set up the one-object info benchmark outside its timed lookup window.
+fn create_one_extent(
+    target: &Target,
+    path: &str,
+    timeout: Duration,
+    messaging: &Messaging,
+) -> Result<()> {
+    let mut conn = Conn::open(target.address, timeout, messaging)?;
+    let append = Cmd::Append {
+        path: path.to_string(),
+        framing: "lf".to_string(),
+        crc: false,
+        expect: None,
+        seal: false,
+        body: Body { data: Some("benchmark".to_string()), file: None },
+    };
+    let answer = conn.call(&build(&append)?)?;
+    if answer.status != Status::Ok {
+        return Err(Error::new(format!(
+            "one-object append answered {}: {}",
+            answer.status,
+            answer.message().unwrap_or_default()
+        )));
+    }
+    let seal = Cmd::Seal { path: path.to_string() };
+    let answer = conn.call(&build(&seal)?)?;
+    if answer.status != Status::Ok {
+        return Err(Error::new(format!(
+            "one-object seal answered {}: {}",
+            answer.status,
+            answer.message().unwrap_or_default()
+        )));
+    }
+    Ok(())
 }
 
 fn benchmark_info_want(flags: u64) -> Want {

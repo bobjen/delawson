@@ -179,7 +179,13 @@ fn detailed(
 
     // The shape first, then the object, then its streams — so a reader knows how many
     // rows follow before it starts reading them.
-    Some(Levelled { shape, head: args, rows, hide_rows: counts_only })
+    Some(Levelled {
+        shape,
+        head: args,
+        rows,
+        hide_rows: counts_only,
+        instances: want.wants(Detail::Instances),
+    })
 }
 
 /// What a lookup came to before any SN was asked.
@@ -188,6 +194,7 @@ struct Levelled {
     head: Vec<Arg>,
     rows: Vec<StreamRow>,
     hide_rows: bool,
+    instances: bool,
 }
 
 impl Levelled {
@@ -576,6 +583,7 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Resp) {
         head: std::mem::take(&mut held.head),
         rows: std::mem::take(&mut held.rows),
         hide_rows: held.hide_rows,
+        instances: held.instances,
     };
     reply.send(Resp { id: 0, status: Status::Ok, args: levelled.args(converted) });
 }
@@ -601,6 +609,7 @@ struct Gather {
     rows: Vec<StreamRow>,
     shape: Shape,
     hide_rows: bool,
+    instances: bool,
     /// The object the asks were about, so what the SNs said can be written back to the
     /// streams' cached sizes (§17.25.1). Only the name: the object itself must not be held
     /// across a round trip, since it can change while the SNs are answering.
@@ -1103,7 +1112,8 @@ impl DN {
             return self.concat_objects(process, &request, reply);
         };
         let mut payload = StructWriter::new();
-        common::info::Listing { limit: 0, at: vec![(stream, 0)] }.write_payload(&mut payload);
+        common::info::Listing { limit: 0, instances: true, at: vec![(stream, 0)] }
+            .write_payload(&mut payload);
         let ask = Req::new(Op::ListExtents).structure(payload);
         let dn = Arc::clone(self);
         let identity = format!("SN{sn}");
@@ -1683,6 +1693,7 @@ impl DN {
             rows: levelled.rows,
             shape: levelled.shape,
             hide_rows: levelled.hide_rows,
+            instances: levelled.instances,
             name: name.to_string(),
         }));
 
@@ -1691,7 +1702,8 @@ impl DN {
             let identity = format!("SN{sn}");
             let ask = {
                 let mut payload = StructWriter::new();
-                Listing { limit: room, at }.write_payload(&mut payload);
+                Listing { limit: room, instances: levelled.instances, at }
+                    .write_payload(&mut payload);
                 Req::new(Op::ListExtents).structure(payload)
             };
             let waiting = Arc::clone(&gather);
@@ -1834,7 +1846,8 @@ impl DN {
         for (sn, at) in by_sn {
             let identity = format!("SN{sn}");
             let mut payload = StructWriter::new();
-            Listing { limit: 0, at }.write_payload(&mut payload);
+            Listing { limit: 0, instances: want.wants(Detail::Instances), at }
+                .write_payload(&mut payload);
             let ask = Req::new(Op::ListExtents).structure(payload);
             let waiting = Arc::clone(&gather);
             if let Err(e) = process.ask(&identity, &ask, move |answer| {

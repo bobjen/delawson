@@ -713,6 +713,8 @@ impl Batch {
 pub struct Listing {
     /// Entries the whole answer may carry, over every stream in it.
     pub limit: u64,
+    /// Whether extent rows should include their `(EnId, DiskId)` instance lists.
+    pub instances: bool,
     /// `(name, first stream-local record to describe from)`, in order.
     ///
     /// ⚠️ **A whole name per stream, not an id against one shared range.** A batch may
@@ -723,7 +725,11 @@ pub struct Listing {
 
 impl Listing {
     pub fn args(&self) -> Vec<Arg> {
-        let mut args = vec![Arg::Number(self.limit), Arg::Number(self.at.len() as u64)];
+        let mut args = vec![
+            Arg::Number(self.limit),
+            Arg::Flag(self.instances),
+            Arg::Number(self.at.len() as u64),
+        ];
         for (name, from) in &self.at {
             args.extend(name.args());
             args.push(Arg::Number(*from));
@@ -733,6 +739,7 @@ impl Listing {
 
     pub fn write_payload(&self, payload: &mut StructWriter) {
         payload.number_u64(self.limit);
+        payload.flag(self.instances);
         payload.number_u32(self.at.len() as u32);
         for (name, from) in &self.at {
             payload.number_u32(name.range.get());
@@ -744,6 +751,7 @@ impl Listing {
 
     pub fn read_payload(payload: &mut StructReader<'_>) -> Result<Listing> {
         let limit = payload.number_u64()?;
+        let instances = payload.flag()?;
         let count = payload.number_u32()?;
         let mut at = payload.checked_vec(count)?;
         for _ in 0..count {
@@ -756,11 +764,11 @@ impl Listing {
                 payload.number_u64()?,
             ));
         }
-        Ok(Listing { limit, at })
+        Ok(Listing { limit, instances, at })
     }
 
     pub fn of_args(args: &[Arg]) -> Result<Listing> {
-        let [Arg::Number(limit), Arg::Number(count), rest @ ..] = args else {
+        let [Arg::Number(limit), Arg::Flag(instances), Arg::Number(count), rest @ ..] = args else {
             return Err(Error::new("list-extents takes a limit and a run of streams"));
         };
         let count = usize::try_from(*count).map_err(|_| Error::new("stream count does not fit"))?;
@@ -781,7 +789,7 @@ impl Listing {
             at.push((name, *from));
             rest = after;
         }
-        Ok(Listing { limit: *limit, at })
+        Ok(Listing { limit: *limit, instances: *instances, at })
     }
 }
 
