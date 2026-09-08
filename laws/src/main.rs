@@ -30,6 +30,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+const BENCH_RICH_FLAGS: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4);
+
 #[derive(Parser)]
 #[command(name = "laws", version, about = "The DeLawson client")]
 struct Cli {
@@ -332,6 +334,10 @@ enum Cmd {
         /// fresh names, so it picks one.
         #[arg(long, default_value_t = 1)]
         trial: usize,
+        /// Detail flags to request. Defaults to streams, extents, instances, and counts;
+        /// use `--flags 0` for the old plain object row.
+        #[arg(long, default_value_t = BENCH_RICH_FLAGS)]
+        flags: u64,
     },
 
     /// A second name for an object, sharing its bytes.
@@ -693,7 +699,17 @@ fn run(cli: Cli) -> Result<()> {
             };
             bench_create(&target, &plan, &cluster.messaging)
         }
-        Cmd::BenchInfo { objects, batch, clients, depth, seconds, prefix, trials, trial } => {
+        Cmd::BenchInfo {
+            objects,
+            batch,
+            clients,
+            depth,
+            seconds,
+            prefix,
+            trials,
+            trial,
+            flags,
+        } => {
             let target = resolve(&cluster, &cli, ServiceKind::Fe)?;
             let plan = Objects {
                 objects: *objects,
@@ -706,7 +722,7 @@ fn run(cli: Cli) -> Result<()> {
                 trials: *trials,
                 timeout,
             };
-            bench_info(&target, &plan, &cluster.messaging, *trial)
+            bench_info(&target, &plan, &cluster.messaging, *trial, *flags)
         }
         Cmd::Scan { path, framing, from, before, budget, rounds } => {
             let target = resolve(&cluster, &cli, ServiceKind::Fe)?;
@@ -1063,22 +1079,31 @@ fn create_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result
 
 /// Look up objects at random for a while. Random because a benchmark that walks
 /// in order measures the cache rather than the index.
-fn bench_info(target: &Target, plan: &Objects, messaging: &Messaging, trial: usize) -> Result<()> {
+fn bench_info(
+    target: &Target,
+    plan: &Objects,
+    messaging: &Messaging,
+    trial: usize,
+    flags: u64,
+) -> Result<()> {
     // Every trial reads the same objects — looking up is not destructive, so unlike
     // creating there is no reason for each trial to want its own names.
     let mine = Objects { prefix: trial_prefix(&plan.prefix, trial), ..plan.clone() };
-    trials(&target.identity, plan.trials, || info_once(target, &mine, messaging))
+    trials(&target.identity, plan.trials, || info_once(target, &mine, messaging, flags))
 }
 
-fn benchmark_info_want() -> Want {
-    Want::plain()
-        .with(Detail::Streams)
-        .with(Detail::Extents)
-        .with(Detail::Instances)
-        .with(Detail::Counts)
+fn benchmark_info_want(flags: u64) -> Want {
+    Want { detail: flags, ..Want::plain() }
 }
 
 fn benchmark_info_found(args: &[Arg]) -> Result<u64> {
+    if matches!(args.first(), Some(Arg::Struct(Op::DescribedResp, _, _))) {
+        let (object, rest) = Described::of_args(args)?;
+        if !rest.is_empty() {
+            return Err(Error::new("plain object-info answer has trailing arguments"));
+        }
+        return Ok(object.is_some() as u64);
+    }
     let (shape, mut rest) = Shape::of_args(args)?;
     let (object, after) = Described::of_args(rest)?;
     rest = after;
@@ -1093,7 +1118,8 @@ fn benchmark_info_found(args: &[Arg]) -> Result<u64> {
     Ok(object.is_some() as u64)
 }
 
-fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f64> {
+fn info_once(target: &Target, plan: &Objects, messaging: &Messaging, flags: u64) -> Result<f64> {
+    let rich = flags != 0;
     if plan.batch == 0 || plan.clients == 0 || plan.depth == 0 || plan.seconds == 0 {
         return Err(Error::new("--batch, --clients, --depth and --seconds must all be positive"));
     }
@@ -1121,7 +1147,7 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
                             let mut payload = common::wire::StructWriter::new();
                             payload.text(&format!("{prefix}{}", rng.next_u64() % objects));
                             payload.flag(true);
-                            benchmark_info_want().write(&mut payload);
+                            benchmark_info_want(flags).write(&mut payload);
                             Req::new(Op::ObjectInfo).structure(payload)
                         } else {
                             let mut payload = common::wire::StructWriter::new();
@@ -1130,7 +1156,7 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
                                 payload.text(&format!("{prefix}{}", rng.next_u64() % objects));
                             }
                             payload.flag(true);
-                            benchmark_info_want().write(&mut payload);
+                            benchmark_info_want(flags).write(&mut payload);
                             Req::new(Op::BatchInfo).structure(payload)
                         };
                         let id = conn.send(&request)?;
@@ -1166,13 +1192,18 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
                         } else {
                             let (covered, rows) = Batch::of_args(&answer.args)?;
                             given += covered.given;
-                            let pieces = Batch::pieces(rows, covered.given)?;
-                            found += pieces
-                                .iter()
-                                .map(|piece| benchmark_info_found(piece))
-                                .collect::<Result<Vec<_>>>()?
-                                .into_iter()
-                                .sum::<u64>();
+                            if rich {
+                                let pieces = Batch::pieces(rows, covered.given)?;
+                                found += pieces
+                                    .iter()
+                                    .map(|piece| benchmark_info_found(piece))
+                                    .collect::<Result<Vec<_>>>()?
+                                    .into_iter()
+                                    .sum::<u64>();
+                            } else {
+                                found +=
+                                    Described::all_of_args(rows)?.iter().flatten().count() as u64;
+                            }
                         }
                     }
                 }
