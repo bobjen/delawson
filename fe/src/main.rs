@@ -1494,9 +1494,20 @@ impl Spread {
         // is why this is not simply `shape.more()`.
         let covered = ask.want.detail & self.want.detail == self.want.detail;
         let whole = if covered { !shape.more() } else { shape.streams == 0 };
-        let full = match shape.streams {
-            UNKNOWN => shape.entries,
-            streams => 1 + streams,
+        let full = if !self.want.wants(Detail::Streams) {
+            1
+        } else {
+            match shape.streams {
+                UNKNOWN => shape.entries,
+                streams => {
+                    let extents = if self.want.wants(Detail::Extents) && shape.extents != UNKNOWN {
+                        shape.extents
+                    } else {
+                        0
+                    };
+                    1u64.saturating_add(streams).saturating_add(extents)
+                }
+            }
         };
         Ok(Slot { args, whole, full, spent: shape.entries })
     }
@@ -2081,8 +2092,16 @@ mod tests {
 
     /// One name's worth of a levelled answer, as a DN would send it.
     fn described(streams: u64, given: u64, next: u64) -> Vec<Arg> {
-        let shape =
-            Shape { streams, given, extents: UNKNOWN, entries: 1 + given, next: ORoff::new(next) };
+        let shape = Shape {
+            streams,
+            given,
+            extents: UNKNOWN,
+            entries: 1 + given,
+            next: ORoff::new(next),
+            records: ORoff::NONE,
+            logical: common::offset::SLoff::NONE,
+            compressed: common::offset::SCoff::NONE,
+        };
         let mut args = shape.args();
         args.extend(
             Described {

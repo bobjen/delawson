@@ -180,12 +180,27 @@ pub struct Shape {
     pub entries: u64,
     /// The object-local record to ask from next, or `UNKNOWN` when nothing follows.
     pub next: ORoff,
+    /// Aggregate object record count, when counts were requested.
+    pub records: ORoff,
+    /// Aggregate logical length, when counts were requested and known.
+    pub logical: SLoff,
+    /// Aggregate compressed length, when counts were requested and known.
+    pub compressed: SCoff,
 }
 
 impl Shape {
     /// What an answer carrying no detail says: one object, nothing else asked about.
     pub fn plain() -> Shape {
-        Shape { streams: 0, given: 0, extents: UNKNOWN, entries: 1, next: ORoff::NONE }
+        Shape {
+            streams: 0,
+            given: 0,
+            extents: UNKNOWN,
+            entries: 1,
+            next: ORoff::NONE,
+            records: ORoff::NONE,
+            logical: SLoff::NONE,
+            compressed: SCoff::NONE,
+        }
     }
 
     pub fn more(&self) -> bool {
@@ -198,6 +213,9 @@ impl Shape {
             payload.number_u64(field);
         }
         payload.number_u64(self.next.number());
+        payload.number_u64(self.records.number());
+        payload.number_u64(self.logical.number());
+        payload.number_u64(self.compressed.number());
         vec![payload.finish(Op::ShapeResp)]
     }
 
@@ -210,6 +228,9 @@ impl Shape {
                 extents: payload.number_u64()?,
                 entries: payload.number_u64()?,
                 next: ORoff::of_number(payload.number_u64()?)?,
+                records: ORoff::of_number(payload.number_u64()?)?,
+                logical: SLoff::of_number(payload.number_u64()?)?,
+                compressed: SCoff::of_number(payload.number_u64()?)?,
             };
             payload.done()?;
             return Ok((shape, rest));
@@ -922,7 +943,16 @@ mod tests {
     /// rows come back as themselves.
     #[test]
     fn a_shape_and_its_streams_survive_the_wire() {
-        let shape = Shape { streams: 3, given: 2, extents: 40, entries: 3, next: ORoff::new(700) };
+        let shape = Shape {
+            streams: 3,
+            given: 2,
+            extents: 40,
+            entries: 3,
+            next: ORoff::new(700),
+            records: ORoff::NONE,
+            logical: SLoff::NONE,
+            compressed: SCoff::NONE,
+        };
         let rows = vec![stream(1, 0, 300), stream(2, 300, 400)];
         let mut args = shape.args();
         for row in &rows {
@@ -959,7 +989,16 @@ mod tests {
     /// rather than read as fewer rows.
     #[test]
     fn a_shape_promising_more_rows_than_it_carries_is_refused() {
-        let shape = Shape { streams: 9, given: 3, extents: UNKNOWN, entries: 4, next: ORoff::NONE };
+        let shape = Shape {
+            streams: 9,
+            given: 3,
+            extents: UNKNOWN,
+            entries: 4,
+            next: ORoff::NONE,
+            records: ORoff::NONE,
+            logical: SLoff::NONE,
+            compressed: SCoff::NONE,
+        };
         let mut args = shape.args();
         args.extend(stream(1, 0, 10).args());
         let (back, rest) = Shape::of_args(&args).expect("a shape");
@@ -1065,8 +1104,16 @@ mod tests {
     /// the whole point of §9.1.3.2.
     #[test]
     fn an_answer_can_be_complete_in_counts_and_partial_in_detail() {
-        let shape =
-            Shape { streams: 1000, given: 2, extents: UNKNOWN, entries: 3, next: ORoff::new(512) };
+        let shape = Shape {
+            streams: 1000,
+            given: 2,
+            extents: UNKNOWN,
+            entries: 3,
+            next: ORoff::new(512),
+            records: ORoff::NONE,
+            logical: SLoff::NONE,
+            compressed: SCoff::NONE,
+        };
         let args = shape.args();
         let (back, _) = Shape::of_args(&args).expect("a shape");
         assert_eq!(back.streams, 1000, "how many there are");

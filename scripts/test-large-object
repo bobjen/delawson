@@ -77,7 +77,7 @@ fi
 # The final block is deliberately followed by the explicit forced seal, since the
 # extent is full by logical size while per_stream is intentionally very large.
 "$laws" --config "$config/cluster.toml" seal "$path"
-"$laws" --config "$config/cluster.toml" object-info "$path" --want extents >/dev/null
+"$laws" --config "$config/cluster.toml" object-info "$path" --want counts
 
 source=$path
 destinations=(
@@ -153,6 +153,7 @@ for ((n = 0; n < ${#destinations[@]}; n++)); do
         exit 0
     fi
     "$laws" --config "$config/cluster.toml" seal "$destination"
+    "$laws" --config "$config/cluster.toml" object-info "$destination" --want counts
     source=$destination
 done
 echo "large-object: reached the script's same-DN name bound without an error" >&2

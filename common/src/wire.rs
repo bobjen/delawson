@@ -1528,6 +1528,9 @@ mod tests {
             extents: 7,
             entries: 9,
             next: crate::offset::ORoff::new(11),
+            records: crate::offset::ORoff::NONE,
+            logical: crate::offset::SLoff::NONE,
+            compressed: crate::offset::SCoff::NONE,
         };
         let compact = Req { id: 7, op: Op::BatchInfo, args: shape.args() };
         assert_eq!(compact.args.len(), 1, "the shape is one self-contained value");

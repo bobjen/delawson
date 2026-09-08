@@ -1070,6 +1070,29 @@ fn bench_info(target: &Target, plan: &Objects, messaging: &Messaging, trial: usi
     trials(&target.identity, plan.trials, || info_once(target, &mine, messaging))
 }
 
+fn benchmark_info_want() -> Want {
+    Want::plain()
+        .with(Detail::Streams)
+        .with(Detail::Extents)
+        .with(Detail::Instances)
+        .with(Detail::Counts)
+}
+
+fn benchmark_info_found(args: &[Arg]) -> Result<u64> {
+    let (shape, mut rest) = Shape::of_args(args)?;
+    let (object, after) = Described::of_args(rest)?;
+    rest = after;
+    for _ in 0..shape.given {
+        let (stream, after) = StreamRow::of_args(rest)?;
+        let (_, after) = ExtentRow::some_of_args(after, stream.given)?;
+        rest = after;
+    }
+    if !rest.is_empty() {
+        return Err(Error::new("richer object-info answer has trailing arguments"));
+    }
+    Ok(object.is_some() as u64)
+}
+
 fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f64> {
     if plan.batch == 0 || plan.clients == 0 || plan.depth == 0 || plan.seconds == 0 {
         return Err(Error::new("--batch, --clients, --depth and --seconds must all be positive"));
@@ -1097,7 +1120,8 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
                         let request = if batch == 1 {
                             let mut payload = common::wire::StructWriter::new();
                             payload.text(&format!("{prefix}{}", rng.next_u64() % objects));
-                            payload.flag(false);
+                            payload.flag(true);
+                            benchmark_info_want().write(&mut payload);
                             Req::new(Op::ObjectInfo).structure(payload)
                         } else {
                             let mut payload = common::wire::StructWriter::new();
@@ -1105,7 +1129,8 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
                             for _ in 0..batch {
                                 payload.text(&format!("{prefix}{}", rng.next_u64() % objects));
                             }
-                            payload.flag(false);
+                            payload.flag(true);
+                            benchmark_info_want().write(&mut payload);
                             Req::new(Op::BatchInfo).structure(payload)
                         };
                         let id = conn.send(&request)?;
@@ -1126,27 +1151,29 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result<f
                     if batch == 1 {
                         given += 1;
                     }
-                    // ⚠️ Counted by parsing the rows, not by chopping the args into
-                    // pieces of an assumed width. The assumed width was five and the
-                    // row is eight, so this counted every object twice (§17.5g).
-                    //
-                    // A miss answers `not found` with a message rather than with rows,
-                    // and that is not a failure — it is what looking up a name nobody
-                    // took looks like, and it is worth measuring on purpose.
+                    // A miss answers `not found` with a message rather than with rows, and that
+                    // is not a failure — it is what looking up a name nobody took looks like.
+                    if answer.status != Status::Ok && answer.status != Status::NotFound {
+                        return Err(Error::new(format!(
+                            "object-info benchmark answered {}: {}",
+                            answer.status,
+                            answer.message().unwrap_or_default()
+                        )));
+                    }
                     if answer.status == Status::Ok {
-                        // A batch answer leads with what it covered; a single one is a bare row
-                        // (§9.1.3.7). Which it is follows from what was asked, not from guessing.
-                        let rows = if batch == 1 {
-                            &answer.args[..]
+                        if batch == 1 {
+                            found += benchmark_info_found(&answer.args)?;
                         } else {
                             let (covered, rows) = Batch::of_args(&answer.args)?;
                             given += covered.given;
-                            rows
-                        };
-                        found += Described::all_of_args(rows)?
-                            .iter()
-                            .filter(|row| row.is_some())
-                            .count() as u64;
+                            let pieces = Batch::pieces(rows, covered.given)?;
+                            found += pieces
+                                .iter()
+                                .map(|piece| benchmark_info_found(piece))
+                                .collect::<Result<Vec<_>>>()?
+                                .into_iter()
+                                .sum::<u64>();
+                        }
                     }
                 }
                 Ok((asked, given, found, tally))
@@ -1493,6 +1520,22 @@ fn say(
         it.first_record
     );
     let Some(shape) = shape else { return Ok(()) };
+    if shape.records != ORoff::NONE {
+        let logical = if shape.logical == SLoff::NONE {
+            "unknown".to_string()
+        } else {
+            shape.logical.to_string()
+        };
+        let compressed = if shape.compressed == SCoff::NONE {
+            "unknown".to_string()
+        } else {
+            shape.compressed.to_string()
+        };
+        println!(
+            "  object totals: {} records, {} logical bytes, {} stored",
+            shape.records, logical, compressed
+        );
+    }
     for (row, extents) in streams {
         // UNKNOWN is "nobody asked" or "not knowable here", never a count of zero.
         let records = match row.records {

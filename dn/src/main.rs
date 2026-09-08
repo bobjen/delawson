@@ -131,8 +131,11 @@ fn detailed(
     };
     let room = cap.saturating_sub(1);
     let mut rows = Vec::new();
+    let counts_only = want.wants(Detail::Counts) && !want.wants(Detail::Streams);
     if want.wants(Detail::Streams) {
-        for (at, held) in object.streams_from().skip(first).take(room as usize) {
+        let streams = object.streams_from().skip(first);
+        let streams = streams.take(room as usize);
+        for (at, held) in streams {
             rows.push(StreamRow {
                 stream: held.id,
                 sn: held.sn,
@@ -156,7 +159,7 @@ fn detailed(
     let shape = Shape {
         streams: if want.wants(Detail::Counts) { total.number() } else { UNKNOWN },
         given: rows.len() as u64,
-        extents: UNKNOWN,
+        extents: if want.wants(Detail::Counts) { object.cached_extents() } else { UNKNOWN },
         entries: 1 + rows.len() as u64,
         // ⚠️ **Wherever a stream count was given, not only where stream rows were.** A
         // summary — counts and no rows — is what a batch asks the DNs it is not leading
@@ -169,11 +172,14 @@ fn detailed(
         } else {
             ORoff::NONE
         },
+        records: if want.wants(Detail::Counts) { object.cached_records() } else { ORoff::NONE },
+        logical: if want.wants(Detail::Counts) { object.logical() } else { SLoff::NONE },
+        compressed: if want.wants(Detail::Counts) { object.compressed() } else { SCoff::NONE },
     };
 
     // The shape first, then the object, then its streams — so a reader knows how many
     // rows follow before it starts reading them.
-    Some(Levelled { shape, head: args, rows })
+    Some(Levelled { shape, head: args, rows, hide_rows: counts_only })
 }
 
 /// What a lookup came to before any SN was asked.
@@ -181,6 +187,7 @@ struct Levelled {
     shape: Shape,
     head: Vec<Arg>,
     rows: Vec<StreamRow>,
+    hide_rows: bool,
 }
 
 impl Levelled {
@@ -192,6 +199,9 @@ impl Levelled {
     fn args(self, mut extents: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)>) -> Vec<Arg> {
         let mut out = self.shape.args();
         out.extend(self.head);
+        if self.hide_rows {
+            return out;
+        }
         for mut row in self.rows {
             match extents.remove(&row.stream) {
                 Some((run, rows)) => {
@@ -415,6 +425,46 @@ impl Object {
         }
     }
 
+    fn cached_records(&self) -> ORoff {
+        self.streams.iter().fold(ORoff::ZERO, |total, stream| {
+            if stream.records.is_none() || total == ORoff::MAX {
+                total
+            } else {
+                total.plus(ORoff::from_stream(stream.records)).unwrap_or(ORoff::MAX)
+            }
+        })
+    }
+
+    fn cached_extents(&self) -> u64 {
+        self.streams.iter().fold(0u64, |total, stream| {
+            if stream.extents.is_none() {
+                total
+            } else {
+                total.saturating_add(stream.extents.number())
+            }
+        })
+    }
+
+    fn logical(&self) -> SLoff {
+        self.streams.iter().fold(SLoff::ZERO, |total, stream| {
+            if stream.logical.is_none() || total == SLoff::MAX {
+                total
+            } else {
+                total.plus(stream.logical).unwrap_or(SLoff::MAX)
+            }
+        })
+    }
+
+    fn compressed(&self) -> SCoff {
+        self.streams.iter().fold(SCoff::ZERO, |total, stream| {
+            if stream.compressed.is_none() || total == SCoff::MAX {
+                total
+            } else {
+                total.plus(stream.compressed).unwrap_or(SCoff::MAX)
+            }
+        })
+    }
+
     /// The stream appends go to, which is the last one, and where it starts.
     fn last(&self) -> Option<(ORoff, Stream)> {
         self.streams_from().last().map(|(at, held)| (at, *held))
@@ -525,6 +575,7 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Resp) {
         shape: Shape { extents, entries: held.shape.entries + given, next, ..held.shape },
         head: std::mem::take(&mut held.head),
         rows: std::mem::take(&mut held.rows),
+        hide_rows: held.hide_rows,
     };
     reply.send(Resp { id: 0, status: Status::Ok, args: levelled.args(converted) });
 }
@@ -549,6 +600,7 @@ struct Gather {
     head: Vec<Arg>,
     rows: Vec<StreamRow>,
     shape: Shape,
+    hide_rows: bool,
     /// The object the asks were about, so what the SNs said can be written back to the
     /// streams' cached sizes (§17.25.1). Only the name: the object itself must not be held
     /// across a round trip, since it can change while the SNs are answering.
@@ -733,6 +785,7 @@ impl DN {
     /// by reference; the new object gets one fresh, empty stream at the end so it
     /// is immediately appendable but is not sealed.
     fn concat_objects(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Reply) {
+        let retry = request.clone();
         let (mut payload, rest) =
             match structure(&request.args, Op::ConcatObjects, "a concat-objects request") {
                 Ok(value) => value,
@@ -796,6 +849,8 @@ impl DN {
         let mut framing = None;
         let mut keyed = None;
         let mut single_streams = [None; 2];
+        let mut refresh = Vec::new();
+        let mut refreshed = Vec::new();
         for (source_number, source) in sources.iter().enumerate() {
             if source == &destination {
                 return reply.send(Resp::error(
@@ -838,6 +893,21 @@ impl DN {
             if source_number < single_streams.len() && object.streams.len() == 1 {
                 single_streams[source_number] = Some(object.streams[0]);
             }
+            for stream in &object.streams {
+                if stream.records.is_some()
+                    && (stream.extents.is_none()
+                        || stream.logical.is_none()
+                        || stream.compressed.is_none())
+                    && !refreshed.contains(&(source.clone(), stream.id))
+                {
+                    refreshed.push((source.clone(), stream.id));
+                    refresh.push((
+                        source.clone(),
+                        stream.sn,
+                        StreamName { range: self.mine, stream: stream.id, created: stream.created },
+                    ));
+                }
+            }
             let stream_count = copied.len().checked_add(object.streams.len());
             if stream_count.map_or(true, |count| count as u64 > u32::MAX as u64) {
                 return reply.send(Resp::error(
@@ -850,6 +920,9 @@ impl DN {
                 Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
             };
             copied.extend(object.streams.iter().copied());
+        }
+        if !refresh.is_empty() {
+            return self.refresh_concat(process, retry, reply, refresh, 0);
         }
         if records.number() >= OPEN_STREAM_RECORD_LIMIT {
             return reply.send(Resp::error(
@@ -1005,6 +1078,53 @@ impl DN {
             dn.finish_concat(&destination_name, stream, sn_number);
         }) {
             self.fail_concat(&destination, Resp::error(Status::Internal, e.to_string()));
+        }
+    }
+
+    /// Refresh sealed-stream totals before concat arithmetic. A zero-row SN listing carries
+    /// the complete totals without transferring the extent list itself.
+    fn refresh_concat(
+        self: &Arc<Self>,
+        process: &Arc<Process>,
+        request: Req,
+        reply: Reply,
+        refresh: Vec<(String, SnId, StreamName)>,
+        at: usize,
+    ) {
+        let Some((object, sn, stream)) = refresh.get(at).cloned() else {
+            return self.concat_objects(process, &request, reply);
+        };
+        let mut payload = StructWriter::new();
+        common::info::Listing { limit: 0, at: vec![(stream, 0)] }.write_payload(&mut payload);
+        let ask = Req::new(Op::ListExtents).structure(payload);
+        let dn = Arc::clone(self);
+        let identity = format!("SN{sn}");
+        let onward = Arc::clone(process);
+        let next = Arc::clone(&onward);
+        let named = identity.clone();
+        let asked = onward.ask(&identity, &ask, move |answer| {
+            if answer.status != Status::Ok {
+                return reply.send(answer);
+            }
+            let runs = match ExtentRun::all_of_args(&answer.args) {
+                Ok(mut runs) if runs.len() == 1 && runs[0].0.stream == stream.stream => {
+                    let (run, rows) = runs.pop().expect("one run");
+                    let mut by_stream = HashMap::new();
+                    by_stream.insert(run.stream, (run, rows));
+                    by_stream
+                }
+                _ => {
+                    return reply.send(Resp::error(
+                        Status::Internal,
+                        format!("{named} returned no totals for {stream}"),
+                    ));
+                }
+            };
+            dn.remember(&object, &runs);
+            dn.refresh_concat(&next, request, reply, refresh, at + 1);
+        });
+        if let Err(e) = asked {
+            logw!("could not reach an SN", "sn {identity},{e}");
         }
     }
 
@@ -1554,6 +1674,7 @@ impl DN {
             head: levelled.head,
             rows: levelled.rows,
             shape: levelled.shape,
+            hide_rows: levelled.hide_rows,
             name: name.to_string(),
         }));
 
