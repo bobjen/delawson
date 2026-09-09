@@ -22,7 +22,7 @@ use common::info::{
     StreamRow, Totals, UNKNOWN, Wanted,
 };
 use common::logw;
-use common::offset::{ORoff, SCoff, SLoff, SRoff};
+use common::offset::{OCoff, OEoff, OLoff, ORoff, SCoff, SLoff, SRoff};
 use common::range::{Detail, Want};
 use common::routing;
 use common::server::{self, Process, Reply, Service};
@@ -114,11 +114,7 @@ fn detailed(
         return None;
     }
 
-    // This is an object-stream count, not an SN id. It uses SnId's width for now because
-    // both limits come from the amount of stream metadata a machine can hold; the two
-    // resource limits remain conceptually independent.
-    let total = SnId::of_number(object.streams.len() as u64)
-        .expect("an object's stream count fits the SN id space");
+    let total = StreamId::of_number(object.streams.len() as u64).expect("object stream count fits");
     let from = want.from.object_record().unwrap_or(ORoff::ZERO);
     // Streams are in record order, so the first to describe is the last one starting
     // at or before `from` — the same rule a read uses to pick a stream.
@@ -147,7 +143,7 @@ fn detailed(
                 // What the DN last learned. Exact once the stream is sealed, a point in
                 // time before that, and UNKNOWN until any SN has been asked (§17.25.1).
                 totals: held.totals(),
-                given: 0,
+                given: ExtentId::FIRST,
             });
         }
     }
@@ -157,9 +153,9 @@ fn detailed(
     let after = first + rows.len();
     let next = object.streams_from().nth(after).map_or(ORoff::NONE, |(at, _)| at);
     let shape = Shape {
-        streams: if want.wants(Detail::Counts) { total.number() } else { UNKNOWN },
-        given: rows.len() as u64,
-        extents: if want.wants(Detail::Counts) { object.cached_extents() } else { UNKNOWN },
+        streams: if want.wants(Detail::Counts) { total } else { StreamId::NONE },
+        given: StreamId::of_number(rows.len() as u64).expect("stream row count fits"),
+        extents: if want.wants(Detail::Counts) { object.cached_extents() } else { OEoff::NONE },
         entries: 1 + rows.len() as u64,
         // ⚠️ **Wherever a stream count was given, not only where stream rows were.** A
         // summary — counts and no rows — is what a batch asks the DNs it is not leading
@@ -173,8 +169,8 @@ fn detailed(
             ORoff::NONE
         },
         records: if want.wants(Detail::Counts) { object.cached_records() } else { ORoff::NONE },
-        logical: if want.wants(Detail::Counts) { object.logical() } else { SLoff::NONE },
-        compressed: if want.wants(Detail::Counts) { object.compressed() } else { SCoff::NONE },
+        logical: if want.wants(Detail::Counts) { object.logical() } else { OLoff::NONE },
+        compressed: if want.wants(Detail::Counts) { object.compressed() } else { OCoff::NONE },
     };
 
     // The shape first, then the object, then its streams — so a reader knows how many
@@ -214,14 +210,15 @@ impl Levelled {
                 Some((run, rows)) => {
                     // Straight from the SN, which is more recent than anything cached.
                     row.totals = run.totals;
-                    row.given = rows.len() as u64;
+                    row.given =
+                        ExtentId::of_number(rows.len() as u64).expect("extent row count fits");
                     out.extend(row.args());
                     for extent in rows {
                         out.extend(extent.args());
                     }
                 }
                 None => {
-                    row.given = 0;
+                    row.given = ExtentId::FIRST;
                     out.extend(row.args());
                 }
             }
@@ -442,32 +439,32 @@ impl Object {
         })
     }
 
-    fn cached_extents(&self) -> u64 {
-        self.streams.iter().fold(0u64, |total, stream| {
+    fn cached_extents(&self) -> OEoff {
+        self.streams.iter().fold(OEoff::ZERO, |total, stream| {
             if stream.extents.is_none() {
                 total
             } else {
-                total.saturating_add(stream.extents.number())
+                total.plus(OEoff::from_stream(stream.extents)).unwrap_or(OEoff::MAX)
             }
         })
     }
 
-    fn logical(&self) -> SLoff {
-        self.streams.iter().fold(SLoff::ZERO, |total, stream| {
-            if stream.logical.is_none() || total == SLoff::MAX {
+    fn logical(&self) -> OLoff {
+        self.streams.iter().fold(OLoff::ZERO, |total, stream| {
+            if stream.logical.is_none() || total == OLoff::MAX {
                 total
             } else {
-                total.plus(stream.logical).unwrap_or(SLoff::MAX)
+                total.plus(OLoff::from_stream(stream.logical)).unwrap_or(OLoff::MAX)
             }
         })
     }
 
-    fn compressed(&self) -> SCoff {
-        self.streams.iter().fold(SCoff::ZERO, |total, stream| {
-            if stream.compressed.is_none() || total == SCoff::MAX {
+    fn compressed(&self) -> OCoff {
+        self.streams.iter().fold(OCoff::ZERO, |total, stream| {
+            if stream.compressed.is_none() || total == OCoff::MAX {
                 total
             } else {
-                total.plus(stream.compressed).unwrap_or(SCoff::MAX)
+                total.plus(OCoff::from_stream(stream.compressed)).unwrap_or(OCoff::MAX)
             }
         })
     }
@@ -536,13 +533,16 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Resp) {
     // one's are a point in time, which is what `Stream::learned` refusing to go backwards is
     // for — two answers can cross in flight.
     dn.remember(&held.name, &runs);
-    let mut extents = 0;
+    let mut extents = OEoff::ZERO;
     let mut given = 0;
     let mut converted: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)> = HashMap::new();
     for row in &held.rows {
         let Some((run, rows)) = runs.remove(&row.stream) else { continue };
-        extents +=
-            if run.totals.extents == ExtentId::NONE { 0 } else { run.totals.extents.number() };
+        if run.totals.extents.is_some() {
+            extents = extents
+                .plus(OEoff::from_stream(run.totals.extents))
+                .expect("object extent count fits");
+        }
         given += rows.len() as u64;
         // Stream-local to object-local, by adding where this stream starts in the object.
         let moved = rows
@@ -1398,31 +1398,9 @@ impl DN {
     /// so the first to arrive asks an SN and the rest park behind it — and because
     /// asking an SN is a round trip, they park rather than hold a worker.
     fn extend(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Reply) {
-        let (mut payload, rest) =
-            match structure(&request.args, Op::ExtendObject, "an extend-object request") {
-                Ok(value) => value,
-                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
-            };
-        if !rest.is_empty() {
-            return reply.send(Resp::error(
-                Status::BadRequest,
-                "an extend-object request has trailing arguments",
-            ));
-        }
-        let name = match payload.text() {
-            Ok(name) => name,
+        let (name, sealed, records) = match extension(request) {
+            Ok(extension) => extension,
             Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
-        };
-        let sealed = match payload.number_u64() {
-            Ok(sealed) => sealed,
-            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
-        };
-        let records = match payload.number_u64().and_then(SRoff::of_number) {
-            Ok(records) => records,
-            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
-        };
-        if let Err(e) = payload.done() {
-            return reply.send(Resp::error(Status::BadRequest, e.to_string()));
         };
 
         // ⚠️ One lock, and everything decided inside it. An earlier version released
@@ -1437,7 +1415,7 @@ impl DN {
                 Some(object) => {
                     // Whoever names the stream that filled is the one that seals it in
                     // the list; the rest are late and have nothing to record.
-                    let ours = object.streams.last().is_some_and(|last| last.id.number() == sealed);
+                    let ours = object.streams.last().is_some_and(|last| last.id == sealed);
                     if let Some(last) = object.streams.last_mut().filter(|_| ours) {
                         last.records = records;
                     }
@@ -2056,8 +2034,8 @@ fn merge_batch_info(
         };
         after = after_described;
         let mut stream_args = Vec::new();
-        let mut extent_count = 0;
-        for _ in 0..shape.given {
+        let mut extent_count = OEoff::ZERO;
+        for _ in 0..shape.given.number() {
             let (mut row, rest) = match StreamRow::of_args(after) {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::Internal, e.to_string()),
@@ -2065,8 +2043,11 @@ fn merge_batch_info(
             after = rest;
             if let Some((run, extent_rows)) = runs.remove(&row.stream) {
                 row.totals = run.totals;
-                row.given = extent_rows.len() as u64;
-                extent_count += extent_rows.len() as u64;
+                row.given =
+                    ExtentId::of_number(extent_rows.len() as u64).expect("extent row count fits");
+                extent_count = extent_count
+                    .plus(OEoff::of_len(extent_rows.len()).expect("extent row count fits"))
+                    .expect("object extent count fits");
                 stream_args.extend(row.args());
                 for extent in extent_rows {
                     stream_args.extend(
@@ -2091,7 +2072,7 @@ fn merge_batch_info(
             );
         }
         shape.extents = extent_count;
-        shape.entries = 1 + shape.given + extent_count;
+        shape.entries = 1 + shape.given.number() + extent_count.number();
         entries += shape.entries;
         body.extend(shape.args());
         body.extend(described.map_or_else(Described::missing, |row| row.args()));
@@ -2112,6 +2093,20 @@ struct Piece {
     args: Vec<Arg>,
 }
 
+/// Decode the rollover request using the same ID and record widths as its writer.
+fn extension(request: &Req) -> common::Result<(String, StreamId, SRoff)> {
+    let (mut payload, rest) =
+        structure(&request.args, Op::ExtendObject, "an extend-object request")?;
+    if !rest.is_empty() {
+        return Err(common::Error::new("an extend-object request has trailing arguments"));
+    }
+    let name = payload.text()?;
+    let sealed = payload.stream_id()?;
+    let records = payload.sroff()?;
+    payload.done()?;
+    Ok((name, sealed, records))
+}
+
 fn main() {
     let result = server::main(|process| {
         let dn = DnId::new(process.entry.number());
@@ -2125,6 +2120,58 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn object_summaries_sum_streams_in_object_spaces() {
+        let object = Object {
+            id: ObjectId::FIRST,
+            framing: Framing::Lf,
+            extending: false,
+            waiting: Vec::new(),
+            keyed: false,
+            created: TimeSec::new(100),
+            streams: (0..2)
+                .map(|n| Stream {
+                    extents: ExtentId::MAX,
+                    logical: SLoff::new((1 << 32) + 17),
+                    compressed: SCoff::new((1 << 32) + 3),
+                    ..held(n, 0, Some(1))
+                })
+                .collect(),
+        };
+        let extents: OEoff = object.cached_extents();
+        let logical: OLoff = object.logical();
+        let compressed: OCoff = object.compressed();
+        assert_eq!(extents, OEoff::new(2 * ExtentId::MAX.number()));
+        assert_eq!(logical, OLoff::new(2 * ((1 << 32) + 17)));
+        assert_eq!(compressed, OCoff::new(2 * ((1 << 32) + 3)));
+        let described = detailed(
+            &object,
+            RangeId::FIRST,
+            DnId::FIRST,
+            &Want::plain().with(Detail::Counts),
+            100,
+        )
+        .unwrap();
+        let (shape, _) = Shape::of_args(&described.shape.args()).unwrap();
+        assert_eq!(shape.streams, StreamId::new(2));
+        assert_eq!(
+            (shape.extents, shape.logical, shape.compressed),
+            (extents, logical, compressed)
+        );
+    }
+
+    #[test]
+    fn rollover_reads_a_32_bit_stream_id_and_a_64_bit_record_count() {
+        let stream = StreamId::new(0x1234_5678);
+        let records = SRoff::new((1 << 32) + 20);
+        let mut payload = StructWriter::new();
+        payload.text("/x");
+        payload.stream_id(stream);
+        payload.sroff(records);
+        let request = Req::new(Op::ExtendObject).structure(payload);
+        assert_eq!(extension(&request).unwrap(), ("/x".to_string(), stream, records));
+    }
+
     #[test]
     fn locate_stream_refuses_a_replaced_object() {
         let dn = Arc::new(DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST));
@@ -2381,7 +2428,7 @@ mod tests {
     fn read_back(args: &[Arg]) -> (Shape, Vec<StreamRow>) {
         let (shape, rest) = Shape::of_args(args).expect("a shape");
         let (_, rest) = Described::of_args(rest).expect("an object");
-        let (rows, rest) = StreamRow::some_of_args(rest, shape.given).expect("streams");
+        let (rows, rest) = StreamRow::some_of_args(rest, shape.given.number()).expect("streams");
         assert!(rest.is_empty(), "and nothing left over");
         (shape, rows)
     }
@@ -2418,8 +2465,8 @@ mod tests {
                 .expect("an answer"),
         );
         let (shape, rows) = read_back(&args);
-        assert_eq!(shape.streams, 3, "how many there are");
-        assert_eq!((shape.given, rows.len()), (1, 1), "how many are described");
+        assert_eq!(shape.streams, StreamId::new(3), "how many there are");
+        assert_eq!((shape.given, rows.len()), (StreamId::new(1), 1), "how many are described");
         assert_eq!(shape.entries, 2, "the object and one stream");
         assert_eq!(shape.next, ORoff::new(100), "and where to carry on");
         assert!(shape.more());
@@ -2439,7 +2486,7 @@ mod tests {
                     &object,
                     RangeId::new(0),
                     DnId::new(0),
-                    &Want { limit: 2, from: Start::Record(at.get()), ..want },
+                    &Want { limit: 2, from: Start::Record(at), ..want },
                     100,
                 )
                 .expect("an answer"),
@@ -2475,7 +2522,7 @@ mod tests {
                 )
                 .expect("an answer"),
             );
-            read_back(&args).0.given
+            read_back(&args).0.given.number()
         };
         assert_eq!(given(0, 3), 2, "no request cap, so the configured one: object plus two");
         assert_eq!(given(2, 100), 1, "the request asks for less");
@@ -2507,7 +2554,10 @@ mod tests {
         let args =
             flat(detailed(&grown(), RangeId::new(0), DnId::new(0), &want, 100).expect("an answer"));
         let (shape, rows) = read_back(&args);
-        assert_eq!((shape.streams, shape.given, shape.entries), (3, 0, 1));
+        assert_eq!(
+            (shape.streams, shape.given, shape.entries),
+            (StreamId::new(3), StreamId::FIRST, 1)
+        );
         assert!(rows.is_empty());
         assert!(shape.more(), "three streams it did not describe is not nothing more");
         assert_eq!(shape.next, ORoff::ZERO, "and a listing would start at the first of them");
@@ -2640,7 +2690,10 @@ mod tests {
         assert_eq!(pieces.len(), 3);
         // The middle one is the miss: a shape saying nothing, then a row saying nothing.
         let (shape, rest) = Shape::of_args(pieces[1]).expect("a shape");
-        assert_eq!((shape.streams, shape.given, shape.entries), (0, 0, 1));
+        assert_eq!(
+            (shape.streams, shape.given, shape.entries),
+            (StreamId::FIRST, StreamId::FIRST, 1)
+        );
         assert!(Described::of_args(rest).expect("a row").0.is_none(), "the name is not there");
         // And the ones either side are real, which is what proves nothing slid by five.
         for present in [pieces[0], pieces[2]] {

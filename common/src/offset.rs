@@ -149,6 +149,15 @@ space!(ORoff, u64, "records", "an object");
 space!(SRoff, u64, "records", "a stream");
 space!(ERoff, u32, "records", "an extent");
 
+// Objects can reference more extents than any one stream or SN can name.
+space!(OEoff, u64, "extents", "an object");
+
+impl OEoff {
+    pub const fn from_stream(count: crate::ids::ExtentId) -> OEoff {
+        if count.is_none() { OEoff::NONE } else { OEoff::new(count.number()) }
+    }
+}
+
 /// Explicitly move a record position between its nesting levels. These are not wire
 /// conversions: naming the source and destination keeps a record in one space from
 /// being silently used in another.
@@ -171,12 +180,20 @@ impl SCoff {
 }
 
 impl OLoff {
+    pub const fn from_stream(value: SLoff) -> OLoff {
+        OLoff::new(value.get())
+    }
+
     pub const fn from_extent(value: ELoff) -> OLoff {
         OLoff::new(value.get() as u64)
     }
 }
 
 impl OCoff {
+    pub const fn from_stream(value: SCoff) -> OCoff {
+        OCoff::new(value.get())
+    }
+
     pub const fn from_extent(value: ECoff) -> OCoff {
         OCoff::new(value.get() as u64)
     }
@@ -191,6 +208,17 @@ impl ORoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_extent_counts_outgrow_one_stream_and_preserve_unknown() {
+        let per_stream = crate::ids::ExtentId::MAX;
+        let total = OEoff::from_stream(per_stream).plus(OEoff::from_stream(per_stream)).unwrap();
+        assert_eq!(total.number(), 2 * per_stream.number());
+        assert!(total.number() > u32::MAX as u64);
+        assert_eq!(OEoff::from_stream(crate::ids::ExtentId::NONE), OEoff::NONE);
+        assert_eq!(OEoff::from_stream(crate::ids::ExtentId::FIRST), OEoff::ZERO);
+        assert!(OEoff::MAX.plus(OEoff::new(1)).is_err());
+    }
 
     #[test]
     fn a_position_moves_on_by_a_length() {

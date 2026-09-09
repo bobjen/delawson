@@ -31,11 +31,11 @@ use crate::{Error, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Start {
     /// An object-local record number: the durable form, good for ever.
-    Record(u64),
+    Record(ORoff),
     /// That many logical bytes past that record's own start, which may land **inside**
     /// the record. The only way to address a record's interior, which a store for very
     /// large objects needs (§9.1.3.4).
-    RecordThen(u64, u64),
+    RecordThen(ORoff, OLoff),
     /// That many logical bytes into the object, snapping **forward** to the next
     /// record boundary.
     ///
@@ -45,38 +45,69 @@ pub enum Start {
     /// leading one. That is what keeps §9.1.3.4's partition property: the record snap
     /// is a deterministic function of the offset and the bytes, and every caller sees
     /// both identically, so adjacent callers agree on the boundary without talking.
-    Logical(u64),
+    Logical(OLoff),
 }
 
 /// The beginning of the object, which is where a caller that names no start means.
 impl Default for Start {
     fn default() -> Start {
-        Start::Record(0)
+        Start::Record(ORoff::ZERO)
     }
 }
 
 impl Start {
-    /// The record this start is at or after, which is what locates the extent.
-    pub fn record(self) -> Option<u64> {
+    pub fn record(self) -> Option<ORoff> {
         match self {
             Start::Record(record) | Start::RecordThen(record, _) => Some(record),
             Start::Logical(_) => None,
         }
     }
 
-    /// The object-local record position, when this start names one.
     pub fn object_record(self) -> Option<ORoff> {
+        self.record()
+    }
+
+    fn fields(self) -> (u8, u64, u64) {
         match self {
-            Start::Record(record) | Start::RecordThen(record, _) => Some(ORoff::new(record)),
-            Start::Logical(_) => None,
+            Start::Record(record) => (0, record.number(), 0),
+            Start::RecordThen(record, offset) => (1, record.number(), offset.number()),
+            Start::Logical(offset) => (2, offset.number(), 0),
         }
     }
 
-    fn code(self) -> u8 {
+    fn from_fields((kind, first, second): (u8, u64, u64)) -> Result<Self> {
+        match kind {
+            0 => Ok(Start::Record(ORoff::of_number(first)?)),
+            1 => Ok(Start::RecordThen(ORoff::of_number(first)?, OLoff::of_number(second)?)),
+            2 => Ok(Start::Logical(OLoff::of_number(first)?)),
+            other => Err(Error::new(format!("no range start of kind {other}"))),
+        }
+    }
+}
+
+/// A position within the extent named by a ReadExtent request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtentStart {
+    Record(ERoff),
+    RecordThen(ERoff, ELoff),
+    Logical(ELoff),
+}
+
+impl ExtentStart {
+    fn fields(self) -> (u8, u64, u64) {
         match self {
-            Start::Record(_) => 0,
-            Start::RecordThen(..) => 1,
-            Start::Logical(_) => 2,
+            ExtentStart::Record(record) => (0, record.number(), 0),
+            ExtentStart::RecordThen(record, offset) => (1, record.number(), offset.number()),
+            ExtentStart::Logical(offset) => (2, offset.number(), 0),
+        }
+    }
+
+    fn from_fields((kind, first, second): (u8, u64, u64)) -> Result<Self> {
+        match kind {
+            0 => Ok(ExtentStart::Record(ERoff::of_number(first)?)),
+            1 => Ok(ExtentStart::RecordThen(ERoff::of_number(first)?, ELoff::of_number(second)?)),
+            2 => Ok(ExtentStart::Logical(ELoff::of_number(first)?)),
+            other => Err(Error::new(format!("no extent range start of kind {other}"))),
         }
     }
 }
@@ -147,90 +178,91 @@ impl Range {
     /// The default budget, in logical bytes, for a caller that named none.
     pub const DEFAULT_LOGICAL: u64 = 1 << 20;
 
-    pub fn from(record: u64) -> Range {
+    pub fn from(record: ORoff) -> Range {
         Range { start: Start::Record(record), budget: Budget::Logical(Range::DEFAULT_LOGICAL) }
     }
 
-    /// Four arguments: what kind of start, its two numbers, then the budget as a kind
-    /// and an amount. Fixed width whichever variant it is, so a reader never has to
-    /// know the kind before it can find what follows.
     pub fn args(&self) -> Vec<Arg> {
-        let (first, second) = match self.start {
-            Start::Record(record) => (record, 0),
-            Start::RecordThen(record, offset) => (record, offset),
-            Start::Logical(offset) => (offset, 0),
-        };
         let mut payload = StructWriter::new();
-        payload.number_u8(self.start.code() as u8);
-        payload.number_u64(first);
-        payload.number_u64(second);
-        payload.number_u8(self.budget.code() as u8);
-        payload.number_u64(self.budget.amount());
+        write_range_fields(&mut payload, self.start.fields(), self.budget);
         vec![payload.finish(Op::Range)]
     }
 
-    /// Write this range as a nested value in a command-owned payload.
     pub fn write_nested(&self, payload: &mut StructWriter) {
-        let (first, second) = match self.start {
-            Start::Record(record) => (record, 0),
-            Start::RecordThen(record, offset) => (record, offset),
-            Start::Logical(offset) => (offset, 0),
-        };
         payload.nested(Op::Range, |payload| {
-            payload.number_u8(self.start.code() as u8);
-            payload.number_u64(first);
-            payload.number_u64(second);
-            payload.number_u8(self.budget.code() as u8);
-            payload.number_u64(self.budget.amount());
+            write_range_fields(payload, self.start.fields(), self.budget);
         });
     }
 
     pub fn read_nested(payload: &mut StructReader<'_>) -> Result<Range> {
-        payload.nested(Op::Range, "a range", |payload| {
-            let kind = payload.number_u8()?;
-            let first = payload.number_u64()?;
-            let second = payload.number_u64()?;
-            let measure = payload.number_u8()?;
-            let amount = payload.number_u64()?;
-            let start = match kind {
-                0 => Start::Record(first),
-                1 => Start::RecordThen(first, second),
-                2 => Start::Logical(first),
-                other => return Err(Error::new(format!("no range start of kind {other}"))),
-            };
-            let budget = match measure {
-                0 => Budget::Records(amount),
-                1 => Budget::Logical(amount),
-                2 => Budget::Compressed(amount),
-                other => return Err(Error::new(format!("no budget measured in kind {other}"))),
-            };
-            Ok(Range { start, budget })
+        payload.nested(Op::Range, "an object range", |payload| {
+            let (start, budget) = read_range_fields(payload)?;
+            Ok(Range { start: Start::from_fields(start)?, budget })
         })
     }
 
-    /// And back, returning whatever followed it.
     pub fn of_args(args: &[Arg]) -> Result<(Range, &[Arg])> {
-        let (mut payload, rest) = structure(args, Op::Range, "a range")?;
-        let kind = payload.number_u8()?;
-        let first = payload.number_u64()?;
-        let second = payload.number_u64()?;
-        let measure = payload.number_u8()?;
-        let amount = payload.number_u64()?;
+        let (mut payload, rest) = structure(args, Op::Range, "an object range")?;
+        let (start, budget) = read_range_fields(&mut payload)?;
         payload.done()?;
-        let start = match kind {
-            0 => Start::Record(first),
-            1 => Start::RecordThen(first, second),
-            2 => Start::Logical(first),
-            other => return Err(Error::new(format!("no range start of kind {other}"))),
-        };
-        let budget = match measure {
-            0 => Budget::Records(amount),
-            1 => Budget::Logical(amount),
-            2 => Budget::Compressed(amount),
-            other => return Err(Error::new(format!("no budget measured in kind {other}"))),
-        };
-        Ok((Range { start, budget }, rest))
+        Ok((Range { start: Start::from_fields(start)?, budget }, rest))
     }
+}
+
+/// The FE-to-EN range. Its start cannot be an object-local record number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtentRange {
+    pub start: ExtentStart,
+    pub budget: Budget,
+}
+
+impl ExtentRange {
+    pub fn from(record: ERoff) -> ExtentRange {
+        ExtentRange {
+            start: ExtentStart::Record(record),
+            budget: Budget::Logical(Range::DEFAULT_LOGICAL),
+        }
+    }
+
+    pub fn write_nested(&self, payload: &mut StructWriter) {
+        payload.nested(Op::Range, |payload| {
+            write_range_fields(payload, self.start.fields(), self.budget);
+        });
+    }
+
+    pub fn read_nested(payload: &mut StructReader<'_>) -> Result<ExtentRange> {
+        payload.nested(Op::Range, "an extent range", |payload| {
+            let (start, budget) = read_range_fields(payload)?;
+            Ok(ExtentRange { start: ExtentStart::from_fields(start)?, budget })
+        })
+    }
+}
+
+// Both commands retain their existing wire layout. The command selects the
+// coordinate space; raw numbers exist only inside this encoding boundary.
+fn write_range_fields(
+    payload: &mut StructWriter,
+    (kind, first, second): (u8, u64, u64),
+    budget: Budget,
+) {
+    payload.number_u8(kind);
+    payload.number_u64(first);
+    payload.number_u64(second);
+    payload.number_u8(budget.code());
+    payload.number_u64(budget.amount());
+}
+
+fn read_range_fields(payload: &mut StructReader<'_>) -> Result<((u8, u64, u64), Budget)> {
+    let start = (payload.number_u8()?, payload.number_u64()?, payload.number_u64()?);
+    let measure = payload.number_u8()?;
+    let amount = payload.number_u64()?;
+    let budget = match measure {
+        0 => Budget::Records(amount),
+        1 => Budget::Logical(amount),
+        2 => Budget::Compressed(amount),
+        other => return Err(Error::new(format!("no budget measured in kind {other}"))),
+    };
+    Ok((start, budget))
 }
 
 /// What an extent came to when it filled: the three measures the writing tier knows
@@ -492,7 +524,12 @@ impl Want {
     /// Nothing beyond the object and its first stream: what every caller asked for before this
     /// field existed.
     pub fn plain() -> Want {
-        Want { detail: 0, limit: 0, from: Start::Record(0), expect: Expecting::whatever() }
+        Want {
+            detail: 0,
+            limit: 0,
+            from: Start::Record(ORoff::ZERO),
+            expect: Expecting::whatever(),
+        }
     }
 
     pub fn with(mut self, detail: Detail) -> Want {
@@ -523,9 +560,9 @@ impl Want {
     /// sends neither — so the plain lookup is byte-for-byte what §17.5g measured.
     pub fn args(&self) -> Vec<Arg> {
         let (kind, at) = match self.from {
-            Start::Record(record) => (0, record),
-            Start::RecordThen(record, _) => (1, record),
-            Start::Logical(offset) => (2, offset),
+            Start::Record(record) => (0, record.number()),
+            Start::RecordThen(record, _) => (1, record.number()),
+            Start::Logical(offset) => (2, offset.number()),
         };
         let mut args = vec![
             Arg::Number(self.detail),
@@ -540,9 +577,9 @@ impl Want {
     /// Write the want fields into a command-owned payload without per-field wire tags.
     pub fn write(&self, payload: &mut StructWriter) {
         let (kind, at) = match self.from {
-            Start::Record(record) => (0, record),
-            Start::RecordThen(record, _) => (1, record),
-            Start::Logical(offset) => (2, offset),
+            Start::Record(record) => (0, record.number()),
+            Start::RecordThen(record, _) => (1, record.number()),
+            Start::Logical(offset) => (2, offset.number()),
         };
         payload.number_u64(self.detail);
         payload.number_u64(self.limit);
@@ -564,9 +601,9 @@ impl Want {
             created: crate::time::TimeSec::new(payload.number_u64()?),
         });
         let from = match kind {
-            0 => Start::Record(at),
-            1 => Start::RecordThen(at, 0),
-            2 => Start::Logical(at),
+            0 => Start::Record(ORoff::new(at)),
+            1 => Start::RecordThen(ORoff::new(at), OLoff::ZERO),
+            2 => Start::Logical(OLoff::new(at)),
             other => return Err(Error::new(format!("no range start of kind {other}"))),
         };
         let mut want = Want { detail, limit, from, expect };
@@ -594,9 +631,9 @@ impl Want {
         };
         let (expect, rest) = Expecting::of_args(rest)?;
         let from = match kind {
-            0 => Start::Record(*at),
-            1 => Start::RecordThen(*at, 0),
-            2 => Start::Logical(*at),
+            0 => Start::Record(ORoff::new(*at)),
+            1 => Start::RecordThen(ORoff::new(*at), OLoff::ZERO),
+            2 => Start::Logical(OLoff::new(*at)),
             other => return Err(Error::new(format!("no range start of kind {other}"))),
         };
         // Normalized on the way in, so nothing downstream has to remember the implications.
@@ -713,13 +750,51 @@ impl ObjectPiece {
 mod tests {
     use super::*;
 
+    #[test]
+    fn extent_starts_round_trip_in_their_own_space() {
+        for start in [
+            ExtentStart::Record(ERoff::new(7)),
+            ExtentStart::RecordThen(ERoff::new(7), ELoff::new(4096)),
+            ExtentStart::Logical(ELoff::new(4096)),
+        ] {
+            let range = ExtentRange { start, budget: Budget::Logical(1 << 20) };
+            let mut payload = StructWriter::new();
+            range.write_nested(&mut payload);
+            let args = vec![payload.finish(Op::ReadExtent)];
+            let (mut reader, _) = structure(&args, Op::ReadExtent, "read extent").unwrap();
+            assert_eq!(ExtentRange::read_nested(&mut reader).unwrap(), range);
+            reader.done().unwrap();
+        }
+    }
+
+    #[test]
+    fn object_starts_above_32_bits_cannot_decode_as_extent_starts() {
+        for start in [
+            Start::Record(ORoff::new(1 << 32)),
+            Start::RecordThen(ORoff::new(7), OLoff::new(1 << 32)),
+            Start::Logical(OLoff::new(1 << 32)),
+        ] {
+            let range = Range { start, budget: Budget::Records(1) };
+            let mut payload = StructWriter::new();
+            range.write_nested(&mut payload);
+            let args = vec![payload.finish(Op::ReadExtent)];
+            let (mut object_reader, _) = structure(&args, Op::ReadExtent, "test wrapper").unwrap();
+            assert_eq!(Range::read_nested(&mut object_reader).unwrap(), range);
+            let (mut extent_reader, _) = structure(&args, Op::ReadExtent, "test wrapper").unwrap();
+            assert!(ExtentRange::read_nested(&mut extent_reader).is_err());
+        }
+    }
+
     /// Every variant survives the wire, which is the only thing this file is for.
     #[test]
     fn a_range_survives_the_wire() {
         let each = [
-            Range { start: Start::Record(7), budget: Budget::Records(3) },
-            Range { start: Start::RecordThen(7, 4096), budget: Budget::Logical(1 << 20) },
-            Range { start: Start::Logical(1 << 30), budget: Budget::Compressed(4096) },
+            Range { start: Start::Record(ORoff::new(7)), budget: Budget::Records(3) },
+            Range {
+                start: Start::RecordThen(ORoff::new(7), OLoff::new(4096)),
+                budget: Budget::Logical(1 << 20),
+            },
+            Range { start: Start::Logical(OLoff::new(1 << 30)), budget: Budget::Compressed(4096) },
         ];
         for range in each {
             let args = range.args();
@@ -733,10 +808,11 @@ mod tests {
     /// without having to interpret the kind first.
     #[test]
     fn a_range_is_the_same_width_whichever_kind_it_is() {
-        let mut args = Range { start: Start::Logical(9), budget: Budget::Records(1) }.args();
+        let mut args =
+            Range { start: Start::Logical(OLoff::new(9)), budget: Budget::Records(1) }.args();
         args.push(Arg::Text("and something after it".into()));
         let (range, rest) = Range::of_args(&args).expect("a range");
-        assert_eq!(range.start, Start::Logical(9));
+        assert_eq!(range.start, Start::Logical(OLoff::new(9)));
         assert_eq!(rest.len(), 1, "and the rest is whoever's else");
     }
 
@@ -786,9 +862,9 @@ mod tests {
     /// cannot — which is why §9.1.3.4 needs a prefix sum for that one.
     #[test]
     fn only_a_record_start_locates_an_extent_by_itself() {
-        assert_eq!(Start::Record(7).record(), Some(7));
-        assert_eq!(Start::RecordThen(7, 99).record(), Some(7));
-        assert_eq!(Start::Logical(99).record(), None);
+        assert_eq!(Start::Record(ORoff::new(7)).record(), Some(ORoff::new(7)));
+        assert_eq!(Start::RecordThen(ORoff::new(7), OLoff::new(99)).record(), Some(ORoff::new(7)));
+        assert_eq!(Start::Logical(OLoff::new(99)).record(), None);
     }
 
     #[test]
@@ -871,13 +947,13 @@ mod tests {
         let want = Want {
             detail: Detail::Extents.bit(),
             limit: 500,
-            from: Start::Record(9_000),
+            from: Start::Record(ORoff::new(9_000)),
             ..Want::plain()
         };
         let args = want.args();
         let (back, _) = Want::of_args(&args).expect("a want");
         assert_eq!(back.limit, 500);
-        assert_eq!(back.from, Start::Record(9_000));
+        assert_eq!(back.from, Start::Record(ORoff::new(9_000)));
         assert!(Want::of_args(&args[..3]).is_err(), "and a short one is refused");
     }
 

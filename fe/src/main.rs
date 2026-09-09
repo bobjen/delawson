@@ -23,12 +23,13 @@ use common::Result;
 use common::block::Holds;
 use common::config::{FEConfig, ServiceKind};
 use common::framing::Framing;
-use common::ids::{DiskId, DnId, EnId, ExtentId, SnId};
+use common::ids::{DiskId, DnId, EnId, ExtentId, SnId, StreamId};
 use common::info::{Batch, Described, Expecting, Shape, StreamName, UNKNOWN, Wanted};
 use common::logw;
-use common::offset::{ELoff, ERoff, OCoff, OLoff, ORoff, SRoff};
+use common::offset::{ELoff, ERoff, OCoff, OEoff, OLoff, ORoff, SRoff};
 use common::range::{
-    Budget, Detail, ExtentCovered, Filled, ObjectCovered, ObjectPiece, Piece, Range, Start, Want,
+    Budget, Detail, ExtentCovered, ExtentRange, ExtentStart, Filled, ObjectCovered, ObjectPiece,
+    Piece, Range, Start, Want,
 };
 use common::routing;
 use common::server::{self, Process, Reply, Service};
@@ -187,6 +188,14 @@ enum Plan {
 }
 
 impl Stream {
+    /// Cache the last extent's own count after an explicit seal.
+    fn seal_open(&mut self, records: ERoff) {
+        if let Some(mut old) = self.open.take() {
+            old.records = records;
+            self.remember(old);
+        }
+    }
+
     /// Decide what an append should do, and record what the decision implies.
     ///
     /// `sealed` is `(extent, records)` when the caller has just been told that extent
@@ -421,11 +430,7 @@ impl FE {
                     }
                 };
                 if let Some(state) = fe2.streams.lock().expect("streams").get_mut(&stream) {
-                    if let Some(mut old) = state.open.take() {
-                        old.records =
-                            ERoff::of_number(records.number()).expect("stream records fit");
-                        state.remember(old);
-                    }
+                    state.seal_open(filled.records);
                 }
                 let mut payload = StructWriter::new();
                 payload.text(&path);
@@ -895,7 +900,6 @@ impl FE {
             ));
         };
         reply.about(format_args!("{path},record {record},{:?}", range.budget));
-        let record = ORoff::new(record);
         self.resolve_record(
             process,
             &path,
@@ -1173,7 +1177,7 @@ fn from_instance(
     payload.sn_id(open.sn);
     payload.extent_id(open.id);
     payload.time_sec(open.created);
-    Range { start: Start::Record(at.number()), budget }.write_nested(&mut payload);
+    ExtentRange { start: ExtentStart::Record(at), budget }.write_nested(&mut payload);
     let ask = Req::new(Op::ReadExtent).structure(payload);
     let named = identity.clone();
     // The blocks come back whole and are passed on whole: the reader decompresses
@@ -1471,19 +1475,20 @@ impl Spread {
         // summary of an object with no streams is still all there is to say about it, which
         // is why this is not simply `shape.more()`.
         let covered = ask.want.detail & self.want.detail == self.want.detail;
-        let whole = if covered { !shape.more() } else { shape.streams == 0 };
+        let whole = if covered { !shape.more() } else { shape.streams == StreamId::FIRST };
         let full = if !self.want.wants(Detail::Streams) {
             1
         } else {
             match shape.streams {
-                UNKNOWN => shape.entries,
+                StreamId::NONE => shape.entries,
                 streams => {
-                    let extents = if self.want.wants(Detail::Extents) && shape.extents != UNKNOWN {
-                        shape.extents
-                    } else {
-                        0
-                    };
-                    1u64.saturating_add(streams).saturating_add(extents)
+                    let extents =
+                        if self.want.wants(Detail::Extents) && shape.extents != OEoff::NONE {
+                            shape.extents.number()
+                        } else {
+                            0
+                        };
+                    1u64.saturating_add(streams.number()).saturating_add(extents)
                 }
             }
         };
@@ -1998,6 +2003,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_sealing_caches_only_the_last_extents_record_count() {
+        for first in [100, (1 << 32) + 100] {
+            let mut stream = Stream { open: Some(extent(2, first)), ..Stream::default() };
+            stream.seal_open(ERoff::new(20));
+            assert!(stream.open.is_none());
+            assert_eq!(stream.sealed[0].records, ERoff::new(20));
+            assert!(stream.holding(SRoff::new(first)).is_some());
+            assert!(stream.holding(SRoff::new(first + 19)).is_some());
+            assert!(stream.holding(SRoff::new(first + 20)).is_none());
+        }
+    }
+
+    #[test]
     fn read_lookup_preserves_the_object_expectation() {
         for expected in [
             Expecting::whatever(),
@@ -2082,7 +2100,9 @@ mod tests {
     #[test]
     fn interior_starts_are_refused_before_lookup() {
         let fe = Arc::new(FE::new(common::testing::fe_config()));
-        for start in [Start::RecordThen(7, 1), Start::Logical(1)] {
+        for start in
+            [Start::RecordThen(ORoff::new(7), OLoff::new(1)), Start::Logical(OLoff::new(1))]
+        {
             let request =
                 Range { start, budget: Budget::Records(1) }.request("/x", Expecting::whatever());
             let (wire, mut reader) = common::testing::link();
@@ -2166,14 +2186,14 @@ mod tests {
     /// One name's worth of a levelled answer, as a DN would send it.
     fn described(streams: u64, given: u64, next: u64) -> Vec<Arg> {
         let shape = Shape {
-            streams,
-            given,
-            extents: UNKNOWN,
+            streams: StreamId::of_number(streams).unwrap(),
+            given: StreamId::of_number(given).unwrap(),
+            extents: OEoff::NONE,
             entries: 1 + given,
             next: ORoff::new(next),
             records: ORoff::NONE,
-            logical: common::offset::SLoff::NONE,
-            compressed: common::offset::SCoff::NONE,
+            logical: common::offset::OLoff::NONE,
+            compressed: common::offset::OCoff::NONE,
         };
         let mut args = shape.args();
         args.extend(
@@ -2205,7 +2225,7 @@ mod tests {
                     records: SRoff::new(3),
                     created: TimeSec::new(1_000_000),
                     totals: Totals::unknown(),
-                    given: 0,
+                    given: ExtentId::FIRST,
                 }
                 .args(),
             );

@@ -18081,3 +18081,37 @@ These changes update the current prototype wire contract: `LocateStream` now car
 expectation, and client blocks have a distinct tag and a wider first-record field. Rebuild the
 client and servers together for this prototype revision. This is not capability negotiation or a
 mixed-version rollout implementation; the requirements of §17.42 still apply before shipping.
+
+### 17.43.1 Stream rollover and explicit sealing retain their types
+
+The follow-up review found two more mismatches. The FE already wrote an `ExtendObject`
+request with a 32-bit `StreamId` and a 64-bit `SRoff`; the DN now reads those same types
+and compares stream IDs directly. Previously it read the ID as 64 bits, consuming part of
+the record count and then rejecting the truncated request.
+
+After an explicit seal, the FE caches the last extent's count from `Filled.records`
+(`ERoff`), while forwarding the SN's whole-stream count (`SRoff`) to the DN. The stream
+total must never become the last extent's count. Direct unit tests cover rollover parsing
+and the cached extent's boundaries, including a stream position above 32 bits.
+
+### 17.43.2 Object totals and read coordinates retain their scope
+
+Object logical and compressed byte totals use `OLoff` and `OCoff`, with explicit
+widening from stream totals at aggregation. Object extent totals use `OEoff`
+(Object Extent OFFset), a `u64`: an object can contain more extents than one stream.
+Per-stream extent counts, including counts of returned extent rows, use `ExtentId`;
+object stream counts use `StreamId`, not `SnId`. No separate stream extent count
+type is needed: a stream is limited to `ExtentId::MAX` extents, reflecting the
+number an SN can represent and the usual single reference per extent.
+
+Object read starts now carry `ORoff`/`OLoff`. Extent reads use a separate
+`ExtentRange`/`ExtentStart` carrying `ERoff`/`ELoff`, so the FE no longer
+widens an extent position into an object start and the EN no longer narrows it
+back. Both retain the existing range encoding; the request selects its scope.
+The SN copies sealed extent measurements straight into extent rows, widening
+only when computing stream totals.
+
+These repairs preserve wire layouts and add direct unit tests for large object
+totals, scoped range decoding, unknown-count encoding, and sealed extent rows.
+The mixed stream/object coordinates in `ExtentRow.first_record` remain a
+separate, deferred repair.

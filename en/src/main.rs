@@ -26,7 +26,7 @@ use common::crypto;
 use common::framing::Framing;
 use common::ids::{DiskId, EnId, ExtentId, SnId};
 use common::offset::{ECoff, ELoff, ERoff};
-use common::range::{Budget, ExtentCovered, Filled, Piece, Range};
+use common::range::{Budget, ExtentCovered, ExtentRange, ExtentStart, Filled, Piece};
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::wire::{
@@ -980,9 +980,9 @@ impl Disk {
         sn: SnId,
         extent: ExtentId,
         created: TimeSec,
-        range: Range,
+        range: ExtentRange,
     ) -> Resp {
-        let common::range::Start::Record(from) = range.start else {
+        let ExtentStart::Record(from) = range.start else {
             return Resp::error(
                 Status::Unimplemented,
                 "only record-boundary starts are implemented",
@@ -1005,10 +1005,6 @@ impl Disk {
             }
             Some(_) => {}
         }
-        let from = match ERoff::of_number(from) {
-            Ok(from) => from,
-            Err(e) => return Resp::error(Status::NotFound, e.to_string()),
-        };
         let place = held.at[&(sn, extent)];
         let ranged = match held.range(
             &self.daily_cache,
@@ -1219,7 +1215,7 @@ impl EN {
             Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let range = match Range::read_nested(&mut payload) {
+        let range = match ExtentRange::read_nested(&mut payload) {
             Ok(range) => range,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
@@ -1389,7 +1385,7 @@ mod tests {
                 SnId::FIRST,
                 ExtentId::new(1),
                 TimeSec::new(1_000_000),
-                Range::from(0),
+                ExtentRange::from(ERoff::ZERO),
             );
             assert_eq!(answer.status, Status::Ok);
             let (covered, rest) = ExtentCovered::of_args(&answer.args).unwrap();
@@ -1400,7 +1396,10 @@ mod tests {
                 SnId::FIRST,
                 ExtentId::new(1),
                 TimeSec::new(1_000_000),
-                Range { start: common::range::Start::RecordThen(0, 1), budget: Budget::Records(1) },
+                ExtentRange {
+                    start: ExtentStart::RecordThen(ERoff::ZERO, ELoff::new(1)),
+                    budget: Budget::Records(1),
+                },
             );
             assert_eq!(answer.status, Status::Unimplemented);
             send.send(()).unwrap();

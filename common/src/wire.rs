@@ -27,7 +27,7 @@
 
 use crate::config::Messaging;
 use crate::ids::{DiskId, DnId, EnId, ExtentId, ObjectId, RangeId, SnId, StreamId};
-use crate::offset::{ECoff, ELoff, ERoff, OCoff, OLoff, ORoff, SCoff, SLoff, SRoff};
+use crate::offset::{ECoff, ELoff, ERoff, OCoff, OEoff, OLoff, ORoff, SCoff, SLoff, SRoff};
 use crate::random::Rng;
 use crate::seal::{self, Seal};
 use crate::time::TimeSec;
@@ -367,6 +367,10 @@ impl StructWriter {
         self.number_u32(value.get());
     }
 
+    pub fn oeoff(&mut self, value: OEoff) {
+        self.number_u64(value.get());
+    }
+
     pub fn oroff(&mut self, value: ORoff) {
         self.number_u64(value.get());
     }
@@ -509,6 +513,10 @@ impl<'a> StructReader<'a> {
 
     pub fn ecoff(&mut self) -> Result<ECoff> {
         Ok(ECoff::new(self.number_u32()?))
+    }
+
+    pub fn oeoff(&mut self) -> Result<OEoff> {
+        Ok(OEoff::new(self.number_u64()?))
     }
 
     pub fn oroff(&mut self) -> Result<ORoff> {
@@ -1485,7 +1493,7 @@ mod tests {
     #[test]
     fn a_message_carries_the_depth_seen_while_serializing() {
         let mut payload = StructWriter::new();
-        crate::range::Range::from(7).write_nested(&mut payload);
+        crate::range::Range::from(ORoff::new(7)).write_nested(&mut payload);
         let request = Req::new(Op::ReadRecord).structure(payload);
         let mut plain = Vec::new();
         put_request(&mut plain, &request).unwrap();
@@ -1495,7 +1503,7 @@ mod tests {
     #[test]
     fn a_nested_structure_may_not_exceed_the_message_depth() {
         let mut payload = StructWriter::new();
-        crate::range::Range::from(7).write_nested(&mut payload);
+        crate::range::Range::from(ORoff::new(7)).write_nested(&mut payload);
         let Arg::Struct(op, bytes, _) = payload.finish(Op::ReadRecord) else {
             panic!("a self-contained payload")
         };
@@ -1524,14 +1532,14 @@ mod tests {
     #[test]
     fn a_shape_is_one_self_contained_wire_argument() {
         let shape = crate::info::Shape {
-            streams: 3,
-            given: 2,
-            extents: 7,
+            streams: StreamId::new(3),
+            given: StreamId::new(2),
+            extents: OEoff::new(7),
             entries: 9,
             next: crate::offset::ORoff::new(11),
             records: crate::offset::ORoff::NONE,
-            logical: crate::offset::SLoff::NONE,
-            compressed: crate::offset::SCoff::NONE,
+            logical: crate::offset::OLoff::NONE,
+            compressed: crate::offset::OCoff::NONE,
         };
         let compact = Req { id: 7, op: Op::BatchInfo, args: shape.args() };
         assert_eq!(compact.args.len(), 1, "the shape is one self-contained value");

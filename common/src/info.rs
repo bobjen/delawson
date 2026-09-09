@@ -13,7 +13,7 @@
 
 use crate::framing::Framing;
 use crate::ids::{DiskId, DnId, EnId, ExtentId, ObjectId, RangeId, SnId, StreamId};
-use crate::offset::{ECoff, ELoff, ERoff, ORoff, SCoff, SLoff, SRoff};
+use crate::offset::{ECoff, ELoff, ERoff, OCoff, OEoff, OLoff, ORoff, SCoff, SLoff, SRoff};
 use crate::placement::Expansion;
 use crate::time::TimeSec;
 use crate::wire::Arg;
@@ -171,11 +171,11 @@ pub const UNKNOWN: u64 = u64::MAX;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Shape {
     /// Streams the object has, whether or not they are all described here.
-    pub streams: u64,
+    pub streams: StreamId,
     /// Stream rows that follow.
-    pub given: u64,
+    pub given: StreamId,
     /// Extents across the streams described, or `UNKNOWN` when no SN was asked.
-    pub extents: u64,
+    pub extents: OEoff,
     /// Entries this answer spent, against the limit it was given (§9.1.3.7).
     pub entries: u64,
     /// The object-local record to ask from next, or `UNKNOWN` when nothing follows.
@@ -183,23 +183,23 @@ pub struct Shape {
     /// Aggregate object record count, when counts were requested.
     pub records: ORoff,
     /// Aggregate logical length, when counts were requested and known.
-    pub logical: SLoff,
+    pub logical: OLoff,
     /// Aggregate compressed length, when counts were requested and known.
-    pub compressed: SCoff,
+    pub compressed: OCoff,
 }
 
 impl Shape {
     /// What an answer carrying no detail says: one object, nothing else asked about.
     pub fn plain() -> Shape {
         Shape {
-            streams: 0,
-            given: 0,
-            extents: UNKNOWN,
+            streams: StreamId::FIRST,
+            given: StreamId::FIRST,
+            extents: OEoff::NONE,
             entries: 1,
             next: ORoff::NONE,
             records: ORoff::NONE,
-            logical: SLoff::NONE,
-            compressed: SCoff::NONE,
+            logical: OLoff::NONE,
+            compressed: OCoff::NONE,
         }
     }
 
@@ -209,9 +209,11 @@ impl Shape {
 
     pub fn args(&self) -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        for field in [self.streams, self.given, self.extents, self.entries] {
-            payload.number_u64(field);
-        }
+        // Preserve the existing 64-bit wire fields and UNKNOWN spelling.
+        payload.number_u64(if self.streams.is_none() { UNKNOWN } else { self.streams.number() });
+        payload.number_u64(self.given.number());
+        payload.oeoff(self.extents);
+        payload.number_u64(self.entries);
         payload.number_u64(self.next.number());
         payload.number_u64(self.records.number());
         payload.number_u64(self.logical.number());
@@ -223,14 +225,17 @@ impl Shape {
         {
             let (mut payload, rest) = structure(args, Op::ShapeResp, "a shape")?;
             let shape = Shape {
-                streams: payload.number_u64()?,
-                given: payload.number_u64()?,
-                extents: payload.number_u64()?,
+                streams: match payload.number_u64()? {
+                    UNKNOWN => StreamId::NONE,
+                    count => StreamId::of_number(count)?,
+                },
+                given: StreamId::of_number(payload.number_u64()?)?,
+                extents: payload.oeoff()?,
                 entries: payload.number_u64()?,
                 next: ORoff::of_number(payload.number_u64()?)?,
                 records: ORoff::of_number(payload.number_u64()?)?,
-                logical: SLoff::of_number(payload.number_u64()?)?,
-                compressed: SCoff::of_number(payload.number_u64()?)?,
+                logical: OLoff::of_number(payload.number_u64()?)?,
+                compressed: OCoff::of_number(payload.number_u64()?)?,
             };
             payload.done()?;
             return Ok((shape, rest));
@@ -482,7 +487,7 @@ pub struct StreamRow {
     /// Extent rows that follow this one. ⚠️ **The answer is interleaved** — a stream then
     /// its extents, repeated — so a reader never attributes extents to a stream by
     /// position, which is §17.19's defect.
-    pub given: u64,
+    pub given: ExtentId,
 }
 
 impl StreamRow {
@@ -498,7 +503,7 @@ impl StreamRow {
         payload.extent_id(self.totals.extents);
         payload.sloff(self.totals.logical);
         payload.scoff(self.totals.compressed);
-        payload.number_u64(self.given);
+        payload.number_u64(self.given.number());
         vec![payload.finish(Op::StreamRowResp)]
     }
 
@@ -515,7 +520,7 @@ impl StreamRow {
                 logical: payload.sloff()?,
                 compressed: payload.scoff()?,
             },
-            given: payload.number_u64()?,
+            given: ExtentId::of_number(payload.number_u64()?)?,
         };
         payload.done()?;
         Ok((row, rest))
@@ -687,10 +692,10 @@ impl Batch {
             let (shape, mut rest) = Shape::of_args(args)?;
             let (_, after) = Described::of_args(rest)?;
             rest = after;
-            for _ in 0..shape.given {
+            for _ in 0..shape.given.number() {
                 let (row, after) = StreamRow::of_args(rest)?;
                 rest = after;
-                for _ in 0..row.given {
+                for _ in 0..row.given.number() {
                     rest = ExtentRow::of_args(rest)?.1;
                 }
             }
@@ -854,6 +859,15 @@ impl ExtentRun {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unknown_stream_counts_keep_the_existing_wire_sentinel() {
+        let shape = Shape { streams: StreamId::NONE, ..Shape::plain() };
+        let args = shape.args();
+        let (mut payload, _) = structure(&args, Op::ShapeResp, "shape").unwrap();
+        assert_eq!(payload.number_u64().unwrap(), UNKNOWN);
+        assert_eq!(Shape::of_args(&args).unwrap().0, shape);
+    }
+
     fn one(id: u32) -> Described {
         let id = ObjectId::new(id);
         Described {
@@ -943,7 +957,7 @@ mod tests {
             records: SRoff::new(records),
             created: TimeSec::new(1_000_000),
             totals: Totals::unknown(),
-            given: 0,
+            given: ExtentId::FIRST,
         }
     }
 
@@ -952,14 +966,14 @@ mod tests {
     #[test]
     fn a_shape_and_its_streams_survive_the_wire() {
         let shape = Shape {
-            streams: 3,
-            given: 2,
-            extents: 40,
+            streams: StreamId::new(3),
+            given: StreamId::new(2),
+            extents: OEoff::new(40),
             entries: 3,
             next: ORoff::new(700),
             records: ORoff::NONE,
-            logical: SLoff::NONE,
-            compressed: SCoff::NONE,
+            logical: OLoff::NONE,
+            compressed: OCoff::NONE,
         };
         let rows = vec![stream(1, 0, 300), stream(2, 300, 400)];
         let mut args = shape.args();
@@ -968,7 +982,7 @@ mod tests {
         }
         let (back, rest) = Shape::of_args(&args).expect("a shape");
         assert_eq!(back, shape);
-        let (given, rest) = StreamRow::some_of_args(rest, back.given).expect("streams");
+        let (given, rest) = StreamRow::some_of_args(rest, back.given.number()).expect("streams");
         assert_eq!(given, rows);
         assert!(rest.is_empty());
     }
@@ -989,7 +1003,7 @@ mod tests {
         assert_ne!(open, empty);
         // A plain answer knows its own entry count and nothing else.
         let plain = Shape::plain();
-        assert_eq!((plain.entries, plain.extents), (1, UNKNOWN));
+        assert_eq!((plain.entries, plain.extents), (1, OEoff::NONE));
         assert!(!plain.more(), "nothing follows a plain answer");
     }
 
@@ -998,19 +1012,22 @@ mod tests {
     #[test]
     fn a_shape_promising_more_rows_than_it_carries_is_refused() {
         let shape = Shape {
-            streams: 9,
-            given: 3,
-            extents: UNKNOWN,
+            streams: StreamId::new(9),
+            given: StreamId::new(3),
+            extents: OEoff::NONE,
             entries: 4,
             next: ORoff::NONE,
             records: ORoff::NONE,
-            logical: SLoff::NONE,
-            compressed: SCoff::NONE,
+            logical: OLoff::NONE,
+            compressed: OCoff::NONE,
         };
         let mut args = shape.args();
         args.extend(stream(1, 0, 10).args());
         let (back, rest) = Shape::of_args(&args).expect("a shape");
-        assert!(StreamRow::some_of_args(rest, back.given).is_err(), "three promised, one given");
+        assert!(
+            StreamRow::some_of_args(rest, back.given.number()).is_err(),
+            "three promised, one given"
+        );
     }
 
     fn extent(id: u64, first_record: u64, records: u64) -> ExtentRow {
@@ -1113,19 +1130,19 @@ mod tests {
     #[test]
     fn an_answer_can_be_complete_in_counts_and_partial_in_detail() {
         let shape = Shape {
-            streams: 1000,
-            given: 2,
-            extents: UNKNOWN,
+            streams: StreamId::new(1000),
+            given: StreamId::new(2),
+            extents: OEoff::NONE,
             entries: 3,
             next: ORoff::new(512),
             records: ORoff::NONE,
-            logical: SLoff::NONE,
-            compressed: SCoff::NONE,
+            logical: OLoff::NONE,
+            compressed: OCoff::NONE,
         };
         let args = shape.args();
         let (back, _) = Shape::of_args(&args).expect("a shape");
-        assert_eq!(back.streams, 1000, "how many there are");
-        assert_eq!(back.given, 2, "how many are described");
+        assert_eq!(back.streams, StreamId::new(1000), "how many there are");
+        assert_eq!(back.given, StreamId::new(2), "how many are described");
         assert!(back.more(), "and where to carry on");
         assert_eq!(back.next, ORoff::new(512));
     }

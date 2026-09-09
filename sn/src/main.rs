@@ -741,9 +741,9 @@ impl SN {
                 id: sealed.extent.id,
                 created: sealed.extent.created,
                 first_record: at.get(),
-                records: ERoff::of_number(sealed.records().number()).expect("extent records fit"),
-                logical: ELoff::of_number(sealed.logical().number()).expect("extent bytes fit"),
-                length: ECoff::of_number(sealed.compressed().number()).expect("extent bytes fit"),
+                records: sealed.extent.records,
+                logical: sealed.logical,
+                length: sealed.compressed,
                 disks: if instances {
                     sealed
                         .extent
@@ -799,7 +799,7 @@ impl SN {
         // cache is allowed (§17.25.1) — and a sealed stream has no open extent, so its
         // totals are exact.
         let mut totals = Totals {
-            extents: ExtentId::new(total as u32),
+            extents: ExtentId::of_number(total).expect("stream extent count fits"),
             logical: SLoff::ZERO,
             compressed: SCoff::ZERO,
         };
@@ -808,7 +808,15 @@ impl SN {
             totals.compressed =
                 totals.compressed.plus(sealed.compressed()).expect("stream bytes fit");
         }
-        (ExtentRun { stream, totals, given: ExtentId::new(rows.len() as u32), next }, rows)
+        (
+            ExtentRun {
+                stream,
+                totals,
+                given: ExtentId::of_number(rows.len() as u64).expect("extent row count fits"),
+                next,
+            },
+            rows,
+        )
     }
 
     /// A stream's name, the sealed extent and what it came to: record it and open the next
@@ -1026,6 +1034,40 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extent_rows_keep_extent_measures_while_stream_totals_widen() {
+        let sn = SN::new(testing::sn_config(), 10, SnId::FIRST, Vec::new());
+        let extent = Sealed {
+            extent: Extent {
+                id: ExtentId::FIRST,
+                records: ERoff::new(7),
+                created: TimeSec::new(100),
+                disks: Vec::new(),
+            },
+            logical: ELoff::MAX,
+            compressed: ECoff::new(123),
+        };
+        let stream = Stream {
+            created: TimeSec::new(100),
+            creator: SnId::FIRST,
+            sealed: vec![extent.clone(), extent],
+            open: None,
+            sealed_records: SRoff::new(14),
+            sealed_stream: true,
+        };
+        let (run, rows) = sn.run_of(&stream, StreamId::FIRST, 0, 10, false);
+        assert_eq!(run.totals.extents, ExtentId::new(2));
+        assert_eq!(run.given, ExtentId::new(2));
+        assert_eq!(run.totals.logical, SLoff::new(2 * ELoff::MAX.number()));
+        assert_eq!(run.totals.compressed, SCoff::new(246));
+        for row in rows {
+            assert_eq!(
+                (row.records, row.logical, row.length),
+                (ERoff::new(7), ELoff::MAX, ECoff::new(123))
+            );
+        }
+    }
+
     /// What an extent came to, for a test that does not care about the difference between
     /// a logical length and a compressed one. Anything testing #94's distinction says both.
     fn came(records: u64, compressed: u64) -> Filled {

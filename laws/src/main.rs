@@ -14,7 +14,7 @@ use common::block::{APPEND_OVERHEAD, Holds, expand, squeeze};
 use common::config::Compress;
 use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
-use common::ids::{ExtentId, ObjectId, RangeId};
+use common::ids::{ExtentId, ObjectId, RangeId, StreamId};
 use common::info::{Batch, Described, Expecting, ExtentRow, ObjectName, Shape, StreamRow, UNKNOWN};
 use common::offset::{ELoff, ERoff, ORoff, SCoff, SLoff, SRoff};
 use common::placement::{self, Expansion};
@@ -81,7 +81,8 @@ impl Want1 {
 
 /// What a run of `--want` choices comes to, with implications applied.
 fn asking(want: &[Want1], limit: u64, from: u64) -> Want {
-    let mut asked = Want { detail: 0, limit, from: Start::Record(from), ..Want::plain() };
+    let mut asked =
+        Want { detail: 0, limit, from: Start::Record(ORoff::new(from)), ..Want::plain() };
     for one in want {
         asked = asked.with(one.detail());
     }
@@ -1154,9 +1155,9 @@ fn benchmark_info_found(args: &[Arg]) -> Result<u64> {
     let (shape, mut rest) = Shape::of_args(args)?;
     let (object, after) = Described::of_args(rest)?;
     rest = after;
-    for _ in 0..shape.given {
+    for _ in 0..shape.given.number() {
         let (stream, after) = StreamRow::of_args(rest)?;
-        let (_, after) = ExtentRow::some_of_args(after, stream.given)?;
+        let (_, after) = ExtentRow::some_of_args(after, stream.given.number())?;
         rest = after;
     }
     if !rest.is_empty() {
@@ -1471,9 +1472,9 @@ fn object(target: &Target, response: &Resp, expansion: Expansion) -> Result<()> 
     // Interleaved: a stream, then the extents it says follow, repeated (§17.22).
     let mut rest = rest;
     let mut streams = Vec::new();
-    for _ in 0..shape.given {
+    for _ in 0..shape.given.number() {
         let Ok((row, after)) = StreamRow::of_args(rest) else { return report(target, response) };
-        let Ok((extents, after)) = ExtentRow::some_of_args(after, row.given) else {
+        let Ok((extents, after)) = ExtentRow::some_of_args(after, row.given.number()) else {
             return report(target, response);
         };
         streams.push((row, extents));
@@ -1599,12 +1600,9 @@ fn say(
     );
     let Some(shape) = shape else { return Ok(()) };
     if shape.records != ORoff::NONE {
-        let logical = if shape.logical == SLoff::NONE {
-            "unknown".to_string()
-        } else {
-            shape.logical.to_string()
-        };
-        let compressed = if shape.compressed == SCoff::NONE {
+        let logical =
+            if shape.logical.is_none() { "unknown".to_string() } else { shape.logical.to_string() };
+        let compressed = if shape.compressed.is_none() {
             "unknown".to_string()
         } else {
             shape.compressed.to_string()
@@ -1659,10 +1657,10 @@ fn say(
     }
     // What it did not tell you, which is what makes a partial answer usable.
     let of = match shape.streams {
-        UNKNOWN => String::new(),
+        StreamId::NONE => String::new(),
         total => format!(" of {total}"),
     };
-    let s = if shape.given == 1 { "" } else { "s" };
+    let s = if shape.given.number() == 1 { "" } else { "s" };
     let e = if shape.entries == 1 { "y" } else { "ies" };
     match shape.next {
         ORoff::NONE => println!(
@@ -1769,8 +1767,8 @@ fn scan(
         if before.is_some_and(|stop| at >= stop) {
             break;
         }
-        let request =
-            Range { start: Start::Record(at), budget }.request(path, Expecting::whatever());
+        let request = Range { start: Start::Record(ORoff::new(at)), budget }
+            .request(path, Expecting::whatever());
         let answer = conn.call(&request)?;
         asked += 1;
         // Running off the end is how a scan of an object whose length it does not
@@ -2227,7 +2225,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
                 // holding it comes back whole either way, and asking this way means
                 // there is one shape on the read path rather than two.
                 Arg::Number(record) => {
-                    Range { start: Start::Record(record), budget: Budget::Records(1) }
+                    Range { start: Start::Record(ORoff::new(record)), budget: Budget::Records(1) }
                         .request(path, expecting(expect)?)
                 }
                 // A key, which is a keyed read and unbuilt. Sent as it stands so the
@@ -2294,7 +2292,7 @@ mod tests {
             at: At { record: Some(7), key: None },
         })
         .unwrap();
-        let scan = Range { start: Start::Record(7), budget: Budget::Logical(1024) }
+        let scan = Range { start: Start::Record(ORoff::new(7)), budget: Budget::Logical(1024) }
             .request("/x", Expecting::whatever());
         for request in [point, scan] {
             let (mut payload, rest) = structure(&request.args, Op::ReadRecord, "read").unwrap();
@@ -2302,7 +2300,10 @@ mod tests {
             assert_eq!(payload.text().unwrap(), "/x");
             assert!(!Expecting::read(&mut payload).unwrap().asked());
             assert_eq!(payload.number_u64().unwrap(), 0);
-            assert_eq!(Range::read_nested(&mut payload).unwrap().start, Start::Record(7));
+            assert_eq!(
+                Range::read_nested(&mut payload).unwrap().start,
+                Start::Record(ORoff::new(7))
+            );
             payload.done().unwrap();
         }
     }
@@ -2361,7 +2362,7 @@ mod tests {
         let want = Want::read(&mut payload).expect("a want");
         payload.done().unwrap();
         assert!(want.wants(Detail::Instances) && want.wants(Detail::Extents));
-        assert_eq!((want.limit, want.from), (7, Start::Record(3)));
+        assert_eq!((want.limit, want.from), (7, Start::Record(ORoff::new(3))));
     }
 
     /// A limit or a start without any detail is not detail, so it must not make a plain lookup
