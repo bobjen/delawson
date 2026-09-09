@@ -1077,7 +1077,7 @@ impl DN {
         }
 
         let mut create = StructWriter::new();
-        create.number_u32(self.mine.get());
+        create.number_u64(self.mine.get());
         create.number_u32(stream.get());
         create.number_u64(1);
         create.number_u64(created.number());
@@ -1343,7 +1343,7 @@ impl DN {
             }
         };
         let mut payload = StructWriter::new();
-        payload.number_u32(self.mine.get());
+        payload.number_u64(self.mine.get());
         payload.number_u32(first as u32);
         payload.number_u64(count);
         payload.number_u64(created.number());
@@ -1494,7 +1494,7 @@ impl DN {
         let sn_number =
             SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
         let mut payload = StructWriter::new();
-        payload.number_u32(self.mine.get());
+        payload.number_u64(self.mine.get());
         payload.number_u32(stream as u32);
         payload.number_u64(1);
         payload.number_u64(created.number());
@@ -2163,7 +2163,7 @@ mod tests {
     /// ⚠️ **No first record to give it**: where a stream starts in an object is the object's
     /// to work out by summing what came before (§17.33.1), so a test builds the list and the
     /// positions follow.
-    fn held(id: u32, sn: u32, records: Option<u64>) -> Stream {
+    fn held(id: u32, sn: u64, records: Option<u64>) -> Stream {
         Stream {
             records: records.map(SRoff::new).unwrap_or(SRoff::NONE),
             ..Stream::new(StreamId::new(id), SnId::new(sn), TimeSec::new(1_000_000))

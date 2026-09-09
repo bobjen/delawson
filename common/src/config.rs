@@ -442,8 +442,9 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 impl ServiceEntry {
     /// The number in the identity, which is this process's id among its kind:
-    /// the `DnId` a stream is named by, the `SnId` an extent is named by.
-    pub fn number(&self) -> u32 {
+    /// the `DnId` a stream is named by, the `SnId` an extent is named by, or the `EnId`
+    /// holding an extent instance.
+    pub fn number(&self) -> u64 {
         self.identity.trim_start_matches(|c: char| !c.is_ascii_digit()).parse().unwrap_or(0)
     }
 }

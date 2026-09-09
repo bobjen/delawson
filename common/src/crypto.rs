@@ -16,9 +16,9 @@ pub const MASTER_KEY: [u8; 32] = [
 pub const MASTER_KEY_AD: &[u8] = b"sn-master-key";
 
 pub fn sn_key(master_key: &[u8; 32], sn_id: SnId, day_start: TimeSec) -> [u8; 32] {
-    let mut info = [0u8; 12];
-    info[..4].copy_from_slice(&sn_id.get().to_le_bytes());
-    info[4..].copy_from_slice(&day_start.number().to_le_bytes());
+    let mut info = [0u8; 16];
+    info[..8].copy_from_slice(&sn_id.get().to_le_bytes());
+    info[8..].copy_from_slice(&day_start.number().to_le_bytes());
     let hk = Hkdf::<Sha256>::new(None, master_key);
     let mut okm = [0u8; 32];
     hk.expand(&info, &mut okm).expect("32 bytes is valid for HKDF-SHA256");
@@ -31,10 +31,10 @@ pub fn extent_key(
     extent_id: ExtentId,
     ts: TimeSec,
 ) -> [u8; 32] {
-    let mut info = [0u8; 16];
-    info[..4].copy_from_slice(&sn_id.get().to_le_bytes());
-    info[4..8].copy_from_slice(&extent_id.get().to_le_bytes());
-    info[8..16].copy_from_slice(&ts.number().to_le_bytes());
+    let mut info = [0u8; 20];
+    info[..8].copy_from_slice(&sn_id.get().to_le_bytes());
+    info[8..12].copy_from_slice(&extent_id.get().to_le_bytes());
+    info[12..20].copy_from_slice(&ts.number().to_le_bytes());
     let hk = Hkdf::<Sha256>::new(None, sn_daily_key);
     let mut okm = [0u8; 32];
     hk.expand(&info, &mut okm).expect("32 bytes is valid for HKDF-SHA256");

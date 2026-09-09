@@ -7,9 +7,8 @@
 //! is the same argument for identity, which is the largest remaining population of bare
 //! integers.
 //!
-//! **Most IDs are 32 bits, with `DiskId` a 16-bit id scoped within an EN.** It is not guaranteed
-//! that all IDs will stay 32 bits for ever — for example, extreme scaling could eventually require
-//! 64 bits for `EnId` — but types encapsulate their width so widening or narrowing is localized.
+//! **Service IDs are 64 bits, with `DiskId` a 16-bit id scoped within an EN.** Types encapsulate
+//! their width so widening or narrowing is localized.
 //!
 //! **The top of the range is the sentinel**, the same convention `offset` uses, and a caller
 //! looking one of these up and not finding it gets `NONE`.
@@ -109,9 +108,9 @@ macro_rules! id {
     };
 }
 
-id!(DnId, "a DN");
-id!(SnId, "an SN");
-id!(EnId, "an EN");
+id!(DnId, u64, "a DN");
+id!(SnId, u64, "an SN");
+id!(EnId, u64, "an EN");
 // ⚠️ A **disk** within an EN, scoped by `(EnId, DiskId)`. 16 bits within its EN.
 id!(DiskId, u16, "a disk");
 // ⚠️ An SN-only index into its array of all known disks across all ENs.
@@ -119,7 +118,7 @@ id!(SnDiskId, "an SN disk index");
 // ⚠️ A **range**, not the DN serving it, for the same reason a disk is not an EN. But note what
 // #75 actually settles: the range is a **hint** and the *key* is the durable name — a range is more
 // stable than a DN and is not itself stable, because a split renames it (§17.38.1).
-id!(RangeId, "a range");
+id!(RangeId, u64, "a range");
 id!(ObjectId, "an object");
 id!(StreamId, "a stream");
 id!(ExtentId, "an extent");
@@ -159,10 +158,8 @@ mod tests {
     /// answer is worse than no answer.
     #[test]
     fn a_number_too_wide_is_refused() {
-        assert_eq!(SnId::of_number(4_000_000_000).unwrap().get(), 4_000_000_000);
-        assert!(SnId::of_number(u32::MAX as u64 + 1).is_err());
-        let said = DnId::of_number(1 << 40).expect_err("too wide").to_string();
-        assert!(said.contains("a DN"), "and it says which kind: {said}");
+        assert_eq!(SnId::of_number(1 << 40).unwrap().get(), 1 << 40);
+        assert_eq!(DnId::of_number(u64::MAX - 1).unwrap().get(), u64::MAX - 1);
 
         // DiskId is 16-bit
         assert_eq!(DiskId::of_number(60_000).unwrap().get(), 60_000);

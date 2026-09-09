@@ -538,7 +538,7 @@ impl Want {
         payload.number_u64(self.limit);
         payload.number_u8(kind as u8);
         payload.number_u64(at);
-        payload.number_u32(self.expect.0.range.get());
+        payload.number_u64(self.expect.0.range.get());
         payload.number_u32(self.expect.0.object.get());
         payload.number_u64(self.expect.0.created.number());
     }
@@ -549,7 +549,7 @@ impl Want {
         let kind = payload.number_u8()?;
         let at = payload.number_u64()?;
         let expect = Expecting::of(ObjectName {
-            range: RangeId::of_number(payload.number_u32()? as u64)?,
+            range: RangeId::of_number(payload.number_u64()?)?,
             object: ObjectId::of_number(payload.number_u32()? as u64)?,
             created: crate::time::TimeSec::new(payload.number_u64()?),
         });

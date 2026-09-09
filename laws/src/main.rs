@@ -1649,7 +1649,7 @@ fn say(
             // ⚠️ As numbers, not as `{:?}` — a typed id's `Debug` is `DiskId(0)`, which is right
             // in a panic and noise in a listing.
             let disks: Vec<u16> = extent.disks.iter().map(|(_, disk)| disk.get()).collect();
-            let ens: Vec<u32> = extent.disks.iter().map(|(en, _)| en.get()).collect();
+            let ens: Vec<u64> = extent.disks.iter().map(|(en, _)| en.get()).collect();
             println!(
                 "    extent {} of SN{} made in second {}, from record {}, {held}, \
                  on disks {disks:?} at ENs {ens:?}",
@@ -2003,8 +2003,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
         Cmd::Unlock => Req::new(Op::Unlock),
         Cmd::SnMasterKey { sn, at } => {
             let mut payload = common::wire::StructWriter::new();
-            payload
-                .number_u32(u32::try_from(*sn).map_err(|_| Error::new("SN id exceeds 32 bits"))?);
+            payload.number_u64(*sn);
             payload.number_u64(TimeSec::new(*at).number());
             Req::new(Op::SnMasterKey).structure(payload)
         }

@@ -1375,7 +1375,7 @@ mod tests {
         format!("{text}\n").into_bytes()
     }
 
-    fn block(sn: u32, extent: u32, bytes: &[u8]) -> AppendBlock {
+    fn block(sn: u64, extent: u32, bytes: &[u8]) -> AppendBlock {
         let holds = Holds::of(Framing::Lf, b"", bytes, bytes.len()).expect("a well-formed block");
         AppendBlock {
             sn: SnId::new(sn),

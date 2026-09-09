@@ -319,15 +319,15 @@ impl StructWriter {
     }
 
     pub fn dn_id(&mut self, value: DnId) {
-        self.number_u32(value.get());
+        self.number_u64(value.get());
     }
 
     pub fn sn_id(&mut self, value: SnId) {
-        self.number_u32(value.get());
+        self.number_u64(value.get());
     }
 
     pub fn en_id(&mut self, value: EnId) {
-        self.number_u32(value.get());
+        self.number_u64(value.get());
     }
 
     pub fn disk_id(&mut self, value: DiskId) {
@@ -335,7 +335,7 @@ impl StructWriter {
     }
 
     pub fn range_id(&mut self, value: RangeId) {
-        self.number_u32(value.get());
+        self.number_u64(value.get());
     }
 
     pub fn object_id(&mut self, value: ObjectId) {
@@ -463,15 +463,15 @@ impl<'a> StructReader<'a> {
     }
 
     pub fn dn_id(&mut self) -> Result<DnId> {
-        Ok(DnId::new(self.number_u32()?))
+        Ok(DnId::new(self.number_u64()?))
     }
 
     pub fn sn_id(&mut self) -> Result<SnId> {
-        Ok(SnId::new(self.number_u32()?))
+        Ok(SnId::new(self.number_u64()?))
     }
 
     pub fn en_id(&mut self) -> Result<EnId> {
-        Ok(EnId::new(self.number_u32()?))
+        Ok(EnId::new(self.number_u64()?))
     }
 
     pub fn disk_id(&mut self) -> Result<DiskId> {
@@ -479,7 +479,7 @@ impl<'a> StructReader<'a> {
     }
 
     pub fn range_id(&mut self) -> Result<RangeId> {
-        Ok(RangeId::new(self.number_u32()?))
+        Ok(RangeId::new(self.number_u64()?))
     }
 
     pub fn object_id(&mut self) -> Result<ObjectId> {

@@ -58,14 +58,14 @@ impl Described {
     /// position stops working and the answer has to say how many names it covered.
     pub fn missing() -> Vec<Arg> {
         let mut payload = StructWriter::new();
-        payload.number_u32(0);
+        payload.number_u64(0);
         payload.number_u32(ObjectId::NONE.get());
         payload.number_u64(0);
-        payload.number_u32(0);
-        payload.number_u32(0);
-        payload.number_u32(0);
+        payload.number_u64(0);
         payload.number_u64(0);
         payload.number_u32(0);
+        payload.number_u64(0);
+        payload.number_u64(0);
         payload.flag(false);
         payload.number_u8(0);
         payload.number_u32(0);
@@ -742,7 +742,7 @@ impl Listing {
         payload.flag(self.instances);
         payload.number_u32(self.at.len() as u32);
         for (name, from) in &self.at {
-            payload.number_u32(name.range.get());
+            payload.number_u64(name.range.get());
             payload.number_u32(name.stream.get());
             payload.number_u64(name.created.number());
             payload.number_u64(*from);
@@ -757,7 +757,7 @@ impl Listing {
         for _ in 0..count {
             at.push((
                 StreamName {
-                    range: RangeId::new(payload.number_u32()?),
+                    range: RangeId::new(payload.number_u64()?),
                     stream: StreamId::new(payload.number_u32()?),
                     created: TimeSec::new(payload.number_u64()?),
                 },
@@ -930,7 +930,7 @@ mod tests {
     fn an_impossible_framing_is_refused() {
         let mut args = one(1).args();
         let Arg::Struct(_, payload, _) = &mut args[0] else { panic!("a self-contained row") };
-        payload[41] = 99;
+        payload[57] = 99;
         assert!(Described::of_args(&args).is_err());
     }
 
@@ -1103,7 +1103,7 @@ mod tests {
     fn an_extent_lying_about_its_instances_is_refused() {
         let mut args = extent(1, 0, 40).args();
         let Arg::Struct(_, payload, _) = &mut args[0] else { panic!("a self-contained extent") };
-        payload[36..40].copy_from_slice(&99u32.to_le_bytes());
+        payload[40..44].copy_from_slice(&99u32.to_le_bytes());
         assert!(ExtentRow::of_args(&args).is_err());
         assert!(ExtentRow::of_args(&args[..0]).is_err(), "and a short row too");
     }

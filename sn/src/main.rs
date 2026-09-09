@@ -1087,7 +1087,7 @@ mod tests {
     /// The name every test in here uses, so the second is one thing rather than sprinkled.
     const MADE: TimeSec = TimeSec::new(1_000_000);
 
-    fn named(range: u32, stream: u32) -> StreamName {
+    fn named(range: u64, stream: u32) -> StreamName {
         StreamName { range: RangeId::new(range), stream: StreamId::new(stream), created: MADE }
     }
 
@@ -1101,7 +1101,7 @@ mod tests {
         disks
     }
 
-    fn sn_with_stream(range: u32, stream: u32) -> SN {
+    fn sn_with_stream(range: u64, stream: u32) -> SN {
         let sn = SN::new(
             testing::sn_config(),
             testing::extents().per_stream,
@@ -1120,7 +1120,7 @@ mod tests {
         sn
     }
 
-    fn add_stream(sn: &SN, range: u32, stream: u32) {
+    fn add_stream(sn: &SN, range: u64, stream: u32) {
         let made = sn.create(&Req::new(Op::CreateStream).structure({
             let mut payload = StructWriter::new();
             payload.range_id(RangeId::new(range));
@@ -1324,13 +1324,13 @@ mod tests {
 
     /// Where the open extent starts, for a test.
     impl SN {
-        fn starts_at(&self, range: u32, stream: u32) -> SRoff {
+        fn starts_at(&self, range: u64, stream: u32) -> SRoff {
             self.shards[shard_of(named(range, stream))].lock().unwrap()[&named(range, stream)]
                 .sealed_records
         }
 
         /// The stream-local first record of every sealed extent, recomputed by summing.
-        fn firsts(&self, range: u32, stream: u32) -> Vec<SRoff> {
+        fn firsts(&self, range: u64, stream: u32) -> Vec<SRoff> {
             self.shards[shard_of(named(range, stream))].lock().unwrap()[&named(range, stream)]
                 .sealed_from()
                 .map(|(at, _)| at)

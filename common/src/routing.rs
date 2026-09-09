@@ -43,7 +43,7 @@ use crate::ids::{DnId, RangeId};
 /// because a **split renames a range**. So the `RangeId` in a name is the range that *minted* it,
 /// which stays unique for ever, and is not where the thing lives now (§17.38.1).
 pub fn range_of_dn(dn: DnId) -> RangeId {
-    RangeId::new(dn.get())
+    RangeId::of_number(dn.number()).expect("the placeholder range id must fit")
 }
 
 /// Which of `count` owners holds a name. Zero owners is not a question this can answer,
