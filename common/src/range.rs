@@ -517,7 +517,16 @@ pub struct Want {
 }
 
 impl Want {
-    /// Arguments a want takes on the wire, so a caller sizing or slicing a request does not
+    fn supported_start(from: Start) -> Result<()> {
+        match from {
+            Start::Record(_) => Ok(()),
+            Start::RecordThen(_, _) | Start::Logical(_) => {
+                Err(Error::new("object-info logical-offset starts are not supported"))
+            }
+        }
+    }
+
+    /// Minimum arguments a want takes on the wire (RecordThen adds its offset), so a caller sizing or slicing a request does not
     /// count them itself (§17.13.3).
     pub const ARGS: usize = 4 + Expecting::ARGS;
 
@@ -570,6 +579,9 @@ impl Want {
             Arg::Number(kind),
             Arg::Number(at),
         ];
+        if let Start::RecordThen(_, offset) = self.from {
+            args.push(Arg::Number(offset.number()));
+        }
         args.extend(self.expect.args());
         args
     }
@@ -585,6 +597,9 @@ impl Want {
         payload.number_u64(self.limit);
         payload.number_u8(kind as u8);
         payload.number_u64(at);
+        if let Start::RecordThen(_, offset) = self.from {
+            payload.oloff(offset);
+        }
         payload.number_u64(self.expect.0.range.get());
         payload.number_u32(self.expect.0.object.get());
         payload.number_u64(self.expect.0.created.number());
@@ -595,6 +610,7 @@ impl Want {
         let limit = payload.number_u64()?;
         let kind = payload.number_u8()?;
         let at = payload.number_u64()?;
+        let offset = if kind == 1 { payload.oloff()? } else { OLoff::ZERO };
         let expect = Expecting::of(ObjectName {
             range: RangeId::of_number(payload.number_u64()?)?,
             object: ObjectId::of_number(payload.number_u32()? as u64)?,
@@ -602,10 +618,11 @@ impl Want {
         });
         let from = match kind {
             0 => Start::Record(ORoff::new(at)),
-            1 => Start::RecordThen(ORoff::new(at), OLoff::ZERO),
+            1 => Start::RecordThen(ORoff::new(at), offset),
             2 => Start::Logical(OLoff::new(at)),
             other => return Err(Error::new(format!("no range start of kind {other}"))),
         };
+        Self::supported_start(from)?;
         let mut want = Want { detail, limit, from, expect };
         for one in Detail::ALL {
             if want.wants(*one) {
@@ -629,13 +646,22 @@ impl Want {
         else {
             return Err(Error::new("a want takes a detail field, a limit and a start"));
         };
+        let (offset, rest) = if *kind == 1 {
+            let [Arg::Number(offset), rest @ ..] = rest else {
+                return Err(Error::new("record-then start needs a logical offset"));
+            };
+            (OLoff::of_number(*offset)?, rest)
+        } else {
+            (OLoff::ZERO, rest)
+        };
         let (expect, rest) = Expecting::of_args(rest)?;
         let from = match kind {
             0 => Start::Record(ORoff::new(*at)),
-            1 => Start::RecordThen(ORoff::new(*at), OLoff::ZERO),
+            1 => Start::RecordThen(ORoff::new(*at), offset),
             2 => Start::Logical(OLoff::new(*at)),
             other => return Err(Error::new(format!("no range start of kind {other}"))),
         };
+        Self::supported_start(from)?;
         // Normalized on the way in, so nothing downstream has to remember the implications.
         let mut want = Want { detail: 0, limit: *limit, from, expect };
         want.detail = *detail;
@@ -921,6 +947,31 @@ mod tests {
         let raw = Want { detail: Detail::Instances.bit(), ..Want::plain() }.args();
         let (want, _) = Want::of_args(&raw).expect("a want");
         assert!(want.wants(Detail::Extents) && want.wants(Detail::Streams));
+    }
+
+    #[test]
+    fn info_offsets_are_encoded_and_parsed_before_being_refused() {
+        for start in [
+            Start::RecordThen(ORoff::new(7), OLoff::new((1 << 32) + 9)),
+            Start::Logical(OLoff::new(99)),
+        ] {
+            let want = Want { from: start, ..Want::plain() };
+            let args = want.args();
+            if let Start::RecordThen(_, offset) = start {
+                assert_eq!(args[4], Arg::Number(offset.number()));
+            }
+            assert!(Want::of_args(&args).unwrap_err().to_string().contains("not supported"));
+            let mut writer = StructWriter::new();
+            want.write(&mut writer);
+            let args = vec![writer.finish(Op::ObjectInfo)];
+            let (mut reader, _) = structure(&args, Op::ObjectInfo, "want").unwrap();
+            assert!(Want::read(&mut reader).unwrap_err().to_string().contains("not supported"));
+            reader.done().unwrap();
+        }
+        let mut args =
+            Want { from: Start::RecordThen(ORoff::new(7), OLoff::new(9)), ..Want::plain() }.args();
+        args.truncate(4);
+        assert!(Want::of_args(&args).unwrap_err().to_string().contains("needs a logical offset"));
     }
 
     /// A bit this build does not know is not an error — that is the forward compatibility the

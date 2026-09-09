@@ -626,6 +626,56 @@ impl ExtentRow {
     }
 }
 
+/// Trim a detailed object answer in record order, keeping counts independent of row limits.
+/// Both DN and FE use this final boundary check after collecting independently bounded replies.
+pub fn limit_object_info(args: &[Arg], limit: u64) -> Result<Vec<Arg>> {
+    if limit == 0 {
+        return Err(Error::new("an object summary needs at least one entry"));
+    }
+    let (mut shape, rest) = Shape::of_args(args)?;
+    let (described, mut rest) = Described::of_args(rest)?;
+    let mut body = Vec::new();
+    let mut entries = 1;
+    let mut streams = 0;
+    let mut stopped = false;
+    for _ in 0..shape.given.number() {
+        let (mut stream, after) = StreamRow::of_args(rest)?;
+        let (extents, after) = ExtentRow::some_of_args(after, stream.given.number())?;
+        rest = after;
+        if stopped {
+            continue;
+        }
+        if entries == limit {
+            shape.next = shape.next.min(stream.first_record);
+            stopped = true;
+            continue;
+        }
+        entries += 1;
+        streams += 1;
+        let take = extents.len().min((limit - entries) as usize);
+        if let Some(omitted) = extents.get(take) {
+            let next = stream.first_record.plus(ORoff::from_stream(omitted.first_record))?;
+            shape.next = shape.next.min(next);
+            stopped = true;
+        }
+        stream.given = ExtentId::of_number(take as u64)?;
+        body.extend(stream.args());
+        for extent in extents.iter().take(take) {
+            body.extend(extent.args());
+        }
+        entries += take as u64;
+    }
+    if !rest.is_empty() {
+        return Err(Error::new("object summary has trailing arguments"));
+    }
+    shape.given = StreamId::of_number(streams)?;
+    shape.entries = entries;
+    let mut out = shape.args();
+    out.extend(described.map_or_else(Described::missing, |row| row.args()));
+    out.extend(body);
+    Ok(out)
+}
+
 /// What a batch answer covered, and where to carry on.
 ///
 /// ⚠️ **This replaces lining up by position** (§9.1.3.7). The old answer padded a missing
@@ -725,7 +775,7 @@ pub struct Listing {
     /// ⚠️ **A whole name per stream, not an id against one shared range.** A batch may
     /// name streams of different ranges — and once ranges split and move (#75) it routinely
     /// will — so the range travels with each entry rather than once at the front.
-    pub at: Vec<(StreamName, u64)>,
+    pub at: Vec<(StreamName, SRoff)>,
 }
 
 impl Listing {
@@ -737,7 +787,7 @@ impl Listing {
         ];
         for (name, from) in &self.at {
             args.extend(name.args());
-            args.push(Arg::Number(*from));
+            args.push(Arg::Number(from.number()));
         }
         args
     }
@@ -750,7 +800,7 @@ impl Listing {
             payload.number_u64(name.range.get());
             payload.number_u32(name.stream.get());
             payload.number_u64(name.created.number());
-            payload.number_u64(*from);
+            payload.sroff(*from);
         }
     }
 
@@ -766,7 +816,7 @@ impl Listing {
                     stream: StreamId::new(payload.number_u32()?),
                     created: TimeSec::new(payload.number_u64()?),
                 },
-                payload.number_u64()?,
+                payload.sroff()?,
             ));
         }
         Ok(Listing { limit, instances, at })
@@ -791,7 +841,7 @@ impl Listing {
             let [Arg::Number(from), after @ ..] = after else {
                 return Err(Error::new("a stream is named, then the record to start from"));
             };
-            at.push((name, *from));
+            at.push((name, SRoff::of_number(*from)?));
             rest = after;
         }
         Ok(Listing { limit: *limit, instances: *instances, at })

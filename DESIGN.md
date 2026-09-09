@@ -18130,3 +18130,34 @@ has the same layout, but DN extent positions now mean stream-relative positions;
 clients expecting the old object-relative values must be updated together.
 Direct unit tests cover both summary assembly paths with nonzero bases and
 stream positions above 32 bits.
+
+### 17.43.4 Info pagination, counts, and response limits
+
+Listing requests carry `SRoff` through DN, the wire, and SN. DN subtracts each
+stream's object-relative base from the requested record, using zero for streams
+starting later. SN's continuation also advances into the open extent rather
+than returning the preceding sealed extent again.
+
+Each requested stream occurrence is kept independently, including repeated names
+and shared streams with identical or different starts. DN groups the list only
+by destination SN, preserving its order within each group. Each SN response fills
+the corresponding original row slot. There is no sorting, deduplication, range
+merging, or metadata-cache planner. Batch asks are built from the same selected
+object/stream-row snapshot that their responses will fill.
+
+Every SN can use the request's allowance: DN's cached counts need not be accurate
+enough to divide it beforehand. DN trims the combined object/stream/extent rows
+before replying, and FE applies the same trimming routine at its final batch
+boundary. Counts remain counts from SN, not the number of rows that fit. The
+first omitted entry supplies the continuation, and a batch cut inside an object
+points back to that object. Rich batch requests now ask for extent rows rather
+than sending the count-only zero-row limit.
+
+`Want` encodes and parses the offset in a record-then-offset start, then rejects
+that unsupported selector explicitly; logical-only starts are also refused.
+Ordinary record-start encodings are unchanged. The previously lossy, unsupported
+record-then-offset encoding now carries its extra offset before the expectation.
+
+Direct unit tests cover repeated requests, independently arriving SN replies,
+typed starts, pagination through an open extent, counts under row limits, and
+DN/FE trimming. No live cluster is needed for these tests.

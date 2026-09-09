@@ -676,8 +676,7 @@ impl SN {
     /// count and where to resume rather than being left to infer that it was skipped.
     ///
     /// ⚠️ **Record numbers here are stream-local**, which is what an SN knows. The DN
-    /// converts them to the object's numbering, because it is the tier that holds each
-    /// stream's first record (§17.22).
+    /// retains them alongside each stream's object-relative base.
     fn list(&self, request: &Req) -> Resp {
         let (mut payload, rest) =
             match structure(&request.args, Op::ListExtents, "a list-extents request") {
@@ -719,16 +718,18 @@ impl SN {
         &self,
         held: &Stream,
         stream: StreamId,
-        from: u64,
+        from: SRoff,
         room: u64,
         instances: bool,
     ) -> (ExtentRun, Vec<ExtentRow>) {
         // The sealed extents are in record order, so the first to describe is the last
         // one starting at or before `from` — the same rule locate uses to pick one.
-        let first = if from == 0 {
+        let first = if held.open.is_some() && from >= held.sealed_records {
+            held.sealed.len()
+        } else if from == SRoff::ZERO {
             0
         } else {
-            held.sealed_from().filter(|(at, _)| at.number() <= from).count().saturating_sub(1)
+            held.sealed_from().filter(|(at, _)| *at <= from).count().saturating_sub(1)
         };
         let total = held.sealed.len() as u64 + u64::from(held.open.is_some());
 
@@ -1055,7 +1056,7 @@ mod tests {
             sealed_records: SRoff::new(14),
             sealed_stream: true,
         };
-        let (run, rows) = sn.run_of(&stream, StreamId::FIRST, 0, 10, false);
+        let (run, rows) = sn.run_of(&stream, StreamId::FIRST, SRoff::ZERO, 10, false);
         assert_eq!(run.totals.extents, ExtentId::new(2));
         assert_eq!(run.given, ExtentId::new(2));
         assert_eq!(run.totals.logical, SLoff::new(2 * ELoff::MAX.number()));
@@ -1066,6 +1067,47 @@ mod tests {
                 (ERoff::new(7), ELoff::MAX, ECoff::new(123))
             );
         }
+    }
+
+    #[test]
+    fn listing_continuation_advances_through_sealed_extents_and_into_the_open_one() {
+        let sn = SN::new(testing::sn_config(), 10, SnId::FIRST, Vec::new());
+        let extent = |id| Extent {
+            id: ExtentId::new(id),
+            records: ERoff::new(7),
+            created: TimeSec::new(100),
+            disks: Vec::new(),
+        };
+        let sealed = |id| Sealed {
+            extent: extent(id),
+            logical: ELoff::new(100),
+            compressed: ECoff::new(80),
+        };
+        let stream = Stream {
+            created: TimeSec::new(100),
+            creator: SnId::FIRST,
+            sealed: vec![sealed(1), sealed(2)],
+            open: Some(extent(3)),
+            sealed_records: SRoff::new(14),
+            sealed_stream: false,
+        };
+        let mut from = SRoff::ZERO;
+        for (id, first, next) in [
+            (1, SRoff::ZERO, SRoff::new(7)),
+            (2, SRoff::new(7), SRoff::new(14)),
+            (3, SRoff::new(14), SRoff::NONE),
+        ] {
+            let (run, rows) = sn.run_of(&stream, StreamId::FIRST, from, 1, false);
+            assert_eq!(run.totals.extents, ExtentId::new(3));
+            assert_eq!(rows.len(), 1);
+            assert_eq!((rows[0].id, rows[0].first_record), (ExtentId::new(id), first));
+            assert_eq!(run.next, next);
+            from = run.next;
+        }
+        let (run, rows) = sn.run_of(&stream, StreamId::FIRST, SRoff::new(7), 0, false);
+        assert!(rows.is_empty());
+        assert_eq!(run.totals.extents, ExtentId::new(3));
+        assert_eq!(run.next, SRoff::new(7));
     }
 
     /// What an extent came to, for a test that does not care about the difference between

@@ -1553,21 +1553,35 @@ impl Spread {
         }
         let mut args = Vec::new();
         let mut given = 0;
+        let mut entries = 0;
+        let mut next = UNKNOWN;
         for slot in &self.got {
-            match slot {
-                Some(slot) => {
-                    args.extend(slot.args.iter().cloned());
-                    given += 1;
-                }
-                None => break,
+            let Some(slot) = slot else { break };
+            if entries == self.limit {
+                break;
             }
+            let (piece, spent, whole) = if self.want.detail == 0 {
+                (slot.args.clone(), 1, slot.whole)
+            } else {
+                let piece = match common::info::limit_object_info(&slot.args, self.limit - entries)
+                {
+                    Ok(piece) => piece,
+                    Err(e) => return Resp::error(Status::Internal, e.to_string()),
+                };
+                let (shape, _) = Shape::of_args(&piece).expect("validated summary");
+                (piece, shape.entries, slot.whole && !shape.more())
+            };
+            if !whole && next == UNKNOWN {
+                next = given;
+            }
+            args.extend(piece);
+            entries += spent;
+            given += 1;
         }
-        let next = match self.unfinished() {
-            Some(at) if (at as u64) < given => at as u64,
-            _ if given < self.asked as u64 => given,
-            _ => UNKNOWN,
-        };
-        let covered = Batch { asked: self.asked as u64, given, entries: self.spent(), next };
+        if next == UNKNOWN && given < self.asked as u64 {
+            next = given;
+        }
+        let covered = Batch { asked: self.asked as u64, given, entries, next };
         let mut out = covered.args();
         out.append(&mut args);
         Resp { id: 0, status: Status::Ok, args: out }
@@ -2245,6 +2259,23 @@ mod tests {
             args.extend(piece.iter().cloned());
         }
         Resp { id: 0, status: Status::Ok, args }
+    }
+
+    #[test]
+    fn final_batch_trims_detail_when_independent_dn_answers_exceed_the_limit() {
+        let want = Want::plain().with(Detail::Streams);
+        let mut spread = spreading(2, vec![0, 1], want, 4);
+        for i in 0..2 {
+            let ask = Ask { dn: format!("DN{i}"), at: vec![i], want };
+            spread.take(&ask, answer_of(&[described(2, 2, UNKNOWN)], 3));
+        }
+        let response = spread.answer();
+        let (batch, rest) = Batch::of_args(&response.args).unwrap();
+        assert_eq!((batch.given, batch.entries, batch.next), (2, 4, 1));
+        let pieces = Batch::pieces(rest, batch.given).unwrap();
+        let (second, _) = Shape::of_args(pieces[1]).unwrap();
+        assert_eq!(second.given, StreamId::FIRST);
+        assert!(second.more());
     }
 
     /// A summary is a valid answer for a name and not a finished one, so the continuation

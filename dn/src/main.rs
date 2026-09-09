@@ -60,6 +60,16 @@ const SHARDS: usize = 64;
 /// though the stream itself does not need to know the object's total.
 const OPEN_STREAM_RECORD_LIMIT: u64 = 3 * (1u64 << 62);
 
+type ExtentReply = (ExtentRun, Vec<ExtentRow>);
+
+/// One original stream-row request. The index is a reply slot, not a stream identity.
+#[derive(Debug, Clone)]
+struct ExtentAsk {
+    row: usize,
+    name: StreamName,
+    from: SRoff,
+}
+
 const BATCH_ANSWERS: u64 = Detail::Streams.bit() | Detail::Counts.bit();
 
 /// Which `Detail` bits this build actually answers.
@@ -194,34 +204,16 @@ struct Levelled {
 }
 
 impl Levelled {
-    /// Flattened, with each stream's extents following its row.
-    ///
-    /// ⚠️ **Interleaved rather than two blocks**, so the answer is self-describing: a reader takes a
-    /// stream, reads the extents it says follow, and takes the next. Two blocks would need the reader
-    /// to attribute extents to streams by position, which is §17.19's defect.
-    fn args(self, mut extents: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)>) -> Vec<Arg> {
+    /// The DN-only answer, before any extent rows have been requested.
+    fn args(self) -> Vec<Arg> {
         let mut out = self.shape.args();
         out.extend(self.head);
         if self.hide_rows {
             return out;
         }
         for mut row in self.rows {
-            match extents.remove(&row.stream) {
-                Some((run, rows)) => {
-                    // Straight from the SN, which is more recent than anything cached.
-                    row.totals = run.totals;
-                    row.given =
-                        ExtentId::of_number(rows.len() as u64).expect("extent row count fits");
-                    out.extend(row.args());
-                    for extent in rows {
-                        out.extend(extent.args());
-                    }
-                }
-                None => {
-                    row.given = ExtentId::FIRST;
-                    out.extend(row.args());
-                }
-            }
+            row.given = ExtentId::FIRST;
+            out.extend(row.args());
         }
         out
     }
@@ -493,22 +485,15 @@ impl Object {
 /// ⚠️ **Refusals are kept and the whole answer fails**, rather than being dropped so that the answer
 /// silently lacks extents the caller asked for. §17's rule: a well-formed request for something that
 /// did not work says so.
-fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Resp) {
+fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, asked: &[ExtentAsk], answer: Resp) {
     let ready = {
         let mut held = gather.lock().expect("gather");
         held.left -= 1;
         if answer.status != Status::Ok {
             held.failed.get_or_insert(answer);
         } else {
-            match ExtentRun::all_of_args(&answer.args) {
-                Ok(runs) => {
-                    for (run, rows) in runs {
-                        held.runs.insert(run.stream, (run, rows));
-                    }
-                }
-                Err(e) => {
-                    held.failed.get_or_insert(Resp::error(Status::Internal, e.to_string()));
-                }
+            if let Err(e) = receive_extents(&mut held.runs, asked, &answer.args) {
+                held.failed.get_or_insert(Resp::error(Status::Internal, e.to_string()));
             }
         }
         held.left == 0
@@ -537,53 +522,103 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Resp) {
         hide_rows: held.hide_rows,
         instances: held.instances,
     };
-    reply.send(Resp { id: 0, status: Status::Ok, args: merge_object_info(levelled, runs) });
+    reply.send(Resp {
+        id: 0,
+        status: Status::Ok,
+        args: merge_object_info(levelled, &runs, held.limit),
+    });
 }
 
-/// Assemble an object summary without changing the stream-relative extent positions.
-fn merge_object_info(
-    mut held: Levelled,
-    mut runs: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)>,
-) -> Vec<Arg> {
+/// Group by destination only. Keep every occurrence, its start, and its input order.
+fn extent_asks(range: RangeId, rows: &[StreamRow], from: ORoff) -> HashMap<SnId, Vec<ExtentAsk>> {
+    let mut groups: HashMap<SnId, Vec<ExtentAsk>> = HashMap::new();
+    for (at, row) in rows.iter().enumerate() {
+        groups.entry(row.sn).or_default().push(ExtentAsk {
+            row: at,
+            name: StreamName { range, stream: row.stream, created: row.created },
+            from: stream_start(from, row.first_record),
+        });
+    }
+    groups
+}
+
+fn ask_extents(asked: &[ExtentAsk], limit: u64, instances: bool) -> Req {
+    let mut payload = StructWriter::new();
+    Listing { limit, instances, at: asked.iter().map(|ask| (ask.name, ask.from)).collect() }
+        .write_payload(&mut payload);
+    Req::new(Op::ListExtents).structure(payload)
+}
+
+/// SN replies in request order; restore each reply to its original row slot.
+fn receive_extents(
+    slots: &mut [Option<ExtentReply>],
+    asked: &[ExtentAsk],
+    args: &[Arg],
+) -> common::Result<()> {
+    let replies = ExtentRun::all_of_args(args)?;
+    if replies.len() != asked.len() {
+        return Err(common::Error::new(
+            "SN returned a different number of stream runs than requested",
+        ));
+    }
+    for (ask, (run, _)) in asked.iter().zip(&replies) {
+        if run.stream != ask.name.stream || ask.row >= slots.len() {
+            return Err(common::Error::new("SN extent response does not match its request"));
+        }
+    }
+    for (ask, reply) in asked.iter().zip(replies) {
+        slots[ask.row] = Some(reply);
+    }
+    Ok(())
+}
+
+/// Convert an object position to the stream's space; later streams start at zero.
+fn stream_start(from: ORoff, base: ORoff) -> SRoff {
+    SRoff::new(from.since(base).number())
+}
+
+/// Assemble each reference independently: sharing a stream does not consume its summary.
+fn merge_object_info(mut held: Levelled, runs: &[Option<ExtentReply>], limit: u64) -> Vec<Arg> {
+    let mut body = Vec::new();
     let mut extents = OEoff::ZERO;
     let mut given = 0;
-    let mut selected: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)> = HashMap::new();
-    for row in &held.rows {
-        let Some((run, rows)) = runs.remove(&row.stream) else { continue };
-        if run.totals.extents.is_some() {
-            extents = extents
-                .plus(OEoff::from_stream(run.totals.extents))
-                .expect("object extent count fits");
+    assert_eq!(held.rows.len(), runs.len());
+    for (row, reply) in held.rows.iter_mut().zip(runs) {
+        if let Some((run, rows)) = reply {
+            row.totals = run.totals;
+
+            row.given = ExtentId::of_number(rows.len() as u64).expect("extent row count fits");
+            if run.next.is_some() {
+                held.shape.next = held.shape.next.min(
+                    row.first_record
+                        .plus(ORoff::from_stream(run.next))
+                        .expect("object position fits"),
+                );
+            }
+            body.extend(row.args());
+            for extent in rows {
+                body.extend(extent.args());
+            }
+            given += rows.len() as u64;
+        } else {
+            row.given = ExtentId::FIRST;
+            body.extend(row.args());
         }
-        given += rows.len() as u64;
-        selected.insert(row.stream, (run, rows));
+        // Counts come from the SN when available, never from the bounded row vector.
+        extents = if extents.is_none() || row.totals.extents.is_none() {
+            OEoff::NONE
+        } else {
+            extents.plus(OEoff::from_stream(row.totals.extents)).expect("object count fits")
+        };
     }
-    // ⚠️ **Where to carry on is now the extent level's business.** A stream whose extents were cut
-    // short is the place to resume, and it comes before any stream that was not described at all — so
-    // the first such stream in record order wins, and only if none was cut does the stream-level
-    // continuation stand. Without this an answer that truncated extents reported `nothing more`.
-    let cut = held.rows.iter().find_map(|row| {
-        let (run, rows) = selected.get(&row.stream)?;
-        let short = run.totals.extents != ExtentId::NONE
-            && rows.len() < run.totals.extents.number() as usize;
-        // ⚠️ `then`, not `then_some`: `then_some` evaluates its argument **eagerly**, so it
-        // computed `UNKNOWN + first_record` — `u64::MAX` plus a record number — and
-        // overflowed. It reads like a guard and is not one (§17.22.1).
-        (short && run.next != SRoff::NONE).then(|| {
-            ORoff::from_stream(run.next)
-                .plus(row.first_record)
-                .expect("object record position fits")
-        })
-    });
-    let next = cut.unwrap_or(held.shape.next);
-    let levelled = Levelled {
-        shape: Shape { extents, entries: held.shape.entries + given, next, ..held.shape },
-        head: std::mem::take(&mut held.head),
-        rows: std::mem::take(&mut held.rows),
-        hide_rows: held.hide_rows,
-        instances: held.instances,
-    };
-    levelled.args(selected)
+    if !held.rows.is_empty() {
+        held.shape.extents = extents;
+    }
+    held.shape.entries = 1 + held.rows.len() as u64 + given;
+    let mut args = held.shape.args();
+    args.extend(held.head);
+    args.extend(body);
+    common::info::limit_object_info(&args, limit).expect("assembled object summary")
 }
 
 /// Several asks outstanding at once, answered when the last of them returns.
@@ -595,8 +630,8 @@ fn merge_object_info(
 struct Gather {
     /// Answers still to come. The one that takes it to zero assembles and replies.
     left: usize,
-    /// What each SN said, keyed by stream so nothing depends on the order they return in.
-    runs: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)>,
+    /// One reply slot per original stream row, independent of SN arrival order.
+    runs: Vec<Option<ExtentReply>>,
     /// Set when any SN refused, so the whole answer fails rather than silently omitting extents
     /// the caller asked for.
     failed: Option<Resp>,
@@ -612,13 +647,14 @@ struct Gather {
     /// streams' cached sizes (§17.25.1). Only the name: the object itself must not be held
     /// across a round trip, since it can change while the SNs are answering.
     name: String,
+    limit: u64,
 }
 
 struct BatchCountGather {
     left: usize,
     reply: Option<Reply>,
     base: Vec<Arg>,
-    runs: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)>,
+    runs: Vec<Option<ExtentReply>>,
     failed: Option<Resp>,
 }
 
@@ -1117,7 +1153,7 @@ impl DN {
             return self.concat_objects(process, &request, reply);
         };
         let mut payload = StructWriter::new();
-        common::info::Listing { limit: 0, instances: true, at: vec![(stream, 0)] }
+        common::info::Listing { limit: 0, instances: true, at: vec![(stream, SRoff::ZERO)] }
             .write_payload(&mut payload);
         let ask = Req::new(Op::ListExtents).structure(payload);
         let dn = Arc::clone(self);
@@ -1132,9 +1168,7 @@ impl DN {
             let runs = match ExtentRun::all_of_args(&answer.args) {
                 Ok(mut runs) if runs.len() == 1 && runs[0].0.stream == stream.stream => {
                     let (run, rows) = runs.pop().expect("one run");
-                    let mut by_stream = HashMap::new();
-                    by_stream.insert(run.stream, (run, rows));
-                    by_stream
+                    vec![Some((run, rows))]
                 }
                 _ => {
                     return reply.send(Resp::error(
@@ -1620,11 +1654,16 @@ impl DN {
             Err(refused) => reply.send(refused),
             Ok(Answering::Plain(args)) => reply.send(Resp { id: 0, status: Status::Ok, args }),
             // Extents were asked for, so the SNs holding those streams have to be asked.
-            Ok(Answering::Levelled(levelled)) if want.wants(Detail::Extents) => {
-                self.spread(process, name, levelled, limit, reply)
-            }
+            Ok(Answering::Levelled(levelled)) if want.wants(Detail::Extents) => self.spread(
+                process,
+                name,
+                levelled,
+                want.from.object_record().expect("validated record start"),
+                limit.min(if want.limit == 0 { limit } else { want.limit }),
+                reply,
+            ),
             Ok(Answering::Levelled(levelled)) => {
-                reply.send(Resp { id: 0, status: Status::Ok, args: levelled.args(HashMap::new()) })
+                reply.send(Resp { id: 0, status: Status::Ok, args: levelled.args() })
             }
         }
     }
@@ -1641,6 +1680,7 @@ impl DN {
         process: &Arc<Process>,
         name: &str,
         levelled: Levelled,
+        from: ORoff,
         limit: u64,
         reply: Reply,
     ) {
@@ -1648,28 +1688,16 @@ impl DN {
         // ⚠️ The whole name per stream, not the id: the SN keys streams by
         // `(RangeId, StreamId, CreateSec)` (#109), and the DN is what holds all three.
         // The DN's own range, which it already holds — see `DN::mine`.
-        let range = self.mine;
-        let mut by_sn: HashMap<SnId, Vec<(StreamName, u64)>> = HashMap::new();
-        for row in &levelled.rows {
-            let name = StreamName { range, stream: row.stream, created: row.created };
-            by_sn.entry(row.sn).or_default().push((name, 0));
-        }
+        let by_sn = extent_asks(self.mine, &levelled.rows, from);
         if by_sn.is_empty() {
-            return reply.send(Resp {
-                id: 0,
-                status: Status::Ok,
-                args: levelled.args(HashMap::new()),
-            });
+            return reply.send(Resp { id: 0, status: Status::Ok, args: levelled.args() });
         }
 
-        // ⚠️ **The limit is one number over the whole answer** (§9.1.3.7), so what goes to the SNs is
-        // what the object and its stream rows did *not* spend. Passing the whole limit again would let
-        // an answer carry twice what was asked for — which it did, until a live run showed six entries
-        // against a cap of three.
-        let room = limit.saturating_sub(levelled.shape.entries);
+        // Each SN can use the allowance; final assembly trims the combined rows.
+        let room = limit; // Overfetch per SN; trim the combined answer, not stale estimates.
         let gather = Arc::new(Mutex::new(Gather {
             left: by_sn.len(),
-            runs: HashMap::new(),
+            runs: vec![None; levelled.rows.len()],
             failed: None,
             reply: Some(reply),
             head: levelled.head,
@@ -1678,27 +1706,24 @@ impl DN {
             hide_rows: levelled.hide_rows,
             instances: levelled.instances,
             name: name.to_string(),
+            limit,
         }));
 
         let dn = Arc::clone(self);
         for (sn, at) in by_sn {
             let identity = format!("SN{sn}");
-            let ask = {
-                let mut payload = StructWriter::new();
-                Listing { limit: room, instances: levelled.instances, at }
-                    .write_payload(&mut payload);
-                Req::new(Op::ListExtents).structure(payload)
-            };
+            let ask = ask_extents(&at, room, levelled.instances);
             let waiting = Arc::clone(&gather);
             let named = identity.clone();
             let mine = Arc::clone(&dn);
             if let Err(e) =
-                process.ask(&identity, &ask, move |answer| arrived(&mine, &waiting, answer))
+                process.ask(&identity, &ask, move |answer| arrived(&mine, &waiting, &at, answer))
             {
                 logw!("could not reach an SN", "sn {named},{e}");
                 arrived(
                     self,
                     &gather,
+                    &[],
                     Resp::error(Status::Internal, format!("could not reach {named}")),
                 );
             }
@@ -1707,7 +1732,7 @@ impl DN {
 
     /// What the SNs said a stream has come to, kept against the next question about it
     /// (§17.25.1). Takes the name's shard lock, so nothing may hold it.
-    fn remember(&self, name: &str, runs: &HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)>) {
+    fn remember(&self, name: &str, runs: &[Option<ExtentReply>]) {
         if runs.is_empty() {
             return;
         }
@@ -1716,7 +1741,7 @@ impl DN {
         // about, since the streams it named are going away too.
         let Some(object) = shard.get_mut(name) else { return };
         for held in &mut object.streams {
-            if let Some((run, _)) = runs.get(&held.id) {
+            if let Some((run, _)) = runs.iter().flatten().find(|(run, _)| run.stream == held.id) {
                 held.learned(run.totals);
             }
         }
@@ -1786,23 +1811,25 @@ impl DN {
             Ok(value) => value,
             Err(answer) => return reply.send(answer),
         };
+        let unsupported =
+            want.beyond(BATCH_ANSWERS | Detail::Extents.bit() | Detail::Instances.bit());
+        if !unsupported.is_empty() {
+            return reply.send(Resp::error(
+                Status::Unimplemented,
+                format!("object-info cannot yet return {}", unsupported.join(", ")),
+            ));
+        }
         let beyond = want.beyond(BATCH_ANSWERS);
         if beyond.is_empty() {
             return reply.send(self.info_many(request));
         }
 
-        let mut by_sn: HashMap<SnId, Vec<(StreamName, u64)>> = HashMap::new();
-        for name in &names {
-            let shard = self.shards[shard_of(&name)].lock().expect("objects");
-            let Some(object) = shard.get(name.as_str()) else { continue };
-            for stream in &object.streams {
-                by_sn.entry(stream.sn).or_default().push((
-                    StreamName { range: self.mine, stream: stream.id, created: stream.created },
-                    0,
-                ));
-            }
-        }
-
+        let limit = if want.limit == 0 {
+            self.config.info_entries
+        } else {
+            want.limit.min(self.config.info_entries)
+        };
+        let from = want.from.object_record().expect("validated record start");
         // First construct the object and stream rows. The SN responses will fill in the
         // authoritative extent runs and totals without making this fan-out hold DN locks.
         let mut base_payload = StructWriter::new();
@@ -1816,6 +1843,11 @@ impl DN {
         if base.status != Status::Ok {
             return reply.send(base);
         }
+        let rows = match batch_stream_rows(&base.args) {
+            Ok(rows) => rows,
+            Err(e) => return reply.send(Resp::error(Status::Internal, e.to_string())),
+        };
+        let by_sn = extent_asks(self.mine, &rows, from);
         if by_sn.is_empty() {
             return reply.send(base);
         }
@@ -1823,45 +1855,23 @@ impl DN {
             left: by_sn.len(),
             reply: Some(reply),
             base: base.args,
-            runs: HashMap::new(),
+            runs: vec![None; rows.len()],
             failed: None,
         }));
         for (sn, at) in by_sn {
             let identity = format!("SN{sn}");
-            let mut payload = StructWriter::new();
-            Listing { limit: 0, instances: want.wants(Detail::Instances), at }
-                .write_payload(&mut payload);
-            let ask = Req::new(Op::ListExtents).structure(payload);
+            let ask = ask_extents(&at, limit, want.wants(Detail::Instances));
             let waiting = Arc::clone(&gather);
             if let Err(e) = process.ask(&identity, &ask, move |answer| {
-                let mut gather = waiting.lock().expect("batch-info gather");
-                if answer.status != Status::Ok {
-                    gather.failed.get_or_insert(answer);
-                } else {
-                    match ExtentRun::all_of_args(&answer.args) {
-                        Ok(runs) => {
-                            for (run, rows) in runs {
-                                gather.runs.insert(run.stream, (run, rows));
-                            }
-                        }
-                        Err(e) => {
-                            gather
-                                .failed
-                                .get_or_insert(Resp::error(Status::Internal, e.to_string()));
-                        }
-                    }
-                }
-                gather.left -= 1;
-                if gather.left == 0 {
-                    let failed = gather.failed.take();
-                    let base = std::mem::take(&mut gather.base);
-                    let runs = std::mem::take(&mut gather.runs);
-                    let reply = gather.reply.take().expect("the last response owns the reply");
-                    drop(gather);
-                    reply.send(failed.unwrap_or_else(|| merge_batch_info(base, runs)));
-                }
+                batch_arrived(&waiting, &at, answer, limit);
             }) {
                 logw!("could not reach an SN", "sn {identity},{e}");
+                batch_arrived(
+                    &gather,
+                    &[],
+                    Resp::error(Status::Internal, format!("could not reach {identity}")),
+                    limit,
+                );
             }
         }
     }
@@ -1964,7 +1974,7 @@ impl DN {
         // reached with no room to spare still gets its row and no streams.
         let levelled = detailed(object, self.mine, self.dn, want, room.max(1))?;
         let (entries, whole) = (levelled.shape.entries, !levelled.shape.more());
-        Some(Piece { entries, whole, args: levelled.args(HashMap::new()) })
+        Some(Piece { entries, whole, args: levelled.args() })
     }
 
     /// What an object is: id, stream, the SN holding it, the second it was made,
@@ -2005,73 +2015,101 @@ impl DN {
     }
 }
 
+/// Stream rows in the already selected batch prefix, in original request order.
+fn batch_stream_rows(args: &[Arg]) -> common::Result<Vec<StreamRow>> {
+    let (batch, rest) = Batch::of_args(args)?;
+    let mut all = Vec::new();
+    for piece in Batch::pieces(rest, batch.given)? {
+        let (shape, rest) = Shape::of_args(piece)?;
+        let (_, rest) = Described::of_args(rest)?;
+        let (rows, rest) = StreamRow::some_of_args(rest, shape.given.number())?;
+        if !rest.is_empty() {
+            return Err(common::Error::new("batch base has trailing rows"));
+        }
+        all.extend(rows);
+    }
+    Ok(all)
+}
+
+fn batch_arrived(
+    gather: &Arc<Mutex<BatchCountGather>>,
+    asked: &[ExtentAsk],
+    answer: Resp,
+    limit: u64,
+) {
+    let mut held = gather.lock().expect("batch-info gather");
+    if answer.status != Status::Ok {
+        held.failed.get_or_insert(answer);
+    } else if let Err(e) = receive_extents(&mut held.runs, asked, &answer.args) {
+        held.failed.get_or_insert(Resp::error(Status::Internal, e.to_string()));
+    }
+    held.left -= 1;
+    if held.left != 0 {
+        return;
+    }
+    let failed = held.failed.take();
+    let base = std::mem::take(&mut held.base);
+    let runs = std::mem::take(&mut held.runs);
+    let reply = held.reply.take().expect("the last response owns the reply");
+    drop(held);
+    reply.send(failed.unwrap_or_else(|| merge_batch_info(base, &runs, limit)));
+}
+
 /// Merge SN extent runs into the batch body, retaining stream-relative positions.
 /// Each parent stream row carries its object-relative base once.
-fn merge_batch_info(
-    mut args: Vec<Arg>,
-    mut runs: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)>,
-) -> Resp {
-    let (mut batch, rest) = match Batch::of_args(&args) {
-        Ok(value) => value,
-        Err(e) => return Resp::error(Status::Internal, e.to_string()),
-    };
-    let pieces = match Batch::pieces(rest, batch.given) {
-        Ok(pieces) => pieces,
-        Err(e) => return Resp::error(Status::Internal, e.to_string()),
-    };
-    let mut body = Vec::new();
-    let mut entries = 0;
-    for piece in pieces {
-        let (mut shape, mut after) = match Shape::of_args(piece) {
-            Ok(value) => value,
-            Err(e) => return Resp::error(Status::Internal, e.to_string()),
-        };
-        let (described, after_described) = match Described::of_args(after) {
-            Ok(value) => value,
-            Err(e) => return Resp::error(Status::Internal, e.to_string()),
-        };
-        after = after_described;
-        let mut stream_args = Vec::new();
-        let mut extent_count = OEoff::ZERO;
-        for _ in 0..shape.given.number() {
-            let (mut row, rest) = match StreamRow::of_args(after) {
-                Ok(value) => value,
-                Err(e) => return Resp::error(Status::Internal, e.to_string()),
-            };
-            after = rest;
-            if let Some((run, extent_rows)) = runs.remove(&row.stream) {
-                row.totals = run.totals;
-                row.given =
-                    ExtentId::of_number(extent_rows.len() as u64).expect("extent row count fits");
-                extent_count = extent_count
-                    .plus(OEoff::of_len(extent_rows.len()).expect("extent row count fits"))
-                    .expect("object extent count fits");
-                stream_args.extend(row.args());
-                for extent in extent_rows {
-                    stream_args.extend(extent.args());
-                }
-            } else {
-                stream_args.extend(row.args());
+fn merge_batch_info(args: Vec<Arg>, runs: &[Option<ExtentReply>], limit: u64) -> Resp {
+    let merge = || -> common::Result<Vec<Arg>> {
+        let (mut batch, rest) = Batch::of_args(&args)?;
+        let pieces = Batch::pieces(rest, batch.given)?;
+        let mut body = Vec::new();
+        let mut entries = 0;
+        let mut given = 0;
+        let mut at = 0;
+        for (i, piece) in pieces.iter().enumerate() {
+            if entries == limit {
+                batch.next = i as u64;
+                break;
+            }
+            let (shape, rest) = Shape::of_args(piece)?;
+            let (described, rest) = Described::of_args(rest)?;
+            let (rows, rest) = StreamRow::some_of_args(rest, shape.given.number())?;
+            if !rest.is_empty() {
+                return Err(common::Error::new("batch base has trailing rows"));
+            }
+            let end = at + rows.len();
+            let replies =
+                runs.get(at..end).ok_or_else(|| common::Error::new("missing stream replies"))?;
+            at = end;
+            let merged = merge_object_info(
+                Levelled {
+                    shape,
+                    head: described.map_or_else(Described::missing, |row| row.args()),
+                    rows,
+                    hide_rows: false,
+                    instances: false,
+                },
+                replies,
+                limit - entries,
+            );
+            let (shape, _) = Shape::of_args(&merged)?;
+            entries += shape.entries;
+            given += 1;
+            body.extend(merged);
+            if shape.more() {
+                batch.next = i as u64;
+                break;
             }
         }
-        if !after.is_empty() {
-            return Resp::error(
-                Status::Internal,
-                "batch-object-info response was not self-contained",
-            );
-        }
-        shape.extents = extent_count;
-        shape.entries = 1 + shape.given.number() + extent_count.number();
-        entries += shape.entries;
-        body.extend(shape.args());
-        body.extend(described.map_or_else(Described::missing, |row| row.args()));
-        body.extend(stream_args);
+        batch.given = given;
+        batch.entries = entries;
+        let mut out = batch.args();
+        out.extend(body);
+        Ok(out)
+    };
+    match merge() {
+        Ok(args) => Resp { id: 0, status: Status::Ok, args },
+        Err(e) => Resp::error(Status::Internal, e.to_string()),
     }
-    batch.entries = entries;
-    args.clear();
-    args.extend(batch.args());
-    args.extend(body);
-    Resp { id: 0, status: Status::Ok, args }
 }
 
 /// One name's worth of a batch answer: what it cost, whether it is all of that
@@ -2411,7 +2449,7 @@ mod tests {
 
     /// What a caller sees, with no SN asked — so every stream row says `given` zero.
     fn flat(levelled: Levelled) -> Vec<Arg> {
-        levelled.args(HashMap::new())
+        levelled.args()
     }
 
     fn read_back(args: &[Arg]) -> (Shape, Vec<StreamRow>) {
@@ -2452,6 +2490,181 @@ mod tests {
         (summary, run, extent)
     }
 
+    #[test]
+    fn listing_positions_preserve_each_occurrence_and_order() {
+        let base = ORoff::new(1 << 40);
+        let (summary, _, _) = scoped_summary(base);
+        let mut rows = vec![summary.rows[0].clone(); 4];
+        rows[1].first_record = base.plus(ORoff::new(43)).unwrap();
+        rows[2].sn = SnId::new(99);
+        let from = base.plus(ORoff::new(50)).unwrap();
+        let groups = extent_asks(RangeId::FIRST, &rows, from);
+        let asked = &groups[&rows[0].sn];
+        assert_eq!(asked.iter().map(|ask| ask.row).collect::<Vec<_>>(), vec![0, 1, 3]);
+        assert_eq!(
+            asked.iter().map(|ask| ask.from).collect::<Vec<_>>(),
+            vec![SRoff::new(50), SRoff::new(7), SRoff::new(50)]
+        );
+        assert_eq!(groups[&SnId::new(99)][0].row, 2);
+        assert_eq!(stream_start(ORoff::ZERO, base), SRoff::ZERO);
+        let request = ask_extents(asked, 3, true);
+        let (mut reader, _) = structure(&request.args, Op::ListExtents, "listing").unwrap();
+        let listing = Listing::read_payload(&mut reader).unwrap();
+        reader.done().unwrap();
+        assert_eq!(listing.limit, 3);
+        assert!(listing.instances);
+        assert_eq!(listing.at.len(), 3, "identical requests are not combined");
+        assert_eq!(listing.at[0], listing.at[2]);
+        assert_eq!(Listing::of_args(&listing.args()).unwrap(), listing);
+    }
+
+    fn summary_contents(args: &[Arg]) -> (Shape, Vec<(StreamRow, Vec<ExtentRow>)>) {
+        let (shape, rest) = Shape::of_args(args).unwrap();
+        let (_, mut rest) = Described::of_args(rest).unwrap();
+        let mut rows = Vec::new();
+        for _ in 0..shape.given.number() {
+            let (row, after) = StreamRow::of_args(rest).unwrap();
+            let (extents, after) = ExtentRow::some_of_args(after, row.given.number()).unwrap();
+            rows.push((row, extents));
+            rest = after;
+        }
+        assert!(rest.is_empty());
+        (shape, rows)
+    }
+
+    #[test]
+    fn replies_fill_original_slots_without_unifying_repeated_streams() {
+        let base = ORoff::new(1 << 40);
+        let (summary, run, extent) = scoped_summary(base);
+        let mut rows = vec![summary.rows[0].clone(); 3];
+        rows[1].sn = SnId::new(99);
+        rows[2].first_record = base.plus(ORoff::new(40)).unwrap();
+        let groups = extent_asks(RangeId::FIRST, &rows, base.plus(ORoff::new(50)).unwrap());
+        let mut slots = vec![None; 3];
+        let answer = |starts: &[u64]| {
+            let mut args = Vec::new();
+            for &start in starts {
+                args.extend(run.args());
+                args.extend(ExtentRow { first_record: SRoff::new(start), ..extent.clone() }.args());
+            }
+            args
+        };
+        // The second SN finishes first. The first and third requests have the same stream ID.
+        receive_extents(&mut slots, &groups[&SnId::new(99)], &answer(&[50])).unwrap();
+        assert!(slots[0].is_none() && slots[2].is_none());
+        receive_extents(&mut slots, &groups[&rows[0].sn], &answer(&[50, 10])).unwrap();
+        let starts: Vec<_> =
+            slots.iter().map(|slot| slot.as_ref().unwrap().1[0].first_record).collect();
+        assert_eq!(starts, vec![SRoff::new(50), SRoff::new(50), SRoff::new(10)]);
+        assert!(
+            receive_extents(&mut slots, &groups[&rows[0].sn], &answer(&[50])).is_err(),
+            "missing replies must not silently reuse another occurrence"
+        );
+    }
+
+    #[test]
+    fn combined_sn_responses_are_trimmed_to_one_object_budget() {
+        let base = ORoff::new(1 << 40);
+        let (mut summary, mut run, extent) = scoped_summary(base);
+        run.next = SRoff::NONE;
+        let mut second = summary.rows[0].clone();
+        second.sn = SnId::new(99);
+        second.stream = StreamId::new(99);
+        second.first_record = base.plus(ORoff::new(1 << 35)).unwrap();
+        let next = second.first_record;
+        let other = ExtentRun { stream: second.stream, ..run.clone() };
+        summary.rows.push(second);
+        summary.shape.given = StreamId::new(2);
+        summary.shape.entries = 3;
+        let extents = vec![ExtentRow { first_record: SRoff::ZERO, ..extent.clone() }, extent];
+        let replies = vec![Some((run, extents.clone())), Some((other, extents))];
+        let args = merge_object_info(summary, &replies, 4);
+        let (shape, rows) = summary_contents(&args);
+        assert_eq!(shape.entries, 4);
+        assert_eq!(shape.extents, OEoff::new(4), "retain SN counts, not the two returned rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.len(), 2);
+        assert_eq!(shape.next, next);
+    }
+
+    #[test]
+    fn shared_streams_are_reported_for_every_reference_and_trimmed_after_collection() {
+        let base = ORoff::new(1 << 40);
+        let (mut summary, mut run, extent) = scoped_summary(base);
+        run.next = SRoff::NONE;
+        run.totals.extents = ExtentId::new(1);
+        let mut second = summary.rows[0].clone();
+        second.first_record = base.plus(ORoff::new(1 << 35)).unwrap();
+        summary.rows.push(second);
+        summary.shape.given = StreamId::new(2);
+        summary.shape.entries = 3;
+        let runs = vec![Some((run, vec![extent.clone()]))];
+        let runs = vec![runs[0].clone(), runs[0].clone()];
+        let full = merge_object_info(summary, &runs, 100);
+        let (shape, rows) = summary_contents(&full);
+        assert_eq!(shape.extents, OEoff::new(2));
+        assert_eq!(shape.entries, 5);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, vec![extent.clone()]);
+        assert_eq!(rows[1].1, vec![extent.clone()]);
+        let trimmed = common::info::limit_object_info(&full, 4).unwrap();
+        let (shape, rows) = summary_contents(&trimmed);
+        assert_eq!(shape.entries, 4);
+        assert_eq!(shape.extents, OEoff::new(2), "counts survive trimming");
+        assert_eq!(rows[1].1.len(), 0);
+        assert_eq!(
+            shape.next,
+            rows[1].0.first_record.plus(ORoff::from_stream(extent.first_record)).unwrap()
+        );
+    }
+
+    #[test]
+    fn resumed_summary_counts_all_extents_but_reports_only_the_requested_suffix() {
+        let base = ORoff::new(1 << 40);
+        let (summary, mut run, extent) = scoped_summary(base);
+        run.next = SRoff::NONE;
+        let from = base.plus(ORoff::from_stream(extent.first_record)).unwrap();
+        let groups = extent_asks(RangeId::FIRST, &summary.rows, from);
+        assert_eq!(groups[&summary.rows[0].sn][0].from, extent.first_record);
+        let runs = vec![Some((run, vec![extent.clone()]))];
+        let args = merge_object_info(summary, &runs, 3);
+        let (shape, rows) = summary_contents(&args);
+        assert_eq!(shape.extents, OEoff::new(2));
+        assert_eq!(shape.entries, 3);
+        assert_eq!(rows[0].1, vec![extent]);
+        assert_eq!(shape.next, ORoff::NONE);
+    }
+
+    #[test]
+    fn batch_repeats_shared_summaries_and_uses_sn_counts_even_without_room_for_extents() {
+        let base = ORoff::new(1 << 40);
+        let (summary, mut run, extent) = scoped_summary(base);
+        run.next = SRoff::NONE;
+        run.totals.extents = ExtentId::new(1);
+        let piece = flat(summary);
+        let mut args = Batch { asked: 2, given: 2, entries: 4, next: UNKNOWN }.args();
+        args.extend(piece.clone());
+        args.extend(piece);
+        let runs = vec![Some((run, vec![extent.clone()]))];
+        let runs = vec![runs[0].clone(), runs[0].clone()];
+        let response = merge_batch_info(args.clone(), &runs, 6);
+        assert_eq!(response.status, Status::Ok);
+        let (batch, rest) = Batch::of_args(&response.args).unwrap();
+        assert_eq!((batch.given, batch.entries, batch.next), (2, 6, UNKNOWN));
+        for piece in Batch::pieces(rest, batch.given).unwrap() {
+            let (shape, rows) = summary_contents(piece);
+            assert_eq!(shape.extents, OEoff::new(1));
+            assert_eq!(rows[0].1, vec![extent.clone()]);
+        }
+        let response = merge_batch_info(args, &runs, 2);
+        let (batch, rest) = Batch::of_args(&response.args).unwrap();
+        assert_eq!((batch.given, batch.entries, batch.next), (1, 2, 0));
+        let (shape, rows) = summary_contents(rest);
+        assert_eq!(shape.extents, OEoff::new(1));
+        assert!(rows[0].1.is_empty());
+        assert_eq!(shape.next, base.plus(ORoff::from_stream(extent.first_record)).unwrap());
+    }
+
     fn assert_scoped_summary(args: &[Arg], base: ORoff, expected: &ExtentRow) -> Shape {
         let (shape, rest) = Shape::of_args(args).unwrap();
         let (_, rest) = Described::of_args(rest).unwrap();
@@ -2468,8 +2681,8 @@ mod tests {
         let base = ORoff::new(1 << 40);
         let (summary, run, extent) = scoped_summary(base);
         let next = base.plus(ORoff::from_stream(run.next)).unwrap();
-        let runs = HashMap::from([(run.stream, (run, vec![extent.clone()]))]);
-        let args = merge_object_info(summary, runs);
+        let runs = vec![Some((run, vec![extent.clone()]))];
+        let args = merge_object_info(summary, &runs, 100);
         let shape = assert_scoped_summary(&args, base, &extent);
         assert_eq!(shape.next, next, "object continuation still includes the stream base");
     }
@@ -2477,20 +2690,22 @@ mod tests {
     #[test]
     fn batch_summary_keeps_extent_positions_stream_local_for_each_object() {
         let mut body = Vec::new();
-        let mut runs = HashMap::new();
+        let mut runs = Vec::new();
         let mut expected = Vec::new();
         for i in 0..2 {
             let base = ORoff::new((1 << 40) + i * 1000);
             let (mut summary, mut run, extent) = scoped_summary(base);
+            run.totals.extents = ExtentId::new(1);
+            run.next = SRoff::NONE;
             run.stream = StreamId::new(i as u32);
             summary.rows[0].stream = run.stream;
             body.extend(flat(summary));
-            runs.insert(run.stream, (run, vec![extent.clone()]));
+            runs.push(Some((run, vec![extent.clone()])));
             expected.push((base, extent));
         }
         let mut args = Batch { asked: 2, given: 2, entries: 4, next: UNKNOWN }.args();
         args.extend(body);
-        let response = merge_batch_info(args, runs);
+        let response = merge_batch_info(args, &runs, 100);
         assert_eq!(response.status, Status::Ok);
         let (batch, rest) = Batch::of_args(&response.args).unwrap();
         let pieces = Batch::pieces(rest, batch.given).unwrap();
