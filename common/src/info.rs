@@ -554,9 +554,9 @@ pub struct ExtentRow {
     pub sn: SnId,
     pub id: ExtentId,
     pub created: TimeSec,
-    /// Its first record. **Stream-local from the SN, object-local once the FE has
-    /// converted it** (§17.16.2 is what happens when that is skipped).
-    pub first_record: u64,
+    /// Its first record within the stream, at every tier. Add the parent
+    /// StreamRow.first_record only when an object-relative position is needed.
+    pub first_record: SRoff,
     /// Records in it, or `UNKNOWN` while it is the one being appended to — which is
     /// also what says it is not sealed.
     pub records: ERoff,
@@ -584,7 +584,7 @@ impl ExtentRow {
         payload.sn_id(self.sn);
         payload.extent_id(self.id);
         payload.time_sec(self.created);
-        payload.number_u64(self.first_record);
+        payload.sroff(self.first_record);
         payload.eroff(self.records);
         payload.eloff(self.logical);
         payload.ecoff(self.length);
@@ -601,7 +601,7 @@ impl ExtentRow {
         let sn = payload.sn_id()?;
         let id = payload.extent_id()?;
         let created = payload.time_sec()?;
-        let first_record = payload.number_u64()?;
+        let first_record = payload.sroff()?;
         let records = payload.eroff()?;
         let logical = payload.eloff()?;
         let length = payload.ecoff()?;
@@ -1035,7 +1035,7 @@ mod tests {
             sn: SnId::new(2),
             id: ExtentId::of_number(id).expect("an extent"),
             created: TimeSec::new(1_000_000),
-            first_record,
+            first_record: SRoff::new(first_record),
             records: ERoff::new(records as u32),
             logical: if records == UNKNOWN {
                 ELoff::NONE

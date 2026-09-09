@@ -522,10 +522,7 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Resp) {
     if let Some(failed) = held.failed.take() {
         return reply.send(failed);
     }
-    // ⚠️ The rows come back stream-local and the caller counts from the start of the object, so the
-    // DN converts — it is the tier that holds each stream's first record (§17.16.2 is what happens
-    // when a conversion like this is skipped).
-    let mut runs = std::mem::take(&mut held.runs);
+    let runs = std::mem::take(&mut held.runs);
     // ⚠️ **Write back what the SNs said before answering.** This is the only path by which a
     // stream's cached sizes ever stop being UNKNOWN (§17.25.1), so skipping it would leave
     // every listing blank while the numbers sat in a response on their way out the door.
@@ -533,9 +530,24 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Resp) {
     // one's are a point in time, which is what `Stream::learned` refusing to go backwards is
     // for — two answers can cross in flight.
     dn.remember(&held.name, &runs);
+    let levelled = Levelled {
+        shape: held.shape.clone(),
+        head: std::mem::take(&mut held.head),
+        rows: std::mem::take(&mut held.rows),
+        hide_rows: held.hide_rows,
+        instances: held.instances,
+    };
+    reply.send(Resp { id: 0, status: Status::Ok, args: merge_object_info(levelled, runs) });
+}
+
+/// Assemble an object summary without changing the stream-relative extent positions.
+fn merge_object_info(
+    mut held: Levelled,
+    mut runs: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)>,
+) -> Vec<Arg> {
     let mut extents = OEoff::ZERO;
     let mut given = 0;
-    let mut converted: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)> = HashMap::new();
+    let mut selected: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)> = HashMap::new();
     for row in &held.rows {
         let Some((run, rows)) = runs.remove(&row.stream) else { continue };
         if run.totals.extents.is_some() {
@@ -544,28 +556,14 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Resp) {
                 .expect("object extent count fits");
         }
         given += rows.len() as u64;
-        // Stream-local to object-local, by adding where this stream starts in the object.
-        let moved = rows
-            .into_iter()
-            .map(|extent| ExtentRow {
-                // SN supplies an extent-local position. Add it to the stream's
-                // object-local start, then reduce only because ExtentRow is the
-                // context-dependent shape shared by SN and DN.
-                first_record: ORoff::from_stream(SRoff::new(extent.first_record))
-                    .plus(row.first_record)
-                    .expect("object record position fits")
-                    .get(),
-                ..extent
-            })
-            .collect();
-        converted.insert(row.stream, (run, moved));
+        selected.insert(row.stream, (run, rows));
     }
     // ⚠️ **Where to carry on is now the extent level's business.** A stream whose extents were cut
     // short is the place to resume, and it comes before any stream that was not described at all — so
     // the first such stream in record order wins, and only if none was cut does the stream-level
     // continuation stand. Without this an answer that truncated extents reported `nothing more`.
     let cut = held.rows.iter().find_map(|row| {
-        let (run, rows) = converted.get(&row.stream)?;
+        let (run, rows) = selected.get(&row.stream)?;
         let short = run.totals.extents != ExtentId::NONE
             && rows.len() < run.totals.extents.number() as usize;
         // ⚠️ `then`, not `then_some`: `then_some` evaluates its argument **eagerly**, so it
@@ -585,7 +583,7 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, answer: Resp) {
         hide_rows: held.hide_rows,
         instances: held.instances,
     };
-    reply.send(Resp { id: 0, status: Status::Ok, args: levelled.args(converted) });
+    levelled.args(selected)
 }
 
 /// Several asks outstanding at once, answered when the last of them returns.
@@ -2007,8 +2005,8 @@ impl DN {
     }
 }
 
-/// Merge SN extent runs into the already-built batch body. SN positions are stream-local; the
-/// DN adds each stream's object-local starting record before putting the rows on the wire.
+/// Merge SN extent runs into the batch body, retaining stream-relative positions.
+/// Each parent stream row carries its object-relative base once.
 fn merge_batch_info(
     mut args: Vec<Arg>,
     mut runs: HashMap<StreamId, (ExtentRun, Vec<ExtentRow>)>,
@@ -2050,16 +2048,7 @@ fn merge_batch_info(
                     .expect("object extent count fits");
                 stream_args.extend(row.args());
                 for extent in extent_rows {
-                    stream_args.extend(
-                        ExtentRow {
-                            first_record: ORoff::from_stream(SRoff::new(extent.first_record))
-                                .plus(row.first_record)
-                                .expect("object record position fits")
-                                .get(),
-                            ..extent
-                        }
-                        .args(),
-                    );
+                    stream_args.extend(extent.args());
                 }
             } else {
                 stream_args.extend(row.args());
@@ -2431,6 +2420,84 @@ mod tests {
         let (rows, rest) = StreamRow::some_of_args(rest, shape.given.number()).expect("streams");
         assert!(rest.is_empty(), "and nothing left over");
         (shape, rows)
+    }
+
+    fn scoped_summary(base: ORoff) -> (Levelled, ExtentRun, ExtentRow) {
+        let want = Want::plain().with(Detail::Streams).with(Detail::Counts);
+        let mut summary = detailed(&grown(), RangeId::new(0), DnId::new(0), &want, 100).unwrap();
+        summary.rows.truncate(1);
+        summary.rows[0].first_record = base;
+        summary.shape.given = StreamId::new(1);
+        summary.shape.entries = 2;
+        let run = ExtentRun {
+            stream: summary.rows[0].stream,
+            totals: common::info::Totals {
+                extents: ExtentId::new(2),
+                logical: SLoff::new(100),
+                compressed: SCoff::new(80),
+            },
+            given: ExtentId::new(1),
+            next: SRoff::new((1 << 32) + 20),
+        };
+        let extent = ExtentRow {
+            sn: summary.rows[0].sn,
+            id: ExtentId::new(3),
+            created: TimeSec::new(100),
+            first_record: SRoff::new((1 << 32) + 7),
+            records: common::offset::ERoff::new(13),
+            logical: common::offset::ELoff::new(100),
+            length: common::offset::ECoff::new(80),
+            disks: vec![],
+        };
+        (summary, run, extent)
+    }
+
+    fn assert_scoped_summary(args: &[Arg], base: ORoff, expected: &ExtentRow) -> Shape {
+        let (shape, rest) = Shape::of_args(args).unwrap();
+        let (_, rest) = Described::of_args(rest).unwrap();
+        let (stream, rest) = StreamRow::of_args(rest).unwrap();
+        let (extent, rest) = ExtentRow::of_args(rest).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(stream.first_record, base);
+        assert_eq!(&extent, expected, "DN must preserve the entire SN extent row");
+        shape
+    }
+
+    #[test]
+    fn object_summary_keeps_extent_positions_stream_local_but_rebases_continuation() {
+        let base = ORoff::new(1 << 40);
+        let (summary, run, extent) = scoped_summary(base);
+        let next = base.plus(ORoff::from_stream(run.next)).unwrap();
+        let runs = HashMap::from([(run.stream, (run, vec![extent.clone()]))]);
+        let args = merge_object_info(summary, runs);
+        let shape = assert_scoped_summary(&args, base, &extent);
+        assert_eq!(shape.next, next, "object continuation still includes the stream base");
+    }
+
+    #[test]
+    fn batch_summary_keeps_extent_positions_stream_local_for_each_object() {
+        let mut body = Vec::new();
+        let mut runs = HashMap::new();
+        let mut expected = Vec::new();
+        for i in 0..2 {
+            let base = ORoff::new((1 << 40) + i * 1000);
+            let (mut summary, mut run, extent) = scoped_summary(base);
+            run.stream = StreamId::new(i as u32);
+            summary.rows[0].stream = run.stream;
+            body.extend(flat(summary));
+            runs.insert(run.stream, (run, vec![extent.clone()]));
+            expected.push((base, extent));
+        }
+        let mut args = Batch { asked: 2, given: 2, entries: 4, next: UNKNOWN }.args();
+        args.extend(body);
+        let response = merge_batch_info(args, runs);
+        assert_eq!(response.status, Status::Ok);
+        let (batch, rest) = Batch::of_args(&response.args).unwrap();
+        let pieces = Batch::pieces(rest, batch.given).unwrap();
+        assert_eq!(pieces.len(), expected.len());
+        for (piece, (base, extent)) in pieces.iter().zip(expected) {
+            assert_scoped_summary(piece, base, &extent);
+        }
     }
 
     /// Wanting nothing asks for no levels at all, so the caller gets the row that

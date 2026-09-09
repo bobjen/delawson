@@ -1651,7 +1651,12 @@ fn say(
             println!(
                 "    extent {} of SN{} made in second {}, from record {}, {held}, \
                  on disks {disks:?} at ENs {ens:?}",
-                extent.id, extent.sn, extent.created, extent.first_record
+                extent.id,
+                extent.sn,
+                extent.created,
+                row.first_record
+                    .plus(ORoff::from_stream(extent.first_record))
+                    .expect("object record position fits")
             );
         }
     }

@@ -18113,5 +18113,20 @@ only when computing stream totals.
 
 These repairs preserve wire layouts and add direct unit tests for large object
 totals, scoped range decoding, unknown-count encoding, and sealed extent rows.
-The mixed stream/object coordinates in `ExtentRow.first_record` remain a
-separate, deferred repair.
+The mixed stream/object coordinates in `ExtentRow.first_record` are addressed below.
+
+### 17.43.3 Extent rows retain stream-relative record positions
+
+`ExtentRow.first_record` is now `SRoff` throughout SN, DN, and the client.
+The parent `StreamRow.first_record` reports the stream's `ORoff` base once;
+neither single-object nor batch-object info adds that base to extent rows.
+This keeps the representation suitable for direct stream access if that becomes
+useful, without adding such an API now.
+
+Object-facing consumers add the stream base when they need an object-relative
+position. The CLI therefore retains its object-relative record display, and
+object-summary continuation positions still include the base. The row encoding
+has the same layout, but DN extent positions now mean stream-relative positions;
+clients expecting the old object-relative values must be updated together.
+Direct unit tests cover both summary assembly paths with nonzero bases and
+stream positions above 32 bits.
