@@ -18051,3 +18051,33 @@ charge additional work after reading a parameter such as a count, but it may not
 speculative parsing and roll it back. Shared readers count parse operations against the message byte
 count. A routine that violates these rules is a software bug; process-level liveness supervision is
 the backstop for a routine that never returns.
+
+## 17.43 Read and append contract repairs
+
+The September 2026 review found seven mismatches in implemented paths. These are repairs to
+existing operations, not implementations of new addressing modes:
+
+- Point reads and scans use the same record-request builder, including the selector the FE reads.
+- The EN validates an extent's identity and reads its blocks under one extent lock, without
+  acquiring that lock a second time.
+- An EN reporting an automatically sealed extent returns all three measures in `Filled`,
+  which is what the FE needs to report the seal and request a successor.
+- A piece's CRC describes its uncompressed framed bytes. The FE preserves every piece's CRC,
+  including the first; neither compressed bytes nor the whole-append CRC replace it. Zero retains
+  its existing meaning of checksum disabled, and the reader skips that optional check.
+- EN response blocks retain extent-local `ERoff` numbering. Client response blocks use
+  `ObjectPiece` with `ORoff` and the new `ObjectPieceResp` tag (73), so an object record
+  number above 32 bits is never narrowed back into an extent record number.
+- Record lookups carry `Expecting` through `LocateStream` to the DN's existing identity check.
+- Both FE and EN refuse `RecordThen` and `Logical` starts with `Unimplemented`; an interior
+  offset must not silently become a request for the beginning of the record.
+
+Tests call the relevant parsers, builders, converters, readers, and handlers directly. The FE
+append parser and its lookup and append builders are separate routines so checksum and identity
+preservation can be checked without mock peers or a running cluster. The read-lock regression
+calls `Disk::read` with a timeout to prevent a reintroduced deadlock from hanging the test suite.
+
+These changes update the current prototype wire contract: `LocateStream` now carries an
+expectation, and client blocks have a distinct tag and a wider first-record field. Rebuild the
+client and servers together for this prototype revision. This is not capability negotiation or a
+mixed-version rollout implementation; the requirements of §17.42 still apply before shipping.

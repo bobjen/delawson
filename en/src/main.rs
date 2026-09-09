@@ -847,7 +847,7 @@ impl Disk {
                     came_to.logical,
                     came_to.compressed
                 ));
-                reply.send(Resp::number(Status::Sealed, came_to.records.number()));
+                reply.send(Resp { id: 0, status: Status::Sealed, args: came_to.args() });
                 return Ok(());
             }
         };
@@ -960,6 +960,7 @@ impl Disk {
         Resp::ok()
     }
 
+    #[cfg(test)]
     fn range(
         &self,
         process: &Process,
@@ -981,10 +982,10 @@ impl Disk {
         created: TimeSec,
         range: Range,
     ) -> Resp {
-        let Some(from) = range.start.record() else {
+        let common::range::Start::Record(from) = range.start else {
             return Resp::error(
                 Status::Unimplemented,
-                "starting from a logical offset needs a prefix sum nothing keeps yet",
+                "only record-boundary starts are implemented",
             );
         };
 
@@ -1008,7 +1009,15 @@ impl Disk {
             Ok(from) => from,
             Err(e) => return Resp::error(Status::NotFound, e.to_string()),
         };
-        let ranged = match self.range(process, sn, extent, from, range.budget) {
+        let place = held.at[&(sn, extent)];
+        let ranged = match held.range(
+            &self.daily_cache,
+            &self.extent_cache,
+            process,
+            place,
+            from,
+            range.budget,
+        ) {
             Ok(Some(ranged)) => ranged,
             Ok(None) => {
                 return Resp::error(
@@ -1366,6 +1375,61 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_read_returns_without_relocking_and_refuses_interior_starts() {
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let en = EN::new(common::testing::en_config());
+            append(&en, 1, b"one\n");
+            let disk = en.disk(DiskId::FIRST).unwrap();
+            let process = common::testing::process();
+            let answer = disk.read(
+                &process,
+                SnId::FIRST,
+                ExtentId::new(1),
+                TimeSec::new(1_000_000),
+                Range::from(0),
+            );
+            assert_eq!(answer.status, Status::Ok);
+            let (covered, rest) = ExtentCovered::of_args(&answer.args).unwrap();
+            assert_eq!(covered.records, ERoff::new(1));
+            assert_eq!(Piece::all_of_args(rest).unwrap()[0].bytes, b"one\n");
+            let answer = disk.read(
+                &process,
+                SnId::FIRST,
+                ExtentId::new(1),
+                TimeSec::new(1_000_000),
+                Range { start: common::range::Start::RecordThen(0, 1), budget: Budget::Records(1) },
+            );
+            assert_eq!(answer.status, Status::Unimplemented);
+            send.send(()).unwrap();
+        });
+        receive.recv_timeout(std::time::Duration::from_secs(5)).expect("read must finish");
+    }
+
+    #[test]
+    fn a_full_extent_replies_with_all_three_measures() {
+        let en = EN::new(common::testing::en_config());
+        append(&en, 1, b"one\n");
+        let disk = en.disk(DiskId::FIRST).unwrap();
+        let (wire, mut reader) = common::testing::link();
+        let reply = Reply::new_test(Arc::new(common::server::Out::direct(wire)));
+        disk.try_append(
+            &common::testing::process(),
+            (EnId::FIRST, DiskId::FIRST),
+            block(0, 1, b"two\n"),
+            reply,
+        )
+        .unwrap();
+        let response = reader.response().unwrap();
+        assert_eq!(response.status, Status::Sealed);
+        let (filled, rest) = Filled::of_args(&response.args).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(filled.records, ERoff::new(1));
+        assert_eq!(filled.logical, ELoff::new(7));
+        assert_eq!(filled.compressed, block(0, 1, b"one\n").holds.compressed);
+    }
     use common::framing::Framing;
     use common::testing;
 

@@ -18,8 +18,8 @@ use common::config::{DNConfig, ServiceKind};
 use common::framing::Framing;
 use common::ids::{DnId, ExtentId, ObjectId, RangeId, SnId, StreamId};
 use common::info::{
-    Batch, Described, ExtentRow, ExtentRun, Listing, ObjectName, Shape, StreamName, StreamRow,
-    Totals, UNKNOWN, Wanted,
+    Batch, Described, Expecting, ExtentRow, ExtentRun, Listing, ObjectName, Shape, StreamName,
+    StreamRow, Totals, UNKNOWN, Wanted,
 };
 use common::logw;
 use common::offset::{ORoff, SCoff, SLoff, SRoff};
@@ -720,6 +720,10 @@ impl Service for DN {
                         return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                     }
                 };
+                let expect = match Expecting::read(&mut payload) {
+                    Ok(expect) => expect,
+                    Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+                };
                 if let Err(e) = payload.done() {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                 }
@@ -731,7 +735,10 @@ impl Service for DN {
                 }
                 let mut payload = StructWriter::new();
                 payload.text(&path);
-                payload.flag(false);
+                payload.flag(expect.asked());
+                if expect.asked() {
+                    Want { expect, ..Want::plain() }.write(&mut payload);
+                }
                 let request = Req::new(Op::ObjectInfo).structure(payload);
                 self.info(process, &request, Some(record), reply)
             }
@@ -2118,6 +2125,39 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn locate_stream_refuses_a_replaced_object() {
+        let dn = Arc::new(DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST));
+        dn.shards[shard_of("/x")].lock().unwrap().insert(
+            Box::from("/x"),
+            Object {
+                id: ObjectId::new(2),
+                framing: Framing::Lf,
+                streams: vec![held(0, 0, None)],
+                extending: false,
+                waiting: Vec::new(),
+                keyed: false,
+                created: TimeSec::new(100),
+            },
+        );
+        let mut payload = StructWriter::new();
+        payload.text("/x");
+        payload.oroff(ORoff::ZERO);
+        Expecting::of(ObjectName {
+            range: RangeId::FIRST,
+            object: ObjectId::new(1),
+            created: TimeSec::new(100),
+        })
+        .write(&mut payload);
+        let (wire, mut reader) = testing::link();
+        dn.handle(
+            &testing::process(),
+            Req::new(Op::LocateStream).structure(payload),
+            Reply::new_test(Arc::new(common::server::Out::direct(wire))),
+        );
+        assert_eq!(reader.response().unwrap().status, Status::Replaced);
+    }
+
     /// ⚠️ **The property a path cannot supply and a name must** (§17.35.2). A user may replace an
     /// object many times a second, so two incarnations at one path share a creation second — and
     /// they must still be told apart. The id is what does it, minted from a counter rather than

@@ -215,6 +215,7 @@ ops! {
     ForceSealExtent = 70, "force-seal-extent";
     SealStream = 71, "seal-stream";
     SealObject = 72, "seal-object";
+    ObjectPieceResp = 73, "object-piece-response";
 }
 
 impl std::fmt::Display for Op {

@@ -28,7 +28,7 @@ use common::info::{Batch, Described, Expecting, Shape, StreamName, UNKNOWN, Want
 use common::logw;
 use common::offset::{ELoff, ERoff, OCoff, OLoff, ORoff, SRoff};
 use common::range::{
-    Budget, Detail, ExtentCovered, Filled, ObjectCovered, Piece, Range, Start, Want,
+    Budget, Detail, ExtentCovered, Filled, ObjectCovered, ObjectPiece, Piece, Range, Start, Want,
 };
 use common::routing;
 use common::server::{self, Process, Reply, Service};
@@ -515,23 +515,7 @@ impl FE {
         let path = path.to_string();
         // ⚠️ The expectation goes to the **DN**, because the DN owns the path table and is the
         // only tier that can see the path point somewhere new (§17.36).
-        let ask = match record {
-            None => {
-                let mut payload = StructWriter::new();
-                payload.text(&path);
-                payload.flag(expect.asked());
-                if expect.asked() {
-                    Want { expect, ..Want::plain() }.write(&mut payload);
-                }
-                Req::new(Op::ObjectInfo).structure(payload)
-            }
-            Some(record) => {
-                let mut payload = StructWriter::new();
-                payload.text(&path);
-                payload.oroff(record);
-                Req::new(Op::LocateStream).structure(payload)
-            }
-        };
+        let ask = object_lookup(&path, record, expect);
         let named = dn.clone();
         let asked = process.ask(&dn, &ask, move |answer| {
             // An append may make the object it is appending to, which is one more
@@ -562,85 +546,11 @@ impl FE {
     /// An append: resolve the name — making the object if it is not there — find the
     /// extent, and hand the bytes to its primary.
     fn append(self: &Arc<Self>, process: &Arc<Process>, request: &Req, mut reply: Reply) {
-        let (path, expect, framing, crc, holds, body, tail) = {
-            let (mut payload, rest) =
-                match structure(&request.args, Op::AppendRecord, "an append request") {
-                    Ok(value) => value,
-                    Err(e) => {
-                        return reply.send(Resp::error(Status::BadRequest, e.to_string()));
-                    }
-                };
-            let path = match payload.text() {
-                Ok(path) => path,
-                Err(e) => {
-                    return reply.send(Resp::error(Status::BadRequest, e.to_string()));
-                }
-            };
-            let expect = match Expecting::read(&mut payload) {
-                Ok(expect) => expect,
-                Err(e) => {
-                    return reply.send(Resp::error(Status::BadRequest, e.to_string()));
-                }
-            };
-            let kind = match payload.number_u8() {
-                Ok(kind) => kind,
-                Err(e) => {
-                    return reply.send(Resp::error(Status::BadRequest, e.to_string()));
-                }
-            };
-            let width = match payload.number_u32() {
-                Ok(width) => width,
-                Err(e) => {
-                    return reply.send(Resp::error(Status::BadRequest, e.to_string()));
-                }
-            };
-            let framing = match Framing::of_wire(kind, width) {
-                Ok(framing) => framing,
-                Err(e) => {
-                    return reply.send(Resp::error(Status::BadRequest, e.to_string()));
-                }
-            };
-            let crc = match payload.number_u64() {
-                Ok(crc) => crc,
-                Err(e) => {
-                    return reply.send(Resp::error(Status::BadRequest, e.to_string()));
-                }
-            };
-            let count = match payload.number_u32() {
-                Ok(count) if count > 0 => count,
-                Ok(_) => {
-                    return reply.send(Resp::error(Status::BadRequest, "an append has no blocks"));
-                }
-                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
-            };
-            let mut parts = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                let holds = match Holds::read(&mut payload) {
-                    Ok(holds) => holds,
-                    Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
-                };
-                let crc = match payload.number_u64() {
-                    Ok(crc) => crc,
-                    Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
-                };
-                let body = match payload.bytes() {
-                    Ok(body) => body,
-                    Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
-                };
-                parts.push(AppendPart { holds, crc, body });
-            }
-            if let Err(e) = payload.done() {
-                return reply.send(Resp::error(Status::BadRequest, e.to_string()));
-            }
-            if !rest.is_empty() {
-                return reply.send(Resp::error(
-                    Status::BadRequest,
-                    "an append request has trailing arguments",
-                ));
-            }
-            let first = parts.remove(0);
-            (path, expect, framing, crc, first.holds, first.body, parts)
+        let ParsedAppend { path, expect, framing, first, tail } = match ParsedAppend::of(request) {
+            Ok(append) => append,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
         };
+        let AppendPart { holds, crc, body } = first;
         reply.about(format_args!("{path},bytes {},logical {}", body.len(), holds.logical));
         let named = path.clone();
         self.resolve(
@@ -803,30 +713,8 @@ impl FE {
     fn to_primary(self: &Arc<Self>, process: &Arc<Process>, wanting: Wanting, open: Open) {
         let Wanting { path, located, framing, crc, body, holds, tail, tries, reply } = wanting;
         let identity = format!("EN{}", open.disks[0].0);
-        // One shape, built and read in `common`, so neither side counts positions.
-        let mut pieces = vec![AppendPiece {
-            holds,
-            crc: if crc == 0 { 0 } else { common::crc::of(&body) },
-            bytes: body.clone(),
-        }];
-        pieces.extend(tail.iter().cloned().map(|part| AppendPiece {
-            holds: part.holds,
-            crc: part.crc,
-            bytes: part.body,
-        }));
-        let ask = AppendBlock {
-            sn: open.sn,
-            extent: open.id,
-            created: open.created,
-            framing,
-            crc,
-            holds,
-            logical_offset: None,
-            instances: open.disks.clone(),
-            bytes: body.clone(),
-            pieces,
-        }
-        .request(open.disks[0].0, open.disks[0].1, Op::AppendExtent);
+        let ask =
+            append_request(&open, framing, AppendPart { holds, crc, body: body.clone() }, &tail);
         let named = identity.clone();
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
@@ -1000,10 +888,10 @@ impl FE {
         // The start has to be a record for now: the other two forms need a prefix sum
         // of logical lengths, which §4.5 keeps lazily and nothing here can ask for
         // (§9.1.3.4). A well-formed request for something unbuilt.
-        let Some(record) = range.start.record() else {
+        let Start::Record(record) = range.start else {
             return reply.send(Resp::error(
                 Status::Unimplemented,
-                "starting from a logical offset needs a prefix sum nothing keeps yet",
+                "only record-boundary starts are implemented",
             ));
         };
         reply.about(format_args!("{path},record {record},{:?}", range.budget));
@@ -1080,6 +968,87 @@ impl FE {
             logw!("could not reach an SN", "sn {named},{e}");
         }
     }
+}
+
+/// The fields owned by an append request, before routing adds an extent.
+struct ParsedAppend {
+    path: String,
+    expect: Expecting,
+    framing: Framing,
+    first: AppendPart,
+    tail: Vec<AppendPart>,
+}
+
+impl ParsedAppend {
+    fn of(request: &Req) -> common::Result<Self> {
+        let (mut payload, rest) = structure(&request.args, Op::AppendRecord, "an append request")?;
+        let path = payload.text()?;
+        let expect = Expecting::read(&mut payload)?;
+        let kind = payload.number_u8()?;
+        let width = payload.number_u32()?;
+        let framing = Framing::of_wire(kind, width)?;
+        // Retained on the wire for now; it must never replace a piece's own CRC.
+        let _append_crc = payload.number_u64()?;
+        let count = payload.number_u32()?;
+        if count == 0 {
+            return Err(common::Error::new("an append has no blocks"));
+        }
+        let mut parts = Vec::new();
+        for _ in 0..count {
+            parts.push(AppendPart {
+                holds: Holds::read(&mut payload)?,
+                crc: payload.number_u64()?,
+                body: payload.bytes()?,
+            });
+        }
+        payload.done()?;
+        if !rest.is_empty() {
+            return Err(common::Error::new("an append request has trailing arguments"));
+        }
+        let first = parts.remove(0);
+        Ok(Self { path, expect, framing, first, tail: parts })
+    }
+}
+
+/// Both lookup forms preserve the caller's object identity expectation.
+fn object_lookup(path: &str, record: Option<ORoff>, expect: Expecting) -> Req {
+    let mut payload = StructWriter::new();
+    payload.text(path);
+    match record {
+        None => {
+            payload.flag(expect.asked());
+            if expect.asked() {
+                Want { expect, ..Want::plain() }.write(&mut payload);
+            }
+            Req::new(Op::ObjectInfo).structure(payload)
+        }
+        Some(record) => {
+            payload.oroff(record);
+            expect.write(&mut payload);
+            Req::new(Op::LocateStream).structure(payload)
+        }
+    }
+}
+
+/// Add routing to opaque append pieces without changing their bytes or checksums.
+fn append_request(open: &Open, framing: Framing, first: AppendPart, tail: &[AppendPart]) -> Req {
+    let pieces = std::iter::once(&first)
+        .chain(tail)
+        .map(|part| AppendPiece { holds: part.holds, crc: part.crc, bytes: part.body.clone() })
+        .collect();
+    AppendBlock {
+        sn: open.sn,
+        extent: open.id,
+        created: open.created,
+        framing,
+        crc: first.crc,
+        holds: first.holds,
+        logical_offset: None,
+        instances: open.disks.clone(),
+        bytes: first.body,
+        pieces,
+    }
+    .request(open.disks[0].0, open.disks[0].1, Op::AppendExtent)
 }
 
 /// What to ask the SN for the next extent: open one, or report the one that filled
@@ -1295,7 +1264,16 @@ fn in_the_callers_numbering(answer: Resp, base: ORoff, sealed: bool) -> Resp {
         let first_record = ORoff::from_stream(SRoff::from_extent(piece.first_record))
             .plus(base)
             .expect("object record position fits");
-        args.extend(Piece { first_record: ERoff::new(first_record.get() as u32), ..piece }.args());
+        args.extend(
+            ObjectPiece {
+                first_record,
+                logical: piece.logical,
+                records: piece.records,
+                crc: piece.crc,
+                bytes: piece.bytes,
+            }
+            .args(),
+        );
     }
     Resp { id: 0, status: Status::Ok, args }
 }
@@ -2018,6 +1996,101 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_lookup_preserves_the_object_expectation() {
+        for expected in [
+            Expecting::whatever(),
+            Expecting::of(ObjectName {
+                range: RangeId::FIRST,
+                object: ObjectId::new(17),
+                created: TimeSec::new(100),
+            }),
+        ] {
+            let request = object_lookup("/x", Some(ORoff::new(7)), expected);
+            let (mut payload, rest) = structure(&request.args, Op::LocateStream, "locate").unwrap();
+            assert!(rest.is_empty());
+            assert_eq!(payload.text().unwrap(), "/x");
+            assert_eq!(payload.oroff().unwrap(), ORoff::new(7));
+            assert_eq!(Expecting::read(&mut payload).unwrap(), expected);
+            payload.done().unwrap();
+        }
+    }
+
+    #[test]
+    fn append_parsing_and_forwarding_preserve_piece_checksums() {
+        let plain = format!("{}\n", "compress me ".repeat(1000)).into_bytes();
+        let stored = common::block::squeeze(common::config::Compress::Lz4, &plain).unwrap();
+        let crc = common::crc::of(&plain);
+        assert_ne!(crc, common::crc::of(&stored));
+        let holds = Holds::of(Framing::Lf, b"", &plain, stored.len()).unwrap();
+        // Different checksums on adjacent pieces detect dropping, swapping, and
+        // recomputation. Zero also stays zero (checksum disabled).
+        for checksums in [[crc, 0], [0, crc]] {
+            let mut payload = StructWriter::new();
+            payload.text("/x");
+            Expecting::whatever().write(&mut payload);
+            let (kind, width) = Framing::Lf.wire();
+            payload.number_u8(kind);
+            payload.number_u32(width);
+            payload.number_u64(999); // whole-append CRC is not a piece CRC
+            payload.number_u32(2);
+            for checksum in checksums {
+                holds.write(&mut payload);
+                payload.number_u64(checksum);
+                payload.bytes(&stored);
+            }
+            let parsed = ParsedAppend::of(&Req::new(Op::AppendRecord).structure(payload)).unwrap();
+            assert_eq!(parsed.first.crc, checksums[0]);
+            assert_eq!(parsed.tail[0].crc, checksums[1]);
+            let request = append_request(&extent(1, 0), parsed.framing, parsed.first, &parsed.tail);
+            let (_, _, forwarded) = AppendBlock::of(&request).unwrap();
+            assert_eq!(forwarded.pieces.len(), 2);
+            for (piece, checksum) in forwarded.pieces.iter().zip(checksums) {
+                assert_eq!(piece.crc, checksum);
+                assert_eq!(piece.bytes, stored);
+                assert_eq!(piece.holds, holds);
+            }
+        }
+    }
+
+    #[test]
+    fn object_block_numbers_do_not_narrow_at_32_bits() {
+        let piece = Piece {
+            logical: ELoff::new(5),
+            first_record: ERoff::new(7),
+            records: ERoff::new(1),
+            crc: 123,
+            bytes: b"x\n".to_vec(),
+        };
+        let covered = ExtentCovered { next: ERoff::new(8), ..ExtentCovered::default() };
+        let mut args = covered.args();
+        args.extend(piece.args());
+        let response = in_the_callers_numbering(
+            Resp { id: 0, status: Status::Ok, args },
+            ORoff::new(1 << 32),
+            false,
+        );
+        let (covered, rest) = ObjectCovered::of_args(&response.args).unwrap();
+        let pieces = ObjectPiece::all_of_args(rest).unwrap();
+        assert_eq!(pieces[0].first_record, ORoff::new((1 << 32) + 7));
+        assert_eq!(covered.next, ORoff::new((1 << 32) + 8));
+        assert_eq!(pieces[0].crc, 123);
+        assert!(Piece::all_of_args(rest).is_err(), "object and extent shapes differ");
+    }
+
+    #[test]
+    fn interior_starts_are_refused_before_lookup() {
+        let fe = Arc::new(FE::new(common::testing::fe_config()));
+        for start in [Start::RecordThen(7, 1), Start::Logical(1)] {
+            let request =
+                Range { start, budget: Budget::Records(1) }.request("/x", Expecting::whatever());
+            let (wire, mut reader) = common::testing::link();
+            let reply = Reply::new_test(Arc::new(common::server::Out::direct(wire)));
+            fe.read(&common::testing::process(), &request, reply);
+            assert_eq!(reader.response().unwrap().status, Status::Unimplemented);
+        }
+    }
     use common::ids::{ObjectId, RangeId, StreamId};
     use common::info::{ObjectName, StreamRow, Totals};
 
@@ -2289,7 +2362,7 @@ mod tests {
             "measures untouched"
         );
         assert!(back.more, "and a sealed extent has something after it");
-        let pieces = Piece::all_of_args(rest).expect("blocks");
+        let pieces = ObjectPiece::all_of_args(rest).expect("blocks");
         let numbers: Vec<u64> = pieces.iter().map(|piece| piece.first_record.number()).collect();
         assert_eq!(numbers, [740, 741, 742], "every block, not just the first");
         assert!(pieces.iter().all(|piece| piece.logical == ELoff::new(3)), "and not their sizes");

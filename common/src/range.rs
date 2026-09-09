@@ -134,6 +134,16 @@ pub struct Range {
 }
 
 impl Range {
+    /// The client-to-FE record request, shared by point reads and scans.
+    pub fn request(&self, path: &str, expect: Expecting) -> crate::wire::Req {
+        let mut payload = StructWriter::new();
+        payload.text(path);
+        expect.write(&mut payload);
+        payload.number_u64(0); // record selector; 1 is reserved for keyed reads
+        self.write_nested(&mut payload);
+        crate::wire::Req::new(Op::ReadRecord).structure(payload)
+    }
+
     /// The default budget, in logical bytes, for a caller that named none.
     pub const DEFAULT_LOGICAL: u64 = 1 << 20;
 
@@ -613,9 +623,7 @@ impl Want {
 pub struct Piece {
     /// Bytes before compression, which is what to decompress to.
     pub logical: ELoff,
-    /// The number of the first record this block **completed**, in whatever numbering
-    /// the tier that answered counts in — an EN's is extent-local, and the FE is what
-    /// converts it (§17.16.2).
+    /// The extent-local number of the first record this block completed.
     pub first_record: ERoff,
     /// Records it completed. **Zero is ordinary**: a block wholly inside one record
     /// completes nothing (§8.2.4), and it is still part of the answer because its
@@ -655,6 +663,46 @@ impl Piece {
         while !args.is_empty() {
             let (piece, rest) = Piece::of_args(args)?;
             pieces.push(piece);
+            args = rest;
+        }
+        Ok(pieces)
+    }
+}
+
+/// A block returned to a client, with its first record in object coordinates.
+/// Extent-local counts and sizes retain their original types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectPiece {
+    pub logical: ELoff,
+    pub first_record: ORoff,
+    pub records: ERoff,
+    pub crc: u64,
+    pub bytes: Vec<u8>,
+}
+
+impl ObjectPiece {
+    pub fn args(&self) -> Vec<Arg> {
+        let mut payload = StructWriter::new();
+        payload.eloff(self.logical);
+        payload.oroff(self.first_record);
+        payload.eroff(self.records);
+        payload.number_u64(self.crc);
+        payload.bytes(&self.bytes);
+        vec![payload.finish(Op::ObjectPieceResp)]
+    }
+
+    pub fn all_of_args(mut args: &[Arg]) -> Result<Vec<ObjectPiece>> {
+        let mut pieces = Vec::new();
+        while !args.is_empty() {
+            let (mut payload, rest) = structure(args, Op::ObjectPieceResp, "an object piece")?;
+            pieces.push(ObjectPiece {
+                logical: payload.eloff()?,
+                first_record: payload.oroff()?,
+                records: payload.eroff()?,
+                crc: payload.number_u64()?,
+                bytes: payload.bytes()?,
+            });
+            payload.done()?;
             args = rest;
         }
         Ok(pieces)

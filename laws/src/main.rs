@@ -20,7 +20,7 @@ use common::offset::{ELoff, ERoff, ORoff, SCoff, SLoff, SRoff};
 use common::placement::{self, Expansion};
 
 use common::random::Rng;
-use common::range::{Budget, Detail, ObjectCovered, Piece, Range, Start, Want};
+use common::range::{Budget, Detail, ObjectCovered, ObjectPiece as Piece, Range, Start, Want};
 use common::time::TimeSec;
 use common::wire::{Arg, Op, Receipt, Req, Resp, Status, structure};
 use common::{Error, Result};
@@ -1702,7 +1702,7 @@ fn records_of(framing: Framing, pieces: &[Piece]) -> Result<Vec<(u64, Vec<u8>)>>
         let body_len = piece.logical.get() - piece.records.get() * 4;
         let expected = body_len + piece.records.get() * framing.overhead() as u32;
         let block = expand(Compress::Lz4, &piece.bytes, expected as usize)?;
-        if piece.crc != common::crc::of(&block) {
+        if piece.crc != 0 && piece.crc != common::crc::of(&block) {
             return Err(Error::new(format!(
                 "{} bytes came back and do not match the CRC they were written with",
                 block.len()
@@ -1769,11 +1769,8 @@ fn scan(
         if before.is_some_and(|stop| at >= stop) {
             break;
         }
-        let mut payload = common::wire::StructWriter::new();
-        payload.text(path);
-        Expecting::whatever().write(&mut payload);
-        Range { start: Start::Record(at), budget }.write_nested(&mut payload);
-        let request = Req::new(Op::ReadRecord).structure(payload);
+        let request =
+            Range { start: Start::Record(at), budget }.request(path, Expecting::whatever());
         let answer = conn.call(&request)?;
         asked += 1;
         // Running off the end is how a scan of an object whose length it does not
@@ -2225,16 +2222,13 @@ fn build(cmd: &Cmd) -> Result<Req> {
             Req::new(Op::DeleteRecord).structure(payload)
         }
         Cmd::Read { path, at, expect, .. } => {
-            let mut payload = common::wire::StructWriter::new();
-            payload.text(path);
-            expecting(expect)?.write(&mut payload);
             match at.arg() {
                 // A point read is a range of one record (§9.1.3.6): the block
                 // holding it comes back whole either way, and asking this way means
                 // there is one shape on the read path rather than two.
                 Arg::Number(record) => {
                     Range { start: Start::Record(record), budget: Budget::Records(1) }
-                        .write_nested(&mut payload)
+                        .request(path, expecting(expect)?)
                 }
                 // A key, which is a keyed read and unbuilt. Sent as it stands so the
                 // answer says so rather than the client guessing.
@@ -2248,10 +2242,9 @@ fn build(cmd: &Cmd) -> Result<Req> {
                     } else {
                         unreachable!();
                     }
-                    return Ok(Req::new(Op::ReadRecord).structure(payload));
+                    Req::new(Op::ReadRecord).structure(payload)
                 }
             }
-            Req::new(Op::ReadRecord).structure(payload)
         }
 
         // Scan is a loop over range reads rather than one request, so it is driven
@@ -2291,6 +2284,49 @@ fn name(cmd: &Cmd) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn point_and_scan_requests_include_the_record_selector() {
+        let point = build(&Cmd::Read {
+            path: "/x".into(),
+            framing: "lf".into(),
+            expect: None,
+            at: At { record: Some(7), key: None },
+        })
+        .unwrap();
+        let scan = Range { start: Start::Record(7), budget: Budget::Logical(1024) }
+            .request("/x", Expecting::whatever());
+        for request in [point, scan] {
+            let (mut payload, rest) = structure(&request.args, Op::ReadRecord, "read").unwrap();
+            assert!(rest.is_empty());
+            assert_eq!(payload.text().unwrap(), "/x");
+            assert!(!Expecting::read(&mut payload).unwrap().asked());
+            assert_eq!(payload.number_u64().unwrap(), 0);
+            assert_eq!(Range::read_nested(&mut payload).unwrap().start, Start::Record(7));
+            payload.done().unwrap();
+        }
+    }
+
+    #[test]
+    fn compressed_and_unchecksummed_records_are_readable() {
+        let plain = format!("{}\n", "compress me ".repeat(1000)).into_bytes();
+        let (holds, stored, crc) = append_parts(Framing::Lf, &plain).unwrap().remove(0);
+        assert!(stored.len() < plain.len());
+        for checksum in [crc, 0] {
+            let piece = Piece {
+                logical: holds.logical,
+                first_record: ORoff::new(1 << 32),
+                records: holds.records,
+                crc: checksum,
+                bytes: stored.clone(),
+            };
+            let pieces = Piece::all_of_args(&piece.args()).unwrap();
+            assert_eq!(
+                records_of(Framing::Lf, &pieces).unwrap(),
+                vec![(1 << 32, plain[..plain.len() - 1].to_vec())]
+            );
+        }
+    }
 
     /// ⚠️ **The plain request must stay byte-identical to what it was before `--want` existed**,
     /// because §17.5g's 263k/s is the baseline #79 will be measured against. If naming no detail
@@ -2348,14 +2384,14 @@ mod tests {
         let block2 = frame(framing, body2).unwrap();
         let piece1 = Piece {
             logical: ELoff::new(framing.canonical_size(0, &block1).unwrap() as u32),
-            first_record: ERoff::ZERO,
+            first_record: ORoff::ZERO,
             records: ERoff::new(1),
             crc: common::crc::of(&block1),
             bytes: block1.clone(),
         };
         let piece2 = Piece {
             logical: ELoff::new(framing.canonical_size(0, &block2).unwrap() as u32),
-            first_record: ERoff::new(1),
+            first_record: ORoff::new(1),
             records: ERoff::new(1),
             crc: common::crc::of(&block2),
             bytes: block2.clone(),
