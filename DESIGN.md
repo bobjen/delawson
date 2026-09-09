@@ -286,7 +286,7 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | Latency is irrelevant on that path — §1.0.5's *cluster diameter is free, ring diameter is not*, one level out | §7.3.2.8 |
 | Rings have 2n+1 voters but only **3 materialized members** — 3× RAM, not 7× | §5.7 |
 | **Many rings per machine**; rings are a concurrency unit, not a capacity unit | §5.8 |
-| **32-bit node ids**, bounded fan-out ~20,000, local indices in the data plane | §5.10 |
+| **64-bit node ids**, bounded fan-out ~20,000, local indices in the data plane | §5.10 |
 | SNs place on a **disk**, not an EN | §5.3.1 |
 | Failure domains are **nested, never orthogonal**; slack 4/3 | §5.6 |
 | Placement is **free-space-weighted random with rejection** — provably optimal, and self-balancing at any scale | §5.6.3, §5.6.4 |
@@ -736,12 +736,12 @@ across a compact subset and 13 s across the whole.
 | | Elements or nodes | Bits | Where |
 |---|---|---|---|
 | Ship gate | 100,000 nodes | ~10^21 | §1.4.0, issue #26 |
-| Addressable by design | 2^32 = 4.3 × 10^9 nodes | ~7 × 10^25 | §5.10 |
+| Addressable by design | 2^64 = 1.8 × 10^19 nodes | — | §5.10 |
 | **Torus Dyson swarm**, as simulated | 32 rings × 8,192 = **2^18** elements | — | §1.0.5 |
 | The dense core | — | 1.2 × 10^57 | this section |
 
-So DeLawson's addressing tops out about **10^31 short** of the dense core. **Derived.** It is not the design
-that goes there, and saying so plainly is more useful than a hedge — the target is directional.
+So DeLawson's node addressing is no longer the limiting comparison with the dense core. **Derived.** It is
+not the design that goes there, and saying so plainly is more useful than a hedge — the target is directional.
 
 **The intermediate scale is a different story**, and it is the one worth taking seriously — see §1.0.5.
 
@@ -794,9 +794,9 @@ placement would need constant re-verification.
 
 **Two numbers that make this concrete rather than decorative. Derived.**
 
-**The simulated swarm has 2^18 elements, and DeLawson addresses 2^32 nodes.** So unlike the dense core, this
-scale is *inside* the design's addressing — with room for ~16,000 nodes per element before the 32-bit
-identifiers of §5.10 run out. A coincidence of magnitudes rather than a design, but it identifies which of
+**The simulated swarm has 2^18 elements, and DeLawson addresses 2^64 nodes.** So unlike the dense core, this
+scale is well inside the design's addressing — with room for ~16,000 nodes per element before the bounded
+fan-out of §5.10 becomes the constraint. A coincidence of magnitudes rather than a design, but it identifies which of
 the four rows above DeLawson is actually built for.
 
 **A cluster's size is a definition, not a constraint.** You choose the **minimum communication time** you are
@@ -1201,7 +1201,7 @@ Differing, and why:
 
 | | GFS | DeLawson |
 |---|---|---|
-| Metadata scale | **single master** | many DN and SN rings, bounded fan-out, 2^32 nodes (§5.10) |
+| Metadata scale | **single master** | many DN and SN rings, bounded fan-out, 2^64 nodes (§5.10) |
 | Durability | 3 replicas | 4 replicas derived from a 10^-14 target, then erasure coding (§4.3.1) |
 | Consistency | relaxed | 3-of-4 quorum, applied-as-prefix, SCN consistent read (§8.1.1) |
 | Namespace | flat pathname lookup table, no per-directory structure | `(parent dir id, name)`, so directory rename is O(1) (§5.5.4) |
@@ -2724,7 +2724,7 @@ reference-counted targets**, and they behave symmetrically:
 | object → stream | a DN | **4 B** | streams a DN references |
 | stream → extent | an SN | **4 B** | 1.7 × 10^9 extents per SN (§14.1) |
 | extent → instance | an SN, within its fan-out | 6 B | a **disk** within an EN, plus a slot (§5.3.1) |
-| global node id | cluster-wide, control plane | 4 B | 2^32 nodes (§5.10) |
+| global node id | cluster-wide, control plane | 8 B | 2^64 nodes (§5.10) |
 
 Nothing in the data plane carries a cluster-wide name. Every reference is an index
 into a population its holder already knows, sized to that population.
@@ -4342,7 +4342,7 @@ placement, and *neither changes when the cluster grows* — an SN's work depends
 fan-out, not on the fleet. Adding ENs or SNs requires no re-partitioning, no rehashing, and
 no global recomputation.
 
-> **The 2^32 node limit is a consequence of identifier width, not of the algorithm.** The
+> **The 2^64 node limit is a consequence of identifier width, not of the algorithm.** The
 > algorithm itself works arbitrarily large.
 
 And raising that limit is cheap, thanks to the local-reference design of §4.6: global node
@@ -4832,7 +4832,7 @@ is charged automatically rather than administered.
 
 ### 5.10 Node identifiers and bounded fan-out
 
-**DN, SN, and EN identifiers are 32 bits**, so the design scales to 2^32 of each.
+**DN, SN, and EN identifiers are 64 bits**, so the design scales to 2^64 of each.
 
 That immediately rules out a full mesh. There are only 65,536 ports per IP and a
 usable ephemeral range of ~28,000, so a machine can hold on the order of 10^3–10^4
@@ -4912,11 +4912,11 @@ being used where a stable identity is needed. Both want deciding together.
 
 #### 5.10.4 Bounded fan-out means 2-byte references, not 4-byte
 
-The 32-bit identifiers are for **cluster-wide naming** — topology, configuration,
+The 64-bit identifiers are for **cluster-wide naming** — topology, configuration,
 the control plane. They need not appear in per-extent metadata at all.
 
 Because an SN can reach at most ~20,000 ENs, and 2 bytes addresses 65,536, an
-instance's EN can be named by a **neighborhood-local index**. The global 32-bit id
+instance's EN can be named by a **neighborhood-local index**. The global 64-bit id
 appears exactly once, in the SN's fan-out table: 20,000 entries × 4 B = **78 KB**,
 once per table rather than once per reference.
 
@@ -7742,10 +7742,10 @@ for every quantity that has a name.**
 | Candidate | Type today | A mix-up is | Verdict |
 |---|---|---|---|
 | **`ROff`** — a record number or count, beside `LOff` and `COff` | `u64` | **silent**: §9.1.3.6's three measures are records, logical bytes and compressed bytes, and only two of them have types | **yes** |
-| **`ObjectId`, `StreamId`, `ExtentId`** | `u64` | **silent** — see the correction below | **yes** |
+| **`ObjectId`, `StreamId`, `ExtentId`** | `u32` | **silent** — see the correction below | **yes** |
 | **`Second`** (and a day) for key derivation (§7.3.3) | `u64` | **silent and unrecoverable** — a *derived* key looks valid either way, and §7.3.2.4 makes a key you cannot reproduce that day's data gone | **yes** |
 | **entries / bytes** for the answer limit (§9.1.3.7, §16.132) | `u64` | silent while entries are uniform | once the limit exists |
-| `DnId` / `SnId` / `EnId` | `u32` | mixed: loud as an address, silent as a map key | lower |
+| `DnId` / `SnId` / `EnId` / `RangeId` | `u64` | mixed: loud as an address, silent as a map key | lower |
 
 **`ROff` is the cheapest of these and the most obviously missing**, because `common/src/offset.rs`
 already generates `LOff` and `COff` from one macro and §9.1.3.6 names *three* measures. Two have types
@@ -9690,7 +9690,7 @@ the answer says which range of each level it covered, and what to ask for next.
 
 | | |
 |---|---|
-| An extent entry | 3 name fields, 4 instances, 3 ranges and lengths, a flag, a 34-byte capability (§7.2.4) ≈ **~140 B** in the current encoding |
+| An extent entry | 3 name fields, 4 instances, 3 ranges and lengths, a flag, a 34-byte capability (§7.2.4) ≈ **~160 B** in the current encoding |
 | 10,000 of them | **~1.4 MB**, well inside `MAX_SEGMENT_BYTES` (8 MB), so an answer never needs segmenting |
 | §1.4.0's measured batch — 1,000 objects, one stream each | **2,000 entries**, leaving room for objects averaging five entries |
 
@@ -12433,9 +12433,9 @@ anchor, as DN0 already is for the bootstrap root, so nothing new is needed to di
 |---|---|
 | 1 | 20,000 |
 | 2 | 4 × 10^8 |
-| 3 | 8 × 10^12 — beyond the 2^32 node limit of §5.10 |
+| 3 | 8 × 10^12 — still below the 2^64 node limit of §5.10 |
 
-So two levels covers any realistic cluster and three covers the design limit. Each level adds a round trip, but
+So two levels covers any realistic cluster and four covers the design limit. Each level adds a round trip, but
 reporting is periodic rather than per-repair and grants change slowly (§13.4.3.4), so the depth costs nothing.
 
 #### 13.4.4.3 Two consequences to settle before it is built
@@ -16908,9 +16908,9 @@ new `Placed { extent, first }` is what anything answering *about an extent in a 
 entries. A stream with millions would want a sparse checkpoint every *k* extents, one `u64` per
 *k* rather than per extent (#107).
 
-### 17.29.2 `u32` ids are safe because the id was never the name
+### 17.29.2 `ExtentId` remains `u32` because the id was never the name
 
-An extent is `(SN, id, second)` (§4.6.3), so an id only has to be unique among the extents **one
+An extent is `(SN, id, second)` (§4.6.3), so the 32-bit `ExtentId` only has to be unique among the extents **one
 SN makes in one second**. 4.3 × 10^9 is not close to that, and the monotonic counter would need
 to wrap inside a single second to alias anything.
 
@@ -17176,11 +17176,12 @@ position that arrives with the thing it describes cannot be passed by accident.
 **Measured on the real thing**: an object over two streams reports stream 2 *"from record 202"* —
 computed, not stored — and reads at 199, 201, 202, 250 and 349 all land on the right record.
 
-### 17.33.2 `(RangeId, StreamId, CreateSec)`, which is what makes 32 bits safe
+### 17.33.2 `(RangeId, StreamId, CreateSec)`, which scopes the 32-bit `StreamId`
 
-⚠️ **The id was `u64` and DN-scoped, and narrowing it looked unsafe.** §13.1.3's large-object row is
-10^12 streams on one DN — 233× past `u32` — and unlike an extent id there was no second in the name,
-so an id could never be reused and the cap was on streams *ever created*.
+⚠️ **The earlier id was `u64` and DN-scoped, and narrowing it looked unsafe.** §13.1.3's large-object row is
+10^12 streams on one DN — 233× past `u32` — and the earlier name had no creation second, so an id
+could never be reused and the cap was on streams *ever created*. The current name includes the
+creation second and scopes the local 32-bit slot to a range and second.
 
 **Bob's answer settles both halves** (Asserted, 2026-08-20): *"it should take (RangeId, StreamId,
 CreateSec) to be a stable reference to a stream."*
@@ -17195,25 +17196,26 @@ when an object was made (§17.25.1) — and it turns out to be load-bearing for 
 decoration. That is the second time this week a field added for one reason has been the thing that
 made a narrowing safe.
 
-⚠️ **The narrowing bought nothing yet, and the size test says so.** Four `u64` and three `u32` is 44
-bytes, which alignment rounds back to 48. It buys 8 the moment a fourth `u32` joins it — worth
-knowing before anyone claims it as a saving.
+**The current name is 20 bytes:** an 8-byte `RangeId`, a 4-byte `StreamId`, and an 8-byte creation
+second. The wider range is deliberate: ranges and service identities must not inherit a 32-bit
+cluster-wide ceiling, while the stream slot remains a per-range, per-second quantity.
 
-**What is not built is the reference itself** (#109): `RangeId` does not exist, `dn` stands in for it,
-and the SN keys streams by `(dn, stream)` with no second at all.
+**The reference is now represented directly** (#109): `RangeId` is carried in the name and the SN
+keys streams by the whole `(RangeId, StreamId, CreateSec)` name.
 
-## 17.34 A 16-byte triple against a 16-byte GUID
+## 17.34 The historical 16-byte triple against a 16-byte GUID
 
 **Bob, 2026-08-20**: *"Microsoft usually used 16-byte GUIDs for identifiers. I'm using 16-byte
 triples. Mine compress better and are guaranteed not to collide for a few million years."*
 
-**Both names in the store are exactly 16 bytes**, which is the point — the comparison is like for
-like:
+**The original implementation and measurements used 16-byte names.** Current service and range IDs
+are 64-bit, so both names are now 20 bytes; the comparison below is retained as a historical
+measurement:
 
 | | |
 |---|---|
-| an extent | `(SnId, ExtentId, CreateSec)` = 4 + 4 + 8 (§17.29.2) |
-| a stream | `(RangeId, StreamId, CreateSec)` = 4 + 4 + 8 (§17.33.2) |
+| an extent | historical `(SnId, ExtentId, CreateSec)` = 4 + 4 + 8; current = 8 + 4 + 8 (§17.29.2) |
+| a stream | historical `(RangeId, StreamId, CreateSec)` = 4 + 4 + 8; current = 8 + 4 + 8 (§17.33.2) |
 
 ### 17.34.1 Measured: 3× against 1.00×
 
@@ -17235,7 +17237,7 @@ about it. Beside it you still have to keep:
 | the **creating SN** | §7.3.3 derives the extent's key from it — *the creating SN, never the serving one* |
 | the **second** | selects the day's master key (§7.3), and is the extent's age for GC, tiering and repair |
 
-**So the triple is smaller before compression as well as after**: 16 bytes against 28, and **53,403
+**In the historical encoding, the triple was smaller before compression as well as after**: 16 bytes against 28, and **53,403
 against 219,672 — 4.1×** once both are compressed. The identifier is doing the work of three fields
 because it *is* three fields.
 
@@ -17244,13 +17246,13 @@ makes it collide-resistant, and it is exactly what makes it incompressible. **Th
 the same property.**
 
 ⚠️ **And 3× is the floor, not the ceiling.** LZ4 matches repeated byte *sequences*: the SN field
-repeats every 16 bytes and the second barely moves, so both compress — but the id increments, and an
+repeats every 16 bytes in the historical encoding and the second barely moves, so both compress — but the id increments, and an
 incrementing integer has no repeated bytes to find. A **delta** encoder would spend about a bit on
 each id and each second, taking a name to well under a byte and the ratio to around **30×**. A GUID
 has no such headroom, because there is no structure to delta against.
 
 **Which matters here more than it usually would**: §4.7.1 makes a stream's extent list the largest
-thing the store keeps, and the design budgets 4 bytes per reference against a 16-byte name. A delta
+thing the store keeps, and the design budgets 4 bytes per local reference against a 20-byte name. A delta
 encoding over triples is how that budget becomes reachable; over GUIDs it is not reachable at all.
 
 ### 17.34.2 Collision-free by construction, not by probability
@@ -17294,10 +17296,8 @@ What holds the bound is **two buckets**: freed ids go to the open one, and the s
 against an unpunctual drain rather than because one would be too short. Nothing recycles ids yet —
 nothing deletes an extent or a stream — so this is a note for when it does (#110).
 
-⚠️ **What is not yet closed is that the stream name is not enforced** (#109): the SN keys streams by
-`(dn, stream)` with no second at all, so the guarantee above holds for extents and is currently a
-statement of intent for streams. Until it lands, the `u32` stream id rests on a name the code does not
-check.
+**The stream name is enforced** (#109): the SN keys streams by the whole
+`(RangeId, StreamId, CreateSec)` name, so the reuse guarantee applies to streams as well as extents.
 
 ### 17.33.3 The name is enforced now, not merely intended
 
@@ -17318,9 +17318,8 @@ narrower than its guarantee. It is checked now.
 > DN; #75 makes ranges split and move, and then a batch routinely spans them — so the range travels
 > **per entry**.
 
-⚠️ **`RangeId` still does not exist**: `routing::range_of_dn` is the identity function, the same
-placeholder shape as `placement::en_of` (§17.29.3). What has changed is that there is now exactly one
-function to replace, and every tier already carries the field.
+`routing::range_of_dn` remains a placeholder identity function, the same shape as
+`placement::en_of` (§17.29.3), but `RangeId` itself now exists and every tier carries the field.
 
 #### 17.33.4 Four tests were asserting positions, and the shape moved under them
 
@@ -17504,13 +17503,14 @@ was silent.
 > reader being told a lie about it. That is the same trade §9.1.3.5 makes for a stale certificate, and
 > the same one an `ETag` makes over HTTP.
 
-## 17.37 Seven kinds of identity, and none of them a bare integer
+## 17.37 Eight kinds of identity, and none of them a bare integer
 
 **Bob, 2026-08-20**, on a `held.id as u64` in the DN: *"DnId, RangeId, ObjectId, SnId, EnId,
-ExtentId should all be u32, and they should all be explicit types as well. Any raw u32 or u64,
-especially u64, is suspicious."*
+ExtentId should all be explicit types."* The later scaling decision widened the service and range
+IDs to `u64`; `ObjectId`, `StreamId`, and `ExtentId` remain `u32` because their scopes bound their
+live populations.
 
-**Seven, with `StreamId` and `DiskId`** — the two the list implies. §8.1.6 made this argument for
+**Eight, with `StreamId` and `DiskId`** — the two the list implies. §8.1.6 made this argument for
 byte offsets and §17.32 for record offsets; identity was the largest remaining population of bare
 integers, and the largest one where a wrong value is *another real thing* rather than a wrong place
 in the right thing.
@@ -17520,10 +17520,10 @@ to sit in a wire row; the row holds a `StreamId` now.
 
 ### 17.37.1 Why 32 bits is a decision and not an economy
 
-Every one is part of a 16-byte triple whose third component is a creation second (§17.34), so an id
-has only to be unique among what **one minter makes in one second**. A 64-bit id would be eight
-bytes buying a range nothing can reach — and #110's reuse gate, not the width, is what actually
-keeps them apart.
+The extent and stream names are now 20-byte triples because their service/range component is 64-bit
+and their local object component is 32-bit (§17.34). The local component only has to be unique among
+what **one minter makes in one second**; the 64-bit service/range component provides the cluster-wide
+and range-wide namespace without imposing a 32-bit ceiling.
 
 ### 17.37.2 ⚠️ Zero was tried as the sentinel and the top is better
 
@@ -17568,8 +17568,8 @@ ids it is a choice.
 
 ⚠️ **`placement::en_of` now reads `DiskId -> EnId`**, so the placeholder identity function says in
 its own signature that it converts between two different things (§17.29.3). It was
-`fn en_of(u32) -> u32`, which is indistinguishable from doing nothing — and doing nothing is
-precisely what it must stop doing when #108 lands.
+`fn en_of(u32) -> u32`, which is indistinguishable from doing nothing; the explicit types remain
+important now that `EnId` is 64-bit.
 
 ### 17.37.6 Re-measured: the typing cost 13.6% on the batch path
 
@@ -17652,7 +17652,7 @@ differ accordingly — **a stale hint costs a re-descent; a mismatched identity 
 ### 17.38.2 The three regimes are one mechanism with two degenerate ends
 
 Bob's three storage strategies, priced against §17.35.4's measured path lengths (43 B typical), a
-16-byte triple and an 8-byte record number:
+20-byte triple and an 8-byte record number:
 
 | | per entry | when |
 |---|---|---|
