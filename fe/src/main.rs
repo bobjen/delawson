@@ -511,7 +511,7 @@ impl FE {
         // own object under that name with its own stream, and the SN saw one stream key per
         // DN. Appends reported success and landed in three unrelated streams (§17.30).
         let dn = match process.owner(ServiceKind::Dn, path) {
-            Ok(dn) => dn.to_string(),
+            Ok(dn) => dn,
             Err(e) => return reply.send(Resp::error(Status::Internal, e.to_string())),
         };
 
@@ -521,7 +521,7 @@ impl FE {
         // ⚠️ The expectation goes to the **DN**, because the DN owns the path table and is the
         // only tier that can see the path point somewhere new (§17.36).
         let ask = object_lookup(&path, record, expect);
-        let named = dn.clone();
+        let named = dn.to_string();
         let asked = process.ask(&dn, &ask, move |answer| {
             // An append may make the object it is appending to, which is one more
             // hop and only on the first append.
@@ -805,7 +805,7 @@ impl FE {
         let ask = Req::new(Op::ExtendObject).structure(payload);
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
-        let named = dn.clone();
+        let named = dn.to_string();
         let asked = process.ask(&dn, &ask, move |answer| {
             if answer.status != Status::Ok {
                 return reply.send(answer);
@@ -1771,7 +1771,7 @@ impl FE {
     /// Forward a request whole to the DN that should answer it.
     fn onward(&self, process: &Arc<Process>, request: &Req, mut reply: Reply) {
         let dn = match self.destination(process, request) {
-            Ok(dn) => dn.to_string(),
+            Ok(dn) => dn,
             Err(e) => return reply.send(Resp::error(Status::Internal, e.to_string())),
         };
         // Which DN it went to belongs on the line, since that is the hop a live-site
@@ -1788,15 +1788,15 @@ impl FE {
     /// ⚠️ **By name, not in turn.** A name has an owner, and taking DNs in turn means a
     /// create lands on one machine and the lookup that follows it asks another — which with
     /// one DN is invisible and with two loses half the objects.
-    fn destination<'a>(&self, process: &'a Process, request: &Req) -> Result<&'a str> {
+    fn destination(&self, process: &Process, request: &Req) -> Result<String> {
         match request.op {
             Op::CreateObject | Op::ObjectInfo | Op::BatchInfo | Op::ConcatObjects => {
-                process.owner(ServiceKind::Dn, &first(request))
+                process.owner(ServiceKind::Dn, &first(request)).map(str::to_string)
             }
             // A batch create reaching here is one DN's worth: `FE::create` has already
             // grouped by owner, or there was nothing to group (#98). Either way the name to
             // route by is the first one.
-            Op::BatchCreate => process.owner(ServiceKind::Dn, &first(request)),
+            Op::BatchCreate => process.owner(ServiceKind::Dn, &first(request)).map(str::to_string),
             _ => process.pick(ServiceKind::Dn),
         }
     }

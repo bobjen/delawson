@@ -53,11 +53,12 @@ use crate::wire::{
 use crate::{Context, Error, Result};
 use crate::{logd, logi, logn, logsec, logw};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 pub const READY_FILE: &str = "ready";
@@ -77,6 +78,7 @@ pub struct Process {
     pub started: Instant,
     /// Connections to the other processes this one talks to.
     pub(crate) peers: Peers,
+    pub(crate) assigned: RwLock<HashMap<String, SocketAddr>>,
     /// Where round-robin over a kind has got to.
     pub(crate) turn: AtomicU64,
     pub(crate) stopping: AtomicBool,
@@ -190,6 +192,7 @@ impl Process {
         );
         Ok(Process {
             peers,
+            assigned: RwLock::new(HashMap::new()),
             turn: AtomicU64::new(0),
             config,
             cluster,
@@ -212,6 +215,9 @@ impl Process {
 
     /// Where a peer is, which only KS knows.
     pub fn peer(&self, identity: &str) -> Result<SocketAddr> {
+        if let Some(address) = self.assigned.read().expect("assigned peers").get(identity) {
+            return Ok(*address);
+        }
         if let Some(address) = self.cluster.fixed_address(identity) {
             return Ok(address);
         }
@@ -232,6 +238,10 @@ impl Process {
             },
             status => Err(Error::new(format!("KS answered {status} for {identity}"))),
         }
+    }
+
+    pub fn assign_peer(&self, identity: String, address: SocketAddr) {
+        self.assigned.write().expect("assigned peers").insert(identity, address);
     }
 
     /// Ask another process something and say what to do with the answer, holding
@@ -266,14 +276,40 @@ impl Process {
     /// **There is no escape hatch.** One existed for `batch-create` while it still sent
     /// every name to one DN; #98 grouped them by owner, so the hatch went with the debt it
     /// was holding open.
-    pub fn pick(&self, kind: ServiceKind) -> Result<&str> {
+    pub fn pick(&self, kind: ServiceKind) -> Result<String> {
         pickable(kind)?;
-        let of_kind: Vec<&ServiceEntry> = self.cluster.services_of_kind(kind).collect();
+        let assigned: Vec<String> = self
+            .assigned
+            .read()
+            .expect("assigned peers")
+            .keys()
+            .filter(|identity| {
+                self.cluster.service(identity).is_some_and(|entry| entry.kind == kind)
+            })
+            .cloned()
+            .collect();
+        let of_kind: Vec<&str> = if assigned.is_empty() {
+            self.cluster.services_of_kind(kind).map(|entry| entry.identity.as_str()).collect()
+        } else {
+            assigned.iter().map(String::as_str).collect()
+        };
         if of_kind.is_empty() {
             return Err(Error::new(format!("no {} in the roster", kind.as_str().to_uppercase())));
         }
         let turn = self.turn.fetch_add(1, Ordering::Relaxed) as usize;
-        Ok(&of_kind[turn % of_kind.len()].identity)
+        Ok(of_kind[turn % of_kind.len()].to_string())
+    }
+
+    pub fn assigned_of_kind(&self, kind: ServiceKind) -> Vec<String> {
+        self.assigned
+            .read()
+            .expect("assigned peers")
+            .keys()
+            .filter(|identity| {
+                self.cluster.service(identity).is_some_and(|entry| entry.kind == kind)
+            })
+            .cloned()
+            .collect()
     }
 
     /// The process of a kind that owns a name. ⚠️ **Not `pick`** — a name has an owner,
@@ -760,6 +796,9 @@ fn answer_here<S: Service>(
         Op::Status => reply.send(Resp::text(status(process, &**service))),
         Op::Shutdown => reply.send(Resp::ok()),
         Op::LogHistogram | Op::LogGrep | Op::LogLines => reply.send(read_logs(process, &request)),
+        Op::AssignPeers if process.entry.kind != ServiceKind::Ks => {
+            reply.send(assign_peers(process, &request))
+        }
         Op::Sites => reply.send(Resp::text(
             crate::log::histogram()
                 .iter()
@@ -777,6 +816,58 @@ fn answer_here<S: Service>(
         logn!("shutdown requested");
         process.stop_soon();
     }
+}
+
+fn assign_peers(process: &Process, request: &Req) -> Resp {
+    let (mut payload, rest) =
+        match structure(&request.args, Op::AssignPeers, "an assign-peers request") {
+            Ok(value) => value,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+    let source = match payload.text() {
+        Ok(value) => value,
+        Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+    };
+    if source != process.identity() {
+        return Resp::error(
+            Status::BadRequest,
+            format!("assignment for {source} reached {}", process.identity()),
+        );
+    }
+    let count = match payload.number_u64() {
+        Ok(value) => value,
+        Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+    };
+    for n in 0..count {
+        let identity = match payload.text() {
+            Ok(value) => value,
+            Err(e) => {
+                return Resp::error(
+                    Status::BadRequest,
+                    format!("got through {n} destinations: {e}"),
+                );
+            }
+        };
+        let address = match payload.text().and_then(|text| {
+            text.parse().map_err(|_| Error::new(format!("invalid address for {identity}")))
+        }) {
+            Ok(value) => value,
+            Err(e) => {
+                return Resp::error(
+                    Status::BadRequest,
+                    format!("got through {n} destinations: {e}"),
+                );
+            }
+        };
+        process.assign_peer(identity, address);
+    }
+    if !rest.is_empty() || payload.done().is_err() {
+        return Resp::error(
+            Status::BadRequest,
+            format!("got through {count} destinations, then found trailing data"),
+        );
+    }
+    Resp::text(format!("{} got through {count} destinations", process.identity()))
 }
 
 /// Answer one of the three questions about this process's own log files. It runs

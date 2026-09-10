@@ -191,6 +191,7 @@ pub fn process() -> Arc<Process> {
         run_dir: ".".into(),
         started: std::time::Instant::now(),
         peers: crate::peer::Peers::new(messaging(), std::time::Duration::from_secs(1)),
+        assigned: std::sync::RwLock::new(std::collections::HashMap::new()),
         turn: std::sync::atomic::AtomicU64::new(0),
         stopping: std::sync::atomic::AtomicBool::new(false),
         answered: std::sync::atomic::AtomicU64::new(0),

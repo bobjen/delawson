@@ -171,6 +171,8 @@ enum Cmd {
     Services,
     /// Every process KS knows about, with the port it registered.
     Registry,
+    /// Tell one source process which destination processes it may contact.
+    AssignPeers { source: String, destinations: Vec<String> },
     /// What a process logs, by site, busiest first: the live counters.
     Sites,
     /// A histogram of a process's log files: a row per place in the code that said
@@ -574,6 +576,20 @@ fn run(cli: Cli) -> Result<()> {
             if response.args.is_empty() {
                 println!("{} nothing has registered", target.identity);
             }
+            report(&target, &response)
+        }
+        Cmd::AssignPeers { source, destinations } => {
+            let target = resolve(&cluster, &cli, ServiceKind::Ks)?;
+            let mut payload = common::wire::StructWriter::new();
+            payload.text(source);
+            payload.number_u64(destinations.len() as u64);
+            for identity in destinations {
+                let address = lookup(&cluster, identity)?;
+                payload.text(identity);
+                payload.text(&address.to_string());
+            }
+            let response = open(&target, timeout, &cluster.messaging)?
+                .call(&Req::new(Op::AssignPeers).structure(payload))?;
             report(&target, &response)
         }
         Cmd::Bootstrap => {
@@ -1918,9 +1934,11 @@ fn serves(cmd: &Cmd) -> ServiceKind {
     match cmd {
         // Any process can be asked about its own logs; without --to, ask KS.
         Cmd::LogHistogram { .. } | Cmd::LogGrep { .. } | Cmd::LogLines { .. } => ServiceKind::Ks,
-        Cmd::Unlock | Cmd::SnMasterKey { .. } | Cmd::RotateMasterKey | Cmd::Registry => {
-            ServiceKind::Ks
-        }
+        Cmd::Unlock
+        | Cmd::SnMasterKey { .. }
+        | Cmd::RotateMasterKey
+        | Cmd::Registry
+        | Cmd::AssignPeers { .. } => ServiceKind::Ks,
         _ => ServiceKind::Fe,
     }
 }

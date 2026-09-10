@@ -290,7 +290,7 @@ struct SN {
     /// SN, not an argument to its methods.
     mine: SnId,
     /// All disks across all ENs that this SN can see.
-    disks: Vec<(EnId, DiskId)>,
+    disks: Mutex<Vec<(EnId, DiskId)>>,
     /// ⚠️ **Keyed by the whole name**, `(RangeId, StreamId, CreateSec)`, and not by the id
     /// alone (#109). That is what makes the id safe at 32 bits and what makes recycling one
     /// safe at all: a re-minted id in a later second is a different key, so the old stream is
@@ -356,12 +356,21 @@ impl Service for SN {
 }
 
 impl SN {
+    fn disk_at(&self, id: SnDiskId) -> (EnId, DiskId) {
+        self.disks.lock().expect("disks")[id.get() as usize]
+    }
+
+    fn extent_args(&self, extent: &Extent, first: SRoff) -> Vec<Arg> {
+        let disks = self.disks.lock().expect("disks");
+        extent.args(first, &disks)
+    }
+
     fn new(config: SNConfig, per_stream: usize, mine: SnId, disks: Vec<(EnId, DiskId)>) -> SN {
         SN {
             config,
             per_stream,
             mine,
-            disks,
+            disks: Mutex::new(disks),
             shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
             naming: Naming::new(),
             streams: AtomicU64::new(0),
@@ -599,11 +608,24 @@ impl SN {
             Ok(name) => name,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
+        let assigned = process.assigned_of_kind(ServiceKind::En);
+        if !assigned.is_empty() {
+            let mut disks = self.disks.lock().expect("disks");
+            disks.clear();
+            for identity in assigned {
+                let en = EnId::new(
+                    process.cluster.service(&identity).map(|entry| entry.number()).unwrap_or(0),
+                );
+                for disk in 0..5 {
+                    disks.push((en, DiskId::new(disk)));
+                }
+            }
+        }
         match self.open(name, TimeSec::now(), process.cluster.extents.instances) {
             Ok(placed) => Resp {
                 id: 0,
                 status: Status::Ok,
-                args: placed.extent.args(placed.first, &self.disks),
+                args: self.extent_args(&placed.extent, placed.first),
             },
             Err(Full { records, why: None }) => Resp::number(Status::Sealed, records.number()),
             Err(Full { why: Some(why), .. }) => Resp::error(Status::Internal, why.to_string()),
@@ -645,7 +667,7 @@ impl SN {
             return Resp {
                 id: 0,
                 status: Status::Ok,
-                args: sealed.extent.args(first, &self.disks),
+                args: self.extent_args(&sealed.extent, first),
             };
         }
         match &held.open {
@@ -655,7 +677,7 @@ impl SN {
             Some(extent) if record >= held.sealed_records => Resp {
                 id: 0,
                 status: Status::Ok,
-                args: extent.args(held.sealed_records, &self.disks),
+                args: self.extent_args(extent, held.sealed_records),
             },
             Some(_) | None => Resp::error(
                 Status::NotFound,
@@ -746,12 +768,7 @@ impl SN {
                 logical: sealed.logical,
                 length: sealed.compressed,
                 disks: if instances {
-                    sealed
-                        .extent
-                        .disks
-                        .iter()
-                        .map(|sn_disk| self.disks[sn_disk.get() as usize])
-                        .collect()
+                    sealed.extent.disks.iter().map(|sn_disk| self.disk_at(*sn_disk)).collect()
                 } else {
                     Vec::new()
                 },
@@ -775,7 +792,7 @@ impl SN {
                 logical: ELoff::NONE,
                 length: ECoff::NONE,
                 disks: if instances {
-                    open.disks.iter().map(|sn_disk| self.disks[sn_disk.get() as usize]).collect()
+                    open.disks.iter().map(|sn_disk| self.disk_at(*sn_disk)).collect()
                 } else {
                     Vec::new()
                 },
@@ -859,7 +876,7 @@ impl SN {
             Ok(placed) => Resp {
                 id: 0,
                 status: Status::Ok,
-                args: placed.extent.args(placed.first, &self.disks),
+                args: self.extent_args(&placed.extent, placed.first),
             },
             // The stream is full, which is the DN's business: it says what the
             // stream came to so the object's next stream can carry on from there.
@@ -1003,7 +1020,7 @@ impl SN {
             id,
             created,
             records: ERoff::ZERO,
-            disks: self.naming.disks(self.disks.len(), instances)?,
+            disks: self.naming.disks(self.disks.lock().expect("disks").len(), instances)?,
         };
         held.open = Some(extent.clone());
         self.extents.fetch_add(1, Ordering::Relaxed);
@@ -1013,18 +1030,11 @@ impl SN {
 
 fn main() {
     let result = server::main(|process| {
-        let mut disks = Vec::new();
-        for en in process.cluster.services_of_kind(ServiceKind::En) {
-            let en_id = EnId::new(en.number());
-            for d in 0..5 {
-                disks.push((en_id, DiskId::new(d)));
-            }
-        }
         Ok(SN::new(
             SNConfig::load(&process.config.service_config)?,
             process.cluster.extents.per_stream,
             SnId::new(process.entry.number()),
-            disks,
+            Vec::new(),
         ))
     });
     if let Err(e) = result {
@@ -1442,7 +1452,7 @@ mod tests {
 
         // And the answer on the wire says so, which is the argument that was wrong: third
         // field is the first record, fourth is the count.
-        let answer = next.extent.args(next.first, &sn.disks);
+        let answer = sn.extent_args(&next.extent, next.first);
         let (mut payload, rest) = structure(&answer, Op::ExtentResp, "an extent").unwrap();
         assert!(rest.is_empty());
         let _id = payload.extent_id().unwrap();

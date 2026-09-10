@@ -216,6 +216,7 @@ ops! {
     SealStream = 71, "seal-stream";
     SealObject = 72, "seal-object";
     ObjectPieceResp = 73, "object-piece-response";
+    AssignPeers = 74, "assign-peers";
 }
 
 impl std::fmt::Display for Op {

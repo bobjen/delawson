@@ -51,8 +51,15 @@ struct Ks {
     master_keys: RwLock<Vec<MasterEpoch>>,
 }
 
-const SERVES: &[Op] =
-    &[Op::Register, Op::Lookup, Op::Registry, Op::Unlock, Op::SnMasterKey, Op::RotateMasterKey];
+const SERVES: &[Op] = &[
+    Op::Register,
+    Op::Lookup,
+    Op::Registry,
+    Op::AssignPeers,
+    Op::Unlock,
+    Op::SnMasterKey,
+    Op::RotateMasterKey,
+];
 
 impl Service for Ks {
     fn serves(&self) -> &'static [Op] {
@@ -67,6 +74,7 @@ impl Service for Ks {
         match request.op {
             Op::Register => self.enroll(process, request),
             Op::Lookup => self.lookup(request),
+            Op::AssignPeers => self.assign_peers(process, request),
             Op::Registry => registry::response(self.peers.lock().expect("peers").values().cloned()),
 
             Op::SnMasterKey => {
@@ -236,6 +244,72 @@ impl Ks {
         logn!("registered a peer", "identity {},at {}", peer.identity, peer.address);
         self.peers.lock().expect("peers").insert(peer.identity.clone(), peer);
         Resp::ok()
+    }
+
+    fn assign_peers(&self, process: &Process, request: &Req) -> Resp {
+        let (mut payload, rest) =
+            match structure(&request.args, Op::AssignPeers, "an assign-peers request") {
+                Ok(value) => value,
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+            };
+        let source = match payload.text() {
+            Ok(value) => value,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        let Some(source_peer) = self.peers.lock().expect("peers").get(&source).cloned() else {
+            return Resp::error(Status::NotFound, format!("{source} has not registered"));
+        };
+        let count = match payload.number_u64() {
+            Ok(value) => value,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        let mut forwarded = common::wire::StructWriter::new();
+        forwarded.text(&source);
+        forwarded.number_u64(count);
+        for n in 0..count {
+            let identity = match payload.text() {
+                Ok(value) => value,
+                Err(e) => {
+                    return Resp::error(
+                        Status::BadRequest,
+                        format!("got through {n} destinations: {e}"),
+                    );
+                }
+            };
+            let address = match payload.text() {
+                Ok(value) => value,
+                Err(e) => {
+                    return Resp::error(
+                        Status::BadRequest,
+                        format!("got through {n} destinations: {e}"),
+                    );
+                }
+            };
+            if self.peers.lock().expect("peers").get(&identity).is_none() {
+                return Resp::error(Status::NotFound, format!("{identity} has not registered"));
+            }
+            if address.parse::<std::net::SocketAddr>().is_err() {
+                return Resp::error(Status::BadRequest, format!("invalid address for {identity}"));
+            }
+            forwarded.text(&identity);
+            forwarded.text(&address);
+        }
+        if !rest.is_empty() || payload.done().is_err() {
+            return Resp::error(
+                Status::BadRequest,
+                format!("got through {count} destinations, then found trailing data"),
+            );
+        }
+        let request = Req::new(Op::AssignPeers).structure(forwarded);
+        match server::ask(
+            source_peer.address,
+            &request,
+            process.timeout(),
+            &process.cluster.messaging,
+        ) {
+            Ok(response) => response,
+            Err(e) => Resp::error(Status::Internal, format!("could not relay to {source}: {e}")),
+        }
     }
 
     fn lookup(&self, request: &Req) -> Resp {
