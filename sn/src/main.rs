@@ -14,6 +14,7 @@
 //! to cope with reuse — an index that has to survive churn is a later problem.
 
 use common::config::{SNConfig, ServiceKind};
+use common::deletion::{Extras, Flags};
 use common::ids::{DiskId, EnId, ExtentId, RangeId, SnDiskId, SnId, StreamId};
 use common::info::{ExtentRow, ExtentRun, Listing, StreamName, Totals};
 use common::offset::{ECoff, ELoff, ERoff, SCoff, SLoff, SRoff};
@@ -27,6 +28,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 const SERVES: &[Op] = &[
+    Op::SoftDeleteStream,
+    Op::DeleteStream,
     Op::CreateStream,
     Op::ConcatStreams,
     Op::SealStream,
@@ -50,6 +53,8 @@ fn stream_name(payload: &mut StructReader<'_>) -> common::Result<StreamName> {
 
 #[derive(Clone)]
 struct Stream {
+    #[allow(dead_code)]
+    deletion: Flags,
     /// When it was made. Nothing reads it yet; whether a stream needs a creation
     /// timestamp of its own at all is an open question.
     #[allow(dead_code)]
@@ -120,6 +125,8 @@ impl Stream {
 /// was wrong for every other (§17.29.1).
 #[derive(Debug)]
 struct Extent {
+    #[allow(dead_code)]
+    deletion: Flags,
     references: AtomicU32,
     data: ExtentData,
 }
@@ -300,6 +307,11 @@ struct SN {
     shards: Vec<Mutex<HashMap<StreamName, Stream>>>,
     /// Lock stream shards before this table. IDs are stable vector indexes.
     extent_table: RwLock<Vec<Extent>>,
+    // Lock owner before its sparse extras.
+    #[allow(dead_code)]
+    stream_extras: Mutex<Extras<StreamName>>,
+    #[allow(dead_code)]
+    extent_extras: Mutex<Extras<(ExtentId, TimeSec)>>,
     naming: Naming,
     streams: AtomicU64,
     extents: AtomicU64,
@@ -336,6 +348,11 @@ impl Service for SN {
 
     fn answer(&self, process: &Process, request: &Req) -> Resp {
         match request.op {
+            Op::SoftDeleteStream | Op::DeleteStream => common::deletion::Delete::stub(
+                request,
+                "SN stream",
+                process.cluster.max_soft_delete_retention_secs,
+            ),
             Op::CreateStream => self.create(request),
             Op::ConcatStreams => self.concat_streams(request),
             Op::SealStream => self.seal_stream(request),
@@ -376,6 +393,8 @@ impl SN {
             disks: Mutex::new(disks),
             shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
             extent_table: RwLock::new(Vec::new()),
+            stream_extras: Mutex::new(Extras::default()),
+            extent_extras: Mutex::new(Extras::default()),
             naming: Naming::new(),
             streams: AtomicU64::new(0),
             extents: AtomicU64::new(0),
@@ -433,6 +452,7 @@ impl SN {
             shard.insert(
                 name,
                 Stream {
+                    deletion: Flags::default(),
                     created,
                     creator: self.mine,
                     sealed: Vec::new(),
@@ -575,6 +595,7 @@ impl SN {
             return Resp::error(Status::NotFound, format!("no {destination}"));
         }
         let destination_stream = shard.entry(destination).or_insert_with(|| Stream {
+            deletion: Flags::default(),
             created: destination.created,
             creator: self.mine,
             sealed: Vec::new(),
@@ -1051,7 +1072,11 @@ impl SN {
             compressed: ECoff::ZERO,
             disks,
         };
-        extents.push(Extent { references: AtomicU32::new(1), data: extent.clone() });
+        extents.push(Extent {
+            deletion: Flags::default(),
+            references: AtomicU32::new(1),
+            data: extent.clone(),
+        });
         held.open = Some(id);
         self.extents.fetch_add(1, Ordering::Relaxed);
         Ok(Placed { extent, first })
@@ -1113,6 +1138,7 @@ mod tests {
     fn extent_rows_keep_extent_measures_while_stream_totals_widen() {
         let sn = SN::new(testing::sn_config(), 10, SnId::FIRST, Vec::new());
         sn.extent_table.write().unwrap().push(Extent {
+            deletion: Flags::default(),
             references: AtomicU32::new(2),
             data: ExtentData {
                 id: ExtentId::FIRST,
@@ -1125,6 +1151,7 @@ mod tests {
         });
         let extent = ExtentId::FIRST;
         let stream = Stream {
+            deletion: Flags::default(),
             created: TimeSec::new(100),
             creator: SnId::FIRST,
             sealed: vec![extent.clone(), extent],
@@ -1150,6 +1177,7 @@ mod tests {
         let sn = SN::new(testing::sn_config(), 10, SnId::FIRST, Vec::new());
         for id in 0..4 {
             sn.extent_table.write().unwrap().push(Extent {
+                deletion: Flags::default(),
                 references: AtomicU32::new(1),
                 data: ExtentData {
                     id: ExtentId::new(id),
@@ -1162,6 +1190,7 @@ mod tests {
             });
         }
         let stream = Stream {
+            deletion: Flags::default(),
             created: TimeSec::new(100),
             creator: SnId::FIRST,
             sealed: vec![ExtentId::new(1), ExtentId::new(2)],

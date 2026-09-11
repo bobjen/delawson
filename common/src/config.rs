@@ -427,6 +427,11 @@ fn nonnegative_seconds<'de, D: serde::Deserializer<'de>>(
 struct ClusterFile {
     schema_version: u32,
     cluster_name: String,
+    #[serde(
+        default = "default_max_soft_delete_retention_secs",
+        deserialize_with = "nonnegative_seconds"
+    )]
+    max_soft_delete_retention_secs: TimeIntSec64,
     ks: KsBootstrap,
     failure_domains: FailureDomains,
     extents: Extents,
@@ -446,6 +451,8 @@ pub struct ClusterConfig {
     /// does not understand rather than misreading it.
     pub schema_version: u32,
     pub cluster_name: String,
+    /// Upper bound enforced independently by FE, DN, SN, and EN.
+    pub max_soft_delete_retention_secs: TimeIntSec64,
     pub ks: KsBootstrap,
     pub failure_domains: FailureDomains,
     pub extents: Extents,
@@ -458,6 +465,10 @@ pub struct ClusterConfig {
 }
 
 pub const SCHEMA_VERSION: u32 = 1;
+
+pub fn default_max_soft_delete_retention_secs() -> TimeIntSec64 {
+    TimeIntSec64::new(30 * 24 * 60 * 60)
+}
 
 impl ServiceEntry {
     /// The number in the identity, which is this process's id among its kind:
@@ -508,6 +519,7 @@ impl ClusterConfig {
         let config = ClusterConfig {
             schema_version: file.schema_version,
             cluster_name: file.cluster_name,
+            max_soft_delete_retention_secs: file.max_soft_delete_retention_secs,
             ks: file.ks,
             failure_domains: file.failure_domains,
             extents: file.extents,
@@ -523,6 +535,7 @@ impl ClusterConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        self.max_soft_delete_retention_secs.to_duration()?;
         if self.schema_version != SCHEMA_VERSION {
             return Err(Error::new(format!(
                 "schema version {}, this build understands {SCHEMA_VERSION}",
@@ -804,6 +817,26 @@ mod expansion_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retention_cap_defaults_to_thirty_days_and_must_be_finite_nonnegative() {
+        let file: ClusterFile = toml::from_str(HEADER).unwrap();
+        assert_eq!(file.max_soft_delete_retention_secs, TimeIntSec64::new(2592000));
+        for value in [0, 10, 2592000] {
+            let file: ClusterFile =
+                toml::from_str(&format!("max_soft_delete_retention_secs = {value}\n{HEADER}"))
+                    .unwrap();
+            assert_eq!(file.max_soft_delete_retention_secs, TimeIntSec64::new(value));
+        }
+        for value in [-1, i64::MIN, i64::MAX - 1, i64::MAX] {
+            assert!(
+                toml::from_str::<ClusterFile>(&format!(
+                    "max_soft_delete_retention_secs = {value}\n{HEADER}"
+                ))
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn configured_intervals_are_finite_and_nonnegative() {

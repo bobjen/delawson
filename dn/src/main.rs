@@ -15,6 +15,7 @@
 //! request to be answered when the SN says the streams exist.
 
 use common::config::{DNConfig, ServiceKind};
+use common::deletion::{Extras, Flags};
 use common::framing::Framing;
 use common::ids::{DnId, ExtentId, ObjectId, RangeId, SnId, StreamId};
 use common::info::{
@@ -44,6 +45,7 @@ const SERVES: &[Op] = &[
     Op::List,
     Op::Stat,
     Op::DeleteObject,
+    Op::SoftDeleteObject,
     Op::UndeleteObject,
     Op::SetExpiry,
     Op::CloneObject,
@@ -230,6 +232,8 @@ impl Levelled {
 }
 
 struct Object {
+    #[allow(dead_code)] // Wired into deletion handlers in the next phase.
+    deletion: Flags,
     /// ⚠️ **`u32`, minted per range**, so an object's name is `(RangeId, ObjectId, CreateSec)` —
     /// the same triple as a stream's and an extent's (§17.35.2). **A path is not part of it**: a
     /// path points at a name and may be repointed as often as a user likes, which is exactly what
@@ -279,6 +283,8 @@ enum Next {
 /// Stored once per range, rather than once per object reference. The reference count
 /// is atomic; ordinary metadata is protected by the range's stream table lock.
 struct Stream {
+    #[allow(dead_code)]
+    deletion: Flags,
     references: AtomicU32,
     /// ⚠️ **`u32`, and safe for the reason an extent id is** (§17.29.2): a stable reference
     /// to a stream is `(RangeId, StreamId, CreateSec)` (Asserted, Bob, 2026-08-20), so the
@@ -351,6 +357,7 @@ impl Stream {
     /// A stream just handed out: nothing has come to anything yet.
     fn new(id: StreamId, sn: SnId, created: TimeSec) -> Stream {
         Stream {
+            deletion: Flags::default(),
             references: AtomicU32::new(1),
             id,
             records: SRoff::NONE,
@@ -736,6 +743,11 @@ struct DN {
     /// The current DN serves one range (`mine`). StreamId indexes this range's table.
     /// Lock an object shard before this table; never hold either across a network call.
     stream_table: RwLock<Vec<Stream>>,
+    // Sparse, range-scoped metadata. Lock owner before extras, never the reverse.
+    #[allow(dead_code)]
+    object_extras: Mutex<Extras<(ObjectId, TimeSec)>>,
+    #[allow(dead_code)]
+    stream_extras: Mutex<Extras<(StreamId, TimeSec)>>,
 }
 
 fn shard_of(name: &str) -> usize {
@@ -794,6 +806,11 @@ impl Service for DN {
 
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
         match request.op {
+            Op::SoftDeleteObject | Op::DeleteObject => reply.send(common::deletion::Delete::stub(
+                &request,
+                "DN object",
+                process.cluster.max_soft_delete_retention_secs,
+            )),
             Op::CreateObject => self.create(process, &request, reply),
             Op::BatchCreate => self.create_many(process, &request, reply),
             Op::ObjectInfo => self.info(process, &request, None, reply),
@@ -1108,6 +1125,7 @@ impl DN {
                 shard.insert(
                     destination.clone().into_boxed_str(),
                     Object {
+                        deletion: Flags::default(),
                         id: ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32),
                         framing: framing.expect("at least two sources"),
                         streams: Vec::new(),
@@ -1183,6 +1201,7 @@ impl DN {
                 return reply.send(Resp::error(Status::BadRequest, e.to_string()));
             }
             let object = Object {
+                deletion: Flags::default(),
                 id: ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32),
                 framing: framing.expect("at least two sources"),
                 streams: copied,
@@ -1286,6 +1305,7 @@ impl DN {
         let mut shard = self.shards[shard_of(name)].lock().expect("objects");
         let Some(object) = shard.get_mut(name) else { return };
         object.streams.push(self.install_stream(Stream {
+            deletion: Flags::default(),
             references: AtomicU32::new(1),
             id: stream,
             records: SRoff::NONE,
@@ -1433,6 +1453,7 @@ impl DN {
                 shard.insert(
                     Box::from(one.name.as_str()),
                     Object {
+                        deletion: Flags::default(),
                         id,
                         framing: one.framing,
                         streams: Vec::new(),
@@ -2178,6 +2199,8 @@ impl DN {
             // arena is a real object, and starting at one would waste it (§17.37.2).
             next_object: AtomicU64::new(0),
             stream_table: RwLock::new(Vec::new()),
+            object_extras: Mutex::new(Extras::default()),
+            stream_extras: Mutex::new(Extras::default()),
         }
     }
 }
@@ -2385,6 +2408,7 @@ mod tests {
             })
             .collect();
         let object = Object {
+            deletion: Flags::default(),
             id: ObjectId::FIRST,
             framing: Framing::Lf,
             extending: false,
@@ -2434,6 +2458,7 @@ mod tests {
         dn.shards[shard_of("/x")].lock().unwrap().insert(
             Box::from("/x"),
             Object {
+                deletion: Flags::default(),
                 id: ObjectId::new(2),
                 framing: Framing::Lf,
                 streams: vec![install(&dn, held(0, 0, None))],
@@ -2478,6 +2503,7 @@ mod tests {
             dn.shards[shard_of("/p")].lock().unwrap().insert(
                 Box::from("/p"),
                 Object {
+                    deletion: Flags::default(),
                     id: ObjectId::new(dn.next_object.fetch_add(1, Ordering::Relaxed) as u32),
                     framing: Framing::Lf,
                     streams: Vec::new(),
@@ -2546,6 +2572,7 @@ mod tests {
         dn.shards[shard_of(name)].lock().unwrap().insert(
             Box::from(name),
             Object {
+                deletion: Flags::default(),
                 id: ObjectId::new(1),
                 framing: Framing::Lf,
                 streams: Vec::new(),
@@ -2606,6 +2633,7 @@ mod tests {
                 shard.insert(
                     Box::from(name.as_str()),
                     Object {
+                        deletion: Flags::default(),
                         id: ObjectId::new(dn.next_object.fetch_add(1, Ordering::Relaxed) as u32),
                         framing: Framing::Lf,
                         streams: Vec::new(),
@@ -2630,6 +2658,7 @@ mod tests {
         let table =
             vec![held(0, 0, Some(0)), held(1, 0, Some(10)), held(2, 0, Some(5)), held(3, 0, None)];
         let mut object = Object {
+            deletion: Flags::default(),
             id: ObjectId::new(1),
             framing: Framing::Lf,
             streams: Vec::new(),
@@ -2659,6 +2688,7 @@ mod tests {
     /// An object with three streams, two sealed and one still growing.
     fn grown() -> Object {
         let mut object = Object {
+            deletion: Flags::default(),
             id: ObjectId::new(1),
             framing: Framing::Lf,
             streams: Vec::new(),
@@ -3115,6 +3145,7 @@ mod tests {
             dn.shards[shard_of(&name)].lock().unwrap().insert(
                 Box::from(name.as_str()),
                 Object {
+                    deletion: Flags::default(),
                     id: ObjectId::new(n as u32 + 1),
                     framing: Framing::Lf,
                     streams: vec![install(&dn, held(n as u32 + 1, 0, None))],

@@ -38,6 +38,7 @@ pub fn cluster() -> ClusterConfig {
     ClusterConfig {
         schema_version: SCHEMA_VERSION,
         cluster_name: "test".to_string(),
+        max_soft_delete_retention_secs: crate::config::default_max_soft_delete_retention_secs(),
         ks: KsBootstrap { address: "127.0.0.1:9601".parse().expect("address"), port_base: 9602 },
         failure_domains: FailureDomains {
             levels: ["region", "datacenter", "rack", "machine", "disk"]

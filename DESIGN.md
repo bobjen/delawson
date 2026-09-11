@@ -18190,3 +18190,58 @@ reference-count changes themselves are atomic. DN reserves vector slots before
 asynchronous stream creation and publishes them to objects on success. Failed
 reservations remain unreferenced; there is no recycling yet. This refactor
 prepares shared ownership for deletion; it does not implement deletion messages.
+
+### 17.45 Deletion metadata and message foundation
+
+Objects and streams at DN, streams and extents at SN, and extent instances at
+EN now carry a one-byte deletion flag set: extra, soft_deleted, and deleted.
+The retention TimeSec is eight bytes in a sparse Extra record, not inline and
+not behind a per-record pointer. DN and SN have sparse side tables keyed by
+full local identity including creation time; EN keeps its table per disk.
+Acquire the owning record/table lock before its extras lock, never the reverse.
+The current DN stream layout remains 56 bytes.
+
+Soft deletion records a deadline computed from the receiving tier's current
+TimeSec and the passed TimeIntSec64. Finite negative intervals are valid.
+MIN means already expired: store the ordinary timestamp one second before now,
+not a reserved TimeSec value. At the epoch itself there is no representable
+earlier timestamp, so that case is refused. MAX, NONE, and finite timestamp
+overflow/underflow are rejected. A repeated
+notification does not reset the established deadline. Hard deletion must be
+rejected unless the record is already soft-deleted and its deadline is
+strictly before now. It cannot be recorded early as a pending hard deletion.
+Physical removal requires the deleted flag as well as expired retention.
+
+A combined soft-delete-and-delete request can give MIN or a negative retention
+interval to establish an already-expired deadline and immediately hard-delete
+a live record. The local combined transition is atomic on failure. It cannot
+shorten an existing soft-delete deadline. Zero retention is not strictly in
+the past within the same second. Reads of soft-deleted records will require
+explicit opt-in; hard-deleted records are not readable.
+
+Deletion messages carry object paths, full stream names, or extent instance
+addresses (EN, disk, SN, ExtentId, creation second). Soft-delete messages add
+signed two's-complement 64-bit seconds and a flag requesting hard deletion in
+the same operation. Hard-delete-only messages do not carry an interval.
+The client exposes soft-delete with required --retention-secs (signed seconds
+or MIN) and optional --delete; delete is hard-delete-only. FE validates and
+routes both by path.
+
+The cluster-wide max_soft_delete_retention_secs setting defaults to 2,592,000
+seconds (30 days). It must be finite and nonnegative; zero permits only zero
+or negative retention, including MIN. FE, DN, SN, and EN independently reject
+requests above their configured cap rather than silently shortening them.
+The metadata soft-delete and combined-transition methods also require a cap
+and check it before mutation, covering local DN stream and SN extent transitions
+when those are wired. A retry cannot extend an established deadline, including
+when the cap is changed. Lowering the cap does not rewrite existing deadlines.
+This bounds the requested retention window; it does not replace the separate
+hard-delete request or implement automatic collection.
+
+This phase implements metadata transitions and message codecs, not distributed
+deletion. DN, SN, and EN handlers validate these requests and return Unimplemented
+with an explicit "I got this far" stage, without changing live metadata.
+Still to wire: reference release and last-reference propagation, read opt-in
+through FE/DN/SN/EN, name lookup of retained objects, and actual removal after
+successful downstream deletion. There is no GC loop or slot recycling.
+The maximum-retention-across-references problem remains tracked in issue #118.

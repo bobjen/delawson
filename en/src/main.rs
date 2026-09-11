@@ -37,7 +37,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-const SERVES: &[Op] = &[Op::AppendExtent, Op::ApplyAppend, Op::ReadExtent, Op::ForceSealExtent];
+const SERVES: &[Op] = &[
+    Op::SoftDeleteExtentInstance,
+    Op::DeleteExtentInstance,
+    Op::AppendExtent,
+    Op::ApplyAppend,
+    Op::ReadExtent,
+    Op::ForceSealExtent,
+];
 
 /// Cached SN keys, addressed by the exact extent creation second. The exact
 /// time matters because KS may install an emergency key epoch mid-day.
@@ -184,6 +191,8 @@ pub const APPEND_OVERHEAD: usize = 44;
 
 /// An extent instance held here.
 struct Extent {
+    #[allow(dead_code)]
+    deletion: common::deletion::Flags,
     sn_id: SnId,
     id: ExtentId,
     created: TimeSec,
@@ -335,6 +344,8 @@ struct Landed {
 
 /// Everything this Disk holds.
 struct Extents {
+    #[allow(dead_code)]
+    extras: common::deletion::Extras<(SnId, ExtentId, TimeSec)>,
     extents: Vec<Extent>,
     at: HashMap<(SnId, ExtentId), usize>,
     appends: Vec<Append>,
@@ -342,7 +353,12 @@ struct Extents {
 
 impl Extents {
     fn new() -> Extents {
-        Extents { extents: Vec::new(), at: HashMap::new(), appends: Vec::new() }
+        Extents {
+            extras: common::deletion::Extras::default(),
+            extents: Vec::new(),
+            at: HashMap::new(),
+            appends: Vec::new(),
+        }
     }
 
     fn place(&mut self, sn: SnId, id: ExtentId, created: TimeSec) -> Result<usize> {
@@ -356,6 +372,7 @@ impl Extents {
             return Ok(*place);
         }
         self.extents.push(Extent {
+            deletion: common::deletion::Flags::default(),
             sn_id: sn,
             id,
             created,
@@ -1091,6 +1108,13 @@ impl Service for EN {
 
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
         match request.op {
+            Op::SoftDeleteExtentInstance | Op::DeleteExtentInstance => {
+                reply.send(common::deletion::Delete::stub(
+                    &request,
+                    "EN extent instance",
+                    process.cluster.max_soft_delete_retention_secs,
+                ))
+            }
             Op::AppendExtent => self.append(process, request, reply),
             Op::ApplyAppend => reply.send(self.apply(process, request)),
             Op::ReadExtent => reply.send(self.read(process, &request)),

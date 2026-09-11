@@ -217,6 +217,11 @@ ops! {
     SealObject = 72, "seal-object";
     ObjectPieceResp = 73, "object-piece-response";
     AssignPeers = 74, "assign-peers";
+    SoftDeleteObject = 75, "soft-delete";
+    SoftDeleteStream = 76, "soft-delete-stream";
+    DeleteStream = 77, "delete-stream";
+    SoftDeleteExtentInstance = 78, "soft-delete-extent-instance";
+    DeleteExtentInstance = 79, "delete-extent-instance";
 }
 
 impl std::fmt::Display for Op {

@@ -32,6 +32,14 @@ use std::time::Duration;
 
 const BENCH_RICH_FLAGS: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4);
 
+fn retention_seconds(value: &str) -> std::result::Result<i64, String> {
+    if value.eq_ignore_ascii_case("min") {
+        Ok(common::time::TimeIntSec64::MIN.get())
+    } else {
+        value.parse().map_err(|_| "expected signed seconds or MIN".into())
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "laws", version, about = "The DeLawson client")]
 struct Cli {
@@ -251,8 +259,17 @@ enum Cmd {
         #[arg(long)]
         expiry: Option<u64>,
     },
-    /// Delete an object, into the soft-delete window.
+    /// Hard-delete an already soft-deleted object whose retention has expired.
     Delete { path: String },
+    /// Soft-delete an object, optionally also hard-deleting it in the same request.
+    SoftDelete {
+        path: String,
+        /// Signed seconds from now, or MIN. Use MIN with --delete for immediate deletion.
+        #[arg(long, allow_hyphen_values = true, value_parser = retention_seconds)]
+        retention_secs: i64,
+        #[arg(long)]
+        delete: bool,
+    },
     /// Recover an object still inside its soft-delete window.
     Undelete { path: String },
     /// Set or clear an object's declared expiry.
@@ -2110,6 +2127,12 @@ fn build(cmd: &Cmd) -> Result<Req> {
             }
             Req::new(Op::CreateObject).structure(payload)
         }
+        Cmd::SoftDelete { path, retention_secs, delete } => common::deletion::Delete {
+            target: common::deletion::Target::Object(path.clone()),
+            retention: Some(common::time::TimeIntSec64::new(*retention_secs)),
+            hard: *delete,
+        }
+        .request()?,
         Cmd::Delete { path } => {
             let mut payload = common::wire::StructWriter::new();
             payload.text(path);
@@ -2305,6 +2328,28 @@ fn name(cmd: &Cmd) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deletion_commands_keep_signed_retention_and_combined_flag() {
+        assert_eq!(retention_seconds("MIN").unwrap(), common::time::TimeIntSec64::MIN.get());
+        assert_eq!(retention_seconds("-1").unwrap(), -1);
+        assert!(retention_seconds("forever").is_err());
+        for (seconds, hard) in [(3, false), (-1, true)] {
+            let request = build(&Cmd::SoftDelete {
+                path: "/x".into(),
+                retention_secs: seconds,
+                delete: hard,
+            })
+            .unwrap();
+            let delete = common::deletion::Delete::of(&request).unwrap();
+            assert_eq!(delete.retention, Some(common::time::TimeIntSec64::new(seconds)));
+            assert_eq!(delete.hard, hard);
+        }
+        let request = build(&Cmd::Delete { path: "/x".into() }).unwrap();
+        let delete = common::deletion::Delete::of(&request).unwrap();
+        assert!(delete.retention.is_none());
+        assert!(delete.hard);
+    }
 
     #[test]
     fn point_and_scan_requests_include_the_record_selector() {

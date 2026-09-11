@@ -51,6 +51,7 @@ const SERVES: &[Op] = &[
     Op::ObjectInfo,
     Op::BatchInfo,
     Op::DeleteObject,
+    Op::SoftDeleteObject,
     Op::UndeleteObject,
     Op::SetExpiry,
     Op::CloneObject,
@@ -68,8 +69,15 @@ const SERVES: &[Op] = &[
 
 /// What a DN can answer on its own. The rest of `SERVES` is here so that a client
 /// sending it is told it is unbuilt rather than misdirected.
-const FORWARDED: &[Op] =
-    &[Op::CreateObject, Op::BatchCreate, Op::ObjectInfo, Op::BatchInfo, Op::ConcatObjects];
+const FORWARDED: &[Op] = &[
+    Op::CreateObject,
+    Op::BatchCreate,
+    Op::ObjectInfo,
+    Op::BatchInfo,
+    Op::ConcatObjects,
+    Op::SoftDeleteObject,
+    Op::DeleteObject,
+];
 
 /// How many sealed extents an append will step over before giving up. More than one
 /// because other writers are filling extents at the same time; bounded because
@@ -268,6 +276,14 @@ impl Service for FE {
 
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
         match request.op {
+            Op::SoftDeleteObject | Op::DeleteObject => {
+                if let Err(error) = common::deletion::Delete::of_with_limit(
+                    &request,
+                    process.cluster.max_soft_delete_retention_secs,
+                ) {
+                    return reply.send(Resp::error(Status::BadRequest, error.to_string()));
+                }
+            }
             Op::AppendRecord => return self.append(process, &request, reply),
             Op::ReadRecord => return self.read(process, &request, reply),
             Op::SealObject => return self.seal_object(process, &request, reply),
@@ -1790,7 +1806,12 @@ impl FE {
     /// one DN is invisible and with two loses half the objects.
     fn destination(&self, process: &Process, request: &Req) -> Result<String> {
         match request.op {
-            Op::CreateObject | Op::ObjectInfo | Op::BatchInfo | Op::ConcatObjects => {
+            Op::SoftDeleteObject
+            | Op::DeleteObject
+            | Op::CreateObject
+            | Op::ObjectInfo
+            | Op::BatchInfo
+            | Op::ConcatObjects => {
                 process.owner(ServiceKind::Dn, &first(request)).map(str::to_string)
             }
             // A batch create reaching here is one DN's worth: `FE::create` has already
@@ -1968,6 +1989,12 @@ fn arrived(
 fn first(request: &Req) -> String {
     match request.args.first() {
         Some(Arg::Text(name)) => name.clone(),
+        Some(Arg::Struct(Op::SoftDeleteObject | Op::DeleteObject, _, _)) => {
+            match common::deletion::Delete::of(request).map(|value| value.target) {
+                Ok(common::deletion::Target::Object(path)) => path,
+                _ => String::new(),
+            }
+        }
         Some(Arg::Struct(Op::ObjectInfo, _bytes, _)) => {
             structure(&request.args, Op::ObjectInfo, "an object-info request")
                 .and_then(|(mut payload, _)| payload.text())
@@ -2015,6 +2042,21 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deletion_requests_are_forwarded_by_object_path() {
+        for retention in [None, Some(common::time::TimeIntSec64::new(-1))] {
+            let request = common::deletion::Delete {
+                target: common::deletion::Target::Object("/not-the-empty-path".into()),
+                retention,
+                hard: true,
+            }
+            .request()
+            .unwrap();
+            assert!(FORWARDED.contains(&request.op));
+            assert_eq!(first(&request), "/not-the-empty-path");
+        }
+    }
 
     #[test]
     fn explicit_sealing_caches_only_the_last_extents_record_count() {

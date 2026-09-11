@@ -5,6 +5,7 @@ pub mod block;
 pub mod config;
 pub mod crc;
 pub mod crypto;
+pub mod deletion;
 pub mod framing;
 pub mod ids;
 pub mod info;
