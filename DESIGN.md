@@ -18314,7 +18314,10 @@ DN Stream and SN Extent no longer carry inline reference counters. Without an
 extra record, their live and retained counts are implicitly one or zero according
 to soft_deleted and deleted respectively. Sharing promotes the record to an extra
 containing two checked AtomicU32 counters; promotion and flag publication occur
-under the table write lock. Returning to one reference keeps the extra. Both base
+under the table write lock. Returning to one live and one retained reference drops
+the extra and clears its flag when max_retention is MIN and no other extra payload
+is needed. A non-MIN retention history must survive even with only one reference.
+Both base
 records now occupy 56 bytes, saving eight bytes in the ordinary case.
 
 The shared extra also holds max_retention, a four-byte TimeIntSec32 initially MIN.
@@ -18330,3 +18333,10 @@ Messages still pass TimeIntSec64. Checked narrowing preserves MIN/MAX/NONE seman
 and rejects finite values outside TimeIntSec32's finite range. Retention validation
 at every layer requires this representability, including for the configured cap;
 the default maximum remains 30 days. No recycling or GC is introduced here.
+
+Extra removal and flag clearing are one operation under the owner/table lock.
+Reference rollback and hard-reference release both check for demotion. Soft-deleted
+records keep their deadline, including while hard-delete fanout is pending; successful
+reclamation drops the extra and clears its flag before removing the owner or leaving
+its tombstone. Future extra payloads, such as more than four SN extent instances, must
+participate in the same needs-extra check. Extra recycling remains separate future work.

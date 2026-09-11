@@ -974,19 +974,19 @@ impl DN {
                 let key = (stream.id, stream.created);
                 assert!(self.stream_extras.lock().unwrap().reclaim(
                     &key,
-                    stream.deletion,
+                    &mut stream.deletion,
                     TimeSec::now()
                 ));
-                stream.deletion.retire(); // Keep only an unrecycled index tombstone.
+                // Keep only an unrecycled index tombstone.
             }
         }
         if deletion.hard {
             let mut shard = self.shards[shard_of(path)].lock().unwrap();
-            let object = shard.get(path.as_str()).expect("deleting object");
+            let object = shard.get_mut(path.as_str()).expect("deleting object");
             let key = (object.id, object.created);
             assert!(self.object_extras.lock().unwrap().reclaim(
                 &key,
-                object.deletion,
+                &mut object.deletion,
                 TimeSec::now()
             ));
             shard.remove(path.as_str());
@@ -2597,6 +2597,9 @@ mod tests {
                 .unwrap()
         );
         assert!(!extras.release_hard(&key, &mut stream.deletion).unwrap());
+        assert!(!stream.deletion.extra());
+        assert!(extras.get(&key).is_none());
+        assert_eq!(extras.counts(&key, stream.deletion), (1, 1));
         assert!(
             extras
                 .release_soft(

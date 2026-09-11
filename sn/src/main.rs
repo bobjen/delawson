@@ -472,20 +472,19 @@ impl SN {
                 let extent = &mut table[id.get() as usize];
                 assert!(self.extent_extras.lock().unwrap().reclaim(
                     &(id, created),
-                    extent.deletion,
+                    &mut extent.deletion,
                     TimeSec::now()
                 ));
                 extent.data.disks = Vec::new();
-                extent.deletion.retire();
                 self.extents.fetch_sub(1, Ordering::Relaxed);
             }
         }
         if deletion.hard {
             let mut shard = self.shards[shard_of(name)].lock().unwrap();
-            let stream = shard.get(&name).unwrap();
+            let stream = shard.get_mut(&name).unwrap();
             assert!(self.stream_extras.lock().unwrap().reclaim(
                 &name,
-                stream.deletion,
+                &mut stream.deletion,
                 TimeSec::now()
             ));
             shard.remove(&name);
@@ -1578,6 +1577,9 @@ mod tests {
         let key = (extent.data.id, extent.data.created);
         assert!(!extras.release(&key, &mut extent.deletion).unwrap());
         assert!(!extras.release(&key, &mut extent.deletion).unwrap());
+        assert!(!extent.deletion.extra());
+        assert!(extras.get(&key).is_none());
+        assert_eq!(extras.counts(&key, extent.deletion), (1, 1));
         assert!(extras.release(&key, &mut extent.deletion).unwrap());
         assert!(extras.release(&key, &mut extent.deletion).is_err());
     }

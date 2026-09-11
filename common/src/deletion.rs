@@ -180,10 +180,6 @@ impl Flags {
     pub fn retired(self) -> bool {
         self.deleted() && !self.extra()
     }
-    pub fn retire(&mut self) {
-        assert!(self.deleted());
-        self.0 &= !Self::EXTRA;
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -306,13 +302,19 @@ impl<K: Eq + Hash, R: Default> Extras<K, R> {
             && flags.extra()
             && self.get(key).is_some_and(|extra| extra.retain_until < now)
     }
-    /// Caller removes the owning record in the same critical section.
-    pub fn reclaim(&mut self, key: &K, flags: Flags, now: TimeSec) -> bool {
-        if !self.reclaimable(key, flags, now) {
+    /// Drop the extra and clear its flag before the owner is removed or recycled.
+    /// Caller holds the owner lock throughout this operation.
+    pub fn reclaim(&mut self, key: &K, flags: &mut Flags, now: TimeSec) -> bool {
+        if !self.reclaimable(key, *flags, now) {
             return false;
         }
-        self.0.remove(key);
+        self.drop_extra(key, flags);
         true
+    }
+
+    fn drop_extra(&mut self, key: &K, flags: &mut Flags) {
+        self.0.remove(key);
+        flags.0 &= !Flags::EXTRA;
     }
 }
 
@@ -373,6 +375,22 @@ impl ReferenceCounts {
 pub type SharedExtras<K> = Extras<K, ReferenceCounts>;
 
 impl<K: Eq + Hash> SharedExtras<K> {
+    /// All current reasons for a live shared record to retain an extra belong here.
+    /// Future extra payloads (such as overflow extent instances) must also veto demotion.
+    /// Caller holds the owner/table write lock, just as for promotion.
+    fn drop_if_unused(&mut self, key: &K, flags: &mut Flags) {
+        if flags.extra()
+            && !flags.soft_deleted()
+            && !flags.deleted()
+            && self.get(key).is_some_and(|extra| {
+                extra.references.counts() == (1, 1)
+                    && extra.references.max_retention == TimeIntSec32::MIN
+            })
+        {
+            self.drop_extra(key, flags);
+        }
+    }
+
     /// No map lookup for the ordinary, implicitly singly referenced record.
     pub fn counts(&self, key: &K, flags: Flags) -> (u32, u32) {
         if !flags.extra() {
@@ -405,6 +423,9 @@ impl<K: Eq + Hash> SharedExtras<K> {
             return Ok(());
         }
         let interval = TimeIntSec32::try_from(retention)?;
+        if interval == TimeIntSec32::MIN && !flags.extra() {
+            return Ok(());
+        }
         let extra = self.0.entry(key).or_default();
         extra.references.max_retention = extra.references.max_retention.max(interval);
         flags.0 |= Flags::EXTRA;
@@ -456,6 +477,7 @@ impl<K: Eq + Hash> SharedExtras<K> {
         if last {
             flags.0 |= Flags::DELETED;
         }
+        self.drop_if_unused(key, flags);
         Ok(last)
     }
 
@@ -475,8 +497,9 @@ impl<K: Eq + Hash> SharedExtras<K> {
         }
         if hard_last {
             flags.0 |= Flags::DELETED;
-            self.0.remove(key);
-            flags.retire();
+            self.drop_extra(key, flags);
+        } else {
+            self.drop_if_unused(key, flags);
         }
         Ok(hard_last)
     }
@@ -570,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_references_preserve_promotion_and_reject_invalid_intervals() {
+    fn sparse_references_demote_and_reject_invalid_intervals() {
         let mut extras = SharedExtras::default();
         let mut flags = Flags::default();
         assert_eq!(extras.counts(&7, Flags::vacant()), (0, 0));
@@ -583,7 +606,8 @@ mod tests {
         assert!(extras.get(&7).is_none());
         extras.retain(7, &mut flags).unwrap();
         assert!(!extras.release(&7, &mut flags).unwrap());
-        assert!(flags.extra());
+        assert!(!flags.extra());
+        assert!(extras.get(&7).is_none());
         assert_eq!(extras.counts(&7, flags), (1, 1));
         assert!(
             extras.release_soft(7, &mut flags, TimeSec::new(10), TimeIntSec64::MIN, CAP).unwrap()
@@ -591,6 +615,47 @@ mod tests {
         assert_eq!(extras.get(&7).unwrap().retain_until, TimeSec::new(9));
         assert_eq!(std::mem::size_of::<ReferenceCounts>(), 12);
         assert_eq!(std::mem::size_of::<Extra<ReferenceCounts>>(), 24);
+    }
+
+    #[test]
+    fn hard_reference_release_demotes_only_without_retention_history() {
+        for retention in [TimeIntSec64::MIN, TimeIntSec64::new(10)] {
+            let mut extras = SharedExtras::default();
+            let mut flags = Flags::default();
+            extras.retain(7, &mut flags).unwrap();
+            assert!(
+                !extras.release_soft(7, &mut flags, TimeSec::new(100), retention, CAP).unwrap()
+            );
+            assert_eq!(extras.counts(&7, flags), (1, 2));
+            assert!(flags.extra());
+            assert!(!extras.release_hard(&7, &mut flags).unwrap());
+            assert_eq!(extras.counts(&7, flags), (1, 1));
+            assert_eq!(flags.extra(), retention != TimeIntSec64::MIN);
+            assert_eq!(extras.get(&7).is_some(), flags.extra());
+            // A retry with MIN must not recreate an unnecessary extra.
+            extras.observe_retention(7, &mut flags, TimeIntSec64::MIN, CAP).unwrap();
+            assert_eq!(flags.extra(), retention != TimeIntSec64::MIN);
+            // Promotion works again after demotion, without losing retained history.
+            extras.retain(7, &mut flags).unwrap();
+            assert_eq!(extras.counts(&7, flags), (2, 2));
+            assert!(!extras.release(&7, &mut flags).unwrap());
+            assert_eq!(flags.extra(), retention != TimeIntSec64::MIN);
+            assert!(
+                extras
+                    .release_soft(7, &mut flags, TimeSec::new(200), TimeIntSec64::MIN, CAP)
+                    .unwrap()
+            );
+            assert!(flags.extra());
+            let until = if retention == TimeIntSec64::MIN { 199 } else { 210 };
+            assert_eq!(extras.get(&7).unwrap().retain_until, TimeSec::new(until));
+            assert!(extras.release_hard(&7, &mut flags).unwrap());
+            // Zero references do not authorize discarding a deadline or pending fanout.
+            assert!(flags.extra());
+            assert!(extras.reclaim(&7, &mut flags, TimeSec::new(211)));
+            assert!(extras.get(&7).is_none());
+            assert!(!flags.extra());
+            assert!(flags.retired());
+        }
     }
 
     #[test]
@@ -828,11 +893,13 @@ mod tests {
         assert!(extras.delete(&7, &mut flags, TimeSec::new(12)).is_err());
         assert!(extras.delete(&7, &mut flags, TimeSec::new(13)).is_err());
         assert!(!flags.deleted());
-        assert!(!extras.reclaim(&7, flags, TimeSec::new(1000)));
+        assert!(!extras.reclaim(&7, &mut flags, TimeSec::new(1000)));
         assert!(extras.delete(&7, &mut flags, TimeSec::new(14)).unwrap());
         assert!(!extras.delete(&7, &mut flags, TimeSec::new(14)).unwrap());
         assert!(!flags.readable(true));
-        assert!(extras.reclaim(&7, flags, TimeSec::new(14)));
+        assert!(extras.reclaim(&7, &mut flags, TimeSec::new(14)));
+        assert!(!flags.extra());
+        assert!(flags.retired());
         assert!(extras.get(&7).is_none());
     }
     #[test]

@@ -399,8 +399,7 @@ impl Extents {
         let extent = &mut self.extents[place];
         self.extras.transition(key, &mut extent.deletion, now, retention, hard, maximum)?;
         if hard && !extent.deletion.retired() {
-            assert!(self.extras.reclaim(&key, extent.deletion, now));
-            extent.deletion.retire();
+            assert!(self.extras.reclaim(&key, &mut extent.deletion, now));
             self.appends.retain(|append| append.extent != place);
         }
         Ok(())
