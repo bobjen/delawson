@@ -18307,3 +18307,26 @@ versus retained ownership, physical EN payload removal, lazy replicas, stale
 appends, and creation-second checks. scripts/test-delete runs an isolated
 cluster and exercises ordinary and opted-in reads/scans, shared DN streams and
 SN extents, rejected premature deletion, MIN deletion, and idempotent retries.
+
+### 17.47 Sparse shared-reference metadata and maximum retention
+
+DN Stream and SN Extent no longer carry inline reference counters. Without an
+extra record, their live and retained counts are implicitly one or zero according
+to soft_deleted and deleted respectively. Sharing promotes the record to an extra
+containing two checked AtomicU32 counters; promotion and flag publication occur
+under the table write lock. Returning to one reference keeps the extra. Both base
+records now occupy 56 bytes, saving eight bytes in the ordinary case.
+
+The shared extra also holds max_retention, a four-byte TimeIntSec32 initially MIN.
+Each soft-delete notification raises this maximum if needed. When the last live
+reference disappears, its deadline is calculated from that time plus the largest
+interval seen, not merely the last owner's interval (#118). This conservatively
+retains data longer than an exact maximum of per-reference deadlines might require;
+tracking that timing history is not planned. Retries do not restart an established
+deadline. The extra occupies 24 bytes including padding and its TimeSec deadline;
+retention-only extras on other record types remain eight bytes.
+
+Messages still pass TimeIntSec64. Checked narrowing preserves MIN/MAX/NONE semantics
+and rejects finite values outside TimeIntSec32's finite range. Retention validation
+at every layer requires this representability, including for the configured cap;
+the default maximum remains 30 days. No recycling or GC is introduced here.

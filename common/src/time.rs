@@ -94,6 +94,35 @@ macro_rules! timeint {
 
 timeint!(TimeIntMilli64, i64, "milliseconds");
 timeint!(TimeIntSec64, i64, "seconds");
+timeint!(TimeIntSec32, i32, "seconds");
+
+impl From<TimeIntSec32> for TimeIntSec64 {
+    fn from(value: TimeIntSec32) -> Self {
+        match value {
+            TimeIntSec32::MIN => Self::MIN,
+            TimeIntSec32::MAX => Self::MAX,
+            TimeIntSec32::NONE => Self::NONE,
+            _ => Self::new(i64::from(value.get())),
+        }
+    }
+}
+
+impl TryFrom<TimeIntSec64> for TimeIntSec32 {
+    type Error = Error;
+    fn try_from(value: TimeIntSec64) -> Result<Self> {
+        match value {
+            TimeIntSec64::MIN => Ok(Self::MIN),
+            TimeIntSec64::MAX => Ok(Self::MAX),
+            TimeIntSec64::NONE => Ok(Self::NONE),
+            _ if value.get() >= i64::from(Self::MIN_REAL.get())
+                && value.get() <= i64::from(Self::MAX_REAL.get()) =>
+            {
+                Ok(Self::new(value.get() as i32))
+            }
+            _ => Err(Error::new("seconds interval does not fit TimeIntSec32")),
+        }
+    }
+}
 
 // Runtime waits remain std::time::Duration. Reject sentinels and negative spans
 // at that boundary rather than turning them into very long waits.
@@ -112,6 +141,7 @@ macro_rules! duration_conversion {
 
 duration_conversion!(TimeIntMilli64, from_millis);
 duration_conversion!(TimeIntSec64, from_secs);
+duration_conversion!(TimeIntSec32, from_secs);
 
 impl TimeIntMilli64 {
     /// Deduct elapsed time from a finite budget. Exhaustion clamps at zero;
@@ -207,6 +237,24 @@ impl std::fmt::Display for TimeSec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seconds_interval_width_conversion_preserves_meaning() {
+        assert_eq!(std::mem::size_of::<TimeIntSec32>(), 4);
+        for value in [
+            TimeIntSec32::MIN,
+            TimeIntSec32::MAX,
+            TimeIntSec32::NONE,
+            TimeIntSec32::MIN_REAL,
+            TimeIntSec32::MAX_REAL,
+            TimeIntSec32::ZERO,
+        ] {
+            assert_eq!(TimeIntSec32::try_from(TimeIntSec64::from(value)).unwrap(), value);
+        }
+        for raw in [i64::from(i32::MIN), i64::from(i32::MAX - 1), i64::from(i32::MAX)] {
+            assert!(TimeIntSec32::try_from(TimeIntSec64::new(raw)).is_err());
+        }
+    }
 
     #[test]
     fn duration_conversion_checks_units_and_rejects_special_values() {

@@ -14,7 +14,9 @@
 //! recycling them safely is a later step.
 
 use common::config::{SNConfig, ServiceKind};
-use common::deletion::{Delete, Extras, Flags, Target, bad, forward, read_soft_deleted};
+use common::deletion::{
+    Delete, Extras, Flags, SharedExtras, Target, bad, forward, read_soft_deleted,
+};
 use common::ids::{DiskId, EnId, ExtentId, RangeId, SnDiskId, SnId, StreamId};
 use common::info::{ExtentRow, ExtentRun, Listing, StreamName, Totals};
 use common::offset::{ECoff, ELoff, ERoff, SCoff, SLoff, SRoff};
@@ -24,7 +26,9 @@ use common::time::TimeSec;
 use common::wire::{Arg, Op, Req, Resp, Status, StructReader, StructWriter, structure};
 use common::{Error, Result};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 const SERVES: &[Op] = &[
@@ -125,50 +129,7 @@ impl Stream {
 #[derive(Debug)]
 struct Extent {
     deletion: Flags,
-    /// Live owners; reaching zero starts soft deletion.
-    soft_references: AtomicU32,
-    /// All owners, including soft-deleted owners; reaching zero permits hard deletion.
-    hard_references: AtomicU32,
     data: ExtentData,
-}
-impl Extent {
-    fn retain(&self) -> common::Result<()> {
-        self.hard_references
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                if n == 0 { None } else { n.checked_add(1) }
-            })
-            .map_err(|_| {
-                common::Error::new("extent retained reference count overflow or retired")
-            })?;
-        if self
-            .soft_references
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                if n == 0 { None } else { n.checked_add(1) }
-            })
-            .is_err()
-        {
-            self.hard_references.fetch_sub(1, Ordering::Relaxed);
-            return Err(common::Error::new("extent live reference count overflow or soft-deleted"));
-        }
-        Ok(())
-    }
-    fn release_soft(&self) -> common::Result<bool> {
-        self.soft_references
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-            .map(|n| n == 1)
-            .map_err(|_| common::Error::new("extent live reference count underflow"))
-    }
-    fn release_hard(&self) -> common::Result<bool> {
-        self.hard_references
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-            .map(|n| n == 1)
-            .map_err(|_| common::Error::new("extent retained reference count underflow"))
-    }
-    /// Roll back an owning reference that never entered soft deletion.
-    fn release(&self) -> common::Result<bool> {
-        self.release_soft()?;
-        self.release_hard()
-    }
 }
 /// A snapshot for an answer, never an owning reference.
 #[derive(Clone, Debug)]
@@ -337,7 +298,7 @@ struct SN {
     extent_table: RwLock<Vec<Extent>>,
     // Lock owner before its sparse extras.
     stream_extras: Mutex<Extras<StreamName>>,
-    extent_extras: Mutex<Extras<(ExtentId, TimeSec)>>,
+    extent_extras: Mutex<SharedExtras<(ExtentId, TimeSec)>>,
     naming: Naming,
     streams: AtomicU64,
     extents: AtomicU64,
@@ -443,24 +404,25 @@ impl SN {
             let mut extent_extras = self.extent_extras.lock().expect("extent extras");
             for id in &ids {
                 let extent = &mut table[id.get() as usize];
-                if first && extent.release_soft().expect("owned live extent reference") {
+                let key = (extent.data.id, extent.data.created);
+                if first {
                     extent_extras
-                        .transition(
-                            (extent.data.id, extent.data.created),
+                        .release_soft(
+                            key,
                             &mut extent.deletion,
                             now,
-                            Some(interval),
-                            false,
+                            deletion.retention.unwrap_or(interval),
                             maximum,
                         )
                         .map_err(bad)?;
                 }
-            }
-            if first_hard {
-                for id in &ids {
-                    table[id.get() as usize]
-                        .release_hard()
-                        .expect("owned retained extent reference");
+                if let Some(interval) = deletion.retention {
+                    extent_extras
+                        .observe_retention(key, &mut extent.deletion, interval, maximum)
+                        .map_err(bad)?;
+                }
+                if first_hard {
+                    extent_extras.release_hard(&key, &mut extent.deletion).map_err(bad)?;
                 }
             }
             ids
@@ -473,13 +435,12 @@ impl SN {
             let (created, disks, interval, hard) = {
                 let mut table = self.extent_table.write().unwrap();
                 let extent = &mut table[id.get() as usize];
-                if extent.soft_references.load(Ordering::Acquire) != 0 || extent.deletion.retired()
-                {
+                if !extent.deletion.soft_deleted() || extent.deletion.retired() {
                     continue;
                 }
                 let extras = self.extent_extras.lock().unwrap();
                 let key = (extent.data.id, extent.data.created);
-                let hard = deletion.hard && extent.hard_references.load(Ordering::Acquire) == 0;
+                let hard = deletion.hard && extent.deletion.deleted();
                 if hard {
                     extras.delete(&key, &mut extent.deletion, TimeSec::now()).map_err(bad)?;
                 }
@@ -789,12 +750,19 @@ impl SN {
         {
             return Resp::error(Status::BadRequest, "destination stream is not empty and open");
         }
-        let extents = self.extent_table.read().expect("extents");
+        let mut extents = self.extent_table.write().expect("extents");
+        let mut extras = self.extent_extras.lock().expect("extent extras");
         let mut retained: Vec<ExtentId> = Vec::new();
         for &id in &copied {
-            if let Err(e) = extents[id.get() as usize].retain() {
+            let extent = &mut extents[id.get() as usize];
+            if let Err(e) =
+                extras.retain((extent.data.id, extent.data.created), &mut extent.deletion)
+            {
                 for prior in retained {
-                    extents[prior.get() as usize].release().expect("retained reference");
+                    let extent = &mut extents[prior.get() as usize];
+                    extras
+                        .release(&(extent.data.id, extent.data.created), &mut extent.deletion)
+                        .expect("retained reference");
                 }
                 return Resp::error(Status::BadRequest, e.to_string());
             }
@@ -1271,12 +1239,7 @@ impl SN {
             compressed: ECoff::ZERO,
             disks,
         };
-        extents.push(Extent {
-            deletion: Flags::default(),
-            soft_references: AtomicU32::new(1),
-            hard_references: AtomicU32::new(1),
-            data: extent.clone(),
-        });
+        extents.push(Extent { deletion: Flags::default(), data: extent.clone() });
         held.open = Some(id);
         self.extents.fetch_add(1, Ordering::Relaxed);
         Ok(Placed { extent, first })
@@ -1300,6 +1263,20 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    fn counts(sn: &SN, extent: &Extent) -> (u32, u32) {
+        sn.extent_extras
+            .lock()
+            .unwrap()
+            .counts(&(extent.data.id, extent.data.created), extent.deletion)
+    }
+
+    fn retain(sn: &SN, extent: &mut Extent) {
+        sn.extent_extras
+            .lock()
+            .unwrap()
+            .retain((extent.data.id, extent.data.created), &mut extent.deletion)
+            .unwrap();
+    }
 
     #[test]
     fn shared_extent_waits_for_retained_streams_after_all_live_references_are_gone() {
@@ -1314,7 +1291,7 @@ mod tests {
         sn.streams.fetch_add(1, Ordering::Relaxed);
         {
             let mut table = sn.extent_table.write().unwrap();
-            table[id.get() as usize].retain().unwrap();
+            retain(&sn, &mut table[id.get() as usize]);
             // No network in this unit test; the live test verifies instance fanout.
             table[id.get() as usize].data.disks.clear();
         }
@@ -1337,8 +1314,8 @@ mod tests {
         {
             let table = sn.extent_table.read().unwrap();
             let extent = &table[id.get() as usize];
-            assert_eq!(extent.soft_references.load(Ordering::Relaxed), 0);
-            assert_eq!(extent.hard_references.load(Ordering::Relaxed), 1);
+            assert_eq!(counts(&sn, extent).0, 0);
+            assert_eq!(counts(&sn, extent).1, 1);
             assert!(extent.deletion.soft_deleted());
             assert!(!extent.deletion.deleted());
         }
@@ -1346,30 +1323,35 @@ mod tests {
         assert_eq!(sn.delete_stream(&process, &request(source, None, true)).status, Status::Ok);
         let table = sn.extent_table.read().unwrap();
         assert!(table[id.get() as usize].deletion.retired());
-        assert_eq!(table[id.get() as usize].hard_references.load(Ordering::Relaxed), 0);
+        assert_eq!(counts(&sn, &table[id.get() as usize]).1, 0);
     }
     #[test]
     fn concat_rolls_back_reference_increments_on_overflow() {
         let sn = sn_with_stream(0, 7);
         seal_for_concat(&sn, named(0, 7));
         {
-            let table = sn.extent_table.read().unwrap();
-            table[0].hard_references.store(u32::MAX - 1, Ordering::Relaxed);
+            let mut table = sn.extent_table.write().unwrap();
+            retain(&sn, &mut table[0]);
+            sn.extent_extras
+                .lock()
+                .unwrap()
+                .get(&(table[0].data.id, table[0].data.created))
+                .unwrap()
+                .references
+                .hard
+                .store(u32::MAX - 1, Ordering::Relaxed);
         }
         let response = sn.concat_streams(&concat_request(named(0, 9), named(0, 7), named(0, 7)));
         assert_eq!(response.status, Status::BadRequest);
         let table = sn.extent_table.read().unwrap();
         assert_eq!(table.len(), 1);
-        assert_eq!(table[0].hard_references.load(Ordering::Relaxed), u32::MAX - 1);
+        assert_eq!(counts(&sn, &table[0]).1, u32::MAX - 1);
         assert_eq!(table[0].data.records, ERoff::new(12));
     }
 
     #[test]
     fn extent_reference_counts_are_atomic() {
-        let sn = sn_with_stream(0, 7);
-        sn.open(named(0, 7), MADE, testing::extents().instances).unwrap();
-        let table = sn.extent_table.read().unwrap();
-        let extent = &table[0];
+        let extent = &common::deletion::ReferenceCounts::default();
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(move || {
@@ -1380,15 +1362,13 @@ mod tests {
                 });
             }
         });
-        assert_eq!(extent.hard_references.load(Ordering::Relaxed), 1);
+        assert_eq!(extent.hard.load(Ordering::Relaxed), 1);
     }
     #[test]
     fn extent_rows_keep_extent_measures_while_stream_totals_widen() {
         let sn = SN::new(testing::sn_config(), 10, SnId::FIRST, Vec::new());
         sn.extent_table.write().unwrap().push(Extent {
             deletion: Flags::default(),
-            soft_references: AtomicU32::new(2),
-            hard_references: AtomicU32::new(2),
             data: ExtentData {
                 id: ExtentId::FIRST,
                 records: ERoff::new(7),
@@ -1427,8 +1407,6 @@ mod tests {
         for id in 0..4 {
             sn.extent_table.write().unwrap().push(Extent {
                 deletion: Flags::default(),
-                soft_references: AtomicU32::new(1),
-                hard_references: AtomicU32::new(1),
                 data: ExtentData {
                     id: ExtentId::new(id),
                     records: ERoff::new(7),
@@ -1482,6 +1460,7 @@ mod tests {
     #[test]
     fn extent_references_are_four_bytes() {
         assert_eq!(size_of::<ExtentId>(), 4);
+        assert_eq!(size_of::<Extent>(), 56);
         assert_eq!(size_of::<AtomicU32>(), 4);
     }
 
@@ -1591,14 +1570,16 @@ mod tests {
             destination.sealed[0], destination.sealed[1],
             "self-concat shares the same immutable extent"
         );
-        let extents = sn.extent_table.read().unwrap();
+        let mut extents = sn.extent_table.write().unwrap();
         assert_eq!(extents.len(), 1);
-        let extent = &extents[destination.sealed[0].get() as usize];
-        assert_eq!(extent.hard_references.load(Ordering::Relaxed), 3);
-        assert!(!extent.release().unwrap());
-        assert!(!extent.release().unwrap());
-        assert!(extent.release().unwrap());
-        assert!(extent.release().is_err());
+        let extent = &mut extents[destination.sealed[0].get() as usize];
+        assert_eq!(counts(&sn, extent).1, 3);
+        let mut extras = sn.extent_extras.lock().unwrap();
+        let key = (extent.data.id, extent.data.created);
+        assert!(!extras.release(&key, &mut extent.deletion).unwrap());
+        assert!(!extras.release(&key, &mut extent.deletion).unwrap());
+        assert!(extras.release(&key, &mut extent.deletion).unwrap());
+        assert!(extras.release(&key, &mut extent.deletion).is_err());
     }
 
     #[test]

@@ -420,6 +420,14 @@ fn nonnegative_seconds<'de, D: serde::Deserializer<'de>>(
     Ok(interval)
 }
 
+fn retention_seconds<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<TimeIntSec64, D::Error> {
+    let interval = nonnegative_seconds(d)?;
+    crate::time::TimeIntSec32::try_from(interval).map_err(serde::de::Error::custom)?;
+    Ok(interval)
+}
+
 /// The cluster file as written. Roster lines are expanded into one entry per
 /// process before anything else sees them.
 #[derive(Debug, Clone, Deserialize)]
@@ -429,7 +437,7 @@ struct ClusterFile {
     cluster_name: String,
     #[serde(
         default = "default_max_soft_delete_retention_secs",
-        deserialize_with = "nonnegative_seconds"
+        deserialize_with = "retention_seconds"
     )]
     max_soft_delete_retention_secs: TimeIntSec64,
     ks: KsBootstrap,
@@ -536,6 +544,7 @@ impl ClusterConfig {
 
     fn validate(&self) -> Result<()> {
         self.max_soft_delete_retention_secs.to_duration()?;
+        crate::time::TimeIntSec32::try_from(self.max_soft_delete_retention_secs)?;
         if self.schema_version != SCHEMA_VERSION {
             return Err(Error::new(format!(
                 "schema version {}, this build understands {SCHEMA_VERSION}",
@@ -822,13 +831,15 @@ mod tests {
     fn retention_cap_defaults_to_thirty_days_and_must_be_finite_nonnegative() {
         let file: ClusterFile = toml::from_str(HEADER).unwrap();
         assert_eq!(file.max_soft_delete_retention_secs, TimeIntSec64::new(2592000));
-        for value in [0, 10, 2592000] {
+        for value in [0, 10, 2592000, i64::from(i32::MAX - 2)] {
             let file: ClusterFile =
                 toml::from_str(&format!("max_soft_delete_retention_secs = {value}\n{HEADER}"))
                     .unwrap();
             assert_eq!(file.max_soft_delete_retention_secs, TimeIntSec64::new(value));
         }
-        for value in [-1, i64::MIN, i64::MAX - 1, i64::MAX] {
+        for value in
+            [-1, i64::MIN, i64::from(i32::MAX - 1), i64::from(i32::MAX), i64::MAX - 1, i64::MAX]
+        {
             assert!(
                 toml::from_str::<ClusterFile>(&format!(
                     "max_soft_delete_retention_secs = {value}\n{HEADER}"

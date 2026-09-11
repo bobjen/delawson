@@ -16,7 +16,8 @@
 
 use common::config::{DNConfig, ServiceKind};
 use common::deletion::{
-    Delete, Extras, Flags, Target, bad, forward, read_soft_deleted, with_read_soft_deleted,
+    Delete, Extras, Flags, SharedExtras, Target, bad, forward, read_soft_deleted,
+    with_read_soft_deleted,
 };
 use common::framing::Framing;
 use common::ids::{DnId, ExtentId, ObjectId, RangeId, SnId, StreamId};
@@ -32,7 +33,9 @@ use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::wire::{Arg, Op, Req, Resp, Status, StructWriter, structure};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 const SERVES: &[Op] = &[
@@ -285,10 +288,6 @@ enum Next {
 /// is atomic; ordinary metadata is protected by the range's stream table lock.
 struct Stream {
     deletion: Flags,
-    /// Live owners; reaching zero starts soft deletion.
-    soft_references: AtomicU32,
-    /// All owners, including soft-deleted owners; reaching zero permits hard deletion.
-    hard_references: AtomicU32,
     /// ⚠️ **`u32`, and safe for the reason an extent id is** (§17.29.2): a stable reference
     /// to a stream is `(RangeId, StreamId, CreateSec)` (Asserted, Bob, 2026-08-20), so the
     /// id alone was never the name. It has only to be unique among the streams **one range
@@ -345,49 +344,10 @@ impl Stream {
             compressed: self.compressed,
         }
     }
-    fn retain(&self) -> common::Result<()> {
-        self.hard_references
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                if n == 0 { None } else { n.checked_add(1) }
-            })
-            .map_err(|_| {
-                common::Error::new("stream retained reference count overflow or retired")
-            })?;
-        if self
-            .soft_references
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                if n == 0 { None } else { n.checked_add(1) }
-            })
-            .is_err()
-        {
-            self.hard_references.fetch_sub(1, Ordering::Relaxed);
-            return Err(common::Error::new("stream live reference count overflow or soft-deleted"));
-        }
-        Ok(())
-    }
-    fn release_soft(&self) -> common::Result<bool> {
-        self.soft_references
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-            .map(|n| n == 1)
-            .map_err(|_| common::Error::new("stream live reference count underflow"))
-    }
-    fn release_hard(&self) -> common::Result<bool> {
-        self.hard_references
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-            .map(|n| n == 1)
-            .map_err(|_| common::Error::new("stream retained reference count underflow"))
-    }
-    /// Roll back an owning reference that never entered soft deletion.
-    fn release(&self) -> common::Result<bool> {
-        self.release_soft()?;
-        self.release_hard()
-    }
     /// A stream just handed out: nothing has come to anything yet.
     fn new(id: StreamId, sn: SnId, created: TimeSec) -> Stream {
         Stream {
             deletion: Flags::default(),
-            soft_references: AtomicU32::new(1),
-            hard_references: AtomicU32::new(1),
             id,
             records: SRoff::NONE,
             created,
@@ -776,7 +736,7 @@ struct DN {
     stream_table: RwLock<Vec<Stream>>,
     // Sparse, range-scoped metadata. Lock owner before extras, never the reverse.
     object_extras: Mutex<Extras<(ObjectId, TimeSec)>>,
-    stream_extras: Mutex<Extras<(StreamId, TimeSec)>>,
+    stream_extras: Mutex<SharedExtras<(StreamId, TimeSec)>>,
 }
 
 fn shard_of(name: &str) -> usize {
@@ -949,24 +909,25 @@ impl DN {
             let mut stream_extras = self.stream_extras.lock().expect("stream extras");
             for id in &object.streams {
                 let stream = &mut table[id.get() as usize];
-                if first && stream.release_soft().expect("owned live stream reference") {
+                let key = (stream.id, stream.created);
+                if first {
                     stream_extras
-                        .transition(
-                            (stream.id, stream.created),
+                        .release_soft(
+                            key,
                             &mut stream.deletion,
                             now,
-                            Some(interval),
-                            false,
+                            deletion.retention.unwrap_or(interval),
                             maximum,
                         )
                         .map_err(bad)?;
                 }
-            }
-            if first_hard {
-                for id in &object.streams {
-                    table[id.get() as usize]
-                        .release_hard()
-                        .expect("owned retained stream reference");
+                if let Some(interval) = deletion.retention {
+                    stream_extras
+                        .observe_retention(key, &mut stream.deletion, interval, maximum)
+                        .map_err(bad)?;
+                }
+                if first_hard {
+                    stream_extras.release_hard(&key, &mut stream.deletion).map_err(bad)?;
                 }
             }
             object.streams.clone()
@@ -980,13 +941,12 @@ impl DN {
             let child = {
                 let mut table = self.stream_table.write().expect("streams");
                 let stream = &mut table[id.get() as usize];
-                if stream.soft_references.load(Ordering::Acquire) != 0 || stream.deletion.retired()
-                {
+                if !stream.deletion.soft_deleted() || stream.deletion.retired() {
                     continue;
                 }
                 let extras = self.stream_extras.lock().expect("stream extras");
                 let key = (stream.id, stream.created);
-                let hard = deletion.hard && stream.hard_references.load(Ordering::Acquire) == 0;
+                let hard = deletion.hard && stream.deletion.deleted();
                 if hard {
                     extras.delete(&key, &mut stream.deletion, TimeSec::now()).map_err(bad)?;
                 }
@@ -1474,8 +1434,6 @@ impl DN {
         let Some(object) = shard.get_mut(name) else { return };
         object.streams.push(self.install_stream(Stream {
             deletion: Flags::default(),
-            soft_references: AtomicU32::new(1),
-            hard_references: AtomicU32::new(1),
             id: stream,
             records: SRoff::NONE,
             created: object.created,
@@ -2339,9 +2297,8 @@ impl DN {
             .ok_or_else(|| common::Error::new("stream table is full"))?;
         table.try_reserve(count).map_err(|e| common::Error::new(e.to_string()))?;
         for n in first..end {
-            let stream = Stream::new(StreamId::new(n as u32), SnId::NONE, TimeSec::EPOCH);
-            stream.soft_references.store(0, Ordering::Relaxed);
-            stream.hard_references.store(0, Ordering::Relaxed);
+            let mut stream = Stream::new(StreamId::new(n as u32), SnId::NONE, TimeSec::EPOCH);
+            stream.deletion = Flags::vacant();
             table.push(stream);
         }
         Ok(StreamId::new(first as u32))
@@ -2350,29 +2307,37 @@ impl DN {
     fn install_stream(&self, stream: Stream) -> StreamId {
         let id = stream.id;
         let mut table = self.stream_table.write().expect("streams");
-        assert_eq!(table[id.get() as usize].soft_references.load(Ordering::Relaxed), 0);
-        assert_eq!(table[id.get() as usize].hard_references.load(Ordering::Relaxed), 0);
+        assert!(table[id.get() as usize].deletion.retired());
         table[id.get() as usize] = stream;
         id
     }
 
     fn retain_streams(&self, ids: &[StreamId]) -> common::Result<()> {
-        let table = self.stream_table.read().expect("streams");
+        let mut table = self.stream_table.write().expect("streams");
+        let mut extras = self.stream_extras.lock().expect("stream extras");
         for (i, id) in ids.iter().enumerate() {
-            if let Err(e) = table[id.get() as usize].retain() {
+            let stream = &mut table[id.get() as usize];
+            if let Err(error) = extras.retain((stream.id, stream.created), &mut stream.deletion) {
                 for prior in &ids[..i] {
-                    table[prior.get() as usize].release().expect("retained reference");
+                    let stream = &mut table[prior.get() as usize];
+                    extras
+                        .release(&(stream.id, stream.created), &mut stream.deletion)
+                        .expect("retained reference");
                 }
-                return Err(e);
+                return Err(error);
             }
         }
         Ok(())
     }
 
     fn release_streams(&self, ids: &[StreamId]) {
-        let table = self.stream_table.read().expect("streams");
+        let mut table = self.stream_table.write().expect("streams");
+        let mut extras = self.stream_extras.lock().expect("stream extras");
         for id in ids {
-            table[id.get() as usize].release().expect("owned reference");
+            let stream = &mut table[id.get() as usize];
+            extras
+                .release(&(stream.id, stream.created), &mut stream.deletion)
+                .expect("owned reference");
         }
     }
 
@@ -2529,15 +2494,17 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    fn counts(dn: &DN, stream: &Stream) -> (u32, u32) {
+        dn.stream_extras.lock().unwrap().counts(&(stream.id, stream.created), stream.deletion)
+    }
 
     #[test]
     fn deletion_retry_releases_each_counter_once_and_keeps_the_name_until_success() {
         use common::time::TimeIntSec64;
         let dn = DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST);
         let stream = held(0, 0, Some(1));
-        stream.soft_references.store(2, Ordering::Relaxed);
-        stream.hard_references.store(2, Ordering::Relaxed);
         install(&dn, stream);
+        dn.retain_streams(&[StreamId::FIRST]).unwrap();
         let mut object = grown();
         object.streams = vec![StreamId::FIRST, StreamId::FIRST];
         dn.shards[shard_of("/retry")].lock().unwrap().insert("/retry".into(), object);
@@ -2589,12 +2556,12 @@ mod tests {
         assert_eq!(dn.delete_object(&process, &soft).status, Status::Internal);
         {
             let table = dn.stream_table.read().unwrap();
-            assert_eq!(table[0].soft_references.load(Ordering::Relaxed), 0);
-            assert_eq!(table[0].hard_references.load(Ordering::Relaxed), 2);
+            assert_eq!(counts(&dn, &table[0]).0, 0);
+            assert_eq!(counts(&dn, &table[0]).1, 2);
         }
         assert!(dn.shards[shard_of("/retry")].lock().unwrap().contains_key("/retry"));
         assert_eq!(dn.delete_object(&process, &soft).status, Status::Ok);
-        assert_eq!(dn.stream_table.read().unwrap()[0].hard_references.load(Ordering::Relaxed), 2);
+        assert_eq!(counts(&dn, &dn.stream_table.read().unwrap()[0]).1, 2);
         let hard = Delete { target: Target::Object("/retry".into()), retention: None, hard: true }
             .request()
             .unwrap();
@@ -2602,7 +2569,7 @@ mod tests {
         assert_eq!(dn.delete_object(&process, &hard).status, Status::Ok);
         assert!(!dn.shards[shard_of("/retry")].lock().unwrap().contains_key("/retry"));
         let table = dn.stream_table.read().unwrap();
-        assert_eq!(table[0].hard_references.load(Ordering::Relaxed), 0);
+        assert_eq!(counts(&dn, &table[0]).1, 0);
         assert!(table[0].deletion.retired());
         peer.join().unwrap();
         assert_eq!(seen.load(Ordering::Relaxed), 4);
@@ -2610,15 +2577,41 @@ mod tests {
 
     #[test]
     fn live_and_retained_stream_counters_are_independent() {
-        let stream = held(0, 0, Some(1));
-        stream.retain().unwrap();
-        assert!(!stream.release_soft().unwrap());
-        assert!(!stream.release_hard().unwrap());
-        assert!(stream.release_soft().unwrap());
-        assert_eq!(stream.hard_references.load(Ordering::Relaxed), 1);
-        assert!(stream.retain().is_err());
-        assert_eq!(stream.hard_references.load(Ordering::Relaxed), 1);
-        assert!(stream.release_hard().unwrap());
+        use common::time::TimeIntSec64;
+        let mut stream = held(0, 0, Some(1));
+        let key = (stream.id, stream.created);
+        let mut extras = SharedExtras::default();
+        assert_eq!(extras.counts(&key, stream.deletion), (1, 1));
+        assert!(!stream.deletion.extra());
+        extras.retain(key, &mut stream.deletion).unwrap();
+        assert!(stream.deletion.extra());
+        assert!(
+            !extras
+                .release_soft(
+                    key,
+                    &mut stream.deletion,
+                    TimeSec::new(10),
+                    TimeIntSec64::MIN,
+                    TimeIntSec64::new(30)
+                )
+                .unwrap()
+        );
+        assert!(!extras.release_hard(&key, &mut stream.deletion).unwrap());
+        assert!(
+            extras
+                .release_soft(
+                    key,
+                    &mut stream.deletion,
+                    TimeSec::new(10),
+                    TimeIntSec64::MIN,
+                    TimeIntSec64::new(30)
+                )
+                .unwrap()
+        );
+        assert_eq!(extras.counts(&key, stream.deletion), (0, 1));
+        assert!(extras.retain(key, &mut stream.deletion).is_err());
+        assert!(extras.release_hard(&key, &mut stream.deletion).unwrap());
+        assert_eq!(extras.counts(&key, stream.deletion), (0, 0));
     }
     #[test]
     fn shared_stream_metadata_and_reference_rollback() {
@@ -2630,7 +2623,7 @@ mod tests {
         {
             let mut table = dn.stream_table.write().unwrap();
             assert_eq!(table.len(), 1);
-            assert_eq!(table[0].hard_references.load(Ordering::Relaxed), 3);
+            assert_eq!(counts(&dn, &table[0]).1, 3);
             table[0].learned(Totals {
                 extents: ExtentId::new(2),
                 logical: SLoff::new(100),
@@ -2648,12 +2641,12 @@ mod tests {
         // A failed concat gives back every repeated reference it acquired.
         dn.shards[shard_of("/failed")].lock().unwrap().insert(Box::from("/failed"), second);
         dn.fail_concat("/failed", Resp::error(Status::Internal, "test"));
-        assert_eq!(dn.stream_table.read().unwrap()[0].hard_references.load(Ordering::Relaxed), 1);
+        assert_eq!(counts(&dn, &dn.stream_table.read().unwrap()[0]).1, 1);
     }
 
     #[test]
     fn stream_reference_counts_are_atomic_and_checked() {
-        let stream = held(0, 0, None);
+        let stream = common::deletion::ReferenceCounts::default();
         std::thread::scope(|scope| {
             for _ in 0..4 {
                 let stream = &stream;
@@ -2665,20 +2658,28 @@ mod tests {
                 });
             }
         });
-        assert_eq!(stream.hard_references.load(Ordering::Relaxed), 1);
+        assert_eq!(stream.hard.load(Ordering::Relaxed), 1);
         assert!(stream.release().unwrap());
         assert!(stream.release().is_err());
-        stream.hard_references.store(u32::MAX, Ordering::Relaxed);
+        stream.hard.store(u32::MAX, Ordering::Relaxed);
         assert!(stream.retain().is_err());
-        assert_eq!(stream.hard_references.load(Ordering::Relaxed), u32::MAX);
+        assert_eq!(stream.hard.load(Ordering::Relaxed), u32::MAX);
 
         let dn = DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST);
         dn.reserve_streams(2).unwrap();
         dn.install_stream(held(0, 0, None));
         dn.install_stream(held(1, 0, None));
-        dn.stream_table.read().unwrap()[1].hard_references.store(u32::MAX, Ordering::Relaxed);
+        dn.retain_streams(&[StreamId::new(1)]).unwrap();
+        dn.stream_extras
+            .lock()
+            .unwrap()
+            .get(&(StreamId::new(1), TimeSec::new(1_000_000)))
+            .unwrap()
+            .references
+            .hard
+            .store(u32::MAX, Ordering::Relaxed);
         assert!(dn.retain_streams(&[StreamId::new(0), StreamId::new(1)]).is_err());
-        assert_eq!(dn.stream_table.read().unwrap()[0].hard_references.load(Ordering::Relaxed), 1);
+        assert_eq!(counts(&dn, &dn.stream_table.read().unwrap()[0]).1, 1);
     }
     #[test]
     fn object_summaries_sum_streams_in_object_spaces() {
@@ -2840,7 +2841,7 @@ mod tests {
     #[test]
     fn stream_references_and_counts_are_four_bytes() {
         assert_eq!(size_of::<StreamId>(), 4);
-        assert_eq!(size_of::<Stream>(), 64);
+        assert_eq!(size_of::<Stream>(), 56);
         assert_eq!(size_of::<AtomicU32>(), 4);
     }
 

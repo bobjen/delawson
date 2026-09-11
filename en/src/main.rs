@@ -385,7 +385,7 @@ impl Extents {
             if retention.is_none() {
                 return Err(Error::new("hard delete requires a soft-deleted instance"));
             }
-            let mut probe = common::deletion::Extras::default();
+            let mut probe = common::deletion::Extras::<_>::default();
             probe.transition(
                 key,
                 &mut common::deletion::Flags::default(),
