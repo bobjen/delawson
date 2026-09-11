@@ -431,6 +431,8 @@ enum Cmd {
     /// Read one record.
     Read {
         path: String,
+        #[arg(long)]
+        read_soft_deleted: bool,
         /// The object's framing, needed to find the record inside the block that
         /// comes back — nothing below the client parses one.
         #[arg(long, default_value = "lf")]
@@ -452,6 +454,8 @@ enum Cmd {
     /// caller is certain about.
     Scan {
         path: String,
+        #[arg(long)]
+        read_soft_deleted: bool,
         #[arg(long, default_value = "lf")]
         framing: String,
         /// Record number to start at.
@@ -762,7 +766,7 @@ fn run(cli: Cli) -> Result<()> {
             };
             bench_info(&target, &plan, &cluster.messaging, *trial, *flags, *one_object)
         }
-        Cmd::Scan { path, framing, from, before, budget, rounds } => {
+        Cmd::Scan { path, framing, from, before, budget, rounds, read_soft_deleted } => {
             let target = resolve(&cluster, &cli, ServiceKind::Fe)?;
             let mut conn = open(&target, timeout, &cluster.messaging)?;
             scan(
@@ -774,6 +778,7 @@ fn run(cli: Cli) -> Result<()> {
                 *before,
                 budget.budget(),
                 *rounds,
+                *read_soft_deleted,
             )
         }
         cmd => {
@@ -1796,6 +1801,7 @@ fn scan(
     before: Option<u64>,
     budget: Budget,
     rounds: usize,
+    read_soft_deleted: bool,
 ) -> Result<()> {
     let mut at = from;
     let mut total = ObjectCovered::default();
@@ -1807,11 +1813,15 @@ fn scan(
         }
         let request = Range { start: Start::Record(ORoff::new(at)), budget }
             .request(path, Expecting::whatever());
+        let request = common::deletion::with_read_soft_deleted(request, read_soft_deleted);
         let answer = conn.call(&request)?;
         asked += 1;
         // Running off the end is how a scan of an object whose length it does not
         // know finds out, so it is the ordinary way to stop rather than a failure.
         if answer.status == Status::NotFound {
+            if asked == 1 {
+                return report(target, &answer);
+            }
             break;
         }
         if answer.status != Status::Ok {
@@ -2265,8 +2275,8 @@ fn build(cmd: &Cmd) -> Result<Req> {
             }
             Req::new(Op::DeleteRecord).structure(payload)
         }
-        Cmd::Read { path, at, expect, .. } => {
-            match at.arg() {
+        Cmd::Read { path, at, expect, read_soft_deleted, .. } => {
+            let request = match at.arg() {
                 // A point read is a range of one record (§9.1.3.6): the block
                 // holding it comes back whole either way, and asking this way means
                 // there is one shape on the read path rather than two.
@@ -2288,7 +2298,8 @@ fn build(cmd: &Cmd) -> Result<Req> {
                     }
                     Req::new(Op::ReadRecord).structure(payload)
                 }
-            }
+            };
+            common::deletion::with_read_soft_deleted(request, *read_soft_deleted)
         }
 
         // Scan is a loop over range reads rather than one request, so it is driven
@@ -2355,6 +2366,7 @@ mod tests {
     fn point_and_scan_requests_include_the_record_selector() {
         let point = build(&Cmd::Read {
             path: "/x".into(),
+            read_soft_deleted: false,
             framing: "lf".into(),
             expect: None,
             at: At { record: Some(7), key: None },

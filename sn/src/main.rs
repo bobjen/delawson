@@ -10,11 +10,11 @@
 //! this is asked once per extent rather than once per write.
 //!
 //! State is in memory and sharded by stream id, so creating streams from every
-//! core does not queue on one lock. Nothing is deleted yet, so nothing here has
-//! to cope with reuse — an index that has to survive churn is a later problem.
+//! core does not queue on one lock. Deleted extent slots remain tombstones;
+//! recycling them safely is a later step.
 
 use common::config::{SNConfig, ServiceKind};
-use common::deletion::{Extras, Flags};
+use common::deletion::{Delete, Extras, Flags, Target, bad, forward, read_soft_deleted};
 use common::ids::{DiskId, EnId, ExtentId, RangeId, SnDiskId, SnId, StreamId};
 use common::info::{ExtentRow, ExtentRun, Listing, StreamName, Totals};
 use common::offset::{ECoff, ELoff, ERoff, SCoff, SLoff, SRoff};
@@ -53,7 +53,6 @@ fn stream_name(payload: &mut StructReader<'_>) -> common::Result<StreamName> {
 
 #[derive(Clone)]
 struct Stream {
-    #[allow(dead_code)]
     deletion: Flags,
     /// When it was made. Nothing reads it yet; whether a stream needs a creation
     /// timestamp of its own at all is an open question.
@@ -125,23 +124,50 @@ impl Stream {
 /// was wrong for every other (§17.29.1).
 #[derive(Debug)]
 struct Extent {
-    #[allow(dead_code)]
     deletion: Flags,
-    references: AtomicU32,
+    /// Live owners; reaching zero starts soft deletion.
+    soft_references: AtomicU32,
+    /// All owners, including soft-deleted owners; reaching zero permits hard deletion.
+    hard_references: AtomicU32,
     data: ExtentData,
 }
 impl Extent {
-    fn retain(&self) -> Result<()> {
-        self.references
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map(|_| ())
-            .map_err(|_| Error::new("extent reference count overflow"))
+    fn retain(&self) -> common::Result<()> {
+        self.hard_references
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                if n == 0 { None } else { n.checked_add(1) }
+            })
+            .map_err(|_| {
+                common::Error::new("extent retained reference count overflow or retired")
+            })?;
+        if self
+            .soft_references
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                if n == 0 { None } else { n.checked_add(1) }
+            })
+            .is_err()
+        {
+            self.hard_references.fetch_sub(1, Ordering::Relaxed);
+            return Err(common::Error::new("extent live reference count overflow or soft-deleted"));
+        }
+        Ok(())
     }
-    fn release(&self) -> Result<bool> {
-        self.references
+    fn release_soft(&self) -> common::Result<bool> {
+        self.soft_references
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
             .map(|n| n == 1)
-            .map_err(|_| Error::new("extent reference count underflow"))
+            .map_err(|_| common::Error::new("extent live reference count underflow"))
+    }
+    fn release_hard(&self) -> common::Result<bool> {
+        self.hard_references
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .map(|n| n == 1)
+            .map_err(|_| common::Error::new("extent retained reference count underflow"))
+    }
+    /// Roll back an owning reference that never entered soft deletion.
+    fn release(&self) -> common::Result<bool> {
+        self.release_soft()?;
+        self.release_hard()
     }
 }
 /// A snapshot for an answer, never an owning reference.
@@ -287,6 +313,8 @@ impl Naming {
 
 struct SN {
     config: SNConfig,
+    deleting: Mutex<()>,
+    retired_streams: Mutex<std::collections::HashSet<StreamName>>,
     /// Maximum sealed extents one stream may hold, including extent references made by
     /// concatenation rather than by appending.
     per_stream: usize,
@@ -308,9 +336,7 @@ struct SN {
     /// Lock stream shards before this table. IDs are stable vector indexes.
     extent_table: RwLock<Vec<Extent>>,
     // Lock owner before its sparse extras.
-    #[allow(dead_code)]
     stream_extras: Mutex<Extras<StreamName>>,
-    #[allow(dead_code)]
     extent_extras: Mutex<Extras<(ExtentId, TimeSec)>>,
     naming: Naming,
     streams: AtomicU64,
@@ -348,11 +374,7 @@ impl Service for SN {
 
     fn answer(&self, process: &Process, request: &Req) -> Resp {
         match request.op {
-            Op::SoftDeleteStream | Op::DeleteStream => common::deletion::Delete::stub(
-                request,
-                "SN stream",
-                process.cluster.max_soft_delete_retention_secs,
-            ),
+            Op::SoftDeleteStream | Op::DeleteStream => self.delete_stream(process, request),
             Op::CreateStream => self.create(request),
             Op::ConcatStreams => self.concat_streams(request),
             Op::SealStream => self.seal_stream(request),
@@ -376,6 +398,142 @@ impl Service for SN {
 }
 
 impl SN {
+    fn delete_stream(&self, process: &Process, request: &Req) -> Resp {
+        match self.deleting_stream(process, request) {
+            Ok(()) => Resp::ok(),
+            Err(error) => error,
+        }
+    }
+
+    fn deleting_stream(&self, process: &Process, request: &Req) -> std::result::Result<(), Resp> {
+        let deletion =
+            Delete::of_with_limit(request, process.cluster.max_soft_delete_retention_secs)
+                .map_err(bad)?;
+        let Target::Stream(name) = deletion.target else {
+            return Err(bad("expected a stream"));
+        };
+        let _serial = self.deleting.lock().expect("deletion");
+        let now = TimeSec::now();
+        let maximum = process.cluster.max_soft_delete_retention_secs;
+        let ids = {
+            let mut shard = self.shards[shard_of(name)].lock().expect("streams");
+            let Some(stream) = shard.get_mut(&name) else {
+                return if self.retired_streams.lock().unwrap().contains(&name) {
+                    Ok(())
+                } else {
+                    Err(Resp::error(Status::NotFound, "no stream"))
+                };
+            };
+            let mut extras = self.stream_extras.lock().expect("stream extras");
+            let first_hard = deletion.hard && !stream.deletion.deleted();
+            let first = extras
+                .transition(
+                    name,
+                    &mut stream.deletion,
+                    now,
+                    deletion.retention,
+                    deletion.hard,
+                    maximum,
+                )
+                .map_err(bad)?;
+            let interval = extras.remaining(&name, now).map_err(bad)?;
+            drop(extras);
+            let ids: Vec<_> = stream.sealed.iter().copied().chain(stream.open).collect();
+            let mut table = self.extent_table.write().expect("extents");
+            let mut extent_extras = self.extent_extras.lock().expect("extent extras");
+            for id in &ids {
+                let extent = &mut table[id.get() as usize];
+                if first && extent.release_soft().expect("owned live extent reference") {
+                    extent_extras
+                        .transition(
+                            (extent.data.id, extent.data.created),
+                            &mut extent.deletion,
+                            now,
+                            Some(interval),
+                            false,
+                            maximum,
+                        )
+                        .map_err(bad)?;
+                }
+            }
+            if first_hard {
+                for id in &ids {
+                    table[id.get() as usize]
+                        .release_hard()
+                        .expect("owned retained extent reference");
+                }
+            }
+            ids
+        };
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            if !seen.insert(id) {
+                continue;
+            }
+            let (created, disks, interval, hard) = {
+                let mut table = self.extent_table.write().unwrap();
+                let extent = &mut table[id.get() as usize];
+                if extent.soft_references.load(Ordering::Acquire) != 0 || extent.deletion.retired()
+                {
+                    continue;
+                }
+                let extras = self.extent_extras.lock().unwrap();
+                let key = (extent.data.id, extent.data.created);
+                let hard = deletion.hard && extent.hard_references.load(Ordering::Acquire) == 0;
+                if hard {
+                    extras.delete(&key, &mut extent.deletion, TimeSec::now()).map_err(bad)?;
+                }
+                (
+                    extent.data.created,
+                    extent.data.disks.clone(),
+                    extras.remaining(&key, TimeSec::now()).map_err(bad)?,
+                    hard,
+                )
+            };
+            for disk in disks {
+                let (en, disk) = self.disk_at(disk);
+                let target = Target::Instance { en, disk, sn: self.mine, extent: id, created };
+                forward(
+                    process,
+                    &format!("EN{en}"),
+                    Delete { target: target.clone(), retention: Some(interval), hard: false },
+                )?;
+                if hard {
+                    forward(
+                        process,
+                        &format!("EN{en}"),
+                        Delete { target, retention: None, hard: true },
+                    )?;
+                }
+            }
+            if hard {
+                let mut table = self.extent_table.write().unwrap();
+                let extent = &mut table[id.get() as usize];
+                assert!(self.extent_extras.lock().unwrap().reclaim(
+                    &(id, created),
+                    extent.deletion,
+                    TimeSec::now()
+                ));
+                extent.data.disks = Vec::new();
+                extent.deletion.retire();
+                self.extents.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        if deletion.hard {
+            let mut shard = self.shards[shard_of(name)].lock().unwrap();
+            let stream = shard.get(&name).unwrap();
+            assert!(self.stream_extras.lock().unwrap().reclaim(
+                &name,
+                stream.deletion,
+                TimeSec::now()
+            ));
+            shard.remove(&name);
+            self.retired_streams.lock().unwrap().insert(name);
+            self.streams.fetch_sub(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     fn disk_at(&self, id: SnDiskId) -> (EnId, DiskId) {
         self.disks.lock().expect("disks")[id.get() as usize]
     }
@@ -388,6 +546,8 @@ impl SN {
     fn new(config: SNConfig, per_stream: usize, mine: SnId, disks: Vec<(EnId, DiskId)>) -> SN {
         SN {
             config,
+            deleting: Mutex::new(()),
+            retired_streams: Mutex::new(std::collections::HashSet::new()),
             per_stream,
             mine,
             disks: Mutex::new(disks),
@@ -407,6 +567,7 @@ impl SN {
     /// objects at once names a run of streams in one request, and they share the second —
     /// so it is the consecutive ids that keep the names apart (#110).
     fn create(&self, request: &Req) -> Resp {
+        let _serial = self.deleting.lock().expect("deletion");
         let (mut payload, rest) =
             match structure(&request.args, Op::CreateStream, "a create-stream request") {
                 Ok(value) => value,
@@ -438,6 +599,7 @@ impl SN {
             return Resp::error(Status::BadRequest, e.to_string());
         }
 
+        let mut made = 0;
         for n in 0..count {
             // Every stream of the run shares the second, which is what makes the ids have to
             // differ — and they do, being consecutive (#110).
@@ -448,7 +610,16 @@ impl SN {
                 );
             };
             let name = StreamName { range, stream, created };
+            if self.retired_streams.lock().unwrap().contains(&name) {
+                return bad("stream identity has been retired");
+            }
             let mut shard = self.shards[shard_of(name)].lock().expect("streams");
+            if let Some(stream) = shard.get(&name) {
+                if !stream.deletion.readable(false) {
+                    return bad("stream is deleted");
+                }
+                continue; // A create retry must not overwrite its extents or flags.
+            }
             shard.insert(
                 name,
                 Stream {
@@ -461,8 +632,9 @@ impl SN {
                     sealed_stream: false,
                 },
             );
+            made += 1;
         }
-        self.streams.fetch_add(count, Ordering::Relaxed);
+        self.streams.fetch_add(made, Ordering::Relaxed);
         Resp::ok()
     }
 
@@ -470,6 +642,7 @@ impl SN {
     /// stream. The destination remains open, so a caller can append after the copied
     /// data. Extents themselves are immutable references here; no EN data is copied.
     fn concat_streams(&self, request: &Req) -> Resp {
+        let _serial = self.deleting.lock().expect("deletion");
         let (mut payload, rest) =
             match structure(&request.args, Op::ConcatStreams, "a concat-streams request") {
                 Ok(value) => value,
@@ -485,6 +658,9 @@ impl SN {
             Ok(name) => name,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
+        if self.retired_streams.lock().unwrap().contains(&destination) {
+            return bad("destination stream identity has been retired");
+        }
         let left = match stream_name(&mut payload) {
             Ok(name) => name,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
@@ -520,7 +696,8 @@ impl SN {
         {
             let shard = self.shards[shard_of(destination)].lock().expect("streams");
             if let Some(destination_stream) = shard.get(&destination) {
-                if destination_stream.sealed_stream
+                if !destination_stream.deletion.readable(false)
+                    || destination_stream.sealed_stream
                     || destination_stream.open.is_some()
                     || !destination_stream.sealed.is_empty()
                 {
@@ -545,6 +722,9 @@ impl SN {
             Some(stream) => stream.clone(),
             None => return Resp::error(Status::NotFound, format!("no {right}")),
         };
+        if !left_stream.deletion.readable(false) || !right_stream.deletion.readable(false) {
+            return bad("cannot concatenate deleted streams");
+        }
         if !left_stream.sealed_stream
             || left_stream.open.is_some()
             || !right_stream.sealed_stream
@@ -678,12 +858,10 @@ impl SN {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
-        if !rest.is_empty() {
-            return Resp::error(
-                Status::BadRequest,
-                "a locate-record request has trailing arguments",
-            );
-        }
+        let include = match read_soft_deleted(rest) {
+            Ok(value) => value,
+            Err(error) => return bad(error),
+        };
         let name = match stream_name(&mut payload) {
             Ok(name) => name,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
@@ -696,7 +874,18 @@ impl SN {
         let Some(held) = shard.get(&name) else {
             return Resp::error(Status::NotFound, format!("no {name}"));
         };
+        if !held.deletion.readable(include) {
+            return Resp::error(Status::NotFound, "stream is deleted");
+        }
         let extents = self.extent_table.read().expect("extents");
+        if held
+            .sealed
+            .iter()
+            .chain(held.open.iter())
+            .any(|id| extents[id.get() as usize].deletion.deleted())
+        {
+            return Resp::error(Status::NotFound, "extent is deleted");
+        }
         // The sealed extents are in record order, so this is a walk over a sorted run,
         // accumulating each extent's start as it goes (§17.29.1).
         if let Some((first, sealed)) =
@@ -746,12 +935,10 @@ impl SN {
         if let Err(e) = payload.done() {
             return Resp::error(Status::BadRequest, e.to_string());
         }
-        if !rest.is_empty() {
-            return Resp::error(
-                Status::BadRequest,
-                "a list-extents request has trailing arguments",
-            );
-        }
+        let include = match read_soft_deleted(rest) {
+            Ok(value) => value,
+            Err(error) => return bad(error),
+        };
         let mut args = Vec::new();
         let mut room = asked.limit;
         for (name, from) in &asked.at {
@@ -759,6 +946,9 @@ impl SN {
             let Some(held) = shard.get(name) else {
                 return Resp::error(Status::NotFound, format!("no {name}"));
             };
+            if !held.deletion.readable(include) {
+                return Resp::error(Status::NotFound, "stream is deleted");
+            }
             let (run, rows) = self.run_of(held, name.stream, *from, room, asked.instances);
             room = room.saturating_sub(rows.len() as u64);
             args.extend(run.args());
@@ -947,6 +1137,9 @@ impl SN {
         let Some(stream) = shard.get_mut(&name) else {
             return Resp::error(Status::NotFound, format!("no {name}"));
         };
+        if !stream.deletion.readable(false) {
+            return bad("stream is deleted");
+        }
         if stream.sealed_stream {
             return Resp::number(Status::Ok, stream.sealed_records.number());
         }
@@ -992,6 +1185,9 @@ impl SN {
         };
         // Only whoever names the open extent seals it. Two appends can find the same
         // extent full at once, and the second one has nothing left to do.
+        if !held.deletion.readable(false) {
+            return Err(Full::from(Error::new("stream is deleted")));
+        }
         if held.open == Some(id) {
             let extent = held.open.take().expect("an open extent");
             // ⚠️ Accumulated rather than computed from a stored base, which is the same
@@ -1050,6 +1246,9 @@ impl SN {
     /// on somebody else's round trip, and blocking a worker per waiter would be the
     /// wrong shape — the waiters must attach to the one in flight instead.
     fn appendable(&self, held: &mut Stream, second: TimeSec, instances: usize) -> Result<Placed> {
+        if !held.deletion.readable(false) {
+            return Err(Error::new("stream is deleted"));
+        }
         // Where the open extent starts is the stream's running total, whether the extent
         // was already there or is being made now.
         let first = held.sealed_records;
@@ -1074,7 +1273,8 @@ impl SN {
         };
         extents.push(Extent {
             deletion: Flags::default(),
-            references: AtomicU32::new(1),
+            soft_references: AtomicU32::new(1),
+            hard_references: AtomicU32::new(1),
             data: extent.clone(),
         });
         held.open = Some(id);
@@ -1100,19 +1300,67 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn shared_extent_waits_for_retained_streams_after_all_live_references_are_gone() {
+        use common::time::TimeIntSec64;
+        let sn = sn_with_stream(0, 7);
+        let source = named(0, 7);
+        let other = named(0, 9);
+        let placed = sn.open(source, TimeSec::new(1_000_000), 4).unwrap();
+        let id = placed.extent.id;
+        let snapshot = sn.shards[shard_of(source)].lock().unwrap()[&source].clone();
+        sn.shards[shard_of(other)].lock().unwrap().insert(other, snapshot);
+        sn.streams.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut table = sn.extent_table.write().unwrap();
+            table[id.get() as usize].retain().unwrap();
+            // No network in this unit test; the live test verifies instance fanout.
+            table[id.get() as usize].data.disks.clear();
+        }
+        let process = testing::process();
+        let request = |name, retention, hard| {
+            Delete { target: Target::Stream(name), retention, hard }.request().unwrap()
+        };
+        assert_eq!(
+            sn.delete_stream(&process, &request(source, None, true)).status,
+            Status::BadRequest
+        );
+        assert_eq!(
+            sn.delete_stream(&process, &request(source, Some(TimeIntSec64::MIN), false)).status,
+            Status::Ok
+        );
+        assert_eq!(
+            sn.delete_stream(&process, &request(other, Some(TimeIntSec64::MIN), true)).status,
+            Status::Ok
+        );
+        {
+            let table = sn.extent_table.read().unwrap();
+            let extent = &table[id.get() as usize];
+            assert_eq!(extent.soft_references.load(Ordering::Relaxed), 0);
+            assert_eq!(extent.hard_references.load(Ordering::Relaxed), 1);
+            assert!(extent.deletion.soft_deleted());
+            assert!(!extent.deletion.deleted());
+        }
+        assert_eq!(sn.delete_stream(&process, &request(source, None, true)).status, Status::Ok);
+        assert_eq!(sn.delete_stream(&process, &request(source, None, true)).status, Status::Ok);
+        let table = sn.extent_table.read().unwrap();
+        assert!(table[id.get() as usize].deletion.retired());
+        assert_eq!(table[id.get() as usize].hard_references.load(Ordering::Relaxed), 0);
+    }
     #[test]
     fn concat_rolls_back_reference_increments_on_overflow() {
         let sn = sn_with_stream(0, 7);
         seal_for_concat(&sn, named(0, 7));
         {
             let table = sn.extent_table.read().unwrap();
-            table[0].references.store(u32::MAX - 1, Ordering::Relaxed);
+            table[0].hard_references.store(u32::MAX - 1, Ordering::Relaxed);
         }
         let response = sn.concat_streams(&concat_request(named(0, 9), named(0, 7), named(0, 7)));
         assert_eq!(response.status, Status::BadRequest);
         let table = sn.extent_table.read().unwrap();
         assert_eq!(table.len(), 1);
-        assert_eq!(table[0].references.load(Ordering::Relaxed), u32::MAX - 1);
+        assert_eq!(table[0].hard_references.load(Ordering::Relaxed), u32::MAX - 1);
         assert_eq!(table[0].data.records, ERoff::new(12));
     }
 
@@ -1132,14 +1380,15 @@ mod tests {
                 });
             }
         });
-        assert_eq!(extent.references.load(Ordering::Relaxed), 1);
+        assert_eq!(extent.hard_references.load(Ordering::Relaxed), 1);
     }
     #[test]
     fn extent_rows_keep_extent_measures_while_stream_totals_widen() {
         let sn = SN::new(testing::sn_config(), 10, SnId::FIRST, Vec::new());
         sn.extent_table.write().unwrap().push(Extent {
             deletion: Flags::default(),
-            references: AtomicU32::new(2),
+            soft_references: AtomicU32::new(2),
+            hard_references: AtomicU32::new(2),
             data: ExtentData {
                 id: ExtentId::FIRST,
                 records: ERoff::new(7),
@@ -1178,7 +1427,8 @@ mod tests {
         for id in 0..4 {
             sn.extent_table.write().unwrap().push(Extent {
                 deletion: Flags::default(),
-                references: AtomicU32::new(1),
+                soft_references: AtomicU32::new(1),
+                hard_references: AtomicU32::new(1),
                 data: ExtentData {
                     id: ExtentId::new(id),
                     records: ERoff::new(7),
@@ -1344,7 +1594,7 @@ mod tests {
         let extents = sn.extent_table.read().unwrap();
         assert_eq!(extents.len(), 1);
         let extent = &extents[destination.sealed[0].get() as usize];
-        assert_eq!(extent.references.load(Ordering::Relaxed), 3);
+        assert_eq!(extent.hard_references.load(Ordering::Relaxed), 3);
         assert!(!extent.release().unwrap());
         assert!(!extent.release().unwrap());
         assert!(extent.release().unwrap());

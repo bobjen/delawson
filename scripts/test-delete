@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Isolated end-to-end deletion smoke test. Leaves its logs under /tmp.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+scratch=$(mktemp -d /tmp/delawson-delete.XXXXXX)
+cp -r config "$scratch/config"
+# Mechanically relocate only the bootstrap ports; do not touch the user's cluster.
+sed -i 's/127.0.0.1:9601/127.0.0.1:29601/;s/port_base = 9602/port_base = 29602/' "$scratch/config/cluster.toml"
+export LAWS_CONFIG="$scratch/config/cluster.toml"
+trap './scripts/stop-laws --run-dir "$scratch/run" --grace 1 >/dev/null' EXIT
+./scripts/start-laws --debug --no-build --run-dir "$scratch/run" --config "$scratch/config" >/dev/null
+laws=./target/debug/laws
+fail() {
+    local answer
+    if answer=$("$@" 2>&1); then
+        echo "unexpected success: $*" >&2
+        exit 1
+    fi
+    [[ "$answer" == *"deleted"* || "$answer" == *"retention"* || "$answer" == *"no object"* ]] || {
+        echo "unexpected failure: $answer" >&2
+        exit 1
+    }
+}
+read_alpha() {
+    local answer
+    answer=$("$laws" read "$@")
+    [[ "$answer" == *alpha* ]] || { echo "wrong read: $answer" >&2; exit 1; }
+}
+"$laws" append /delete-basic --data alpha
+fail "$laws" delete /delete-basic
+fail "$laws" soft-delete /delete-basic --retention-secs 2592001
+"$laws" soft-delete /delete-basic --retention-secs 600
+"$laws" soft-delete /delete-basic --retention-secs 600
+fail "$laws" read /delete-basic --record 0
+fail "$laws" scan /delete-basic
+read_alpha /delete-basic --record 0 --read-soft-deleted
+"$laws" scan /delete-basic --read-soft-deleted
+fail "$laws" append /delete-basic --data forbidden
+fail "$laws" delete /delete-basic
+fail "$laws" soft-delete /delete-basic --retention-secs MIN --delete
+"$laws" append /delete-expired --data alpha
+"$laws" soft-delete /delete-expired --retention-secs MIN
+read_alpha /delete-expired --record 0 --read-soft-deleted
+"$laws" delete /delete-expired
+"$laws" delete /delete-expired
+fail "$laws" read /delete-expired --record 0 --read-soft-deleted
+"$laws" append /delete-now --data alpha
+"$laws" soft-delete /delete-now --retention-secs MIN --delete
+fail "$laws" read /delete-now --record 0 --read-soft-deleted
+"$laws" create /delete-empty --flavor unkeyed
+"$laws" soft-delete /delete-empty --retention-secs MIN --delete
+
+# These names route to DN3. Two-source concat shares SN extents; three-source
+# concat shares DN streams. Both kinds must survive deletion of another owner.
+"$laws" append /large-object --data alpha --seal
+"$laws" concat /shared-2 /large-object /large-object
+"$laws" concat /shared-5 /large-object /large-object /large-object
+"$laws" soft-delete /large-object --retention-secs MIN
+read_alpha /large-object --record 0 --read-soft-deleted
+read_alpha /shared-2 --record 1
+read_alpha /shared-5 --record 2
+"$laws" soft-delete /shared-5 --retention-secs MIN --delete
+read_alpha /shared-2 --record 1
+"$laws" soft-delete /shared-2 --retention-secs MIN
+read_alpha /shared-2 --record 1 --read-soft-deleted
+read_alpha /large-object --record 0 --read-soft-deleted
+"$laws" delete /shared-2
+# The last live reference is gone, but the source's retained reference still
+# protects the data at both shared layers.
+read_alpha /large-object --record 0 --read-soft-deleted
+"$laws" delete /large-object
+fail "$laws" read /shared-2 --record 0 --read-soft-deleted
+echo "Deletion smoke test passed; logs: $scratch"

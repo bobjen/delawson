@@ -22,6 +22,7 @@
 use common::Result;
 use common::block::Holds;
 use common::config::{FEConfig, ServiceKind};
+use common::deletion::{read_soft_deleted, with_read_soft_deleted};
 use common::framing::Framing;
 use common::ids::{DiskId, DnId, EnId, ExtentId, SnId, StreamId};
 use common::info::{Batch, Described, Expecting, Shape, StreamName, UNKNOWN, Wanted};
@@ -481,7 +482,7 @@ impl FE {
         reply: Reply,
         then: impl FnOnce(&Arc<FE>, &Arc<Process>, Located, Reply) + Send + 'static,
     ) {
-        self.resolving(process, path, None, expect, make, true, reply, then)
+        self.resolving(process, path, None, expect, make, true, false, reply, then)
     }
 
     /// Look up the specific stream holding an object-local record number (`ORoff`),
@@ -493,10 +494,11 @@ impl FE {
         path: &str,
         record: ORoff,
         expect: Expecting,
+        include: bool,
         reply: Reply,
         then: impl FnOnce(&Arc<FE>, &Arc<Process>, Located, Reply) + Send + 'static,
     ) {
-        self.resolving(process, path, Some(record), expect, None, false, reply, then)
+        self.resolving(process, path, Some(record), expect, None, false, include, reply, then)
     }
 
     /// Resolve an object path at the owning Directory Node (DN).
@@ -519,6 +521,7 @@ impl FE {
         expect: Expecting,
         make: Option<Framing>,
         again: bool,
+        include: bool,
         reply: Reply,
         then: impl FnOnce(&Arc<FE>, &Arc<Process>, Located, Reply) + Send + 'static,
     ) {
@@ -536,7 +539,7 @@ impl FE {
         let path = path.to_string();
         // ⚠️ The expectation goes to the **DN**, because the DN owns the path table and is the
         // only tier that can see the path point somewhere new (§17.36).
-        let ask = object_lookup(&path, record, expect);
+        let ask = with_read_soft_deleted(object_lookup(&path, record, expect), include);
         let named = dn.to_string();
         let asked = process.ask(&dn, &ask, move |answer| {
             // An append may make the object it is appending to, which is one more
@@ -853,7 +856,7 @@ impl FE {
     /// conversion happens here — a bug in one of them shows up as a read that works
     /// until the first seal and then does not.
     fn read(self: &Arc<Self>, process: &Arc<Process>, request: &Req, mut reply: Reply) {
-        let (path, expect, range) = {
+        let (path, expect, range, include) = {
             let (mut payload, rest) =
                 match structure(&request.args, Op::ReadRecord, "a read request") {
                     Ok(value) => value,
@@ -898,13 +901,13 @@ impl FE {
             if let Err(e) = payload.done() {
                 return reply.send(Resp::error(Status::BadRequest, e.to_string()));
             }
-            if !rest.is_empty() {
-                return reply.send(Resp::error(
-                    Status::BadRequest,
-                    "a read request has trailing arguments",
-                ));
-            }
-            (path, expect, range)
+            let include = match read_soft_deleted(rest) {
+                Ok(value) => value,
+                Err(error) => {
+                    return reply.send(Resp::error(Status::BadRequest, error.to_string()));
+                }
+            };
+            (path, expect, range, include)
         };
         // The start has to be a record for now: the other two forms need a prefix sum
         // of logical lengths, which §4.5 keeps lazily and nothing here can ask for
@@ -921,12 +924,13 @@ impl FE {
             &path,
             record,
             expect,
+            include,
             reply,
             move |fe, process, located, reply| {
                 // The DN answered with the stream holding it, so the number the stream
                 // knows it by is what is left after that stream's first.
                 let at = in_stream(record, located.first_record);
-                fe.locate(process, located, at, range.budget, reply);
+                fe.locate(process, located, at, range.budget, include, reply);
             },
         );
     }
@@ -944,6 +948,7 @@ impl FE {
         located: Located,
         record: SRoff,
         budget: Budget,
+        include: bool,
         reply: Reply,
     ) {
         let known = self
@@ -953,7 +958,7 @@ impl FE {
             .get(&located.stream)
             .and_then(|stream| stream.holding(record));
         if let Some(open) = known {
-            return from_instance(process, &located, &open, record, budget, reply);
+            return from_instance(process, &located, &open, record, budget, include, reply);
         }
 
         let identity = format!("SN{}", located.sn);
@@ -962,7 +967,7 @@ impl FE {
         payload.stream_id(located.stream.stream);
         payload.time_sec(located.stream.created);
         payload.sroff(record);
-        let ask = Req::new(Op::LocateRecord).structure(payload);
+        let ask = with_read_soft_deleted(Req::new(Op::LocateRecord).structure(payload), include);
         let fe = Arc::clone(self);
         let onward = Arc::clone(process);
         let named = identity.clone();
@@ -982,7 +987,7 @@ impl FE {
                 .entry(located.stream)
                 .or_default()
                 .remember(open.clone());
-            from_instance(&onward, &located, &open, record, budget, reply);
+            from_instance(&onward, &located, &open, record, budget, include, reply);
         });
         if let Err(e) = asked {
             logw!("could not reach an SN", "sn {named},{e}");
@@ -1139,6 +1144,7 @@ fn make_object(
                 Expecting::whatever(),
                 Some(framing),
                 false,
+                false,
                 reply,
                 then,
             );
@@ -1174,6 +1180,7 @@ fn from_instance(
     open: &Open,
     in_stream: SRoff,
     budget: Budget,
+    include: bool,
     reply: Reply,
 ) {
     let identity = format!("EN{}", open.disks[0].0);
@@ -1194,7 +1201,7 @@ fn from_instance(
     payload.extent_id(open.id);
     payload.time_sec(open.created);
     ExtentRange { start: ExtentStart::Record(at), budget }.write_nested(&mut payload);
-    let ask = Req::new(Op::ReadExtent).structure(payload);
+    let ask = with_read_soft_deleted(Req::new(Op::ReadExtent).structure(payload), include);
     let named = identity.clone();
     // The blocks come back whole and are passed on whole: the reader decompresses
     // them, checks the CRC against what it wrote, and takes the records it wanted.

@@ -222,6 +222,7 @@ ops! {
     DeleteStream = 77, "delete-stream";
     SoftDeleteExtentInstance = 78, "soft-delete-extent-instance";
     DeleteExtentInstance = 79, "delete-extent-instance";
+    ReadSoftDeleted = 80, "read-soft-deleted";
 }
 
 impl std::fmt::Display for Op {

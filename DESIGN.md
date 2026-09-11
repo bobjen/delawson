@@ -18199,7 +18199,8 @@ The retention TimeSec is eight bytes in a sparse Extra record, not inline and
 not behind a per-record pointer. DN and SN have sparse side tables keyed by
 full local identity including creation time; EN keeps its table per disk.
 Acquire the owning record/table lock before its extras lock, never the reverse.
-The current DN stream layout remains 56 bytes.
+The foundation used a 56-byte DN stream record; the two counters in §17.46
+bring that record to 64 bytes.
 
 Soft deletion records a deadline computed from the receiving tier's current
 TimeSec and the passed TimeIntSec64. Finite negative intervals are valid.
@@ -18216,7 +18217,7 @@ A combined soft-delete-and-delete request can give MIN or a negative retention
 interval to establish an already-expired deadline and immediately hard-delete
 a live record. The local combined transition is atomic on failure. It cannot
 shorten an existing soft-delete deadline. Zero retention is not strictly in
-the past within the same second. Reads of soft-deleted records will require
+the past within the same second. Reads of soft-deleted records require
 explicit opt-in; hard-deleted records are not readable.
 
 Deletion messages carry object paths, full stream names, or extent instance
@@ -18232,16 +18233,77 @@ seconds (30 days). It must be finite and nonnegative; zero permits only zero
 or negative retention, including MIN. FE, DN, SN, and EN independently reject
 requests above their configured cap rather than silently shortening them.
 The metadata soft-delete and combined-transition methods also require a cap
-and check it before mutation, covering local DN stream and SN extent transitions
-when those are wired. A retry cannot extend an established deadline, including
+and check it before mutation, including local DN stream and SN extent transitions.
+A retry cannot extend an established deadline, including
 when the cap is changed. Lowering the cap does not rewrite existing deadlines.
 This bounds the requested retention window; it does not replace the separate
 hard-delete request or implement automatic collection.
 
-This phase implements metadata transitions and message codecs, not distributed
-deletion. DN, SN, and EN handlers validate these requests and return Unimplemented
-with an explicit "I got this far" stage, without changing live metadata.
-Still to wire: reference release and last-reference propagation, read opt-in
-through FE/DN/SN/EN, name lookup of retained objects, and actual removal after
-successful downstream deletion. There is no GC loop or slot recycling.
+The foundation initially provided message stubs; §17.46 replaces them with
+working deletion handlers. There is still no GC loop or slot recycling.
 The maximum-retention-across-references problem remains tracked in issue #118.
+
+### 17.46 End-to-end deletion and two reference counts
+
+DN Stream and SN Extent each have two checked, lock-free AtomicU32 counters:
+soft_references counts live owning references; hard_references counts all
+retained owning references, including soft-deleted owners. Each occurrence in
+an owner's list counts. Acquiring a reference increments both; overflow rolls
+back and a zero live count cannot be resurrected by concat. First soft deletion
+of an owner releases only its live references. First hard deletion releases
+only its retained references. Repeated requests release neither again.
+
+The last live reference starts child soft deletion; the last retained reference
+permits child hard deletion, subject to the child's own expired retention check.
+Thus a soft-deleted object can still read shared data after another object is
+hard-deleted, even if there are no live references left. The same holds for
+streams sharing extents. Using only a live-reference counter is not sufficient.
+
+Deletion propagates object DN -> stream DN -> stream SN -> extent SN -> instance
+EN. DN and SN retain their parent and its child IDs until downstream requests
+succeed. Retried fanout replays soft deletion before hard deletion, using the
+remaining interval from stored metadata rather than restarting retention or
+trusting a different interval in a retry. Expired retention propagates as MIN.
+Child identities are deduplicated for messages but not for reference counting.
+Retired identities acknowledge retries without recreating data.
+
+The current handlers serialize deletion/concat coordination per node and make
+downward calls on worker threads, without holding object/stream/extent or extras
+locks across network calls. Failure is returned to the caller, which can retry;
+there is no background retry or GC task yet. An accepted hard-delete intent
+remains recorded during failed fanout, so reads cannot reopen that object.
+Deletion during unfinished DN creation/extension is rejected for retry.
+
+Hard deletion removes the object's name entry and the SN stream's owning list,
+frees the SN extent's instance list, and drops the EN instance's encrypted append
+payloads. Stable array slots retain tombstones, and retired object/stream names
+are remembered for retry handling. Late creates/appends cannot reset an existing
+deleted identity. EN also soft-deletes lazily allocated, unwritten replicas so
+a delayed first apply-append cannot recreate them. Pending EN append queues are
+refused/drained on deletion.
+
+Point reads and scans accept --read-soft-deleted. The optional ReadSoftDeleted
+wire structure is checked and forwarded through FE, DN, SN, and EN. It is not
+cached as an extent property: each read must opt in. EN checks even when FE
+uses a cached extent location. Hard-deleted records cannot be read with this
+flag. Soft-deleted objects remain indexed by name and can be described with the
+same wire option. Appends, extends, sealing, and concatenation reject deleted
+owners. Same-name recreation semantics and undelete remain unfinished.
+
+The eventual user-facing delete will initiate soft deletion, and DN GC will
+send hard deletion after expiry plus roughly one minute of grace for tier skew.
+Lower tiers must still reject premature hard deletion; GC will retry rather
+than relying on the grace period as a clock guarantee. Orphan cleanup should
+normally choose a recovery interval (such as three days), not MIN. Neither GC
+nor this grace scheduling is implemented here. Retention windows overlap along
+the chain rather than stacking independent full windows at successive tiers.
+
+Future recycling will collect tombstones on recycled lists and append those
+lists to free lists under a global write lock, guaranteeing no reader still
+holds a recycled tombstone. This is not implemented.
+
+Regression tests cover failure/retry without double reference release, live
+versus retained ownership, physical EN payload removal, lazy replicas, stale
+appends, and creation-second checks. scripts/test-delete runs an isolated
+cluster and exercises ordinary and opted-in reads/scans, shared DN streams and
+SN extents, rejected premature deletion, MIN deletion, and idempotent retries.

@@ -7,6 +7,48 @@ use crate::{Error, Result};
 use std::collections::HashMap;
 use std::hash::Hash;
 
+pub fn read_soft_deleted(args: &[crate::wire::Arg]) -> Result<bool> {
+    if args.is_empty() {
+        return Ok(false);
+    }
+    let (mut value, rest) = structure(args, Op::ReadSoftDeleted, "read options")?;
+    let include = value.flag()?;
+    value.done()?;
+    if !rest.is_empty() {
+        return Err(Error::new("trailing read options"));
+    }
+    Ok(include)
+}
+
+pub fn with_read_soft_deleted(mut request: Req, include: bool) -> Req {
+    if include {
+        let mut value = StructWriter::new();
+        value.flag(true);
+        request.args.push(value.finish(Op::ReadSoftDeleted));
+    }
+    request
+}
+
+pub fn bad(error: impl std::fmt::Display) -> Resp {
+    Resp::error(Status::BadRequest, error.to_string())
+}
+
+/// No record or side-table lock may be held while calling the next tier.
+pub fn forward(
+    process: &crate::server::Process,
+    identity: &str,
+    deletion: Delete,
+) -> std::result::Result<(), Resp> {
+    let request = deletion.request().map_err(bad)?;
+    let answer = process
+        .call(identity, &request)
+        .map_err(|error| Resp::error(Status::Internal, error.to_string()))?;
+    if answer.status != Status::Ok {
+        return Err(answer);
+    }
+    Ok(())
+}
+
 /// External names always include the creation second; a vector index is not a name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -110,17 +152,6 @@ impl Delete {
         }
         Ok(deletion)
     }
-
-    /// Phase boundary: validate the message but do not mutate any metadata yet.
-    pub fn stub(request: &Req, stage: &str, maximum: TimeIntSec64) -> Resp {
-        match Self::of_with_limit(request, maximum) {
-            Ok(_) => Resp::error(
-                Status::Unimplemented,
-                format!("I got this far: {stage}; deletion propagation is not implemented yet"),
-            ),
-            Err(error) => Resp::error(Status::BadRequest, error.to_string()),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -142,6 +173,13 @@ impl Flags {
     pub fn readable(self, include_soft_deleted: bool) -> bool {
         !self.deleted() && (!self.soft_deleted() || include_soft_deleted)
     }
+    pub fn retired(self) -> bool {
+        self.deleted() && !self.extra()
+    }
+    pub fn retire(&mut self) {
+        assert!(self.deleted());
+        self.0 &= !Self::EXTRA;
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -157,6 +195,41 @@ impl<K> Default for Extras<K> {
     }
 }
 impl<K: Eq + Hash> Extras<K> {
+    /// A single local transition, returning whether references must be released.
+    pub fn transition(
+        &mut self,
+        key: K,
+        flags: &mut Flags,
+        now: TimeSec,
+        retention: Option<TimeIntSec64>,
+        hard: bool,
+        maximum: TimeIntSec64,
+    ) -> Result<bool> {
+        if flags.retired() {
+            return Ok(false);
+        }
+        match (retention, hard) {
+            (Some(interval), true) => self
+                .soft_delete_and_delete(key, flags, now, interval, maximum)
+                .map(|(soft, _)| soft),
+            (Some(interval), false) => self.soft_delete(key, flags, now, interval, maximum),
+            (None, true) => self.delete(&key, flags, now).map(|_| false),
+            (None, false) => Err(Error::new("empty deletion request")),
+        }
+    }
+
+    /// Retry propagation from the retained deadline, never from a new caller's interval.
+    pub fn remaining(&self, key: &K, now: TimeSec) -> Result<TimeIntSec64> {
+        let extra = self.get(key).ok_or_else(|| Error::new("missing retention metadata"))?;
+        let delta = i128::from(extra.retain_until.number()) - i128::from(now.number());
+        if delta < 0 {
+            return Ok(TimeIntSec64::MIN);
+        }
+        let value = i64::try_from(delta).map_err(|_| Error::new("retention interval overflow"))?;
+        let interval = TimeIntSec64::new(value);
+        valid_interval(interval)?;
+        Ok(interval)
+    }
     pub fn get(&self, key: &K) -> Option<&Extra> {
         self.0.get(key)
     }
@@ -344,9 +417,8 @@ mod tests {
                     Delete { target: target.clone(), retention: Some(retention), hard: false };
                 let request = delete.request().unwrap();
                 assert_eq!(Delete::of(&request).unwrap(), delete);
-                let expected =
-                    if retention > CAP { Status::BadRequest } else { Status::Unimplemented };
-                assert_eq!(Delete::stub(&request, "tier", CAP).status, expected);
+                let expected = retention <= CAP;
+                assert_eq!(Delete::of_with_limit(&request, CAP).is_ok(), expected);
             }
         }
     }
@@ -450,7 +522,7 @@ mod tests {
                 let delete = Delete { target: target.clone(), retention, hard };
                 let request = delete.request().unwrap();
                 assert_eq!(Delete::of(&request).unwrap(), delete);
-                assert_eq!(Delete::stub(&request, "test", CAP).status, Status::Unimplemented);
+                assert!(Delete::of_with_limit(&request, CAP).is_ok());
                 let mut extra = delete.request().unwrap();
                 extra.args.push(Arg::Flag(false));
                 assert!(Delete::of(&extra).is_err());
@@ -482,7 +554,7 @@ mod tests {
             payload.number_u64(interval.get() as u64);
             payload.flag(false);
             let request = Req::new(Op::SoftDeleteObject).structure(payload);
-            assert_eq!(Delete::stub(&request, "test", CAP).status, Status::BadRequest);
+            assert!(Delete::of_with_limit(&request, CAP).is_err());
         }
     }
 

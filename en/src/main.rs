@@ -23,6 +23,7 @@
 use common::block::Holds;
 use common::config::ENConfig;
 use common::crypto;
+use common::deletion::{Delete, Target, bad, read_soft_deleted};
 use common::framing::Framing;
 use common::ids::{DiskId, EnId, ExtentId, SnId};
 use common::offset::{ECoff, ELoff, ERoff};
@@ -191,7 +192,6 @@ pub const APPEND_OVERHEAD: usize = 44;
 
 /// An extent instance held here.
 struct Extent {
-    #[allow(dead_code)]
     deletion: common::deletion::Flags,
     sn_id: SnId,
     id: ExtentId,
@@ -344,7 +344,6 @@ struct Landed {
 
 /// Everything this Disk holds.
 struct Extents {
-    #[allow(dead_code)]
     extras: common::deletion::Extras<(SnId, ExtentId, TimeSec)>,
     extents: Vec<Extent>,
     at: HashMap<(SnId, ExtentId), usize>,
@@ -361,6 +360,52 @@ impl Extents {
         }
     }
 
+    fn delete_instance(
+        &mut self,
+        sn: SnId,
+        id: ExtentId,
+        created: TimeSec,
+        retention: Option<common::time::TimeIntSec64>,
+        hard: bool,
+        maximum: common::time::TimeIntSec64,
+    ) -> Result<()> {
+        let now = TimeSec::now();
+        let key = (sn, id, created);
+        let place = if let Some(&place) = self.at.get(&(sn, id)) {
+            if self.extents[place].created != created {
+                return Err(Error::new("wrong extent creation second"));
+            }
+            if self.extents[place].deletion.retired() {
+                return Ok(());
+            }
+            place
+        } else {
+            // EN creates instances lazily on the first append. A soft-delete must
+            // also fence an as-yet-unwritten replica against a late apply-append.
+            if retention.is_none() {
+                return Err(Error::new("hard delete requires a soft-deleted instance"));
+            }
+            let mut probe = common::deletion::Extras::default();
+            probe.transition(
+                key,
+                &mut common::deletion::Flags::default(),
+                now,
+                retention,
+                hard,
+                maximum,
+            )?;
+            self.place(sn, id, created)?
+        };
+        let extent = &mut self.extents[place];
+        self.extras.transition(key, &mut extent.deletion, now, retention, hard, maximum)?;
+        if hard && !extent.deletion.retired() {
+            assert!(self.extras.reclaim(&key, extent.deletion, now));
+            extent.deletion.retire();
+            self.appends.retain(|append| append.extent != place);
+        }
+        Ok(())
+    }
+
     fn place(&mut self, sn: SnId, id: ExtentId, created: TimeSec) -> Result<usize> {
         if let Some(place) = self.at.get(&(sn, id)) {
             let held = self.extents[*place].created;
@@ -368,6 +413,9 @@ impl Extents {
                 return Err(Error::new(format!(
                     "extent {id} of sn {sn} was made in second {held} because a second is part of a name, not {created}"
                 )));
+            }
+            if !self.extents[*place].deletion.readable(false) {
+                return Err(Error::new("extent is deleted"));
             }
             return Ok(*place);
         }
@@ -808,6 +856,9 @@ impl Disk {
         if current.created != created {
             return Err(Error::new("force-seal extent has the wrong creation second"));
         }
+        if !current.deletion.readable(false) {
+            return Err(Error::new("extent is deleted"));
+        }
         if !current.sealed {
             current.sealed = true;
             self.sealed.fetch_add(1, Ordering::Relaxed);
@@ -841,16 +892,27 @@ impl Disk {
             process,
             &appending,
             cap,
-        )?;
+        );
+        let took = match took {
+            Ok(value) => value,
+            Err(error) => {
+                reply.send(bad(error));
+                return Ok(());
+            }
+        };
 
         let landed = match took {
             Took::Landed(landed) => landed,
             Took::Queued => {
                 let lo = appending.logical_offset.unwrap();
-                self.pending_fixed
-                    .lock()
-                    .expect("queue")
-                    .insert((appending.sn, appending.extent, lo), (appending, reply));
+                let mut queue = self.pending_fixed.lock().expect("queue");
+                let held = self.held.lock().expect("extents");
+                let place = held.at[&(appending.sn, appending.extent)];
+                if !held.extents[place].deletion.readable(false) {
+                    reply.send(bad("extent was deleted"));
+                    return Ok(());
+                }
+                queue.insert((appending.sn, appending.extent, lo), (appending, reply));
                 return Ok(());
             }
             Took::Sealed { came_to, closing } => {
@@ -893,13 +955,19 @@ impl Disk {
         let quorum_wants = process.cluster.extents.quorum;
         let pending = Arc::new(Pending::new(receipt, quorum_wants, reply));
         match landed.records == ERoff::ZERO {
-            true => self
-                .waiting
-                .lock()
-                .expect("waiting")
-                .entry((appending.sn, appending.extent))
-                .or_default()
-                .push(Arc::clone(&pending)),
+            true => {
+                let mut waiting = self.waiting.lock().expect("waiting");
+                let held = self.held.lock().expect("extents");
+                let place = held.at[&(appending.sn, appending.extent)];
+                if !held.extents[place].deletion.readable(false) {
+                    pending.lost();
+                    return Ok(());
+                }
+                waiting
+                    .entry((appending.sn, appending.extent))
+                    .or_default()
+                    .push(Arc::clone(&pending));
+            }
             false => {
                 pending.records_are_whole();
                 self.finish(appending.sn, appending.extent);
@@ -924,11 +992,12 @@ impl Disk {
         }
 
         let next_lo = landed.logical.plus(appending.holds.logical)?;
-        if let Some((next_app, next_reply)) = self.pending_fixed.lock().expect("queue").remove(&(
+        let next = self.pending_fixed.lock().expect("queue").remove(&(
             appending.sn,
             appending.extent,
             next_lo,
-        )) {
+        ));
+        if let Some((next_app, next_reply)) = next {
             self.try_append(process, mine, next_app, next_reply)?;
         }
 
@@ -992,6 +1061,7 @@ impl Disk {
         held.range(&self.daily_cache, &self.extent_cache, process, place, from, budget)
     }
 
+    #[cfg(test)]
     fn read(
         &self,
         process: &Process,
@@ -999,6 +1069,18 @@ impl Disk {
         extent: ExtentId,
         created: TimeSec,
         range: ExtentRange,
+    ) -> Resp {
+        self.read_including(process, sn, extent, created, range, false)
+    }
+
+    fn read_including(
+        &self,
+        process: &Process,
+        sn: SnId,
+        extent: ExtentId,
+        created: TimeSec,
+        range: ExtentRange,
+        include: bool,
     ) -> Resp {
         let ExtentStart::Record(from) = range.start else {
             return Resp::error(
@@ -1024,6 +1106,9 @@ impl Disk {
             Some(_) => {}
         }
         let place = held.at[&(sn, extent)];
+        if !held.extents[place].deletion.readable(include) {
+            return Resp::error(Status::NotFound, "extent is deleted");
+        }
         let ranged = match held.range(
             &self.daily_cache,
             &self.extent_cache,
@@ -1109,11 +1194,7 @@ impl Service for EN {
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
         match request.op {
             Op::SoftDeleteExtentInstance | Op::DeleteExtentInstance => {
-                reply.send(common::deletion::Delete::stub(
-                    &request,
-                    "EN extent instance",
-                    process.cluster.max_soft_delete_retention_secs,
-                ))
+                reply.send(self.delete_instance(process, &request))
             }
             Op::AppendExtent => self.append(process, request, reply),
             Op::ApplyAppend => reply.send(self.apply(process, request)),
@@ -1136,6 +1217,55 @@ impl Service for EN {
 }
 
 impl EN {
+    fn delete_instance(&self, process: &Process, request: &Req) -> Resp {
+        let deletion =
+            match Delete::of_with_limit(request, process.cluster.max_soft_delete_retention_secs) {
+                Ok(value) => value,
+                Err(error) => return bad(error),
+            };
+        let Target::Instance { en, disk, sn, extent, created } = deletion.target else {
+            return bad("expected an extent instance");
+        };
+        if en.number() != process.entry.number() {
+            return bad("deletion addressed to a different EN");
+        }
+        let disk = match self.disk(disk) {
+            Ok(disk) => disk,
+            Err(error) => return bad(error),
+        };
+        let result = {
+            let mut held = disk.held.lock().unwrap();
+            held.delete_instance(
+                sn,
+                extent,
+                created,
+                deletion.retention,
+                deletion.hard,
+                process.cluster.max_soft_delete_retention_secs,
+            )
+        };
+        match result {
+            Err(error) => bad(error),
+            Ok(()) => {
+                let mut queued = disk.pending_fixed.lock().unwrap();
+                let keys: Vec<_> =
+                    queued.keys().filter(|(s, e, _)| *s == sn && *e == extent).copied().collect();
+                for key in keys {
+                    if let Some((_, reply)) = queued.remove(&key) {
+                        reply.send(bad("extent was deleted"));
+                    }
+                }
+                drop(queued);
+                for pending in
+                    disk.waiting.lock().unwrap().remove(&(sn, extent)).unwrap_or_default()
+                {
+                    pending.lost();
+                }
+                Resp::ok()
+            }
+        }
+    }
+
     fn append(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
         let (en, disk_id, appending) = match AppendBlock::of(&request) {
             Ok(res) => res,
@@ -1247,9 +1377,10 @@ impl EN {
         if let Err(e) = payload.done() {
             return Resp::error(Status::BadRequest, e.to_string());
         }
-        if !rest.is_empty() {
-            return Resp::error(Status::BadRequest, "a read-extent request has trailing arguments");
-        }
+        let include = match read_soft_deleted(rest) {
+            Ok(value) => value,
+            Err(error) => return bad(error),
+        };
         let mine = EnId::new(process.entry.number());
         if en != mine {
             return Resp::error(
@@ -1258,7 +1389,7 @@ impl EN {
             );
         }
         match self.disk(disk) {
-            Ok(disk) => disk.read(process, sn, extent, created, range),
+            Ok(disk) => disk.read_including(process, sn, extent, created, range, include),
             Err(e) => Resp::error(Status::BadRequest, e.to_string()),
         }
     }
@@ -1395,6 +1526,112 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn deleted_instance_denies_reads_and_late_appends_and_reclaims_payloads() {
+        use common::time::TimeIntSec64;
+        let en = EN::new(testing::en_config());
+        let process = testing::process();
+        append(&en, 1, b"one\n");
+        let disk = en.disk(DiskId::FIRST).unwrap();
+        let target = Target::Instance {
+            en: EnId::FIRST,
+            disk: DiskId::FIRST,
+            sn: SnId::FIRST,
+            extent: ExtentId::new(1),
+            created: TimeSec::new(1_000_000),
+        };
+        let request =
+            |retention, hard| Delete { target: target.clone(), retention, hard }.request().unwrap();
+        assert_eq!(en.delete_instance(&process, &request(None, true)).status, Status::BadRequest);
+        assert_eq!(disk.held.lock().unwrap().appends.len(), 1);
+        let soft = request(Some(TimeIntSec64::MIN), false);
+        assert_eq!(en.delete_instance(&process, &soft).status, Status::Ok);
+        assert_eq!(en.delete_instance(&process, &soft).status, Status::Ok);
+        assert_eq!(
+            disk.read(
+                &process,
+                SnId::FIRST,
+                ExtentId::new(1),
+                TimeSec::new(1_000_000),
+                ExtentRange::from(ERoff::ZERO)
+            )
+            .status,
+            Status::NotFound
+        );
+        assert_eq!(
+            disk.read_including(
+                &process,
+                SnId::FIRST,
+                ExtentId::new(1),
+                TimeSec::new(1_000_000),
+                ExtentRange::from(ERoff::ZERO),
+                true
+            )
+            .status,
+            Status::Ok
+        );
+        assert!(disk.take(&process, &block(0, 1, b"late\n"), ROOM).is_err());
+        assert_eq!(en.delete_instance(&process, &request(None, true)).status, Status::Ok);
+        assert!(disk.held.lock().unwrap().appends.is_empty());
+        assert_eq!(
+            disk.read_including(
+                &process,
+                SnId::FIRST,
+                ExtentId::new(1),
+                TimeSec::new(1_000_000),
+                ExtentRange::from(ERoff::ZERO),
+                true
+            )
+            .status,
+            Status::NotFound
+        );
+        assert!(disk.take(&process, &block(0, 1, b"late\n"), ROOM).is_err());
+        assert_eq!(en.delete_instance(&process, &soft).status, Status::Ok);
+        assert_eq!(en.delete_instance(&process, &request(None, true)).status, Status::Ok);
+        assert!(disk.held.lock().unwrap().appends.is_empty());
+    }
+
+    #[test]
+    fn lazy_replica_deletion_fences_first_append_and_rejects_wrong_identity() {
+        use common::time::TimeIntSec64;
+        let en = EN::new(testing::en_config());
+        let process = testing::process();
+        let target = Target::Instance {
+            en: EnId::FIRST,
+            disk: DiskId::FIRST,
+            sn: SnId::FIRST,
+            extent: ExtentId::new(1),
+            created: TimeSec::new(1_000_000),
+        };
+        let soft = Delete {
+            target: target.clone(),
+            retention: Some(TimeIntSec64::new(1000)),
+            hard: false,
+        }
+        .request()
+        .unwrap();
+        assert_eq!(en.delete_instance(&process, &soft).status, Status::Ok);
+        let hard = Delete { target, retention: None, hard: true }.request().unwrap();
+        assert_eq!(en.delete_instance(&process, &hard).status, Status::BadRequest);
+        let disk = en.disk(DiskId::FIRST).unwrap();
+        assert!(disk.take(&process, &block(0, 1, b"late\n"), ROOM).is_err());
+        let wrong = Delete {
+            target: Target::Instance {
+                en: EnId::FIRST,
+                disk: DiskId::FIRST,
+                sn: SnId::FIRST,
+                extent: ExtentId::new(1),
+                created: TimeSec::new(2),
+            },
+            retention: Some(TimeIntSec64::MIN),
+            hard: true,
+        }
+        .request()
+        .unwrap();
+        assert_eq!(en.delete_instance(&process, &wrong).status, Status::BadRequest);
+        assert!(!disk.held.lock().unwrap().extents[0].deletion.deleted());
+    }
     use super::*;
 
     #[test]

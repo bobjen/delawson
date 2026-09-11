@@ -8,14 +8,16 @@
 //!
 //! ⚠️ **The hash table sharded by name is a stand-in for a B-tree** with a read and
 //! a write lock per node, walked by locking a parent and then a child. Nothing is
-//! deleted yet either, so nothing here copes with reuse.
+//! recycled yet: deleted array entries remain tombstones.
 //!
 //! A create waits on an SN, and waits without holding a worker: the names are
 //! taken, the streams are asked for, and the client's `Reply` travels with that
 //! request to be answered when the SN says the streams exist.
 
 use common::config::{DNConfig, ServiceKind};
-use common::deletion::{Extras, Flags};
+use common::deletion::{
+    Delete, Extras, Flags, Target, bad, forward, read_soft_deleted, with_read_soft_deleted,
+};
 use common::framing::Framing;
 use common::ids::{DnId, ExtentId, ObjectId, RangeId, SnId, StreamId};
 use common::info::{
@@ -232,7 +234,6 @@ impl Levelled {
 }
 
 struct Object {
-    #[allow(dead_code)] // Wired into deletion handlers in the next phase.
     deletion: Flags,
     /// ⚠️ **`u32`, minted per range**, so an object's name is `(RangeId, ObjectId, CreateSec)` —
     /// the same triple as a stream's and an extent's (§17.35.2). **A path is not part of it**: a
@@ -283,9 +284,11 @@ enum Next {
 /// Stored once per range, rather than once per object reference. The reference count
 /// is atomic; ordinary metadata is protected by the range's stream table lock.
 struct Stream {
-    #[allow(dead_code)]
     deletion: Flags,
-    references: AtomicU32,
+    /// Live owners; reaching zero starts soft deletion.
+    soft_references: AtomicU32,
+    /// All owners, including soft-deleted owners; reaching zero permits hard deletion.
+    hard_references: AtomicU32,
     /// ⚠️ **`u32`, and safe for the reason an extent id is** (§17.29.2): a stable reference
     /// to a stream is `(RangeId, StreamId, CreateSec)` (Asserted, Bob, 2026-08-20), so the
     /// id alone was never the name. It has only to be unique among the streams **one range
@@ -343,22 +346,48 @@ impl Stream {
         }
     }
     fn retain(&self) -> common::Result<()> {
-        self.references
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map(|_| ())
-            .map_err(|_| common::Error::new("stream reference count overflow"))
+        self.hard_references
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                if n == 0 { None } else { n.checked_add(1) }
+            })
+            .map_err(|_| {
+                common::Error::new("stream retained reference count overflow or retired")
+            })?;
+        if self
+            .soft_references
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                if n == 0 { None } else { n.checked_add(1) }
+            })
+            .is_err()
+        {
+            self.hard_references.fetch_sub(1, Ordering::Relaxed);
+            return Err(common::Error::new("stream live reference count overflow or soft-deleted"));
+        }
+        Ok(())
     }
-    fn release(&self) -> common::Result<bool> {
-        self.references
+    fn release_soft(&self) -> common::Result<bool> {
+        self.soft_references
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
             .map(|n| n == 1)
-            .map_err(|_| common::Error::new("stream reference count underflow"))
+            .map_err(|_| common::Error::new("stream live reference count underflow"))
+    }
+    fn release_hard(&self) -> common::Result<bool> {
+        self.hard_references
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .map(|n| n == 1)
+            .map_err(|_| common::Error::new("stream retained reference count underflow"))
+    }
+    /// Roll back an owning reference that never entered soft deletion.
+    fn release(&self) -> common::Result<bool> {
+        self.release_soft()?;
+        self.release_hard()
     }
     /// A stream just handed out: nothing has come to anything yet.
     fn new(id: StreamId, sn: SnId, created: TimeSec) -> Stream {
         Stream {
             deletion: Flags::default(),
-            references: AtomicU32::new(1),
+            soft_references: AtomicU32::new(1),
+            hard_references: AtomicU32::new(1),
             id,
             records: SRoff::NONE,
             created,
@@ -728,6 +757,8 @@ struct BatchCountGather {
 
 struct DN {
     config: DNConfig,
+    deleting: Mutex<()>,
+    retired_objects: Mutex<std::collections::HashSet<String>>,
     /// This DN's own identity.
     dn: DnId,
     /// The RangeId managed by this DN (#109, `routing::range_of_dn`).
@@ -744,9 +775,7 @@ struct DN {
     /// Lock an object shard before this table; never hold either across a network call.
     stream_table: RwLock<Vec<Stream>>,
     // Sparse, range-scoped metadata. Lock owner before extras, never the reverse.
-    #[allow(dead_code)]
     object_extras: Mutex<Extras<(ObjectId, TimeSec)>>,
-    #[allow(dead_code)]
     stream_extras: Mutex<Extras<(StreamId, TimeSec)>>,
 }
 
@@ -806,11 +835,9 @@ impl Service for DN {
 
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
         match request.op {
-            Op::SoftDeleteObject | Op::DeleteObject => reply.send(common::deletion::Delete::stub(
-                &request,
-                "DN object",
-                process.cluster.max_soft_delete_retention_secs,
-            )),
+            Op::SoftDeleteObject | Op::DeleteObject => {
+                reply.send(self.delete_object(process, &request))
+            }
             Op::CreateObject => self.create(process, &request, reply),
             Op::BatchCreate => self.create_many(process, &request, reply),
             Op::ObjectInfo => self.info(process, &request, None, reply),
@@ -841,19 +868,18 @@ impl Service for DN {
                 if let Err(e) = payload.done() {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                 }
-                if !rest.is_empty() {
-                    return reply.send(Resp::error(
-                        Status::BadRequest,
-                        "a locate-stream request has trailing arguments",
-                    ));
-                }
+                let include = match read_soft_deleted(rest) {
+                    Ok(value) => value,
+                    Err(error) => return reply.send(bad(error)),
+                };
                 let mut payload = StructWriter::new();
                 payload.text(&path);
                 payload.flag(expect.asked());
                 if expect.asked() {
                     Want { expect, ..Want::plain() }.write(&mut payload);
                 }
-                let request = Req::new(Op::ObjectInfo).structure(payload);
+                let request =
+                    with_read_soft_deleted(Req::new(Op::ObjectInfo).structure(payload), include);
                 self.info(process, &request, Some(record), reply)
             }
             Op::ExtendObject => self.extend(process, &request, reply),
@@ -875,6 +901,141 @@ impl Service for DN {
 }
 
 impl DN {
+    fn delete_object(&self, process: &Process, request: &Req) -> Resp {
+        match self.deleting_object(process, request) {
+            Ok(()) => Resp::ok(),
+            Err(error) => error,
+        }
+    }
+
+    fn deleting_object(&self, process: &Process, request: &Req) -> Result<(), Resp> {
+        let deletion =
+            Delete::of_with_limit(request, process.cluster.max_soft_delete_retention_secs)
+                .map_err(bad)?;
+        let Target::Object(path) = &deletion.target else {
+            return Err(bad("expected an object"));
+        };
+        let _serial = self.deleting.lock().expect("deletion");
+        let now = TimeSec::now();
+        let maximum = process.cluster.max_soft_delete_retention_secs;
+        let ids = {
+            let mut shard = self.shards[shard_of(path)].lock().expect("objects");
+            let Some(object) = shard.get_mut(path.as_str()) else {
+                return if self.retired_objects.lock().unwrap().contains(path) {
+                    Ok(())
+                } else {
+                    Err(Resp::error(Status::NotFound, "no object"))
+                };
+            };
+            if object.extending || object.streams.is_empty() {
+                return Err(bad("object creation or extension is in progress; retry deletion"));
+            }
+            let key = (object.id, object.created);
+            let mut extras = self.object_extras.lock().expect("object extras");
+            let first_hard = deletion.hard && !object.deletion.deleted();
+            let first = extras
+                .transition(
+                    key,
+                    &mut object.deletion,
+                    now,
+                    deletion.retention,
+                    deletion.hard,
+                    maximum,
+                )
+                .map_err(bad)?;
+            let interval = extras.remaining(&key, now).map_err(bad)?;
+            drop(extras);
+            let mut table = self.stream_table.write().expect("streams");
+            let mut stream_extras = self.stream_extras.lock().expect("stream extras");
+            for id in &object.streams {
+                let stream = &mut table[id.get() as usize];
+                if first && stream.release_soft().expect("owned live stream reference") {
+                    stream_extras
+                        .transition(
+                            (stream.id, stream.created),
+                            &mut stream.deletion,
+                            now,
+                            Some(interval),
+                            false,
+                            maximum,
+                        )
+                        .map_err(bad)?;
+                }
+            }
+            if first_hard {
+                for id in &object.streams {
+                    table[id.get() as usize]
+                        .release_hard()
+                        .expect("owned retained stream reference");
+                }
+            }
+            object.streams.clone()
+        };
+        // Each occurrence released a reference above; fan out once per distinct child.
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            if !seen.insert(id) {
+                continue;
+            }
+            let child = {
+                let mut table = self.stream_table.write().expect("streams");
+                let stream = &mut table[id.get() as usize];
+                if stream.soft_references.load(Ordering::Acquire) != 0 || stream.deletion.retired()
+                {
+                    continue;
+                }
+                let extras = self.stream_extras.lock().expect("stream extras");
+                let key = (stream.id, stream.created);
+                let hard = deletion.hard && stream.hard_references.load(Ordering::Acquire) == 0;
+                if hard {
+                    extras.delete(&key, &mut stream.deletion, TimeSec::now()).map_err(bad)?;
+                }
+                (
+                    stream.sn,
+                    StreamName { range: self.mine, stream: stream.id, created: stream.created },
+                    extras.remaining(&key, TimeSec::now()).map_err(bad)?,
+                    hard,
+                )
+            };
+            // Replaying soft deletion repairs an interrupted fanout before hard deletion.
+            forward(
+                process,
+                &format!("SN{}", child.0),
+                Delete { target: Target::Stream(child.1), retention: Some(child.2), hard: false },
+            )?;
+            if child.3 {
+                forward(
+                    process,
+                    &format!("SN{}", child.0),
+                    Delete { target: Target::Stream(child.1), retention: None, hard: true },
+                )?;
+                let mut table = self.stream_table.write().unwrap();
+                let stream = &mut table[id.get() as usize];
+                let key = (stream.id, stream.created);
+                assert!(self.stream_extras.lock().unwrap().reclaim(
+                    &key,
+                    stream.deletion,
+                    TimeSec::now()
+                ));
+                stream.deletion.retire(); // Keep only an unrecycled index tombstone.
+            }
+        }
+        if deletion.hard {
+            let mut shard = self.shards[shard_of(path)].lock().unwrap();
+            let object = shard.get(path.as_str()).expect("deleting object");
+            let key = (object.id, object.created);
+            assert!(self.object_extras.lock().unwrap().reclaim(
+                &key,
+                object.deletion,
+                TimeSec::now()
+            ));
+            shard.remove(path.as_str());
+            self.retired_objects.lock().unwrap().insert(path.clone());
+            self.objects.fetch_sub(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     fn seal_object(&self, request: &Req, reply: Reply) {
         let (mut payload, rest) =
             match structure(&request.args, Op::SealObject, "a seal-object request") {
@@ -901,6 +1062,9 @@ impl DN {
         let Some(object) = shard.get_mut(name.as_str()) else {
             return reply.send(Resp::error(Status::NotFound, format!("no object {name}")));
         };
+        if !object.deletion.readable(false) {
+            return reply.send(bad("object is deleted"));
+        }
         let mut table = self.stream_table.write().expect("streams");
         let Some(last) = object.streams.last().map(|id| &mut table[id.get() as usize]) else {
             return reply.send(Resp::error(Status::BadRequest, "object has no stream"));
@@ -925,6 +1089,7 @@ impl DN {
     /// by reference; the new object gets one fresh, empty stream at the end so it
     /// is immediately appendable but is not sealed.
     fn concat_objects(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Reply) {
+        let _serial = self.deleting.lock().expect("deletion");
         let retry = request.clone();
         let (mut payload, rest) =
             match structure(&request.args, Op::ConcatObjects, "a concat-objects request") {
@@ -1002,6 +1167,9 @@ impl DN {
             let Some(object) = shard.get(source.as_str()) else {
                 return reply.send(Resp::error(Status::NotFound, format!("no object {source}")));
             };
+            if !object.deletion.readable(false) {
+                return reply.send(bad("object is deleted"));
+            }
             let table = self.stream_table.read().expect("streams");
             if object.streams.is_empty()
                 || object.streams.iter().any(|id| table[id.get() as usize].records.is_none())
@@ -1306,7 +1474,8 @@ impl DN {
         let Some(object) = shard.get_mut(name) else { return };
         object.streams.push(self.install_stream(Stream {
             deletion: Flags::default(),
-            references: AtomicU32::new(1),
+            soft_references: AtomicU32::new(1),
+            hard_references: AtomicU32::new(1),
             id: stream,
             records: SRoff::NONE,
             created: object.created,
@@ -1553,6 +1722,9 @@ impl DN {
             let mut shard = self.shards[shard_of(&name)].lock().expect("objects");
             match shard.get_mut(name.as_str()) {
                 None => Next::Say(Resp::error(Status::NotFound, format!("no object {name}"))),
+                Some(object) if !object.deletion.readable(false) => {
+                    Next::Say(bad("object is deleted"))
+                }
                 Some(object) => {
                     // Whoever names the stream that filled is the one that seals it in
                     // the list; the rest are late and have nothing to record.
@@ -1698,7 +1870,7 @@ impl DN {
         record: Option<ORoff>,
         reply: Reply,
     ) {
-        let (name, want) = if matches!(request.args.first(), Some(Arg::Struct(..))) {
+        let (name, want, include) = if matches!(request.args.first(), Some(Arg::Struct(..))) {
             let (mut payload, rest) =
                 match structure(&request.args, Op::ObjectInfo, "an object-info request") {
                     Ok(value) => value,
@@ -1727,13 +1899,11 @@ impl DN {
             if let Err(e) = payload.done() {
                 return reply.send(Resp::error(Status::BadRequest, e.to_string()));
             }
-            if !rest.is_empty() {
-                return reply.send(Resp::error(
-                    Status::BadRequest,
-                    "an object-info request has trailing arguments",
-                ));
-            }
-            (name, want)
+            let include = match read_soft_deleted(rest) {
+                Ok(value) => value,
+                Err(error) => return reply.send(bad(error)),
+            };
+            (name, want, include)
         } else {
             return reply.send(Resp::error(
                 Status::BadRequest,
@@ -1759,6 +1929,19 @@ impl DN {
                         Status::Replaced,
                         format!("{name} is {} and not {}", object.named(self.mine), want.expect.0),
                     )))
+                }
+                Some(object)
+                    if object.deletion.soft_deleted() && !object.deletion.deleted() && !include =>
+                {
+                    Some(Err(bad("object is soft-deleted; reading requires read-soft-deleted")))
+                }
+                Some(object)
+                    if object.deletion.deleted()
+                        || object.streams.iter().any(|id| {
+                            self.stream_table.read().unwrap()[id.get() as usize].deletion.deleted()
+                        }) =>
+                {
+                    Some(Err(Resp::error(Status::NotFound, "object is deleted")))
                 }
                 Some(object) => match describe_at(
                     object,
@@ -1790,6 +1973,7 @@ impl DN {
                 levelled,
                 want.from.object_record().expect("validated record start"),
                 limit.min(if want.limit == 0 { limit } else { want.limit }),
+                include,
                 reply,
             ),
             Ok(Answering::Levelled(levelled)) => {
@@ -1812,6 +1996,7 @@ impl DN {
         levelled: Levelled,
         from: ORoff,
         limit: u64,
+        include: bool,
         reply: Reply,
     ) {
         // Group by SN, keeping each stream's record to start from.
@@ -1842,7 +2027,7 @@ impl DN {
         let dn = Arc::clone(self);
         for (sn, at) in by_sn {
             let identity = format!("SN{sn}");
-            let ask = ask_extents(&at, room, levelled.instances);
+            let ask = with_read_soft_deleted(ask_extents(&at, room, levelled.instances), include);
             let waiting = Arc::clone(&gather);
             let named = identity.clone();
             let mine = Arc::clone(&dn);
@@ -2101,6 +2286,9 @@ impl DN {
     fn piece(&self, name: &str, want: &Want, room: u64) -> Option<Piece> {
         let shard = self.shards[shard_of(name)].lock().expect("objects");
         let object = shard.get(name)?;
+        if !object.deletion.readable(false) {
+            return None;
+        }
         if want.detail == 0 {
             return object
                 .args(&self.stream_table.read().expect("streams"), self.mine, self.dn, None)
@@ -2152,7 +2340,8 @@ impl DN {
         table.try_reserve(count).map_err(|e| common::Error::new(e.to_string()))?;
         for n in first..end {
             let stream = Stream::new(StreamId::new(n as u32), SnId::NONE, TimeSec::EPOCH);
-            stream.references.store(0, Ordering::Relaxed);
+            stream.soft_references.store(0, Ordering::Relaxed);
+            stream.hard_references.store(0, Ordering::Relaxed);
             table.push(stream);
         }
         Ok(StreamId::new(first as u32))
@@ -2161,7 +2350,8 @@ impl DN {
     fn install_stream(&self, stream: Stream) -> StreamId {
         let id = stream.id;
         let mut table = self.stream_table.write().expect("streams");
-        assert_eq!(table[id.get() as usize].references.load(Ordering::Relaxed), 0);
+        assert_eq!(table[id.get() as usize].soft_references.load(Ordering::Relaxed), 0);
+        assert_eq!(table[id.get() as usize].hard_references.load(Ordering::Relaxed), 0);
         table[id.get() as usize] = stream;
         id
     }
@@ -2189,6 +2379,8 @@ impl DN {
     fn new(config: DNConfig, dn: DnId, mine: RangeId) -> DN {
         DN {
             config,
+            deleting: Mutex::new(()),
+            retired_objects: Mutex::new(std::collections::HashSet::new()),
             dn,
             mine,
             shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
@@ -2337,6 +2529,97 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn deletion_retry_releases_each_counter_once_and_keeps_the_name_until_success() {
+        use common::time::TimeIntSec64;
+        let dn = DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST);
+        let stream = held(0, 0, Some(1));
+        stream.soft_references.store(2, Ordering::Relaxed);
+        stream.hard_references.store(2, Ordering::Relaxed);
+        install(&dn, stream);
+        let mut object = grown();
+        object.streams = vec![StreamId::FIRST, StreamId::FIRST];
+        dn.shards[shard_of("/retry")].lock().unwrap().insert("/retry".into(), object);
+        dn.objects.store(1, Ordering::Relaxed);
+        let process = testing::process();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        process.assign_peer("SN0".into(), listener.local_addr().unwrap());
+        let seen = Arc::new(AtomicU32::new(0));
+        let count = Arc::clone(&seen);
+        let peer = std::thread::spawn(move || {
+            let mut workers = Vec::new();
+            for _ in 0..testing::messaging().peer_conns.max(1) {
+                let socket = listener.accept().unwrap().0;
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let count = Arc::clone(&count);
+                workers.push(std::thread::spawn(move || {
+                    let (mut reader, mut writer) =
+                        common::wire::accept(socket, &testing::messaging()).unwrap();
+                    for _ in 0..2 {
+                        let request = reader.request().unwrap();
+                        let n = count.fetch_add(1, Ordering::Relaxed);
+                        assert_eq!(
+                            request.op,
+                            if n == 3 { Op::DeleteStream } else { Op::SoftDeleteStream }
+                        );
+                        let mut response = if n == 0 {
+                            Resp::error(Status::Internal, "injected failure")
+                        } else {
+                            Resp::ok()
+                        };
+                        response.id = request.id;
+                        let mut bytes = Vec::new();
+                        common::wire::put_response(&mut bytes, &response).unwrap();
+                        writer.send(&mut bytes).unwrap();
+                    }
+                }));
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        let soft = Delete {
+            target: Target::Object("/retry".into()),
+            retention: Some(TimeIntSec64::MIN),
+            hard: false,
+        }
+        .request()
+        .unwrap();
+        assert_eq!(dn.delete_object(&process, &soft).status, Status::Internal);
+        {
+            let table = dn.stream_table.read().unwrap();
+            assert_eq!(table[0].soft_references.load(Ordering::Relaxed), 0);
+            assert_eq!(table[0].hard_references.load(Ordering::Relaxed), 2);
+        }
+        assert!(dn.shards[shard_of("/retry")].lock().unwrap().contains_key("/retry"));
+        assert_eq!(dn.delete_object(&process, &soft).status, Status::Ok);
+        assert_eq!(dn.stream_table.read().unwrap()[0].hard_references.load(Ordering::Relaxed), 2);
+        let hard = Delete { target: Target::Object("/retry".into()), retention: None, hard: true }
+            .request()
+            .unwrap();
+        assert_eq!(dn.delete_object(&process, &hard).status, Status::Ok);
+        assert_eq!(dn.delete_object(&process, &hard).status, Status::Ok);
+        assert!(!dn.shards[shard_of("/retry")].lock().unwrap().contains_key("/retry"));
+        let table = dn.stream_table.read().unwrap();
+        assert_eq!(table[0].hard_references.load(Ordering::Relaxed), 0);
+        assert!(table[0].deletion.retired());
+        peer.join().unwrap();
+        assert_eq!(seen.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn live_and_retained_stream_counters_are_independent() {
+        let stream = held(0, 0, Some(1));
+        stream.retain().unwrap();
+        assert!(!stream.release_soft().unwrap());
+        assert!(!stream.release_hard().unwrap());
+        assert!(stream.release_soft().unwrap());
+        assert_eq!(stream.hard_references.load(Ordering::Relaxed), 1);
+        assert!(stream.retain().is_err());
+        assert_eq!(stream.hard_references.load(Ordering::Relaxed), 1);
+        assert!(stream.release_hard().unwrap());
+    }
     #[test]
     fn shared_stream_metadata_and_reference_rollback() {
         let dn = DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST);
@@ -2347,7 +2630,7 @@ mod tests {
         {
             let mut table = dn.stream_table.write().unwrap();
             assert_eq!(table.len(), 1);
-            assert_eq!(table[0].references.load(Ordering::Relaxed), 3);
+            assert_eq!(table[0].hard_references.load(Ordering::Relaxed), 3);
             table[0].learned(Totals {
                 extents: ExtentId::new(2),
                 logical: SLoff::new(100),
@@ -2365,7 +2648,7 @@ mod tests {
         // A failed concat gives back every repeated reference it acquired.
         dn.shards[shard_of("/failed")].lock().unwrap().insert(Box::from("/failed"), second);
         dn.fail_concat("/failed", Resp::error(Status::Internal, "test"));
-        assert_eq!(dn.stream_table.read().unwrap()[0].references.load(Ordering::Relaxed), 1);
+        assert_eq!(dn.stream_table.read().unwrap()[0].hard_references.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -2382,20 +2665,20 @@ mod tests {
                 });
             }
         });
-        assert_eq!(stream.references.load(Ordering::Relaxed), 1);
+        assert_eq!(stream.hard_references.load(Ordering::Relaxed), 1);
         assert!(stream.release().unwrap());
         assert!(stream.release().is_err());
-        stream.references.store(u32::MAX, Ordering::Relaxed);
+        stream.hard_references.store(u32::MAX, Ordering::Relaxed);
         assert!(stream.retain().is_err());
-        assert_eq!(stream.references.load(Ordering::Relaxed), u32::MAX);
+        assert_eq!(stream.hard_references.load(Ordering::Relaxed), u32::MAX);
 
         let dn = DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST);
         dn.reserve_streams(2).unwrap();
         dn.install_stream(held(0, 0, None));
         dn.install_stream(held(1, 0, None));
-        dn.stream_table.read().unwrap()[1].references.store(u32::MAX, Ordering::Relaxed);
+        dn.stream_table.read().unwrap()[1].hard_references.store(u32::MAX, Ordering::Relaxed);
         assert!(dn.retain_streams(&[StreamId::new(0), StreamId::new(1)]).is_err());
-        assert_eq!(dn.stream_table.read().unwrap()[0].references.load(Ordering::Relaxed), 1);
+        assert_eq!(dn.stream_table.read().unwrap()[0].hard_references.load(Ordering::Relaxed), 1);
     }
     #[test]
     fn object_summaries_sum_streams_in_object_spaces() {
@@ -2557,7 +2840,7 @@ mod tests {
     #[test]
     fn stream_references_and_counts_are_four_bytes() {
         assert_eq!(size_of::<StreamId>(), 4);
-        assert_eq!(size_of::<Stream>(), 56);
+        assert_eq!(size_of::<Stream>(), 64);
         assert_eq!(size_of::<AtomicU32>(), 4);
     }
 
