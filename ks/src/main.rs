@@ -168,7 +168,7 @@ impl Ks {
 
     fn sn_key_for(&self, sn: common::ids::SnId, at: TimeSec) -> Result<SnKey> {
         self.ensure_day(at.day_start())?;
-        let horizon = at.plus_secs(self.config.master_key_delay_secs);
+        let horizon = at.plus_secs(self.config.master_key_delay_secs)?;
         self.ensure_day(horizon.day_start())?;
         {
             let keys = self.sn_keys.read().expect("sn_keys");
@@ -208,7 +208,7 @@ impl Ks {
         if !rest.is_empty() {
             return Err(common::Error::new("a rotate-master-key request has trailing arguments"));
         }
-        let since = TimeSec::now().plus_secs(self.config.master_key_delay_secs);
+        let since = TimeSec::now().plus_secs(self.config.master_key_delay_secs)?;
         let mut epochs = self.master_keys.write().expect("master_keys");
         let key = random_master_key()?;
         let at = epochs.partition_point(|epoch| epoch.since < since);

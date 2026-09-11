@@ -548,7 +548,7 @@ fn main() {
 
 fn run(cli: Cli) -> Result<()> {
     let cluster = ClusterConfig::load(&cli.config)?;
-    let mut timeout = Duration::from_millis(cluster.timeouts.request_ms);
+    let mut timeout = cluster.timeouts.request_ms.to_duration()?;
     // Reading log files is not an ordinary request: it can take minutes, being
     // serial on purpose so as not to compete with the work. So it gets minutes.
     if matches!(cli.cmd, Cmd::LogHistogram { .. } | Cmd::LogGrep { .. } | Cmd::LogLines { .. }) {
@@ -1973,7 +1973,7 @@ fn resolve(cluster: &ClusterConfig, cli: &Cli, kind: ServiceKind) -> Result<Targ
 
 /// Ask KS where a process is. Nothing but KS has an address of its own.
 fn lookup(cluster: &ClusterConfig, identity: &str) -> Result<SocketAddr> {
-    let timeout = Duration::from_millis(cluster.timeouts.request_ms);
+    let timeout = cluster.timeouts.request_ms.to_duration()?;
     let mut ks = Conn::open(cluster.ks.address, timeout, &cluster.messaging)?;
     let mut payload = common::wire::StructWriter::new();
     payload.text(identity);

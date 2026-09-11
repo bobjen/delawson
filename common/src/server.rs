@@ -186,10 +186,8 @@ impl Process {
             &config.identity,
             cluster.logging.build(&cluster.media_classes)?,
         )?;
-        let peers = Peers::new(
-            cluster.messaging.clone(),
-            Duration::from_millis(cluster.timeouts.request_ms),
-        );
+        let peers =
+            Peers::new(cluster.messaging.clone(), cluster.timeouts.request_ms.to_duration()?);
         Ok(Process {
             peers,
             assigned: RwLock::new(HashMap::new()),
@@ -331,7 +329,7 @@ impl Process {
     }
 
     pub fn timeout(&self) -> Duration {
-        Duration::from_millis(self.cluster.timeouts.request_ms)
+        self.cluster.timeouts.request_ms.to_duration().expect("validated request timeout")
     }
 
     /// Announce this process's port to KS, which is how anything else finds it.

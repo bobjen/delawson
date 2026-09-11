@@ -47,7 +47,8 @@ struct DailyKeyCache {
 
 struct CachedSnKey {
     key: [u8; 32],
-    until: TimeSec,
+    /// Exclusive end of the key epoch, or no known end.
+    until: Option<TimeSec>,
 }
 
 impl DailyKeyCache {
@@ -59,7 +60,7 @@ impl DailyKeyCache {
         {
             let keys = self.keys.read().expect("keys");
             if let Some((_, cached)) = keys.range((sn_id, TimeSec::EPOCH)..=(sn_id, ts)).next_back()
-                && ts < cached.until
+                && cached.until.is_none_or(|until| ts < until)
             {
                 return Ok(cached.key);
             }
@@ -126,12 +127,12 @@ impl DailyKeyCache {
                 return Err(Error::new("KS returned no key"));
             }
         };
-        let until = response.next.map_or(TimeSec::NONE, |(at, _)| at);
+        let until = response.next.map(|(at, _)| at);
         let key = response.current;
         let mut keys = self.keys.write().expect("keys");
         keys.insert((sn_id, ts), CachedSnKey { key, until });
         if let Some((at, key)) = response.next {
-            keys.insert((sn_id, at), CachedSnKey { key, until: TimeSec::NONE });
+            keys.insert((sn_id, at), CachedSnKey { key, until: None });
         }
         Ok(key)
     }

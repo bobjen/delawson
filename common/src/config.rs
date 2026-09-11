@@ -16,6 +16,7 @@
 
 use crate::offset::{ECoff, ELoff};
 use crate::placement::Expansion;
+use crate::time::{TimeIntMilli64, TimeIntSec64};
 use crate::{Context, Error, Result};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -395,10 +396,28 @@ pub struct Rings {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Timeouts {
-    pub request_ms: u64,
+    #[serde(deserialize_with = "nonnegative_milliseconds")]
+    pub request_ms: TimeIntMilli64,
     /// How long `stop-laws` waits after asking a process to stop, before
     /// escalating to a signal.
-    pub shutdown_grace_ms: u64,
+    #[serde(deserialize_with = "nonnegative_milliseconds")]
+    pub shutdown_grace_ms: TimeIntMilli64,
+}
+
+fn nonnegative_milliseconds<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<TimeIntMilli64, D::Error> {
+    let interval = TimeIntMilli64::new(i64::deserialize(d)?);
+    interval.to_duration().map_err(serde::de::Error::custom)?;
+    Ok(interval)
+}
+
+fn nonnegative_seconds<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<TimeIntSec64, D::Error> {
+    let interval = TimeIntSec64::new(i64::deserialize(d)?);
+    interval.to_duration().map_err(serde::de::Error::custom)?;
+    Ok(interval)
 }
 
 /// The cluster file as written. Roster lines are expanded into one entry per
@@ -603,7 +622,8 @@ pub struct KsConfig {
     pub lazy_day_keys: bool,
     /// Delay between generating a replacement master key and making it
     /// effective, so ENs can cache the current derived key safely.
-    pub master_key_delay_secs: u64,
+    #[serde(deserialize_with = "nonnegative_seconds")]
+    pub master_key_delay_secs: TimeIntSec64,
     /// Whether the operator-and-hardware unlocking ceremony is required before
     /// KS will answer key requests. False on a test box — and `status` says so
     /// rather than staying quiet about it.
@@ -784,6 +804,31 @@ mod expansion_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_intervals_are_finite_and_nonnegative() {
+        let timeouts: Timeouts =
+            toml::from_str("request_ms = 1500\nshutdown_grace_ms = 0").unwrap();
+        assert_eq!(timeouts.request_ms, TimeIntMilli64::new(1500));
+        assert_eq!(timeouts.shutdown_grace_ms, TimeIntMilli64::ZERO);
+        #[derive(Deserialize)]
+        struct Seconds {
+            #[serde(deserialize_with = "nonnegative_seconds")]
+            value: TimeIntSec64,
+        }
+        assert_eq!(toml::from_str::<Seconds>("value = 60").unwrap().value, TimeIntSec64::new(60));
+        for value in [-1, i64::MIN, i64::MAX - 1, i64::MAX] {
+            assert!(
+                toml::from_str::<Timeouts>(&format!("request_ms = {value}\nshutdown_grace_ms = 0"))
+                    .is_err()
+            );
+            assert!(
+                toml::from_str::<Timeouts>(&format!("request_ms = 0\nshutdown_grace_ms = {value}"))
+                    .is_err()
+            );
+            assert!(toml::from_str::<Seconds>(&format!("value = {value}")).is_err());
+        }
+    }
 
     const HEADER: &str = r#"
         schema_version = 1

@@ -48,7 +48,10 @@ pub fn cluster() -> ClusterConfig {
         rings: Rings { members: 1 },
         messaging: messaging(),
         logging: logging(),
-        timeouts: Timeouts { request_ms: 1000, shutdown_grace_ms: 1000 },
+        timeouts: Timeouts {
+            request_ms: crate::time::TimeIntMilli64::new(1000),
+            shutdown_grace_ms: crate::time::TimeIntMilli64::new(1000),
+        },
         services,
         media_classes: vec![hdd(), ssd()],
     }
