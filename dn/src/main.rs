@@ -29,8 +29,8 @@ use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::wire::{Arg, Op, Req, Resp, Status, StructWriter, structure};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 const SERVES: &[Op] = &[
     Op::CreateObject,
@@ -85,6 +85,7 @@ const BATCH_ANSWERS: u64 = Detail::Streams.bit() | Detail::Counts.bit();
 /// reads — so detail is an `object-info` feature and not a lookup feature.
 fn describe_at(
     object: &Object,
+    table: &[Stream],
     range: RangeId,
     dn: DnId,
     record: Option<ORoff>,
@@ -92,11 +93,11 @@ fn describe_at(
     limit: u64,
 ) -> Option<Answering> {
     match record {
-        Some(_) => object.args(range, dn, record).map(Answering::Plain),
-        None => match detailed(object, range, dn, want, limit) {
+        Some(_) => object.args(table, range, dn, record).map(Answering::Plain),
+        None => match detailed(object, table, range, dn, want, limit) {
             Some(levelled) => Some(Answering::Levelled(levelled)),
             // No detail asked for, so the row that predates the field, byte for byte.
-            None => object.args(range, dn, None).map(Answering::Plain),
+            None => object.args(table, range, dn, None).map(Answering::Plain),
         },
     }
 }
@@ -114,12 +115,13 @@ enum Answering {
 /// stream count is the DN's own, so it costs nothing to include and is always right.
 fn detailed(
     object: &Object,
+    table: &[Stream],
     range: RangeId,
     dn: DnId,
     want: &Want,
     limit: u64,
 ) -> Option<Levelled> {
-    let args = object.args(range, dn, None)?;
+    let args = object.args(table, range, dn, None)?;
     if want.detail == 0 {
         return None;
     }
@@ -128,7 +130,7 @@ fn detailed(
     let from = want.from.object_record().unwrap_or(ORoff::ZERO);
     // Streams are in record order, so the first to describe is the last one starting
     // at or before `from` — the same rule a read uses to pick a stream.
-    let first = object.streams_from().filter(|(at, _)| *at <= from).count().saturating_sub(1);
+    let first = object.streams_from(table).filter(|(at, _)| *at <= from).count().saturating_sub(1);
 
     // One entry for the object, then one per stream, against whichever cap is smaller.
     let cap = match want.limit {
@@ -139,7 +141,7 @@ fn detailed(
     let mut rows = Vec::new();
     let counts_only = want.wants(Detail::Counts) && !want.wants(Detail::Streams);
     if want.wants(Detail::Streams) {
-        let streams = object.streams_from().skip(first);
+        let streams = object.streams_from(table).skip(first);
         let streams = streams.take(room as usize);
         for (at, held) in streams {
             rows.push(StreamRow {
@@ -161,11 +163,15 @@ fn detailed(
     // Where to carry on: the first record of the stream after the last one described,
     // and nothing when the last stream described is the object's last.
     let after = first + rows.len();
-    let next = object.streams_from().nth(after).map_or(ORoff::NONE, |(at, _)| at);
+    let next = object.streams_from(table).nth(after).map_or(ORoff::NONE, |(at, _)| at);
     let shape = Shape {
         streams: if want.wants(Detail::Counts) { total } else { StreamId::NONE },
         given: StreamId::of_number(rows.len() as u64).expect("stream row count fits"),
-        extents: if want.wants(Detail::Counts) { object.cached_extents() } else { OEoff::NONE },
+        extents: if want.wants(Detail::Counts) {
+            object.cached_extents(table)
+        } else {
+            OEoff::NONE
+        },
         entries: 1 + rows.len() as u64,
         // ⚠️ **Wherever a stream count was given, not only where stream rows were.** A
         // summary — counts and no rows — is what a batch asks the DNs it is not leading
@@ -178,9 +184,13 @@ fn detailed(
         } else {
             ORoff::NONE
         },
-        records: if want.wants(Detail::Counts) { object.cached_records() } else { ORoff::NONE },
-        logical: if want.wants(Detail::Counts) { object.logical() } else { OLoff::NONE },
-        compressed: if want.wants(Detail::Counts) { object.compressed() } else { OCoff::NONE },
+        records: if want.wants(Detail::Counts) {
+            object.cached_records(table)
+        } else {
+            ORoff::NONE
+        },
+        logical: if want.wants(Detail::Counts) { object.logical(table) } else { OLoff::NONE },
+        compressed: if want.wants(Detail::Counts) { object.compressed(table) } else { OCoff::NONE },
     };
 
     // The shape first, then the object, then its streams — so a reader knows how many
@@ -234,7 +244,7 @@ struct Object {
     ///
     /// A stream fills, so an object grows more of them; the last is the one appends
     /// go to and the record ranges say which holds what.
-    streams: Vec<Stream>,
+    streams: Vec<StreamId>,
     /// An extension is being asked of an SN, so anything else that wants one waits
     /// rather than asking for a second.
     extending: bool,
@@ -266,14 +276,10 @@ enum Next {
 /// streams before it, and only the last stream of an object can be unsealed — so every term of
 /// that sum is known (§17.33.1).
 ///
-/// ⚠️ **The DN's largest structure, so every field here is paid 10^12 times** in §13.1.3's
-/// worst case. Adding the sizes took it from **40 to 56 bytes**, and four new fields cost
-/// the space of two only because `records` stopped being an `Option<u64>` — a sentinel in a
-/// space that already reserves one is 8 bytes where the discriminant was 8 plus padding
-/// (`EVERY-SPACE-RESERVES-A-SENTINEL`, §8.1.6.3). The layout is exact: six `u64` and two
-/// `u32`, no padding.
-#[derive(Clone, Copy)]
+/// Stored once per range, rather than once per object reference. The reference count
+/// is atomic; ordinary metadata is protected by the range's stream table lock.
 struct Stream {
+    references: AtomicU32,
     /// ⚠️ **`u32`, and safe for the reason an extent id is** (§17.29.2): a stable reference
     /// to a stream is `(RangeId, StreamId, CreateSec)` (Asserted, Bob, 2026-08-20), so the
     /// id alone was never the name. It has only to be unique among the streams **one range
@@ -308,10 +314,44 @@ struct Stream {
     extents: ExtentId,
 }
 
+/// Metadata copied only while planning a concat, never an owning reference.
+#[derive(Clone, Copy)]
+struct StreamSnapshot {
+    id: StreamId,
+    sn: SnId,
+    created: TimeSec,
+    extents: ExtentId,
+    logical: SLoff,
+    compressed: SCoff,
+}
+
 impl Stream {
+    fn snapshot(&self) -> StreamSnapshot {
+        StreamSnapshot {
+            id: self.id,
+            sn: self.sn,
+            created: self.created,
+            extents: self.extents,
+            logical: self.logical,
+            compressed: self.compressed,
+        }
+    }
+    fn retain(&self) -> common::Result<()> {
+        self.references
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map(|_| ())
+            .map_err(|_| common::Error::new("stream reference count overflow"))
+    }
+    fn release(&self) -> common::Result<bool> {
+        self.references
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .map(|n| n == 1)
+            .map_err(|_| common::Error::new("stream reference count underflow"))
+    }
     /// A stream just handed out: nothing has come to anything yet.
     fn new(id: StreamId, sn: SnId, created: TimeSec) -> Stream {
         Stream {
+            references: AtomicU32::new(1),
             id,
             records: SRoff::NONE,
             created,
@@ -359,8 +399,11 @@ impl Object {
     /// ⚠️ **Only the last stream of an object can be unsealed**, so every term of the sum
     /// before the last is a known count and the walk never meets an `UNKNOWN` it needs. The
     /// last one's own count is unknown, which is why it is the last (§17.33.1).
-    fn streams_from(&self) -> impl Iterator<Item = (ORoff, &Stream)> {
-        self.streams.iter().scan(ORoff::ZERO, |at, stream| {
+    fn streams_from<'a>(
+        &'a self,
+        table: &'a [Stream],
+    ) -> impl Iterator<Item = (ORoff, &'a Stream)> {
+        self.streams.iter().map(|id| &table[id.get() as usize]).scan(ORoff::ZERO, |at, stream| {
             let first = *at;
             if stream.records.is_some() {
                 *at = at
@@ -380,12 +423,18 @@ impl Object {
 
     /// What this object is, at one of its streams: the last for an append, or the one
     /// holding a record for a read.
-    fn args(&self, range: RangeId, dn: DnId, record: Option<ORoff>) -> Option<Vec<Arg>> {
+    fn args(
+        &self,
+        table: &[Stream],
+        range: RangeId,
+        dn: DnId,
+        record: Option<ORoff>,
+    ) -> Option<Vec<Arg>> {
         // ⚠️ The position comes back *with* the stream, because the stream does not carry
         // it (§17.33.1) — the same shape as `sn::Placed`, and for the same reason.
         let (first, held) = match record {
-            None => self.last()?,
-            Some(record) => self.holding(record)?,
+            None => self.last(table)?,
+            Some(record) => self.holding(table, record)?,
         };
         Some(
             Described {
@@ -411,8 +460,8 @@ impl Object {
     ///
     /// ⚠️ **`ORoff::NONE` while the last stream is open**, because how far that one reaches is
     /// not the DN's to say (§6.3).
-    fn records(&self) -> ORoff {
-        match self.streams_from().last() {
+    fn records(&self, table: &[Stream]) -> ORoff {
+        match self.streams_from(table).last() {
             Some((_, last)) if last.records.is_none() => ORoff::NONE,
             Some((at, last)) => {
                 at.plus(ORoff::from_stream(last.records)).expect("object record position fits")
@@ -421,59 +470,71 @@ impl Object {
         }
     }
 
-    fn cached_records(&self) -> ORoff {
-        self.streams.iter().fold(ORoff::ZERO, |total, stream| {
-            if stream.records.is_none() || total == ORoff::MAX {
-                total
-            } else {
-                total.plus(ORoff::from_stream(stream.records)).unwrap_or(ORoff::MAX)
-            }
-        })
+    fn cached_records(&self, table: &[Stream]) -> ORoff {
+        self.streams.iter().map(|id| &table[id.get() as usize]).fold(
+            ORoff::ZERO,
+            |total, stream| {
+                if stream.records.is_none() || total == ORoff::MAX {
+                    total
+                } else {
+                    total.plus(ORoff::from_stream(stream.records)).unwrap_or(ORoff::MAX)
+                }
+            },
+        )
     }
 
-    fn cached_extents(&self) -> OEoff {
-        self.streams.iter().fold(OEoff::ZERO, |total, stream| {
-            if stream.extents.is_none() {
-                total
-            } else {
-                total.plus(OEoff::from_stream(stream.extents)).unwrap_or(OEoff::MAX)
-            }
-        })
+    fn cached_extents(&self, table: &[Stream]) -> OEoff {
+        self.streams.iter().map(|id| &table[id.get() as usize]).fold(
+            OEoff::ZERO,
+            |total, stream| {
+                if stream.extents.is_none() {
+                    total
+                } else {
+                    total.plus(OEoff::from_stream(stream.extents)).unwrap_or(OEoff::MAX)
+                }
+            },
+        )
     }
 
-    fn logical(&self) -> OLoff {
-        self.streams.iter().fold(OLoff::ZERO, |total, stream| {
-            if stream.logical.is_none() || total == OLoff::MAX {
-                total
-            } else {
-                total.plus(OLoff::from_stream(stream.logical)).unwrap_or(OLoff::MAX)
-            }
-        })
+    fn logical(&self, table: &[Stream]) -> OLoff {
+        self.streams.iter().map(|id| &table[id.get() as usize]).fold(
+            OLoff::ZERO,
+            |total, stream| {
+                if stream.logical.is_none() || total == OLoff::MAX {
+                    total
+                } else {
+                    total.plus(OLoff::from_stream(stream.logical)).unwrap_or(OLoff::MAX)
+                }
+            },
+        )
     }
 
-    fn compressed(&self) -> OCoff {
-        self.streams.iter().fold(OCoff::ZERO, |total, stream| {
-            if stream.compressed.is_none() || total == OCoff::MAX {
-                total
-            } else {
-                total.plus(OCoff::from_stream(stream.compressed)).unwrap_or(OCoff::MAX)
-            }
-        })
+    fn compressed(&self, table: &[Stream]) -> OCoff {
+        self.streams.iter().map(|id| &table[id.get() as usize]).fold(
+            OCoff::ZERO,
+            |total, stream| {
+                if stream.compressed.is_none() || total == OCoff::MAX {
+                    total
+                } else {
+                    total.plus(OCoff::from_stream(stream.compressed)).unwrap_or(OCoff::MAX)
+                }
+            },
+        )
     }
 
     /// The stream appends go to, which is the last one, and where it starts.
-    fn last(&self) -> Option<(ORoff, Stream)> {
-        self.streams_from().last().map(|(at, held)| (at, *held))
+    fn last<'a>(&'a self, table: &'a [Stream]) -> Option<(ORoff, &'a Stream)> {
+        self.streams_from(table).last()
     }
 
     /// The stream holding an object-local record number: the sealed one whose range
     /// covers it, or the last, whose reach is not known here.
-    fn holding(&self, record: ORoff) -> Option<(ORoff, Stream)> {
-        for (at, held) in self.streams_from() {
+    fn holding<'a>(&'a self, table: &'a [Stream], record: ORoff) -> Option<(ORoff, &'a Stream)> {
+        for (at, held) in self.streams_from(table) {
             if held.records.is_none()
                 || record < at.plus(ORoff::from_stream(held.records)).expect("record fits")
             {
-                return Some((at, *held));
+                return Some((at, held));
             }
         }
         None
@@ -672,7 +733,9 @@ struct DN {
     /// costs.
     streams: AtomicU64,
     next_object: AtomicU64,
-    next_stream: AtomicU64,
+    /// The current DN serves one range (`mine`). StreamId indexes this range's table.
+    /// Lock an object shard before this table; never hold either across a network call.
+    stream_table: RwLock<Vec<Stream>>,
 }
 
 fn shard_of(name: &str) -> usize {
@@ -821,7 +884,8 @@ impl DN {
         let Some(object) = shard.get_mut(name.as_str()) else {
             return reply.send(Resp::error(Status::NotFound, format!("no object {name}")));
         };
-        let Some(last) = object.streams.last_mut() else {
+        let mut table = self.stream_table.write().expect("streams");
+        let Some(last) = object.streams.last().map(|id| &mut table[id.get() as usize]) else {
             return reply.send(Resp::error(Status::BadRequest, "object has no stream"));
         };
         if last.id != stream {
@@ -834,7 +898,8 @@ impl DN {
             return reply
                 .send(Resp::error(Status::BadRequest, "seal-object record count disagrees"));
         }
-        match object.args(self.mine, self.dn, None) {
+        drop(table);
+        match object.args(&self.stream_table.read().expect("streams"), self.mine, self.dn, None) {
             Some(args) => reply.send(Resp { id: 0, status: Status::Ok, args }),
             None => reply.send(Resp::error(Status::Internal, "sealed object has no description")),
         }
@@ -920,8 +985,9 @@ impl DN {
             let Some(object) = shard.get(source.as_str()) else {
                 return reply.send(Resp::error(Status::NotFound, format!("no object {source}")));
             };
+            let table = self.stream_table.read().expect("streams");
             if object.streams.is_empty()
-                || object.streams.iter().any(|stream| stream.records.is_none())
+                || object.streams.iter().any(|id| table[id.get() as usize].records.is_none())
             {
                 return reply.send(Resp::error(
                     Status::BadRequest,
@@ -949,9 +1015,11 @@ impl DN {
                 keyed = Some(object.keyed);
             }
             if source_number < single_streams.len() && object.streams.len() == 1 {
-                single_streams[source_number] = Some(object.streams[0]);
+                single_streams[source_number] =
+                    Some(table[object.streams[0].get() as usize].snapshot());
             }
-            for stream in &object.streams {
+            for id in &object.streams {
+                let stream = &table[id.get() as usize];
                 if stream.records.is_some()
                     && (stream.extents.is_none()
                         || stream.logical.is_none()
@@ -973,7 +1041,7 @@ impl DN {
                     "concat would exceed the stream-reference limit",
                 ));
             }
-            records = match records.plus(object.records()) {
+            records = match records.plus(object.records(&table)) {
                 Ok(records) => records,
                 Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
             };
@@ -1024,7 +1092,10 @@ impl DN {
         if let Some((left, right, extents, logical, compressed)) = optimized {
             let sn = format!("SN{}", left.sn);
             let sn_number = left.sn;
-            let stream = StreamId::new(self.next_stream.fetch_add(1, Ordering::Relaxed) as u32);
+            let stream = match self.reserve_streams(1) {
+                Ok(id) => id,
+                Err(e) => return reply.send(Resp::error(Status::Internal, e.to_string())),
+            };
             let created = TimeSec::now();
             {
                 let mut shard = self.shards[destination_shard].lock().expect("objects");
@@ -1095,7 +1166,10 @@ impl DN {
         };
         let sn_number =
             SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
-        let stream = StreamId::new(self.next_stream.fetch_add(1, Ordering::Relaxed) as u32);
+        let stream = match self.reserve_streams(1) {
+            Ok(id) => id,
+            Err(e) => return reply.send(Resp::error(Status::Internal, e.to_string())),
+        };
         let created = TimeSec::now();
         {
             let mut shard = self.shards[destination_shard].lock().expect("objects");
@@ -1104,6 +1178,9 @@ impl DN {
                     Status::BadRequest,
                     format!("{destination} exists already"),
                 ));
+            }
+            if let Err(e) = self.retain_streams(&copied) {
+                return reply.send(Resp::error(Status::BadRequest, e.to_string()));
             }
             let object = Object {
                 id: ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32),
@@ -1189,7 +1266,7 @@ impl DN {
     fn finish_concat(&self, name: &str, stream: StreamId, sn: SnId) {
         let mut shard = self.shards[shard_of(name)].lock().expect("objects");
         let Some(object) = shard.get_mut(name) else { return };
-        object.streams.push(Stream::new(stream, sn, object.created));
+        object.streams.push(self.install_stream(Stream::new(stream, sn, object.created)));
         object.extending = false;
         self.objects.fetch_add(1, Ordering::Relaxed);
         drop(shard);
@@ -1208,7 +1285,8 @@ impl DN {
     ) {
         let mut shard = self.shards[shard_of(name)].lock().expect("objects");
         let Some(object) = shard.get_mut(name) else { return };
-        object.streams.push(Stream {
+        object.streams.push(self.install_stream(Stream {
+            references: AtomicU32::new(1),
             id: stream,
             records: SRoff::NONE,
             created: object.created,
@@ -1216,7 +1294,7 @@ impl DN {
             compressed,
             sn,
             extents,
-        });
+        }));
         object.extending = false;
         self.objects.fetch_add(1, Ordering::Relaxed);
         drop(shard);
@@ -1230,7 +1308,10 @@ impl DN {
             .lock()
             .expect("objects")
             .remove(name)
-            .map(|object| object.waiting)
+            .map(|object| {
+                self.release_streams(&object.streams);
+                object.waiting
+            })
             .unwrap_or_default();
         for waiter in waiters {
             waiter.send(failure.clone());
@@ -1372,7 +1453,14 @@ impl DN {
         // FE's, the range matches it with the SN's.
         let named_first = mine[0].clone();
         let count = mine.len() as u64;
-        let first = self.next_stream.fetch_add(count, Ordering::Relaxed);
+        let first = match self.reserve_streams(mine.len()) {
+            Ok(id) => id.number(),
+            Err(e) => {
+                let failed = self.give_back(&mine, Status::Internal, e.to_string());
+                self.wake(&mine, Some(&failed));
+                return reply.send(failed);
+            }
+        };
         let sn = match process.pick(ServiceKind::Sn) {
             Ok(sn) => sn.to_string(),
             Err(e) => {
@@ -1403,11 +1491,11 @@ impl DN {
                 let mut shard = dn.shards[shard_of(name)].lock().expect("objects");
                 if let Some(object) = shard.get_mut(name.as_str()) {
                     let made = object.created;
-                    object.streams.push(Stream::new(
+                    object.streams.push(dn.install_stream(Stream::new(
                         StreamId::new((first + n as u64) as u32),
                         sn_number,
                         made,
-                    ));
+                    )));
                 }
             }
             dn.objects.fetch_add(count, Ordering::Relaxed);
@@ -1447,9 +1535,10 @@ impl DN {
                 Some(object) => {
                     // Whoever names the stream that filled is the one that seals it in
                     // the list; the rest are late and have nothing to record.
-                    let ours = object.streams.last().is_some_and(|last| last.id == sealed);
+                    let ours = object.streams.last().is_some_and(|last| *last == sealed);
                     if let Some(last) = object.streams.last_mut().filter(|_| ours) {
-                        last.records = records;
+                        self.stream_table.write().expect("streams")[last.get() as usize].records =
+                            records;
                     }
                     if object.extending {
                         object.waiting.push(carry.take().expect("a reply"));
@@ -1459,7 +1548,8 @@ impl DN {
                         // The sealed stream's count was just recorded above, so the object's
                         // total is known and is where the next stream starts. Reserve enough
                         // headroom for the one open stream that is about to be added.
-                        let first_record = object.records();
+                        let first_record =
+                            object.records(&self.stream_table.read().expect("streams"));
                         if first_record.number() >= OPEN_STREAM_RECORD_LIMIT {
                             Next::Say(Resp::error(
                                 Status::BadRequest,
@@ -1472,7 +1562,12 @@ impl DN {
                     } else {
                         // Somebody else extended past it already, so whatever is last
                         // now is the answer.
-                        match object.args(self.mine, self.dn, None) {
+                        match object.args(
+                            &self.stream_table.read().expect("streams"),
+                            self.mine,
+                            self.dn,
+                            None,
+                        ) {
                             Some(args) => Next::Say(Resp { id: 0, status: Status::Ok, args }),
                             None => Next::Say(Resp::error(
                                 Status::Internal,
@@ -1503,7 +1598,10 @@ impl DN {
         mut reply: Reply,
     ) {
         let created = TimeSec::now();
-        let stream = self.next_stream.fetch_add(1, Ordering::Relaxed);
+        let stream = match self.reserve_streams(1) {
+            Ok(id) => id.number(),
+            Err(e) => return reply.send(self.gave_up(&name, Status::Internal, e.to_string())),
+        };
         let sn = match process.pick(ServiceKind::Sn) {
             Ok(sn) => sn.to_string(),
             Err(e) => return reply.send(self.gave_up(&name, Status::Internal, e.to_string())),
@@ -1530,11 +1628,11 @@ impl DN {
             {
                 let mut shard = dn.shards[shard_of(&name)].lock().expect("objects");
                 if let Some(object) = shard.get_mut(name.as_str()) {
-                    object.streams.push(Stream::new(
+                    object.streams.push(dn.install_stream(Stream::new(
                         StreamId::new(stream as u32),
                         sn_number,
-                        TimeSec::now(),
-                    ));
+                        created,
+                    )));
                     object.extending = false;
                 }
             }
@@ -1563,7 +1661,11 @@ impl DN {
     /// Release names taken for objects that could not be given a stream.
     fn give_back(&self, names: &[String], status: Status, why: String) -> Resp {
         for name in names {
-            self.shards[shard_of(name)].lock().expect("objects").remove(name.as_str());
+            if let Some(object) =
+                self.shards[shard_of(name)].lock().expect("objects").remove(name.as_str())
+            {
+                self.release_streams(&object.streams);
+            }
         }
         Resp::error(status, why)
     }
@@ -1637,8 +1739,15 @@ impl DN {
                         format!("{name} is {} and not {}", object.named(self.mine), want.expect.0),
                     )))
                 }
-                Some(object) => match describe_at(object, self.mine, self.dn, record, &want, limit)
-                {
+                Some(object) => match describe_at(
+                    object,
+                    &self.stream_table.read().expect("streams"),
+                    self.mine,
+                    self.dn,
+                    record,
+                    &want,
+                    limit,
+                ) {
                     Some(answering) => Some(Ok(answering)),
                     None if object.between_streams() => {
                         object.waiting.push(carry.take().expect("a reply"));
@@ -1740,7 +1849,9 @@ impl DN {
         // Gone while the SNs answered: a deleted object is not a lost update worth caring
         // about, since the streams it named are going away too.
         let Some(object) = shard.get_mut(name) else { return };
-        for held in &mut object.streams {
+        let mut table = self.stream_table.write().expect("streams");
+        for id in &object.streams {
+            let held = &mut table[id.get() as usize];
             if let Some((run, _)) = runs.iter().flatten().find(|(run, _)| run.stream == held.id) {
                 held.learned(run.totals);
             }
@@ -1755,9 +1866,15 @@ impl DN {
             let (waiters, args) = {
                 let mut shard = self.shards[shard_of(name)].lock().expect("objects");
                 match shard.get_mut(name.as_str()) {
-                    Some(object) => {
-                        (std::mem::take(&mut object.waiting), object.args(self.mine, self.dn, None))
-                    }
+                    Some(object) => (
+                        std::mem::take(&mut object.waiting),
+                        object.args(
+                            &self.stream_table.read().expect("streams"),
+                            self.mine,
+                            self.dn,
+                            None,
+                        ),
+                    ),
                     None => (Vec::new(), None),
                 }
             };
@@ -1964,15 +2081,20 @@ impl DN {
         let shard = self.shards[shard_of(name)].lock().expect("objects");
         let object = shard.get(name)?;
         if want.detail == 0 {
-            return object.args(self.mine, self.dn, None).map(|args| Piece {
-                entries: 1,
-                whole: true,
-                args,
-            });
+            return object
+                .args(&self.stream_table.read().expect("streams"), self.mine, self.dn, None)
+                .map(|args| Piece { entries: 1, whole: true, args });
         }
         // Room is what the limit has left, and an object costs at least its own entry, so a name
         // reached with no room to spare still gets its row and no streams.
-        let levelled = detailed(object, self.mine, self.dn, want, room.max(1))?;
+        let levelled = detailed(
+            object,
+            &self.stream_table.read().expect("streams"),
+            self.mine,
+            self.dn,
+            want,
+            room.max(1),
+        )?;
         let (entries, whole) = (levelled.shape.entries, !levelled.shape.more());
         Some(Piece { entries, whole, args: levelled.args() })
     }
@@ -1989,15 +2111,60 @@ impl DN {
 
     /// ⚠️ **Takes the name's shard lock** — see `look`.
     fn describe(&self, name: &str, record: Option<ORoff>) -> Option<Vec<Arg>> {
-        self.shards[shard_of(name)]
-            .lock()
-            .expect("objects")
-            .get(name)?
-            .args(self.mine, self.dn, record)
+        self.shards[shard_of(name)].lock().expect("objects").get(name)?.args(
+            &self.stream_table.read().expect("streams"),
+            self.mine,
+            self.dn,
+            record,
+        )
     }
 }
 
 impl DN {
+    fn reserve_streams(&self, count: usize) -> common::Result<StreamId> {
+        let mut table = self.stream_table.write().expect("streams");
+        let first = table.len();
+        let end = first
+            .checked_add(count)
+            .filter(|end| *end as u64 <= StreamId::NONE.number())
+            .ok_or_else(|| common::Error::new("stream table is full"))?;
+        table.try_reserve(count).map_err(|e| common::Error::new(e.to_string()))?;
+        for n in first..end {
+            let stream = Stream::new(StreamId::new(n as u32), SnId::NONE, TimeSec::EPOCH);
+            stream.references.store(0, Ordering::Relaxed);
+            table.push(stream);
+        }
+        Ok(StreamId::new(first as u32))
+    }
+
+    fn install_stream(&self, stream: Stream) -> StreamId {
+        let id = stream.id;
+        let mut table = self.stream_table.write().expect("streams");
+        assert_eq!(table[id.get() as usize].references.load(Ordering::Relaxed), 0);
+        table[id.get() as usize] = stream;
+        id
+    }
+
+    fn retain_streams(&self, ids: &[StreamId]) -> common::Result<()> {
+        let table = self.stream_table.read().expect("streams");
+        for (i, id) in ids.iter().enumerate() {
+            if let Err(e) = table[id.get() as usize].retain() {
+                for prior in &ids[..i] {
+                    table[prior.get() as usize].release().expect("retained reference");
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    fn release_streams(&self, ids: &[StreamId]) {
+        let table = self.stream_table.read().expect("streams");
+        for id in ids {
+            table[id.get() as usize].release().expect("owned reference");
+        }
+    }
+
     fn new(config: DNConfig, dn: DnId, mine: RangeId) -> DN {
         DN {
             config,
@@ -2010,7 +2177,7 @@ impl DN {
             // ⚠️ From zero, because the sentinel is at the top of the range now: slot 0 of an
             // arena is a real object, and starting at one would waste it (§17.37.2).
             next_object: AtomicU64::new(0),
-            next_stream: AtomicU64::new(0),
+            stream_table: RwLock::new(Vec::new()),
         }
     }
 }
@@ -2148,7 +2315,75 @@ fn main() {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn shared_stream_metadata_and_reference_rollback() {
+        let dn = DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST);
+        let id = dn.reserve_streams(1).unwrap();
+        assert_eq!(id, StreamId::FIRST);
+        dn.install_stream(held(id.get(), 0, Some(12)));
+        dn.retain_streams(&[id, id]).unwrap();
+        {
+            let mut table = dn.stream_table.write().unwrap();
+            assert_eq!(table.len(), 1);
+            assert_eq!(table[0].references.load(Ordering::Relaxed), 3);
+            table[0].learned(Totals {
+                extents: ExtentId::new(2),
+                logical: SLoff::new(100),
+                compressed: SCoff::new(80),
+            });
+        }
+        let mut first = grown();
+        first.streams = vec![id];
+        let mut second = grown();
+        second.streams = vec![id, id];
+        let table = dn.stream_table.read().unwrap();
+        assert_eq!(first.logical(&table), OLoff::new(100));
+        assert_eq!(second.logical(&table), OLoff::new(200));
+        drop(table);
+        // A failed concat gives back every repeated reference it acquired.
+        dn.shards[shard_of("/failed")].lock().unwrap().insert(Box::from("/failed"), second);
+        dn.fail_concat("/failed", Resp::error(Status::Internal, "test"));
+        assert_eq!(dn.stream_table.read().unwrap()[0].references.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn stream_reference_counts_are_atomic_and_checked() {
+        let stream = held(0, 0, None);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let stream = &stream;
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        stream.retain().unwrap();
+                        assert!(!stream.release().unwrap());
+                    }
+                });
+            }
+        });
+        assert_eq!(stream.references.load(Ordering::Relaxed), 1);
+        assert!(stream.release().unwrap());
+        assert!(stream.release().is_err());
+        stream.references.store(u32::MAX, Ordering::Relaxed);
+        assert!(stream.retain().is_err());
+        assert_eq!(stream.references.load(Ordering::Relaxed), u32::MAX);
+
+        let dn = DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST);
+        dn.reserve_streams(2).unwrap();
+        dn.install_stream(held(0, 0, None));
+        dn.install_stream(held(1, 0, None));
+        dn.stream_table.read().unwrap()[1].references.store(u32::MAX, Ordering::Relaxed);
+        assert!(dn.retain_streams(&[StreamId::new(0), StreamId::new(1)]).is_err());
+        assert_eq!(dn.stream_table.read().unwrap()[0].references.load(Ordering::Relaxed), 1);
+    }
+    #[test]
     fn object_summaries_sum_streams_in_object_spaces() {
+        let table: Vec<Stream> = (0..2)
+            .map(|n| Stream {
+                extents: ExtentId::MAX,
+                logical: SLoff::new((1 << 32) + 17),
+                compressed: SCoff::new((1 << 32) + 3),
+                ..held(n, 0, Some(1))
+            })
+            .collect();
         let object = Object {
             id: ObjectId::FIRST,
             framing: Framing::Lf,
@@ -2156,23 +2391,17 @@ mod tests {
             waiting: Vec::new(),
             keyed: false,
             created: TimeSec::new(100),
-            streams: (0..2)
-                .map(|n| Stream {
-                    extents: ExtentId::MAX,
-                    logical: SLoff::new((1 << 32) + 17),
-                    compressed: SCoff::new((1 << 32) + 3),
-                    ..held(n, 0, Some(1))
-                })
-                .collect(),
+            streams: vec![StreamId::new(0), StreamId::new(1)],
         };
-        let extents: OEoff = object.cached_extents();
-        let logical: OLoff = object.logical();
-        let compressed: OCoff = object.compressed();
+        let extents: OEoff = object.cached_extents(&table);
+        let logical: OLoff = object.logical(&table);
+        let compressed: OCoff = object.compressed(&table);
         assert_eq!(extents, OEoff::new(2 * ExtentId::MAX.number()));
         assert_eq!(logical, OLoff::new(2 * ((1 << 32) + 17)));
         assert_eq!(compressed, OCoff::new(2 * ((1 << 32) + 3)));
         let described = detailed(
             &object,
+            &table,
             RangeId::FIRST,
             DnId::FIRST,
             &Want::plain().with(Detail::Counts),
@@ -2207,7 +2436,7 @@ mod tests {
             Object {
                 id: ObjectId::new(2),
                 framing: Framing::Lf,
-                streams: vec![held(0, 0, None)],
+                streams: vec![install(&dn, held(0, 0, None))],
                 extending: false,
                 waiting: Vec::new(),
                 keyed: false,
@@ -2284,31 +2513,26 @@ mod tests {
         }
     }
 
+    fn install(dn: &DN, stream: Stream) -> StreamId {
+        let id = stream.id;
+        let len = dn.stream_table.read().unwrap().len();
+        if len <= id.get() as usize {
+            dn.reserve_streams(id.get() as usize + 1 - len).unwrap();
+        }
+        dn.install_stream(stream)
+    }
+
+    fn grown_streams() -> Vec<Stream> {
+        vec![held(0, 0, Some(0)), held(1, 0, Some(100)), held(2, 1, Some(50)), held(3, 2, None)]
+    }
+
     use std::mem::size_of;
 
-    /// What one stream costs an object's list here. As with the SN (§4.7 again),
-    /// the design budgets a **4 byte** node-local reference and this inlines the
-    /// record, so an object's stream list is ten times its budget.
     #[test]
-    fn a_stream_costs_an_object_more_than_a_reference() {
-        let each = size_of::<Stream>();
-        assert_eq!(each, 48, "if this moved, §4.7 and issue #9 want to hear about it");
-        // ⚠️ **40, then 56, now 48.** The sizes went in (§17.25.1) — a creation second, an
-        // extent count, a logical length and a compressed one, for the space of two, because
-        // `records` stopped being an `Option<u64>` in the same change. Then the stream's
-        // position came out again (§17.33.1), because a stream shared between objects has no
-        // single one. Net: four fields gained and eight bytes, for a stream that now says
-        // what it holds rather than where somebody put it.
-        // ⚠️ Four `u64` and three `u32` is 44, and the alignment rounds it to 48 — so the
-        // id narrowing to `u32` (§17.33.2) bought nothing here, and would buy 8 bytes the
-        // moment a fourth `u32` joins it. Worth knowing before anyone claims it as a saving.
-        assert_eq!(4 * size_of::<u64>() + 3 * size_of::<u32>(), 44, "and 4 bytes of padding");
-        for bits in [24u32, 27, 32] {
-            println!(
-                "2^{bits} streams in one object = {:.0} GB",
-                each as f64 * 2f64.powi(bits as i32) / 1e9
-            );
-        }
+    fn stream_references_and_counts_are_four_bytes() {
+        assert_eq!(size_of::<StreamId>(), 4);
+        assert_eq!(size_of::<Stream>(), 56);
+        assert_eq!(size_of::<AtomicU32>(), 4);
     }
 
     use super::*;
@@ -2358,7 +2582,7 @@ mod tests {
             .get_mut("/half")
             .unwrap()
             .streams
-            .push(held(7, 0, None));
+            .push(install(&dn, held(7, 0, None)));
         let args = dn.look("/half").expect("an object");
         // ⚠️ Read through the shape rather than by index: the stream is a whole name now
         // (#109), so its id is no longer argument one, and an index would have gone on
@@ -2403,6 +2627,8 @@ mod tests {
     /// continuous across them. This is the arithmetic the DN answers reads with.
     #[test]
     fn an_objects_streams_carry_on_from_one_another() {
+        let table =
+            vec![held(0, 0, Some(0)), held(1, 0, Some(10)), held(2, 0, Some(5)), held(3, 0, None)];
         let mut object = Object {
             id: ObjectId::new(1),
             framing: Framing::Lf,
@@ -2413,20 +2639,20 @@ mod tests {
             created: TimeSec::new(1_000_000),
         };
         // Two sealed streams and one still open.
-        object.streams.push(held(1, 0, Some(10)));
-        object.streams.push(held(2, 0, Some(5)));
-        object.streams.push(held(3, 0, None));
+        object.streams.push(StreamId::new(1));
+        object.streams.push(StreamId::new(2));
+        object.streams.push(StreamId::new(3));
 
-        assert_eq!(object.holding(ORoff::new(0)).unwrap().1.id, StreamId::new(1));
-        assert_eq!(object.holding(ORoff::new(9)).unwrap().1.id, StreamId::new(1));
-        assert_eq!(object.holding(ORoff::new(10)).unwrap().1.id, StreamId::new(2));
-        assert_eq!(object.holding(ORoff::new(14)).unwrap().1.id, StreamId::new(2));
-        assert_eq!(object.holding(ORoff::new(15)).unwrap().1.id, StreamId::new(3));
+        assert_eq!(object.holding(&table, ORoff::new(0)).unwrap().1.id, StreamId::new(1));
+        assert_eq!(object.holding(&table, ORoff::new(9)).unwrap().1.id, StreamId::new(1));
+        assert_eq!(object.holding(&table, ORoff::new(10)).unwrap().1.id, StreamId::new(2));
+        assert_eq!(object.holding(&table, ORoff::new(14)).unwrap().1.id, StreamId::new(2));
+        assert_eq!(object.holding(&table, ORoff::new(15)).unwrap().1.id, StreamId::new(3));
         // Past everything sealed goes to the open stream, whose reach is not known
         // here — the SN and EN say whether the record is really there.
-        assert_eq!(object.holding(ORoff::new(1000)).unwrap().1.id, StreamId::new(3));
+        assert_eq!(object.holding(&table, ORoff::new(1000)).unwrap().1.id, StreamId::new(3));
         // And an append always goes to the last.
-        assert_eq!(object.last().unwrap().1.id, StreamId::new(3));
+        assert_eq!(object.last(&table).unwrap().1.id, StreamId::new(3));
         assert!(!object.between_streams());
     }
 
@@ -2441,9 +2667,9 @@ mod tests {
             keyed: false,
             created: TimeSec::new(1_000_000),
         };
-        object.streams.push(held(1, 0, Some(100)));
-        object.streams.push(held(2, 1, Some(50)));
-        object.streams.push(held(3, 2, None));
+        object.streams.push(StreamId::new(1));
+        object.streams.push(StreamId::new(2));
+        object.streams.push(StreamId::new(3));
         object
     }
 
@@ -2462,7 +2688,9 @@ mod tests {
 
     fn scoped_summary(base: ORoff) -> (Levelled, ExtentRun, ExtentRow) {
         let want = Want::plain().with(Detail::Streams).with(Detail::Counts);
-        let mut summary = detailed(&grown(), RangeId::new(0), DnId::new(0), &want, 100).unwrap();
+        let mut summary =
+            detailed(&grown(), &grown_streams(), RangeId::new(0), DnId::new(0), &want, 100)
+                .unwrap();
         summary.rows.truncate(1);
         summary.rows[0].first_record = base;
         summary.shape.given = StreamId::new(1);
@@ -2721,12 +2949,28 @@ mod tests {
     #[test]
     fn wanting_nothing_answers_the_bare_row() {
         assert!(
-            detailed(&grown(), RangeId::new(0), DnId::new(0), &Want::plain(), 100).is_none(),
+            detailed(
+                &grown(),
+                &grown_streams(),
+                RangeId::new(0),
+                DnId::new(0),
+                &Want::plain(),
+                100
+            )
+            .is_none(),
             "nothing levelled to build"
         );
         let object = grown();
-        match describe_at(&object, RangeId::new(0), DnId::new(0), None, &Want::plain(), 100)
-            .expect("an answer")
+        match describe_at(
+            &object,
+            &grown_streams(),
+            RangeId::new(0),
+            DnId::new(0),
+            None,
+            &Want::plain(),
+            100,
+        )
+        .expect("an answer")
         {
             Answering::Plain(args) => {
                 assert_eq!(args.len(), Described::ARGS);
@@ -2743,8 +2987,15 @@ mod tests {
         let want = Want::plain().with(Detail::Streams).with(Detail::Counts);
         // Two entries: one for the object, so room for one stream.
         let args = flat(
-            detailed(&grown(), RangeId::new(0), DnId::new(0), &Want { limit: 2, ..want }, 100)
-                .expect("an answer"),
+            detailed(
+                &grown(),
+                &grown_streams(),
+                RangeId::new(0),
+                DnId::new(0),
+                &Want { limit: 2, ..want },
+                100,
+            )
+            .expect("an answer"),
         );
         let (shape, rows) = read_back(&args);
         assert_eq!(shape.streams, StreamId::new(3), "how many there are");
@@ -2766,6 +3017,7 @@ mod tests {
             let args = flat(
                 detailed(
                     &object,
+                    &grown_streams(),
                     RangeId::new(0),
                     DnId::new(0),
                     &Want { limit: 2, from: Start::Record(at), ..want },
@@ -2797,6 +3049,7 @@ mod tests {
             let args = flat(
                 detailed(
                     &grown(),
+                    &grown_streams(),
                     RangeId::new(0),
                     DnId::new(0),
                     &Want { limit: asked, ..want },
@@ -2818,8 +3071,15 @@ mod tests {
     fn the_growing_stream_says_unknown_and_not_zero() {
         let want = Want::plain().with(Detail::Streams);
         let args = flat(
-            detailed(&grown(), RangeId::new(0), DnId::new(0), &Want { limit: 100, ..want }, 100)
-                .expect("an answer"),
+            detailed(
+                &grown(),
+                &grown_streams(),
+                RangeId::new(0),
+                DnId::new(0),
+                &Want { limit: 100, ..want },
+                100,
+            )
+            .expect("an answer"),
         );
         let (_, rows) = read_back(&args);
         assert_eq!(rows[0].records, SRoff::new(100));
@@ -2833,8 +3093,10 @@ mod tests {
     #[test]
     fn counts_alone_bring_no_rows_but_say_where_rows_start() {
         let want = Want::plain().with(Detail::Counts);
-        let args =
-            flat(detailed(&grown(), RangeId::new(0), DnId::new(0), &want, 100).expect("an answer"));
+        let args = flat(
+            detailed(&grown(), &grown_streams(), RangeId::new(0), DnId::new(0), &want, 100)
+                .expect("an answer"),
+        );
         let (shape, rows) = read_back(&args);
         assert_eq!(
             (shape.streams, shape.given, shape.entries),
@@ -2855,7 +3117,7 @@ mod tests {
                 Object {
                     id: ObjectId::new(n as u32 + 1),
                     framing: Framing::Lf,
-                    streams: vec![held(n as u32 + 1, 0, None)],
+                    streams: vec![install(&dn, held(n as u32 + 1, 0, None))],
                     extending: false,
                     waiting: Vec::new(),
                     keyed: false,

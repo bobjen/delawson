@@ -18161,3 +18161,32 @@ record-then-offset encoding now carries its extra offset before the expectation.
 Direct unit tests cover repeated requests, independently arriving SN replies,
 typed starts, pagination through an open extent, counts under row limits, and
 DN/FE trimming. No live cluster is needed for these tests.
+
+### 17.44 Shared stream and extent tables before deletion
+
+The DN keeps a vector of Stream records for its range, indexed by StreamId.
+Objects keep vectors of StreamId, so concatenating objects shares one stream's
+metadata rather than copying it. The current implementation serves one range
+per DN; this table belongs to that range, not to a machine-wide ID namespace.
+The SN likewise keeps a vector of Extent records indexed by ExtentId. Its
+streams keep vectors of sealed ExtentId and an optional open ExtentId. Sealed
+record counts, logical/compressed sizes, creation time, and instance locations
+belong to the shared extent record.
+
+DN streams and SN extents each carry an AtomicU32 reference count. Each
+occurrence in an owning list counts, including repeated IDs from self-concat.
+Increment/decrement use checked atomic updates; overflow and underflow do not
+wrap. Failed acquisition rolls back the increments it already performed.
+Temporary response and planning snapshots do not own references.
+
+These four-byte indexes do not replace full external identities: streams are
+(RangeId, StreamId, TimeSec), and extents are (SnId, ExtentId, TimeSec). A stream
+creation reply records the timestamp sent in its request, not a fresh clock
+reading when the reply arrives.
+
+The owner shard is locked before its shared table, and neither lock is held
+across a network operation. Table growth/mutable metadata still use a table lock;
+reference-count changes themselves are atomic. DN reserves vector slots before
+asynchronous stream creation and publishes them to objects on success. Failed
+reservations remain unreferenced; there is no recycling yet. This refactor
+prepares shared ownership for deletion; it does not implement deletion messages.
