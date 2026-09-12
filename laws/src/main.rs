@@ -1860,8 +1860,10 @@ fn records_of(framing: Framing, pieces: &[Piece]) -> Result<Vec<(u64, Vec<u8>)>>
     let mut carry: Vec<u8> = Vec::new();
     let mut numbering = pieces.first().map_or(0, |piece| piece.first_record.number());
     for piece in pieces {
-        let body_len = piece.logical.get() - piece.records.get() * 4;
-        let expected = body_len + piece.records.get() * framing.overhead() as u32;
+        let expected = framing
+            .block_size(piece.logical.number(), piece.records.number(), &carry)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| Error::new("decompressed block size overflow"))?;
         let block = expand(Compress::Lz4, &piece.bytes, expected as usize)?;
         if piece.crc != 0 && piece.crc != common::crc::of(&block) {
             return Err(Error::new(format!(
@@ -2588,6 +2590,31 @@ mod tests {
         assert_ne!(asked, Want::plain(), "but it still travels, since the limit is meant");
     }
 
+    #[test]
+    fn split_records_decompress_in_their_original_framing() {
+        for (framing, first, second) in [
+            (Framing::Lf, b"part".as_slice(), b"two\n".as_slice()),
+            (Framing::CrLf, b"part".as_slice(), b"two\r\n".as_slice()),
+            (Framing::Length, b"\x07\0\0\0part".as_slice(), b"two".as_slice()),
+        ] {
+            let mut open = Vec::new();
+            let mut pieces = Vec::new();
+            for bytes in [first, second] {
+                let stored = squeeze(Compress::Lz4, bytes).unwrap_or_else(|| bytes.to_vec());
+                let holds = Holds::of(framing, &open, bytes, stored.len()).unwrap();
+                pieces.push(Piece {
+                    logical: holds.logical,
+                    records: holds.records,
+                    first_record: ORoff::ZERO,
+                    crc: common::crc::of(bytes),
+                    bytes: stored,
+                });
+                open = framing.advance(&open, bytes).unwrap().1;
+            }
+            assert_eq!(records_of(framing, &pieces).unwrap(), vec![(0, b"parttwo".to_vec())]);
+        }
+    }
+
     /// Decompressing checks the CRC over the uncompressed block bytes.
     #[test]
     fn records_of_verifies_crc_over_block_bytes() {
@@ -2597,14 +2624,14 @@ mod tests {
         let block1 = frame(framing, body1).unwrap();
         let block2 = frame(framing, body2).unwrap();
         let piece1 = Piece {
-            logical: ELoff::new(framing.canonical_size(0, &block1).unwrap() as u32),
+            logical: ELoff::new(framing.canonical_size(b"", &block1).unwrap() as u32),
             first_record: ORoff::ZERO,
             records: ERoff::new(1),
             crc: common::crc::of(&block1),
             bytes: block1.clone(),
         };
         let piece2 = Piece {
-            logical: ELoff::new(framing.canonical_size(0, &block2).unwrap() as u32),
+            logical: ELoff::new(framing.canonical_size(b"", &block2).unwrap() as u32),
             first_record: ORoff::new(1),
             records: ERoff::new(1),
             crc: common::crc::of(&block2),

@@ -78,6 +78,26 @@ def main():
             run(laws + ['object-info', '/empty', '--want', 'extents'])
             info = run(laws + ['object-info', '/empty', '--want', 'counts']).decode()
             assert '3 records' in info and '0 logical' in info, info
+            # Every framing exposes its own byte length, while the canonical
+            # payload is the same. Repeated summaries must not add framing twice.
+            for framing, framed, records in [
+                ('lf', b'ab\n\n', [b'ab', b'']),
+                ('nul', b'ab\0\0', [b'ab', b'']),
+                ('crlf', b'ab\r\n\r\n', [b'ab', b'']),
+                ('length', b'\x02\0\0\0ab\0\0\0\0', [b'ab', b'']),
+                ('fixed:1', b'ab', [b'a', b'b']),
+            ]:
+                path = '/framed-' + framing.replace(':', '-')
+                block = work/'block'
+                block.write_bytes(framed)
+                run(laws + ['append-block', path, '--framing', framing, '--file', block])
+                for record, expected in enumerate(records):
+                    assert run(laws + ['read', path, '--record', record, '--framing', framing]) == expected+b'\n'
+                run(laws + ['seal', path])
+                for _ in range(2):
+                    run(laws + ['object-info', path, '--want', 'extents'])
+                    info = run(laws + ['object-info', path, '--want', 'counts']).decode()
+                    assert '2 records' in info and f'{len(framed)} logical' in info, info
             # One large incompressible append remains one record across read budgets.
             data = os.urandom(4 * 1024 * 1024)
             append('/large-bytes', data)
@@ -88,7 +108,7 @@ def main():
             run(laws + ['seal', '/large-bytes'])
             run(laws + ['concat', '/joined', '/empty', '/large-bytes', '/empty', '/large-bytes'])
             assert read('/joined', len(data)-2, 9) == data[-2:]+b'end'+data[:4]
-            print('PASS: bytes offsets, empty records, record access, sizes, seals, large appends, and concat.')
+            print('PASS: bytes offsets, empty records, record access, sizes in every framing, seals, large appends, and concat.')
         finally:
             run([ROOT/'scripts/stop-laws', '--run-dir', work/'run', '--clean'])
 

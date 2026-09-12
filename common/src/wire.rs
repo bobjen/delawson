@@ -824,6 +824,8 @@ pub struct AppendBlock {
     pub holds: crate::block::Holds,
     /// The canonical logical offset assigned by the primary, for secondaries.
     pub logical_offset: Option<ELoff>,
+    /// Optional expected extent record count; required on replica application.
+    pub record_offset: Option<ERoff>,
     /// The **(EnId, DiskId)** pairs holding it, primary first.
     pub instances: Vec<(EnId, DiskId)>,
     /// The block as stored: compressed, unless compressing it did not help.
@@ -996,6 +998,8 @@ impl AppendBlock {
         payload.eroff(self.holds.records);
         payload.flag(self.logical_offset.is_some());
         payload.eloff(self.logical_offset.unwrap_or(ELoff::ZERO));
+        payload.flag(self.record_offset.is_some());
+        payload.eroff(self.record_offset.unwrap_or(ERoff::ZERO));
         payload.number_u32(self.instances.len() as u32);
         for (en, disk) in &self.instances {
             payload.en_id(*en);
@@ -1036,6 +1040,8 @@ impl AppendBlock {
         };
         let has_logical = payload.flag()?;
         let logical = payload.eloff()?;
+        let has_record = payload.flag()?;
+        let record = payload.eroff()?;
         let count = payload.number_u32()?;
         let mut instances = payload.checked_vec(count)?;
         for _ in 0..count {
@@ -1075,6 +1081,7 @@ impl AppendBlock {
                 holds,
                 instances,
                 logical_offset: has_logical.then_some(logical),
+                record_offset: has_record.then_some(record),
                 bytes: pieces.first().map_or_else(Vec::new, |piece| piece.bytes.clone()),
                 pieces,
             },
@@ -1588,6 +1595,7 @@ mod tests {
                 records: crate::offset::ERoff::new(2),
             },
             logical_offset: None,
+            record_offset: None,
             instances: vec![
                 (EnId::new(2), DiskId::new(0)),
                 (EnId::new(3), DiskId::new(0)),
@@ -1617,6 +1625,7 @@ mod tests {
         let onward = AppendBlock {
             instances: Vec::new(),
             logical_offset: Some(ELoff::new(512)),
+            record_offset: Some(ERoff::new(9)),
             ..block.clone()
         };
         let (read_en, read_disk, read_block) =
@@ -1668,6 +1677,7 @@ mod tests {
                 records: crate::offset::ERoff::new(5),
             },
             logical_offset: Some(crate::offset::ELoff::new(7)),
+            record_offset: Some(ERoff::new(2)),
             instances: Vec::new(),
             bytes: b"one".to_vec(),
             pieces: vec![

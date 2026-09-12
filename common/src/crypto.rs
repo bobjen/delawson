@@ -41,9 +41,16 @@ pub fn extent_key(
     okm
 }
 
-pub fn derive_block_secrets(extent_key: &[u8; 32], offset: u64) -> ([u8; 16], [u8; 16]) {
-    let mut info = [0u8; 8];
-    info.copy_from_slice(&offset.to_le_bytes());
+/// Bind both extent-local starting coordinates to the block key and nonce.
+/// Fixed-width fields make the context unambiguous; neither coordinate alone is unique.
+pub fn derive_block_secrets(
+    extent_key: &[u8; 32],
+    offset: u64,
+    record: u64,
+) -> ([u8; 16], [u8; 16]) {
+    let mut info = [0u8; 16];
+    info[..8].copy_from_slice(&offset.to_le_bytes());
+    info[8..].copy_from_slice(&record.to_le_bytes());
     let hk = Hkdf::<Sha256>::new(None, extent_key);
     let mut okm = [0u8; 32];
     hk.expand(&info, &mut okm).expect("32 bytes is valid for HKDF-SHA256");
@@ -73,4 +80,19 @@ pub fn decrypt_block(
 ) -> Result<Vec<u8>> {
     let cipher = Aegis128X2::<16>::new(key, nonce);
     cipher.decrypt(sealed, tag, ad).map_err(|e| Error::new(format!("decryption failed: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_identity_includes_byte_and_record_offsets() {
+        let extent = [7; 32];
+        let base = derive_block_secrets(&extent, 0, 0);
+        assert_ne!(base, derive_block_secrets(&extent, 0, 1));
+        assert_ne!(base, derive_block_secrets(&extent, 1, 0));
+        assert_ne!(derive_block_secrets(&extent, 0, 1), derive_block_secrets(&extent, 1, 0));
+        assert_eq!(base, derive_block_secrets(&extent, 0, 0));
+    }
 }

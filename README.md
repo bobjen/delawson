@@ -266,8 +266,9 @@ past EOF succeeds with no bytes; a read crossing EOF returns the available suffi
 Each append block counts as one record, even an empty append. FE stores a hidden
 four-byte length before each block. `read --record N --framing bytes` retains the
 existing textual CLI record display; `read-bytes` strips all hidden framing.
-ObjectInfo sizes use the visible bytes space; record counts still include empty
-appends. Counts-only sizes use existing DN caches: request `object-info /file
+Canonical lengths count payload bytes, with record counts tracked separately.
+ObjectInfo adds the object framing overhead; bytes mode adds none. Record counts
+still include empty appends. Counts-only sizes use existing DN caches: request `object-info /file
 --want extents` to refresh them after sealing, then `--want counts` for totals.
 
 Byte offsets survive appends and storage coalescing, which preserves append record
@@ -277,8 +278,8 @@ at `OLoff::MAX`, while record access remains available. The top `u64` value reta
 its existing no-value-sentinel meaning.
 
 Byte reads walk extent locators and scan preceding append-block headers at EN.
-A header supplies the payload length as canonical length minus four bytes per
-record, so skipped payloads are neither decrypted nor sent to FE. Only overlapping
+A header supplies the canonical payload length directly, so skipped payloads
+are neither decrypted nor sent to FE. Only overlapping
 blocks are fetched and decompressed. Responses contain at most 1 MiB of requested
 bytes; the CLI repeats requests for larger reads. Header lookup is still linear
 and repeated requests can revisit headers; a prefix index and efficient

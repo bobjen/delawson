@@ -641,16 +641,16 @@ fn stream_start(from: ORoff, base: ORoff) -> SRoff {
     SRoff::new(from.since(base).number())
 }
 
-/// Storage remains canonical; only user-facing bytes summaries hide the prefixes.
+/// Translate payload totals to the object framing; caches remain canonical.
 fn visible_totals(framing: Framing, mut totals: Totals, records: SRoff) -> Totals {
-    if framing == Framing::Bytes {
+    if framing.overhead() != 0 {
         totals.logical = if totals.logical.is_none() || records.is_none() {
             SLoff::NONE
         } else {
             framing
                 .visible_length(totals.logical.number(), records.number())
-                .map(SLoff::new)
-                .unwrap_or(SLoff::NONE)
+                .map(|n| SLoff::new(n.min(SLoff::MAX.number())))
+                .unwrap_or(SLoff::MAX)
         };
     }
     totals
@@ -680,14 +680,18 @@ fn merge_object_info(mut held: Levelled, runs: &[Option<ExtentReply>], limit: u6
             body.extend(row.args());
             for extent in rows {
                 let mut extent = extent.clone();
-                if framing == Some(Framing::Bytes) {
+                if let Some(framing) = framing.filter(|f| f.overhead() != 0) {
                     extent.logical = if extent.logical.is_none() || extent.records.is_none() {
                         common::offset::ELoff::NONE
                     } else {
-                        Framing::Bytes
+                        framing
                             .visible_length(extent.logical.number(), extent.records.number())
-                            .and_then(|n| common::offset::ELoff::of_number(n).ok())
-                            .unwrap_or(common::offset::ELoff::NONE)
+                            .map(|n| {
+                                common::offset::ELoff::new(
+                                    n.min(common::offset::ELoff::MAX.number()) as u32,
+                                )
+                            })
+                            .unwrap_or(common::offset::ELoff::MAX)
                     };
                 }
                 body.extend(extent.args());
@@ -2540,9 +2544,9 @@ mod tests {
         object.framing = Framing::Bytes;
         object.streams = vec![StreamId::new(0), StreamId::new(1)];
         let table: Vec<_> = (0..2)
-            .map(|n| Stream { logical: SLoff::new(1u64 << 63), ..held(n, 0, Some(1)) })
+            .map(|n| Stream { logical: SLoff::new((1u64 << 63) - 4), ..held(n, 0, Some(1)) })
             .collect();
-        // Canonical length overflows, visible length still fits after hiding prefixes.
+        // Payload length fits even though length-prefixed framing would overflow.
         assert_eq!(object.logical(&table).number(), u64::MAX - 7);
         let table: Vec<_> = table
             .into_iter()
@@ -2554,16 +2558,26 @@ mod tests {
     }
 
     #[test]
+    fn framing_overflow_saturates_instead_of_becoming_unknown() {
+        let totals =
+            Totals { extents: ExtentId::new(1), logical: SLoff::MAX, compressed: SCoff::ZERO };
+        for framing in [Framing::Lf, Framing::Length] {
+            assert_eq!(visible_totals(framing, totals, SRoff::new(1)).logical, SLoff::MAX);
+        }
+        assert_eq!(visible_totals(Framing::Bytes, totals, SRoff::NONE).logical, SLoff::MAX);
+    }
+
+    #[test]
     fn bytes_summary_counts_empty_records_without_exposing_prefixes() {
         let totals = Totals {
             extents: ExtentId::new(1),
-            logical: SLoff::new(19),
+            logical: SLoff::new(3),
             compressed: SCoff::new(99),
         };
         let visible = visible_totals(Framing::Bytes, totals, SRoff::new(4));
         assert_eq!(visible.logical, SLoff::new(3));
         assert_eq!(visible.compressed, totals.compressed);
-        assert_eq!(visible_totals(Framing::Bytes, totals, SRoff::NONE).logical, SLoff::NONE);
+        assert_eq!(visible_totals(Framing::Bytes, totals, SRoff::NONE).logical, SLoff::new(3));
     }
 
     #[test]
@@ -2706,8 +2720,8 @@ mod tests {
         let mut second = grown();
         second.streams = vec![id, id];
         let table = dn.stream_table.read().unwrap();
-        assert_eq!(first.logical(&table), OLoff::new(100));
-        assert_eq!(second.logical(&table), OLoff::new(200));
+        assert_eq!(first.logical(&table), OLoff::new(112));
+        assert_eq!(second.logical(&table), OLoff::new(224));
         drop(table);
         // A failed concat gives back every repeated reference it acquired.
         dn.shards[shard_of("/failed")].lock().unwrap().insert(Box::from("/failed"), second);
@@ -2776,7 +2790,7 @@ mod tests {
         let logical: OLoff = object.logical(&table);
         let compressed: OCoff = object.compressed(&table);
         assert_eq!(extents, OEoff::new(2 * ExtentId::MAX.number()));
-        assert_eq!(logical, OLoff::new(2 * ((1 << 32) + 17)));
+        assert_eq!(logical, OLoff::new(2 * ((1 << 32) + 18)));
         assert_eq!(compressed, OCoff::new(2 * ((1 << 32) + 3)));
         let described = detailed(
             &object,
@@ -3218,8 +3232,8 @@ mod tests {
         assert_eq!(shape.extents, OEoff::new(2));
         assert_eq!(shape.entries, 5);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].1, vec![extent.clone()]);
-        assert_eq!(rows[1].1, vec![extent.clone()]);
+        assert_eq!(rows[0].1, vec![visible_extent(&extent)]);
+        assert_eq!(rows[1].1, vec![visible_extent(&extent)]);
         let trimmed = common::info::limit_object_info(&full, 4).unwrap();
         let (shape, rows) = summary_contents(&trimmed);
         assert_eq!(shape.entries, 4);
@@ -3244,7 +3258,7 @@ mod tests {
         let (shape, rows) = summary_contents(&args);
         assert_eq!(shape.extents, OEoff::new(2));
         assert_eq!(shape.entries, 3);
-        assert_eq!(rows[0].1, vec![extent]);
+        assert_eq!(rows[0].1, vec![visible_extent(&extent)]);
         assert_eq!(shape.next, ORoff::NONE);
     }
 
@@ -3267,7 +3281,7 @@ mod tests {
         for piece in Batch::pieces(rest, batch.given).unwrap() {
             let (shape, rows) = summary_contents(piece);
             assert_eq!(shape.extents, OEoff::new(1));
-            assert_eq!(rows[0].1, vec![extent.clone()]);
+            assert_eq!(rows[0].1, vec![visible_extent(&extent)]);
         }
         let response = merge_batch_info(args, &runs, 2);
         let (batch, rest) = Batch::of_args(&response.args).unwrap();
@@ -3278,6 +3292,16 @@ mod tests {
         assert_eq!(shape.next, base.plus(ORoff::from_stream(extent.first_record)).unwrap());
     }
 
+    fn visible_extent(extent: &ExtentRow) -> ExtentRow {
+        ExtentRow {
+            logical: common::offset::ELoff::of_number(
+                extent.logical.number() + extent.records.number(),
+            )
+            .unwrap(),
+            ..extent.clone()
+        }
+    }
+
     fn assert_scoped_summary(args: &[Arg], base: ORoff, expected: &ExtentRow) -> Shape {
         let (shape, rest) = Shape::of_args(args).unwrap();
         let (_, rest) = Described::of_args(rest).unwrap();
@@ -3285,7 +3309,11 @@ mod tests {
         let (extent, rest) = ExtentRow::of_args(rest).unwrap();
         assert!(rest.is_empty());
         assert_eq!(stream.first_record, base);
-        assert_eq!(&extent, expected, "DN must preserve the entire SN extent row");
+        assert_eq!(
+            extent,
+            visible_extent(expected),
+            "DN preserves extent coordinates and translates the size to LF framing"
+        );
         shape
     }
 

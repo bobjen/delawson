@@ -708,12 +708,12 @@ impl Want {
 /// ⚠️ **The bytes are useless without the other four**, which is why they travel as
 /// one shape: a block arrives compressed, so its logical size cannot be recovered
 /// from it, and its records cannot be found without the framing and the number the
-/// writer assigned (§8.1.4.1, §17.16.1). A reader decompresses to `logical`, checks
+/// writer assigned (§8.1.4.1, §17.16.1). A reader translates payload `logical` to the stored framing, decompresses, checks
 /// `crc`, parses by the object's framing, and numbers what it finds from
 /// `first_record`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Piece {
-    /// Bytes before compression, which is what to decompress to.
+    /// Payload bytes, excluding the stored framing.
     pub logical: ELoff,
     /// The extent-local number of the first record this block completed.
     pub first_record: ERoff,

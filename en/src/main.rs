@@ -200,7 +200,7 @@ struct Extent {
     sealed: bool,
     /// Where the next append starts, in stored bytes.
     end: ECoff,
-    /// And where it starts in the canonical logical numbering (body + records*4).
+    /// And where it starts in the canonical logical numbering (payload bytes only).
     logical_end: ELoff,
     /// Records completed in this extent, which is what numbers them.
     records: ERoff,
@@ -250,7 +250,8 @@ impl Encrypted {
     ) -> Result<Self> {
         let extent_key =
             extent_cache.get(daily_cache, process, extent.sn_id, extent.id, extent.created)?;
-        let (key, nonce) = crypto::derive_block_secrets(&extent_key, logical.number());
+        let (key, nonce) =
+            crypto::derive_block_secrets(&extent_key, logical.number(), first_record.number());
 
         let (kind, width) = framing.wire();
         let mut plain = Vec::with_capacity(16 + body.len());
@@ -275,7 +276,11 @@ impl Encrypted {
     ) -> Result<(u64, Framing, Vec<u8>)> {
         let extent_key =
             extent_cache.get(daily_cache, process, extent.sn_id, extent.id, extent.created)?;
-        let (key, nonce) = crypto::derive_block_secrets(&extent_key, self.logical.number());
+        let (key, nonce) = crypto::derive_block_secrets(
+            &extent_key,
+            self.logical.number(),
+            self.first_record.number(),
+        );
 
         if self.sealed.len() < 16 {
             return Err(Error::new("stored block too short for tag"));
@@ -434,6 +439,59 @@ impl Extents {
         Ok(place)
     }
 
+    /// No encrypted piece may leave both components of its identity unchanged.
+    fn check_progress(appending: &AppendBlock) -> Result<()> {
+        let check = |holds: Holds| {
+            if holds.logical == ELoff::ZERO && holds.records == ERoff::ZERO {
+                Err(Error::new("an encrypted block must advance bytes or records"))
+            } else {
+                Ok(())
+            }
+        };
+        if appending.pieces.is_empty() {
+            check(appending.holds)?;
+        }
+        for piece in &appending.pieces {
+            check(piece.holds)?;
+        }
+        Ok(())
+    }
+
+    fn check_retry(
+        existing: &Append,
+        appending: &AppendBlock,
+        daily_cache: &DailyKeyCache,
+        extent_cache: &ExtentKeyCache,
+        process: &Process,
+        extent: &Extent,
+    ) -> Result<()> {
+        let single;
+        let pieces = if appending.pieces.is_empty() {
+            single = vec![AppendPiece {
+                holds: appending.holds,
+                crc: appending.crc,
+                bytes: appending.bytes.clone(),
+            }];
+            &single
+        } else {
+            &appending.pieces
+        };
+        if existing.holds != appending.holds || existing.blocks.len() != pieces.len() {
+            return Err(Error::new("retry conflicts with existing append"));
+        }
+        for (old, new) in existing.blocks.iter().zip(pieces) {
+            let (crc, framing, bytes) = old.decrypt(daily_cache, extent_cache, process, extent)?;
+            if old.holds != new.holds
+                || crc != new.crc
+                || framing != appending.framing
+                || bytes != new.bytes
+            {
+                return Err(Error::new("retry conflicts with existing append"));
+            }
+        }
+        Ok(())
+    }
+
     fn take(
         &mut self,
         daily_cache: &DailyKeyCache,
@@ -450,16 +508,35 @@ impl Extents {
         let logical_offset = extent.logical_end;
         let first_record = extent.records;
 
+        if appending.record_offset.is_some() && appending.logical_offset.is_none() {
+            return Err(Error::new("an expected record count requires a fixed byte offset"));
+        }
+        if appending.logical_offset.is_some()
+            && logical_size == ELoff::ZERO
+            && appending.record_offset.is_none()
+        {
+            return Err(Error::new(
+                "a zero-length fixed-offset append requires an expected record count",
+            ));
+        }
+        Self::check_progress(appending)?;
         if let Some(wanted) = appending.logical_offset {
-            if wanted < logical_offset {
-                // Check if it's a retry of existing data.
+            let wanted_record = appending.record_offset;
+            if wanted < logical_offset || wanted_record.is_some_and(|n| n < first_record) {
                 if let Some(existing) = self.appends.iter().find(|a| {
                     a.extent == place
                         && a.logical == wanted
-                        && a.holds.records == appending.holds.records
-                        && a.holds.logical == appending.holds.logical
-                        && a.holds.compressed == appending.holds.compressed
+                        && wanted_record.is_none_or(|n| n == a.first_record)
+                        && a.holds == appending.holds
                 }) {
+                    Self::check_retry(
+                        existing,
+                        appending,
+                        daily_cache,
+                        extent_cache,
+                        process,
+                        extent,
+                    )?;
                     return Ok(Took::Landed(Landed {
                         offset: existing.offset,
                         logical: existing.logical,
@@ -471,7 +548,7 @@ impl Extents {
                     "fixed-offset append to {wanted} conflicts with existing data"
                 )));
             }
-            if wanted > logical_offset {
+            if wanted > logical_offset || wanted_record.is_some_and(|n| n > first_record) {
                 return Ok(Took::Queued);
             }
         }
@@ -479,8 +556,9 @@ impl Extents {
         let stored_len = appending.holds.compressed;
 
         let sealable = !extent.open_record;
-        let full =
-            extent.end.plus(stored_len)? > cap || extent.logical_end.plus(logical_size).is_err();
+        let full = extent.end.plus(stored_len)? > cap
+            || extent.logical_end.plus(logical_size).is_err()
+            || extent.records.plus(appending.holds.records).is_err();
         if extent.sealed || (sealable && full) {
             let closing = !extent.sealed;
             extent.sealed = true;
@@ -565,10 +643,35 @@ impl Extents {
             .ok_or_else(|| Error::new("apply-append to EN must carry a logical offset"))?;
 
         let offset = self.extents[place].end;
-        let first_record = self.extents[place].records;
-
-        if self.appends.iter().any(|a| a.extent == place && a.logical == logical_offset) {
+        let first_record = appending
+            .record_offset
+            .ok_or_else(|| Error::new("apply-append must carry an extent record offset"))?;
+        Self::check_progress(appending)?;
+        if let Some(existing) = self.appends.iter().find(|a| {
+            a.extent == place && a.logical == logical_offset && a.first_record == first_record
+        }) {
+            Self::check_retry(
+                existing,
+                appending,
+                daily_cache,
+                extent_cache,
+                process,
+                &self.extents[place],
+            )?;
             return Ok(Applied::Already);
+        }
+        // Overlapping identities must not be encrypted again with different data.
+        let end = (first_record.plus(appending.holds.records)?, logical_offset.plus(logical_size)?);
+        for existing in self.appends.iter().filter(|a| a.extent == place) {
+            let old_end = (
+                existing.first_record.plus(existing.holds.records)?,
+                existing.logical.plus(existing.holds.logical)?,
+            );
+            if (first_record, logical_offset) < old_end
+                && (existing.first_record, existing.logical) < end
+            {
+                return Err(Error::new("replicated append overlaps existing data"));
+            }
         }
 
         let extent = &mut self.extents[place];
@@ -702,7 +805,7 @@ impl Extents {
     ) -> Result<Option<Ranged>> {
         let mut blocks: Vec<&Append> =
             self.appends.iter().filter(|append| append.extent == place).collect();
-        blocks.sort_by_key(|append| append.offset);
+        blocks.sort_by_key(|append| (append.first_record, append.logical));
 
         let extent = &self.extents[place];
 
@@ -729,7 +832,7 @@ impl Extents {
                 });
                 let is_open =
                     block.holds.records == ERoff::ZERO && block.holds.logical > ELoff::ZERO;
-                if budget.met(&covered) && !is_open {
+                if (budget.met(&covered) || covered.compressed.number() >= 1 << 20) && !is_open {
                     break 'append;
                 }
             }
@@ -822,7 +925,7 @@ impl Extents {
         let Some(&place) = self.at.get(&(sn, id)) else { return Vec::new() };
         let mut found: Vec<&Append> =
             self.appends.iter().filter(|append| append.extent == place).collect();
-        found.sort_by_key(|append| append.offset);
+        found.sort_by_key(|append| (append.first_record, append.logical));
         let extent = &self.extents[place];
         found
             .iter()
@@ -844,7 +947,7 @@ struct Disk {
     checksummed: AtomicU64,
     daily_cache: Arc<DailyKeyCache>,
     extent_cache: Arc<ExtentKeyCache>,
-    pending_fixed: Mutex<HashMap<(SnId, ExtentId, ELoff), QueuedAppend>>,
+    pending_fixed: Mutex<HashMap<(SnId, ExtentId, ELoff, Option<ERoff>), QueuedAppend>>,
 }
 
 impl Disk {
@@ -881,16 +984,8 @@ impl Disk {
             }
         }
 
-        // Holds.logical is canonical length-format size, so this limit is a
-        // format-independent upper bound on the decompressed append buffer.
-        if appending.holds.logical.get() > process.cluster.extents.max_append_bytes {
-            reply.send(Resp::error(
-                Status::BadRequest,
-                format!(
-                    "append of {} logical bytes exceeds maximum {}",
-                    appending.holds.logical, process.cluster.extents.max_append_bytes
-                ),
-            ));
+        if let Err(error) = Self::check_size(&appending, process.cluster.extents.max_append_bytes) {
+            reply.send(bad(error));
             return Ok(());
         }
 
@@ -906,6 +1001,20 @@ impl Disk {
         }
 
         self.try_append(process, mine, appending, reply)
+    }
+
+    fn check_size(appending: &AppendBlock, maximum: u32) -> Result<()> {
+        // Payload accounting must not turn a compressed run of empty records into
+        // an unbounded decompression. Allow one hidden bytes-mode prefix beyond the cap.
+        let framed = appending
+            .framing
+            .visible_length(appending.holds.logical.number(), appending.holds.records.number());
+        if appending.holds.logical.number() > maximum as u64
+            || framed.is_none_or(|n| n > maximum as u64 + 4)
+        {
+            return Err(Error::new("append exceeds maximum payload or framed size"));
+        }
+        Ok(())
     }
 
     fn force_seal(&self, sn: SnId, extent: ExtentId, created: TimeSec) -> Result<Filled> {
@@ -974,7 +1083,10 @@ impl Disk {
                     reply.send(bad("extent was deleted"));
                     return Ok(());
                 }
-                queue.insert((appending.sn, appending.extent, lo), (appending, reply));
+                queue.insert(
+                    (appending.sn, appending.extent, lo, appending.record_offset),
+                    (appending, reply),
+                );
                 return Ok(());
             }
             Took::Sealed { came_to, closing } => {
@@ -1040,6 +1152,7 @@ impl Disk {
         let mut onward = appending.clone();
         onward.instances = Vec::new();
         onward.logical_offset = Some(landed.logical);
+        onward.record_offset = Some(landed.first_record);
 
         for (en, disk) in others {
             let apply = onward.request(en, disk, Op::ApplyAppend);
@@ -1053,13 +1166,26 @@ impl Disk {
             }
         }
 
+        // Wake both byte-only requests and requests naming this record boundary.
+        // Requests overtaken by an append must wake too, to receive a conflict.
         let next_lo = landed.logical.plus(appending.holds.logical)?;
-        let next = self.pending_fixed.lock().expect("queue").remove(&(
-            appending.sn,
-            appending.extent,
-            next_lo,
-        ));
-        if let Some((next_app, next_reply)) = next {
+        let next_record = landed.first_record.plus(landed.records)?;
+        let ready = {
+            let mut queue = self.pending_fixed.lock().expect("queue");
+            let keys: Vec<_> = queue
+                .keys()
+                .filter(|(sn, extent, lo, record)| {
+                    *sn == appending.sn
+                        && *extent == appending.extent
+                        && (*lo < next_lo
+                            || record.is_some_and(|n| n < next_record)
+                            || (*lo == next_lo && record.is_none_or(|n| n == next_record)))
+                })
+                .copied()
+                .collect();
+            keys.into_iter().filter_map(|key| queue.remove(&key)).collect::<Vec<_>>()
+        };
+        for (next_app, next_reply) in ready {
             self.try_append(process, mine, next_app, next_reply)?;
         }
 
@@ -1091,6 +1217,9 @@ impl Disk {
     }
 
     fn apply(&self, process: &Process, appending: AppendBlock) -> Resp {
+        if let Err(error) = Self::check_size(&appending, process.cluster.extents.max_append_bytes) {
+            return bad(error);
+        }
         match self.held.lock().expect("extents").apply(
             &self.daily_cache,
             &self.extent_cache,
@@ -1330,8 +1459,11 @@ impl EN {
             Err(error) => bad(error),
             Ok(()) => {
                 let mut queued = disk.pending_fixed.lock().unwrap();
-                let keys: Vec<_> =
-                    queued.keys().filter(|(s, e, _)| *s == sn && *e == extent).copied().collect();
+                let keys: Vec<_> = queued
+                    .keys()
+                    .filter(|(s, e, _, _)| *s == sn && *e == extent)
+                    .copied()
+                    .collect();
                 for key in keys {
                     if let Some((_, reply)) = queued.remove(&key) {
                         reply.send(bad("extent was deleted"));
@@ -1770,7 +1902,7 @@ mod tests {
         let (filled, rest) = Filled::of_args(&response.args).unwrap();
         assert!(rest.is_empty());
         assert_eq!(filled.records, ERoff::new(1));
-        assert_eq!(filled.logical, ELoff::new(7));
+        assert_eq!(filled.logical, ELoff::new(3));
         assert_eq!(filled.compressed, block(0, 1, b"one\n").holds.compressed);
     }
     use common::framing::Framing;
@@ -1793,6 +1925,7 @@ mod tests {
             holds,
             instances: Vec::new(),
             logical_offset: None,
+            record_offset: None,
             bytes: bytes.to_vec(),
             pieces: Vec::new(),
         }
@@ -1805,6 +1938,79 @@ mod tests {
             Took::Landed(landed) => landed,
             _ => panic!("should have landed"),
         }
+    }
+
+    #[test]
+    fn empty_fixed_appends_need_record_offsets_and_replicate_distinctly() {
+        let primary = EN::new(testing::en_config());
+        let disk = primary.disk(DiskId::FIRST).unwrap();
+        let replica = EN::new(testing::en_config());
+        let other = replica.disk(DiskId::FIRST).unwrap();
+        let process = testing::process();
+        let mut empty = block(0, 1, b"\n");
+        empty.logical_offset = Some(ELoff::ZERO);
+        assert!(disk.take(&process, &empty, ROOM).is_err());
+        empty.record_offset = Some(ERoff::ZERO);
+        assert!(matches!(disk.take(&process, &empty, ROOM), Ok(Took::Landed(_))));
+        // Exact retry does not insert another record.
+        assert!(matches!(disk.take(&process, &empty, ROOM), Ok(Took::Landed(_))));
+        let mut next = empty.clone();
+        next.record_offset = Some(ERoff::new(1));
+        assert!(matches!(disk.take(&process, &next, ROOM), Ok(Took::Landed(_))));
+        // Delivery can be out of order; the replica uses the primary's record offset.
+        assert_eq!(other.apply(&process, next.clone()).status, Status::Ok);
+        assert_eq!(other.apply(&process, empty.clone()).status, Status::Ok);
+        assert_eq!(other.apply(&process, next).status, Status::Ok);
+        let held = disk.held.lock().unwrap();
+        let mut replicated = other.held.lock().unwrap();
+        assert_eq!(held.extents[0].records, ERoff::new(2));
+        assert_eq!(held.extents[0].logical_end, ELoff::ZERO);
+        assert_eq!(replicated.extents[0].records, ERoff::new(2));
+        assert_eq!(replicated.appends.len(), 2);
+        assert_ne!(held.appends[0].blocks[0].sealed, held.appends[1].blocks[0].sealed);
+        assert_eq!(held.appends[0].blocks[0].sealed, replicated.appends[1].blocks[0].sealed);
+        // Changing the record offset alone breaks decryption.
+        replicated.appends[1].blocks[0].first_record = ERoff::new(1);
+        assert!(
+            replicated.appends[1].blocks[0]
+                .decrypt(
+                    &replica._daily_cache,
+                    &other.extent_cache,
+                    &process,
+                    &replicated.extents[0]
+                )
+                .is_err()
+        );
+        drop(replicated);
+        drop(held);
+        // A following nonempty append at the same byte offset remains possible.
+        let mut following = block(0, 1, b"a\n");
+        following.logical_offset = Some(ELoff::ZERO);
+        following.record_offset = Some(ERoff::new(2));
+        assert!(matches!(disk.take(&process, &following, ROOM), Ok(Took::Landed(_))));
+        let mut conflict = following.clone();
+        conflict.bytes = b"b\n".to_vec();
+        conflict.crc = common::crc::of(&conflict.bytes);
+        assert!(disk.take(&process, &conflict, ROOM).is_err());
+        following.record_offset = None;
+        assert!(matches!(disk.take(&process, &following, ROOM), Ok(Took::Landed(_))));
+    }
+
+    #[test]
+    fn queued_empty_appends_wake_at_the_requested_record_count() {
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
+        let mut process = testing::process();
+        Arc::get_mut(&mut process).unwrap().cluster.extents.seal_bytes = 4096;
+        let mut later = block(0, 1, b"\n");
+        later.logical_offset = Some(ELoff::ZERO);
+        later.record_offset = Some(ERoff::new(1));
+        disk.append(&process, (EnId::FIRST, DiskId::FIRST), later, testing::reply()).unwrap();
+        assert_eq!(disk.pending_fixed.lock().unwrap().len(), 1);
+        disk.append(&process, (EnId::FIRST, DiskId::FIRST), block(0, 1, b"\n"), testing::reply())
+            .unwrap();
+        assert!(disk.pending_fixed.lock().unwrap().is_empty());
+        assert_eq!(disk.held.lock().unwrap().extents[0].records, ERoff::new(2));
     }
 
     #[test]
@@ -2167,6 +2373,7 @@ mod tests {
         let disk_id = DiskId::FIRST;
         let mut block = block(0, 1, &line("late"));
         block.logical_offset = Some(ELoff::ZERO);
+        block.record_offset = Some(ERoff::ZERO);
         let request = block.request(EnId::new(0), disk_id, Op::ApplyAppend);
         assert_eq!(en.apply(&testing::process(), request).status, Status::Ok);
     }
@@ -2199,6 +2406,7 @@ mod tests {
         let mut held = disk.held.lock().unwrap();
         let mut same = block(0, 1, b"once\n");
         same.logical_offset = Some(ELoff::ZERO);
+        same.record_offset = Some(ERoff::ZERO);
         assert!(matches!(
             held.apply(&en._daily_cache, &disk.extent_cache, &testing::process(), &same),
             Ok(Applied::Stored)

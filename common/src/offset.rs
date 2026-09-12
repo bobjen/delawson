@@ -2,7 +2,7 @@
 //!
 //! Two kinds of position in an extent's bytes, and three in its records.
 //!
-//! A **logical** position counts the bytes a writer wrote. A **compressed** one
+//! A **logical** position counts payload bytes, excluding record framing. A **compressed** one
 //! counts the bytes that were stored. Both are 32-bit — an extent is capped well
 //! inside that — so nothing but a type stops one being used where the other
 //! belongs, and the two are equal in exactly the case that makes the mistake

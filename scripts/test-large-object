@@ -45,9 +45,8 @@ import sys
 record = b"Doctor, sometimes I have the feeling that I'm not accomplishing anything other than taking up space\0"
 target = 32 * 1024 * 1024
 with open(sys.argv[1], "wb") as output:
-    # Canonical logical length is body bytes plus four bytes per completed
-    # record, so leave room for the record framing as well as the NUL marker.
-    count = (target - 1) // (len(record) + 4)
+    # Canonical length excludes the NUL marker; bound the framed buffer too.
+    count = (target - 1) // len(record)
     output.write(record * count)
 PY
 

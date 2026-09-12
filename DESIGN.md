@@ -483,7 +483,7 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 | An object has a **sealed prefix** with dense numbering and a **growing frontier** addressed per stream | §8.6.6 |
 | Non-monotone extent lists are pruned by **min/max durable-second intervals**, which fail safe by widening | §9.7.3 |
 | Rewrites retain their inputs for the **hint window** (guess: 10 minutes) — retention, not compaction frequency | §10.1 |
-| Append offsets are assigned in a **canonical length-stuffed space**, so they survive re-framing | §8.2.2 |
+| Append offsets are assigned in a **canonical payload-byte space**, so they survive re-framing | §8.2.2 |
 
 **Billing**
 
@@ -8183,55 +8183,31 @@ most of that before it reaches the physical bytes anyone is billed for (§12.3).
 offset by nothing, and **two appends share an offset**. The fixed-offset check then cannot tell a
 retry from a new append, which is precisely what it exists to do.
 
-**Resolved: the append offset is always determined in a canonical length-stuffed space** (Asserted,
-Bob, 2026-08-15), independent of how the append is actually formatted.
+**Resolved: canonical logical length counts payload bytes only** (Asserted, Bob,
+2026-09-12; implemented in §17.47). This replaces the earlier length-stuffed
+canonical space, which charged four bytes per record. Record counts remain
+separate. Both counts survive re-framing and coalescing; neither depends on the
+stored representation. Visible length in a framing is payload length plus its
+per-record overhead times the record count.
 
-> The offset assigned at accept is computed as if the append were **length-stuffed**, where every
-> row's length field occupies **4 bytes** of logical space. The append's real format is a separate
-> field in the append header.
+A fixed-offset append may supply an **optional expected extent record count**.
+Without that count, it must advance the byte offset strictly: a zero-payload
+append is rejected. With the count, a zero-payload append is legal if it advances
+the record count. Retries compare the existing contents as well as their identity.
+Ordinary empty records remain legal and advance the record count without advancing
+canonical bytes. A block that advances neither bytes nor records cannot get a
+fresh encryption identity and is rejected.
 
-**This makes no assumption whatever about row content.** A zero-width fixed-length row still consumes
-4 logical bytes, so `FixedLength(0)` stops being degenerate and no framing mode needs forbidding.
+Encryption uses both the block's starting canonical byte offset and its starting
+extent record offset. Neither alone suffices: empty records share a byte offset,
+and fragments of one record share a record offset. The pair distinguishes both.
+The identity remains write-once within an extent; truncation seals that extent,
+so discarded positions cannot later encrypt different data under the same key.
 
-The invariant the check actually needs is still worth stating:
-
-> **Every fixed-offset append must advance the logical offset strictly.**
-
-but the only way left to violate it is an append containing **zero records**, permitted by §8.1. That
-is a property of the individual request rather than of the object's declared framing, so it is
-detectable at accept and cheap to reject — a far narrower restriction than disallowing a framing mode.
-
-**The larger payoff is that logical offsets become invariant under re-framing**, which removes a
-contradiction between §8.2.1 and §8.1.1a-7 that would otherwise have been latent. §8.2.1 permits
-coalescing to change the stored framing; §8.1.1a-7 defines the object offset as the sum of sealed
-extent *logical* lengths. If logical length were measured in the stored framing, re-framing an extent
-during compaction would silently shift every offset above it — destroying exactly the density and
-stability §8.1.1a-6 says three mechanisms depend on. A canonical space decouples the two: **framing is
-a representation, and now so is the physical byte position; only the canonical offset is a name.**
-
-**What it costs, and what it does not.**
-
-- **4 bytes per row of canonical space**, whatever the stored framing. At 100-byte records that is 4%
-  inflation of the logical space; at 8-byte records, 50%.
-- **Nothing in billing**, because §12.3 bills physical bytes and the canonical space never reaches a
-  disk.
-- **Something in sealing**: §6's 4 GB *logical* cap is consumed in canonical bytes, so an extent of
-  very small records seals at fewer physical bytes than a naive reading suggests. Worth stating
-  explicitly, since the two limits of §6 are meant to bracket a known range.
-- **No new work on the append path.** The primary must parse the append per its declared framing to
-  compute canonical lengths — but it already has to parse it to maintain the cumulative record counts
-  of §4, and §8.2.1 shows converting a logical length between framings is O(1) given the record count.
-- **A 4-byte length field caps a row at 4 GB**, which coincides with §6's logical extent cap. Those two
-  agreeing is a consistency check, not a coincidence to be relied on.
-
-**An earlier draft suggested using the record number instead, and that does not work.** Appends may contain
-**record fragments** — a writer that fixes its own offsets may reasonably let a record span appends — so an
-append boundary need not fall on a record boundary. A record number therefore does not identify an append: two
-appends can both begin inside record 5, and distinguishing them needs *(record number, offset within the
-record)*, a two-part token strictly worse than the single logical byte offset.
-
-So **the logical byte offset is the right token precisely because it is record-agnostic**, and the
-zero-width-fixed-length case is a genuine corner that simply needs forbidding rather than designing around.
+The 32-bit extent payload-byte and record-count limits are checked independently.
+An object may exceed the 64-bit logical-byte range; an unrepresentable summary
+saturates at OLoff::MAX without preventing record access. Framing overhead cannot
+hide an otherwise representable bytes-mode length.
 
 #### 8.2.3 An extent holds whole records; an append need not
 
@@ -14080,7 +14056,7 @@ Roughly in order of how much else depends on them.
 - whether to defer the object offset until sealing — no; no system does it, and the
   reasons are structural, not merely conventional (§8.1.1a-9);
 - how zero-width fixed-length rows break the fixed-offset check — they no longer do,
-  because offsets are assigned in a canonical length-stuffed space (§8.2.2);
+  because offsets are assigned in a canonical payload-byte space (§8.2.2);
 - whether logical offsets survive re-framing during coalescing — they do, for the same
   reason (§8.2.2, §8.2.1);
 - whether EC splits extents into fragments — it does not, so reads never touch EC
@@ -18399,7 +18375,7 @@ implicit default caused TPM error 0x2D6 and was corrected before that passing ru
 `bytes` is user-visible framing with zero boundary bytes (wire kind 5, width 0).
 Each append block becomes one internal `length` record at FE: a four-byte
 little-endian payload length followed by the payload. Empty appends are legal and
-count as records, adding four canonical bytes and zero visible bytes. Coalescing
+count as records, adding zero canonical bytes and zero visible bytes. Coalescing
 preserves these original record boundaries. Application conventions such as fixed
 4 MiB appends are not inferred by DeLawson.
 
@@ -18415,7 +18391,7 @@ Budget::Logical, returning BytesResp, capped to 1 MiB. The initial implementatio
 walks existing DN/SN record locators. EN's ExtentStart::Payload specifies a
 block-boundary record and a payload-byte skip, carried as u64 so an offset past an
 entire extent can be handled without narrowing it. EN scans Holds headers and
-subtracts `logical - 4 * records`, skipping ciphertext without decrypting it.
+subtracts canonical `logical` payload bytes, skipping ciphertext without decrypting it.
 ByteSeekResp reports skipped payload bytes and the next record after skipped and
 returned blocks, followed by Piece responses only for overlapping blocks. FE
 decompresses those blocks to extract the exact byte interval. Empty blocks advance
@@ -18429,15 +18405,57 @@ raw output and repeated requests. Header scanning remains linear per request and
 uses an FE worker while waiting; indexed lookup and continuation optimization
 remain unimplemented.
 
-ObjectInfo translates bytes lengths at the response boundary without changing
-canonical storage accounting. Prefixes are subtracted per stream before summing:
-a canonical total exceeding u64 may still have an expressible visible size.
-Oversized visible totals retain the existing OLoff::MAX saturation. Unknown
-record counts cannot safely translate cached canonical lengths and remain unknown.
-The existing cache-refresh and record-count semantics are unchanged. Byte offsets
-remain stable under append and coalescing, but not length-changing updates/deletes.
+ObjectInfo translates payload lengths to the object's framing at the response
+boundary. Bytes framing adds no overhead, so record-count saturation or unavailable
+record counts do not obscure known payload lengths. Oversized visible totals retain
+OLoff::MAX saturation. The existing cache-refresh and record-count semantics are
+unchanged. Byte offsets remain stable under append and coalescing, but not
+length-changing updates/deletes.
 
 Regression coverage includes empty appends, hidden-prefix checksums, exact byte
 lookup around empty records, multi-response binary reads, seals, concatenation,
 and metadata-only objects exceeding the byte-offset space. The integration command
 is scripts/test-bytes; the workspace suite requires --features delawson-common/testing.
+
+## 17.47 Payload-byte canonical lengths and append identities
+
+Canonical logical lengths exclude all framing bytes. Holds retains the existing
+logical-length and record-count fields; no extra block length is stored. A complete
+block decompresses to `logical + records * stored_framing.overhead()`. Re-framing
+happens after decompression. For a fragmented length-prefixed record, the reader
+accounts for its prefix in the block that starts it, using the preceding carry.
+The framing helper uses actual carry bytes when counting completed records.
+Record payload may cross blocks; the current helper requires a length prefix or
+CRLF marker to stay wholly within one block. It refuses ambiguous cuts within
+those markers rather than reporting an incorrect payload length.
+
+HKDF-SHA256's block context is the concatenation of two fixed-width little-endian
+u64 values: starting extent payload-byte offset, then starting extent record count.
+The derived output remains a 16-byte key and a 16-byte nonce. There was no persisted
+encrypted data to migrate, so this replaces the old offset-only derivation directly.
+Every independently encrypted block must advance at least one count. Empty records
+advance records; fragments carrying payload advance bytes.
+
+AppendBlock carries an optional record_offset beside logical_offset. User
+fixed-offset requests may omit it when they advance bytes. Zero-byte fixed-offset
+requests must supply it and advance records. EN replication always supplies both
+coordinates from the primary; followers never substitute their arrival-time record
+count. Duplicate application checks both coordinates and the actual stored contents,
+and overlapping identities are rejected. Read order is record/byte order, including
+out-of-order replica delivery. Queued fixed-offset requests include the optional
+record count in their identity and wake when their boundary is reached or passed.
+
+SN/DN caches keep canonical payload sizes. ObjectInfo adds the object's framing
+for all object, stream and extent summaries; bytes mode uses the payload total
+directly. Overflow saturates at the corresponding maximum and never invalidates
+the object or its record access. Extent sealing checks both payload and record-count
+limits. The append payload cap remains max_append_bytes; the framed-buffer cap is
+that value plus four bytes, allowing the hidden prefix on a maximum-sized bytes
+append. This also bounds decompression of batches of empty records. Record reads
+have a stored-byte response budget as well as their requested budget, so zero-byte
+records cannot make a logical-byte budget accumulate an unbounded response.
+
+Regression tests cover distinct encryption of successive empty records, rejection
+without an expected record count, exact retries and conflicting contents, queued
+empty appends, replica reordering, split-record payload accounting, all framing
+sizes, and oversized objects. scripts/test-bytes exercises the complete bytes path.

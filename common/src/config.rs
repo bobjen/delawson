@@ -291,8 +291,9 @@ pub struct Extents {
     /// needs another. A real stream holds as many as its SN has memory for; a test
     /// cluster sets it low so that a stream sealing is the common path.
     pub per_stream: usize,
-    /// Maximum logical bytes allowed in a single append. Default is 32 MB (33,554,432 bytes),
-    /// bounded above by ELoff::MAX.
+    /// Maximum payload bytes in a single append, bounded above by ELoff::MAX.
+    /// Framed bytes are also capped at this value plus one four-byte prefix.
+    /// Default is 32 MiB (33,554,432 bytes).
     #[serde(default = "default_max_append_bytes")]
     pub max_append_bytes: u32,
     /// Bytes of device a stored byte costs, which is what billing charges for

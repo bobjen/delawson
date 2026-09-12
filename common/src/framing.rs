@@ -13,8 +13,8 @@
 //! | crlf | a terminating `\r\n` | 2 |
 //! | length | a four-byte length before each record | 4 |
 //!
-//! **The boundary bytes are part of the logical length**, so a 100-byte record in
-//! `crlf` occupies 102 logical bytes and the cumulative totals include the framing.
+//! Canonical lengths count payload bytes only. User-visible lengths add the
+//! requested framing: a 100-byte record is 102 bytes in `crlf`.
 //!
 //! A record's *content* is what a reader gets back, without the terminator or the
 //! length that found it. Framing is how the records happen to be laid out, not a
@@ -44,9 +44,7 @@ impl Framing {
 
     /// Translate canonical length without pretending unknown/invalid counts are zero.
     pub fn visible_length(self, canonical: u64, records: u64) -> Option<u64> {
-        canonical
-            .checked_sub(records.checked_mul(4)?)?
-            .checked_add(records.checked_mul(self.overhead() as u64)?)
+        canonical.checked_add(records.checked_mul(self.overhead() as u64)?)
     }
 
     /// The name used on a command line and in a configuration. `fixed` carries its
@@ -165,29 +163,41 @@ impl Framing {
         Ok((records, carry))
     }
 
-    /// The size this block would occupy in `length` framing, which is the
-    /// canonical logical space.
-    pub fn canonical_size(self, open_len: usize, block: &[u8]) -> Result<u64> {
-        // Use dummy open bytes to find record boundaries.
-        let (records, _) = self.advance(&vec![0u8; open_len], block)?;
-        let overhead = self.overhead() as usize;
-
-        let body_len = if records > 0 {
-            block.len() - (records as usize * overhead)
-        } else {
-            match self {
-                Framing::Fixed(_) | Framing::Bytes => block.len(),
-                Framing::Nul | Framing::Lf | Framing::CrLf => block.len(),
-                Framing::Length => {
-                    if open_len >= 4 {
-                        block.len()
-                    } else {
-                        block.len().saturating_sub(4 - open_len)
-                    }
-                }
+    /// Payload bytes contributed by this block. Framing bytes do not count.
+    /// A framing marker must be wholly in one block; record payload may span blocks.
+    pub fn canonical_size(self, open: &[u8], block: &[u8]) -> Result<u64> {
+        let (records, carry) = self.advance(open, block)?;
+        if self == Framing::Length && !carry.is_empty() && carry.len() < 4 {
+            return Err(Error::new("a length prefix must fit in one block"));
+        }
+        if self == Framing::CrLf && carry.ends_with(b"\r") {
+            return Err(Error::new("a CRLF boundary must fit in one block"));
+        }
+        let overhead = match self {
+            // The prefix of the open record was already in the preceding block.
+            Framing::Length => {
+                let started = records + u64::from(!carry.is_empty());
+                (started - u64::from(!open.is_empty())) * 4
             }
+            _ => records * self.overhead() as u64,
         };
-        Ok(body_len as u64 + records * 4)
+        (block.len() as u64)
+            .checked_sub(overhead)
+            .ok_or_else(|| Error::new("framing exceeds block length"))
+    }
+
+    /// Stored byte count for a block, given the carry from its preceding block.
+    pub fn block_size(self, logical: u64, records: u64, open: &[u8]) -> Option<u64> {
+        if self == Framing::Length {
+            let prefixes = if records == 0 {
+                u64::from(open.is_empty())
+            } else {
+                records.checked_sub(u64::from(!open.is_empty()))?
+            };
+            logical.checked_add(prefixes.checked_mul(4)?)
+        } else {
+            self.visible_length(logical, records)
+        }
     }
 }
 
@@ -289,8 +299,8 @@ mod tests {
         assert_eq!(Framing::Bytes.storage(), Framing::Length);
         assert_eq!(Framing::Bytes.whole(b"").unwrap(), 1);
         assert_eq!(Framing::Bytes.whole(b"a\0\n").unwrap(), 1);
-        assert_eq!(Framing::Bytes.canonical_size(0, b"").unwrap(), 4);
-        assert_eq!(Framing::Bytes.visible_length(19, 4), Some(3));
+        assert_eq!(Framing::Bytes.canonical_size(b"", b"").unwrap(), 0);
+        assert_eq!(Framing::Bytes.visible_length(3, 4), Some(3));
         let mut stored = Vec::new();
         for block in [b"a".as_slice(), b"", b"", b"bc"] {
             stored.extend_from_slice(&(block.len() as u32).to_le_bytes());
@@ -300,6 +310,33 @@ mod tests {
             Framing::Length.records(&stored).collect::<Vec<_>>(),
             vec![b"a".as_slice(), b"", b"", b"bc"]
         );
+    }
+
+    #[test]
+    fn ambiguous_cuts_inside_framing_markers_are_rejected() {
+        assert!(Framing::Length.canonical_size(b"", b"\x08\0").is_err());
+        assert!(Framing::CrLf.canonical_size(b"", b"payload\r").is_err());
+    }
+
+    #[test]
+    fn payload_accounting_and_stored_size_agree_for_fragments() {
+        for (framing, first, second) in [
+            (Framing::Lf, b"half".as_slice(), b"done\n".as_slice()),
+            (Framing::CrLf, b"half".as_slice(), b"done\r\n".as_slice()),
+            (Framing::Length, b"\x08\0\0\0half".as_slice(), b"done".as_slice()),
+        ] {
+            let mut open = Vec::new();
+            let mut logical = 0;
+            for block in [first, second] {
+                let size = framing.canonical_size(&open, block).unwrap();
+                let (records, carry) = framing.advance(&open, block).unwrap();
+                assert_eq!(framing.block_size(size, records, &open), Some(block.len() as u64));
+                logical += size;
+                open = carry;
+            }
+            assert_eq!(logical, 8);
+            assert!(open.is_empty());
+        }
     }
 
     #[test]

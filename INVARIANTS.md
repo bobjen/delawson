@@ -121,7 +121,7 @@ is **not** the fix for a signature with a run of same-typed parameters: that wan
 numbers, which a single `ROff` would make one type; that stays covered by a test, and a partial fix that
 looks total is the risk worth naming.
 
-**`CANONICAL-OFFSET-SPACE`** — append offsets are assigned in a canonical length-stuffed space, so a
+**`CANONICAL-OFFSET-SPACE`** — append offsets are assigned in a canonical payload-byte space, so a
 logical offset is invariant under re-framing.
 *Argued* §8.2.2 · *Enforced* design only · *Checked* not yet; wants a test that re-frames an extent
 and re-resolves every offset
@@ -129,10 +129,9 @@ and re-resolves every offset
 the density and stability of `LOGICAL-OFFSETS-DENSE`. §8.2.2 exists because this contradiction was
 latent.
 
-**`FIXED-OFFSET-ADVANCES`** — every fixed-offset append advances the logical offset strictly, so a
-zero-record append is refused at accept.
-*Argued* §8.2.2 · *Enforced* design only · *Checked* unit test, cheap — it is a property of one
-request
+**`FIXED-OFFSET-ADVANCES`** — a byte-only fixed append advances bytes strictly; with an expected
+extent record count it may instead advance records. A block advancing neither is rejected.
+*Argued* §8.2.2, §17.47 · *Enforced* EN accept · *Checked* empty fixed-append and retry regressions
 *Breaks* the fixed-offset exactly-once check cannot distinguish a retry from a new append.
 
 **`EXTENT-IDENTITY-UNIQUE`** — `(SnId, ExtentId, creation second)` never names two different extents,
@@ -287,7 +286,7 @@ sweep, exactly rather than probabilistically, using the AEAD tag
 *Breaks* erasure reconstruction combines fragments from different machines, so divergence yields
 garbage rather than a detectable error.
 
-**`EXTENT-OFFSET-WRITE-ONCE`** — within one extent identity, an offset is written at most once, ever.
+**`EXTENT-OFFSET-WRITE-ONCE`** — within one extent identity, a (payload-byte offset, record offset) pair is written at most once, ever.
 *Argued* §7.2.4, §17.17 · *Enforced* **code**: the primary was already safe, since `take` only moves
 `end` forward; the secondary was not, and `apply` now refuses different bytes at a written offset
 (#83) · *Checked* unit tests exist (`an_offset_holds_one_plaintext_and_refuses_a_second`,
@@ -977,7 +976,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **tombstone** | §8.3 | `A-TOMBSTONE-KEEPS-ITS-WIDTH`, `UPDATE-DELETE-PRESERVE-COUNTS` |
 | **stream flag** | §4.1.1 | `A-CAPABILITY-RESTORES-CHEAPLY-AND-WITHDRAWS-SLOWLY`, `THE-OFFICIAL-FLAG-STAYS-PERMISSIVE-UNTIL-CLEANUP-ENDS`, `A-NAME-IS-NOT-A-NEGATION`, `RARE-AND-TRANSIENT-FIELDS-GO-OUT-OF-LINE` |
 | **count** | §8.1.6.2 | `ONE-PAST-THE-END-IS-REPRESENTABLE`, `EVERY-SPACE-RESERVES-A-SENTINEL`, `UNKEYED-COUNT-EXACT`, `UPDATE-DELETE-PRESERVE-COUNTS` |
-| ⚠️ **logical offset** | §8.1.6, §8.2.2 | `LOGICAL-OFFSETS-DENSE`, `CANONICAL-OFFSET-SPACE`, `FIXED-OFFSET-ADVANCES`, `OFFSET-SNAPS-FORWARD`, `EXTENT-OFFSET-WRITE-ONCE`, `ONE-UNSEALED-EXTENT-UNKEYED`. *Measured in canonical length-stuffed bytes, not in the stored framing.* |
+| ⚠️ **logical offset** | §8.1.6, §8.2.2 | `LOGICAL-OFFSETS-DENSE`, `CANONICAL-OFFSET-SPACE`, `FIXED-OFFSET-ADVANCES`, `OFFSET-SNAPS-FORWARD`, `EXTENT-OFFSET-WRITE-ONCE`, `ONE-UNSEALED-EXTENT-UNKEYED`. *Measured in canonical payload bytes, not in the stored framing.* |
 | **media class** | §7.4 | `ONE-MEDIA-CLASS-PER-EXTENT` |
 | **object** | §3 | `A-USER-CHOSEN-NAME-IS-PINNED-BY-A-COUNTER`, `READ-NAMES-THE-OBJECT`, `RECORD-NUMBER-STABLE`, `HINT-BOUND-BY-CAPABILITY`, `CAPABILITY-IS-MEMBERSHIP-ONLY`, `ZERO-REFERENCES-IS-A-BUG`, `ONE-UNSEALED-EXTENT-UNKEYED` |
 | **path** | §4.6.3 | `PATH-IS-THE-PORTABLE-NAME`, `HINT-BOUND-BY-CAPABILITY`, `READ-NAMES-THE-OBJECT`, `POLICY-ATTACHES-TO-A-DIRECTORY` |

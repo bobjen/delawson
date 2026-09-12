@@ -1112,7 +1112,18 @@ fn read_bytes(
             if piece.logical.get() > process.cluster.extents.max_append_bytes {
                 return Err(common::Error::new("oversized byte-read block"));
             }
-            let block = expand(Compress::Lz4, &piece.bytes, piece.logical.get() as usize)?;
+            let expected = Framing::Length
+                .visible_length(piece.logical.number(), piece.records.number())
+                .ok_or_else(|| common::Error::new("byte-read size overflow"))?;
+            if expected > process.cluster.extents.max_append_bytes as u64 + 4 {
+                return Err(common::Error::new("oversized framed byte-read block"));
+            }
+            let block = expand(
+                Compress::Lz4,
+                &piece.bytes,
+                usize::try_from(expected)
+                    .map_err(|_| common::Error::new("byte-read size overflow"))?,
+            )?;
             if piece.crc != 0 && common::crc::of(&block) != piece.crc {
                 return Err(common::Error::new("byte-read CRC mismatch"));
             }
@@ -1158,7 +1169,7 @@ impl ParsedAppend {
         }
         let mut total = 0u64;
         for part in std::iter::once(&mut self.first).chain(&mut self.tail) {
-            if part.holds.records != ERoff::new(1) || part.holds.logical.get() < 4 {
+            if part.holds.records != ERoff::new(1) {
                 return Err(common::Error::new(
                     "a bytes append block must declare exactly one record",
                 ));
@@ -1167,7 +1178,7 @@ impl ParsedAppend {
             if total > maximum as u64 {
                 return Err(common::Error::new("bytes append exceeds maximum logical append size"));
             }
-            let expected = part.holds.logical.get() as usize - 4;
+            let expected = part.holds.logical.get() as usize;
             let plain = expand(Compress::Lz4, &part.body, expected)?;
             if part.crc != 0 && common::crc::of(&plain) != part.crc {
                 return Err(common::Error::new("bytes append CRC mismatch"));
@@ -1245,6 +1256,7 @@ fn append_request(open: &Open, framing: Framing, first: AppendPart, tail: &[Appe
         crc: first.crc,
         holds: first.holds,
         logical_offset: None,
+        record_offset: None,
         instances: open.disks.clone(),
         bytes: first.body,
         pieces,
@@ -2241,13 +2253,15 @@ mod tests {
                 },
                 tail: vec![],
             };
-            assert!(append.wrap_bytes(3).is_err());
+            if plain.len() > 3 {
+                assert!(append.wrap_bytes(3).is_err());
+            }
             append.wrap_bytes(8192).unwrap();
             let part = append.first;
             assert_eq!(part.holds.records, ERoff::new(1));
-            assert_eq!(part.holds.logical.number(), plain.len() as u64 + 4);
+            assert_eq!(part.holds.logical.number(), plain.len() as u64);
             let stored =
-                expand(Compress::Lz4, &part.body, part.holds.logical.get() as usize).unwrap();
+                expand(Compress::Lz4, &part.body, part.holds.logical.get() as usize + 4).unwrap();
             assert_eq!(Framing::Length.records(&stored).collect::<Vec<_>>(), vec![plain]);
             assert_eq!(part.crc, common::crc::of(&stored));
         }

@@ -38,7 +38,7 @@ pub struct Holds {
     /// The actual physical length of the append block on disk:
     /// `APPEND_OVERHEAD` + the length of the compressed user data.
     pub compressed: ECoff,
-    /// Bytes before compression, in canonical logical numbering (`body + records * 4`).
+    /// Bytes before compression, in canonical logical numbering (payload only).
     pub logical: ELoff,
     /// Records this block completed, which is what numbers them.
     pub records: ERoff,
@@ -100,7 +100,7 @@ impl Holds {
         user_compressed_len: usize,
     ) -> Result<Holds> {
         let (records, _) = framing.advance(open, block)?;
-        let logical = ELoff::of_number(framing.canonical_size(open.len(), block)?)?;
+        let logical = ELoff::of_number(framing.canonical_size(open, block)?)?;
         let records = ERoff::of_number(records)?;
         let compressed = ECoff::of_len(user_compressed_len + APPEND_OVERHEAD)?;
         Ok(Holds { compressed, logical, records })
@@ -202,8 +202,8 @@ mod tests {
         let holds = Holds::of(Framing::Lf, b"", &block, block.len()).unwrap();
         assert_eq!(holds.records, ERoff::new(3));
         // Lf overhead is 1. body is lines(3).len() - 3.
-        // canonical = (len - 3) + 3 * 4 = len + 9.
-        assert_eq!(holds.logical, ELoff::of_number((block.len() + 9) as u64).unwrap());
+        // Canonical length excludes the three LF terminators.
+        assert_eq!(holds.logical, ELoff::of_number((block.len() - 3) as u64).unwrap());
         assert_eq!(holds.compressed, ECoff::of_len(block.len() + APPEND_OVERHEAD).unwrap());
 
         // A block that leaves a record open closes nothing.
@@ -216,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn logical_limit_uses_the_default_length_format_for_every_framing() {
+    fn logical_length_counts_payload_for_every_framing() {
         let blocks = [
             (Framing::Nul, b"one\0two\0three\0".as_slice()),
             (Framing::Lf, b"one\ntwo\nthree\n".as_slice()),
@@ -234,7 +234,7 @@ mod tests {
             .map(|(framing, block)| Holds::of(*framing, b"", block, block.len()).unwrap().logical)
             .collect();
         assert!(logical.iter().all(|size| *size == logical[0]));
-        assert_eq!(logical[0], ELoff::new(23));
+        assert_eq!(logical[0], ELoff::new(11));
     }
 
     /// A logical length that does not match what was stored, for a block nothing
