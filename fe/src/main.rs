@@ -20,7 +20,8 @@
 //! that holds no state.
 
 use common::Result;
-use common::block::Holds;
+use common::block::{Holds, expand, squeeze};
+use common::config::Compress;
 use common::config::{FEConfig, ServiceKind};
 use common::deletion::{read_soft_deleted, with_read_soft_deleted};
 use common::framing::Framing;
@@ -570,7 +571,11 @@ impl FE {
     /// An append: resolve the name — making the object if it is not there — find the
     /// extent, and hand the bytes to its primary.
     fn append(self: &Arc<Self>, process: &Arc<Process>, request: &Req, mut reply: Reply) {
-        let ParsedAppend { path, expect, framing, first, tail } = match ParsedAppend::of(request) {
+        let ParsedAppend { path, expect, framing, first, tail } = match ParsedAppend::of(request)
+            .and_then(|mut append| {
+                append.wrap_bytes(process.cluster.extents.max_append_bytes)?;
+                Ok(append)
+            }) {
             Ok(append) => append,
             Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
         };
@@ -909,9 +914,16 @@ impl FE {
             };
             (path, expect, range, include)
         };
-        // The start has to be a record for now: the other two forms need a prefix sum
-        // of logical lengths, which §4.5 keeps lazily and nothing here can ask for
-        // (§9.1.3.4). A well-formed request for something unbuilt.
+        // Bytes objects support exact logical starts by walking their stored records.
+        // RecordThen still needs the general framing-aware range implementation.
+        if let Start::Logical(offset) = range.start {
+            return reply.send(
+                match read_bytes(process, &path, expect, offset.number(), range.budget, include) {
+                    Ok(answer) => answer,
+                    Err(error) => Resp::error(Status::Internal, error.to_string()),
+                },
+            );
+        }
         let Start::Record(record) = range.start else {
             return reply.send(Resp::error(
                 Status::Unimplemented,
@@ -995,6 +1007,141 @@ impl FE {
     }
 }
 
+/// Byte-view reads walk extent locators and ask EN to skip preceding block
+/// headers. Only blocks overlapping the byte range bring payloads back to FE.
+fn read_bytes(
+    process: &Arc<Process>,
+    path: &str,
+    expect: Expecting,
+    offset: u64,
+    budget: Budget,
+    include: bool,
+) -> Result<Resp> {
+    let Budget::Logical(amount) = budget else {
+        return Ok(Resp::error(Status::BadRequest, "byte-offset reads need a logical-byte budget"));
+    };
+    if offset == OLoff::NONE.number() {
+        return Ok(Resp::error(Status::BadRequest, "byte offset is the no-value sentinel"));
+    }
+    let amount = amount.min(Range::DEFAULT_LOGICAL) as usize;
+    let dn = process.owner(ServiceKind::Dn, path)?.to_string();
+    let initial =
+        process.call(&dn, &with_read_soft_deleted(object_lookup(path, None, expect), include))?;
+    if initial.status != Status::Ok {
+        return Ok(initial);
+    }
+    let (described, _) = Described::of_args(&initial.args)?;
+    let Some(described) = described else {
+        return Ok(Resp::error(Status::NotFound, "no object"));
+    };
+    if described.framing != Framing::Bytes {
+        return Ok(Resp::error(
+            Status::BadRequest,
+            "byte-offset reads currently require bytes framing",
+        ));
+    }
+    let pinned = Expecting::of(described.object);
+    let mut wanted = ORoff::ZERO;
+    let mut skip = offset;
+    let mut output = Vec::with_capacity(amount);
+    while output.len() < amount {
+        let answer = process.call(
+            &dn,
+            &with_read_soft_deleted(object_lookup(path, Some(wanted), pinned), include),
+        )?;
+        if answer.status == Status::NotFound {
+            let check = process
+                .call(&dn, &with_read_soft_deleted(object_lookup(path, None, pinned), include))?;
+            if check.status != Status::Ok {
+                return Ok(check);
+            }
+            break;
+        }
+        if answer.status != Status::Ok {
+            return Ok(answer);
+        }
+        let located = Located::of(&answer.args)
+            .ok_or_else(|| common::Error::new("byte lookup returned no stream"))?;
+        let at = in_stream(wanted, located.first_record);
+        let mut payload = StructWriter::new();
+        payload.range_id(located.stream.range);
+        payload.stream_id(located.stream.stream);
+        payload.time_sec(located.stream.created);
+        payload.sroff(at);
+        let answer = process.call(
+            &format!("SN{}", located.sn),
+            &with_read_soft_deleted(Req::new(Op::LocateRecord).structure(payload), include),
+        )?;
+        if answer.status == Status::NotFound {
+            break;
+        }
+        if answer.status != Status::Ok {
+            return Ok(answer);
+        }
+        let open = Open::of(located.sn, located.framing, &answer.args)
+            .ok_or_else(|| common::Error::new("byte lookup returned no extent"))?;
+        let mut payload = StructWriter::new();
+        payload.en_id(open.disks[0].0);
+        payload.disk_id(open.disks[0].1);
+        payload.sn_id(open.sn);
+        payload.extent_id(open.id);
+        payload.time_sec(open.created);
+        ExtentRange {
+            start: ExtentStart::Payload(in_extent(at, open.first_record), skip),
+            budget: Budget::Logical((amount - output.len()) as u64),
+        }
+        .write_nested(&mut payload);
+        let answer = process.call(
+            &format!("EN{}", open.disks[0].0),
+            &with_read_soft_deleted(Req::new(Op::ReadExtent).structure(payload), include),
+        )?;
+        if answer.status == Status::NotFound {
+            break;
+        }
+        if answer.status != Status::Ok {
+            return Ok(answer);
+        }
+        let (seek, rest) = common::range::ByteSeek::of_args(&answer.args)?;
+        skip = skip
+            .checked_sub(seek.skipped)
+            .ok_or_else(|| common::Error::new("byte seek skipped beyond requested offset"))?;
+        let pieces = Piece::all_of_args(rest)?;
+        let base = origin(located.first_record, open.first_record);
+        let before = wanted;
+        for piece in pieces {
+            if piece.logical.get() > process.cluster.extents.max_append_bytes {
+                return Err(common::Error::new("oversized byte-read block"));
+            }
+            let block = expand(Compress::Lz4, &piece.bytes, piece.logical.get() as usize)?;
+            if piece.crc != 0 && common::crc::of(&block) != piece.crc {
+                return Err(common::Error::new("byte-read CRC mismatch"));
+            }
+            // Bytes appends, including coalesced ones, preserve complete records.
+            if Framing::Length.whole(&block)? != piece.records.number() {
+                return Err(common::Error::new("byte-read record count mismatch"));
+            }
+            for bytes in Framing::Length.records(&block) {
+                if skip >= bytes.len() as u64 {
+                    skip -= bytes.len() as u64;
+                } else {
+                    let bytes = &bytes[skip as usize..];
+                    skip = 0;
+                    output.extend_from_slice(&bytes[..bytes.len().min(amount - output.len())]);
+                }
+                if output.len() == amount {
+                    return Ok(Resp::bytes(output));
+                }
+            }
+        }
+        wanted = base.plus(ORoff::new(seek.next.number()))?;
+        if wanted <= before {
+            // The current open extent has no further records: EOF at this view.
+            break;
+        }
+    }
+    Ok(Resp::bytes(output))
+}
+
 /// The fields owned by an append request, before routing adds an extent.
 struct ParsedAppend {
     path: String,
@@ -1005,6 +1152,35 @@ struct ParsedAppend {
 }
 
 impl ParsedAppend {
+    fn wrap_bytes(&mut self, maximum: u32) -> Result<()> {
+        if self.framing != Framing::Bytes {
+            return Ok(());
+        }
+        let mut total = 0u64;
+        for part in std::iter::once(&mut self.first).chain(&mut self.tail) {
+            if part.holds.records != ERoff::new(1) || part.holds.logical.get() < 4 {
+                return Err(common::Error::new(
+                    "a bytes append block must declare exactly one record",
+                ));
+            }
+            total += part.holds.logical.number();
+            if total > maximum as u64 {
+                return Err(common::Error::new("bytes append exceeds maximum logical append size"));
+            }
+            let expected = part.holds.logical.get() as usize - 4;
+            let plain = expand(Compress::Lz4, &part.body, expected)?;
+            if part.crc != 0 && common::crc::of(&plain) != part.crc {
+                return Err(common::Error::new("bytes append CRC mismatch"));
+            }
+            let mut framed = (expected as u32).to_le_bytes().to_vec();
+            framed.extend_from_slice(&plain);
+            part.body = squeeze(Compress::Lz4, &framed).unwrap_or_else(|| framed.clone());
+            part.holds = Holds::of(Framing::Length, b"", &framed, part.body.len())?;
+            part.crc = common::crc::of(&framed);
+        }
+        Ok(())
+    }
+
     fn of(request: &Req) -> common::Result<Self> {
         let (mut payload, rest) = structure(&request.args, Op::AppendRecord, "an append request")?;
         let path = payload.text()?;
@@ -1065,7 +1241,7 @@ fn append_request(open: &Open, framing: Framing, first: AppendPart, tail: &[Appe
         sn: open.sn,
         extent: open.id,
         created: open.created,
-        framing,
+        framing: framing.storage(),
         crc: first.crc,
         holds: first.holds,
         logical_offset: None,
@@ -2051,6 +2227,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bytes_appends_are_wrapped_once_including_empty_records() {
+        for plain in [b"".as_slice(), b"a\0\n\xff", &[42; 4096]] {
+            let stored = squeeze(Compress::Lz4, plain).unwrap_or_else(|| plain.to_vec());
+            let mut append = ParsedAppend {
+                path: "/bytes".into(),
+                expect: Expecting::whatever(),
+                framing: Framing::Bytes,
+                first: AppendPart {
+                    holds: Holds::of(Framing::Bytes, b"", plain, stored.len()).unwrap(),
+                    crc: common::crc::of(plain),
+                    body: stored,
+                },
+                tail: vec![],
+            };
+            assert!(append.wrap_bytes(3).is_err());
+            append.wrap_bytes(8192).unwrap();
+            let part = append.first;
+            assert_eq!(part.holds.records, ERoff::new(1));
+            assert_eq!(part.holds.logical.number(), plain.len() as u64 + 4);
+            let stored =
+                expand(Compress::Lz4, &part.body, part.holds.logical.get() as usize).unwrap();
+            assert_eq!(Framing::Length.records(&stored).collect::<Vec<_>>(), vec![plain]);
+            assert_eq!(part.crc, common::crc::of(&stored));
+        }
+    }
+
+    #[test]
     fn deletion_requests_are_forwarded_by_object_path() {
         for retention in [None, Some(common::time::TimeIntSec64::new(-1))] {
             let request = common::deletion::Delete {
@@ -2161,7 +2364,7 @@ mod tests {
     }
 
     #[test]
-    fn interior_starts_are_refused_before_lookup() {
+    fn unsupported_start_budget_pairs_are_refused_before_lookup() {
         let fe = Arc::new(FE::new(common::testing::fe_config()));
         for start in
             [Start::RecordThen(ORoff::new(7), OLoff::new(1)), Start::Logical(OLoff::new(1))]
@@ -2171,7 +2374,13 @@ mod tests {
             let (wire, mut reader) = common::testing::link();
             let reply = Reply::new_test(Arc::new(common::server::Out::direct(wire)));
             fe.read(&common::testing::process(), &request, reply);
-            assert_eq!(reader.response().unwrap().status, Status::Unimplemented);
+            assert_eq!(
+                reader.response().unwrap().status,
+                match start {
+                    Start::Logical(_) => Status::BadRequest,
+                    _ => Status::Unimplemented,
+                }
+            );
         }
     }
     use common::ids::{ObjectId, RangeId, StreamId};

@@ -18393,3 +18393,51 @@ TPM 2.0 host: anonymous unlock, authenticated key issuance and registration, and
 rejection of anonymous key requests and impersonated registration. The signing
 template explicitly specifies a null symmetric algorithm; relying on the tools'
 implicit default caused TPM error 0x2D6 and was corrected before that passing run.
+
+## 17.46 Bytes framing
+
+`bytes` is user-visible framing with zero boundary bytes (wire kind 5, width 0).
+Each append block becomes one internal `length` record at FE: a four-byte
+little-endian payload length followed by the payload. Empty appends are legal and
+count as records, adding four canonical bytes and zero visible bytes. Coalescing
+preserves these original record boundaries. Application conventions such as fixed
+4 MiB appends are not inferred by DeLawson.
+
+FE validates and decompresses incoming bytes blocks, wraps them, then recomputes
+compression, Holds and CRC for the storage representation. EN receives `length`
+framing. A record read parses this storage framing; a logical-byte read removes
+it and selects exactly the requested byte interval. For record lengths 1, 0, 0, 2,
+byte offsets 0, 1 and 2 select record 0, record 3, and record 3 plus one byte.
+Empty records cannot contain a byte. EOF returns a successful empty response.
+
+Logical starts on bytes objects use ReadRecord with Start::Logical and
+Budget::Logical, returning BytesResp, capped to 1 MiB. The initial implementation
+walks existing DN/SN record locators. EN's ExtentStart::Payload specifies a
+block-boundary record and a payload-byte skip, carried as u64 so an offset past an
+entire extent can be handled without narrowing it. EN scans Holds headers and
+subtracts `logical - 4 * records`, skipping ciphertext without decrypting it.
+ByteSeekResp reports skipped payload bytes and the next record after skipped and
+returned blocks, followed by Piece responses only for overlapping blocks. FE
+decompresses those blocks to extract the exact byte interval. Empty blocks advance
+the record cursor, and an extent entirely before the requested offset returns
+header progress without payloads. A regression test makes skipped ciphertext
+unreadable and verifies that a later byte read still succeeds.
+
+This does not accumulate an object byte total, so an object larger than 2^64 bytes
+does not break lookup in the expressible range. The CLI supplies read-bytes with
+raw output and repeated requests. Header scanning remains linear per request and
+uses an FE worker while waiting; indexed lookup and continuation optimization
+remain unimplemented.
+
+ObjectInfo translates bytes lengths at the response boundary without changing
+canonical storage accounting. Prefixes are subtracted per stream before summing:
+a canonical total exceeding u64 may still have an expressible visible size.
+Oversized visible totals retain the existing OLoff::MAX saturation. Unknown
+record counts cannot safely translate cached canonical lengths and remain unknown.
+The existing cache-refresh and record-count semantics are unchanged. Byte offsets
+remain stable under append and coalescing, but not length-changing updates/deletes.
+
+Regression coverage includes empty appends, hidden-prefix checksums, exact byte
+lookup around empty records, multi-response binary reads, seals, concatenation,
+and metadata-only objects exceeding the byte-offset space. The integration command
+is scripts/test-bytes; the workspace suite requires --features delawson-common/testing.

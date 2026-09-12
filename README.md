@@ -251,3 +251,39 @@ temporary files. No system-wide permissions are changed. The smaller
 References: [rustls raw-public-key verification](https://docs.rs/rustls/latest/rustls/crypto/fn.verify_tls13_signature_with_raw_key.html),
 [TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446), and
 [TPM primary creation](https://tpm2-tools.readthedocs.io/en/latest/man/tpm2_createprimary.1/).
+
+## Byte-stream objects
+
+Use `bytes` framing for ordinary file contents, with no visible record delimiters:
+
+```sh
+target/debug/laws append-block /file --framing bytes --file input.bin
+target/debug/laws read-bytes /file --offset 17 --length 4096 --output slice.bin
+```
+
+`read-bytes` writes raw binary to stdout when `--output` is omitted. A read at or
+past EOF succeeds with no bytes; a read crossing EOF returns the available suffix.
+Each append block counts as one record, even an empty append. FE stores a hidden
+four-byte length before each block. `read --record N --framing bytes` retains the
+existing textual CLI record display; `read-bytes` strips all hidden framing.
+ObjectInfo sizes use the visible bytes space; record counts still include empty
+appends. Counts-only sizes use existing DN caches: request `object-info /file
+--want extents` to refresh them after sealing, then `--want counts` for totals.
+
+Byte offsets survive appends and storage coalescing, which preserves append record
+boundaries. Length-changing updates or deletes shift subsequent byte offsets.
+Objects can exceed the byte-offset range: aggregate logical size still saturates
+at `OLoff::MAX`, while record access remains available. The top `u64` value retains
+its existing no-value-sentinel meaning.
+
+Byte reads walk extent locators and scan preceding append-block headers at EN.
+A header supplies the payload length as canonical length minus four bytes per
+record, so skipped payloads are neither decrypted nor sent to FE. Only overlapping
+blocks are fetched and decompressed. Responses contain at most 1 MiB of requested
+bytes; the CLI repeats requests for larger reads. Header lookup is still linear
+and repeated requests can revisit headers; a prefix index and efficient
+continuations remain future work.
+
+Run the isolated integration test with `cargo build --workspace` followed by
+`scripts/test-bytes`. It uses temporary configuration, ports and data, with one DN
+for the existing same-DN concat path, and cleans up its processes afterwards.

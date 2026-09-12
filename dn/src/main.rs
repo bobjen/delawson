@@ -161,7 +161,7 @@ fn detailed(
                 created: held.created,
                 // What the DN last learned. Exact once the stream is sealed, a point in
                 // time before that, and UNKNOWN until any SN has been asked (§17.25.1).
-                totals: held.totals(),
+                totals: visible_totals(object.framing, held.totals(), held.records),
                 given: ExtentId::FIRST,
             });
         }
@@ -493,16 +493,23 @@ impl Object {
     }
 
     fn logical(&self, table: &[Stream]) -> OLoff {
-        self.streams.iter().map(|id| &table[id.get() as usize]).fold(
-            OLoff::ZERO,
-            |total, stream| {
-                if stream.logical.is_none() || total == OLoff::MAX {
-                    total
-                } else {
-                    total.plus(OLoff::from_stream(stream.logical)).unwrap_or(OLoff::MAX)
-                }
-            },
-        )
+        // Sum in the visible space, before any canonical total can overflow.
+        // An unrepresentable byte count does not restrict the object's records.
+        let mut total = OLoff::ZERO;
+        for stream in self.streams.iter().map(|id| &table[id.get() as usize]) {
+            if stream.logical.is_none() {
+                continue;
+            }
+            let logical = visible_totals(self.framing, stream.totals(), stream.records).logical;
+            if logical.is_none() {
+                return OLoff::NONE;
+            }
+            let Ok(next) = total.plus(OLoff::from_stream(logical)) else {
+                return OLoff::MAX;
+            };
+            total = next;
+        }
+        total
     }
 
     fn compressed(&self, table: &[Stream]) -> OCoff {
@@ -634,15 +641,33 @@ fn stream_start(from: ORoff, base: ORoff) -> SRoff {
     SRoff::new(from.since(base).number())
 }
 
+/// Storage remains canonical; only user-facing bytes summaries hide the prefixes.
+fn visible_totals(framing: Framing, mut totals: Totals, records: SRoff) -> Totals {
+    if framing == Framing::Bytes {
+        totals.logical = if totals.logical.is_none() || records.is_none() {
+            SLoff::NONE
+        } else {
+            framing
+                .visible_length(totals.logical.number(), records.number())
+                .map(SLoff::new)
+                .unwrap_or(SLoff::NONE)
+        };
+    }
+    totals
+}
+
 /// Assemble each reference independently: sharing a stream does not consume its summary.
 fn merge_object_info(mut held: Levelled, runs: &[Option<ExtentReply>], limit: u64) -> Vec<Arg> {
+    let framing =
+        Described::of_args(&held.head).ok().and_then(|(row, _)| row).map(|row| row.framing);
     let mut body = Vec::new();
     let mut extents = OEoff::ZERO;
     let mut given = 0;
     assert_eq!(held.rows.len(), runs.len());
     for (row, reply) in held.rows.iter_mut().zip(runs) {
         if let Some((run, rows)) = reply {
-            row.totals = run.totals;
+            row.totals =
+                visible_totals(framing.unwrap_or(Framing::Length), run.totals, row.records);
 
             row.given = ExtentId::of_number(rows.len() as u64).expect("extent row count fits");
             if run.next.is_some() {
@@ -654,6 +679,17 @@ fn merge_object_info(mut held: Levelled, runs: &[Option<ExtentReply>], limit: u6
             }
             body.extend(row.args());
             for extent in rows {
+                let mut extent = extent.clone();
+                if framing == Some(Framing::Bytes) {
+                    extent.logical = if extent.logical.is_none() || extent.records.is_none() {
+                        common::offset::ELoff::NONE
+                    } else {
+                        Framing::Bytes
+                            .visible_length(extent.logical.number(), extent.records.number())
+                            .and_then(|n| common::offset::ELoff::of_number(n).ok())
+                            .unwrap_or(common::offset::ELoff::NONE)
+                    };
+                }
                 body.extend(extent.args());
             }
             given += rows.len() as u64;
@@ -2496,6 +2532,38 @@ fn main() {
 mod tests {
     fn counts(dn: &DN, stream: &Stream) -> (u32, u32) {
         dn.stream_extras.lock().unwrap().counts(&(stream.id, stream.created), stream.deletion)
+    }
+
+    #[test]
+    fn objects_larger_than_byte_offset_space_still_have_record_access() {
+        let mut object = grown();
+        object.framing = Framing::Bytes;
+        object.streams = vec![StreamId::new(0), StreamId::new(1)];
+        let table: Vec<_> = (0..2)
+            .map(|n| Stream { logical: SLoff::new(1u64 << 63), ..held(n, 0, Some(1)) })
+            .collect();
+        // Canonical length overflows, visible length still fits after hiding prefixes.
+        assert_eq!(object.logical(&table).number(), u64::MAX - 7);
+        let table: Vec<_> = table
+            .into_iter()
+            .map(|s| Stream { logical: SLoff::new((1u64 << 63) + 10), ..s })
+            .collect();
+        assert_eq!(object.logical(&table), OLoff::MAX);
+        assert_eq!(object.records(&table), ORoff::new(2));
+        assert_eq!(object.holding(&table, ORoff::new(1)).unwrap().1.id, StreamId::new(1));
+    }
+
+    #[test]
+    fn bytes_summary_counts_empty_records_without_exposing_prefixes() {
+        let totals = Totals {
+            extents: ExtentId::new(1),
+            logical: SLoff::new(19),
+            compressed: SCoff::new(99),
+        };
+        let visible = visible_totals(Framing::Bytes, totals, SRoff::new(4));
+        assert_eq!(visible.logical, SLoff::new(3));
+        assert_eq!(visible.compressed, totals.compressed);
+        assert_eq!(visible_totals(Framing::Bytes, totals, SRoff::NONE).logical, SLoff::NONE);
     }
 
     #[test]

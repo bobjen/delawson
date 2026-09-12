@@ -4,7 +4,9 @@
 //! an EN stores it and hands it back, and the reader that decompresses it is the
 //! same client that compressed it. So compression is not a stage in a pipeline of
 //! machines — it is a representation the data is in from the moment it leaves the
-//! writer's buffer until it reaches a reader's.
+//! writer's buffer until it reaches a reader's. The `bytes` framing is an exception:
+//! FE decompresses and wraps each append as a length-prefixed record, then recompresses
+//! and checksums it. FE also decodes those records when serving logical-byte reads.
 //!
 //! **Not in place.** The original buffer survives compression so that it can be
 //! checked against the CRC afterwards, which is what catches a corruption that

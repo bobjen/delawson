@@ -17,7 +17,7 @@ use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
 use common::ids::{ExtentId, ObjectId, RangeId, StreamId};
 use common::info::{Batch, Described, Expecting, ExtentRow, ObjectName, Shape, StreamRow, UNKNOWN};
-use common::offset::{ELoff, ERoff, ORoff, SCoff, SLoff, SRoff};
+use common::offset::{ELoff, ERoff, OLoff, ORoff, SCoff, SLoff, SRoff};
 use common::placement::{self, Expansion};
 
 use common::random::Rng;
@@ -457,6 +457,20 @@ enum Cmd {
         #[command(flatten)]
         at: At,
     },
+    /// Read an exact byte range from a bytes-framed object; write raw bytes.
+    ReadBytes {
+        path: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long, default_value_t = 1048576)]
+        length: u64,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        expect: Option<String>,
+        #[arg(long)]
+        read_soft_deleted: bool,
+    },
     /// Read one record.
     Read {
         path: String,
@@ -621,6 +635,50 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     match &cli.cmd {
+        Cmd::ReadBytes { path, offset, length, output, expect, read_soft_deleted } => {
+            use std::io::Write;
+            let target = resolve(&cluster, &cli, ServiceKind::Fe)?;
+            let mut conn = open(&target, timeout, &cluster.messaging)?;
+            let mut out: Box<dyn Write> = match output {
+                Some(path) => Box::new(std::fs::File::create(path)?),
+                None => Box::new(std::io::stdout().lock()),
+            };
+            let mut at = *offset;
+            let mut remaining = *length;
+            loop {
+                let amount = remaining.min(Range::DEFAULT_LOGICAL);
+                let req = Range {
+                    start: Start::Logical(OLoff::of_number(at)?),
+                    budget: Budget::Logical(amount),
+                }
+                .request(path, expecting(expect)?);
+                let answer =
+                    conn.call(&common::deletion::with_read_soft_deleted(req, *read_soft_deleted))?;
+                if answer.status != Status::Ok {
+                    return report(&target, &answer);
+                }
+                let (mut payload, rest) = structure(&answer.args, Op::BytesResp, "byte range")?;
+                let bytes = payload.bytes()?;
+                payload.done()?;
+                if !rest.is_empty() || bytes.len() as u64 > amount {
+                    return Err(Error::new("invalid byte-range response"));
+                }
+                out.write_all(&bytes)?;
+                if bytes.is_empty() || (bytes.len() as u64) < amount {
+                    break;
+                }
+                remaining -= bytes.len() as u64;
+                if remaining == 0 {
+                    break;
+                }
+                at = at
+                    .checked_add(bytes.len() as u64)
+                    .filter(|n| *n != OLoff::NONE.number())
+                    .ok_or_else(|| Error::new("next byte offset is not representable"))?;
+            }
+            out.flush()?;
+            Ok(())
+        }
         Cmd::Services => {
             for s in cluster.cold_start_order() {
                 println!("{:<6} {:<3} {}", s.identity, s.kind, s.domain.join("/"));
@@ -1402,6 +1460,7 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging, flags: u64)
 /// which is what keeps a writer clear of the awkward corners around sealing.
 fn frame(framing: Framing, record: &[u8]) -> Result<Vec<u8>> {
     let mark: &[u8] = match framing {
+        Framing::Bytes => return Ok(record.to_vec()),
         Framing::Nul => &[0],
         Framing::Lf => b"\n",
         Framing::CrLf => b"\r\n",
@@ -1435,6 +1494,14 @@ fn frame(framing: Framing, record: &[u8]) -> Result<Vec<u8>> {
 /// Compress one logical append into independently readable pieces. The enclosing
 /// request may be large, but no stored piece exceeds EN's one-megabyte read unit.
 fn append_parts(framing: Framing, block: &[u8]) -> Result<Vec<(Holds, Vec<u8>, u64)>> {
+    if framing == Framing::Bytes {
+        let stored = squeeze(Compress::Lz4, block).unwrap_or_else(|| block.to_vec());
+        return Ok(vec![(
+            Holds::of(framing, b"", block, stored.len())?,
+            stored,
+            common::crc::of(block),
+        )]);
+    }
     const COMPRESSED_TARGET: usize = 1 << 20;
     let logical_target = estimated_logical_target(block, COMPRESSED_TARGET);
     if block.len() > logical_target && likely_fits(block, COMPRESSED_TARGET) {
@@ -1785,6 +1852,7 @@ fn say(
 /// finds. Nothing in between ever looked inside, and nothing in between could have
 /// checked this.
 fn records_of(framing: Framing, pieces: &[Piece]) -> Result<Vec<(u64, Vec<u8>)>> {
+    let framing = framing.storage();
     let mut found = Vec::new();
     // ⚠️ A record may span blocks (§8.2.3), so the tail of one block is carried into
     // the next rather than parsed on its own. A block that completed no record

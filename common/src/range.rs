@@ -91,6 +91,9 @@ pub enum ExtentStart {
     Record(ERoff),
     RecordThen(ERoff, ELoff),
     Logical(ELoff),
+    /// Payload bytes after a stored block boundary. The offset may exceed this
+    /// extent; ByteSeekResp then reports the bytes skipped and the next record.
+    Payload(ERoff, u64),
 }
 
 impl ExtentStart {
@@ -99,6 +102,7 @@ impl ExtentStart {
             ExtentStart::Record(record) => (0, record.number(), 0),
             ExtentStart::RecordThen(record, offset) => (1, record.number(), offset.number()),
             ExtentStart::Logical(offset) => (2, offset.number(), 0),
+            ExtentStart::Payload(record, offset) => (3, record.number(), offset),
         }
     }
 
@@ -107,6 +111,7 @@ impl ExtentStart {
             0 => Ok(ExtentStart::Record(ERoff::of_number(first)?)),
             1 => Ok(ExtentStart::RecordThen(ERoff::of_number(first)?, ELoff::of_number(second)?)),
             2 => Ok(ExtentStart::Logical(ELoff::of_number(first)?)),
+            3 => Ok(ExtentStart::Payload(ERoff::of_number(first)?, second)),
             other => Err(Error::new(format!("no extent range start of kind {other}"))),
         }
     }
@@ -421,6 +426,30 @@ impl ObjectCovered {
         };
         payload.done()?;
         Ok((covered, rest))
+    }
+}
+
+/// Header-only progress before the returned byte-read blocks. `next` is the
+/// record after all skipped and returned blocks, even when no payload is returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteSeek {
+    pub skipped: u64,
+    pub next: ERoff,
+}
+
+impl ByteSeek {
+    pub fn args(self) -> Vec<Arg> {
+        let mut payload = StructWriter::new();
+        payload.number_u64(self.skipped);
+        payload.eroff(self.next);
+        vec![payload.finish(Op::ByteSeekResp)]
+    }
+
+    pub fn of_args(args: &[Arg]) -> Result<(Self, &[Arg])> {
+        let (mut payload, rest) = structure(args, Op::ByteSeekResp, "byte seek")?;
+        let value = Self { skipped: payload.number_u64()?, next: payload.eroff()? };
+        payload.done()?;
+        Ok((value, rest))
     }
 }
 
@@ -782,6 +811,7 @@ mod tests {
             ExtentStart::Record(ERoff::new(7)),
             ExtentStart::RecordThen(ERoff::new(7), ELoff::new(4096)),
             ExtentStart::Logical(ELoff::new(4096)),
+            ExtentStart::Payload(ERoff::new(7), 1u64 << 63),
         ] {
             let range = ExtentRange { start, budget: Budget::Logical(1 << 20) };
             let mut payload = StructWriter::new();

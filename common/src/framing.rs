@@ -1,11 +1,12 @@
 //! Where one record ends and the next begins.
 //!
 //! An object declares its framing when it is created, and appends are stored in
-//! the format the writer gave them. Five of them, differing only in what marks a
+//! the format the writer gave them, except `bytes`, stored as `length`. Six modes differ in the
 //! boundary and what that costs per record:
 //!
 //! | Framing | Boundary | Overhead |
 //! |---|---|---|
+//! | bytes | one append block; boundary hidden from the byte view | 0 |
 //! | fixed | every record the same declared width | 0 |
 //! | nul | a terminating `0x00` | 1 |
 //! | lf | a terminating `\n` | 1 |
@@ -26,6 +27,8 @@ use crate::{Error, Result};
 pub enum Framing {
     /// Every record the declared width, so a boundary is arithmetic.
     Fixed(u32),
+    /// User-visible byte stream; each append is one hidden length-prefixed record.
+    Bytes,
     Nul,
     Lf,
     CrLf,
@@ -34,6 +37,18 @@ pub enum Framing {
 }
 
 impl Framing {
+    /// The byte-stream view uses length-prefixed records on the storage path.
+    pub fn storage(self) -> Framing {
+        if self == Framing::Bytes { Framing::Length } else { self }
+    }
+
+    /// Translate canonical length without pretending unknown/invalid counts are zero.
+    pub fn visible_length(self, canonical: u64, records: u64) -> Option<u64> {
+        canonical
+            .checked_sub(records.checked_mul(4)?)?
+            .checked_add(records.checked_mul(self.overhead() as u64)?)
+    }
+
     /// The name used on a command line and in a configuration. `fixed` carries its
     /// width, since a width is part of the framing rather than a separate knob.
     pub fn parse(text: &str) -> Result<Framing> {
@@ -47,13 +62,14 @@ impl Framing {
             return Ok(Framing::Fixed(width));
         }
         Ok(match text {
+            "bytes" => Framing::Bytes,
             "nul" => Framing::Nul,
             "lf" => Framing::Lf,
             "crlf" => Framing::CrLf,
             "length" => Framing::Length,
             _ => {
                 return Err(Error::new(format!(
-                    "{text:?} is not a framing: nul, lf, crlf, length or fixed:WIDTH"
+                    "{text:?} is not a framing: bytes, nul, lf, crlf, length or fixed:WIDTH"
                 )));
             }
         })
@@ -62,7 +78,7 @@ impl Framing {
     /// Bytes a record costs beyond its content.
     pub fn overhead(self) -> u32 {
         match self {
-            Framing::Fixed(_) => 0,
+            Framing::Fixed(_) | Framing::Bytes => 0,
             Framing::Nul | Framing::Lf => 1,
             Framing::CrLf => 2,
             Framing::Length => 4,
@@ -78,6 +94,7 @@ impl Framing {
             Framing::Lf => (2, 0),
             Framing::CrLf => (3, 0),
             Framing::Length => (4, 0),
+            Framing::Bytes => (5, 0),
         }
     }
 
@@ -89,6 +106,7 @@ impl Framing {
             2 => Framing::Lf,
             3 => Framing::CrLf,
             4 => Framing::Length,
+            5 if width == 0 => Framing::Bytes,
             _ => return Err(Error::new(format!("unknown framing {kind}"))),
         })
     }
@@ -96,7 +114,7 @@ impl Framing {
     /// The records in a block, each as its content without the boundary. Stops at
     /// the last whole record: what is left over is a fragment, which `whole` is for.
     pub fn records<'a>(self, block: &'a [u8]) -> Records<'a> {
-        Records { framing: self, block, at: 0 }
+        Records { framing: self, block, at: 0, bytes_done: false }
     }
 
     /// How many whole records are in a block, and how many bytes they took. The
@@ -158,7 +176,7 @@ impl Framing {
             block.len() - (records as usize * overhead)
         } else {
             match self {
-                Framing::Fixed(_) => block.len(),
+                Framing::Fixed(_) | Framing::Bytes => block.len(),
                 Framing::Nul | Framing::Lf | Framing::CrLf => block.len(),
                 Framing::Length => {
                     if open_len >= 4 {
@@ -176,6 +194,7 @@ impl Framing {
 impl std::fmt::Display for Framing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Framing::Bytes => f.write_str("bytes"),
             Framing::Fixed(width) => write!(f, "fixed:{width}"),
             Framing::Nul => f.write_str("nul"),
             Framing::Lf => f.write_str("lf"),
@@ -191,17 +210,27 @@ pub struct Records<'a> {
     framing: Framing,
     block: &'a [u8],
     at: usize,
+    bytes_done: bool,
 }
 
 impl<'a> Iterator for Records<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<&'a [u8]> {
+        if self.framing == Framing::Bytes {
+            if self.bytes_done {
+                return None;
+            }
+            self.bytes_done = true;
+            self.at = self.block.len();
+            return Some(self.block);
+        }
         let left = self.block.get(self.at..)?;
         if left.is_empty() {
             return None;
         }
         let (content, used) = match self.framing {
+            Framing::Bytes => unreachable!("handled above"),
             Framing::Fixed(width) => {
                 let width = width as usize;
                 (left.get(..width)?, width)
@@ -233,7 +262,7 @@ mod tests {
     /// The same three records in each framing, so the shapes can be compared.
     fn three(framing: Framing) -> Vec<u8> {
         match framing {
-            Framing::Fixed(_) => b"aaabbbccc".to_vec(),
+            Framing::Fixed(_) | Framing::Bytes => b"aaabbbccc".to_vec(),
             Framing::Nul => b"one\0two\0three\0".to_vec(),
             Framing::Lf => b"one\ntwo\nthree\n".to_vec(),
             Framing::CrLf => b"one\r\ntwo\r\nthree\r\n".to_vec(),
@@ -250,6 +279,27 @@ mod tests {
 
     fn every() -> [Framing; 5] {
         [Framing::Fixed(3), Framing::Nul, Framing::Lf, Framing::CrLf, Framing::Length]
+    }
+
+    #[test]
+    fn bytes_preserve_empty_appends_and_have_no_visible_overhead() {
+        assert_eq!(Framing::parse("bytes").unwrap(), Framing::Bytes);
+        assert_eq!(Framing::of_wire(5, 0).unwrap(), Framing::Bytes);
+        assert!(Framing::of_wire(5, 1).is_err());
+        assert_eq!(Framing::Bytes.storage(), Framing::Length);
+        assert_eq!(Framing::Bytes.whole(b"").unwrap(), 1);
+        assert_eq!(Framing::Bytes.whole(b"a\0\n").unwrap(), 1);
+        assert_eq!(Framing::Bytes.canonical_size(0, b"").unwrap(), 4);
+        assert_eq!(Framing::Bytes.visible_length(19, 4), Some(3));
+        let mut stored = Vec::new();
+        for block in [b"a".as_slice(), b"", b"", b"bc"] {
+            stored.extend_from_slice(&(block.len() as u32).to_le_bytes());
+            stored.extend_from_slice(block);
+        }
+        assert_eq!(
+            Framing::Length.records(&stored).collect::<Vec<_>>(),
+            vec![b"a".as_slice(), b"", b"", b"bc"]
+        );
     }
 
     #[test]

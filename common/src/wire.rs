@@ -223,6 +223,7 @@ ops! {
     SoftDeleteExtentInstance = 78, "soft-delete-extent-instance";
     DeleteExtentInstance = 79, "delete-extent-instance";
     ReadSoftDeleted = 80, "read-soft-deleted";
+    ByteSeekResp = 81, "byte-seek-response";
 }
 
 impl std::fmt::Display for Op {

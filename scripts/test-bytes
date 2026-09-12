@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Exercise bytes framing against an isolated local cluster. Build normally first."""
+import os
+from pathlib import Path
+import random
+import shutil
+import socket
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def run(args):
+    result = subprocess.run([str(a) for a in args], capture_output=True, timeout=120)
+    if result.returncode:
+        raise RuntimeError(result.stdout.decode(errors='replace') + result.stderr.decode(errors='replace'))
+    return result.stdout
+
+
+def main():
+    with tempfile.TemporaryDirectory(prefix='delawson-bytes-') as temporary:
+        work = Path(temporary)
+        config = work/'config'
+        shutil.copytree(ROOT/'config', config)
+        # Check a consecutive port range before handing it to start-laws.
+        while True:
+            base = random.randrange(20000, 50000)
+            sockets = []
+            try:
+                for port in range(base, base + 32):
+                    listener = socket.socket()
+                    sockets.append(listener)
+                    listener.bind(('127.0.0.1', port))
+                break
+            except OSError:
+                pass
+            finally:
+                for listener in sockets:
+                    listener.close()
+        text = (config/'cluster.toml').read_text()
+        text = text.replace('127.0.0.1:9601', f'127.0.0.1:{base}')
+        text = text.replace('port_base = 9602', f'port_base = {base+1}')
+        # Concat currently requires all source names to belong to one DN.
+        at = text.index('kind = "dn"')
+        count = text.index('count = 4', at)
+        text = text[:count] + text[count:].replace('count = 4', 'count = 1', 1)
+        text = text.replace('seal_bytes = 4096', 'seal_bytes = 8388608\nmax_append_bytes = 8388608')
+        (config/'cluster.toml').write_text(text)
+        laws = [ROOT/'target/debug/laws', '--config', config/'cluster.toml']
+        def append(path, data):
+            block = work/'block'
+            block.write_bytes(data)
+            run(laws + ['append-block', path, '--framing', 'bytes', '--file', block])
+        def read(path, offset, length):
+            return run(laws + ['read-bytes', path, '--offset', offset, '--length', length])
+        try:
+            run([ROOT/'scripts/start-laws', '--no-build', '--run-dir', work/'run', '--config', config])
+            for block in [b'a', b'', b'', b'bc']:
+                append('/bytes', block)
+            for offset in range(5):
+                for length in [0, 1, 2, 9]:
+                    assert read('/bytes', offset, length) == b'abc'[offset:offset+length]
+            assert read('/bytes', (1 << 64) - 2, 1) == b''
+            # Record access still finds each empty append.
+            for record, expected in enumerate([b'a', b'', b'', b'bc']):
+                assert run(laws + ['read', '/bytes', '--record', record, '--framing', 'bytes']) == expected + b'\n'
+            run(laws + ['seal', '/bytes'])
+            run(laws + ['object-info', '/bytes', '--want', 'extents'])
+            info = run(laws + ['object-info', '/bytes', '--want', 'counts']).decode()
+            assert '4 records' in info and '3 logical' in info, info
+            append('/bytes', b'def')
+            assert read('/bytes', 2, 4) == b'cdef'
+            for _ in range(3):
+                append('/empty', b'')
+            assert read('/empty', 0, 1) == b''
+            run(laws + ['seal', '/empty'])
+            run(laws + ['object-info', '/empty', '--want', 'extents'])
+            info = run(laws + ['object-info', '/empty', '--want', 'counts']).decode()
+            assert '3 records' in info and '0 logical' in info, info
+            # One large incompressible append remains one record across read budgets.
+            data = os.urandom(4 * 1024 * 1024)
+            append('/large-bytes', data)
+            append('/large-bytes', b'')
+            append('/large-bytes', b'end')
+            assert read('/large-bytes', 0, len(data)+3) == data+b'end'
+            assert read('/large-bytes', len(data)-7, 20) == data[-7:]+b'end'
+            run(laws + ['seal', '/large-bytes'])
+            run(laws + ['concat', '/joined', '/empty', '/large-bytes', '/empty', '/large-bytes'])
+            assert read('/joined', len(data)-2, 9) == data[-2:]+b'end'+data[:4]
+            print('PASS: bytes offsets, empty records, record access, sizes, seals, large appends, and concat.')
+        finally:
+            run([ROOT/'scripts/stop-laws', '--run-dir', work/'run', '--clean'])
+
+
+if __name__ == '__main__':
+    main()

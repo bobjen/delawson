@@ -743,6 +743,69 @@ impl Extents {
         Ok(Some(Ranged { pieces, covered }))
     }
 
+    /// Locate payload bytes using only Holds on preceding blocks. Stored payloads
+    /// are decrypted only once their byte interval intersects the requested range.
+    fn payload_range(
+        &self,
+        daily_cache: &DailyKeyCache,
+        extent_cache: &ExtentKeyCache,
+        process: &Process,
+        place: usize,
+        from: ERoff,
+        mut skip: u64,
+        amount: u64,
+    ) -> Result<Vec<Arg>> {
+        let mut appends: Vec<_> = self.appends.iter().filter(|a| a.extent == place).collect();
+        appends.sort_by_key(|a| a.offset);
+        let mut seek = common::range::ByteSeek { skipped: 0, next: from };
+        let mut pieces = Vec::new();
+        let mut remaining = amount;
+        for block in appends.into_iter().flat_map(|a| &a.blocks) {
+            let end = block.first_record.plus(block.holds.records)?;
+            if end <= from {
+                continue;
+            }
+            if block.first_record < from {
+                return Err(Error::new("payload seek must start at a block boundary"));
+            }
+            let payload = Framing::Bytes
+                .visible_length(block.holds.logical.number(), block.holds.records.number())
+                .ok_or_else(|| Error::new("invalid payload length in block header"))?;
+            if skip >= payload {
+                seek.next = end;
+                skip -= payload;
+                seek.skipped += payload;
+                continue;
+            }
+            if remaining == 0 {
+                break;
+            }
+            let (crc, framing, bytes) =
+                block.decrypt(daily_cache, extent_cache, process, &self.extents[place])?;
+            if framing != Framing::Length {
+                return Err(Error::new("payload seek requires length-framed storage"));
+            }
+            seek.next = end;
+            pieces.push(Piece {
+                logical: block.holds.logical,
+                first_record: block.first_record,
+                records: block.holds.records,
+                crc,
+                bytes,
+            });
+            remaining = remaining.saturating_sub(payload - skip);
+            skip = 0;
+            if remaining == 0 {
+                break;
+            }
+        }
+        let mut args = seek.args();
+        for piece in pieces {
+            args.extend(piece.args());
+        }
+        Ok(args)
+    }
+
     fn created(&self, sn: SnId, id: ExtentId) -> Option<TimeSec> {
         self.at.get(&(sn, id)).map(|place| self.extents[*place].created)
     }
@@ -1081,11 +1144,14 @@ impl Disk {
         range: ExtentRange,
         include: bool,
     ) -> Resp {
-        let ExtentStart::Record(from) = range.start else {
-            return Resp::error(
-                Status::Unimplemented,
-                "only record-boundary starts are implemented",
-            );
+        let from = match range.start {
+            ExtentStart::Record(from) | ExtentStart::Payload(from, _) => from,
+            _ => {
+                return Resp::error(
+                    Status::Unimplemented,
+                    "only record-boundary and payload starts are implemented",
+                );
+            }
         };
 
         let held = self.held.lock().expect("extents");
@@ -1107,6 +1173,23 @@ impl Disk {
         let place = held.at[&(sn, extent)];
         if !held.extents[place].deletion.readable(include) {
             return Resp::error(Status::NotFound, "extent is deleted");
+        }
+        if let ExtentStart::Payload(_, skip) = range.start {
+            let Budget::Logical(amount) = range.budget else {
+                return Resp::error(Status::BadRequest, "payload seek needs a byte budget");
+            };
+            return match held.payload_range(
+                &self.daily_cache,
+                &self.extent_cache,
+                process,
+                place,
+                from,
+                skip,
+                amount.min(common::range::Range::DEFAULT_LOGICAL),
+            ) {
+                Ok(args) => Resp { id: 0, status: Status::Ok, args },
+                Err(e) => Resp::error(Status::Internal, e.to_string()),
+            };
         }
         let ranged = match held.range(
             &self.daily_cache,
@@ -1722,6 +1805,65 @@ mod tests {
             Took::Landed(landed) => landed,
             _ => panic!("should have landed"),
         }
+    }
+
+    #[test]
+    fn payload_seek_uses_headers_without_decrypting_skipped_blocks() {
+        let en = EN::new(testing::en_config());
+        let disk = en.disk(DiskId::FIRST).unwrap();
+        let process = testing::process();
+        for payload in [b"a".as_slice(), b"", b"", b"bc", b"tail"] {
+            let mut bytes = (payload.len() as u32).to_le_bytes().to_vec();
+            bytes.extend_from_slice(payload);
+            let append = AppendBlock {
+                framing: Framing::Length,
+                holds: Holds::of(Framing::Length, b"", &bytes, bytes.len()).unwrap(),
+                crc: common::crc::of(&bytes),
+                bytes,
+                ..block(0, 1, b"")
+            };
+            assert!(matches!(disk.take(&process, &append, ROOM).unwrap(), Took::Landed(_)));
+        }
+        {
+            let mut held = disk.held.lock().unwrap();
+            for append in &mut held.appends[..3] {
+                append.blocks[0].sealed.clear(); // touching these ciphertexts must fail
+            }
+            held.appends[4].blocks[0].sealed.clear(); // past the requested budget too
+        }
+        let read = |from, offset, amount| {
+            disk.read(
+                &process,
+                SnId::FIRST,
+                ExtentId::new(1),
+                TimeSec::new(1_000_000),
+                ExtentRange {
+                    start: ExtentStart::Payload(ERoff::new(from), offset),
+                    budget: Budget::Logical(amount),
+                },
+            )
+        };
+        let answer = read(0, 1, 1);
+        assert_eq!(answer.status, Status::Ok);
+        let (seek, rest) = common::range::ByteSeek::of_args(&answer.args).unwrap();
+        assert_eq!(seek.skipped, 1);
+        assert_eq!(seek.next, ERoff::new(4));
+        let pieces = Piece::all_of_args(rest).unwrap();
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].first_record, ERoff::new(3));
+        assert_eq!(pieces[0].bytes, b"\x02\0\0\0bc");
+        // Starting inside a payload returns only its containing block.
+        assert_eq!(read(0, 2, 1).status, Status::Ok);
+        assert_eq!(read(3, 1, 1).status, Status::Ok);
+        // Beyond EOF needs no payload, even when every skipped ciphertext is broken.
+        let answer = read(0, u64::MAX - 1, 1);
+        assert_eq!(answer.status, Status::Ok);
+        let (seek, rest) = common::range::ByteSeek::of_args(&answer.args).unwrap();
+        assert_eq!(seek.skipped, 7);
+        assert_eq!(seek.next, ERoff::new(5));
+        assert!(rest.is_empty());
+        // Confirm the corruption is real and fails if the requested interval overlaps it.
+        assert_eq!(read(0, 0, 1).status, Status::Internal);
     }
 
     #[test]
