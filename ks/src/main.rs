@@ -1,12 +1,5 @@
-//! KS, the Key Store: the process registry, and eventually one random master key
-//! per active day with derived per-SN-per-day keys handed to ENs. Master keys
-//! never leave here.
-//!
-//! KS listens on the one address a cluster cannot discover, so it is also where
-//! every other process announces the port it was given and asks where its peers
-//! are. The keys come later; the key operations answer `unimplemented`, which is
-//! deliberate — a well-formed request for something unbuilt should be
-//! distinguishable from a malformed one.
+//! KS: process registry and in-memory master-key epochs.
+//! Unlock verifies operator-supplied material. Encrypted persistence is not yet built.
 
 use common::config::KsConfig;
 use common::crypto;
@@ -38,6 +31,7 @@ fn random_master_key() -> Result<[u8; 32]> {
 
 struct Ks {
     config: KsConfig,
+    unlock_verifier: Option<[u8; 32]>,
     /// Whether the operator-and-hardware ceremony has been performed. Until it
     /// has, the master keys on disk cannot be decrypted, so no key request can
     /// be answered.
@@ -94,10 +88,10 @@ impl Service for Ks {
                 }
             }
 
-            Op::Unlock => {
-                logn!("asked for a key op", "op {}", request.op);
-                server::unbuilt(process, SERVES, request)
-            }
+            Op::Unlock => match self.unlock(request) {
+                Ok(()) => Resp::ok(),
+                Err(e) => Resp::error(Status::BadRequest, e.to_string()),
+            },
             _ => server::unbuilt(process, SERVES, request),
         }
     }
@@ -126,10 +120,16 @@ impl Service for Ks {
 }
 
 impl Ks {
-    fn new(config: KsConfig) -> Ks {
+    fn new(config: KsConfig) -> Result<Ks> {
+        let unlock_verifier =
+            config.unlock_verifier.as_deref().map(common::shamir::unhex).transpose()?;
+        if config.require_unlock && unlock_verifier.is_none() {
+            return Err(common::Error::new("require_unlock needs unlock_verifier"));
+        }
         let unlocked = AtomicBool::new(!config.require_unlock);
-        Ks {
+        Ok(Ks {
             config,
+            unlock_verifier,
             unlocked,
             peers: Mutex::new(BTreeMap::new()),
             sn_keys: RwLock::new(BTreeMap::new()),
@@ -137,7 +137,27 @@ impl Ks {
                 since: TimeSec::EPOCH,
                 key: random_master_key().expect("OS randomness for initial master key"),
             }]),
+        })
+    }
+
+    fn unlock(&self, request: &Req) -> Result<()> {
+        let (mut payload, rest) = structure(&request.args, Op::Unlock, "an unlock request")?;
+        let bytes = payload.bytes()?;
+        payload.done()?;
+        if !rest.is_empty() {
+            return Err(common::Error::new("trailing unlock arguments"));
         }
+        let key: [u8; 32] =
+            bytes.try_into().map_err(|_| common::Error::new("unlock key must be 32 bytes"))?;
+        let expected = self
+            .unlock_verifier
+            .as_ref()
+            .ok_or_else(|| common::Error::new("no unlock verifier configured"))?;
+        if !common::shamir::matches(&key, expected) {
+            return Err(common::Error::new("incorrect unlock key"));
+        }
+        self.unlocked.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     fn sn_key(&self, request: &Req) -> Resp {
@@ -337,10 +357,41 @@ fn main() {
         if !config.require_unlock {
             logn!("no unlock ceremony required because this is a test configuration");
         }
-        Ok(Ks::new(config))
+        Ks::new(config)
     });
     if let Err(e) = result {
         eprintln!("ks: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod unlock_tests {
+    use super::*;
+    fn request(bytes: &[u8]) -> Req {
+        let mut payload = common::wire::StructWriter::new();
+        payload.bytes(bytes);
+        Req::new(Op::Unlock).structure(payload)
+    }
+    #[test]
+    fn only_correct_well_formed_key_opens_gate() {
+        let key = [42; 32];
+        let config = KsConfig {
+            unlock_verifier: Some(common::shamir::hex(&common::shamir::verifier(&key))),
+            knobs: common::config::Knobs { workers: 1 },
+            lazy_day_keys: true,
+            master_key_delay_secs: common::time::TimeIntSec64::new(3600),
+            require_unlock: true,
+            inline_ping: true,
+        };
+        let ks = Ks::new(config).unwrap();
+        assert!(!ks.unlocked.load(Ordering::SeqCst));
+        for bad in [request(&[0; 32]), request(&key[..31]), Req::new(Op::Unlock)] {
+            assert!(ks.unlock(&bad).is_err());
+            assert!(!ks.unlocked.load(Ordering::SeqCst));
+        }
+        assert!(ks.unlock(&request(&key)).is_ok());
+        assert!(ks.unlocked.load(Ordering::SeqCst));
+        assert!(ks.unlock(&request(&key)).is_ok());
     }
 }

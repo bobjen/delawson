@@ -170,6 +170,11 @@ pub enum Compress {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Messaging {
+    #[serde(default)]
+    pub authentication: Option<crate::machine::Authentication>,
+    /// Set by the caller, never accepted from a remote peer.
+    #[serde(skip)]
+    pub expected_peer: Option<String>,
     pub send: SendMode,
     /// Every message is encrypted. False exists to measure what that costs, and
     /// is not a configuration to run.
@@ -637,6 +642,9 @@ pub struct Knobs {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KsConfig {
+    /// Public SHA-256 verifier of the generated unlock key; required when locked.
+    #[serde(default)]
+    pub unlock_verifier: Option<String>,
     pub knobs: Knobs,
     /// Generate a master key only for a day that creates extents. Marching one
     /// key per elapsed day through a long dormancy would take the store from
@@ -743,6 +751,8 @@ loaders!(DNConfig, SNConfig, ENConfig, FEConfig);
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
+    #[serde(default)]
+    pub machine_identity: Option<PathBuf>,
     pub identity: String,
     pub kind: ServiceKind,
     /// Assigned by whatever started this process, and announced to KS.
@@ -760,6 +770,7 @@ impl ProcessConfig {
         config.cluster_config = resolve(base, &config.cluster_config);
         config.service_config = resolve(base, &config.service_config);
         config.data_dir = resolve(base, &config.data_dir);
+        config.machine_identity = config.machine_identity.map(|p| resolve(base, &p));
         Ok(config)
     }
 }

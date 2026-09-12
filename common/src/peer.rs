@@ -159,9 +159,11 @@ impl Peers {
         }
 
         let address = find()?;
+        let mut config = self.config.clone();
+        config.expected_peer = Some(identity.into());
         let mut fan = Vec::with_capacity(self.config.peer_conns.max(1));
         for _ in 0..self.config.peer_conns.max(1) {
-            fan.push(Peer::connect(address, &self.config, self.timeout)?);
+            fan.push(Peer::connect(address, &config, self.timeout)?);
         }
         let peer = Arc::clone(&fan[turn % fan.len()]);
         self.open.lock().expect("peers").insert(identity.to_string(), fan);

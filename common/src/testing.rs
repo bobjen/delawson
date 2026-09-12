@@ -85,6 +85,8 @@ pub fn entry(identity: &str, kind: ServiceKind, media_class: Option<&str>) -> Se
 /// either does not measure either.
 pub fn messaging() -> Messaging {
     Messaging {
+        authentication: None,
+        expected_peer: None,
         send: SendMode::Direct,
         encrypt: false,
         compress: Compress::None,
@@ -183,6 +185,7 @@ pub fn reply() -> crate::server::Reply {
 pub fn process() -> Arc<Process> {
     Arc::new(Process {
         config: crate::config::ProcessConfig {
+            machine_identity: None,
             identity: "EN0".to_string(),
             kind: ServiceKind::En,
             listen: "127.0.0.1:0".parse().unwrap(),

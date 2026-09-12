@@ -60,3 +60,7 @@ impl<T, E: std::fmt::Display> Context<T> for std::result::Result<T, E> {
         self.map_err(|e| Error(format!("{what}: {e}")))
     }
 }
+
+pub mod shamir;
+
+pub mod machine;

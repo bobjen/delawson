@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Create a local machine identity; enrollment is a separate trusted action."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+
+def run(*args):
+    subprocess.run(args, check=True, stdout=subprocess.DEVNULL, timeout=60)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    choice = parser.add_mutually_exclusive_group(required=True)
+    choice.add_argument("--software", action="store_true", help="development private key file")
+    choice.add_argument("--tpm", action="store_true", help="TPM-bound primary signing identity")
+    parser.add_argument("--device", default="/dev/tpmrm0")
+    parser.add_argument("--owner-auth", type=Path, help="existing owner authorization file")
+    args = parser.parse_args()
+    os.umask(0o077)
+    directory = args.output_dir.resolve()
+    directory.mkdir(mode=0o700)  # exclusive: never replace a machine identity
+    public = directory / "public.der"
+    config = {"public_key": str(public)}
+    with tempfile.TemporaryDirectory(prefix="delawson-identity-") as work:
+        if args.software:
+            pem = str(Path(work) / "key.pem")
+            private = directory / "private.der"
+            run("openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", pem)
+            run("openssl", "pkcs8", "-topk8", "-nocrypt", "-in", pem, "-outform", "DER", "-out", str(private))
+            run("openssl", "pkey", "-in", pem, "-pubout", "-outform", "DER", "-out", str(public))
+            config["private_key"] = str(private)
+        else:
+            if not args.device.startswith("/dev/tpmrm"):
+                parser.error("use a Linux TPM resource-manager device")
+            unique = directory / "unique.dat"
+            # TPM2B_PUBLIC_KEY_RSA input: little-endian length then unique bytes.
+            unique.write_bytes((32).to_bytes(2, "little") + os.urandom(32))
+            command = ["tpm2_createprimary", "-T", "device:" + args.device, "-C", "o",
+                       "-G", "rsa2048:rsapss-sha256:null", "-g", "sha256", "-a",
+                       "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign|noda",
+                       "-u", str(unique), "-c", str(Path(work)/"key.ctx"),
+                       "-f", "der", "-o", str(public)]
+            if args.owner_auth:
+                config["owner_auth"] = str(args.owner_auth.resolve())
+                command.extend(["-P", "file:" + config["owner_auth"]])
+            run(*command)
+            config.update(tpm_unique=str(unique), tpm_device=args.device)
+    (directory/"identity.toml").write_text("".join(f"{k} = {json.dumps(v)}\n" for k,v in config.items()))
+    (directory/"public.hex").write_text(public.read_bytes().hex()+"\n")
+    print(f"Created {'TPM' if args.tpm else 'software'} identity in {directory}")
+    print("Enroll public.hex in trusted configuration; keep identity.toml local to this host.")
+
+
+if __name__ == "__main__":
+    main()

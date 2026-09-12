@@ -21,12 +21,19 @@ pub struct Conn {
 }
 
 impl Conn {
-    pub fn open(addr: SocketAddr, timeout: Duration, config: &Messaging) -> Result<Conn> {
+    pub fn open(
+        addr: SocketAddr,
+        identity: &str,
+        timeout: Duration,
+        config: &Messaging,
+    ) -> Result<Conn> {
         let stream =
             TcpStream::connect_timeout(&addr, timeout).context(format!("connecting {addr}"))?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
-        Ok(Conn { link: wire::connect(stream, config)?, next_id: 0 })
+        let mut config = config.clone();
+        config.expected_peer = Some(identity.into());
+        Ok(Conn { link: wire::connect(stream, &config)?, next_id: 0 })
     }
 
     /// Buffer a request without waiting for it, and return the id to expect back.

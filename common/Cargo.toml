@@ -27,3 +27,6 @@ rand_core = { version = "0.6", default-features = false }
 serde.workspace = true
 sha2 = "0.10.8"
 toml.workspace = true
+
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+tempfile = "3"

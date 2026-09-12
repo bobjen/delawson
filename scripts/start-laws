@@ -8,18 +8,22 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 profile=debug
+unlock_mode=direct
+machine_identity=
 run_dir=$root/run
 config_dir=$root/config
 ready_wait=10   # seconds to wait for a process to announce itself
 
 usage() {
     cat <<'EOF'
-usage: start-laws [--debug | --release] [--run-dir DIR] [--config DIR] [--no-build]
+usage: start-laws [--debug | --release] [--run-dir DIR] [--config DIR] [--no-build] [--unlock-mode direct|shards] [--machine-identity DIR]
 
   --debug     build and run the debug binaries (default)
   --release   build and run the optimized binaries; measure with these
   --run-dir   where the per-process directories go (default: run/)
   --config    where the checked-in configuration lives (default: config/)
+  --machine-identity  opt into TLS using a pre-created local identity directory
+  --unlock-mode  direct (default, fast) or shards (7-of-13 local reconstruction)
   --no-build  use the binaries already built
 EOF
 }
@@ -32,11 +36,18 @@ while (($#)); do
         --run-dir) run_dir=$2; shift ;;
         --config) config_dir=$2; shift ;;
         --no-build) build=no ;;
+        --unlock-mode) unlock_mode=$2; shift ;;
+        --machine-identity) machine_identity=$2; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "start-laws: unknown argument $1" >&2; usage >&2; exit 2 ;;
     esac
     shift
 done
+
+case $unlock_mode in
+    direct|shards) ;;
+    *) echo "start-laws: --unlock-mode must be direct or shards" >&2; exit 2 ;;
+esac
 
 target=debug
 cargo_args=()
@@ -73,6 +84,28 @@ echo "$target" > "$run_dir/build"
 # does not leave a stale one behind.
 rm -f "$run_dir/flavor"
 
+# Trusted single-host bootstrap admits this machine for the configured services.
+# Only its public key enters cluster.toml; local credentials stay in process.toml.
+if [[ -n $machine_identity ]]; then
+    machine_identity=$(cd "$machine_identity" && pwd)
+    [[ -f $machine_identity/identity.toml && -f $machine_identity/public.hex ]] || {
+        echo "start-laws: use scripts/machine-identity to create the identity directory" >&2; exit 1;
+    }
+    cp "$cluster" "$run_dir/cluster.toml"
+    python3 - "$run_dir/cluster.toml" "$machine_identity/public.hex" "$laws" <<'PYAUTH'
+import json, pathlib, subprocess, sys, tomllib
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+if 'authentication' in tomllib.loads(text)['messaging']:
+    raise SystemExit('start-laws: --machine-identity expects a config without pre-existing enrollment')
+services = [line.split()[0] for line in subprocess.check_output([sys.argv[3], '--config', str(path), 'services'], text=True).splitlines()]
+public = pathlib.Path(sys.argv[2]).read_text().strip()
+bytes.fromhex(public)
+path.write_text(text + '\n[[messaging.authentication.members]]\npublic_key = ' + json.dumps(public) + '\nservices = ' + json.dumps(services) + '\n')
+PYAUTH
+    cluster=$run_dir/cluster.toml
+fi
+
 # KS's address is fixed; every other process is handed a port from the base up.
 # A bad configuration fails here, and it has to fail loudly: without this the
 # variables below are simply unset, and the error is about a shell variable
@@ -84,6 +117,23 @@ fi
 eval "$(sed 's/^/ks_/;s/ /=/' <<<"$bootstrap")"
 ks_host=${ks_address%:*}
 next_port=$ks_port_base
+
+# Development ceremony material stays outside the KS process directory. Reuse it
+# across starts; never silently replace existing recovery material.
+ceremony=$run_dir/unlock-$unlock_mode
+if [[ ! -d $ceremony ]]; then
+    generate_args=()
+    [[ $unlock_mode == direct ]] && generate_args+=(--direct)
+    "$laws" unlock-generate --output-dir "$ceremony" "${generate_args[@]}"
+fi
+verifier=$(cat "$ceremony/verifier")
+[[ $verifier =~ ^[0-9a-f]{64}$ ]] || { echo "invalid unlock verifier" >&2; exit 1; }
+unlock_args=()
+if [[ $unlock_mode == direct ]]; then
+    unlock_args=(--key-file "$ceremony/unlock-key")
+else
+    unlock_args=(--share "$ceremony"/share-0{1,2,3,4,5,6,7})
+fi
 
 started=()
 while read -r identity kind domain _; do
@@ -102,6 +152,10 @@ while read -r identity kind domain _; do
     mkdir -p "$dir/data"
     cp "$cluster" "$dir/cluster.toml"
     cp "$service_config" "$dir/$kind.toml"
+    if [[ $kind == ks ]]; then
+        sed -i '/^require_unlock *=/d; /^unlock_verifier *=/d' "$dir/$kind.toml"
+        sed -i "1i require_unlock = true\nunlock_verifier = \"$verifier\"" "$dir/$kind.toml"
+    fi
     cat > "$dir/process.toml" <<EOF
 # Written by start-laws. Says who this process is, which port it was given, and
 # where the shared configuration is; everything else comes from those files.
@@ -113,6 +167,14 @@ service_config = "$kind.toml"
 data_dir = "data"
 EOF
 
+    if [[ -n $machine_identity ]]; then
+        # JSON strings are also valid TOML basic strings for these paths.
+        python3 - "$dir/process.toml" "$machine_identity/identity.toml" <<'PYIDENTITY'
+import json, pathlib, sys
+with pathlib.Path(sys.argv[1]).open('a') as file:
+    file.write('machine_identity = ' + json.dumps(sys.argv[2]) + '\n')
+PYIDENTITY
+    fi
     rm -f "$dir/ready"
     # Whatever the process says before its own logs are open, plus anything the
     # kernel says about it. Its real logs are in $dir/logs.
@@ -134,6 +196,9 @@ EOF
         fi
     done
     echo "started $identity ($kind, $profile) on $listen as pid $pid"
+    if [[ $kind == ks ]]; then
+        "$laws" --config "$cluster" --at "$listen" --to "$identity" unlock "${unlock_args[@]}"
+    fi
     started+=("$identity")
 done < <("$laws" --config "$cluster" services)
 

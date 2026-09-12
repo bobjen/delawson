@@ -1226,7 +1226,7 @@ pub fn frame_into(buf: &mut Vec<u8>, body: impl FnOnce(&mut Vec<u8>)) -> Result<
 /// The write half of a connection. Producers append messages to a plain buffer
 /// of their own; this seals whatever they hand over and writes it as one segment.
 pub struct Wire {
-    stream: TcpStream,
+    stream: crate::machine::Stream,
     seal: Seal,
     sealed: Vec<u8>,
 }
@@ -1252,7 +1252,7 @@ impl Wire {
 /// whether messages from it are still in hand, which is how the reader knows it
 /// may keep working instead of sending.
 pub struct Reader {
-    stream: TcpStream,
+    stream: crate::machine::Stream,
     seal: Seal,
     open: Vec<u8>,
     at: usize,
@@ -1264,6 +1264,9 @@ pub struct Reader {
 }
 
 impl Reader {
+    pub fn peer_key(&self) -> Option<&[u8]> {
+        self.stream.peer_key.as_deref()
+    }
     pub fn more(&self) -> bool {
         self.at < self.open.len()
     }
@@ -1427,6 +1430,7 @@ impl Link {
 /// both and no two segments under one key can share a nonce.
 pub fn connect(stream: TcpStream, config: &Messaging) -> Result<Link> {
     stream.set_nodelay(true)?;
+    let stream = crate::machine::Stream::new(stream, config, false)?;
     let mut prefix = [0u8; 8];
     Rng::new().fill_bytes(&mut prefix);
     let mut writing = stream.try_clone()?;
@@ -1447,6 +1451,7 @@ pub fn connect(stream: TcpStream, config: &Messaging) -> Result<Link> {
 /// The accepting side takes the prefix it is given.
 pub fn accept(stream: TcpStream, config: &Messaging) -> Result<(Reader, Wire)> {
     stream.set_nodelay(true)?;
+    let stream = crate::machine::Stream::new(stream, config, true)?;
     let mut prefix = [0u8; 8];
     let mut reading = stream.try_clone()?;
     reading.read_exact(&mut prefix)?;

@@ -198,6 +198,8 @@ mod tests {
 
     fn messaging(encrypt: bool, compress: Compress) -> Messaging {
         Messaging {
+            authentication: None,
+            expected_peer: None,
             send: crate::config::SendMode::Direct,
             encrypt,
             compress,
@@ -319,6 +321,8 @@ mod sampling {
 
     fn config(sample: usize) -> Messaging {
         Messaging {
+            authentication: None,
+            expected_peer: None,
             send: SendMode::Direct,
             encrypt: false,
             compress: Compress::Lz4,

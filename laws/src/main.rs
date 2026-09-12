@@ -7,6 +7,7 @@
 //! configuration, to find the service directory.
 
 mod client;
+mod operator;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use client::{Conn, Stats, Tally};
@@ -52,6 +53,10 @@ struct Cli {
     /// production. Anything but KS is looked up in KS's registry.
     #[arg(long, global = true)]
     to: Option<String>,
+
+    /// Optional local machine credentials. Omit for an anonymous operator.
+    #[arg(long, global = true)]
+    machine_identity: Option<PathBuf>,
 
     /// Talk straight to this address, skipping the registry. For a process that
     /// has not registered, or a KS that is not answering.
@@ -163,14 +168,38 @@ enum Cmd {
         all: bool,
     },
     /// Perform the unlocking ceremony, without which KS can decrypt nothing.
-    Unlock,
+    Unlock {
+        #[arg(long, conflicts_with = "share", required_unless_present = "share")]
+        key_file: Option<PathBuf>,
+        #[arg(long, num_args = 1.., required_unless_present = "key_file")]
+        share: Vec<PathBuf>,
+    },
+    /// Generate local development/recovery material in a new private directory.
+    UnlockGenerate {
+        #[arg(long)]
+        output_dir: PathBuf,
+        /// Generate a direct key file instead of shares (fast development bootstrap).
+        #[arg(long)]
+        direct: bool,
+        #[arg(long, default_value_t = 7)]
+        threshold: u8,
+        #[arg(long, default_value_t = 13)]
+        count: u8,
+    },
+    /// Reconstruct an unlock key locally into a new private file.
+    UnlockRecover {
+        #[arg(long, required = true, num_args = 1..)]
+        share: Vec<PathBuf>,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// The daily per-SN key an EN needs to decrypt that SN's extents.
     SnMasterKey {
         #[arg(long)]
         sn: u64,
         /// Creation second whose effective master-key epoch should be used.
         #[arg(long)]
-        at: u64,
+        creation_second: u64,
     },
     /// Generate today's master key.
     RotateMasterKey,
@@ -568,7 +597,22 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let cluster = ClusterConfig::load(&cli.config)?;
+    match &cli.cmd {
+        Cmd::UnlockGenerate { output_dir, direct, threshold, count } => {
+            return operator::generate(output_dir, *direct, *threshold, *count);
+        }
+        Cmd::UnlockRecover { share, output } => return operator::reconstruct(share, output),
+        _ => {}
+    }
+    let mut cluster = ClusterConfig::load(&cli.config)?;
+    if let Some(path) = &cli.machine_identity {
+        cluster
+            .messaging
+            .authentication
+            .as_mut()
+            .ok_or_else(|| Error::new("machine identity requires public enrollment"))?
+            .load_identity(path)?;
+    }
     let mut timeout = cluster.timeouts.request_ms.to_duration()?;
     // Reading log files is not an ordinary request: it can take minutes, being
     // serial on purpose so as not to compete with the work. So it gets minutes.
@@ -844,20 +888,22 @@ fn ping(cluster: &ClusterConfig, cli: &Cli, plan: &Plan) -> Result<()> {
     }
     for target in targets(cluster, cli, ServiceKind::Ks)? {
         let addr = target.address;
+        let identity = target.identity.clone();
         let start = std::time::Instant::now();
         let threads: Vec<_> = (0..plan.conns)
             .map(|_| {
                 let (count, size, dull) = (plan.count, plan.size, plan.dull);
                 let (reconnect, timeout) = (plan.reconnect, plan.timeout);
                 let messaging = Arc::clone(&shared);
+                let identity = identity.clone();
                 std::thread::spawn(move || -> Result<(Vec<Duration>, Resp)> {
                     let request = ping_request(size, dull);
-                    let mut conn = Conn::open(addr, timeout, &messaging)?;
+                    let mut conn = Conn::open(addr, &identity, timeout, &messaging)?;
                     let mut samples = Vec::with_capacity(count);
                     let mut last = conn.call(&request)?;
                     for _ in 0..count {
                         if reconnect {
-                            conn = Conn::open(addr, timeout, &messaging)?;
+                            conn = Conn::open(addr, &identity, timeout, &messaging)?;
                         }
                         let (response, elapsed) = conn.timed(&request)?;
                         samples.push(elapsed);
@@ -939,6 +985,7 @@ fn once(target: &Target, plan: &Bench, messaging: &Messaging) -> Result<f64> {
         return Err(Error::new("--clients, --depth and --seconds must all be positive"));
     }
     let addr = target.address;
+    let identity = target.identity.clone();
     let warm_end = std::time::Instant::now() + Duration::from_secs(plan.warmup);
     let end = warm_end + Duration::from_secs(plan.seconds);
 
@@ -947,9 +994,10 @@ fn once(target: &Target, plan: &Bench, messaging: &Messaging) -> Result<f64> {
             let (size, dull) = (plan.size, plan.dull);
             let (depth, timeout) = (plan.depth, plan.timeout);
             let messaging = Arc::clone(&shared);
+            let identity = identity.clone();
             std::thread::spawn(move || -> Result<Tally> {
                 let request = ping_request(size, dull);
-                let mut conn = Conn::open(addr, timeout, &messaging)?;
+                let mut conn = Conn::open(addr, &identity, timeout, &messaging)?;
                 conn.press(&request, depth, warm_end, &mut Tally::new())?;
                 let mut tally = Tally::new();
                 conn.press(&request, depth, end, &mut tally)?;
@@ -1031,17 +1079,19 @@ fn create_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result
     // is not what it is measuring, and every object needs one.
     let (kind, width) = Framing::Lf.wire();
     let addr = target.address;
+    let identity = target.identity.clone();
     let shared = Arc::new(messaging.clone());
     let batches = plan.objects.div_ceil(plan.batch as u64);
     let start = std::time::Instant::now();
 
     let threads: Vec<_> = (0..plan.clients)
         .map(|client| {
+            let identity = identity.clone();
             let (messaging, prefix) = (Arc::clone(&shared), plan.prefix.clone());
             let (batch, depth, keyed, timeout) = (plan.batch, plan.depth, plan.keyed, plan.timeout);
             let mine: Vec<u64> = ((client as u64)..batches).step_by(plan.clients).collect();
             std::thread::spawn(move || -> Result<(u64, Tally)> {
-                let mut conn = Conn::open(addr, timeout, &messaging)?;
+                let mut conn = Conn::open(addr, &identity, timeout, &messaging)?;
                 let mut tally = Tally::new();
                 let mut made = 0;
                 let mut sent: HashMap<u32, std::time::Instant> = HashMap::new();
@@ -1149,7 +1199,7 @@ fn create_one_extent(
     timeout: Duration,
     messaging: &Messaging,
 ) -> Result<()> {
-    let mut conn = Conn::open(target.address, timeout, messaging)?;
+    let mut conn = Conn::open(target.address, &target.identity, timeout, messaging)?;
     let append = Cmd::Append {
         path: path.to_string(),
         framing: "lf".to_string(),
@@ -1210,18 +1260,20 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging, flags: u64)
         return Err(Error::new("--batch, --clients, --depth and --seconds must all be positive"));
     }
     let addr = target.address;
+    let identity = target.identity.clone();
     let shared = Arc::new(messaging.clone());
     let end = std::time::Instant::now() + Duration::from_secs(plan.seconds);
     let start = std::time::Instant::now();
 
     let threads: Vec<_> = (0..plan.clients)
         .map(|client| {
+            let identity = identity.clone();
             let (messaging, prefix) = (Arc::clone(&shared), plan.prefix.clone());
             let (batch, depth, objects, timeout) =
                 (plan.batch, plan.depth, plan.objects, plan.timeout);
             std::thread::spawn(move || -> Result<(u64, u64, u64, Tally)> {
                 let mut rng = Rng::from_seed(client as u64 + 1);
-                let mut conn = Conn::open(addr, timeout, &messaging)?;
+                let mut conn = Conn::open(addr, &identity, timeout, &messaging)?;
                 let mut tally = Tally::new();
                 // Three counts, not two: names asked, names the server *looked at*, and objects
                 // that existed. A miss is not a truncation and the report must not confuse them.
@@ -1953,7 +2005,7 @@ struct Target {
 }
 
 fn open(target: &Target, timeout: Duration, config: &Messaging) -> Result<Conn> {
-    Conn::open(target.address, timeout, config)
+    Conn::open(target.address, &target.identity, timeout, config)
 }
 
 /// Which machine type answers a command, when none was named.
@@ -1961,7 +2013,7 @@ fn serves(cmd: &Cmd) -> ServiceKind {
     match cmd {
         // Any process can be asked about its own logs; without --to, ask KS.
         Cmd::LogHistogram { .. } | Cmd::LogGrep { .. } | Cmd::LogLines { .. } => ServiceKind::Ks,
-        Cmd::Unlock
+        Cmd::Unlock { .. }
         | Cmd::SnMasterKey { .. }
         | Cmd::RotateMasterKey
         | Cmd::Registry
@@ -1974,6 +2026,9 @@ fn serves(cmd: &Cmd) -> ServiceKind {
 /// that answers this command.
 fn resolve(cluster: &ClusterConfig, cli: &Cli, kind: ServiceKind) -> Result<Target> {
     if let Some(address) = cli.at {
+        if cluster.messaging.authentication.is_some() && cli.to.is_none() {
+            return Err(Error::new("--at requires --to when machine authentication is enabled"));
+        }
         return Ok(Target {
             identity: cli.to.clone().unwrap_or_else(|| address.to_string()),
             address,
@@ -2001,7 +2056,12 @@ fn resolve(cluster: &ClusterConfig, cli: &Cli, kind: ServiceKind) -> Result<Targ
 /// Ask KS where a process is. Nothing but KS has an address of its own.
 fn lookup(cluster: &ClusterConfig, identity: &str) -> Result<SocketAddr> {
     let timeout = cluster.timeouts.request_ms.to_duration()?;
-    let mut ks = Conn::open(cluster.ks.address, timeout, &cluster.messaging)?;
+    let mut ks = Conn::open(
+        cluster.ks.address,
+        &cluster.registrar()?.identity,
+        timeout,
+        &cluster.messaging,
+    )?;
     let mut payload = common::wire::StructWriter::new();
     payload.text(identity);
     let response = ks.call(&Req::new(Op::Lookup).structure(payload))?;
@@ -2045,11 +2105,16 @@ fn targets(cluster: &ClusterConfig, cli: &Cli, kind: ServiceKind) -> Result<Vec<
 
 fn build(cmd: &Cmd) -> Result<Req> {
     Ok(match cmd {
-        Cmd::Unlock => Req::new(Op::Unlock),
-        Cmd::SnMasterKey { sn, at } => {
+        Cmd::Unlock { key_file, share } => {
+            let key = operator::key(key_file, share)?;
+            let mut payload = common::wire::StructWriter::new();
+            payload.bytes(&key);
+            Req::new(Op::Unlock).structure(payload)
+        }
+        Cmd::SnMasterKey { sn, creation_second } => {
             let mut payload = common::wire::StructWriter::new();
             payload.number_u64(*sn);
-            payload.number_u64(TimeSec::new(*at).number());
+            payload.number_u64(TimeSec::new(*creation_second).number());
             Req::new(Op::SnMasterKey).structure(payload)
         }
         Cmd::RotateMasterKey => Req::new(Op::RotateMasterKey),

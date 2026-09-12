@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Explicit hardware smoke test; never invoked by cargo test or start-laws."""
+import argparse
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+def run(*args):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=60)
+    if result.returncode:
+        raise RuntimeError(f"{args[0]} failed ({result.returncode}):\n{result.stderr}")
+    return result
+
+
+def reject(*args):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=60)
+    # OpenSSL must report an actual signature verification failure, not merely
+    # fail to open a file or understand an option.
+    if result.returncode != 1 or "Verification failure" not in result.stdout + result.stderr:
+        raise RuntimeError(f"expected signature rejection from {args[0]}: "
+                           f"{result.stdout}{result.stderr}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device", default="/dev/tpmrm0",
+                        help="Linux TPM resource-manager device (default: /dev/tpmrm0)")
+    args = parser.parse_args()
+    device = Path(args.device).resolve()
+    if not device.name.startswith("tpmrm") or not stat.S_ISCHR(device.stat().st_mode):
+        raise RuntimeError("use a Linux TPM resource-manager character device, not a raw TPM")
+    if not os.access(device, os.R_OK | os.W_OK):
+        raise RuntimeError(f"no read/write access to {device}; see README optional TPM testing")
+    for tool in ("tpm2_getcap", "tpm2_createprimary", "tpm2_sign", "openssl"):
+        if shutil.which(tool) is None:
+            raise RuntimeError(f"required tool is missing: {tool}")
+    tcti = f"device:{device}"
+    run("tpm2_getcap", "-T", tcti, "properties-fixed")
+    # Only the Linux resource-manager device is supported. Its per-connection
+    # transient handles disappear when a tool exits. Never flush other clients'
+    # handles globally. The context file is TPM-protected, not a plaintext key.
+    with tempfile.TemporaryDirectory(prefix="delawson-tpm-") as directory:
+        work = Path(directory)
+        context = str(work / "signing.ctx")
+        public = str(work / "public.pem")
+        challenge = work / "challenge"
+        challenge.write_bytes(b"DeLawson TPM signing smoke test v1\0" + os.urandom(32))
+        signature = str(work / "signature")
+        print("Creating transient TPM signing key...", flush=True)
+        run("tpm2_createprimary", "-T", tcti, "-C", "n", "-G", "rsa2048:rsassa-sha256:null",
+            "-g", "sha256", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign|noda",
+            "-c", context, "-f", "pem", "-o", public)
+        run("tpm2_sign", "-T", tcti, "-c", context, "-g", "sha256", "-s", "rsassa",
+            "-f", "plain", "-o", signature, str(challenge))
+        verify = ("openssl", "dgst", "-sha256", "-verify", public, "-signature", signature)
+        run(*verify, str(challenge))
+        altered = work / "altered"
+        altered.write_bytes(challenge.read_bytes() + b"changed")
+        reject(*verify, str(altered))
+        # A fake identity on the same host is sufficient for the negative case.
+        fake_private = str(work / "fake-private.pem")
+        fake_public = str(work / "fake-public.pem")
+        run("openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048",
+            "-out", fake_private)
+        run("openssl", "pkey", "-in", fake_private, "-pubout", "-out", fake_public)
+        reject("openssl", "dgst", "-sha256", "-verify", fake_public, "-signature", signature,
+               str(challenge))
+    print("PASS: TPM signature verified; changed challenge and wrong public key rejected; "
+          "temporary files removed.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        print(f"test-tpm: {error}", file=sys.stderr)
+        sys.exit(1)

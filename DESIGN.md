@@ -18340,3 +18340,56 @@ records keep their deadline, including while hard-delete fanout is pending; succ
 reclamation drops the extra and clears its flag before removing the owner or leaving
 its tombstone. Future extra payloads, such as more than four SN extent instances, must
 participate in the same needs-extra check. Extra recycling remains separate future work.
+
+## 17.44 KS operator-side Shamir ceremony
+
+The first KS unlock implementation uses generated 256-bit secrets, with Shamir
+7-of-13 sharing bytewise over GF(256), polynomial 0x11b. `laws` is the operator
+process: it generates shares, reconstructs locally, and sends only the unlock key.
+KS receives a public verifier through trusted configuration and checks the key
+before opening its key-serving gate. No operator identity is required for unlock.
+`start-laws` defaults to a direct generated key file for speed; `--unlock-mode
+shards` exercises reconstruction. Neither path implements user authorization.
+
+The on-disk share encoding and command examples are documented in README.md.
+This is an incremental implementation: encrypted master-key persistence and Raft
+unlock transfer remain future work. Member authentication and forward-secret
+transport are implemented in §17.45. Existing master epochs are still volatile. Development ceremony files are
+kept together outside the KS process directory, not distributed custody.
+
+## 17.45 Machine identity before KS unlock
+
+Machine authentication now has an opt-in TLS 1.3 implementation, using rustls
+and pinned RFC 7250 raw public keys. Trusted bootstrap supplies the binding from
+a public machine key to its permitted process identities. Private software or
+TPM identity configuration is local to the host. The client verifies that the
+server key is admitted for the intended service; a claimed address alone is not
+an identity. TLS handshakes prove key possession, with no certificate expiry or
+unlock-key dependency. Resumption and early data are disabled.
+
+Operators can remain anonymous while sending the unlock key. KS checks the TLS
+peer identity before accepting registration or issuing SN-derived keys. A machine
+may register only a service assigned to its enrolled public key. Key issuance
+currently checks enrollment for an EN; placement-specific SN permission remains
+unimplemented. No user-authentication policy is introduced by this step.
+
+The TPM backend recreates a signing primary from the owner seed and saved unique
+input, checks the resulting public key, and signs TLS RSA-PSS/SHA-256 challenges.
+The private key is never exported in plaintext, no persistent TPM handle is used,
+and ordinary restarts preserve the identity. TPM clearing/replacement requires
+re-enrollment. Software test identities exercise the same TLS path without TPM
+hardware; explicit hardware tests and their temporary access commands are in
+README.md. TPM-backed end-to-end testing remains an operator-run opt-in test.
+
+The transport retains existing framing inside TLS. Its shared TLS state is
+locked only for record processing, never for blocking socket reads or writes;
+output records have a separate ordering lock so concurrent directions can make
+progress. This is tested with simultaneous multi-megabyte transfers. No
+performance claim is made for this initial implementation.
+
+Validation: the workspace test suite and software end-to-end authentication tests
+passed. Bob also ran `scripts/test-machine-auth --tpm` successfully on the AMD
+TPM 2.0 host: anonymous unlock, authenticated key issuance and registration, and
+rejection of anonymous key requests and impersonated registration. The signing
+template explicitly specifies a null symmetric algorithm; relying on the tools'
+implicit default caused TPM error 0x2D6 and was corrected before that passing run.

@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Opt-in end-to-end machine authentication test. Build normally before running."""
+import argparse
+import json
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+import tempfile
+import time
+import tomllib
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def run(args, success=True):
+    result = subprocess.run([str(a) for a in args], capture_output=True, text=True, timeout=90)
+    if (result.returncode == 0) != success:
+        raise RuntimeError(result.stdout + result.stderr)
+    return result.stdout + result.stderr
+
+
+def port():
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        return listener.getsockname()[1]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--tpm', action='store_true', help='use the real TPM signer; never build as root')
+    args = parser.parse_args()
+    binary = ROOT/'target/debug'
+    for name in ['laws', 'ks', 'en']:
+        if not (binary/name).is_file():
+            raise RuntimeError('build first: cargo build --workspace')
+    children = []
+    with tempfile.TemporaryDirectory(prefix='delawson-machine-auth-') as temporary:
+        work = Path(temporary)
+        try:
+            host = work/'host'
+            fake = work/'other-host'
+            run([ROOT/'scripts/machine-identity', '--output-dir', host, '--tpm' if args.tpm else '--software'])
+            run([ROOT/'scripts/machine-identity', '--output-dir', fake, '--software'])
+            config = work/'cluster.toml'
+            text = (ROOT/'config/cluster.toml').read_text()
+            original = tomllib.loads(text)['ks']['address']
+            address = '127.0.0.1:' + str(port())
+            text = text.replace(json.dumps(original), json.dumps(address), 1)
+            for directory, services in [(host, ['KS0','EN0']), (fake, ['EN1'])]:
+                text += '\n[[messaging.authentication.members]]\npublic_key = ' + json.dumps((directory/'public.hex').read_text().strip()) + '\nservices = ' + json.dumps(services) + '\n'
+            config.write_text(text)
+            ceremony = work/'ceremony'
+            run([binary/'laws', 'unlock-generate', '--direct', '--output-dir', ceremony])
+            verifier = (ceremony/'verifier').read_text().strip()
+            ksconfig = work/'ks.toml'
+            kstext = (ROOT/'config/ks.toml').read_text().replace('require_unlock = false', 'require_unlock = true')
+            ksconfig.write_text('unlock_verifier = '+json.dumps(verifier)+'\n'+kstext)
+            laws = [binary/'laws', '--config', config, '--to', 'KS0']
+
+            def start(name, identity, kind, local, listen, service, accepted=True):
+                directory = work/name
+                directory.mkdir()
+                process = dict(identity=identity, kind=kind, listen=listen,
+                               cluster_config=str(config), service_config=str(service),
+                               data_dir=str(directory/'data'), machine_identity=str(local/'identity.toml'))
+                path = directory/'process.toml'
+                path.write_text(''.join(f'{k} = {json.dumps(v)}\n' for k,v in process.items()))
+                log = (directory/'stderr').open('w')
+                child = subprocess.Popen([binary/kind, path], stdout=log, stderr=log)
+                log.close()
+                children.append(child)
+                deadline = time.monotonic()+90
+                while time.monotonic()<deadline:
+                    if (directory/'ready').exists():
+                        if not accepted:
+                            raise RuntimeError('impostor registered successfully')
+                        return child
+                    if child.poll() is not None:
+                        error=(directory/'stderr').read_text()
+                        if accepted or 'machine is not admitted' not in error:
+                            raise RuntimeError(error)
+                        return child
+                    time.sleep(.02)
+                raise RuntimeError('process did not become ready in time')
+
+            start('ks', 'KS0', 'ks', host, address, ksconfig)
+            key_request = ['sn-master-key','--sn','0','--creation-second','0']
+            denied = run(laws+key_request, success=False)
+            assert 'machine is not admitted' in denied, denied
+            local = ['--machine-identity',host/'identity.toml']
+            locked = run(laws+local+key_request, success=False)
+            assert 'locked' in locked.lower(), locked
+            run(laws+['unlock','--key-file',ceremony/'unlock-key'])  # anonymous operator
+            run(laws+local+key_request)
+            start('en', 'EN0', 'en', host, '127.0.0.1:'+str(port()), ROOT/'config/en.toml')
+            start('impostor', 'EN0', 'en', fake, '127.0.0.1:'+str(port()), ROOT/'config/en.toml', accepted=False)
+            print('PASS: anonymous unlock; authenticated key issuance and registration; '
+                  'anonymous key request and impersonated registration rejected.')
+        finally:
+            for child in reversed(children):
+                if child.poll() is None:
+                    child.terminate()
+                    try:
+                        child.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.wait()
+
+
+if __name__ == '__main__':
+    main()

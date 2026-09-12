@@ -162,7 +162,16 @@ pub fn pickable(kind: ServiceKind) -> Result<()> {
 impl Process {
     pub fn load(process_config: &Path) -> Result<Process> {
         let config = ProcessConfig::load(process_config)?;
-        let cluster = ClusterConfig::load(&config.cluster_config)?;
+        let mut cluster = ClusterConfig::load(&config.cluster_config)?;
+        if let Some(path) = &config.machine_identity {
+            cluster
+                .messaging
+                .authentication
+                .as_mut()
+                .ok_or_else(|| Error::new("machine identity requires public enrollment"))?
+                .load_identity(path)?;
+        }
+        cluster.messaging.expected_peer = Some(cluster.registrar()?.identity.clone());
         let entry = cluster
             .service(&config.identity)
             .ok_or_else(|| {
@@ -406,7 +415,11 @@ pub fn ask(
     let stream =
         TcpStream::connect_timeout(&address, timeout).context(format!("connecting {address}"))?;
     stream.set_read_timeout(Some(timeout))?;
-    wire::connect(stream, config)?.call(request)
+    let config = config.clone();
+    if config.authentication.is_some() && config.expected_peer.is_none() {
+        return Err(Error::new("KS target identity missing"));
+    }
+    wire::connect(stream, &config)?.call(request)
 }
 
 /// The answer for an operation this machine type has not built, or should never
@@ -509,6 +522,24 @@ fn read_loop<S: Service>(
             out.close();
             return Ok(());
         };
+        if let Some(auth) = &process.cluster.messaging.authentication {
+            let allowed = match request.op {
+                Op::Register => Peer::from_args(&request.args)
+                    .is_ok_and(|peer| auth.permits(input.peer_key(), &peer.identity)),
+                Op::SnMasterKey => process
+                    .cluster
+                    .services_of_kind(ServiceKind::En)
+                    .any(|entry| auth.permits(input.peer_key(), &entry.identity)),
+                _ => true,
+            };
+            if !allowed {
+                let response =
+                    Resp::error(Status::BadRequest, "machine is not admitted for this operation")
+                        .to(&request);
+                out.put(&response, true)?;
+                continue;
+            }
+        }
         // An answer that will come from another thread cannot be flushed by this
         // one, so the connection goes onto a sender first — the same reason a
         // pooled answer does.
