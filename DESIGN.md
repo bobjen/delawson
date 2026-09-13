@@ -337,7 +337,7 @@ The load-bearing decisions, so a reader need not reconstruct them from four thou
 
 | | |
 |---|---|
-| Append blocks are atomic; **accepted / applied / durable**, with 3-of-4 a quorum | §8.1.1 |
+| Append blocks are atomic; **accepted / written / durable**, with 3-of-4 a quorum | §8.1.1 |
 | **Erasure coding forces byte-identical instances**, so an instance must **truncate above the durable watermark** on handover | §8.1.1a |
 | The primary assigns a **logical** offset in a tiny serialized window; compress, encrypt and write happen outside it | §8.1.1a-2 |
 | **Fixed-offset** appends supply their expected offset and are **exactly-once**; **assigned-offset** appends are **at-least-once**. The difference is duplicate prevention, not writer count — several writers may fix offsets. Prior art: **Azure append blobs**, same two modes, same rationale | §8.1.1a-3, §8.1.1a-5 |
@@ -1203,7 +1203,7 @@ Differing, and why:
 |---|---|---|
 | Metadata scale | **single master** | many DN and SN rings, bounded fan-out, 2^64 nodes (§5.10) |
 | Durability | 3 replicas | 4 replicas derived from a 10^-14 target, then erasure coding (§4.3.1) |
-| Consistency | relaxed | 3-of-4 quorum, applied-as-prefix, SCN consistent read (§8.1.1) |
+| Consistency | relaxed | 3-of-4 quorum, written-as-prefix, SCN consistent read (§8.1.1) |
 | Namespace | flat pathname lookup table, no per-directory structure | `(parent dir id, name)`, so directory rename is O(1) (§5.5.4) |
 | Billing | none — an internal system | a first-class design constraint (§12) |
 
@@ -1968,7 +1968,7 @@ statement about placement discipline, not about disks.
 **Availability, separately.** A read needs one instance of four, so it is unavailable
 (10^-3)^4 = **10^-12** of the time — *provided the four are tried promptly rather than
 serially* (§9.5). Four copies give durability unconditionally, but they only give
-availability if the read path can reach past a dead one faster than a TCP timeout. A write needs three of four applied (§8.1), which is
+availability if the read path can reach past a dead one faster than a TCP timeout. A write needs three of four written (§8.1), which is
 unavailable ~**6 × 10^-6** of the time — about 190 seconds per year per extent, and six
 orders of magnitude worse than reads. That asymmetry is affordable only because a write
 that cannot reach a quorum does not block: the extent is sealed short and a new one opened
@@ -6875,7 +6875,7 @@ a block and its neighbours.
 
 ### 8.1 Append blocks
 
-The unit of write is an **append block**: a byte range applied to the target extent atomically — the whole
+The unit of write is an **append block**: a byte range written to the target extent atomically — the whole
 range becomes visible or none of it does.
 
 ⚠️ Note "byte range", not "set of records". A block may contain **record fragments** at either end, since with
@@ -6893,7 +6893,7 @@ where its bytes landed.
 An append returns its **logical offset in the extent** as a locator, plus the record number of the first
 complete record it contains (unkeyed) and the extent it landed in.
 
-#### 8.1.1 Accepted, applied, durable
+#### 8.1.1 Accepted, written, durable
 
 An extent has a **primary EN** among the ENs holding its instances, and that primary runs
 the append protocol. Three states, and the distinctions matter:
@@ -6901,10 +6901,19 @@ the append protocol. Three states, and the distinctions matter:
 | State | Means | Scope |
 |---|---|---|
 | **accepted** | a machine has received the append | one machine |
-| **applied** | it *and every append before it* are on disk on that machine | one machine |
-| **durable** | the primary EN knows **3 of 4** instances have applied it | the extent |
+| **written** | it *and every append before it* are on disk on that machine | one machine |
+| **durable** | the primary EN knows **3 of 4** instances have written it | the extent |
 
-**Applied is a prefix property, not a per-append flag.** An append is applied only once
+Here **written** means completion of all required local data and metadata persistence,
+including the EN metadata journal; writing only one of those does not qualify. A journal
+record is **journaled** when it has reached local persistent storage. Raft uses
+**accepted → journaled locally → committed → applied**, where **applied** means execution
+against the state machine. EN keeps **accepted → written locally → durable**. Durability
+remains the general property; **committed** names Raft's consensus state. The current EN
+implementation still stores appends in RAM (§17.8); these names do not imply that EN disk
+persistence has been implemented.
+
+**Written is a prefix property, not a per-append flag.** An append is written only once
 all its predecessors are also on disk, so each instance's state collapses to a single
 watermark and durability is the watermark reached by at least three of the four. That is
 what makes the bookkeeping cheap enough for a tier that must stay CPU-poor (§1.2): the
@@ -6961,7 +6970,7 @@ DeLawson avoids that with a truncation rule rather than with exactly-once semant
 
 > **On primary handover, an instance must truncate anything above the durable watermark** (§8.1.1).
 
-Since "applied" is a prefix property, an instance that applied an append which never reached quorum is holding
+Since "written" is a prefix property, an instance that wrote an append which never reached quorum is holding
 a suffix nobody agreed to. Discarding it restores byte-identity. This is Raft log truncation in another guise,
 and it is what makes the prefix-watermark design sufficient for erasure coding.
 
@@ -7344,7 +7353,7 @@ The pattern: either restrict to one writer, or serialize at a primary and then c
 
 **DeLawson is structurally in the Kafka position but has not specified the token.** §8.1.1 gives a primary EN,
 a total order per extent, and a prefix watermark; §8.1.2's 3-of-4 intersection lets a new primary learn the
-durable point. What is missing is the retry case: if an append is applied by two instances and the primary
+durable point. What is missing is the retry case: if an append is written by two instances and the primary
 then dies, a client retry could append it a second time, and nothing in the design prevents that.
 
 **Resolved, and more cheaply than Kafka's answer.** §8.1.1a-3 gets exactly-once from the expected offset plus
@@ -7376,11 +7385,11 @@ replication — primary → S1 → S2 → S3 — would defeat the quorum entirel
 
 The reason is that a quorum only buys straggler tolerance if the writes are *issued*
 concurrently. Under broadcast, durability arrives when the second-fastest of three
-secondaries applies, so one slow node costs nothing. Under a chain, reaching three of four
+secondaries finishes writing, so one slow node costs nothing. Under a chain, reaching three of four
 means passing *through* the first two secondaries in sequence, so every straggler is on the
 critical path and a stall at S1 blocks S2 and S3 as well:
 
-| | Mean latency to durable (iid apply times, mean 1) |
+| | Mean latency to durable (iid write times, mean 1) |
 |---|---|
 | Broadcast — 2nd fastest of 3 | 1/3 + 1/2 = **0.83** |
 | Chain — first two in sequence | 1 + 1 = **2.00** |
@@ -8048,7 +8057,7 @@ coordinates a seal; here, an instance that knows something nobody else can — a
 unreadable journal — says so.
 
 **And *I* − *Q* + 1 of them make the seal compulsory, by arithmetic.** An append needs *Q* instances
-to apply it, so with *B* broken the healthy count is *I* − *B* and appends are impossible exactly when
+to write it, so with *B* broken the healthy count is *I* − *B* and appends are impossible exactly when
 
 > *I* − *B* < *Q*, that is **when *B* ≥ *I* − *Q* + 1**.
 
@@ -10171,7 +10180,7 @@ the SCN horizon of §4.3.4 has passed.
 |---|---|
 | Granularity | **one second** — not SCN granularity |
 | Assigned | **per append**, not per record; many appends share a second |
-| Semantics | the moment the append became **durable** (3-of-4 applied, §8.1.1), not when it was received |
+| Semantics | the moment the append became **durable** (3-of-4 written, §8.1.1), not when it was received |
 | Stored | as a **table** in the EN's extent index or append header — *not* interleaved with the records |
 
 Keeping it out of the records matters: at 8 bytes per entry it would otherwise be a per-record tax on
@@ -15027,7 +15036,7 @@ operation that reaches an EN and the first that needs an extent.
 | FE → DN | once per append | which stream the object is: `(DnId, StreamId)` and its SN |
 | FE → SN | **once per extent** | the extent that stream is appending to: an id, its second, and its four instances |
 | FE → primary EN | once per append | the receipt, once a quorum of instances has the bytes |
-| primary EN → the other three | once per append | applied, or not |
+| primary EN → the other three | once per append | written, or not |
 
 **The middle row is the one that had to be got right.** §8.1.3 says the SN places instances and
 then gets out of the write path, which it cannot do if every write consults it — so FE remembers
@@ -15041,12 +15050,12 @@ append itself carries the extent's whole name. So there is no create-extent oper
 and there does not need to be one.
 
 **The instance list travels with the append**, because the primary is what broadcasts and the SN is
-not there to be asked again. The primary assigns the offset, applies locally, and issues
-`apply-append` to the other three at once — all of them before any of them answers, since a quorum
+not there to be asked again. The primary assigns the offset, writes locally, and issues
+`write-append` to the other three at once — all of them before any of them answers, since a quorum
 is straggler tolerance only if the writes go out together (§8.1.2).
 
 **Three of four, counted apart from what it means.** The arithmetic is its own type: it says
-`Durable` when two secondaries have applied, `Lost` when enough have failed that the rest cannot
+`Durable` when two secondaries have written, `Lost` when enough have failed that the rest cannot
 make up the quorum, and nothing at all thereafter — so the reply is sent exactly once and the
 counting is unit-testable without a connection to answer down. One slow instance is invisible;
 two failures settle it immediately rather than after a timeout.
@@ -15105,7 +15114,7 @@ offset as the hint tier of §8.1.1a-10.
 
 A record may span appends (§8.2.3 rule 2), so the primary keeps the bytes of an open record and an
 append is told how many records it *closed*, which can be none. **Both gates of §8.2.3 are built**:
-an append is answered when a quorum of instances has applied it **and** its record has finished, and
+an append is answered when a quorum of instances has written it **and** its record has finished, and
 either can arrive first. The block rule of §8.2.4 is enforced where the append lands — a block that
 closes a record and then ends inside another is refused, and refused before anything is written.
 
@@ -15530,12 +15539,12 @@ shipped.
 
 **The primary was already safe by accident.** `take` hands out `extent.end` and moves it forward, so
 an offset is used once as long as nothing moves `end` backwards — and nothing did, because truncation
-did not exist. **The secondary was not.** `apply` took the offset the primary chose and did
+did not exist. **The secondary was not.** `write_append` took the offset the primary chose and did
 `end = end.max(offset + stored)`, which accepts a block at *any* offset, including one already
 written, and silently kept both. That is the catastrophic case of §7.2.4 sitting in the one path where
 the offset arrives from another machine rather than being chosen locally.
 
-**So the check lives on `apply`, and it distinguishes three cases** rather than two:
+**So the check lives on `write_append`, and it distinguishes three cases** rather than two:
 
 | At that offset | Answer | Why |
 |---|---|---|
@@ -15569,7 +15578,7 @@ wearing a different hat.
 ⚠️ **Nothing calls `truncate` from the wire yet, because primary handover is unspecified** (§16.32,
 #55). The primitive is deliberately ahead of its caller: the invariant it carries is most of the reason
 handover cannot be written casually, so it should exist before the protocol rather than after. What is
-enforced today is the `apply` refusal, which is on a live path, plus seven tests naming the two
+enforced today is the `write_append` refusal, which is on a live path, plus seven tests naming the two
 invariants they check.
 
 ### 17.18 A read becomes a range, and one shape replaces two
@@ -18255,7 +18264,7 @@ frees the SN extent's instance list, and drops the EN instance's encrypted appen
 payloads. Stable array slots retain tombstones, and retired object/stream names
 are remembered for retry handling. Late creates/appends cannot reset an existing
 deleted identity. EN also soft-deletes lazily allocated, unwritten replicas so
-a delayed first apply-append cannot recreate them. Pending EN append queues are
+a delayed first write-append cannot recreate them. Pending EN append queues are
 refused/drained on deletion.
 
 Point reads and scans accept --read-soft-deleted. The optional ReadSoftDeleted

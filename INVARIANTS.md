@@ -243,7 +243,7 @@ can only under-spend, and under-spending is recoverable in a second round where 
 
 ## The append path
 
-**`APPLIED-IS-A-PREFIX`** — an append is applied on a machine only once every append before it is
+**`WRITTEN-IS-A-PREFIX`** — an append is written on a machine only once every append before it is
 also on disk, so an instance's state is a single watermark.
 *Argued* §8.1.1 · *Enforced* code, in the EN's offset handling · *Checked* unit tests
 (`offsets_follow_one_another`); **model check wanted** for the interleaving
@@ -258,7 +258,7 @@ intersect.
 need a reconciliation protocol instead of getting one from the intersection.
 
 **`DURABLE-IS-QUORUM-WATERMARK`** — durable means the primary knows a quorum of instances have
-applied it. Nothing weaker is reported to a writer.
+written it. Nothing weaker is reported to a writer.
 *Argued* §8.1.1 · *Enforced* code, in the EN's quorum counting · *Checked* unit tests over the
 counting; **model check wanted**
 *Breaks* an acknowledged write can be lost.
@@ -288,7 +288,7 @@ garbage rather than a detectable error.
 
 **`EXTENT-OFFSET-WRITE-ONCE`** — within one extent identity, a (payload-byte offset, record offset) pair is written at most once, ever.
 *Argued* §7.2.4, §17.17 · *Enforced* **code**: the primary was already safe, since `take` only moves
-`end` forward; the secondary was not, and `apply` now refuses different bytes at a written offset
+`end` forward; the secondary was not, and `write_append` now refuses different bytes at a written offset
 (#83) · *Checked* unit tests exist (`an_offset_holds_one_plaintext_and_refuses_a_second`,
 `the_same_bytes_at_the_same_offset_are_a_retry_not_a_clash`); **model check wanted** with handover
 interleaved, which is the case no test reaches
@@ -957,8 +957,8 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 
 | Term | Defined | Invariants naming it |
 |---|---|---|
-| **append block** | §8.1 | `A-BLOCK-HOLDS-ONE-AUTHORIZATION-DOMAIN`, `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `RECORD-FITS-ONE-EXTENT`, `EXTENT-SEALS-BETWEEN-RECORDS`, `APPLIED-IS-A-PREFIX`, `ONE-BLOCK-ALWAYS-RETURNS` |
-| **applied** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE` |
+| **append block** | §8.1 | `A-BLOCK-HOLDS-ONE-AUTHORIZATION-DOMAIN`, `BLOCK-ENDS-ON-BOUNDARY-OR-HOLDS-NONE`, `ASSIGNED-OFFSET-APPENDS-RECORD-ALIGNED`, `RECORD-FITS-ONE-EXTENT`, `EXTENT-SEALS-BETWEEN-RECORDS`, `WRITTEN-IS-A-PREFIX`, `ONE-BLOCK-ALWAYS-RETURNS` |
+| **written** | §8.1.1 | `WRITTEN-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE` |
 | **capability** | §9.1.3.5 | `A-CERTIFICATE-NAMES-ITS-TENANT-AND-ITS-EXTENT`, `HINT-BOUND-BY-CAPABILITY`, `KEY-AND-SALT-COVER-ONE-PLAINTEXT` |
 | **directory** | §5.1 | `POLICY-ATTACHES-TO-A-DIRECTORY`, `ALIAS-ACCESS-INTERSECTS`, `EVERY-OBJECT-HAS-ONE-CANONICAL-PATH`, `ALIAS-TRAVERSAL-CARRIES-ITS-PATH` |
 | ⚠️ **compressed position** | §8.1.6 | `KEY-AND-SALT-COVER-ONE-PLAINTEXT`, `EC-GROUP-EQUAL-LENGTH`, `SPACES-ARE-TYPES-WHEN-A-MIX-UP-IS-SILENT`. *The same space §4.5 and §8.1.1a-2 call **physical**.* |
@@ -983,7 +983,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **failure domain** | §5.6 | `NESTED-NOT-ORTHOGONAL-DOMAINS`, `TOPOLOGY-IS-SIGNED-NOT-SECRET`, `SOLVER-TIMEOUT-DEFERS-NEVER-DROPS` |
 | **ring** | §5.7 | `MEMBERSHIP-IS-NOT-LEADERSHIP`, `TOPOLOGY-IS-SIGNED-NOT-SECRET`, `RE-KEYING-NEEDS-A-COMMITTED-MEMBERSHIP` |
 | **placement** | §5.6 | `PLACEMENT-NEVER-REVISITED`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `NESTED-NOT-ORTHOGONAL-DOMAINS`, `SOLVER-TIMEOUT-DEFERS-NEVER-DROPS`, `UNENFORCEABLE-RULE-NOT-ENFORCED`, `NO-DATA-MOVEMENT-EXCEPT-RANGE-SPLIT` |
-| **primary** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `TRUNCATION-SEALS` |
+| **primary** | §8.1.1 | `WRITTEN-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `INSTANCE-LIST-ORDER-IS-SEMANTIC`, `TRUNCATION-SEALS` |
 | **quorum** | §8.1.1 | `QUORUM-OVERLAPS`, `DURABLE-IS-QUORUM-WATERMARK`, `SEAL-NEVER-BELOW-DURABLE`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `UNAPPENDABLE-EXTENT-SEALS`, `SELF-SEAL-MARK-IS-DURABLE` |
 | **batch** | §9.1.3.7 | `A-BATCH-ANSWER-IS-A-PREFIX`, `A-NAME-COSTS-AT-LEAST-ONE-ENTRY`, `A-NAME-HAS-ONE-OWNER` |
 | **authorization domain** | §5.9.1a | `A-BLOCK-HOLDS-ONE-AUTHORIZATION-DOMAIN`, `A-MEMBER-THAT-CAN-SERVE-CAN-LEAK` |
@@ -997,7 +997,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **stream** | §4.1 | `STREAM-IDENTITY-OWNED`, `SN-NOT-IN-WRITE-PATH`, `ONE-REQUEST-IN-FLIGHT-PER-STREAM`, `EXTENT-KEY-FROM-CREATING-SN`, `READ-NAMES-THE-OBJECT`, `THE-OFFICIAL-FLAG-STAYS-PERMISSIVE-UNTIL-CLEANUP-ENDS` |
 | **`Op::` tag** | §17.42.1 | `SHIPPED-OP-TAGS-STAY-STABLE-UNTIL-EXHAUSTION`, `NEW-WIRE-FORMATS-REQUIRE-CLIENT-CAPABILITY`, `UNKNOWN-NESTED-TAGS-FAIL-CLOSED` |
 | **summary** | §4.5 | `TAIL-ONLY-SUMMARIES-EXACT`, `UNKEYED-COUNT-EXACT`, `COUNTS-ARE-RECOMPUTABLE` |
-| **watermark** | §8.1.1 | `APPLIED-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `SEAL-NEVER-BELOW-DURABLE`, `INCOMPLETE-RECORD-NOT-DURABLE` |
+| **watermark** | §8.1.1 | `WRITTEN-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `SEAL-NEVER-BELOW-DURABLE`, `INCOMPLETE-RECORD-NOT-DURABLE` |
 
 ## What the index shows
 

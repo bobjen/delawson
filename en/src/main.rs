@@ -6,7 +6,7 @@
 //! the other three instances. Broadcast rather than a chain, because a quorum only
 //! buys straggler tolerance if the writes are issued at once.
 //!
-//! **Durable means three of the four instances have applied it**, the primary
+//! **Durable means three of the four instances have written it**, the primary
 //! included, so one slow instance costs nothing.
 //!
 //! **A caller's CRC is carried and stored, and not checked here.** A Disk holds what
@@ -42,7 +42,7 @@ const SERVES: &[Op] = &[
     Op::SoftDeleteExtentInstance,
     Op::DeleteExtentInstance,
     Op::AppendExtent,
-    Op::ApplyAppend,
+    Op::WriteAppend,
     Op::ReadExtent,
     Op::ForceSealExtent,
 ];
@@ -324,8 +324,8 @@ enum Took {
     },
 }
 
-/// What an apply did.
-enum Applied {
+/// What a secondary append write did.
+enum Written {
     Stored,
     Already,
 }
@@ -386,7 +386,7 @@ impl Extents {
             place
         } else {
             // EN creates instances lazily on the first append. A soft-delete must
-            // also fence an as-yet-unwritten replica against a late apply-append.
+            // also fence an as-yet-unwritten replica against a late write-append.
             if retention.is_none() {
                 return Err(Error::new("hard delete requires a soft-deleted instance"));
             }
@@ -622,13 +622,13 @@ impl Extents {
         Ok(Took::Landed(Landed { offset, logical: logical_offset, first_record, records }))
     }
 
-    fn apply(
+    fn write_append(
         &mut self,
         daily_cache: &DailyKeyCache,
         extent_cache: &ExtentKeyCache,
         process: &Process,
         appending: &AppendBlock,
-    ) -> Result<Applied> {
+    ) -> Result<Written> {
         let logical_size = appending.holds.logical;
         let place = self.place(appending.sn, appending.extent, appending.created)?;
         if self.extents[place].sealed {
@@ -640,12 +640,12 @@ impl Extents {
 
         let logical_offset = appending
             .logical_offset
-            .ok_or_else(|| Error::new("apply-append to EN must carry a logical offset"))?;
+            .ok_or_else(|| Error::new("write-append to EN must carry a logical offset"))?;
 
         let offset = self.extents[place].end;
         let first_record = appending
             .record_offset
-            .ok_or_else(|| Error::new("apply-append must carry an extent record offset"))?;
+            .ok_or_else(|| Error::new("write-append must carry an extent record offset"))?;
         Self::check_progress(appending)?;
         if let Some(existing) = self.appends.iter().find(|a| {
             a.extent == place && a.logical == logical_offset && a.first_record == first_record
@@ -658,7 +658,7 @@ impl Extents {
                 process,
                 &self.extents[place],
             )?;
-            return Ok(Applied::Already);
+            return Ok(Written::Already);
         }
         // Overlapping identities must not be encrypted again with different data.
         let end = (first_record.plus(appending.holds.records)?, logical_offset.plus(logical_size)?);
@@ -727,7 +727,7 @@ impl Extents {
         };
         self.appends.push(append);
 
-        Ok(Applied::Stored)
+        Ok(Written::Stored)
     }
 
     #[allow(dead_code)]
@@ -1155,14 +1155,14 @@ impl Disk {
         onward.record_offset = Some(landed.first_record);
 
         for (en, disk) in others {
-            let apply = onward.request(en, disk, Op::ApplyAppend);
+            let write_request = onward.request(en, disk, Op::WriteAppend);
             let identity = format!("EN{en}");
             let waiting = Arc::clone(&quorum);
-            if let Err(e) = process.ask(&identity, &apply, move |answer| {
-                waiting.applied(answer.status == Status::Ok);
+            if let Err(e) = process.ask(&identity, &write_request, move |answer| {
+                waiting.written(answer.status == Status::Ok);
             }) {
                 logw!("could not reach an instance", "en {identity},{e}");
-                quorum.applied(false);
+                quorum.written(false);
             }
         }
 
@@ -1216,19 +1216,19 @@ impl Disk {
         }
     }
 
-    fn apply(&self, process: &Process, appending: AppendBlock) -> Resp {
+    fn write_append(&self, process: &Process, appending: AppendBlock) -> Resp {
         if let Err(error) = Self::check_size(&appending, process.cluster.extents.max_append_bytes) {
             return bad(error);
         }
-        match self.held.lock().expect("extents").apply(
+        match self.held.lock().expect("extents").write_append(
             &self.daily_cache,
             &self.extent_cache,
             process,
             &appending,
         ) {
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-            Ok(Applied::Already) => return Resp::ok(),
-            Ok(Applied::Stored) => {}
+            Ok(Written::Already) => return Resp::ok(),
+            Ok(Written::Stored) => {}
         }
         self.appends.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(appending.bytes.len() as u64, Ordering::Relaxed);
@@ -1398,7 +1398,7 @@ impl Service for EN {
     fn inline(&self, op: Op) -> bool {
         matches!(
             op,
-            Op::AppendExtent | Op::ApplyAppend | Op::Ping | Op::Status | Op::Shutdown | Op::Sites
+            Op::AppendExtent | Op::WriteAppend | Op::Ping | Op::Status | Op::Shutdown | Op::Sites
         )
     }
 
@@ -1408,7 +1408,7 @@ impl Service for EN {
                 reply.send(self.delete_instance(process, &request))
             }
             Op::AppendExtent => self.append(process, request, reply),
-            Op::ApplyAppend => reply.send(self.apply(process, request)),
+            Op::WriteAppend => reply.send(self.write_append(process, request)),
             Op::ReadExtent => reply.send(self.read(process, &request)),
             Op::ForceSealExtent => reply.send(self.force_seal(process, &request)),
             _ => reply.send(server::unbuilt(process, SERVES, &request)),
@@ -1540,7 +1540,7 @@ impl EN {
         }
     }
 
-    fn apply(&self, process: &Process, request: Req) -> Resp {
+    fn write_append(&self, process: &Process, request: Req) -> Resp {
         let (en, disk_id, appending) = match AppendBlock::of(&request) {
             Ok(res) => res,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
@@ -1549,11 +1549,11 @@ impl EN {
         if en != mine {
             return Resp::error(
                 Status::BadRequest,
-                format!("apply aimed at EN{en} reached EN{mine}"),
+                format!("write-append aimed at EN{en} reached EN{mine}"),
             );
         }
         match self.disk(disk_id) {
-            Ok(disk) => disk.apply(process, appending),
+            Ok(disk) => disk.write_append(process, appending),
             Err(e) => Resp::error(Status::BadRequest, e.to_string()),
         }
     }
@@ -1612,7 +1612,7 @@ impl EN {
 struct Counting {
     others: usize,
     wanted: usize,
-    applied: usize,
+    written: usize,
     failed: usize,
     settled: bool,
 }
@@ -1625,18 +1625,18 @@ enum Verdict {
 
 impl Counting {
     fn new(others: usize, quorum: usize) -> Counting {
-        Counting { others, wanted: quorum.saturating_sub(1), applied: 0, failed: 0, settled: false }
+        Counting { others, wanted: quorum.saturating_sub(1), written: 0, failed: 0, settled: false }
     }
 
-    fn answer(&mut self, applied: bool) -> Option<Verdict> {
+    fn answer(&mut self, written: bool) -> Option<Verdict> {
         if self.settled {
             return None;
         }
-        match applied {
-            true => self.applied += 1,
+        match written {
+            true => self.written += 1,
             false => self.failed += 1,
         }
-        let verdict = if self.applied >= self.wanted {
+        let verdict = if self.written >= self.wanted {
             Verdict::Durable
         } else if !self.possible() {
             Verdict::Lost
@@ -1666,8 +1666,8 @@ impl Quorum {
         quorum
     }
 
-    fn applied(&self, applied: bool) {
-        match self.counting.lock().expect("quorum").answer(applied) {
+    fn written(&self, written: bool) {
+        match self.counting.lock().expect("quorum").answer(written) {
             Some(Verdict::Durable) => self.pending.quorum_is_in(),
             Some(Verdict::Lost) => self.pending.lost(),
             None => {}
@@ -1958,9 +1958,12 @@ mod tests {
         next.record_offset = Some(ERoff::new(1));
         assert!(matches!(disk.take(&process, &next, ROOM), Ok(Took::Landed(_))));
         // Delivery can be out of order; the replica uses the primary's record offset.
-        assert_eq!(other.apply(&process, next.clone()).status, Status::Ok);
-        assert_eq!(other.apply(&process, empty.clone()).status, Status::Ok);
-        assert_eq!(other.apply(&process, next).status, Status::Ok);
+        let response = other.write_append(&process, next.clone());
+        assert_eq!(response.status, Status::Ok);
+        let response = other.write_append(&process, empty.clone());
+        assert_eq!(response.status, Status::Ok);
+        let response = other.write_append(&process, next);
+        assert_eq!(response.status, Status::Ok);
         let held = disk.held.lock().unwrap();
         let mut replicated = other.held.lock().unwrap();
         assert_eq!(held.extents[0].records, ERoff::new(2));
@@ -2368,14 +2371,15 @@ mod tests {
     }
 
     #[test]
-    fn an_applied_append_keeps_the_offset_it_was_given() {
+    fn a_written_append_keeps_the_offset_it_was_given() {
         let en = EN::new(testing::en_config());
         let disk_id = DiskId::FIRST;
         let mut block = block(0, 1, &line("late"));
         block.logical_offset = Some(ELoff::ZERO);
         block.record_offset = Some(ERoff::ZERO);
-        let request = block.request(EnId::new(0), disk_id, Op::ApplyAppend);
-        assert_eq!(en.apply(&testing::process(), request).status, Status::Ok);
+        let request = block.request(EnId::new(0), disk_id, Op::WriteAppend);
+        let response = en.write_append(&testing::process(), request);
+        assert_eq!(response.status, Status::Ok);
     }
 
     #[test]
@@ -2407,14 +2411,12 @@ mod tests {
         let mut same = block(0, 1, b"once\n");
         same.logical_offset = Some(ELoff::ZERO);
         same.record_offset = Some(ERoff::ZERO);
-        assert!(matches!(
-            held.apply(&en._daily_cache, &disk.extent_cache, &testing::process(), &same),
-            Ok(Applied::Stored)
-        ));
-        assert!(matches!(
-            held.apply(&en._daily_cache, &disk.extent_cache, &testing::process(), &same),
-            Ok(Applied::Already)
-        ));
+        let result =
+            held.write_append(&en._daily_cache, &disk.extent_cache, &testing::process(), &same);
+        assert!(matches!(result, Ok(Written::Stored)));
+        let result =
+            held.write_append(&en._daily_cache, &disk.extent_cache, &testing::process(), &same);
+        assert!(matches!(result, Ok(Written::Already)));
     }
 
     #[test]

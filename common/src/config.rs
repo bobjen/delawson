@@ -275,7 +275,7 @@ impl Logging {
     }
 }
 
-/// How many instances an extent has, and how many must have applied an append
+/// How many instances an extent has, and how many must have written an append
 /// before it is durable.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -167,7 +167,7 @@ ops! {
     // EN. An append arrives from an FE at the primary; the primary broadcasts the
     // same bytes at a fixed offset to the other three instances.
     AppendExtent = 34, "append-extent";
-    ApplyAppend = 35, "apply-append";
+    WriteAppend = 35, "write-append";
     ReadExtent = 36, "read-extent";
 
     // Records.
@@ -824,7 +824,7 @@ pub struct AppendBlock {
     pub holds: crate::block::Holds,
     /// The canonical logical offset assigned by the primary, for secondaries.
     pub logical_offset: Option<ELoff>,
-    /// Optional expected extent record count; required on replica application.
+    /// Optional expected extent record count; required when writing a secondary instance.
     pub record_offset: Option<ERoff>,
     /// The **(EnId, DiskId)** pairs holding it, primary first.
     pub instances: Vec<(EnId, DiskId)>,
@@ -1629,7 +1629,7 @@ mod tests {
             ..block.clone()
         };
         let (read_en, read_disk, read_block) =
-            AppendBlock::of(&onward.request(en, disk, Op::ApplyAppend)).unwrap();
+            AppendBlock::of(&onward.request(en, disk, Op::WriteAppend)).unwrap();
         assert_eq!(read_en, en);
         assert_eq!(read_disk, disk);
         assert_eq!(read_block, onward);
@@ -1686,7 +1686,7 @@ mod tests {
             ],
         };
         let (_, _, read) =
-            AppendBlock::of(&block.request(EnId::new(2), DiskId::new(1), Op::ApplyAppend)).unwrap();
+            AppendBlock::of(&block.request(EnId::new(2), DiskId::new(1), Op::WriteAppend)).unwrap();
         assert_eq!(read, block);
         assert_eq!(read.pieces.len(), 2);
         assert_eq!(read.holds.compressed, crate::offset::ECoff::new(110));

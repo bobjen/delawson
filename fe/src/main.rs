@@ -2892,7 +2892,7 @@ mod tests {
             _framing: Framing::Lf,
             disks: vec![(EnId::new(2), DiskId::new(0))],
         };
-        let refused = Resp::error(Status::Internal, "two instances would not apply it");
+        let refused = Resp::error(Status::Internal, "two instances would not write it");
         assert_eq!(receipt(&located, &open, refused.clone()), refused);
     }
 
