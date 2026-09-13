@@ -103,8 +103,8 @@ def main():
             journal = work/'ks/data/master-keys'
             persisted = {p.name: p.read_bytes() for p in journal.glob('journal-*.log')}
             snapshot = (journal/'snapshot-00000000000000000000.bin').read_bytes()
-            assert int.from_bytes(snapshot[40:48], 'little') == 0
-            assert int.from_bytes(persisted['journal-00000000000000000001.log'][-112:-104], 'little') >= 2
+            assert json.loads(snapshot[:-32])['state']['commit'] == 0
+            keys_before = run(laws+local+key_request)
             ks.terminate()
             ks.wait(timeout=15)
             start('ks', 'KS0', 'ks', host, address, ksconfig)
@@ -112,7 +112,9 @@ def main():
             assert 'locked' in locked.lower(), locked
             run(laws+['unlock','--key-file',ceremony/'unlock-key'])
             run(laws+local+key_request)
-            assert {p.name: p.read_bytes() for p in journal.glob('journal-*.log')} == persisted
+            assert run(laws+local+key_request) == keys_before
+            # Restart journals a new term/vote, no-op and commit marker.
+            assert sum(p.stat().st_size for p in journal.glob('journal-*.log')) > sum(map(len, persisted.values()))
             start('en', 'EN0', 'en', host, '127.0.0.1:'+str(port()), ROOT/'config/en.toml')
             start('impostor', 'EN0', 'en', fake, '127.0.0.1:'+str(port()), ROOT/'config/en.toml', accepted=False)
             print('PASS: anonymous unlock; authenticated key issuance and registration; '

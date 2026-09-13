@@ -27,3 +27,17 @@ inline_ping = true
 # Threads answering requests off the read loop. Zero means one per core.
 [knobs]
 workers = 0
+
+# Without explicit raft.members, each KS process is an independent singleton.
+# A replicated ring uses the same ring name and member map on every member,
+# with distinct process IDs, listen addresses, and data directories.
+# [raft]
+# ring = "KS0"
+# heartbeat_ms = 500
+# election_min_ms = 3000
+# election_max_ms = 6000
+# request_timeout_ms = 1000
+# [raft.members]
+# KS0 = "127.0.0.1:9400"
+# KS1 = "127.0.0.1:9401"
+# KS2 = "127.0.0.1:9402"

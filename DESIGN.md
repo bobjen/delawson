@@ -18337,8 +18337,8 @@ before opening its key-serving gate. No operator identity is required for unlock
 shards` exercises reconstruction. Neither path implements user authorization.
 
 The on-disk share encoding and command examples are documented in README.md.
-Encrypted master-key journaling is now implemented in §17.48; Raft unlock transfer
-remains future work. Member authentication and forward-secret transport are
+Encrypted master-key journaling is implemented in §17.48; authenticated Raft
+unlock transfer is implemented in §17.51. Member authentication and forward-secret transport are
 implemented in §17.45. Development ceremony files are
 kept together outside the KS process directory, not distributed custody.
 
@@ -18471,211 +18471,110 @@ sizes, and oversized objects. scripts/test-bytes exercises the complete bytes pa
 
 ## 17.48 KS encrypted master-key journal
 
-KS stores master-key epochs in numbered journal segments under `data_dir/master-keys/`
-(§17.50). A segment's 80-byte header contains magic `DLAWKS03`, the 32-byte store
-identity, its first commit number (u64 LE), and the preceding entry's 32-byte tag.
-Each fixed-size 112-byte entry contains a little-endian u64 commit number, a fresh
-random 32-byte nonce, 40 encrypted
-bytes (the 32-byte master key followed by its activation TimeSec as little-endian
-u64), and a 32-byte AEGIS-256 authentication tag. The unlock key is the 256-bit
-encryption key. Associated data binds the version, journal identity, commit number, and preceding
-entry's tag (zero for the first entry), detecting corruption, reordering, interior
-omissions, and splicing between journals. This does not detect rollback of an
-entire journal or removal of a complete suffix; external rollback protection is
-not implemented.
+KS persists Raft state in one linear journal under `data_dir/master-keys/`.
+Records contain term/vote updates, log entries or replacements, commit markers,
+and installed snapshots. Term/vote records, entry headers, membership, and commit
+positions are plaintext so locked members can recover consensus state, vote, and
+journal encrypted entries toward a quorum. A successful storage write syncs the
+whole batch before publishing its state or acknowledging the RPC.
 
-The first key in a new journal may activate immediately. Every subsequent key is
-chosen with activation at least `master_key_delay_secs` after generation (normally
-3600 seconds; tests use one second). Equal or earlier activation than the final
-recorded entry is rejected, without removing or replacing anything. Automatic
-lazy daily generation uses the actual clock and delay horizon, not a request's
-historical timestamp; missing historical keys are never invented. After dormancy,
-the last committed key remains usable while its replacement waits to activate.
-Keys for the upcoming day are generated when reads enter the delay horizon.
+Each key entry contains a fresh 32-byte nonce, 40 encrypted bytes (master key and
+activation TimeSec), and a 32-byte AEGIS-256 tag. The independent 256-bit unlock
+key encrypts it. Associated data binds `DLAW-RAFT-KEY-1`, ring identity, Raft index,
+and term. Snapshots preserve these encrypted entries and their original positions;
+master keys and activation seconds are encrypted in both journals and snapshots.
+Outer JSON records have SHA-256 checksums for accidental corruption, not malicious
+metadata modification or rollback protection.
 
-Proposals serialize under a journal mutex. The entry is written and `sync_all`
-completes before application acquires the key-history write lock. Reads derive
-from committed history under its shared lock and can continue while another
-proposal is syncing. The old exact-time derived-key cache was removed so it cannot
-retain an obsolete next-key answer after a journal addition. This initial version
-executes after local durability; acceptance, persistence, and application remain
-separate concerns for subsequent Raft work. There is no quorum replication yet.
+The first key may activate immediately after commitment and application. Later
+keys activate at least `master_key_delay_secs` after generation (normally 3600,
+including start-laws). Equal or earlier activation than the last key is rejected.
+Lazy daily generation uses the actual clock and delay horizon, never a historical
+request timestamp. After dormancy, the last committed key remains usable while
+its replacement waits to activate.
 
-The store identity file is exclusively locked for the process lifetime, across
-journal rotations. Initial file
-creation syncs both file and parent directory. Restart leaves the history empty
-and service locked until the operator key authenticates and decrypts the journal.
-Replay authenticates the complete prefix, discards an incomplete final entry, and
-syncs before serving. A complete entry with invalid authentication stops recovery
-without modifying the journal. A failed append or sync disables subsequent writes
-until restart; it never publishes that key. A complete entry from an unacknowledged
-write may legitimately be recovered. Loss or external truncation of previously
-acknowledged bytes is outside the interrupted-write recovery assumption.
+KS's global execution lock is `RwLock<KeyHistory>`. Applying committed entries
+publishes history under its write lock; serving keys derives them under its read
+lock. The consensus/journal mutex is separate. This first implementation applies
+after commitment, with no speculative reader-visible execution. Locked members
+advance consensus without decrypting or applying key history; unlocking rebuilds
+that history from committed entries. An unlocked member can transfer the unlock
+key to another authenticated ring member over the encrypted transport.
 
-The explicit `require_unlock = false` development mode uses a known unlock key;
-`start-laws` instead supplies its generated key and reuses ceremony files. Changing
-unlock mode or recovery material does not re-encrypt an existing journal. Unlock-key
-replacement, chosen-position disaster recovery, and Raft replication remain
-subsequent work. Snapshots are implemented in §17.49. User authorization of explicit rotation remains deferred.
-
-Tests cover immediate initial activation, delayed successors, exact key/time replay,
-locked restart, failed writes without publication, equal/earlier rejection, exclusive
-file ownership, wrong keys, tampering, reordering, cross-journal splicing, and every
-partial final-entry length. The software/optional-TPM authentication integration
-test now also rotates a key with a one-second delay and restarts KS on its journal.
-
-The existing EN key cache does not yet bound how long it trusts an open-ended key
-range. Issue #122 tracks refreshing that knowledge within the activation waiting
-period, including prefetched successors. KS journal durability does not itself
-make live EN key rotation correct until that cache gap is addressed.
+`require_unlock = false` uses a known development key. Normal start-laws supplies
+its generated operator key. Changing recovery material does not re-encrypt files.
+Unlock-key replacement and chosen-position disaster recovery remain future work.
+User authorization of explicit rotation remains deferred. Issue #122 still tracks
+EN refreshing cached key knowledge within the activation delay; KS persistence
+alone does not close that cache gap.
 
 ## 17.49 KS snapshots and recovery positions
 
-Every KS journal entry now has an explicit, contiguous u64 commit number, starting
-at one. Bootstrap first publishes an encrypted empty snapshot at commit zero,
-after the unlock key is supplied and before writing the initial key entry. It is authenticated as associated data. A successful local sync advances
-the durable commit; applying the entry advances the in-memory applied commit under
-the same write lock as the key history. These are distinct positions even though
-the current single-member implementation executes immediately after persistence.
-The segmented journal format is `DLAWKS03`; earlier flat-file stores are rejected
-without modification. There is no automatic migration.
+Raft log index, committed index, and applied index are distinct. A separate u64
+physical batch sequence orders local journal writes, including term/vote and
+commit records. Snapshot and journal filenames use this physical sequence, not
+the Raft index. Both positions are recorded in recovery state. Overflow is checked;
+wrap-aware ordering remains issue #123.
 
-Each numbered `snapshot-<commit>.bin` holds the complete applied key history
-through its named commit. It is an AEGIS-256 encrypted state snapshot, not a copy of the raw
-journal. Its clear header contains magic `DLAWSS01`, journal identity (32 bytes),
-captured commit (u64 LE), the captured journal entry's authentication tag (32 bytes),
-and a fresh nonce (32 bytes). The first 80 header bytes are authenticated associated
-data. Its encrypted body is the snapshot creation second (u64 LE), followed by the
-40-byte key/activation pairs. A 32-byte authentication tag ends the file. All current
-entries add one key, so snapshot key count equals captured commit; ring-management
-entries will require separating that assumption when Raft is introduced.
+Bootstrap publishes an empty snapshot at sequence and committed index zero, even
+while locked. Every recovery starts from the newest snapshot, then replays all
+later journal batches in sequence. Recovery loads uncommitted entries and marks
+them committed only on encountering their commit marker. A new primary may have
+to establish commitment again for entries whose commitment was not recorded.
 
-Snapshot capture coordinates the execution read lock with a journal switch. At
-that boundary, the last applied and durable positions both equal N; a new journal
-starts at N+1. The snapshot retains the execution read lock while writing, but
-releases the logging mutex, so logging can continue. It does not need a full-state
-copy or transactions. Only one snapshot write runs at a time. Before completing
-snapshot bookkeeping, the writer releases its execution read lock, avoiding a
-lock cycle with an applier waiting for the execution write lock.
+Snapshots contain committed key entries and membership plus persistent term/vote
+state. Preparation captures this small opaque KS state and switches journals under
+the journal mutex; writing the captured copy releases that mutex. If the captured
+batch sequence is K and committed index is N, the new journal begins at K+1.
+Any already-journaled uncommitted suffix is carried into that new journal, starting
+at Raft index N+1. Thus replay starts at a journal boundary whether or not the
+snapshot is successfully published. Completion preserves concurrent term changes,
+commit advancement, and new log entries. Only one snapshot write runs at a time.
+This small-state copy is not the future large SN/DN snapshot implementation.
 
-Publication writes a unique temporary file, syncs it, renames it to its numbered
-snapshot name, then syncs the parent directory. Old snapshots remain until pruning
-(§17.50). Journal rotation can complete before the snapshot is durable: a failed
-or interrupted snapshot does not invalidate its successor journal. Snapshot
-failure is logged and retried without retracting a committed key addition.
-Corruption of the newest published snapshot fails recovery rather than silently
-selecting an older history.
-
-On unlock, KS authenticates the highest-numbered snapshot, then reads all journal
-segments starting after its captured commit in commit order, from their beginnings.
-A snapshot need not exist for each journal boundary. Segment filenames, header
-positions and chain anchors must agree, commit numbers must be contiguous, and
-activation seconds must increase. Covered segments are not replayed. Only an
-incomplete final entry in the active last segment may be trimmed; a partial entry
-in a closed segment is an error. Every recovery starts with a snapshot, possibly
-the empty commit-zero snapshot. Bootstrap may complete an interrupted empty store
-containing only an empty first journal; missing snapshots beside logged entries
-are an error. Raft terms, membership and snapshot transfer remain future work.
+Publication writes a temporary file, syncs it, renames it, and syncs the directory.
+An incomplete final frame in the active journal can be trimmed; a partial closed
+segment or complete corrupt frame fails recovery. Frames carry a length and its
+complement, a JSON batch, and checksum. Corruption of the newest snapshot fails
+recovery rather than silently selecting older state. A journal I/O failure fences
+further writes until restart. Snapshot publication failure alone permits retry.
 
 ### 17.49.1 Snapshot frequency
 
-The agreed initial policy for KS, SN, and DN is a snapshot when either one day
-has elapsed or the new journal bytes reach `max(previous snapshot size, 1 MiB)`,
-whichever happens first. KS implements it now; SN and DN will follow when their
-persistence is built. `snapshot_interval_secs` defaults to 86400, and
-`snapshot_min_log_bytes` defaults to 1048576. The minimum is configurable. The
-actual encrypted snapshot file size, including its metadata, supplies the other
-size bound. Only journal entries after the snapshot's captured commit count toward
-the threshold. There is no fixed entry-count threshold.
+Changed state is snapshotted after `snapshot_interval_secs` (default 86400), or
+when subsequent journal bytes reach `max(previous snapshot size,
+snapshot_min_log_bytes)` (default minimum 1048576), whichever comes first. The
+initial empty snapshot supplies the first size and time baseline. Unchanged state
+is not repeatedly snapshotted. The maintenance timer handles idle dirty state;
+this is a scheduling policy, not a hard deadline. Carrying an unchanged suffix
+across rotation does not itself make another snapshot necessary.
 
-Initialization creates the encrypted empty snapshot at commit zero, so even the
-first size-trigger calculation has a real previous snapshot. It also establishes
-the initial time baseline. Subsequent checks require changed state: an unchanged
-snapshot is not rewritten. Checks run after application and recovery and from a
-maintenance thread once per second, so dirty state that goes idle still gets a
-daily snapshot. The thread coordinates capture with proposals, retains the shared
-execution lock while writing, releases the logging mutex, and joins on orderly
-shutdown. Busy writers or slow snapshot
-I/O can delay a check; this is a scheduling policy, not a hard real-time deadline.
-A zero time interval makes every change eligible; a zero minimum still respects
-the previous snapshot size.
-
-Snapshots can be large: a ring using half a 256 GB host may require a snapshot
-around 128 GB before representation or compression savings. A short fixed replay
-time target would be premature. The daily-or-size policy scales with state size;
-measure snapshot load/write time, replay throughput, and background I/O capacity
-before tuning it. SN/DN snapshot generation belongs on the designated materialized
-snapshot-writing member, avoiding long primary stalls. Daily metadata exports for
-billing and analysis remain a separate policy.
-
-The [Raft paper, section 7](https://raft.github.io/raft.pdf) describes the underlying
-tradeoff: frequent snapshots spend write bandwidth, while infrequent snapshots
-enlarge the journal and restart work. The concrete policy above is DeLawson's
-agreed starting policy, not a measured production optimum.
-
-Tests cover restoring an encrypted snapshot plus a later journal suffix, skipping
-covered ciphertext, advancing commit numbers, replacing the latest snapshot,
-wrong keys, altered snapshot metadata/body, commit gaps, truncated journals,
-partial suffixes, failed or interrupted snapshot publication, and schedule triggers.
-Tests also cover commit-zero initialization, refusal to recreate a missing snapshot
-for a nonempty journal, the configurable minimum log size, and the idle timer.
-The software/optional-TPM integration test verifies a snapshot at commit zero and
-recovery of subsequent key entries across a locked restart.
+The same daily-or-size policy is intended for SN and DN. Their snapshots may be
+128 GB or larger, so future implementation must avoid whole-state copies and use
+suitable snapshot-writing members. Measure load, replay, and write throughput
+before tuning the production defaults. Billing exports are a separate policy.
 
 ## 17.50 Numbered KS files, journal rotation and pruning
 
-`data_dir/master-keys/` contains a stable `identity` file plus numbered snapshots
-and journal segments. `identity` stores magic `DLAWKI01` and a random 32-byte store
-identity; its exclusive file lock survives journal rotation and prevents a second
-KS process opening the same store. Filenames use zero-padded 20-digit decimal u64
-positions, so lexical order matches numeric order while overflow is rejected:
+The directory contains `identity`, `snapshot-<sequence>.bin`, and
+`journal-<first-sequence>.log`, with zero-padded 20-digit decimal sequences.
+Identity format `DLAWKR01` binds the store to its ring and member; its exclusive
+file lock prevents concurrent opens and survives rotation. Earlier pre-Raft
+formats are refused without migration. Preserve old recovery files if needed;
+opening them does not convert their format or change their identity.
 
-- `snapshot-00000000000000000100.bin` captures state through commit 100.
-- `journal-00000000000000000101.log` begins with commit 101.
+A snapshot at physical sequence 100 is followed by journal 101. If that snapshot
+never appears, recovery starts with an earlier snapshot and reads every later
+journal, including 101. Sequence continuity is checked. Temporary files are ignored.
+A missing snapshot beside nonempty journals is an error.
 
-At the coordinated snapshot boundary N, the executed state is frozen with a shared
-lock and a new journal starts at N+1. The journal header is written to a temporary
-file, synced, renamed and followed by directory sync before it accepts entries.
-Snapshot writing then proceeds independently of the logging mutex. New entries
-can accumulate for the entire snapshot-writing interval and remain unapplied
-while that member holds its execution read lock. The current KS still executes
-normal requests after local durability; Raft's asynchronous acceptance and quorum
-pipeline will be added separately.
-
-Preparation, snapshot writing and completion are separate operations. Completion
-records the captured position N, even if the logger has advanced beyond N by then.
-If the snapshot never appears, recovery uses an earlier snapshot and reads every
-subsequent journal, including journal boundaries with no matching snapshot. Failed
-journal rotation fences further writes until restart; failed snapshot writing
-alone does not. Snapshot preparation refuses unequal executed/durable capture
-positions: future Raft integration must coordinate this boundary, not place
-unapplied pre-boundary entries in the preceding journal.
-
-`snapshot_retain` defaults to ten for KS and must be positive. KS snapshots and
-journals are tiny, so retaining ten snapshots is inexpensive. Once enough snapshots
-exist, pruning keeps the newest configured count and **all journal segments after
-the oldest retained snapshot**. If fewer exist, all are kept. For snapshots 4, 6,
-and 8, retain journals starting at 5, 7 and 9, plus any intervening segments created
-by unfinished snapshot attempts. Each retained snapshot therefore has its complete
-replay suffix. Reducing the configured count takes effect after successful recovery
-or the next snapshot. The store does not synthesize historical snapshots to fill
-the count.
-
-Pruning happens only after a new snapshot and the successor journal are durably
-published, or after successful recovery verifies surviving state. First remove
-obsolete snapshots and sync their directory; only then remove their covered
-journal segments and sync again. A crash may leave extra files, but must not leave
-a retained snapshot without its required journals. Startup resumes this cleanup.
-Only recognized numbered persistence files are considered; temporary files and
-unrelated files are not pruned. The old flat `master-keys.journal` and
-`master-keys.snapshot` layout is detected and rejected, never silently replaced.
-
-Tests recover independently from every retained snapshot, check configurable
-retention, continue logging during a pending snapshot, recover journal switches
-without matching snapshots, resume pruning after snapshot publication, handle an
-interrupted empty initialization, and reject gaps, malformed headers, bad chain
-anchors and corrupt snapshots. Tests also cover every partial active-entry length
-and ensure that a partial closed segment cannot be silently repaired.
+`snapshot_retain` defaults to ten and must be positive. Keep the newest configured
+count and every journal after the oldest retained snapshot. If fewer snapshots
+exist, retain them all. Pruning follows durable publication or successful recovery:
+remove obsolete snapshots and sync the directory before deleting covered journals
+and syncing again. A crash can leave extra files, but must not remove a retained
+snapshot's replay suffix. Each retained snapshot is independently recoverable
+with its journals.
 
 ### 17.50.1 Recovery storage policy for KS, SN and DN
 
@@ -18700,3 +18599,50 @@ Raft-server copies may be retired once the corresponding files are confirmed
 durable in DeLawson under that policy. Local Raft durability and remote DeLawson
 durability are distinct facts; starting an upload is not permission to remove the
 local copy. Remote backup is future work and never applies to KS.
+
+## 17.51 Plain Raft for KS
+
+KS implements persistent terms and votes, randomized elections, AppendEntries
+conflict repair, current-term majority commitment, a new-primary no-op, and
+primary-to-member InstallSnapshot. Membership changes use joint consensus,
+requiring majorities of both configurations before completing the transition.
+Locked members participate in all these operations. All unlocked members currently
+apply committed key state; selective materialization is deferred.
+
+An explicit `[raft]` configuration gives the ring name and member-ID/address map.
+Without a map, each KS process remains an independent singleton, preserving the
+existing start-laws topology. Ring members need matching bootstrap configuration,
+distinct IDs and data directories, and machine enrollment in the KS roster.
+An added member can start with the old configuration as a nonvoter before the
+membership proposal includes it. `laws raft-members --members-file FILE` accepts
+a JSON member-ID/address map and proposes a joint transition. Automatic maintenance
+and pre-admission catch-up policy remain future work.
+
+Defaults are a 500 ms heartbeat, randomized 3000–6000 ms election timeout, and
+1000 ms RPC timeout. Recent primary contact suppresses ordinary vote requests.
+Key reads require a committed current-term entry and fresh quorum confirmation;
+concurrent reads can share a heartbeat round. No clock-based read lease is used.
+Followers forward key and membership requests to a known primary. Requests waiting
+for quorum do not occupy the shared server worker needed to handle consensus RPCs.
+Machine authentication checks the sender, and replies identify the expected member.
+User authorization remains deferred.
+
+Raft terminology is accepted, journaled locally, committed, applied. EN retains
+accepted, written locally, durable. A timed-out proposal may still commit; there
+is no exactly-once client request identity. The registry is still ephemeral, and
+automatic client bootstrap failover is not implemented. Clients can explicitly
+address another member using `--to` and `--at`.
+
+The core depends on a small storage interface. Routine tests use in-memory storage
+and direct routine calls, including failures, restarts, reordered messages,
+conflicting suffixes, joint membership, snapshot catch-up, and randomized schedules.
+Filesystem recovery tests are ignored by default and run explicitly. The separate
+`scripts/test-ks-raft` integration test exercises locked quorum, unlock transfer,
+key reads, failover, minority rejection, restart, and membership changes.
+
+This initial implementation uses whole JSON messages and a 64 MiB journal frame
+limit. Snapshot transfer is not chunked. Large SN/DN state requires bounded-memory
+streaming and different snapshot capture before reusing this implementation there
+(issue #125).
+Leadership handoff, selective execution, read leases, and independent execution
+liveness monitoring are deferred.

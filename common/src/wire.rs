@@ -224,6 +224,8 @@ ops! {
     DeleteExtentInstance = 79, "delete-extent-instance";
     ReadSoftDeleted = 80, "read-soft-deleted";
     ByteSeekResp = 81, "byte-seek-response";
+    Raft = 82, "raft";
+    RaftMembers = 83, "raft-members";
 }
 
 impl std::fmt::Display for Op {

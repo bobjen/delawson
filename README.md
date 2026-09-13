@@ -289,57 +289,72 @@ Run the isolated integration test with `cargo build --workspace` followed by
 `scripts/test-bytes`. It uses temporary configuration, ports and data, with one DN
 for the existing same-DN concat path, and cleans up its processes afterwards.
 
-### KS key journal
+### KS persistence and Raft
 
-KS persists encrypted master keys and activation seconds in
-`data_dir/master-keys/`. Keep this directory and the matching operator recovery
-material across restarts. `start-laws` reuses its ceremony files; switching between
-`direct` and `shards` modes selects different recovery material and does not convert
-an existing journal. An existing journal will reject the wrong unlock key.
+KS stores encrypted master keys and activation seconds in `data_dir/master-keys/`.
+Preserve that directory and the matching operator recovery material. Both snapshots
+and journals keep key payloads encrypted under the unlock key; consensus metadata
+remains readable while locked. Keep KS recovery files only on physically protected
+KS machines, never in DeLawson.
 
-A new journal's initial key is usable immediately after persistence. Later keys
-wait `master_key_delay_secs` (default 3600); equal or earlier activation than the
-last journaled key is rejected. The journal is synced before a key becomes visible.
-KS restarts locked and restores the same history on unlock. An interrupted partial
-final entry is discarded; corruption of a complete entry fails recovery.
+The first key is usable immediately after commitment and application. Later keys
+wait `master_key_delay_secs` (default 3600, including start-laws). Normal startup
+requires unlocking; `require_unlock = false` uses a known development key.
+Changing operator recovery material does not re-encrypt an existing store.
 
-`require_unlock = false` is explicitly insecure development mode: its journal is
-encrypted with a known test key. Normal `start-laws` supplies a generated key.
-Raft, unlock-key replacement, and explicit recovery cutoffs are not yet
-implemented. No other service has become persistent through this change.
+Without explicit Raft members, each KS process is an independent singleton.
+For a replicated ring, configure each member with the same map and ring name,
+a distinct process ID/data directory, and the required machine enrollment:
 
-Run `cargo test -p delawson-ks --features delawson-common/testing` for journal failure
-and replay coverage. After `cargo build --workspace`, `scripts/test-machine-auth`
-exercises rotation and locked restart with a one-second test delay, using software
-machine identities by default. Its existing `--tpm` option remains opt-in.
+```toml
+[raft]
+ring = "KS0"
+heartbeat_ms = 500
+election_min_ms = 3000
+election_max_ms = 6000
+request_timeout_ms = 1000
+[raft.members]
+KS0 = "127.0.0.1:9400"
+KS1 = "127.0.0.1:9401"
+KS2 = "127.0.0.1:9402"
+```
 
-The directory contains `identity`, numbered `snapshot-<commit>.bin` files and
-`journal-<first-commit>.log` segments. Commit numbers are padded to 20 decimal digits.
-For example, snapshot 100 captures state through commit 100, and its successor
-journal begins at 101. Recovery loads the newest snapshot and replays all later
-journal files in commit order. Journal switching precedes snapshot publication;
-recovery also handles switches whose snapshots never finished.
+Use the actual configured listen addresses. Locked members can vote and journal
+entries toward commitment. An unlocked member can unlock authenticated peers.
+Key reads require fresh quorum confirmation; a minority cannot serve them.
+Followers forward requests to a known primary. `laws raft-members --members-file
+FILE` proposes a joint-consensus transition using a JSON ID/address map. New IDs
+must be admitted KS processes. Automatic ring maintenance and client bootstrap
+failover remain future work; `--to` and `--at` select a member explicitly.
 
-`snapshot_retain = 10` keeps the newest ten snapshots and every journal needed
-after the oldest retained snapshot. The count is configurable and must be positive;
-all snapshots are kept until the configured count exists. Pruning waits for durable
-publication, deletes old snapshots before their covered journals, and resumes on
-restart if interrupted. KS journals and snapshots must remain exclusively on
-physically protected KS machines, even though they are encrypted; never store them
-in DeLawson. Keep the full directory when copying recovery state to another KS machine.
-A corrupt newest snapshot fails recovery; leftover temporary files are ignored.
+Recovery starts from the newest snapshot and replays later numbered journals.
+Filenames use a physical journal batch sequence, distinct from the Raft log index.
+Bootstrap creates snapshot zero. Rotation precedes snapshot publication and carries
+any uncommitted suffix into the new journal. An incomplete final active frame can
+be discarded; complete corruption fails recovery. Earlier pre-Raft formats are
+refused without migration.
 
-Bootstrap writes an encrypted empty snapshot at commit zero before the first key
-entry. Every recovery starts from a snapshot. A missing snapshot beside a nonempty
-journal is an error.
+Snapshot defaults are one day or new journal bytes reaching the larger of the
+previous snapshot size and `snapshot_min_log_bytes = 1048576`. Only changed state
+is snapshotted. `snapshot_retain = 10` keeps ten snapshots and all journals after
+the oldest retained snapshot. These settings are configurable.
 
-Snapshot defaults are `snapshot_interval_secs = 86400` and
-`snapshot_min_log_bytes = 1048576`. Changed state is snapshotted when either a day
-has elapsed or new journal bytes reach the larger of the previous snapshot file
-size and the configurable minimum (1 MiB by default). A maintenance timer also
-handles dirty idle state; unchanged state is not rewritten. The one-hour key
-activation delay remains separate and unchanged.
+Routine tests use direct calls and in-memory storage:
 
-Journal segments use format `DLAWKS03`. Earlier flat `master-keys.journal` and
-`master-keys.snapshot` stores are rejected without modification; this step does
-not automatically migrate them.
+```sh
+cargo test -p delawson-ks --features delawson-common/testing
+```
+
+Occasional filesystem and process integration checks:
+
+```sh
+cargo test -p delawson-ks --features delawson-common/testing -- --ignored
+cargo build --workspace
+scripts/test-ks-raft
+scripts/test-machine-auth
+```
+
+Machine-auth tests use software identities by default; `--tpm` remains opt-in.
+User authorization, unlock-key replacement, recovery cutoffs, selective execution,
+and chunked snapshot transfer are deferred. The registry remains ephemeral.
+See DESIGN.md §§17.48–17.51 for storage and consensus details.

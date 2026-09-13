@@ -529,6 +529,16 @@ fn read_loop<S: Service>(
         };
         if let Some(auth) = &process.cluster.messaging.authentication {
             let allowed = match request.op {
+                Op::Raft => match request.args.first() {
+                    Some(Arg::Text(sender)) => {
+                        process
+                            .cluster
+                            .service(sender)
+                            .is_some_and(|entry| entry.kind == ServiceKind::Ks)
+                            && auth.permits(input.peer_key(), sender)
+                    }
+                    _ => false,
+                },
                 Op::Register => Peer::from_args(&request.args)
                     .is_ok_and(|peer| auth.permits(input.peer_key(), &peer.identity)),
                 Op::SnMasterKey => process

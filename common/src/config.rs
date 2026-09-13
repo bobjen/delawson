@@ -638,11 +638,38 @@ pub struct Knobs {
     pub workers: usize,
 }
 
+/// Ordinary Raft timing and bootstrap membership for KS. Addresses remain available
+/// before unlocking or registry service. Persisted membership wins after bootstrap.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RaftConfig {
+    pub ring: String,
+    pub members: BTreeMap<String, SocketAddr>,
+    pub heartbeat_ms: u64,
+    pub election_min_ms: u64,
+    pub election_max_ms: u64,
+    pub request_timeout_ms: u64,
+}
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self {
+            ring: "KS0".into(),
+            members: BTreeMap::new(),
+            heartbeat_ms: 500,
+            election_min_ms: 3000,
+            election_max_ms: 6000,
+            request_timeout_ms: 1000,
+        }
+    }
+}
+
 /// KS's own configuration. Every other machine type gets a file of this shape,
 /// holding the knobs that type owns and nothing else.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KsConfig {
+    #[serde(default)]
+    pub raft: RaftConfig,
     /// Retain this many snapshots and all journal segments after the oldest.
     #[serde(default = "ks_snapshot_retain")]
     pub snapshot_retain: usize,

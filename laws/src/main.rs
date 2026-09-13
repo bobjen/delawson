@@ -203,6 +203,11 @@ enum Cmd {
     },
     /// Generate today's master key.
     RotateMasterKey,
+    /// Change KS ring membership through Raft joint consensus (JSON identity/address map).
+    RaftMembers {
+        #[arg(long)]
+        members_file: PathBuf,
+    },
 
     /// The configured roster, in cold-start order. Needs no running cluster.
     Services,
@@ -2015,6 +2020,36 @@ fn ranged(
 fn report(target: &Target, response: &Resp) -> Result<()> {
     for arg in &response.args {
         match arg {
+            Arg::Struct(Op::TextResp, _, _) => {
+                let (mut payload, rest) =
+                    structure(&response.args, Op::TextResp, "a text response")?;
+                let text = payload.text()?;
+                payload.done()?;
+                if !rest.is_empty() {
+                    return Err(Error::new("trailing text response arguments"));
+                }
+                for line in text.lines() {
+                    if line.starts_with(&target.identity) {
+                        println!("{line}");
+                    } else {
+                        println!("{} {line}", target.identity);
+                    }
+                }
+                break;
+            }
+            Arg::Struct(Op::SnKeyResp, _, _) => {
+                let key = common::wire::SnKey::read(&response.args)?;
+                println!("{} current {}", target.identity, common::shamir::hex(&key.current));
+                if let Some((since, key)) = key.next {
+                    println!(
+                        "{} next {} {}",
+                        target.identity,
+                        since.number(),
+                        common::shamir::hex(&key)
+                    );
+                }
+                break;
+            }
             Arg::Struct(Op::LogResp, _bytes, _) => {
                 let (mut payload, rest) = structure(&response.args, Op::LogResp, "a log response")?;
                 if !rest.is_empty() {
@@ -2086,6 +2121,7 @@ fn serves(cmd: &Cmd) -> ServiceKind {
         Cmd::Unlock { .. }
         | Cmd::SnMasterKey { .. }
         | Cmd::RotateMasterKey
+        | Cmd::RaftMembers { .. }
         | Cmd::Registry
         | Cmd::AssignPeers { .. } => ServiceKind::Ks,
         _ => ServiceKind::Fe,
@@ -2186,6 +2222,11 @@ fn build(cmd: &Cmd) -> Result<Req> {
             payload.number_u64(*sn);
             payload.number_u64(TimeSec::new(*creation_second).number());
             Req::new(Op::SnMasterKey).structure(payload)
+        }
+        Cmd::RaftMembers { members_file } => {
+            let mut payload = common::wire::StructWriter::new();
+            payload.bytes(&std::fs::read(members_file)?);
+            Req::new(Op::RaftMembers).structure(payload)
         }
         Cmd::RotateMasterKey => {
             Req::new(Op::RotateMasterKey).structure(common::wire::StructWriter::new())

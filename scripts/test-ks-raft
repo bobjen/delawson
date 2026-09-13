@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Three KS processes: election, encrypted recovery, failover and quorum loss. No TPM required."""
+import json
+from pathlib import Path
+import socket
+import subprocess
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+BIN = ROOT/'target/debug'
+
+def run(args, success=True):
+    result = subprocess.run(list(map(str, args)), capture_output=True, text=True, timeout=30)
+    if (result.returncode == 0) != success:
+        raise RuntimeError(result.stdout + result.stderr)
+    return result.stdout + result.stderr
+
+def port():
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+def until(check, timeout=15):
+    end = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < end:
+        try:
+            result = check()
+            if result:
+                return result
+        except (RuntimeError, OSError) as e:
+            last = e
+        time.sleep(.05)
+    raise RuntimeError(f'condition timed out: {last}')
+
+def main():
+    children = {}
+    with tempfile.TemporaryDirectory(prefix='delawson-ks-raft-') as temporary:
+        work = Path(temporary)
+        members = {f'KS{i}': f'127.0.0.1:{port()}' for i in range(3)}
+        host = work/'host'
+        run([ROOT/'scripts/machine-identity', '--output-dir', host, '--software'])
+        ceremony = work/'ceremony'
+        run([BIN/'laws', 'unlock-generate', '--direct', '--output-dir', ceremony])
+        cluster = work/'cluster.toml'
+        text = (ROOT/'config/cluster.toml').read_text().replace('127.0.0.1:9601', members['KS0'])
+        text = text.replace('kind = "ks"\ncount = 3', 'kind = "ks"\ncount = 4')
+        text += '\n[[messaging.authentication.members]]\npublic_key = '+json.dumps((host/'public.hex').read_text().strip())+'\nservices = ["KS0", "KS1", "KS2", "KS3", "EN0"]\n'
+        cluster.write_text(text)
+        config = work/'ks.toml'
+        text = (ROOT/'config/ks.toml').read_text().replace('require_unlock = false', 'require_unlock = true').replace('master_key_delay_secs = 3600', 'master_key_delay_secs = 1').replace('snapshot_interval_secs = 86400', 'snapshot_interval_secs = 1')
+        text = 'unlock_verifier = '+json.dumps((ceremony/'verifier').read_text().strip())+'\n'+text
+        text += '\n[raft]\nring = "KS0"\nheartbeat_ms = 50\nelection_min_ms = 300\nelection_max_ms = 600\nrequest_timeout_ms = 200\n[raft.members]\n'+''.join(f'{id} = {json.dumps(address)}\n' for id, address in members.items())
+        config.write_text(text)
+        def command(id, *args, success=True):
+            result = run([BIN/'laws', '--config', cluster, '--to', id, '--at', members[id], '--machine-identity', host/'identity.toml', *args], success)
+            return '\n'.join(line.removeprefix(id+' ') for line in result.splitlines())
+        def start(id):
+            directory = work/id
+            directory.mkdir(exist_ok=True)
+            (directory/'ready').unlink(missing_ok=True)
+            settings = dict(identity=id, kind='ks', listen=members[id], cluster_config=str(cluster), service_config=str(config), data_dir=str(directory/'data'), machine_identity=str(host/'identity.toml'))
+            path = directory/'process.toml'
+            path.write_text(''.join(f'{k} = {json.dumps(v)}\n' for k,v in settings.items()))
+            with (directory/'stderr').open('a') as stderr:
+                children[id] = subprocess.Popen([BIN/'ks', path], stdout=stderr, stderr=stderr)
+            until(lambda: (directory/'ready').exists())
+        def stop(id):
+            child = children.pop(id)
+            child.kill()
+            child.wait(timeout=10)
+        def status(id):
+            text = command(id, 'status')
+            return dict(line.split(' ', 1) for line in text.splitlines() if ' ' in line)
+        def leader():
+            found = [id for id in children if status(id).get('raft_role') == 'Leader']
+            return found[0] if len(found) == 1 else None
+        try:
+            for id in members: start(id)
+            primary = until(leader)
+            assert all(status(id).get('unlocked') == 'false' for id in children)
+            # Elections and commitment of a term's no-op work while every KS is locked.
+            until(lambda: all(int(status(id)['raft_commit']) > 0 for id in children))
+            command(primary, 'unlock', '--key-file', ceremony/'unlock-key')
+            until(lambda: all(status(id).get('unlocked') == 'true' and int(status(id)['master_keys']) == 1 for id in children))
+            creation = str(int(time.time()))
+            expected = command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation)
+            follower = next(id for id in children if id != primary)
+            assert command(follower, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
+            command(primary, 'rotate-master-key')
+            until(lambda: all(int(status(id)['master_keys']) == 2 for id in children))
+            time.sleep(1.1)
+            creation = str(int(time.time()))
+            expected = command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation)
+            until(lambda: all(len(list((work/id/'data/master-keys').glob('snapshot-*.bin'))) > 1 for id in children))
+            stop(primary)
+            successor = until(leader)
+            assert command(successor, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
+            start(primary)
+            until(lambda: status(primary).get('unlocked') == 'true' and int(status(primary)['master_keys']) == 2)
+            assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
+            # Two down: the surviving former leader cannot serve a quorum-confirmed read.
+            survivor = until(leader)
+            for id in list(children):
+                if id != survivor: stop(id)
+            failed = command(survivor, 'sn-master-key', '--sn', '0', '--creation-second', creation, success=False)
+            assert 'quorum' in failed.lower(), failed
+            stop(survivor)
+            for id in members: start(id)
+            primary = until(leader)
+            assert all(status(id).get('unlocked') == 'false' for id in children)
+            command(primary, 'unlock', '--key-file', ceremony/'unlock-key')
+            until(lambda: all(status(id).get('unlocked') == 'true' for id in children))
+            assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
+            # A fresh nonvoter learns the compacted history through InstallSnapshot.
+            members['KS3'] = f'127.0.0.1:{port()}'
+            start('KS3')
+            membership_file = work/'members.json'
+            membership_file.write_text(json.dumps(members))
+            command(primary, 'raft-members', '--members-file', membership_file)
+            until(lambda: status('KS3').get('unlocked') == 'true' and int(status('KS3')['master_keys']) == 2)
+            assert command('KS3', 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
+            removed = next(id for id in members if id not in (primary, 'KS3'))
+            membership_file.write_text(json.dumps({id: address for id, address in members.items() if id != removed}))
+            command(primary, 'raft-members', '--members-file', membership_file)
+            term = status(primary)['raft_term']
+            time.sleep(1.5)
+            assert status(primary)['raft_term'] == term
+            assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
+            print('PASS: locked quorum; unlock propagation; committed key rotation; follower forwarding; primary failover; restart catch-up; quorum-loss read refusal; full locked restart; snapshot catch-up of a new member; joint membership; removed-member election suppression.')
+        except BaseException:
+            for id in members:
+                if id in children:
+                    try: print('STATUS', id, command(id, 'status'))
+                    except Exception as e: print(e)
+                path = work/id/'stderr'
+                if path.exists(): print(id, path.read_text()[-6000:])
+            raise
+        finally:
+            for child in children.values():
+                if child.poll() is None: child.kill()
+                child.wait(timeout=10)
+
+if __name__ == '__main__': main()
