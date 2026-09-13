@@ -264,6 +264,7 @@ dependencies = [
 name = "delawson-ks"
 version = "0.0.1"
 dependencies = [
+ "aegis",
  "delawson-common",
 ]
 

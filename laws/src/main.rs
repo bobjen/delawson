@@ -2187,7 +2187,9 @@ fn build(cmd: &Cmd) -> Result<Req> {
             payload.number_u64(TimeSec::new(*creation_second).number());
             Req::new(Op::SnMasterKey).structure(payload)
         }
-        Cmd::RotateMasterKey => Req::new(Op::RotateMasterKey),
+        Cmd::RotateMasterKey => {
+            Req::new(Op::RotateMasterKey).structure(common::wire::StructWriter::new())
+        }
 
         Cmd::LogHistogram { from, to, which } => {
             let mut payload = common::wire::StructWriter::new();

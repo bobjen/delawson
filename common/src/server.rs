@@ -93,6 +93,11 @@ pub struct Process {
 /// and nothing else; everything below has an answer that is right until that type
 /// has something of its own to say.
 pub trait Service: Send + Sync + Sized + 'static {
+    /// Start service-specific maintenance after construction and before serving.
+    fn start(self: &Arc<Self>) -> Result<()> {
+        Ok(())
+    }
+
     /// The operations this machine type is the right place to send. Anything
     /// here that is not built yet answers `unimplemented`; anything else answers
     /// `bad request`, so a misdirected call is distinguishable from an unbuilt
@@ -1088,6 +1093,7 @@ pub fn main<S: Service>(build: impl FnOnce(&Process) -> Result<S>) -> Result<()>
     }
     let process = Arc::new(Process::load(Path::new(&path))?);
     let service = Arc::new(build(&process)?);
+    service.start()?;
     serve(process, service)
 }
 

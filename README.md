@@ -288,3 +288,47 @@ continuations remain future work.
 Run the isolated integration test with `cargo build --workspace` followed by
 `scripts/test-bytes`. It uses temporary configuration, ports and data, with one DN
 for the existing same-DN concat path, and cleans up its processes afterwards.
+
+### KS key journal
+
+KS persists encrypted master keys and activation seconds in
+`data_dir/master-keys.journal`. Keep this file and the matching operator recovery
+material across restarts. `start-laws` reuses its ceremony files; switching between
+`direct` and `shards` modes selects different recovery material and does not convert
+an existing journal. An existing journal will reject the wrong unlock key.
+
+A new journal's initial key is usable immediately after persistence. Later keys
+wait `master_key_delay_secs` (default 3600); equal or earlier activation than the
+last journaled key is rejected. The journal is synced before a key becomes visible.
+KS restarts locked and restores the same history on unlock. An interrupted partial
+final entry is discarded; corruption of a complete entry fails recovery.
+
+`require_unlock = false` is explicitly insecure development mode: its journal is
+encrypted with a known test key. Normal `start-laws` supplies a generated key.
+Raft, unlock-key replacement, and explicit recovery cutoffs are not yet
+implemented. No other service has become persistent through this change.
+
+Run `cargo test -p delawson-ks --features delawson-common/testing` for journal failure
+and replay coverage. After `cargo build --workspace`, `scripts/test-machine-auth`
+exercises rotation and locked restart with a one-second test delay, using software
+machine identities by default. Its existing `--tpm` option remains opt-in.
+
+KS also writes `data_dir/master-keys.snapshot`, containing encrypted key history
+and its captured commit number. Recovery loads it and replays only later journal
+entries. Keep **both snapshot and journal**: covered journal storage is not yet
+pruned. A corrupt published snapshot fails recovery; leftover temporary snapshots
+are ignored.
+
+Bootstrap writes an encrypted empty snapshot at commit zero before the first key
+entry. Every recovery starts from a snapshot. A missing snapshot beside a nonempty
+journal is an error.
+
+Snapshot defaults are `snapshot_interval_secs = 86400` and
+`snapshot_min_log_bytes = 1048576`. Changed state is snapshotted when either a day
+has elapsed or new journal bytes reach the larger of the previous snapshot file
+size and the configurable minimum (1 MiB by default). A maintenance timer also
+handles dirty idle state; unchanged state is not rewritten. The one-hour key
+activation delay remains separate and unchanged.
+
+The numbered journal uses format `DLAWKS02`. The earlier experimental `DLAWKS01`
+format is rejected without modifying it; this step provides no automatic migration.

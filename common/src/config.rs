@@ -643,6 +643,13 @@ pub struct Knobs {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KsConfig {
+    /// Minimum journal bytes before the size trigger; actual threshold is the
+    /// larger of this value and the previous snapshot's file size.
+    #[serde(default = "ks_snapshot_min_log_bytes")]
+    pub snapshot_min_log_bytes: u64,
+    /// Maximum snapshot age for changed state; journal size may trigger earlier.
+    #[serde(default = "ks_snapshot_interval")]
+    pub snapshot_interval_secs: u64,
     /// Public SHA-256 verifier of the generated unlock key; required when locked.
     #[serde(default)]
     pub unlock_verifier: Option<String>,
@@ -663,6 +670,14 @@ pub struct KsConfig {
     /// worker. Here to be turned off, since what it costs to hand one small
     /// message to a scheduler is a number worth having.
     pub inline_ping: bool,
+}
+
+fn ks_snapshot_min_log_bytes() -> u64 {
+    1024 * 1024
+}
+
+fn ks_snapshot_interval() -> u64 {
+    86400
 }
 
 impl KsConfig {

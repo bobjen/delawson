@@ -55,12 +55,14 @@ def main():
             verifier = (ceremony/'verifier').read_text().strip()
             ksconfig = work/'ks.toml'
             kstext = (ROOT/'config/ks.toml').read_text().replace('require_unlock = false', 'require_unlock = true')
+            kstext = kstext.replace('master_key_delay_secs = 3600', 'master_key_delay_secs = 1')
             ksconfig.write_text('unlock_verifier = '+json.dumps(verifier)+'\n'+kstext)
             laws = [binary/'laws', '--config', config, '--to', 'KS0']
 
             def start(name, identity, kind, local, listen, service, accepted=True):
                 directory = work/name
-                directory.mkdir()
+                directory.mkdir(exist_ok=True)
+                (directory/'ready').unlink(missing_ok=True)
                 process = dict(identity=identity, kind=kind, listen=listen,
                                cluster_config=str(config), service_config=str(service),
                                data_dir=str(directory/'data'), machine_identity=str(local/'identity.toml'))
@@ -84,7 +86,7 @@ def main():
                     time.sleep(.02)
                 raise RuntimeError('process did not become ready in time')
 
-            start('ks', 'KS0', 'ks', host, address, ksconfig)
+            ks = start('ks', 'KS0', 'ks', host, address, ksconfig)
             key_request = ['sn-master-key','--sn','0','--creation-second','0']
             denied = run(laws+key_request, success=False)
             assert 'machine is not admitted' in denied, denied
@@ -92,11 +94,29 @@ def main():
             locked = run(laws+local+key_request, success=False)
             assert 'locked' in locked.lower(), locked
             run(laws+['unlock','--key-file',ceremony/'unlock-key'])  # anonymous operator
+            key_request[-1] = str(int(time.time()))
             run(laws+local+key_request)
+            run(laws+['rotate-master-key'])
+            time.sleep(1.1)
+            key_request[-1] = str(int(time.time()))
+            run(laws+local+key_request)
+            journal = work/'ks/data/master-keys.journal'
+            persisted = journal.read_bytes()
+            snapshot = journal.with_suffix('.snapshot').read_bytes()
+            assert int.from_bytes(snapshot[40:48], 'little') == 0
+            assert int.from_bytes(persisted[-112:-104], 'little') >= 2
+            ks.terminate()
+            ks.wait(timeout=15)
+            start('ks', 'KS0', 'ks', host, address, ksconfig)
+            locked = run(laws+local+key_request, success=False)
+            assert 'locked' in locked.lower(), locked
+            run(laws+['unlock','--key-file',ceremony/'unlock-key'])
+            run(laws+local+key_request)
+            assert journal.read_bytes() == persisted
             start('en', 'EN0', 'en', host, '127.0.0.1:'+str(port()), ROOT/'config/en.toml')
             start('impostor', 'EN0', 'en', fake, '127.0.0.1:'+str(port()), ROOT/'config/en.toml', accepted=False)
             print('PASS: anonymous unlock; authenticated key issuance and registration; '
-                  'anonymous key request and impersonated registration rejected.')
+                  'anonymous key request and impersonated registration rejected; snapshot plus journal suffix survives restart.')
         finally:
             for child in reversed(children):
                 if child.poll() is None:

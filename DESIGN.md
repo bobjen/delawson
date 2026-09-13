@@ -18328,9 +18328,9 @@ before opening its key-serving gate. No operator identity is required for unlock
 shards` exercises reconstruction. Neither path implements user authorization.
 
 The on-disk share encoding and command examples are documented in README.md.
-This is an incremental implementation: encrypted master-key persistence and Raft
-unlock transfer remain future work. Member authentication and forward-secret
-transport are implemented in §17.45. Existing master epochs are still volatile. Development ceremony files are
+Encrypted master-key journaling is now implemented in §17.48; Raft unlock transfer
+remains future work. Member authentication and forward-secret transport are
+implemented in §17.45. Development ceremony files are
 kept together outside the KS process directory, not distributed custody.
 
 ## 17.45 Machine identity before KS unlock
@@ -18459,3 +18459,151 @@ Regression tests cover distinct encryption of successive empty records, rejectio
 without an expected record count, exact retries and conflicting contents, queued
 empty appends, replica reordering, split-record payload accounting, all framing
 sizes, and oversized objects. scripts/test-bytes exercises the complete bytes path.
+
+## 17.48 KS encrypted master-key journal
+
+KS now stores master-key epochs in `data_dir/master-keys.journal`. The file begins
+with the eight-byte version magic `DLAWKS02` and a random 32-byte journal identity.
+Each fixed-size 112-byte entry contains a little-endian u64 commit number, a fresh
+random 32-byte nonce, 40 encrypted
+bytes (the 32-byte master key followed by its activation TimeSec as little-endian
+u64), and a 32-byte AEGIS-256 authentication tag. The unlock key is the 256-bit
+encryption key. Associated data binds the version, journal identity, commit number, and preceding
+entry's tag (zero for the first entry), detecting corruption, reordering, interior
+omissions, and splicing between journals. This does not detect rollback of an
+entire journal or removal of a complete suffix; external rollback protection is
+not implemented.
+
+The first key in a new journal may activate immediately. Every subsequent key is
+chosen with activation at least `master_key_delay_secs` after generation (normally
+3600 seconds; tests use one second). Equal or earlier activation than the final
+recorded entry is rejected, without removing or replacing anything. Automatic
+lazy daily generation uses the actual clock and delay horizon, not a request's
+historical timestamp; missing historical keys are never invented. After dormancy,
+the last committed key remains usable while its replacement waits to activate.
+Keys for the upcoming day are generated when reads enter the delay horizon.
+
+Proposals serialize under a journal mutex. The entry is written and `sync_all`
+completes before application acquires the key-history write lock. Reads derive
+from committed history under its shared lock and can continue while another
+proposal is syncing. The old exact-time derived-key cache was removed so it cannot
+retain an obsolete next-key answer after a journal addition. This initial version
+executes after local durability; acceptance, persistence, and application remain
+separate concerns for subsequent Raft work. There is no quorum replication yet.
+
+The journal is exclusively file-locked for the process lifetime. Initial file
+creation syncs both file and parent directory. Restart leaves the history empty
+and service locked until the operator key authenticates and decrypts the journal.
+Replay authenticates the complete prefix, discards an incomplete final entry, and
+syncs before serving. A complete entry with invalid authentication stops recovery
+without modifying the journal. A failed append or sync disables subsequent writes
+until restart; it never publishes that key. A complete entry from an unacknowledged
+write may legitimately be recovered. Loss or external truncation of previously
+acknowledged bytes is outside the interrupted-write recovery assumption.
+
+The explicit `require_unlock = false` development mode uses a known unlock key;
+`start-laws` instead supplies its generated key and reuses ceremony files. Changing
+unlock mode or recovery material does not re-encrypt an existing journal. Unlock-key
+replacement, chosen-position disaster recovery, and Raft replication remain
+subsequent work. Snapshots are implemented in §17.49. User authorization of explicit rotation remains deferred.
+
+Tests cover immediate initial activation, delayed successors, exact key/time replay,
+locked restart, failed writes without publication, equal/earlier rejection, exclusive
+file ownership, wrong keys, tampering, reordering, cross-journal splicing, and every
+partial final-entry length. The software/optional-TPM authentication integration
+test now also rotates a key with a one-second delay and restarts KS on its journal.
+
+The existing EN key cache does not yet bound how long it trusts an open-ended key
+range. Issue #122 tracks refreshing that knowledge within the activation waiting
+period, including prefetched successors. KS journal durability does not itself
+make live EN key rotation correct until that cache gap is addressed.
+
+## 17.49 KS snapshots and recovery positions
+
+Every KS journal entry now has an explicit, contiguous u64 commit number, starting
+at one. Bootstrap first publishes an encrypted empty snapshot at commit zero,
+after the unlock key is supplied and before writing the initial key entry. It is authenticated as associated data. A successful local sync advances
+the durable commit; applying the entry advances the in-memory applied commit under
+the same write lock as the key history. These are distinct positions even though
+the current single-member implementation executes immediately after persistence.
+The journal format is `DLAWKS02`; the preceding experimental `DLAWKS01` format is
+rejected without modification. There is no automatic migration or deletion.
+
+`master-keys.snapshot` holds the complete applied key history and the latest commit
+captured in it. It is an AEGIS-256 encrypted state snapshot, not a copy of the raw
+journal. Its clear header contains magic `DLAWSS01`, journal identity (32 bytes),
+captured commit (u64 LE), the captured journal entry's authentication tag (32 bytes),
+and a fresh nonce (32 bytes). The first 80 header bytes are authenticated associated
+data. Its encrypted body is the snapshot creation second (u64 LE), followed by the
+40-byte key/activation pairs. A 32-byte authentication tag ends the file. All current
+entries add one key, so snapshot key count equals captured commit; ring-management
+entries will require separating that assumption when Raft is introduced.
+
+The snapshot writer serializes with proposals, copies key history and applied
+position under the shared state lock, then releases that lock before encryption
+or disk I/O. It requires the captured applied position to equal the durable journal
+position. This simple KS implementation may delay another proposal while it writes
+a snapshot; ordinary key reads continue. It does not introduce transactions or
+copy-on-write machinery for future SN/DN snapshots.
+
+Publication writes a unique temporary file, syncs it, renames it over the latest
+snapshot, then syncs the parent directory. The full journal remains intact. An
+interruption leaves either the old or new complete snapshot; incomplete temporary
+files are ignored on recovery. Snapshot failure is logged and retried by maintenance or on a later
+change or unlock, without failing an already durable key addition. Corruption of
+the published snapshot fails recovery rather than silently discarding it.
+
+On unlock, KS authenticates and loads the latest snapshot, then seeks directly to
+the entry after its captured commit. Covered journal entries are neither read nor
+reapplied. The snapshot's chain anchor authenticates the first remaining entry;
+commit numbers must continue without a gap, and activation seconds must increase.
+A journal shorter than the captured prefix is rejected. A partial final suffix
+entry is trimmed using the existing interrupted-write rule. Every recovery starts with a snapshot, possibly the empty commit-zero snapshot.
+A missing snapshot is initialized only if the journal contains no entries; a
+missing snapshot beside a nonempty journal is an error. Commit numbering continues after recovered entries.
+Journal pruning, segmented logs, Raft terms, membership, and snapshot transfer are
+not implemented by this step; retain both files for recovery.
+
+### 17.49.1 Snapshot frequency
+
+The agreed initial policy for KS, SN, and DN is a snapshot when either one day
+has elapsed or the new journal bytes reach `max(previous snapshot size, 1 MiB)`,
+whichever happens first. KS implements it now; SN and DN will follow when their
+persistence is built. `snapshot_interval_secs` defaults to 86400, and
+`snapshot_min_log_bytes` defaults to 1048576. The minimum is configurable. The
+actual encrypted snapshot file size, including its metadata, supplies the other
+size bound. Only journal entries after the snapshot's captured commit count toward
+the threshold. There is no fixed entry-count threshold.
+
+Initialization creates the encrypted empty snapshot at commit zero, so even the
+first size-trigger calculation has a real previous snapshot. It also establishes
+the initial time baseline. Subsequent checks require changed state: an unchanged
+snapshot is not rewritten. Checks run after application and recovery and from a
+maintenance thread once per second, so dirty state that goes idle still gets a
+daily snapshot. The thread serializes with proposals, releases the shared state
+lock before writing, and joins on orderly shutdown. Busy writers or slow snapshot
+I/O can delay a check; this is a scheduling policy, not a hard real-time deadline.
+A zero time interval makes every change eligible; a zero minimum still respects
+the previous snapshot size.
+
+Snapshots can be large: a ring using half a 256 GB host may require a snapshot
+around 128 GB before representation or compression savings. A short fixed replay
+time target would be premature. The daily-or-size policy scales with state size;
+measure snapshot load/write time, replay throughput, and background I/O capacity
+before tuning it. SN/DN snapshot generation belongs on the designated materialized
+snapshot-writing member, avoiding long primary stalls. Daily metadata exports for
+billing and analysis remain a separate policy.
+
+The [Raft paper, section 7](https://raft.github.io/raft.pdf) describes the underlying
+tradeoff: frequent snapshots spend write bandwidth, while infrequent snapshots
+enlarge the journal and restart work. The concrete policy above is DeLawson's
+agreed starting policy, not a measured production optimum.
+
+Tests cover restoring an encrypted snapshot plus a later journal suffix, skipping
+covered ciphertext, advancing commit numbers, replacing the latest snapshot,
+wrong keys, altered snapshot metadata/body, commit gaps, truncated journals,
+partial suffixes, failed or interrupted snapshot publication, and schedule triggers.
+Tests also cover commit-zero initialization, refusal to recreate a missing snapshot
+for a nonempty journal, the configurable minimum log size, and the idle timer.
+The software/optional-TPM integration test verifies a snapshot at commit zero and
+recovery of subsequent key entries across a locked restart.

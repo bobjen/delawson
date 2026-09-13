@@ -1,5 +1,5 @@
-//! KS: process registry and in-memory master-key epochs.
-//! Unlock verifies operator-supplied material. Encrypted persistence is not yet built.
+//! KS: process registry and encrypted, journaled master-key epochs.
+mod journal;
 
 use common::config::KsConfig;
 use common::crypto;
@@ -15,6 +15,7 @@ use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
 
+#[derive(Clone)]
 struct MasterEpoch {
     since: TimeSec,
     key: [u8; 32],
@@ -29,8 +30,16 @@ fn random_master_key() -> Result<[u8; 32]> {
     Ok(key)
 }
 
+#[derive(Clone, Default)]
+struct KeyHistory {
+    epochs: Vec<MasterEpoch>,
+    applied: u64,
+}
+
 struct Ks {
     config: KsConfig,
+    snapshot_stopping: AtomicBool,
+    snapshot_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     unlock_verifier: Option<[u8; 32]>,
     /// Whether the operator-and-hardware ceremony has been performed. Until it
     /// has, the master keys on disk cannot be decrypted, so no key request can
@@ -38,11 +47,10 @@ struct Ks {
     unlocked: AtomicBool,
     /// In memory only, so a KS restart makes every other process re-register.
     peers: Mutex<BTreeMap<String, Peer>>,
-    /// Cached SN keys, addressed by the exact time requested. An emergency
-    /// master-key epoch can therefore change the answer within one day.
-    sn_keys: RwLock<BTreeMap<(common::ids::SnId, TimeSec), SnKey>>,
+    /// Serializes proposals and disk I/O, without blocking reads of committed keys.
+    journal: Mutex<journal::Journal>,
     /// Master keys sorted by the second at which each becomes effective.
-    master_keys: RwLock<Vec<MasterEpoch>>,
+    master_keys: RwLock<KeyHistory>,
 }
 
 const SERVES: &[Op] = &[
@@ -56,6 +64,36 @@ const SERVES: &[Op] = &[
 ];
 
 impl Service for Ks {
+    fn start(self: &std::sync::Arc<Self>) -> Result<()> {
+        let weak = std::sync::Arc::downgrade(self);
+        let handle = std::thread::Builder::new()
+            .name("ks-snapshots".into())
+            .spawn(move || {
+                loop {
+                    std::thread::park_timeout(std::time::Duration::from_secs(1));
+                    let Some(ks) = weak.upgrade() else {
+                        break;
+                    };
+                    if ks.snapshot_stopping.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if !ks.unlocked.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    if let Ok(mut journal) = ks.journal.try_lock() {
+                        ks.maybe_snapshot(&mut journal);
+                    }
+                }
+            })
+            .context("starting KS snapshot timer")?;
+        *self.snapshot_worker.lock().expect("snapshot_worker") = Some(handle);
+        Ok(())
+    }
+
+    fn stop(&self, _process: &Process) -> Result<()> {
+        self.stop_snapshot_worker()
+    }
+
     fn serves(&self) -> &'static [Op] {
         SERVES
     }
@@ -106,38 +144,105 @@ impl Service for Ks {
     }
 
     fn status(&self, _process: &Process) -> Vec<String> {
-        let sn_keys = self.sn_keys.read().expect("sn_keys").len();
+        let (key_count, applied) = {
+            let history = self.master_keys.read().expect("master_keys");
+            (history.epochs.len(), history.applied)
+        };
         vec![
             format!("lazy_day_keys {}", self.config.lazy_day_keys),
             format!("require_unlock {}", self.config.require_unlock),
             format!("inline_ping {}", self.config.inline_ping),
             format!("unlocked {}", self.unlocked.load(Ordering::SeqCst)),
             format!("registered {}", self.peers.lock().expect("peers").len()),
-            format!("master_keys {}", self.master_keys.read().expect("master_keys").len()),
-            format!("sn_keys {sn_keys}"),
+            format!("master_keys {key_count}"),
+            format!("applied_commit {applied}"),
         ]
     }
 }
 
 impl Ks {
-    fn new(config: KsConfig) -> Result<Ks> {
+    fn stop_snapshot_worker(&self) -> Result<()> {
+        self.snapshot_stopping.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.snapshot_worker.lock().expect("snapshot_worker").take() {
+            handle.thread().unpark();
+            handle.join().map_err(|_| common::Error::new("KS snapshot worker panicked"))?;
+        }
+        Ok(())
+    }
+
+    fn new(config: KsConfig, path: &std::path::Path) -> Result<Ks> {
         let unlock_verifier =
             config.unlock_verifier.as_deref().map(common::shamir::unhex).transpose()?;
         if config.require_unlock && unlock_verifier.is_none() {
             return Err(common::Error::new("require_unlock needs unlock_verifier"));
         }
-        let unlocked = AtomicBool::new(!config.require_unlock);
-        Ok(Ks {
+        let test_mode = !config.require_unlock;
+        let ks = Ks {
             config,
+            snapshot_stopping: AtomicBool::new(false),
+            snapshot_worker: Mutex::new(None),
             unlock_verifier,
-            unlocked,
+            unlocked: AtomicBool::new(false),
             peers: Mutex::new(BTreeMap::new()),
-            sn_keys: RwLock::new(BTreeMap::new()),
-            master_keys: RwLock::new(vec![MasterEpoch {
-                since: TimeSec::EPOCH,
-                key: random_master_key().expect("OS randomness for initial master key"),
-            }]),
-        })
+            journal: Mutex::new(journal::Journal::open(path)?),
+            master_keys: RwLock::new(KeyHistory::default()),
+        };
+        if test_mode {
+            // Explicit insecure development mode, never a production unlock secret.
+            ks.open_keys(crypto::MASTER_KEY)?;
+        }
+        Ok(ks)
+    }
+
+    fn open_keys(&self, key: [u8; 32]) -> Result<()> {
+        let mut journal = self.journal.lock().expect("journal");
+        if self.unlocked.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut epochs = journal.replay(key)?;
+        if epochs.is_empty() {
+            let epoch = MasterEpoch { key: random_master_key()?, since: TimeSec::now() };
+            journal.append(&epoch)?;
+            epochs.push(epoch);
+        }
+        *self.master_keys.write().expect("master_keys") =
+            KeyHistory { epochs, applied: journal.commit() };
+        self.maybe_snapshot(&mut journal);
+        self.unlocked.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn choose_key(&self) -> Result<MasterEpoch> {
+        let key = random_master_key()?;
+        let delay = self.config.master_key_delay_secs.to_duration()?.as_secs();
+        let since = TimeSec::now()
+            .number()
+            .checked_add(delay)
+            .ok_or_else(|| common::Error::new("key activation time overflow"))?;
+        Ok(MasterEpoch { key, since: TimeSec::new(since) })
+    }
+
+    fn apply_key(&self, epoch: MasterEpoch, commit: u64) {
+        let mut history = self.master_keys.write().expect("master_keys");
+        history.epochs.push(epoch);
+        history.applied = commit;
+    }
+
+    fn maybe_snapshot(&self, journal: &mut journal::Journal) {
+        let now = TimeSec::now().number();
+        if !journal.snapshot_due(
+            self.config.snapshot_min_log_bytes,
+            self.config.snapshot_interval_secs,
+            now,
+        ) {
+            return;
+        }
+        let history = self.master_keys.read().expect("master_keys").clone();
+        if let Err(e) = journal.snapshot(&history.epochs, history.applied, now) {
+            // The journal is already durable; snapshot failure must not turn a
+            // successful operation into an apparent failure or retract its state.
+            logn!("KS snapshot failed; durable journal retained", "{e}");
+        }
     }
 
     fn unlock(&self, request: &Req) -> Result<()> {
@@ -156,8 +261,7 @@ impl Ks {
         if !common::shamir::matches(&key, expected) {
             return Err(common::Error::new("incorrect unlock key"));
         }
-        self.unlocked.store(true, Ordering::SeqCst);
-        Ok(())
+        self.open_keys(key)
     }
 
     fn sn_key(&self, request: &Req) -> Resp {
@@ -187,37 +291,54 @@ impl Ks {
     }
 
     fn sn_key_for(&self, sn: common::ids::SnId, at: TimeSec) -> Result<SnKey> {
-        self.ensure_day(at.day_start())?;
-        let horizon = at.plus_secs(self.config.master_key_delay_secs)?;
-        self.ensure_day(horizon.day_start())?;
-        {
-            let keys = self.sn_keys.read().expect("sn_keys");
-            if let Some(key) = keys.get(&(sn, at)) {
-                return Ok(key.clone());
-            }
-        }
-
+        self.ensure_future_key()?;
         let epochs = self.master_keys.read().expect("master_keys");
+        let epochs = &epochs.epochs;
         let count = epochs.partition_point(|epoch| epoch.since <= at);
-        let current = &epochs[count - 1];
+        let current = count
+            .checked_sub(1)
+            .and_then(|i| epochs.get(i))
+            .ok_or_else(|| common::Error::new("no master key is active at the requested second"))?;
         let current_key = crypto::sn_key(&current.key, sn, current.since);
         let next = epochs
             .get(count)
             .map(|epoch| (epoch.since, crypto::sn_key(&epoch.key, sn, epoch.since)));
         let result = SnKey { current: current_key, next };
-        drop(epochs);
-        self.sn_keys.write().expect("sn_keys").insert((sn, at), result.clone());
         Ok(result)
     }
 
-    fn ensure_day(&self, day: TimeSec) -> Result<()> {
-        let mut epochs = self.master_keys.write().expect("master_keys");
-        if epochs.iter().any(|epoch| epoch.since == day) {
+    fn ensure_future_key(&self) -> Result<()> {
+        let horizon = TimeSec::now().plus_secs(self.config.master_key_delay_secs)?;
+        if self
+            .master_keys
+            .read()
+            .expect("master_keys")
+            .epochs
+            .last()
+            .is_some_and(|last| last.since.day() >= horizon.day())
+        {
             return Ok(());
         }
-        let key = random_master_key()?;
-        let at = epochs.partition_point(|epoch| epoch.since < day);
-        epochs.insert(at, MasterEpoch { since: day, key });
+        // Reads may continue using committed keys while another proposal is syncing.
+        let mut journal = match self.journal.try_lock() {
+            Ok(journal) => journal,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(common::Error::new("KS journal lock poisoned"));
+            }
+        };
+        let now = TimeSec::now();
+        let horizon = now.plus_secs(self.config.master_key_delay_secs)?;
+        let last = self.master_keys.read().expect("master_keys").epochs.last().map(|e| e.since);
+        if last.is_some_and(|last| last.day() >= horizon.day()) {
+            return Ok(());
+        }
+        let mut epoch = self.choose_key()?;
+        // When anticipating tomorrow, activate no earlier than its midnight.
+        epoch.since = epoch.since.max(horizon.day_start());
+        let commit = journal.append(&epoch)?;
+        self.apply_key(epoch, commit);
+        self.maybe_snapshot(&mut journal);
         Ok(())
     }
 
@@ -228,16 +349,11 @@ impl Ks {
         if !rest.is_empty() {
             return Err(common::Error::new("a rotate-master-key request has trailing arguments"));
         }
-        let since = TimeSec::now().plus_secs(self.config.master_key_delay_secs)?;
-        let mut epochs = self.master_keys.write().expect("master_keys");
-        let key = random_master_key()?;
-        let at = epochs.partition_point(|epoch| epoch.since < since);
-        if epochs.get(at).is_some_and(|epoch| epoch.since == since) {
-            epochs[at] = MasterEpoch { since, key };
-        } else {
-            epochs.insert(at, MasterEpoch { since, key });
-        }
-        self.sn_keys.write().expect("sn_keys").clear();
+        let mut journal = self.journal.lock().expect("journal");
+        let epoch = self.choose_key()?;
+        let commit = journal.append(&epoch)?;
+        self.apply_key(epoch, commit);
+        self.maybe_snapshot(&mut journal);
         Ok(())
     }
 
@@ -357,7 +473,7 @@ fn main() {
         if !config.require_unlock {
             logn!("no unlock ceremony required because this is a test configuration");
         }
-        Ks::new(config)
+        Ks::new(config, &process.config.data_dir.join("master-keys.journal"))
     });
     if let Err(e) = result {
         eprintln!("ks: {e}");
@@ -377,6 +493,8 @@ mod unlock_tests {
     fn only_correct_well_formed_key_opens_gate() {
         let key = [42; 32];
         let config = KsConfig {
+            snapshot_interval_secs: 86400,
+            snapshot_min_log_bytes: 1024 * 1024,
             unlock_verifier: Some(common::shamir::hex(&common::shamir::verifier(&key))),
             knobs: common::config::Knobs { workers: 1 },
             lazy_day_keys: true,
@@ -384,7 +502,10 @@ mod unlock_tests {
             require_unlock: true,
             inline_ping: true,
         };
-        let ks = Ks::new(config).unwrap();
+        let dir = std::env::temp_dir().join(format!("delawson-ks-unlock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keys");
+        let ks = Ks::new(config, &path).unwrap();
         assert!(!ks.unlocked.load(Ordering::SeqCst));
         for bad in [request(&[0; 32]), request(&key[..31]), Req::new(Op::Unlock)] {
             assert!(ks.unlock(&bad).is_err());
@@ -393,5 +514,103 @@ mod unlock_tests {
         assert!(ks.unlock(&request(&key)).is_ok());
         assert!(ks.unlocked.load(Ordering::SeqCst));
         assert!(ks.unlock(&request(&key)).is_ok());
+        drop(ks);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use crate::journal::tests::Temp;
+
+    fn config(key: &[u8; 32]) -> KsConfig {
+        KsConfig {
+            snapshot_interval_secs: 86400,
+            snapshot_min_log_bytes: 1024 * 1024,
+            unlock_verifier: Some(common::shamir::hex(&common::shamir::verifier(key))),
+            knobs: common::config::Knobs { workers: 1 },
+            lazy_day_keys: true,
+            master_key_delay_secs: common::time::TimeIntSec64::new(1),
+            require_unlock: true,
+            inline_ping: true,
+        }
+    }
+
+    #[test]
+    fn first_key_is_immediate_later_keys_wait_and_restart_preserves_both() {
+        let dir = Temp::new();
+        let key = [42; 32];
+        let ks = Ks::new(config(&key), &dir.path()).unwrap();
+        assert!(ks.master_keys.read().unwrap().epochs.is_empty());
+        ks.open_keys(key).unwrap();
+        let initial = ks.master_keys.read().unwrap().epochs[0].since;
+        assert!(initial <= TimeSec::now());
+        let expected = ks.master_keys.read().unwrap().epochs[0].key;
+        let before = TimeSec::now().plus_secs(ks.config.master_key_delay_secs).unwrap();
+        let replacement = ks.choose_key().unwrap();
+        assert!(replacement.since >= before);
+        let future = replacement.since;
+        let replacement_key = replacement.key;
+        let commit = ks.journal.lock().unwrap().append(&replacement).unwrap();
+        ks.apply_key(replacement, commit);
+        // The proposal lock is deliberately held: ordinary reads need only a shared state lock.
+        let writer = ks.journal.lock().unwrap();
+        let derived = ks.sn_key_for(common::ids::SnId::new(0), initial).unwrap();
+        assert_eq!(derived.current, crypto::sn_key(&expected, common::ids::SnId::new(0), initial));
+        drop(writer);
+        drop(ks);
+        let restored = Ks::new(config(&key), &dir.path()).unwrap();
+        assert!(!restored.unlocked.load(Ordering::SeqCst));
+        assert!(restored.master_keys.read().unwrap().epochs.is_empty());
+        restored.open_keys(key).unwrap();
+        let history = restored.master_keys.read().unwrap();
+        let epochs = &history.epochs;
+        assert_eq!(history.applied, 2);
+        assert_eq!(epochs.len(), 2);
+        assert_eq!((epochs[0].key, epochs[0].since), (expected, initial));
+        assert_eq!((epochs[1].key, epochs[1].since), (replacement_key, future));
+    }
+
+    #[test]
+    fn failed_persistence_does_not_publish_a_key() {
+        let dir = Temp::new();
+        let key = [42; 32];
+        let ks = Ks::new(config(&key), &dir.path()).unwrap();
+        ks.open_keys(key).unwrap();
+        let mut journal = ks.journal.lock().unwrap();
+        // Simulate a disk write failure without relying on permissions or root identity.
+        journal.make_read_only(&dir.path());
+        drop(journal);
+        let request = Req::new(Op::RotateMasterKey).structure(common::wire::StructWriter::new());
+        assert!(ks.rotate_master_key(&request).is_err());
+        assert_eq!(ks.master_keys.read().unwrap().epochs.len(), 1);
+        assert!(ks.rotate_master_key(&request).is_err());
+    }
+
+    #[test]
+    fn timer_snapshots_dirty_idle_state() {
+        let dir = Temp::new();
+        let key = [42; 32];
+        let mut config = config(&key);
+        config.snapshot_interval_secs = 1;
+        let ks = std::sync::Arc::new(Ks::new(config, &dir.path()).unwrap());
+        ks.open_keys(key).unwrap();
+        let request = Req::new(Op::RotateMasterKey).structure(common::wire::StructWriter::new());
+        ks.rotate_master_key(&request).unwrap();
+        ks.start().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let captured = loop {
+            let bytes = std::fs::read(dir.path().with_extension("snapshot")).unwrap();
+            let mut number = [0; 8];
+            number.copy_from_slice(&bytes[40..48]);
+            let captured = u64::from_le_bytes(number);
+            if captured == 2 || std::time::Instant::now() >= deadline {
+                break captured;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        ks.stop_snapshot_worker().unwrap();
+        assert_eq!(captured, 2);
     }
 }
