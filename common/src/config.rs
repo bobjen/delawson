@@ -676,7 +676,7 @@ pub struct KsConfig {
 }
 
 fn ks_snapshot_retain() -> usize {
-    3
+    10
 }
 
 fn ks_snapshot_min_log_bytes() -> u64 {

@@ -18642,7 +18642,8 @@ alone does not. Snapshot preparation refuses unequal executed/durable capture
 positions: future Raft integration must coordinate this boundary, not place
 unapplied pre-boundary entries in the preceding journal.
 
-`snapshot_retain` defaults to three and must be positive. Once enough snapshots
+`snapshot_retain` defaults to ten for KS and must be positive. KS snapshots and
+journals are tiny, so retaining ten snapshots is inexpensive. Once enough snapshots
 exist, pruning keeps the newest configured count and **all journal segments after
 the oldest retained snapshot**. If fewer exist, all are kept. For snapshots 4, 6,
 and 8, retain journals starting at 5, 7 and 9, plus any intervening segments created
@@ -18667,15 +18668,26 @@ interrupted empty initialization, and reject gaps, malformed headers, bad chain
 anchors and corrupt snapshots. Tests also cover every partial active-entry length
 and ensure that a partial closed segment cannot be silently repaired.
 
-### 17.50.1 Future storage of recovery files in DeLawson
+### 17.50.1 Recovery storage policy for KS, SN and DN
 
-Eventually snapshots and journal segments will be stored in DeLawson as streams
-using `bytes` framing. They are opaque binary files: upload chunk boundaries become
-internal records, while downloads reproduce the original byte offsets and contents.
-Very large snapshots motivate fast parallel binary uploads and range downloads.
-Local Raft-server copies may be retired once the corresponding files are confirmed
-durable in DeLawson, under a separate remote retention and recovery policy. Local
-Raft durability and remote DeLawson durability are distinct facts; starting an upload
-is not permission to remove the local copy. Discovery and cold-bootstrap recovery,
-including KS recovery, still need design. This is future work, not implemented by
-local snapshot retention.
+KS snapshots and journals must be persisted **only on physically protected KS
+machines**, never in DeLawson, even in encrypted form. KS recovery therefore relies
+on surviving copies on those machines and the operator's unlock material. The KS
+retention default is ten snapshots, with all journals after the oldest retained
+snapshot, as described above.
+
+SN and DN may eventually back up snapshots and journal segments in DeLawson as
+streams using `bytes` framing. They are opaque binary files: upload chunk boundaries
+become internal records, while downloads reproduce the original byte offsets and
+contents. Very large snapshots motivate fast parallel binary uploads and range
+downloads. Three retained snapshots is a reasonable initial policy for SN and DN
+when they are not backed up in DeLawson; this is a future policy, not an implemented
+SN or DN configuration.
+
+Remote recovery files should reside on different SN and DN rings, or have a
+bootstrapping protocol that can recover them when the rings storing them are down.
+Discovery, cold-bootstrap recovery and remote retention still need design. Local
+Raft-server copies may be retired once the corresponding files are confirmed
+durable in DeLawson under that policy. Local Raft durability and remote DeLawson
+durability are distinct facts; starting an upload is not permission to remove the
+local copy. Remote backup is future work and never applies to KS.

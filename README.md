@@ -320,11 +320,13 @@ journal begins at 101. Recovery loads the newest snapshot and replays all later
 journal files in commit order. Journal switching precedes snapshot publication;
 recovery also handles switches whose snapshots never finished.
 
-`snapshot_retain = 3` keeps the newest three snapshots and every journal needed
+`snapshot_retain = 10` keeps the newest ten snapshots and every journal needed
 after the oldest retained snapshot. The count is configurable and must be positive;
 all snapshots are kept until the configured count exists. Pruning waits for durable
 publication, deletes old snapshots before their covered journals, and resumes on
-restart if interrupted. Keep the full directory when making a recovery copy.
+restart if interrupted. KS journals and snapshots must remain exclusively on
+physically protected KS machines, even though they are encrypted; never store them
+in DeLawson. Keep the full directory when copying recovery state to another KS machine.
 A corrupt newest snapshot fails recovery; leftover temporary files are ignored.
 
 Bootstrap writes an encrypted empty snapshot at commit zero before the first key
