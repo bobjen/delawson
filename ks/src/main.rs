@@ -39,6 +39,7 @@ struct KeyHistory {
 struct Ks {
     config: KsConfig,
     snapshot_stopping: AtomicBool,
+    snapshot_task: Mutex<()>,
     snapshot_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     unlock_verifier: Option<[u8; 32]>,
     /// Whether the operator-and-hardware ceremony has been performed. Until it
@@ -80,9 +81,7 @@ impl Service for Ks {
                     if !ks.unlocked.load(Ordering::SeqCst) {
                         continue;
                     }
-                    if let Ok(mut journal) = ks.journal.try_lock() {
-                        ks.maybe_snapshot(&mut journal);
-                    }
+                    ks.maybe_snapshot();
                 }
             })
             .context("starting KS snapshot timer")?;
@@ -177,14 +176,16 @@ impl Ks {
             return Err(common::Error::new("require_unlock needs unlock_verifier"));
         }
         let test_mode = !config.require_unlock;
+        let journal = journal::Journal::open(path, config.snapshot_retain)?;
         let ks = Ks {
             config,
             snapshot_stopping: AtomicBool::new(false),
+            snapshot_task: Mutex::new(()),
             snapshot_worker: Mutex::new(None),
             unlock_verifier,
             unlocked: AtomicBool::new(false),
             peers: Mutex::new(BTreeMap::new()),
-            journal: Mutex::new(journal::Journal::open(path)?),
+            journal: Mutex::new(journal),
             master_keys: RwLock::new(KeyHistory::default()),
         };
         if test_mode {
@@ -207,8 +208,9 @@ impl Ks {
         }
         *self.master_keys.write().expect("master_keys") =
             KeyHistory { epochs, applied: journal.commit() };
-        self.maybe_snapshot(&mut journal);
         self.unlocked.store(true, Ordering::SeqCst);
+        drop(journal);
+        self.maybe_snapshot();
         Ok(())
     }
 
@@ -228,7 +230,13 @@ impl Ks {
         history.applied = commit;
     }
 
-    fn maybe_snapshot(&self, journal: &mut journal::Journal) {
+    fn maybe_snapshot(&self) {
+        let Ok(_task) = self.snapshot_task.try_lock() else {
+            return;
+        };
+        let Ok(mut journal) = self.journal.try_lock() else {
+            return;
+        };
         let now = TimeSec::now().number();
         if !journal.snapshot_due(
             self.config.snapshot_min_log_bytes,
@@ -237,10 +245,24 @@ impl Ks {
         ) {
             return;
         }
-        let history = self.master_keys.read().expect("master_keys").clone();
-        if let Err(e) = journal.snapshot(&history.epochs, history.applied, now) {
-            // The journal is already durable; snapshot failure must not turn a
-            // successful operation into an apparent failure or retract its state.
+        // Freeze execution, not logging. This read guard also avoids copying the
+        // whole state solely to write a snapshot.
+        let history = self.master_keys.read().expect("master_keys");
+        let pending = match journal.prepare_snapshot(&history.epochs, history.applied, now) {
+            Ok(pending) => pending,
+            Err(e) => {
+                logn!("KS snapshot preparation failed", "{e}");
+                return;
+            }
+        };
+        drop(journal);
+        let result = pending.write(&history.epochs);
+        // Never reacquire the logging lock while holding the execution lock: an
+        // applier may hold the former while waiting for the latter's write lock.
+        drop(history);
+        let result = result
+            .and_then(|size| self.journal.lock().expect("journal").finish_snapshot(&pending, size));
+        if let Err(e) = result {
             logn!("KS snapshot failed; durable journal retained", "{e}");
         }
     }
@@ -338,7 +360,8 @@ impl Ks {
         epoch.since = epoch.since.max(horizon.day_start());
         let commit = journal.append(&epoch)?;
         self.apply_key(epoch, commit);
-        self.maybe_snapshot(&mut journal);
+        drop(journal);
+        self.maybe_snapshot();
         Ok(())
     }
 
@@ -353,7 +376,8 @@ impl Ks {
         let epoch = self.choose_key()?;
         let commit = journal.append(&epoch)?;
         self.apply_key(epoch, commit);
-        self.maybe_snapshot(&mut journal);
+        drop(journal);
+        self.maybe_snapshot();
         Ok(())
     }
 
@@ -473,7 +497,7 @@ fn main() {
         if !config.require_unlock {
             logn!("no unlock ceremony required because this is a test configuration");
         }
-        Ks::new(config, &process.config.data_dir.join("master-keys.journal"))
+        Ks::new(config, &process.config.data_dir.join("master-keys"))
     });
     if let Err(e) = result {
         eprintln!("ks: {e}");
@@ -493,6 +517,7 @@ mod unlock_tests {
     fn only_correct_well_formed_key_opens_gate() {
         let key = [42; 32];
         let config = KsConfig {
+            snapshot_retain: 3,
             snapshot_interval_secs: 86400,
             snapshot_min_log_bytes: 1024 * 1024,
             unlock_verifier: Some(common::shamir::hex(&common::shamir::verifier(&key))),
@@ -526,6 +551,7 @@ mod persistence_tests {
 
     fn config(key: &[u8; 32]) -> KsConfig {
         KsConfig {
+            snapshot_retain: 3,
             snapshot_interval_secs: 86400,
             snapshot_min_log_bytes: 1024 * 1024,
             unlock_verifier: Some(common::shamir::hex(&common::shamir::verifier(key))),
@@ -601,7 +627,17 @@ mod persistence_tests {
         ks.start().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let captured = loop {
-            let bytes = std::fs::read(dir.path().with_extension("snapshot")).unwrap();
+            let bytes = match std::fs::read(dir.path().join("snapshot-00000000000000000002.bin")) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if std::time::Instant::now() >= deadline {
+                        break 0;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
+                }
+                Err(e) => panic!("reading test snapshot: {e}"),
+            };
             let mut number = [0; 8];
             number.copy_from_slice(&bytes[40..48]);
             let captured = u64::from_le_bytes(number);

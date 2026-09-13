@@ -18462,8 +18462,9 @@ sizes, and oversized objects. scripts/test-bytes exercises the complete bytes pa
 
 ## 17.48 KS encrypted master-key journal
 
-KS now stores master-key epochs in `data_dir/master-keys.journal`. The file begins
-with the eight-byte version magic `DLAWKS02` and a random 32-byte journal identity.
+KS stores master-key epochs in numbered journal segments under `data_dir/master-keys/`
+(§17.50). A segment's 80-byte header contains magic `DLAWKS03`, the 32-byte store
+identity, its first commit number (u64 LE), and the preceding entry's 32-byte tag.
 Each fixed-size 112-byte entry contains a little-endian u64 commit number, a fresh
 random 32-byte nonce, 40 encrypted
 bytes (the 32-byte master key followed by its activation TimeSec as little-endian
@@ -18491,7 +18492,8 @@ retain an obsolete next-key answer after a journal addition. This initial versio
 executes after local durability; acceptance, persistence, and application remain
 separate concerns for subsequent Raft work. There is no quorum replication yet.
 
-The journal is exclusively file-locked for the process lifetime. Initial file
+The store identity file is exclusively locked for the process lifetime, across
+journal rotations. Initial file
 creation syncs both file and parent directory. Restart leaves the history empty
 and service locked until the operator key authenticates and decrypts the journal.
 Replay authenticates the complete prefix, discards an incomplete final entry, and
@@ -18526,11 +18528,11 @@ after the unlock key is supplied and before writing the initial key entry. It is
 the durable commit; applying the entry advances the in-memory applied commit under
 the same write lock as the key history. These are distinct positions even though
 the current single-member implementation executes immediately after persistence.
-The journal format is `DLAWKS02`; the preceding experimental `DLAWKS01` format is
-rejected without modification. There is no automatic migration or deletion.
+The segmented journal format is `DLAWKS03`; earlier flat-file stores are rejected
+without modification. There is no automatic migration.
 
-`master-keys.snapshot` holds the complete applied key history and the latest commit
-captured in it. It is an AEGIS-256 encrypted state snapshot, not a copy of the raw
+Each numbered `snapshot-<commit>.bin` holds the complete applied key history
+through its named commit. It is an AEGIS-256 encrypted state snapshot, not a copy of the raw
 journal. Its clear header contains magic `DLAWSS01`, journal identity (32 bytes),
 captured commit (u64 LE), the captured journal entry's authentication tag (32 bytes),
 and a fresh nonce (32 bytes). The first 80 header bytes are authenticated associated
@@ -18539,30 +18541,32 @@ data. Its encrypted body is the snapshot creation second (u64 LE), followed by t
 entries add one key, so snapshot key count equals captured commit; ring-management
 entries will require separating that assumption when Raft is introduced.
 
-The snapshot writer serializes with proposals, copies key history and applied
-position under the shared state lock, then releases that lock before encryption
-or disk I/O. It requires the captured applied position to equal the durable journal
-position. This simple KS implementation may delay another proposal while it writes
-a snapshot; ordinary key reads continue. It does not introduce transactions or
-copy-on-write machinery for future SN/DN snapshots.
+Snapshot capture coordinates the execution read lock with a journal switch. At
+that boundary, the last applied and durable positions both equal N; a new journal
+starts at N+1. The snapshot retains the execution read lock while writing, but
+releases the logging mutex, so logging can continue. It does not need a full-state
+copy or transactions. Only one snapshot write runs at a time. Before completing
+snapshot bookkeeping, the writer releases its execution read lock, avoiding a
+lock cycle with an applier waiting for the execution write lock.
 
-Publication writes a unique temporary file, syncs it, renames it over the latest
-snapshot, then syncs the parent directory. The full journal remains intact. An
-interruption leaves either the old or new complete snapshot; incomplete temporary
-files are ignored on recovery. Snapshot failure is logged and retried by maintenance or on a later
-change or unlock, without failing an already durable key addition. Corruption of
-the published snapshot fails recovery rather than silently discarding it.
+Publication writes a unique temporary file, syncs it, renames it to its numbered
+snapshot name, then syncs the parent directory. Old snapshots remain until pruning
+(§17.50). Journal rotation can complete before the snapshot is durable: a failed
+or interrupted snapshot does not invalidate its successor journal. Snapshot
+failure is logged and retried without retracting a committed key addition.
+Corruption of the newest published snapshot fails recovery rather than silently
+selecting an older history.
 
-On unlock, KS authenticates and loads the latest snapshot, then seeks directly to
-the entry after its captured commit. Covered journal entries are neither read nor
-reapplied. The snapshot's chain anchor authenticates the first remaining entry;
-commit numbers must continue without a gap, and activation seconds must increase.
-A journal shorter than the captured prefix is rejected. A partial final suffix
-entry is trimmed using the existing interrupted-write rule. Every recovery starts with a snapshot, possibly the empty commit-zero snapshot.
-A missing snapshot is initialized only if the journal contains no entries; a
-missing snapshot beside a nonempty journal is an error. Commit numbering continues after recovered entries.
-Journal pruning, segmented logs, Raft terms, membership, and snapshot transfer are
-not implemented by this step; retain both files for recovery.
+On unlock, KS authenticates the highest-numbered snapshot, then reads all journal
+segments starting after its captured commit in commit order, from their beginnings.
+A snapshot need not exist for each journal boundary. Segment filenames, header
+positions and chain anchors must agree, commit numbers must be contiguous, and
+activation seconds must increase. Covered segments are not replayed. Only an
+incomplete final entry in the active last segment may be trimmed; a partial entry
+in a closed segment is an error. Every recovery starts with a snapshot, possibly
+the empty commit-zero snapshot. Bootstrap may complete an interrupted empty store
+containing only an empty first journal; missing snapshots beside logged entries
+are an error. Raft terms, membership and snapshot transfer remain future work.
 
 ### 17.49.1 Snapshot frequency
 
@@ -18580,8 +18584,9 @@ first size-trigger calculation has a real previous snapshot. It also establishes
 the initial time baseline. Subsequent checks require changed state: an unchanged
 snapshot is not rewritten. Checks run after application and recovery and from a
 maintenance thread once per second, so dirty state that goes idle still gets a
-daily snapshot. The thread serializes with proposals, releases the shared state
-lock before writing, and joins on orderly shutdown. Busy writers or slow snapshot
+daily snapshot. The thread coordinates capture with proposals, retains the shared
+execution lock while writing, releases the logging mutex, and joins on orderly
+shutdown. Busy writers or slow snapshot
 I/O can delay a check; this is a scheduling policy, not a hard real-time deadline.
 A zero time interval makes every change eligible; a zero minimum still respects
 the previous snapshot size.
@@ -18607,3 +18612,70 @@ Tests also cover commit-zero initialization, refusal to recreate a missing snaps
 for a nonempty journal, the configurable minimum log size, and the idle timer.
 The software/optional-TPM integration test verifies a snapshot at commit zero and
 recovery of subsequent key entries across a locked restart.
+
+## 17.50 Numbered KS files, journal rotation and pruning
+
+`data_dir/master-keys/` contains a stable `identity` file plus numbered snapshots
+and journal segments. `identity` stores magic `DLAWKI01` and a random 32-byte store
+identity; its exclusive file lock survives journal rotation and prevents a second
+KS process opening the same store. Filenames use zero-padded 20-digit decimal u64
+positions, so lexical order matches numeric order while overflow is rejected:
+
+- `snapshot-00000000000000000100.bin` captures state through commit 100.
+- `journal-00000000000000000101.log` begins with commit 101.
+
+At the coordinated snapshot boundary N, the executed state is frozen with a shared
+lock and a new journal starts at N+1. The journal header is written to a temporary
+file, synced, renamed and followed by directory sync before it accepts entries.
+Snapshot writing then proceeds independently of the logging mutex. New entries
+can accumulate for the entire snapshot-writing interval and remain unapplied
+while that member holds its execution read lock. The current KS still executes
+normal requests after local durability; Raft's asynchronous acceptance and quorum
+pipeline will be added separately.
+
+Preparation, snapshot writing and completion are separate operations. Completion
+records the captured position N, even if the logger has advanced beyond N by then.
+If the snapshot never appears, recovery uses an earlier snapshot and reads every
+subsequent journal, including journal boundaries with no matching snapshot. Failed
+journal rotation fences further writes until restart; failed snapshot writing
+alone does not. Snapshot preparation refuses unequal executed/durable capture
+positions: future Raft integration must coordinate this boundary, not place
+unapplied pre-boundary entries in the preceding journal.
+
+`snapshot_retain` defaults to three and must be positive. Once enough snapshots
+exist, pruning keeps the newest configured count and **all journal segments after
+the oldest retained snapshot**. If fewer exist, all are kept. For snapshots 4, 6,
+and 8, retain journals starting at 5, 7 and 9, plus any intervening segments created
+by unfinished snapshot attempts. Each retained snapshot therefore has its complete
+replay suffix. Reducing the configured count takes effect after successful recovery
+or the next snapshot. The store does not synthesize historical snapshots to fill
+the count.
+
+Pruning happens only after a new snapshot and the successor journal are durably
+published, or after successful recovery verifies surviving state. First remove
+obsolete snapshots and sync their directory; only then remove their covered
+journal segments and sync again. A crash may leave extra files, but must not leave
+a retained snapshot without its required journals. Startup resumes this cleanup.
+Only recognized numbered persistence files are considered; temporary files and
+unrelated files are not pruned. The old flat `master-keys.journal` and
+`master-keys.snapshot` layout is detected and rejected, never silently replaced.
+
+Tests recover independently from every retained snapshot, check configurable
+retention, continue logging during a pending snapshot, recover journal switches
+without matching snapshots, resume pruning after snapshot publication, handle an
+interrupted empty initialization, and reject gaps, malformed headers, bad chain
+anchors and corrupt snapshots. Tests also cover every partial active-entry length
+and ensure that a partial closed segment cannot be silently repaired.
+
+### 17.50.1 Future storage of recovery files in DeLawson
+
+Eventually snapshots and journal segments will be stored in DeLawson as streams
+using `bytes` framing. They are opaque binary files: upload chunk boundaries become
+internal records, while downloads reproduce the original byte offsets and contents.
+Very large snapshots motivate fast parallel binary uploads and range downloads.
+Local Raft-server copies may be retired once the corresponding files are confirmed
+durable in DeLawson, under a separate remote retention and recovery policy. Local
+Raft durability and remote DeLawson durability are distinct facts; starting an upload
+is not permission to remove the local copy. Discovery and cold-bootstrap recovery,
+including KS recovery, still need design. This is future work, not implemented by
+local snapshot retention.

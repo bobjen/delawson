@@ -5,6 +5,8 @@
 # the previous snapshot size and this minimum. Bootstrap writes empty commit 0.
 snapshot_min_log_bytes = 1048576
 snapshot_interval_secs = 86400
+# Keep these snapshots and every journal after the oldest retained snapshot.
+snapshot_retain = 3
 
 # A day that creates no extents needs no master key.
 lazy_day_keys = true

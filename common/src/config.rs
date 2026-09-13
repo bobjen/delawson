@@ -643,6 +643,9 @@ pub struct Knobs {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KsConfig {
+    /// Retain this many snapshots and all journal segments after the oldest.
+    #[serde(default = "ks_snapshot_retain")]
+    pub snapshot_retain: usize,
     /// Minimum journal bytes before the size trigger; actual threshold is the
     /// larger of this value and the previous snapshot's file size.
     #[serde(default = "ks_snapshot_min_log_bytes")]
@@ -670,6 +673,10 @@ pub struct KsConfig {
     /// worker. Here to be turned off, since what it costs to hand one small
     /// message to a scheduler is a number worth having.
     pub inline_ping: bool,
+}
+
+fn ks_snapshot_retain() -> usize {
+    3
 }
 
 fn ks_snapshot_min_log_bytes() -> u64 {

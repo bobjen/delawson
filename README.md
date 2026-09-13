@@ -292,7 +292,7 @@ for the existing same-DN concat path, and cleans up its processes afterwards.
 ### KS key journal
 
 KS persists encrypted master keys and activation seconds in
-`data_dir/master-keys.journal`. Keep this file and the matching operator recovery
+`data_dir/master-keys/`. Keep this directory and the matching operator recovery
 material across restarts. `start-laws` reuses its ceremony files; switching between
 `direct` and `shards` modes selects different recovery material and does not convert
 an existing journal. An existing journal will reject the wrong unlock key.
@@ -313,11 +313,19 @@ and replay coverage. After `cargo build --workspace`, `scripts/test-machine-auth
 exercises rotation and locked restart with a one-second test delay, using software
 machine identities by default. Its existing `--tpm` option remains opt-in.
 
-KS also writes `data_dir/master-keys.snapshot`, containing encrypted key history
-and its captured commit number. Recovery loads it and replays only later journal
-entries. Keep **both snapshot and journal**: covered journal storage is not yet
-pruned. A corrupt published snapshot fails recovery; leftover temporary snapshots
-are ignored.
+The directory contains `identity`, numbered `snapshot-<commit>.bin` files and
+`journal-<first-commit>.log` segments. Commit numbers are padded to 20 decimal digits.
+For example, snapshot 100 captures state through commit 100, and its successor
+journal begins at 101. Recovery loads the newest snapshot and replays all later
+journal files in commit order. Journal switching precedes snapshot publication;
+recovery also handles switches whose snapshots never finished.
+
+`snapshot_retain = 3` keeps the newest three snapshots and every journal needed
+after the oldest retained snapshot. The count is configurable and must be positive;
+all snapshots are kept until the configured count exists. Pruning waits for durable
+publication, deletes old snapshots before their covered journals, and resumes on
+restart if interrupted. Keep the full directory when making a recovery copy.
+A corrupt newest snapshot fails recovery; leftover temporary files are ignored.
 
 Bootstrap writes an encrypted empty snapshot at commit zero before the first key
 entry. Every recovery starts from a snapshot. A missing snapshot beside a nonempty
@@ -330,5 +338,6 @@ size and the configurable minimum (1 MiB by default). A maintenance timer also
 handles dirty idle state; unchanged state is not rewritten. The one-hour key
 activation delay remains separate and unchanged.
 
-The numbered journal uses format `DLAWKS02`. The earlier experimental `DLAWKS01`
-format is rejected without modifying it; this step provides no automatic migration.
+Journal segments use format `DLAWKS03`. Earlier flat `master-keys.journal` and
+`master-keys.snapshot` stores are rejected without modification; this step does
+not automatically migrate them.
