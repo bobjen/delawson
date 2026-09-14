@@ -68,16 +68,10 @@ impl Settings {
         }
     }
     pub fn validate(&self, config: &RaftConfig) -> Result<()> {
-        if self.members.is_empty()
-            || config.heartbeat_ms == 0
-            || config.request_timeout_ms == 0
-            || config.election_min_ms <= config.heartbeat_ms
-            || config.election_max_ms <= config.election_min_ms
-        {
-            return Err(Error::new(
-                "Raft needs nonempty members and 0 < heartbeat < election minimum < maximum",
-            ));
+        if self.members.is_empty() {
+            return Err(Error::new("Raft needs nonempty members"));
         }
+        config.validate_timing()?;
         Ok(())
     }
 }
@@ -206,26 +200,17 @@ impl Ks {
     }
     pub fn confirm_leader(&self) -> Result<()> {
         let began = Instant::now();
-        let deadline = began + Duration::from_millis(self.config.raft.election_max_ms);
+        let deadline = began
+            + Duration::from_millis(
+                self.config.raft.election_max_ms.saturating_add(self.config.raft.primary_wait_ms),
+            );
         loop {
             {
                 let node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
                 if node.role != Role::Leader || node.journal.failed {
                     return Err(Error::new("KS is not a healthy Raft leader"));
                 }
-                let mut votes = BTreeSet::from([self.runtime.id.clone()]);
-                let acks = self
-                    .read_acks
-                    .lock()
-                    .map_err(|_| Error::new("read acknowledgment lock poisoned"))?;
-                votes.extend(
-                    acks.iter()
-                        .filter(|(_, (term, sent))| *term == node.state().term && *sent >= began)
-                        .map(|(id, _)| id.clone()),
-                );
-                if node.state().term_at(node.state().commit) == Some(node.state().term)
-                    && node.state().membership().quorum(&votes)
-                {
+                if node.can_read(lease::now()?) {
                     self.refresh_keys(&node)?;
                     return Ok(());
                 }
@@ -271,7 +256,13 @@ impl Ks {
     }
     pub fn wait_committed(&self, index: u64, term: u64) -> Result<()> {
         let deadline = Instant::now()
-            + Duration::from_millis(self.config.raft.election_max_ms.saturating_mul(2));
+            + Duration::from_millis(
+                self.config
+                    .raft
+                    .election_max_ms
+                    .saturating_mul(2)
+                    .saturating_add(self.config.raft.primary_wait_ms),
+            );
         loop {
             {
                 let node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
@@ -283,7 +274,7 @@ impl Ks {
                         "KS leadership changed; request outcome may be unknown",
                     ));
                 }
-                if node.state().commit >= index {
+                if node.state().commit >= index && node.lease.ready(term, lease::now()?) {
                     self.refresh_keys(&node)?;
                     return Ok(());
                 }
@@ -319,6 +310,7 @@ impl Ks {
                 .raft
                 .election_max_ms
                 .saturating_mul(2)
+                .saturating_add(self.config.raft.primary_wait_ms)
                 .saturating_add(self.config.raft.request_timeout_ms)
         } else {
             self.config.raft.request_timeout_ms
@@ -393,10 +385,10 @@ impl Ks {
                 Message::Consensus(rpc) => {
                     let mut node =
                         self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
-                    let recent_leader = node.role == Role::Leader
-                        || node.leader_contact.is_some_and(|seen| {
-                            seen.elapsed() < Duration::from_millis(self.config.raft.election_min_ms)
-                        });
+                    let recent_leader = node.election_quiet(
+                        Instant::now(),
+                        Duration::from_millis(self.config.raft.election_min_ms),
+                    );
                     let answer = if matches!(rpc, Rpc::Vote { .. }) && recent_leader {
                         Answer { term: node.state().term, success: false, matched: 0 }
                     } else {
@@ -466,11 +458,19 @@ impl Ks {
             {
                 return Err(Error::new("new member is not a KS in the roster"));
             }
+            // Finish the election service delay before publishing a configuration result,
+            // including a final configuration that removes this primary.
+            self.confirm_leader()?;
             let target = Membership { old: members.clone(), new: None };
             let _proposal =
                 self.proposing.lock().map_err(|_| Error::new("proposal lock poisoned"))?;
             let (index, term) = {
                 let mut node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
+                if !node.lease.ready(node.state().term, lease::now()?) {
+                    return Err(Error::new(
+                        "KS primary is waiting for previous read leases to expire",
+                    ));
+                }
                 let old = node.state().membership();
                 if old.new.is_some() || node.state().commit != node.state().last() {
                     return Err(Error::new("Raft configuration or proposal already pending"));
@@ -481,7 +481,13 @@ impl Ks {
                 (index, term)
             };
             let deadline = Instant::now()
-                + Duration::from_millis(self.config.raft.election_max_ms.saturating_mul(2));
+                + Duration::from_millis(
+                    self.config
+                        .raft
+                        .election_max_ms
+                        .saturating_mul(2)
+                        .saturating_add(self.config.raft.primary_wait_ms),
+                );
             loop {
                 {
                     let node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
@@ -631,7 +637,7 @@ impl Ks {
                             }
                         }
                         if let Some(request) = request {
-                            let sent = Instant::now();
+                            let sent = lease::now()?;
                             let response =
                                 ks.send_raft(&peer, address, Message::Consensus(request.clone()))?;
                             if response.status != Status::Ok {
@@ -657,10 +663,7 @@ impl Ks {
                                 && request.term() == node.state().term
                                 && node.role == Role::Leader
                             {
-                                ks.read_acks
-                                    .lock()
-                                    .map_err(|_| Error::new("read acknowledgment lock poisoned"))?
-                                    .insert(peer.clone(), (request.term(), sent));
+                                node.lease.acknowledge(&peer, request.term(), sent);
                             }
                             ks.refresh_keys(&node)?;
                         }

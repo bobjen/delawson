@@ -51,7 +51,7 @@ def main():
         config = work/'ks.toml'
         text = (ROOT/'config/ks.toml').read_text().replace('require_unlock = false', 'require_unlock = true').replace('master_key_delay_secs = 3600', 'master_key_delay_secs = 1').replace('snapshot_interval_secs = 86400', 'snapshot_interval_secs = 1')
         text = 'unlock_verifier = '+json.dumps((ceremony/'verifier').read_text().strip())+'\n'+text
-        text += '\n[raft]\nring = "KS0"\nheartbeat_ms = 50\nelection_min_ms = 300\nelection_max_ms = 600\nrequest_timeout_ms = 200\n[raft.members]\n'+''.join(f'{id} = {json.dumps(address)}\n' for id, address in members.items())
+        text += '\n[raft]\nring = "KS0"\nheartbeat_ms = 75\nelection_min_ms = 150\nelection_max_ms = 300\nrequest_timeout_ms = 200\n[raft.members]\n'+''.join(f'{id} = {json.dumps(address)}\n' for id, address in members.items())
         config.write_text(text)
         def command(id, *args, success=True):
             result = run([BIN/'laws', '--config', cluster, '--to', id, '--at', members[id], '--machine-identity', host/'identity.toml', *args], success)
@@ -100,10 +100,11 @@ def main():
             start(primary)
             until(lambda: status(primary).get('unlocked') == 'true' and int(status(primary)['master_keys']) == 2)
             assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
-            # Two down: the surviving former leader cannot serve a quorum-confirmed read.
+            # Two down: the former leader may read until its lease expires, then must refuse.
             survivor = until(leader)
             for id in list(children):
                 if id != survivor: stop(id)
+            time.sleep(.2)  # Outlast the 150 ms lease, including delayed acknowledgments.
             failed = command(survivor, 'sn-master-key', '--sn', '0', '--creation-second', creation, success=False)
             assert 'quorum' in failed.lower(), failed
             stop(survivor)

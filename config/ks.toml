@@ -33,9 +33,14 @@ workers = 0
 # with distinct process IDs, listen addresses, and data directories.
 # [raft]
 # ring = "KS0"
-# heartbeat_ms = 500
-# election_min_ms = 3000
-# election_max_ms = 6000
+# Require election_min_ms >= 2 * heartbeat_ms, election_max_ms > election_min_ms,
+# and primary_wait_ms >= election_min_ms. The clock margin additionally requires
+# 2 * primary_wait_ms < 99 * election_min_ms (clock rates within 1% of real time).
+# Use matching lease/wait values throughout a ring; change them with a full restart.
+# heartbeat_ms = 75
+# election_min_ms = 150
+# election_max_ms = 300
+# primary_wait_ms = 150
 # request_timeout_ms = 1000
 # [raft.members]
 # KS0 = "127.0.0.1:9400"

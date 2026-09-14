@@ -1,5 +1,6 @@
 //! KS: process registry and encrypted, journaled master-key epochs.
 mod journal;
+mod lease;
 mod raft;
 mod runtime;
 
@@ -55,7 +56,6 @@ struct Ks {
     unlock_key: Mutex<Option<[u8; 32]>>,
     unlock_requests: Mutex<std::collections::BTreeSet<String>>,
     proposing: Mutex<()>,
-    read_acks: Mutex<BTreeMap<String, (u64, std::time::Instant)>>,
     raft_workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// Global execution lock: application takes write access; key serving takes read access.
     /// Master keys are sorted by the second at which each becomes effective.
@@ -237,6 +237,7 @@ impl Ks {
         let initial = raft::State::initial(runtime.ring.clone(), runtime.members.clone())?;
         let journal = journal::Journal::open(path, initial, config.snapshot_retain, &runtime.id)?;
         let mut node = raft::Node::new(runtime.id.clone(), journal);
+        node.lease = lease::Lease::configured(&config.raft);
         if node.state().membership().members().len() == 1
             && node.state().membership().members().contains_key(&runtime.id)
         {
@@ -250,7 +251,6 @@ impl Ks {
             snapshot_task: Mutex::new(()),
             raft_workers: Mutex::new(vec![]),
             proposing: Mutex::new(()),
-            read_acks: Mutex::new(BTreeMap::new()),
             unlock_key: Mutex::new(None),
             unlock_requests: Mutex::new(std::collections::BTreeSet::new()),
             unlock_verifier,
@@ -385,6 +385,13 @@ impl Ks {
         };
         self.wait_committed(index, term)?;
         self.ensure_future_key()?;
+        // Recheck after any proposal or lock wait. Keep consensus and execution stable
+        // while capturing the result, then check time again to cover pauses during capture.
+        self.confirm_leader()?;
+        let node = self.journal.lock().map_err(|_| common::Error::new("Raft lock poisoned"))?;
+        if node.journal.failed || !node.can_read(lease::now()?) {
+            return Err(common::Error::new("KS read lease expired"));
+        }
         let epochs = self.master_keys.read().expect("master_keys");
         let epochs = &epochs.epochs;
         let count = epochs.partition_point(|epoch| epoch.since <= at);
@@ -397,6 +404,9 @@ impl Ks {
             .get(count)
             .map(|epoch| (epoch.since, crypto::sn_key(&epoch.key, sn, epoch.since)));
         let result = SnKey { current: current_key, next };
+        if !node.can_read(lease::now()?) {
+            return Err(common::Error::new("KS read lease expired during key derivation"));
+        }
         Ok(result)
     }
 

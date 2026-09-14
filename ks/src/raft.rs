@@ -298,6 +298,7 @@ pub struct Node<S: Storage = Journal> {
     /// Runtime resets its election deadline after valid leader contact or a granted vote.
     pub contact: u64,
     pub leader_contact: Option<std::time::Instant>,
+    pub lease: crate::lease::Lease,
 }
 impl<S: Storage> Node<S> {
     pub fn new(id: String, journal: S) -> Self {
@@ -310,7 +311,9 @@ impl<S: Storage> Node<S> {
             matched: BTreeMap::new(),
             next: BTreeMap::new(),
             contact: 0,
-            leader_contact: None,
+            // Restart must not erase the quiet period and immediately grant a vote.
+            leader_contact: Some(std::time::Instant::now()),
+            lease: crate::lease::Lease::default(),
         }
     }
     pub fn state(&self) -> &State {
@@ -323,6 +326,7 @@ impl<S: Storage> Node<S> {
         if term > self.state().term {
             self.persist(vec![Record::Hard { term, vote: None }])?;
         }
+        self.lease.reset();
         self.role = Role::Follower;
         self.leader = None;
         self.votes.clear();
@@ -335,6 +339,7 @@ impl<S: Storage> Node<S> {
         let term =
             self.state().term.checked_add(1).ok_or_else(|| Error::new("Raft term overflow"))?;
         self.persist(vec![Record::Hard { term, vote: Some(self.id.clone()) }])?;
+        self.lease.reset();
         self.role = Role::Candidate;
         self.leader = None;
         self.votes = BTreeSet::from([self.id.clone()]);
@@ -342,6 +347,7 @@ impl<S: Storage> Node<S> {
     }
     fn win(&mut self) -> Result<()> {
         if self.role == Role::Candidate && self.state().membership().quorum(&self.votes) {
+            self.lease.start(self.state().term, crate::lease::now()?);
             self.role = Role::Leader;
             self.leader = Some(self.id.clone());
             let next = self
@@ -406,6 +412,17 @@ impl<S: Storage> Node<S> {
         }
         Ok(())
     }
+    pub fn election_quiet(&self, now: std::time::Instant, minimum: std::time::Duration) -> bool {
+        self.role == Role::Leader
+            || self.leader_contact.is_some_and(|seen| {
+                now.checked_duration_since(seen).is_none_or(|elapsed| elapsed < minimum)
+            })
+    }
+    pub fn can_read(&self, now: std::time::Duration) -> bool {
+        self.role == Role::Leader
+            && self.state().term_at(self.state().commit) == Some(self.state().term)
+            && self.lease.valid(self.state().term, &self.id, &self.state().membership(), now)
+    }
     pub fn request(&self, peer: &str) -> Option<Rpc> {
         let s = self.state();
         match self.role {
@@ -454,6 +471,7 @@ impl<S: Storage> Node<S> {
                 }
             }
             Rpc::Append { previous, previous_term, entries, commit, .. } => {
+                self.lease.reset();
                 self.role = Role::Follower;
                 self.leader = Some(sender.into());
                 self.contact = self.contact.wrapping_add(1);
@@ -489,6 +507,7 @@ impl<S: Storage> Node<S> {
                 answer.matched = matched;
             }
             Rpc::Install { snapshot, .. } => {
+                self.lease.reset();
                 self.role = Role::Follower;
                 self.leader = Some(sender.into());
                 self.contact = self.contact.wrapping_add(1);
@@ -621,6 +640,56 @@ pub mod tests {
     fn cluster(n: usize) -> Vec<TestNode> {
         (0..n).map(|i| node(i, members(n))).collect()
     }
+    #[test]
+    fn election_quiet_period_survives_restart_and_leader_contact() {
+        use std::time::{Duration, Instant};
+        let node = node(0, members(3));
+        let start = node.leader_contact.unwrap();
+        let minimum = Duration::from_millis(150);
+        let early = node.election_quiet(start + Duration::from_millis(149), minimum);
+        let allowed = node.election_quiet(start + minimum, minimum);
+        let restored = restart(&node);
+        let restarted = restored.election_quiet(Instant::now(), minimum);
+        assert!(early);
+        assert!(!allowed);
+        assert!(restarted);
+    }
+
+    #[test]
+    fn lease_reads_need_committed_noop_and_do_not_journal_heartbeats() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let mut nodes = cluster(3);
+        nodes[0].campaign().unwrap();
+        pair(&mut nodes, 0, 1); // Elect, but do not yet commit the new term's no-op.
+        let term = nodes[0].state().term;
+        nodes[0].lease = crate::lease::Lease::elected(term, ms(0));
+        nodes[0].lease.acknowledge("KS1", term, ms(100));
+        let no_commit = nodes[0].can_read(ms(160));
+        pair(&mut nodes, 0, 1); // Commit the no-op.
+        pair(&mut nodes, 0, 1); // Tell the follower that it is committed.
+        let before = (nodes[0].journal.records.len(), nodes[1].journal.records.len());
+        pair(&mut nodes, 0, 1); // Ordinary empty heartbeat: no persistent state changes.
+        let after = (nodes[0].journal.records.len(), nodes[1].journal.records.len());
+        let ready = nodes[0].can_read(ms(160));
+        let repeated_reads = (160..250).all(|at| nodes[0].can_read(ms(at)));
+        let expired = nodes[0].can_read(ms(250));
+        let restored = restart(&nodes[0]);
+        let restart_can_read = restored.can_read(ms(160));
+        let old = nodes[0].state();
+        let vote = Rpc::Vote { term: term + 1, last: old.last(), last_term: term };
+        let answer = nodes[0].receive("KS2", &vote).unwrap();
+        let stepped_down = nodes[0].can_read(ms(160));
+        assert!(!no_commit);
+        assert_eq!(before, after);
+        assert!(ready);
+        assert!(repeated_reads);
+        assert!(!expired);
+        assert!(!restart_can_read);
+        assert!(answer.success);
+        assert!(!stepped_down);
+    }
+
     #[test]
     fn votes_survive_restart_and_stale_logs_cannot_win() {
         let mut nodes = cluster(3);

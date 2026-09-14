@@ -266,6 +266,7 @@ version = "0.0.1"
 dependencies = [
  "aegis",
  "delawson-common",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

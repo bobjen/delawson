@@ -309,9 +309,10 @@ a distinct process ID/data directory, and the required machine enrollment:
 ```toml
 [raft]
 ring = "KS0"
-heartbeat_ms = 500
-election_min_ms = 3000
-election_max_ms = 6000
+heartbeat_ms = 75
+election_min_ms = 150
+election_max_ms = 300
+primary_wait_ms = 150
 request_timeout_ms = 1000
 [raft.members]
 KS0 = "127.0.0.1:9400"
@@ -319,9 +320,18 @@ KS1 = "127.0.0.1:9401"
 KS2 = "127.0.0.1:9402"
 ```
 
+Require `election_min_ms >= 2 * heartbeat_ms`, `election_max_ms > election_min_ms`,
+`primary_wait_ms >= election_min_ms`, and `2 * primary_wait_ms < 99 * election_min_ms`.
+These are checked at startup. Use matching primary-wait settings on every member and
+restart the whole ring when introducing leases or changing those settings.
+
 Use the actual configured listen addresses. Locked members can vote and journal
 entries toward commitment. An unlocked member can unlock authenticated peers.
-Key reads require fresh quorum confirmation; a minority cannot serve them.
+Key reads reuse quorum heartbeat acknowledgments for a 150 ms lease measured
+from send time. After election, a primary waits 150 ms and commits/applies its
+current-term no-op before serving clients. A minority loses read permission when
+its lease expires. The lease clock includes system suspend; safety assumes clock
+rates within 1% of real time. All ring members must use the same lease protocol.
 Followers forward requests to a known primary. `laws raft-members --members-file
 FILE` proposes a joint-consensus transition using a JSON ID/address map. New IDs
 must be admitted KS processes. Automatic ring maintenance and client bootstrap

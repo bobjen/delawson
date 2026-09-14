@@ -16,6 +16,7 @@ aegis = "0.9.15"
 serde.workspace = true
 serde_json = "1"
 sha2 = "0.10.8"
+libc = "0.2.189"
 
 [dev-dependencies]
 tempfile = "3"

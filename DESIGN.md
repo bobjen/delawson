@@ -18618,10 +18618,49 @@ membership proposal includes it. `laws raft-members --members-file FILE` accepts
 a JSON member-ID/address map and proposes a joint transition. Automatic maintenance
 and pre-admission catch-up policy remain future work.
 
-Defaults are a 500 ms heartbeat, randomized 3000–6000 ms election timeout, and
-1000 ms RPC timeout. Recent primary contact suppresses ordinary vote requests.
-Key reads require a committed current-term entry and fresh quorum confirmation;
-concurrent reads can share a heartbeat round. No clock-based read lease is used.
+Defaults are a 75 ms heartbeat, randomized 150–300 ms election timeout, and
+1000 ms RPC timeout. Heartbeat and minimum/maximum election timeouts are separate
+parameters. One `primary_wait_ms`, default 150, supplies both the read-lease
+lifetime and the new-primary startup delay. Configuration validation requires positive heartbeat,
+RPC timeout and read lease; `election_min_ms >= 2 * heartbeat_ms`,
+`election_max_ms > election_min_ms`, and `primary_wait_ms >= election_min_ms`.
+The election-gap clock margin requires `2 * primary_wait_ms < 99 * election_min_ms`.
+Recent primary contact suppresses ordinary vote requests.
+Key reads require a committed and applied current-term entry and a live 150 ms
+read lease. A successful current-term AppendEntries response contributes its
+request's send time, never its receive time. A quorum of unexpired acknowledgments
+(in both configurations during joint consensus) permits reads without a fresh
+network round. Ordinary heartbeats with no term, log, or commit change do not
+write the journal. Expiry blocks reads but does not force an election.
+
+A newly elected primary waits 150 ms before serving reads or acknowledging writes.
+It can journal, commit, and apply during this interval. It must commit and apply
+through its current-term no-op before reads. Quorum intersection places an old
+primary's last successful heartbeat send before the replacement's election; the
+election quiet period plus the replacement's wait outlasts the old lease.
+A restarted member also waits the minimum election interval before granting votes,
+so restart cannot erase this quiet period. Membership proposals also pass the
+startup gate before execution. Leadership changes and restart discard lease state.
+
+Leases use Linux CLOCK_BOOTTIME, which is monotonic and includes system suspend.
+The timing assumption is clock rates within 1% of real elapsed time, including
+across suspend or virtual-machine pauses. The minimum-election quiet period is E
+and the common lease/wait duration is D. Safety uses (E+D)/1.01 > D/0.99,
+equivalently 99E > 2D. At the defaults this leaves a large margin. Clock timestamp
+offsets are irrelevant: only elapsed-time rates enter this argument. An immediate
+handoff must preserve this gap or otherwise revoke old read permission before
+bypassing it.
+Clock offsets between hosts need not agree. A host/VM that freezes or resets this
+clock violates the assumption and cannot safely use this protocol. All members
+must obey the same `primary_wait_ms` value (default 150 ms); mixing the previous
+no-wait implementation with this implementation is unsafe. Restart the whole
+ring when introducing this change; do not roll it out member by member.
+
+Reads recheck the lease after proposal/lock waits and after capturing their result,
+while holding the consensus mutex and execution read lock. Thus delayed lock
+acquisition or a pause during derivation cannot return newly captured stale state
+under an expired lease. KS's small derivation still uses local locks; future SN/DN
+integration must preserve the same gate while optimizing local read concurrency.
 Followers forward key and membership requests to a known primary. Requests waiting
 for quorum do not occupy the shared server worker needed to handle consensus RPCs.
 Machine authentication checks the sender, and replies identify the expected member.
@@ -18644,5 +18683,5 @@ This initial implementation uses whole JSON messages and a 64 MiB journal frame
 limit. Snapshot transfer is not chunked. Large SN/DN state requires bounded-memory
 streaming and different snapshot capture before reusing this implementation there
 (issue #125).
-Leadership handoff, selective execution, read leases, and independent execution
+Leadership handoff, selective execution, and independent execution
 liveness monitoring are deferred.

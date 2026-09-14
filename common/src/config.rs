@@ -645,9 +645,15 @@ pub struct Knobs {
 pub struct RaftConfig {
     pub ring: String,
     pub members: BTreeMap<String, SocketAddr>,
+    /// Positive; election_min_ms must be at least twice this interval.
     pub heartbeat_ms: u64,
+    /// At least 2 * heartbeat_ms, and no greater than primary_wait_ms.
     pub election_min_ms: u64,
+    /// Strictly greater than election_min_ms; elections randomize within this range.
     pub election_max_ms: u64,
+    /// Both read-lease lifetime (from heartbeat send) and new-primary service delay.
+    /// Must be >= election_min_ms; all ring members must use the same value.
+    pub primary_wait_ms: u64,
     pub request_timeout_ms: u64,
 }
 impl Default for RaftConfig {
@@ -655,11 +661,37 @@ impl Default for RaftConfig {
         Self {
             ring: "KS0".into(),
             members: BTreeMap::new(),
-            heartbeat_ms: 500,
-            election_min_ms: 3000,
-            election_max_ms: 6000,
+            heartbeat_ms: 75,
+            election_min_ms: 150,
+            election_max_ms: 300,
+            primary_wait_ms: 150,
             request_timeout_ms: 1000,
         }
+    }
+}
+
+impl RaftConfig {
+    pub fn validate_timing(&self) -> Result<()> {
+        if self.heartbeat_ms == 0 || self.request_timeout_ms == 0 || self.primary_wait_ms == 0 {
+            return Err(Error::new(
+                "Raft heartbeat, RPC timeout, and primary wait must be positive",
+            ));
+        }
+        if self.heartbeat_ms > self.election_min_ms / 2 {
+            return Err(Error::new("Raft election_min_ms must be >= 2 * heartbeat_ms"));
+        }
+        if self.election_max_ms <= self.election_min_ms {
+            return Err(Error::new("Raft election_max_ms must be > election_min_ms"));
+        }
+        if self.primary_wait_ms < self.election_min_ms {
+            return Err(Error::new("Raft primary_wait_ms must be >= election_min_ms"));
+        }
+        // At 1% rate error, the election quiet period covers the discrepancy between
+        // equal lease/wait durations: (election_min + wait)/1.01 > wait/0.99.
+        if u128::from(self.primary_wait_ms) * 2 >= u128::from(self.election_min_ms) * 99 {
+            return Err(Error::new("Raft primary wait is too long for the election clock margin"));
+        }
+        Ok(())
     }
 }
 
