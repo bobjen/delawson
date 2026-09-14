@@ -328,11 +328,17 @@ restart the whole ring when introducing leases or changing those settings.
 Use the actual configured listen addresses. Locked members can vote and journal
 entries toward commitment. An unlocked member can unlock authenticated peers.
 Key reads reuse quorum heartbeat acknowledgments for a 150 ms lease measured
-from send time. After election, a primary waits 150 ms and commits/applies its
-current-term no-op before serving clients. A minority loses read permission when
+from send time. A shared incoming-client gate waits 150 ms after election and requires the
+current-term no-op committed/applied before dispatch. Requests admitted under a
+live lease may finish after its expiry; there is no response-delivery deadline. A minority loses read permission when
 its lease expires. The lease clock includes system suspend; safety assumes clock
 rates within 1% of real time. All ring members must use the same lease protocol.
-Followers forward requests to a known primary. `laws raft-members --members-file
+Followers forward requests to a known primary. A demoted primary exits its process
+before entering a new term, after a bounded log-flush/backtrace attempt (at most
+five seconds). It cannot become primary again during cleanup. A supervisor or
+operator must restart it. Removal of
+the primary also exits the process, so that membership request may lose its reply
+even though the change committed. `laws raft-members --members-file
 FILE` proposes a joint-consensus transition using a JSON ID/address map. New IDs
 must be admitted KS processes. Automatic ring maintenance and client bootstrap
 failover remain future work; `--to` and `--at` select a member explicitly.

@@ -9,6 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub struct Admission<'a> {
+    pub history: Option<std::sync::RwLockReadGuard<'a, KeyHistory>>,
+}
+
 pub struct Settings {
     pub id: String,
     pub ring: String,
@@ -95,11 +99,11 @@ struct ConsensusReply {
 }
 
 pub fn waits_for_quorum(request: &Req) -> bool {
-    if matches!(request.op, Op::SnMasterKey | Op::RotateMasterKey | Op::RaftMembers) {
-        return true;
+    if matches!(request.op, Op::Unlock | Op::Register) {
+        return false;
     }
     if request.op != Op::Raft {
-        return false;
+        return true;
     }
     match request.args.as_slice() {
         [Arg::Text(_), Arg::Bytes(bytes)] => {
@@ -108,6 +112,7 @@ pub fn waits_for_quorum(request: &Req) -> bool {
         _ => false,
     }
 }
+
 fn json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(|e| Error::new(e.to_string()))
 }
@@ -198,7 +203,7 @@ impl Ks {
         node.propose(Command::Key(sealed))?;
         Ok(())
     }
-    pub fn confirm_leader(&self) -> Result<()> {
+    pub fn admit_client(&self, read: bool) -> Result<Admission<'_>> {
         let began = Instant::now();
         let deadline = began
             + Duration::from_millis(
@@ -210,9 +215,21 @@ impl Ks {
                 if node.role != Role::Leader || node.journal.failed {
                     return Err(Error::new("KS is not a healthy Raft leader"));
                 }
-                if node.can_read(lease::now()?) {
+                if node.can_admit(lease::now()?) {
                     self.refresh_keys(&node)?;
-                    return Ok(());
+                    let history = if read {
+                        Some(
+                            self.global_lock
+                                .read()
+                                .map_err(|_| Error::new("global lock poisoned"))?,
+                        )
+                    } else {
+                        None
+                    };
+                    // Admission occurs after lock acquisition and application catch-up.
+                    if node.can_admit(lease::now()?) {
+                        return Ok(Admission { history });
+                    }
                 }
             }
             if Instant::now() >= deadline {
@@ -222,7 +239,7 @@ impl Ks {
         }
     }
     pub fn propose_key(&self, epoch: MasterEpoch) -> Result<u64> {
-        let (index, term) = {
+        let index = {
             let mut node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
             if node.state().last() != node.state().commit {
                 return Err(Error::new(
@@ -240,21 +257,20 @@ impl Ks {
                     "new key activation must be later than the last recorded activation",
                 ));
             }
-            let term = node.state().term;
             let index = node
                 .state()
                 .last()
                 .checked_add(1)
                 .ok_or_else(|| Error::new("Raft index overflow"))?;
-            let sealed = seal_key(&key, &self.runtime.ring, index, term, &epoch)?;
+            let sealed = seal_key(&key, &self.runtime.ring, index, node.state().term, &epoch)?;
             let index = node.propose(Command::Key(sealed))?;
             self.refresh_keys(&node)?;
-            (index, term)
+            index
         };
-        self.wait_committed(index, term)?;
+        self.wait_committed(index)?;
         Ok(index)
     }
-    pub fn wait_committed(&self, index: u64, term: u64) -> Result<()> {
+    pub fn wait_committed(&self, index: u64) -> Result<()> {
         let deadline = Instant::now()
             + Duration::from_millis(
                 self.config
@@ -269,12 +285,12 @@ impl Ks {
                 if node.journal.failed {
                     return Err(Error::new("KS journal failed"));
                 }
-                if node.state().term != term || node.role != Role::Leader {
+                if node.role != Role::Leader {
                     return Err(Error::new(
                         "KS leadership changed; request outcome may be unknown",
                     ));
                 }
-                if node.state().commit >= index && node.lease.ready(term, lease::now()?) {
+                if node.state().commit >= index {
                     self.refresh_keys(&node)?;
                     return Ok(());
                 }
@@ -353,7 +369,7 @@ impl Ks {
             .unwrap_or_else(error),
         )
     }
-    pub fn raft_rpc(&self, request: &Req) -> Resp {
+    pub fn raft_rpc(&self, process: &Process, request: &Req) -> Resp {
         let result = (|| -> Result<Resp> {
             let [Arg::Text(sender), Arg::Bytes(bytes)] = request.args.as_slice() else {
                 return Err(Error::new("invalid Raft RPC"));
@@ -420,14 +436,10 @@ impl Ks {
                         return Err(Error::new("forward target is no longer KS leader"));
                     }
                     let request = Req { id: 0, op, args: vec![Arg::Struct(op, payload, depth)] };
-                    match op {
-                        Op::SnMasterKey => Ok(self.sn_key(&request)),
-                        Op::RotateMasterKey => {
-                            self.rotate_master_key(&request).map(|()| Resp::ok())
-                        }
-                        Op::RaftMembers => Ok(self.change_members(&request)),
-                        _ => Err(Error::new("operation cannot be forwarded through Raft")),
+                    if !matches!(op, Op::SnMasterKey | Op::RotateMasterKey | Op::RaftMembers) {
+                        return Err(Error::new("operation cannot be forwarded through Raft"));
                     }
+                    Ok(self.client_request(process, &request, false))
                 }
             }
         })();
@@ -458,27 +470,16 @@ impl Ks {
             {
                 return Err(Error::new("new member is not a KS in the roster"));
             }
-            // Finish the election service delay before publishing a configuration result,
-            // including a final configuration that removes this primary.
-            self.confirm_leader()?;
             let target = Membership { old: members.clone(), new: None };
             let _proposal =
                 self.proposing.lock().map_err(|_| Error::new("proposal lock poisoned"))?;
-            let (index, term) = {
+            let index = {
                 let mut node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
-                if !node.lease.ready(node.state().term, lease::now()?) {
-                    return Err(Error::new(
-                        "KS primary is waiting for previous read leases to expire",
-                    ));
-                }
                 let old = node.state().membership();
                 if old.new.is_some() || node.state().commit != node.state().last() {
                     return Err(Error::new("Raft configuration or proposal already pending"));
                 }
-                let term = node.state().term;
-                let index = node
-                    .propose(Command::Members(Membership { old: old.old, new: Some(members) }))?;
-                (index, term)
+                node.propose(Command::Members(Membership { old: old.old, new: Some(members) }))?
             };
             let deadline = Instant::now()
                 + Duration::from_millis(
@@ -495,7 +496,7 @@ impl Ks {
                     {
                         return Ok(());
                     }
-                    if node.state().term != term || node.role != Role::Leader {
+                    if node.role != Role::Leader {
                         return Err(Error::new("leadership changed during membership change"));
                     }
                 }
@@ -680,5 +681,45 @@ impl Ks {
             .context("starting Raft peer worker")?;
         self.raft_workers.lock().map_err(|_| Error::new("worker lock poisoned"))?.push(handle);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn clients_wait_off_the_raft_worker_including_forwarded_requests() {
+        let clients: Vec<_> = SERVES
+            .iter()
+            .copied()
+            .filter(|op| !matches!(op, Op::Raft | Op::Unlock | Op::Register))
+            .collect();
+        let all_clients = clients.iter().all(|op| waits_for_quorum(&Req::new(*op)));
+        let unknown_client = waits_for_quorum(&Req::new(Op::BytesResp));
+        let unlock = waits_for_quorum(&Req::new(Op::Unlock));
+        let registration = waits_for_quorum(&Req::new(Op::Register));
+        let packet = |message| {
+            Req::new(Op::Raft)
+                .text("KS0")
+                .bytes(json(&Packet { ring: "test".into(), unlocked: false, message }).unwrap())
+        };
+        let consensus = waits_for_quorum(&packet(Message::Consensus(Rpc::Vote {
+            term: 1,
+            last: 0,
+            last_term: 0,
+        })));
+        let transfer = waits_for_quorum(&packet(Message::Unlock([0; 32])));
+        let forwarded = waits_for_quorum(&packet(Message::Forward {
+            op: Op::SnMasterKey.code(),
+            payload: vec![],
+            depth: 0,
+        }));
+        assert!(all_clients);
+        assert!(unknown_client);
+        assert!(!unlock);
+        assert!(!registration);
+        assert!(!consensus);
+        assert!(!transfer);
+        assert!(forwarded);
     }
 }

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Three KS processes: election, encrypted recovery, failover and quorum loss. No TPM required."""
 import json
+import os
+import signal
 from pathlib import Path
 import socket
 import subprocess
@@ -73,8 +75,8 @@ def main():
         def status(id):
             text = command(id, 'status')
             return dict(line.split(' ', 1) for line in text.splitlines() if ' ' in line)
-        def leader():
-            found = [id for id in children if status(id).get('raft_role') == 'Leader']
+        def leader(exclude=()):
+            found = [id for id in children if id not in exclude and children[id].poll() is None and status(id).get('raft_role') == 'Leader']
             return found[0] if len(found) == 1 else None
         try:
             for id in members: start(id)
@@ -94,9 +96,18 @@ def main():
             creation = str(int(time.time()))
             expected = command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation)
             until(lambda: all(len(list((work/id/'data/master-keys').glob('snapshot-*.bin'))) > 1 for id in children))
-            stop(primary)
-            successor = until(leader)
-            assert command(successor, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
+            # Suspend the primary so another is elected, then resume the stale process.
+            # It must terminate itself on demotion, not continue in a newer term.
+            old_primary = children[primary]
+            os.kill(old_primary.pid, signal.SIGSTOP)
+            successor = until(lambda: leader(exclude=(primary,)))
+            actual = command(successor, 'sn-master-key', '--sn', '0', '--creation-second', creation)
+            assert actual == expected
+            os.kill(old_primary.pid, signal.SIGCONT)
+            until(lambda: old_primary.poll() is not None)
+            exit_code = old_primary.wait(timeout=10)
+            assert exit_code == 0, exit_code
+            children.pop(primary)
             start(primary)
             until(lambda: status(primary).get('unlocked') == 'true' and int(status(primary)['master_keys']) == 2)
             assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
@@ -129,7 +140,18 @@ def main():
             time.sleep(1.5)
             assert status(primary)['raft_term'] == term
             assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
-            print('PASS: locked quorum; unlock propagation; committed key rotation; follower forwarding; primary failover; restart catch-up; quorum-loss read refusal; full locked restart; snapshot catch-up of a new member; joint membership; removed-member election suppression.')
+            # Removing the current primary also terminates it after final commitment.
+            membership_file.write_text(json.dumps({id: address for id, address in members.items() if id not in (removed, primary)}))
+            command(primary, 'raft-members', '--members-file', membership_file, success=False)
+            departed = children[primary]
+            until(lambda: departed.poll() is not None)
+            exit_code = departed.wait(timeout=10)
+            assert exit_code == 0, exit_code
+            children.pop(primary)
+            successor = until(leader)
+            actual = command(successor, 'sn-master-key', '--sn', '0', '--creation-second', creation)
+            assert actual == expected
+            print('PASS: demoted-primary process exit; primary removal exit; locked quorum; unlock propagation; committed key rotation; follower forwarding; primary failover; restart catch-up; quorum-loss read refusal; full locked restart; snapshot catch-up of a new member; joint membership; removed-member election suppression.')
         except BaseException:
             for id in members:
                 if id in children:

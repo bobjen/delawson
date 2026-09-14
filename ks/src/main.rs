@@ -88,7 +88,7 @@ impl Service for Ks {
     }
 
     fn defers(&self, op: Op) -> bool {
-        matches!(op, Op::SnMasterKey | Op::RotateMasterKey | Op::RaftMembers | Op::Raft)
+        SERVES.contains(&op) && !matches!(op, Op::Unlock | Op::Register)
     }
     fn handle(
         self: &std::sync::Arc<Self>,
@@ -129,41 +129,14 @@ impl Service for Ks {
     }
 
     fn answer(&self, process: &Process, request: &Req) -> Resp {
-        if matches!(request.op, Op::SnMasterKey | Op::RotateMasterKey | Op::RaftMembers) {
-            if let Some(answer) = self.forward(request) {
-                return answer;
-            }
-        }
         match request.op {
-            Op::Raft => self.raft_rpc(request),
-            Op::RaftMembers => self.change_members(request),
+            Op::Raft => self.raft_rpc(process, request),
             Op::Register => self.enroll(process, request),
-            Op::Lookup => self.lookup(request),
-            Op::AssignPeers => self.assign_peers(process, request),
-            Op::Registry => registry::response(self.peers.lock().expect("peers").values().cloned()),
-
-            Op::SnMasterKey => {
-                if !self.unlocked.load(Ordering::SeqCst) {
-                    return Resp::error(Status::Locked, "KS is locked");
-                }
-                self.sn_key(request)
-            }
-
-            Op::RotateMasterKey => {
-                if !self.unlocked.load(Ordering::SeqCst) {
-                    return Resp::error(Status::Locked, "KS is locked");
-                }
-                match self.rotate_master_key(request) {
-                    Ok(()) => Resp::ok(),
-                    Err(e) => Resp::error(Status::BadRequest, e.to_string()),
-                }
-            }
-
             Op::Unlock => match self.unlock(request) {
                 Ok(()) => Resp::ok(),
                 Err(e) => Resp::error(Status::BadRequest, e.to_string()),
             },
-            _ => server::unbuilt(process, SERVES, request),
+            _ => self.client_request(process, request, true),
         }
     }
 
@@ -195,6 +168,47 @@ impl Service for Ks {
 }
 
 impl Ks {
+    /// Direct requests and forwarded client requests share this admission boundary.
+    fn client_request(&self, process: &Process, request: &Req, allow_forward: bool) -> Resp {
+        if allow_forward
+            && matches!(request.op, Op::SnMasterKey | Op::RotateMasterKey | Op::RaftMembers)
+        {
+            if let Some(answer) = self.forward(request) {
+                return answer;
+            }
+        }
+        // Key generation is internal maintenance; it may journal/apply during the wait.
+        if request.op == Op::SnMasterKey && self.unlocked.load(Ordering::SeqCst) {
+            if let Err(e) = self.prepare_key_read() {
+                return Resp::error(Status::Internal, e.to_string());
+            }
+        }
+        let admission = match self.admit_client(request.op == Op::SnMasterKey) {
+            Ok(admission) => admission,
+            Err(e) => return Resp::error(Status::Internal, e.to_string()),
+        };
+        match request.op {
+            Op::RaftMembers => self.change_members(request),
+            Op::Lookup => self.lookup(request),
+            Op::AssignPeers => self.assign_peers(process, request),
+            Op::Registry => registry::response(self.peers.lock().expect("peers").values().cloned()),
+            Op::SnMasterKey => match admission.history.as_deref() {
+                Some(history) => self.sn_key(request, history),
+                None => Resp::error(Status::Internal, "missing admitted key history"),
+            },
+            Op::RotateMasterKey => {
+                if !self.unlocked.load(Ordering::SeqCst) {
+                    return Resp::error(Status::Locked, "KS is locked");
+                }
+                match self.rotate_master_key(request) {
+                    Ok(()) => Resp::ok(),
+                    Err(e) => Resp::error(Status::BadRequest, e.to_string()),
+                }
+            }
+            _ => server::unbuilt(process, SERVES, request),
+        }
+    }
+
     fn stop_snapshot_worker(&self) -> Result<()> {
         self.snapshot_stopping.store(true, Ordering::SeqCst);
         loop {
@@ -346,7 +360,7 @@ impl Ks {
         self.open_keys(key)
     }
 
-    fn sn_key(&self, request: &Req) -> Resp {
+    fn sn_key(&self, request: &Req, history: &KeyHistory) -> Resp {
         if !self.unlocked.load(Ordering::SeqCst) {
             return Resp::error(Status::Locked, "KS is locked");
         }
@@ -369,31 +383,25 @@ impl Ks {
             Ok(at) => at,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        match self.sn_key_for(sn, at) {
+        match Self::sn_key_for(history, sn, at) {
             Ok(key) => Resp { id: 0, status: Status::Ok, args: vec![key.write()] },
             Err(e) => Resp::error(Status::Internal, e.to_string()),
         }
     }
 
-    fn sn_key_for(&self, sn: common::ids::SnId, at: TimeSec) -> Result<SnKey> {
-        self.confirm_leader()?;
-        let (index, term) = {
+    fn prepare_key_read(&self) -> Result<()> {
+        let index = {
             let mut node =
                 self.journal.lock().map_err(|_| common::Error::new("Raft lock poisoned"))?;
             self.initial_key(&mut node)?;
-            (node.state().last(), node.state().term)
+            node.state().last()
         };
-        self.wait_committed(index, term)?;
-        self.ensure_future_key()?;
-        // Recheck after any proposal or lock wait. Keep consensus and execution stable
-        // while capturing the result, then check time again to cover pauses during capture.
-        self.confirm_leader()?;
-        let node = self.journal.lock().map_err(|_| common::Error::new("Raft lock poisoned"))?;
-        if node.journal.failed || !node.can_read(lease::now()?) {
-            return Err(common::Error::new("KS read lease expired"));
-        }
-        let epochs = self.global_lock.read().expect("global_lock");
-        let epochs = &epochs.epochs;
+        self.wait_committed(index)?;
+        self.ensure_future_key()
+    }
+
+    fn sn_key_for(history: &KeyHistory, sn: common::ids::SnId, at: TimeSec) -> Result<SnKey> {
+        let epochs = &history.epochs;
         let count = epochs.partition_point(|epoch| epoch.since <= at);
         let current = count
             .checked_sub(1)
@@ -404,9 +412,6 @@ impl Ks {
             .get(count)
             .map(|epoch| (epoch.since, crypto::sn_key(&epoch.key, sn, epoch.since)));
         let result = SnKey { current: current_key, next };
-        if !node.can_read(lease::now()?) {
-            return Err(common::Error::new("KS read lease expired during key derivation"));
-        }
         Ok(result)
     }
 

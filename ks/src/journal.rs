@@ -528,21 +528,45 @@ mod tests {
     #[ignore = "filesystem integration; run explicitly with --ignored"]
     fn snapshot_write_can_overlap_new_journal_records_without_regressing_state() {
         let dir = tempfile::tempdir().unwrap();
-        let mut node =
-            Node::new("KS0".into(), Journal::open(dir.path(), initial(), 3, "KS0").unwrap());
-        node.campaign().unwrap();
-        node.propose(Command::Key(vec![8; 104])).unwrap();
-        let pending = node.journal.prepare_snapshot(10).unwrap().unwrap();
-        node.propose(Command::Key(vec![9; 104])).unwrap();
-        node.campaign().unwrap();
-        let term = node.state().term;
-        let commit = node.state().commit;
+        let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        journal
+            .write(&[
+                Record::Hard { term: 1, vote: None },
+                Record::Entries {
+                    from: 1,
+                    entries: vec![crate::raft::Entry {
+                        index: 1,
+                        term: 1,
+                        command: Command::Key(vec![8; 104]),
+                    }],
+                },
+                Record::Commit(1),
+            ])
+            .unwrap();
+        let pending = journal.prepare_snapshot(10).unwrap().unwrap();
+        // A follower can journal entries and a newer term while its snapshot writes.
+        journal
+            .write(&[
+                Record::Entries {
+                    from: 2,
+                    entries: vec![crate::raft::Entry {
+                        index: 2,
+                        term: 1,
+                        command: Command::Key(vec![9; 104]),
+                    }],
+                },
+                Record::Commit(2),
+                Record::Hard { term: 2, vote: None },
+            ])
+            .unwrap();
+        let term = journal.state.term;
+        let commit = journal.state.commit;
         pending.write().unwrap();
-        node.journal.finish_snapshot(&pending).unwrap();
-        assert_eq!(node.state().term, term);
-        assert_eq!(node.state().commit, commit);
-        let expected = node.state().capture();
-        drop(node);
+        journal.finish_snapshot(&pending).unwrap();
+        assert_eq!(journal.state.term, term);
+        assert_eq!(journal.state.commit, commit);
+        let expected = journal.state.capture();
+        drop(journal);
         let restored = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
         assert_eq!(restored.state.capture(), expected);
         assert_eq!(restored.state.term, term);

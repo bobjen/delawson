@@ -278,6 +278,7 @@ pub enum Role {
     Follower,
     Candidate,
     Leader,
+    Stopped,
 }
 
 /// A successful write means the whole batch is journaled. A failure must never
@@ -322,7 +323,56 @@ impl<S: Storage> Node<S> {
     fn persist(&mut self, records: Vec<Record>) -> Result<()> {
         self.journal.write(&records)
     }
+    fn stop_primary(&mut self) -> Result<()> {
+        self.role = Role::Stopped;
+        self.lease.reset();
+        self.leader = None;
+        // A process has only one primary tenure; exit discards its delayed messages.
+        // If demotion ever keeps this process alive, delayed messages must retain
+        // their admission term and check it before proposing work in a new term.
+        #[cfg(not(test))]
+        {
+            // Arm the hard deadline before any logging or stack symbolization can block.
+            let watchdog = std::thread::Builder::new().name("raft-exit".into()).spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                unsafe { libc::_exit(0) }
+            });
+            if watchdog.is_err() {
+                unsafe { libc::_exit(1) }
+            }
+            common::logn!(
+                "Raft primary demoted; ending process",
+                "member {},term {}",
+                self.id,
+                self.state().term
+            );
+            common::log::flush();
+            let stack: String = std::backtrace::Backtrace::force_capture()
+                .to_string()
+                .chars()
+                .take(16 * 1024)
+                .map(|c| if c == '\n' { '|' } else { c })
+                .collect();
+            common::logn!("Raft primary demotion stack", "{}", stack);
+            common::log::flush();
+            // Avoid unbounded atexit handlers after the bounded cleanup attempt.
+            unsafe { libc::_exit(0) }
+        }
+        // Unit tests simulate process death without terminating the whole test runner.
+        #[cfg(test)]
+        Err(Error::new("Raft primary process ended"))
+    }
+    fn running(&self) -> Result<()> {
+        if self.role == Role::Stopped {
+            return Err(Error::new("Raft process has ended"));
+        }
+        Ok(())
+    }
     fn follow(&mut self, term: u64) -> Result<()> {
+        self.running()?;
+        if self.role == Role::Leader {
+            return self.stop_primary();
+        }
         if term > self.state().term {
             self.persist(vec![Record::Hard { term, vote: None }])?;
         }
@@ -333,6 +383,10 @@ impl<S: Storage> Node<S> {
         Ok(())
     }
     pub fn campaign(&mut self) -> Result<()> {
+        self.running()?;
+        if self.role == Role::Leader {
+            return self.stop_primary();
+        }
         if !self.state().membership().members().contains_key(&self.id) {
             return Ok(());
         }
@@ -418,7 +472,7 @@ impl<S: Storage> Node<S> {
                 now.checked_duration_since(seen).is_none_or(|elapsed| elapsed < minimum)
             })
     }
-    pub fn can_read(&self, now: std::time::Duration) -> bool {
+    pub fn can_admit(&self, now: std::time::Duration) -> bool {
         self.role == Role::Leader
             && self.state().term_at(self.state().commit) == Some(self.state().term)
             && self.lease.valid(self.state().term, &self.id, &self.state().membership(), now)
@@ -426,7 +480,7 @@ impl<S: Storage> Node<S> {
     pub fn request(&self, peer: &str) -> Option<Rpc> {
         let s = self.state();
         match self.role {
-            Role::Follower => None,
+            Role::Follower | Role::Stopped => None,
             Role::Candidate => {
                 Some(Rpc::Vote { term: s.term, last: s.last(), last_term: s.term_at(s.last())? })
             }
@@ -447,6 +501,7 @@ impl<S: Storage> Node<S> {
         }
     }
     pub fn receive(&mut self, sender: &str, rpc: &Rpc) -> Result<Answer> {
+        self.running()?;
         if rpc.term() > self.state().term {
             self.follow(rpc.term())?;
         }
@@ -471,8 +526,7 @@ impl<S: Storage> Node<S> {
                 }
             }
             Rpc::Append { previous, previous_term, entries, commit, .. } => {
-                self.lease.reset();
-                self.role = Role::Follower;
+                self.follow(self.state().term)?;
                 self.leader = Some(sender.into());
                 self.contact = self.contact.wrapping_add(1);
                 self.leader_contact = Some(std::time::Instant::now());
@@ -507,8 +561,7 @@ impl<S: Storage> Node<S> {
                 answer.matched = matched;
             }
             Rpc::Install { snapshot, .. } => {
-                self.lease.reset();
-                self.role = Role::Follower;
+                self.follow(self.state().term)?;
                 self.leader = Some(sender.into());
                 self.contact = self.contact.wrapping_add(1);
                 self.leader_contact = Some(std::time::Instant::now());
@@ -522,6 +575,7 @@ impl<S: Storage> Node<S> {
         Ok(answer)
     }
     pub fn response(&mut self, peer: &str, request: &Rpc, answer: &Answer) -> Result<()> {
+        self.running()?;
         if answer.term > self.state().term {
             return self.follow(answer.term);
         }
@@ -624,8 +678,20 @@ pub mod tests {
     }
     fn exchange(a: &mut TestNode, b: &mut TestNode) {
         if let Some(request) = a.request(&b.id) {
-            let response = b.receive(&a.id, &request).unwrap();
-            a.response(&b.id, &request, &response).unwrap();
+            let response = match b.receive(&a.id, &request) {
+                Ok(response) => response,
+                Err(_) if b.role == Role::Stopped => {
+                    *b = restart(b);
+                    return;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            let result = a.response(&b.id, &request, &response);
+            if a.role == Role::Stopped {
+                *a = restart(a);
+            } else {
+                result.unwrap();
+            }
         }
     }
     fn pair(nodes: &mut [TestNode], a: usize, b: usize) {
@@ -665,29 +731,163 @@ pub mod tests {
         let term = nodes[0].state().term;
         nodes[0].lease = crate::lease::Lease::elected(term, ms(0));
         nodes[0].lease.acknowledge("KS1", term, ms(100));
-        let no_commit = nodes[0].can_read(ms(160));
+        let no_commit = nodes[0].can_admit(ms(160));
         pair(&mut nodes, 0, 1); // Commit the no-op.
         pair(&mut nodes, 0, 1); // Tell the follower that it is committed.
         let before = (nodes[0].journal.records.len(), nodes[1].journal.records.len());
         pair(&mut nodes, 0, 1); // Ordinary empty heartbeat: no persistent state changes.
         let after = (nodes[0].journal.records.len(), nodes[1].journal.records.len());
-        let ready = nodes[0].can_read(ms(160));
-        let repeated_reads = (160..250).all(|at| nodes[0].can_read(ms(at)));
-        let expired = nodes[0].can_read(ms(250));
+        let ready = nodes[0].can_admit(ms(160));
+        let repeated_reads = (160..250).all(|at| nodes[0].can_admit(ms(at)));
+        let expired = nodes[0].can_admit(ms(250));
         let restored = restart(&nodes[0]);
-        let restart_can_read = restored.can_read(ms(160));
+        let restart_can_read = restored.can_admit(ms(160));
         let old = nodes[0].state();
         let vote = Rpc::Vote { term: term + 1, last: old.last(), last_term: term };
-        let answer = nodes[0].receive("KS2", &vote).unwrap();
-        let stepped_down = nodes[0].can_read(ms(160));
+        let answer = nodes[0].receive("KS2", &vote);
+        let stepped_down = nodes[0].can_admit(ms(160));
         assert!(!no_commit);
         assert_eq!(before, after);
         assert!(ready);
         assert!(repeated_reads);
         assert!(!expired);
         assert!(!restart_can_read);
-        assert!(answer.success);
+        assert!(answer.is_err());
         assert!(!stepped_down);
+    }
+
+    #[test]
+    fn admitted_writes_can_finish_after_expiry_but_demotion_discards_them() {
+        use std::time::Duration;
+        let mut nodes = cluster(3);
+        nodes[0].campaign().unwrap();
+        pair(&mut nodes, 0, 1);
+        pair(&mut nodes, 0, 1);
+        let term = nodes[0].state().term;
+        nodes[0].lease = crate::lease::Lease::elected(term, Duration::ZERO);
+        nodes[0].lease.acknowledge("KS1", term, Duration::from_millis(100));
+        let admitted = nodes[0].can_admit(Duration::from_millis(160));
+        let after_expiry = nodes[0].can_admit(Duration::from_millis(250));
+        let accepted = nodes[0].propose(Command::Noop);
+        let index = accepted.unwrap();
+        pair(&mut nodes, 0, 1);
+        let committed = nodes[0].state().commit;
+        let vote = Rpc::Vote { term: term + 1, last: index, last_term: term };
+        let answer = nodes[0].receive("KS2", &vote);
+        let before = nodes[0].journal.records.len();
+        let rejected = nodes[0].propose(Command::Noop);
+        let after = nodes[0].journal.records.len();
+        assert!(admitted);
+        assert!(!after_expiry);
+        assert_eq!(committed, index);
+        assert!(answer.is_err());
+        assert!(rejected.is_err());
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn demotion_ends_primary_before_higher_term_or_delayed_work() {
+        let leader = || {
+            let mut nodes = cluster(3);
+            nodes[0].campaign().unwrap();
+            pair(&mut nodes, 0, 1);
+            pair(&mut nodes, 0, 1);
+            nodes.remove(0)
+        };
+        for trigger in 0..7 {
+            let mut node = leader();
+            let old_term = node.state().term;
+            let before = node.journal.records.len();
+            let higher = old_term + 1;
+            let result = match trigger {
+                0 => node
+                    .receive("KS1", &Rpc::Vote { term: higher, last: 1, last_term: old_term })
+                    .map(|_| ()),
+                1 | 2 => node
+                    .receive(
+                        "KS1",
+                        &Rpc::Append {
+                            term: if trigger == 1 { higher } else { old_term },
+                            previous: 1,
+                            previous_term: old_term,
+                            entries: vec![],
+                            commit: 1,
+                        },
+                    )
+                    .map(|_| ()),
+                3 | 4 => node
+                    .receive(
+                        "KS1",
+                        &Rpc::Install {
+                            term: if trigger == 3 { higher } else { old_term },
+                            snapshot: node.state().capture(),
+                        },
+                    )
+                    .map(|_| ()),
+                5 => node.response(
+                    "KS1",
+                    &node.request("KS1").unwrap(),
+                    &Answer { term: higher, success: false, matched: 0 },
+                ),
+                _ => node.campaign(),
+            };
+            let stopped = node.role;
+            let delayed_proposal = node.propose(Command::Noop);
+            let delayed_campaign = node.campaign();
+            let delayed_rpc =
+                node.receive("KS1", &Rpc::Vote { term: higher, last: 1, last_term: old_term });
+            let delayed_response = node.response(
+                "KS1",
+                &Rpc::Vote { term: higher, last: 1, last_term: old_term },
+                &Answer { term: higher, success: true, matched: 1 },
+            );
+            let no_request = node.request("KS1");
+            let after = node.journal.records.len();
+            let persisted_term = node.state().term;
+            let restored = restart(&node);
+            assert!(result.is_err());
+            assert_eq!(stopped, Role::Stopped);
+            assert!(delayed_proposal.is_err());
+            assert!(delayed_campaign.is_err());
+            assert!(delayed_rpc.is_err());
+            assert!(delayed_response.is_err());
+            assert!(no_request.is_none());
+            assert_eq!(before, after);
+            assert_eq!(persisted_term, old_term);
+            assert_eq!(restored.role, Role::Follower);
+        }
+    }
+
+    #[test]
+    fn removing_primary_commits_final_membership_then_ends_process() {
+        let mut nodes = cluster(3);
+        nodes[0].campaign().unwrap();
+        pair(&mut nodes, 0, 1);
+        pair(&mut nodes, 0, 1);
+        let mut new = members(3);
+        new.remove("KS0");
+        nodes[0]
+            .propose(Command::Members(Membership { old: members(3), new: Some(new.clone()) }))
+            .unwrap();
+        for _ in 0..8 {
+            for other in 1..3 {
+                if nodes[0].role == Role::Stopped {
+                    break;
+                }
+                let request = nodes[0].request(&format!("KS{other}")).unwrap();
+                let answer = nodes[other].receive("KS0", &request).unwrap();
+                let result = nodes[0].response(&format!("KS{other}"), &request, &answer);
+                if nodes[0].role != Role::Stopped {
+                    result.unwrap();
+                }
+            }
+        }
+        let stopped = nodes[0].role;
+        let committed = nodes[0].state().committed_membership();
+        let delayed = nodes[0].propose(Command::Noop);
+        assert_eq!(stopped, Role::Stopped);
+        assert_eq!(committed, Membership { old: new, new: None });
+        assert!(delayed.is_err());
     }
 
     #[test]
@@ -836,6 +1036,11 @@ pub mod tests {
             let mut known: BTreeMap<u64, Entry> = BTreeMap::new();
             let mut random = seed;
             for step in 0..600 {
+                for node in &mut nodes {
+                    if node.as_ref().unwrap().role == Role::Stopped {
+                        *node = Some(restart(node.as_ref().unwrap()));
+                    }
+                }
                 random = random.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 let a = (random as usize >> 8) % 5;
                 let b = (random as usize >> 16) % 5;
@@ -861,21 +1066,23 @@ pub mod tests {
                     4 | 5 if !messages.is_empty() => {
                         let index = (random as usize >> 24) % messages.len();
                         let (from, to, request) = messages.swap_remove(index);
-                        let answer = nodes[to]
-                            .as_mut()
-                            .unwrap()
-                            .receive(&format!("KS{from}"), &request)
-                            .unwrap();
-                        acknowledgments.push((from, to, request, answer));
+                        let result =
+                            nodes[to].as_mut().unwrap().receive(&format!("KS{from}"), &request);
+                        if nodes[to].as_ref().unwrap().role != Role::Stopped {
+                            acknowledgments.push((from, to, request, result.unwrap()));
+                        }
                     }
                     6 | 7 if !acknowledgments.is_empty() => {
                         let index = (random as usize >> 24) % acknowledgments.len();
                         let (from, to, request, answer) = acknowledgments.swap_remove(index);
-                        nodes[from]
-                            .as_mut()
-                            .unwrap()
-                            .response(&format!("KS{to}"), &request, &answer)
-                            .unwrap();
+                        let result = nodes[from].as_mut().unwrap().response(
+                            &format!("KS{to}"),
+                            &request,
+                            &answer,
+                        );
+                        if nodes[from].as_ref().unwrap().role != Role::Stopped {
+                            result.unwrap();
+                        }
                     }
                     _ if a != b => {
                         if let Some(request) = nodes[a].as_ref().unwrap().request(&format!("KS{b}"))
@@ -906,13 +1113,20 @@ pub mod tests {
             acknowledgments.clear();
             let mut converged = false;
             for _ in 0..12 {
+                for node in &mut nodes {
+                    if node.as_ref().unwrap().role == Role::Stopped {
+                        *node = Some(restart(node.as_ref().unwrap()));
+                    }
+                }
                 let freshest = (0..5)
                     .max_by_key(|i| {
                         let s = nodes[*i].as_ref().unwrap().state();
                         (s.term_at(s.last()), s.last())
                     })
                     .unwrap();
-                nodes[freshest].as_mut().unwrap().campaign().unwrap();
+                if nodes[freshest].as_ref().unwrap().role != Role::Leader {
+                    nodes[freshest].as_mut().unwrap().campaign().unwrap();
+                }
                 for _ in 0..5 {
                     for other in 0..5 {
                         if other == freshest {
@@ -923,16 +1137,23 @@ pub mod tests {
                         else {
                             break;
                         };
-                        let answer = nodes[other]
+                        let result = nodes[other]
                             .as_mut()
                             .unwrap()
-                            .receive(&format!("KS{freshest}"), &request)
-                            .unwrap();
-                        nodes[freshest]
-                            .as_mut()
-                            .unwrap()
-                            .response(&format!("KS{other}"), &request, &answer)
-                            .unwrap();
+                            .receive(&format!("KS{freshest}"), &request);
+                        if nodes[other].as_ref().unwrap().role == Role::Stopped {
+                            nodes[other] = Some(restart(nodes[other].as_ref().unwrap()));
+                            continue;
+                        }
+                        let answer = result.unwrap();
+                        let result = nodes[freshest].as_mut().unwrap().response(
+                            &format!("KS{other}"),
+                            &request,
+                            &answer,
+                        );
+                        if nodes[freshest].as_ref().unwrap().role != Role::Stopped {
+                            result.unwrap();
+                        }
                     }
                 }
                 if nodes[freshest].as_ref().unwrap().role == Role::Leader {
@@ -946,16 +1167,23 @@ pub mod tests {
                         else {
                             break;
                         };
-                        let answer = nodes[other]
+                        let result = nodes[other]
                             .as_mut()
                             .unwrap()
-                            .receive(&format!("KS{freshest}"), &request)
-                            .unwrap();
-                        nodes[freshest]
-                            .as_mut()
-                            .unwrap()
-                            .response(&format!("KS{other}"), &request, &answer)
-                            .unwrap();
+                            .receive(&format!("KS{freshest}"), &request);
+                        if nodes[other].as_ref().unwrap().role == Role::Stopped {
+                            nodes[other] = Some(restart(nodes[other].as_ref().unwrap()));
+                            continue;
+                        }
+                        let answer = result.unwrap();
+                        let result = nodes[freshest].as_mut().unwrap().response(
+                            &format!("KS{other}"),
+                            &request,
+                            &answer,
+                        );
+                        if nodes[freshest].as_ref().unwrap().role != Role::Stopped {
+                            result.unwrap();
+                        }
                     }
                     let count = nodes[freshest].as_ref().unwrap().state().capture().keys.len();
                     assert!(count > 0);

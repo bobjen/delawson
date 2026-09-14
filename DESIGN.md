@@ -18660,13 +18660,50 @@ must obey the same `primary_wait_ms` value (default 150 ms); mixing the previous
 no-wait implementation with this implementation is unsafe. Restart the whole
 ring when introducing this change; do not roll it out member by member.
 
-Reads recheck the lease after proposal/lock waits and after capturing their result,
-while holding the consensus mutex and execution read lock. Thus delayed lock
-acquisition or a pause during derivation cannot return newly captured stale state
-under an expired lease. KS's small derivation still uses local locks; future SN/DN
-integration must preserve the same gate while optimizing local read concurrency.
-Followers forward key and membership requests to a known primary. Requests waiting
-for quorum do not occupy the shared server worker needed to handle consensus RPCs.
+One incoming-client gate enforces startup readiness and a live lease before command
+dispatch. Direct and forwarded requests use the same gate, including registry
+queries; individual handlers contain no startup timing checks. Raft RPCs, bootstrap
+registration, unlock operations, and process diagnostics bypass this client gate so bootstrap,
+replication, and elections continue while client admission is stopped.
+
+Before admitting a key read, the gate catches execution up and acquires the global
+read lock, then rechecks its lease. The handler receives that guarded history and
+holds it while producing its result. A lease expiring after admission does not
+cancel the read or impose a response-delivery deadline. Responses may finish out
+of order. Once accepted, a write still waits for commitment and application,
+without another startup timer. A demoted primary terminates the process, so its
+pending requests cannot become proposals in a later leadership term.
+
+Lazy key preparation is internal maintenance before admission and can commit/apply
+during the startup wait. Followers forward key and membership requests to a known
+primary. Registry state remains local and unreplicated; its queries and assignment
+requests require primary admission, while registration must work before quorum
+exists because KS members register before serving. Registrar failover remains
+unfinished (#36).
+Requests waiting at the gate run outside the shared worker pool, leaving its
+workers available for consensus RPCs. Future SN/DN integration should preserve
+this central admission boundary and the distinction between admission and response.
+A process has only one tenure as primary. Demotion first enters an irreversible
+stopped state, before persisting or participating in a higher term; removal from
+the committed configuration does the same. It then attempts to flush diagnostic
+logs, capture the demoting thread's backtrace (limited to 16 Ki characters), and
+flush again. A watchdog armed before cleanup forces process exit after five seconds
+if logging or symbolization stalls. Completion exits immediately; failure to start
+the watchdog also exits immediately. No new Raft work or candidacy is possible
+during cleanup. Unit tests retain the terminal state without killing the test runner.
+Durable journal writes are already synced. Pending client work and
+in-progress snapshots are abandoned just as on process failure; ordinary recovery
+handles any incomplete active journal frame or unpublished snapshot. A supervisor
+or operator must start a replacement process; automatic restart is not implemented.
+
+The primary is normally retained as long as practical because switches have a cost.
+The varied reasons to replace one usually benefit from restarting its process too.
+This lifecycle also makes delayed-message admission-term checks unnecessary, and
+those checks have been removed. A comment at the termination point requires
+restoring retained terms and checks if demotion is ever allowed to keep the process
+alive. Raft RPC term validation remains required and unchanged. Unit tests simulate
+process death with a terminal state; the explicit integration test verifies actual
+exit after a stale primary resumes and after primary membership removal.
 Machine authentication checks the sender, and replies identify the expected member.
 User authorization remains deferred.
 
