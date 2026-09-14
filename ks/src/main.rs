@@ -57,9 +57,9 @@ struct Ks {
     unlock_requests: Mutex<std::collections::BTreeSet<String>>,
     proposing: Mutex<()>,
     raft_workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
-    /// Global execution lock: application takes write access; key serving takes read access.
+    /// The process-wide global lock: application takes write access; key serving takes read access.
     /// Master keys are sorted by the second at which each becomes effective.
-    master_keys: RwLock<KeyHistory>,
+    global_lock: RwLock<KeyHistory>,
 }
 
 const SERVES: &[Op] = &[
@@ -178,7 +178,7 @@ impl Service for Ks {
 
     fn status(&self, _process: &Process) -> Vec<String> {
         let (key_count, applied) = {
-            let history = self.master_keys.read().expect("master_keys");
+            let history = self.global_lock.read().expect("global_lock");
             (history.epochs.len(), history.applied)
         };
         vec![
@@ -257,7 +257,7 @@ impl Ks {
             unlocked: AtomicBool::new(false),
             peers: Mutex::new(BTreeMap::new()),
             journal: Mutex::new(node),
-            master_keys: RwLock::new(KeyHistory::default()),
+            global_lock: RwLock::new(KeyHistory::default()),
         };
         if test_mode {
             ks.open_keys(crypto::MASTER_KEY)?;
@@ -270,7 +270,7 @@ impl Ks {
         let history = runtime::decode_history(node.state(), &key)?;
         *self.unlock_key.lock().map_err(|_| common::Error::new("unlock lock poisoned"))? =
             Some(key);
-        *self.master_keys.write().map_err(|_| common::Error::new("key history lock poisoned"))? =
+        *self.global_lock.write().map_err(|_| common::Error::new("key history lock poisoned"))? =
             history;
         self.unlocked.store(true, Ordering::SeqCst);
         // Only a leader establishes the first key, and never over an uncommitted proposal.
@@ -392,7 +392,7 @@ impl Ks {
         if node.journal.failed || !node.can_read(lease::now()?) {
             return Err(common::Error::new("KS read lease expired"));
         }
-        let epochs = self.master_keys.read().expect("master_keys");
+        let epochs = self.global_lock.read().expect("global_lock");
         let epochs = &epochs.epochs;
         let count = epochs.partition_point(|epoch| epoch.since <= at);
         let current = count
@@ -413,7 +413,7 @@ impl Ks {
     fn ensure_future_key(&self) -> Result<()> {
         let horizon = TimeSec::now().plus_secs(self.config.master_key_delay_secs)?;
         if self
-            .master_keys
+            .global_lock
             .read()
             .map_err(|_| common::Error::new("key history lock poisoned"))?
             .epochs
@@ -602,7 +602,7 @@ mod persistence_tests {
         let locked = ks.unlocked.load(Ordering::SeqCst);
         assert!(!locked);
         ks.unlock(&unlock(&[42; 32])).unwrap();
-        let initial = ks.master_keys.read().unwrap().epochs[0].clone();
+        let initial = ks.global_lock.read().unwrap().epochs[0].clone();
         assert!(initial.since <= TimeSec::now());
         let epoch = ks.choose_key().unwrap();
         assert!(epoch.since > initial.since);
@@ -614,7 +614,7 @@ mod persistence_tests {
         let locked = ks.unlocked.load(Ordering::SeqCst);
         assert!(!locked);
         ks.unlock(&unlock(&[42; 32])).unwrap();
-        let history = ks.master_keys.read().unwrap();
+        let history = ks.global_lock.read().unwrap();
         assert_eq!(history.epochs.len(), 2);
         assert_eq!(history.epochs[0].key, initial.key);
         assert_eq!(history.epochs[1].key, epoch.key);
@@ -629,7 +629,7 @@ mod persistence_tests {
         let epoch = ks.choose_key().unwrap();
         let result = ks.propose_key(epoch);
         assert!(result.is_err());
-        assert_eq!(ks.master_keys.read().unwrap().epochs.len(), 1);
+        assert_eq!(ks.global_lock.read().unwrap().epochs.len(), 1);
     }
     #[test]
     fn locked_members_journal_commit_and_snapshot_without_the_unlock_key() {

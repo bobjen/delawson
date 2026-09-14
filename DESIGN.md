@@ -18493,9 +18493,13 @@ Lazy daily generation uses the actual clock and delay horizon, never a historica
 request timestamp. After dormancy, the last committed key remains usable while
 its replacement waits to activate.
 
-KS's global execution lock is `RwLock<KeyHistory>`. Applying committed entries
+KS's single global lock is the `global_lock: RwLock<KeyHistory>` instance. Applying committed entries
 publishes history under its write lock; serving keys derives them under its read
-lock. The consensus/journal mutex is separate. This first implementation applies
+lock. The consensus/journal mutex is separate. The global lock is an instance, not a
+special lock type; other read-write locks remain ordinary `RwLock` instances.
+KS, SN, and DN each require one process-wide global lock for memory management,
+GC, and state execution. SN/DN integration is still to come; whether EN and FE
+need one remains undecided. This first implementation applies
 after commitment, with no speculative reader-visible execution. Locked members
 advance consensus without decrypting or applying key history; unlocking rebuilds
 that history from committed entries. An unlocked member can transfer the unlock

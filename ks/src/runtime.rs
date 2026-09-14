@@ -173,7 +173,7 @@ impl Ks {
             *self.unlock_key.lock().map_err(|_| Error::new("unlock lock poisoned"))?
         {
             let mut history =
-                self.master_keys.write().map_err(|_| Error::new("key history lock poisoned"))?;
+                self.global_lock.write().map_err(|_| Error::new("key history lock poisoned"))?;
             if history.applied != node.state().commit {
                 *history = decode_history(node.state(), &key)?;
             }
