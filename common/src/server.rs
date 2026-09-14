@@ -193,6 +193,11 @@ impl Process {
                 config.identity, config.kind, entry.kind
             )));
         }
+        if matches!(entry.kind, ServiceKind::Sn | ServiceKind::Dn)
+            && !cluster.ring_identities.contains_key(&config.identity)
+        {
+            return Err(Error::new("missing ring identity in bootstrap configuration"));
+        }
         std::fs::create_dir_all(&config.data_dir).context(config.data_dir.display())?;
         let run_dir = process_config.parent().unwrap_or(Path::new(".")).to_path_buf();
         crate::log::open(
@@ -200,6 +205,15 @@ impl Process {
             &config.identity,
             cluster.logging.build(&cluster.media_classes)?,
         )?;
+        if config.ignore_ring_identity {
+            eprintln!(
+                "DANGER: ignore_ring_identity=true IS A GOOD WAY TO LOSE ALL YOUR DATA. Ring identity protection is DISABLED for debugging."
+            );
+            logn!(
+                "DANGER: ring identity protection DISABLED",
+                "A GOOD WAY TO LOSE ALL YOUR DATA: ignore_ring_identity=true"
+            );
+        }
         let peers =
             Peers::new(cluster.messaging.clone(), cluster.timeouts.request_ms.to_duration()?);
         Ok(Process {
@@ -354,6 +368,7 @@ impl Process {
             address: self.address(),
             domain: self.entry.domain.clone(),
             media_class: self.entry.media_class.clone(),
+            ring_identity: self.cluster.ring_identities.get(self.identity()).cloned(),
         };
         let response =
             ask(self.cluster.ks.address, &peer.request(), self.timeout(), &self.cluster.messaging)?;

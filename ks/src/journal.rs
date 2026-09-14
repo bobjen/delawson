@@ -10,7 +10,19 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"DLAWKR01";
+const MAGIC: &[u8; 8] = b"DLAWKR02";
+const HEADER: u64 = 8 + 128;
+fn journal_header(ring: &str) -> Vec<u8> {
+    [MAGIC.as_slice(), ring.as_bytes()].concat()
+}
+fn check_journal_header(reader: &mut impl Read, ring: &str, ignore: bool) -> Result<()> {
+    let mut header = [0; HEADER as usize];
+    reader.read_exact(&mut header)?;
+    if &header[..8] != MAGIC || (!ignore && header.as_slice() != journal_header(ring)) {
+        return Err(Error::new("journal ring identity mismatch"));
+    }
+    Ok(())
+}
 const LIMIT: usize = 64 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
@@ -49,6 +61,7 @@ impl crate::raft::Storage for Journal {
 }
 impl Journal {
     pub fn open(directory: &Path, initial: State, retain: usize, member: &str) -> Result<Self> {
+        let ignore = initial.ignore_ring_identity;
         if retain == 0 {
             return Err(Error::new("snapshot_retain must be positive"));
         }
@@ -75,9 +88,14 @@ impl Journal {
             ownership.write_all(&expected)?;
             ownership.sync_all()?;
             sync_directory(directory)?;
-        } else if identity != expected {
+        } else if identity != expected
+            && !(ignore
+                && identity.len() == expected.len()
+                && identity.starts_with(MAGIC)
+                && identity[HEADER as usize..] == expected[HEADER as usize..])
+        {
             return Err(Error::new(
-                "KS persistence ring mismatch or pre-Raft format; migration required",
+                "KS persistence ring/member mismatch or unsupported format",
             ));
         }
         let (mut state, mut sequence, second, snapshot_bytes) = if let Some((seq, path)) =
@@ -85,7 +103,7 @@ impl Journal {
         {
             let bytes = std::fs::read(path)?;
             let checkpoint: Checkpoint = decode(&bytes)?;
-            if checkpoint.sequence != *seq || checkpoint.state.ring != initial.ring {
+            if checkpoint.sequence != *seq || (!ignore && checkpoint.state.ring != initial.ring) {
                 return Err(Error::new("KS snapshot identity mismatch"));
             }
             (checkpoint.state, *seq, checkpoint.second, bytes.len() as u64)
@@ -99,10 +117,12 @@ impl Journal {
                 state: initial.clone(),
             };
             let bytes = encode(&checkpoint)?;
-            publish(&named(directory, "journal", 1), &[])?;
+            publish(&named(directory, "journal", 1), &journal_header(&initial.ring))?;
             publish(&named(directory, "snapshot", 0), &bytes)?;
             (initial, 0, checkpoint.second, bytes.len() as u64)
         };
+        state.ignore_ring_identity = ignore;
+        state.check_ring(&state.snapshot)?;
         state.validate()?;
         let snapshot_sequence = sequence;
         let segments: Vec<_> = numbered(directory, "journal")?
@@ -122,7 +142,8 @@ impl Journal {
             }
             let mut file = OpenOptions::new().read(true).write(true).open(path)?;
             let size = file.metadata()?.len();
-            let mut offset = 0;
+            check_journal_header(&mut file, &state.ring, ignore)?;
+            let mut offset = HEADER;
             while offset < size {
                 let remaining = size - offset;
                 if remaining < 16 {
@@ -234,6 +255,7 @@ impl Journal {
             return Err(Error::new("KS journal fenced"));
         }
         snapshot.validate()?;
+        self.state.check_ring(&snapshot)?;
         if snapshot.index < self.state.snapshot.index
             || snapshot.index > self.state.commit
             || self.state.term_at(snapshot.index) != Some(snapshot.term)
@@ -243,6 +265,9 @@ impl Journal {
         let mut state = self.state.clone();
         state.log.retain(|e| e.index > snapshot.index);
         state.commit = snapshot.index;
+        if self.state.ignore_ring_identity {
+            state.ring = snapshot.ring.clone();
+        }
         state.snapshot = snapshot;
         let sequence = self.sequence;
         let captured_bytes = self.log_bytes;
@@ -262,11 +287,12 @@ impl Journal {
         };
         // Rotation precedes snapshot publication. If publication fails, replay the old
         // snapshot and every subsequent segment, including this successor and its carried committed/uncommitted suffix.
-        if path.exists() && std::fs::metadata(&path)?.len() != 0 {
+        if path.exists() && std::fs::metadata(&path)?.len() != HEADER {
             return Err(Error::new("nonempty successor journal"));
         }
         let rotate = (|| -> Result<File> {
-            publish(&path, &carried)?;
+            let bytes = [journal_header(&self.state.ring), carried.clone()].concat();
+            publish(&path, &bytes)?;
             Ok(OpenOptions::new().read(true).append(true).open(path)?)
         })();
         match rotate {
@@ -276,6 +302,7 @@ impl Journal {
                 return Err(e);
             }
         }
+        self.log_bytes += HEADER;
         if !carried.is_empty() {
             self.sequence = start;
             self.log_bytes += carried.len() as u64;
@@ -299,6 +326,9 @@ impl Journal {
             && self.state.term_at(snapshot.index) == Some(snapshot.term)
         {
             self.state.log.retain(|e| e.index > snapshot.index);
+            if self.state.ignore_ring_identity {
+                self.state.ring = snapshot.ring.clone();
+            }
             self.state.snapshot = snapshot.clone();
         }
         self.snapshot_sequence = pending.sequence;
@@ -453,7 +483,44 @@ mod tests {
     use super::*;
     use crate::raft::{Command, Entry, Node};
     fn initial() -> State {
-        State::initial("test/KS0".into(), crate::raft::tests::members(1)).unwrap()
+        State::initial("01".repeat(64), crate::raft::tests::members(1)).unwrap()
+    }
+    #[test]
+    fn journal_header_requires_expected_ring_even_for_empty_journals() {
+        let ring = "01".repeat(64);
+        let other = "02".repeat(64);
+        let bytes = journal_header(&ring);
+        let accepted = check_journal_header(&mut bytes.as_slice(), &ring, false).is_ok();
+        let rejected = check_journal_header(&mut bytes.as_slice(), &other, false).is_err();
+        let partial = check_journal_header(&mut &bytes[..bytes.len() - 1], &ring, false).is_err();
+        let debug = check_journal_header(&mut bytes.as_slice(), &other, true).is_ok();
+        assert!(accepted && rejected && partial && debug);
+    }
+    #[test]
+    #[ignore = "filesystem integration; run explicitly with --ignored"]
+    fn foreign_files_with_matching_member_and_positions_are_rejected() {
+        for kind in ["journal", "snapshot"] {
+            let local = tempfile::tempdir().unwrap();
+            let foreign = tempfile::tempdir().unwrap();
+            let mut other = initial();
+            other.ring = "02".repeat(64);
+            other.snapshot.ring = other.ring.clone();
+            drop(Journal::open(local.path(), initial(), 3, "KS0").unwrap());
+            drop(Journal::open(foreign.path(), other, 3, "KS0").unwrap());
+            let index = if kind == "journal" { 1 } else { 0 };
+            std::fs::copy(named(foreign.path(), kind, index), named(local.path(), kind, index))
+                .unwrap();
+            let rejected = Journal::open(local.path(), initial(), 3, "KS0").is_err();
+            assert!(rejected, "foreign {kind}");
+            let mut debug = initial();
+            debug.ignore_ring_identity = true;
+            let recovered = Journal::open(local.path(), debug, 3, "KS0").unwrap();
+            assert!(recovered.state.ignore_ring_identity);
+            drop(recovered);
+            // The override comes from the process, never the copied file.
+            let still_rejected = Journal::open(local.path(), initial(), 3, "KS0").is_err();
+            assert!(still_rejected);
+        }
     }
     #[test]
     fn checkpoint_writes_continue_as_candidate_but_stop_after_winning() {
@@ -595,7 +662,7 @@ mod tests {
         journal.write(&[Record::Hard { term: 1, vote: Some("KS0".into()) }]).unwrap();
         drop(journal);
         let frame = std::fs::read(named(source.path(), "journal", 1)).unwrap();
-        for count in 0..frame.len() {
+        for count in HEADER as usize..frame.len() {
             let dir = tempfile::tempdir().unwrap();
             for name in ["identity", "snapshot-00000000000000000000.bin"] {
                 std::fs::copy(source.path().join(name), dir.path().join(name)).unwrap();
@@ -605,10 +672,10 @@ mod tests {
             let result = Journal::open(dir.path(), initial(), 3, "KS0");
             assert!(result.is_ok(), "partial length {count}");
             let size = std::fs::metadata(path).unwrap().len();
-            assert_eq!(size, 0);
+            assert_eq!(size, HEADER);
         }
         let mut bad = frame.clone();
-        bad[20] ^= 1;
+        bad[HEADER as usize + 20] ^= 1;
         std::fs::write(named(source.path(), "journal", 1), bad).unwrap();
         let result = Journal::open(source.path(), initial(), 3, "KS0");
         assert!(result.is_err());

@@ -55,6 +55,7 @@ def main():
         text = 'unlock_verifier = '+json.dumps((ceremony/'verifier').read_text().strip())+'\n'+text
         text += '\n[raft]\nring = "KS0"\ncheckpoint_lease_secs = 1\nheartbeat_ms = 75\nelection_min_ms = 150\nelection_max_ms = 300\nrequest_timeout_ms = 200\n[raft.members]\n'+''.join(f'{id} = {json.dumps(address)}\n' for id, address in members.items())
         config.write_text(text)
+        run([ROOT/'scripts/ring-identities', cluster, cluster, work/'ring-identities.toml', config])
         def command(id, *args, success=True):
             result = run([BIN/'laws', '--config', cluster, '--to', id, '--at', members[id], '--machine-identity', host/'identity.toml', *args], success)
             return '\n'.join(line.removeprefix(id+' ') for line in result.splitlines())

@@ -106,6 +106,10 @@ PYAUTH
     cluster=$run_dir/cluster.toml
 fi
 
+# Names are routing labels. Preserve independently random ring identities across starts.
+"$root/scripts/ring-identities" "$cluster" "$run_dir/cluster-effective.toml" "$run_dir/ring-identities.toml" "$config_dir/ks.toml"
+cluster=$run_dir/cluster-effective.toml
+
 # KS's address is fixed; every other process is handed a port from the base up.
 # A bad configuration fails here, and it has to fail loudly: without this the
 # variables below are simply unset, and the error is about a shell variable
@@ -165,6 +169,8 @@ listen = "$listen"
 cluster_config = "cluster.toml"
 service_config = "$kind.toml"
 data_dir = "data"
+# DANGER: A GOOD WAY TO LOSE ALL YOUR DATA. Debugging production copies only.
+# ignore_ring_identity = true
 EOF
 
     if [[ -n $machine_identity ]]; then

@@ -257,7 +257,8 @@ impl Ks {
         if config.require_unlock && unlock_verifier.is_none() {
             return Err(common::Error::new("require_unlock needs unlock_verifier"));
         }
-        let initial = raft::State::initial(runtime.ring.clone(), runtime.members.clone())?;
+        let mut initial = raft::State::initial(runtime.ring.clone(), runtime.members.clone())?;
+        initial.ignore_ring_identity = runtime.ignore_ring_identity;
         let journal = journal::Journal::open(path, initial, config.snapshot_retain, &runtime.id)?;
         let mut node = raft::Node::new(runtime.id.clone(), journal);
         node.lease = lease::Lease::configured(&config.raft);
@@ -452,6 +453,12 @@ impl Ks {
                 Status::BadRequest,
                 format!("{} is a {} in the roster, not a {}", peer.identity, entry.kind, peer.kind),
             );
+        }
+        if let Err(e) = peer.check_ring(
+            process.cluster.ring_identities.get(&peer.identity),
+            process.config.ignore_ring_identity,
+        ) {
+            return Resp::error(Status::BadRequest, e.to_string());
         }
         logn!("registered a peer", "identity {},at {}", peer.identity, peer.address);
         self.peers.lock().expect("peers").insert(peer.identity.clone(), peer);

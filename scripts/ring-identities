@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Create/reuse bootstrap ring identities, and write an effective cluster config.
+Usage: ring-identities CLUSTER OUTPUT IDENTITY_FILE [KS_CONFIG]
+Keep IDENTITY_FILE with the bootstrap configuration across every restart.
+"""
+import json
+import os
+from pathlib import Path
+import secrets
+import sys
+import tomllib
+
+
+def main():
+    source, output, manifest = map(Path, sys.argv[1:4])
+    text = source.read_text()
+    config = tomllib.loads(text)
+    supplied = config.get('ring_identities', {})
+    identities = tomllib.loads(manifest.read_text()) if manifest.exists() else {}
+    for name, value in supplied.items():
+        if name in identities and identities[name] != value:
+            raise SystemExit(f'ring identity changed for {name}')
+        identities[name] = value
+    raft = tomllib.loads(Path(sys.argv[4]).read_text()).get('raft', {}) if len(sys.argv) > 4 else {}
+    shared_ks = None
+    if raft.get('members'):
+        name = raft.get('ring', 'KS0')
+        if name not in identities:
+            identities[name] = secrets.token_hex(64)
+        shared_ks = identities[name]
+    numbers = {}
+    for service in config.get('service', []):
+        kind = service['kind']
+        for _ in range(service.get('count', 1)):
+            number = numbers.get(kind, 0)
+            numbers[kind] = number + 1
+            if kind in ('ks', 'sn', 'dn'):
+                name = service.get('identity', f'{kind.upper()}{number}')
+                if kind == 'ks' and shared_ks is not None:
+                    if name in identities and identities[name] != shared_ks:
+                        raise SystemExit(f'{name} has a different ring identity from its configured KS ring')
+                    identities[name] = shared_ks
+                elif name not in identities:
+                    identities[name] = secrets.token_hex(64)
+    for name, value in identities.items():
+        if len(value) != 128 or any(c not in '0123456789abcdef' for c in value):
+            raise SystemExit(f'invalid ring identity for {name}')
+    # The manifest is durable before any process is started with these identities.
+    temporary = manifest.with_suffix('.tmp')
+    with temporary.open('w') as file:
+        file.write(''.join(f'{json.dumps(k)} = {json.dumps(v)}\n' for k, v in sorted(identities.items())))
+        file.flush()
+        os.fsync(file.fileno())
+    temporary.replace(manifest)
+    fd = os.open(manifest.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    # Reopen the table only when absent: TOML forbids defining it twice.
+    if 'ring_identities' in config:
+        missing = identities.keys() - supplied.keys()
+        if missing:
+            raise SystemExit('configured ring_identities is incomplete: ' + ', '.join(sorted(missing)))
+        output.write_text(text)
+    else:
+        output.write_text(text + '\n[ring_identities]\n' + manifest.read_text())
+
+
+if __name__ == '__main__':
+    main()

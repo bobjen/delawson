@@ -441,6 +441,8 @@ fn retention_seconds<'de, D: serde::Deserializer<'de>>(
 struct ClusterFile {
     schema_version: u32,
     cluster_name: String,
+    #[serde(default)]
+    ring_identities: BTreeMap<String, crate::ring::RingIdentity>,
     #[serde(
         default = "default_max_soft_delete_retention_secs",
         deserialize_with = "retention_seconds"
@@ -465,6 +467,8 @@ pub struct ClusterConfig {
     /// does not understand rather than misreading it.
     pub schema_version: u32,
     pub cluster_name: String,
+    /// Bootstrap-created identities; never derive these from cluster or ring names.
+    pub ring_identities: BTreeMap<String, crate::ring::RingIdentity>,
     /// Upper bound enforced independently by FE, DN, SN, and EN.
     pub max_soft_delete_retention_secs: TimeIntSec64,
     pub ks: KsBootstrap,
@@ -533,6 +537,7 @@ impl ClusterConfig {
         let config = ClusterConfig {
             schema_version: file.schema_version,
             cluster_name: file.cluster_name,
+            ring_identities: file.ring_identities,
             max_soft_delete_retention_secs: file.max_soft_delete_retention_secs,
             ks: file.ks,
             failure_domains: file.failure_domains,
@@ -858,6 +863,11 @@ loaders!(DNConfig, SNConfig, ENConfig, FEConfig);
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
+    /// DANGER: A GOOD WAY TO LOSE ALL YOUR DATA. Debugging only: bypass ring
+    /// identity checks for admission and recovery, e.g. a production copy in test.
+    /// Does not bypass machine authentication, checksums, or key authentication.
+    #[serde(default)]
+    pub ignore_ring_identity: bool,
     #[serde(default)]
     pub machine_identity: Option<PathBuf>,
     pub identity: String,

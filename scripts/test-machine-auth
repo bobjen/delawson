@@ -50,6 +50,7 @@ def main():
             for directory, services in [(host, ['KS0','EN0']), (fake, ['EN1'])]:
                 text += '\n[[messaging.authentication.members]]\npublic_key = ' + json.dumps((directory/'public.hex').read_text().strip()) + '\nservices = ' + json.dumps(services) + '\n'
             config.write_text(text)
+            run([ROOT/'scripts/ring-identities', config, config, work/'ring-identities.toml'])
             ceremony = work/'ceremony'
             run([binary/'laws', 'unlock-generate', '--direct', '--output-dir', ceremony])
             verifier = (ceremony/'verifier').read_text().strip()

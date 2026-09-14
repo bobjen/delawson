@@ -18562,10 +18562,9 @@ before tuning the production defaults. Billing exports are a separate policy.
 
 The directory contains `identity`, `snapshot-<sequence>.bin`, and
 `journal-<first-sequence>.log`, with zero-padded 20-digit decimal sequences.
-Identity format `DLAWKR01` binds the store to its ring and member; its exclusive
-file lock prevents concurrent opens and survives rotation. Earlier pre-Raft
-formats are refused without migration. Preserve old recovery files if needed;
-opening them does not convert their format or change their identity.
+Identity format `DLAWKR02` binds the store to its ring and member; its exclusive
+file lock prevents concurrent opens and survives rotation. There is no backward compatibility requirement yet: earlier formats are
+unsupported, with no compatibility reader or migration path.
 
 A snapshot at physical sequence 100 is followed by journal 101. If that snapshot
 never appears, recovery starts with an earlier snapshot and reads every later
@@ -18579,6 +18578,54 @@ remove obsolete snapshots and sync the directory before deleting covered journal
 and syncing again. A crash can leave extra files, but must not remove a retained
 snapshot's replay suffix. Each retained snapshot is independently recoverable
 with its journals.
+
+### Ring identity at admission and recovery
+
+Each KS, SN, and DN ring has an independently OS-generated random **64-byte
+(512-bit) identity**, unique across clusters as well as within one cluster.
+Cluster names and compact KsId/SnId/DnId values remain routing labels. Raft terms
+and indexes do not establish ring identity. Loading another SN ring's checkpoint
+could relabel all its extents and cause EN sync to delete the actual ring's good
+instances as unknown; cross-ring recovery must fail before state installation.
+
+Bootstrap supplies `[ring_identities]` in the effective cluster configuration,
+with 128 hexadecimal characters per identity. `scripts/ring-identities CLUSTER
+OUTPUT IDENTITY_FILE [KS_CONFIG]` generates them with the OS cryptographic random
+source and durably preserves them in `IDENTITY_FILE`. `start-laws` keeps this as
+`run/ring-identities.toml` across starts and distributes the effective cluster
+configuration. Preserve this manifest with bootstrap material. No checked-in
+constant or name-derived fallback is used. When KS members share a Raft ring,
+their bootstrap aliases carry the same ring identity; current SN and DN rings
+are singletons. Missing identities fail process startup.
+
+Registration checks the claimed identity against the bootstrap roster's expected
+identity. KS checks its Raft packet identity before processing membership,
+consensus, unlock forwarding, or checkpoint requests. KS already checked a ring
+string in these control packets; that field now carries the random identity.
+Ordinary data requests continue to use compact routing labels. Long-identity
+checks belong at admission/recovery boundaries, not every extent operation.
+
+Every journal begins with `DLAWKR02` and the 128 ASCII hexadecimal identity
+characters, checked before replay even for an otherwise empty file. Every local
+snapshot and transferable checkpoint carries its source identity. Checkpoint
+installation checks it before altering terms, membership, or application state;
+recovery compares it against independently supplied bootstrap configuration.
+Checksums and encrypted-key authentication remain separate checks. Key encryption
+also binds to this identity, so keys cannot be silently relabeled across rings.
+The directory identity file continues to bind the member name and prevent two
+processes from opening the same store.
+
+**DANGER: `ignore_ring_identity = true` in `process.toml` IS A GOOD WAY TO LOSE
+ALL YOUR DATA.** This explicitly requested debugging escape hatch bypasses ring
+identity equality checks during admission and recovery, for example when studying
+a production checkpoint and poison journal entry in a test environment. It
+defaults to false and emits a prominent startup warning to stderr and the process
+log. It is process-local and never serialized into recovery state. Foreign KS
+state retains its source identity for key encryption/decryption, requiring the
+original unlock key. The override does not bypass machine authentication,
+checksums, encryption authentication, file format, member-directory ownership,
+or Raft structural validation, and it does not rewrite embedded membership or
+turn an arbitrary checkpoint into a valid standalone recovery directory.
 
 ### 17.50.1 Recovery storage policy for KS, SN and DN
 

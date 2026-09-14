@@ -21,6 +21,7 @@ pub struct Admission<'a> {
 }
 
 pub struct Settings {
+    pub ignore_ring_identity: bool,
     pub id: String,
     pub ring: String,
     pub members: Members,
@@ -46,15 +47,17 @@ impl Settings {
         }
         Ok(Self {
             id: process.config.identity.clone(),
-            ring: format!(
-                "{}/{}",
-                process.cluster.cluster_name,
-                if config.raft.members.is_empty() {
+            ignore_ring_identity: process.config.ignore_ring_identity,
+            ring: process
+                .cluster
+                .ring_identities
+                .get(if config.raft.members.is_empty() {
                     &process.config.identity
                 } else {
                     &config.raft.ring
-                }
-            ),
+                })
+                .ok_or_else(|| Error::new("missing KS ring identity in bootstrap configuration"))?
+                .to_string(),
             members,
             admitted: process
                 .cluster
@@ -68,7 +71,8 @@ impl Settings {
     pub fn testing(config: &KsConfig) -> Self {
         Self {
             id: "KS0".into(),
-            ring: "test/KS0".into(),
+            ignore_ring_identity: false,
+            ring: "01".repeat(64),
             members: if config.raft.members.is_empty() {
                 BTreeMap::from([("KS0".into(), "127.0.0.1:1".parse().unwrap())])
             } else {
@@ -460,7 +464,7 @@ impl Ks {
         let epoch = MasterEpoch { key: random_master_key()?, since: TimeSec::now() };
         let index =
             node.state().last().checked_add(1).ok_or_else(|| Error::new("Raft index overflow"))?;
-        let sealed = seal_key(&key, &self.runtime.ring, index, node.state().term, &epoch)?;
+        let sealed = seal_key(&key, &node.state().ring, index, node.state().term, &epoch)?;
         node.propose(Command::Key(sealed))?;
         Ok(())
     }
@@ -523,7 +527,7 @@ impl Ks {
                 .last()
                 .checked_add(1)
                 .ok_or_else(|| Error::new("Raft index overflow"))?;
-            let sealed = seal_key(&key, &self.runtime.ring, index, node.state().term, &epoch)?;
+            let sealed = seal_key(&key, &node.state().ring, index, node.state().term, &epoch)?;
             let index = node.propose(Command::Key(sealed))?;
             self.refresh_keys(&node)?;
             index
@@ -652,7 +656,7 @@ impl Ks {
                 return Err(Error::new("invalid Raft RPC"));
             };
             let packet: Packet = parse(bytes)?;
-            if packet.ring != self.runtime.ring {
+            if !self.runtime.ignore_ring_identity && packet.ring != self.runtime.ring {
                 return Err(Error::new("Raft ring mismatch"));
             }
             {
@@ -1041,6 +1045,31 @@ impl Ks {
 mod tests {
     use super::*;
     #[test]
+    fn debugging_foreign_checkpoint_preserves_key_binding_but_not_override() {
+        let key = [42; 32];
+        let mut source = State::initial("02".repeat(64), crate::raft::tests::members(1)).unwrap();
+        source.apply(&crate::raft::Record::Hard { term: 1, vote: None }).unwrap();
+        let epoch = MasterEpoch { key: [7; 32], since: TimeSec::new(1) };
+        let sealed = seal_key(&key, &source.ring, 1, 1, &epoch).unwrap();
+        source
+            .apply(&crate::raft::Record::Entries {
+                from: 1,
+                entries: vec![Entry { index: 1, term: 1, command: Command::Key(sealed) }],
+            })
+            .unwrap();
+        source.apply(&crate::raft::Record::Commit(1)).unwrap();
+        let mut target = State::initial("01".repeat(64), crate::raft::tests::members(1)).unwrap();
+        target.ignore_ring_identity = true;
+        target.apply(&crate::raft::Record::Hard { term: 1, vote: None }).unwrap();
+        target.apply(&crate::raft::Record::Install(source.capture())).unwrap();
+        let history = decode_history(&target, &key).unwrap();
+        let wrong_key = decode_history(&target, &[43; 32]).is_err();
+        let decoded: State = parse(&json(&target).unwrap()).unwrap();
+        assert_eq!(history.epochs[0].key, epoch.key);
+        assert!(wrong_key);
+        assert!(!decoded.ignore_ring_identity);
+    }
+    #[test]
     fn cold_candidates_wait_longer_without_changing_hot_backup_elections() {
         let config = RaftConfig::default();
         let hot = election_delay(&config, 37, true, false);
@@ -1054,7 +1083,7 @@ mod tests {
     #[test]
     fn application_catches_up_from_snapshot_then_only_decodes_new_commits() {
         let key = [7; 32];
-        let mut state = State::initial("ring".into(), crate::raft::tests::members(3)).unwrap();
+        let mut state = State::initial("01".repeat(64), crate::raft::tests::members(3)).unwrap();
         state.term = 1;
         for index in 1..=3 {
             let epoch = MasterEpoch { since: TimeSec::new(index), key: [index as u8; 32] };

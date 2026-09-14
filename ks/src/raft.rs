@@ -61,6 +61,7 @@ pub struct Entry {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Snapshot {
+    pub ring: String,
     pub index: u64,
     pub term: u64,
     pub membership: Membership,
@@ -99,6 +100,9 @@ impl Snapshot {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct State {
+    /// Process-local debugging override: never inherited from a snapshot or journal.
+    #[serde(skip)]
+    pub ignore_ring_identity: bool,
     pub ring: String,
     pub term: u64,
     pub vote: Option<String>,
@@ -133,14 +137,23 @@ impl State {
         Ok(())
     }
 
+    pub fn check_ring(&self, snapshot: &Snapshot) -> Result<()> {
+        if !self.ignore_ring_identity && snapshot.ring != self.ring {
+            return Err(Error::new("checkpoint ring identity mismatch"));
+        }
+        Ok(())
+    }
     pub fn initial(ring: String, members: Members) -> Result<Self> {
+        common::ring::RingIdentity::try_from(ring.clone())?;
         let membership = Membership { old: members, new: None };
         membership.validate()?;
         Ok(Self {
-            ring,
+            ring: ring.clone(),
+            ignore_ring_identity: false,
             term: 0,
             vote: None,
             snapshot: Snapshot {
+                ring,
                 index: 0,
                 term: 0,
                 membership,
@@ -273,6 +286,7 @@ impl State {
                 self.commit = *index;
             }
             Record::Install(snapshot) => {
+                self.check_ring(snapshot)?;
                 snapshot.validate()?;
                 if snapshot.index < self.commit || snapshot.term > self.term {
                     return Err(Error::new("invalid Raft snapshot boundary"));
@@ -284,6 +298,9 @@ impl State {
                     vec![]
                 };
                 self.commit = snapshot.index;
+                if self.ignore_ring_identity {
+                    self.ring = snapshot.ring.clone();
+                }
                 self.snapshot = snapshot.clone();
             }
         }
@@ -566,6 +583,9 @@ impl<S: Storage> Node<S> {
     }
     pub fn receive(&mut self, sender: &str, rpc: &Rpc) -> Result<Answer> {
         self.running()?;
+        if let Rpc::Install { snapshot, .. } = rpc {
+            self.state().check_ring(snapshot)?;
+        }
         // A removed/lagging member can still send votes from its old configuration.
         // It must not repeatedly terminate the primary by advancing its private term.
         if matches!(rpc, Rpc::Vote { .. })
@@ -760,7 +780,7 @@ pub mod tests {
             .collect()
     }
     pub fn node(id: usize, members: Members) -> TestNode {
-        let state = State::initial("test/KS0".into(), members).unwrap();
+        let state = State::initial("01".repeat(64), members).unwrap();
         Node::new(
             format!("KS{id}"),
             Memory { initial: state.clone(), state, records: vec![], failed: false },
@@ -795,6 +815,20 @@ pub mod tests {
     }
     fn cluster(n: usize) -> Vec<TestNode> {
         (0..n).map(|i| node(i, members(n))).collect()
+    }
+    #[test]
+    fn foreign_checkpoint_rejected_before_state_or_term_changes() {
+        let mut node = node(0, members(3));
+        let mut foreign = node.state().capture();
+        foreign.ring = "02".repeat(64);
+        let term = node.state().term;
+        let before = node.state().capture();
+        let rpc = Rpc::Install { term: term + 10, snapshot: foreign.clone() };
+        let rejected_rpc = node.receive("KS1", &rpc).is_err();
+        let rejected_replay = node.journal.write(&[Record::Install(foreign)]).is_err();
+        assert!(rejected_rpc && rejected_replay);
+        assert_eq!(node.state().term, term);
+        assert_eq!(node.state().capture(), before);
     }
     #[test]
     fn election_quiet_period_survives_restart_and_leader_contact() {

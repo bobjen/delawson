@@ -63,7 +63,7 @@ mod tests {
         let duration = Duration::from_secs(300);
         let mut lease = CheckpointLease::default();
         let mut state =
-            crate::raft::State::initial("ring".into(), crate::raft::tests::members(3)).unwrap();
+            crate::raft::State::initial("01".repeat(64), crate::raft::tests::members(3)).unwrap();
         state.term = 1;
         state.log.push(crate::raft::Entry {
             index: 1,
