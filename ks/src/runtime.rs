@@ -9,6 +9,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+struct SnapshotProduction<'a>(&'a AtomicBool);
+impl Drop for SnapshotProduction<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 pub struct Admission<'a> {
     pub history: Option<std::sync::RwLockReadGuard<'a, KeyHistory>>,
 }
@@ -76,12 +83,19 @@ impl Settings {
             return Err(Error::new("Raft needs nonempty members"));
         }
         config.validate_timing()?;
+        if self.members.len() > 1 && config.apply_members < 2 {
+            return Err(Error::new(
+                "a multi-member ring needs at least two applying members for checkpoints",
+            ));
+        }
         Ok(())
     }
 }
 #[derive(Serialize, Deserialize)]
 enum Message {
     Consensus(Rpc),
+    Checkpoint { after: u64 },
+    CheckpointStart,
     Unlock([u8; 32]),
     Forward { op: u16, payload: Vec<u8>, depth: u8 },
 }
@@ -89,6 +103,8 @@ enum Message {
 struct Packet {
     ring: String,
     unlocked: bool,
+    #[serde(default)]
+    applying: Option<BTreeSet<String>>,
     message: Message,
 }
 #[derive(Serialize, Deserialize)]
@@ -106,9 +122,9 @@ pub fn waits_for_quorum(request: &Req) -> bool {
         return true;
     }
     match request.args.as_slice() {
-        [Arg::Text(_), Arg::Bytes(bytes)] => {
-            parse::<Packet>(bytes).is_ok_and(|p| matches!(p.message, Message::Forward { .. }))
-        }
+        [Arg::Text(_), Arg::Bytes(bytes)] => parse::<Packet>(bytes).is_ok_and(|p| {
+            matches!(p.message, Message::Forward { .. } | Message::Checkpoint { .. })
+        }),
         _ => false,
     }
 }
@@ -172,16 +188,261 @@ pub fn decode_history(state: &State, key: &[u8; 32]) -> Result<KeyHistory> {
     Ok(KeyHistory { epochs, applied: state.commit })
 }
 
+fn apply_history(state: &State, key: &[u8; 32], history: &mut KeyHistory) -> Result<()> {
+    if history.applied == state.commit {
+        return Ok(());
+    }
+    if history.applied < state.snapshot.index {
+        *history = decode_history(state, key)?;
+    } else {
+        let mut additions = Vec::new();
+        let mut since = history.epochs.last().map(|e| e.since);
+        for entry in
+            state.log.iter().filter(|e| e.index > history.applied && e.index <= state.commit)
+        {
+            if matches!(entry.command, Command::Key(_)) {
+                let epoch = open_key(key, &state.ring, entry)?;
+                if since.is_some_and(|last| last >= epoch.since) {
+                    return Err(Error::new("KS key activation order is invalid"));
+                }
+                since = Some(epoch.since);
+                additions.push(epoch);
+            }
+        }
+        history.epochs.extend(additions);
+        history.applied = state.commit;
+    }
+    Ok(())
+}
+pub(crate) fn cancel_checkpoint_after_election(role: Role, member_count: usize) -> bool {
+    role == Role::Leader && member_count > 1
+}
+fn election_delay(config: &RaftConfig, random: u64, hot: bool, writing: bool) -> Duration {
+    Duration::from_millis(
+        config
+            .election_min_ms
+            .saturating_add(random % (config.election_max_ms - config.election_min_ms))
+            .saturating_add(if !hot {
+                config.cold_election_delay_ms
+            } else if writing {
+                config.checkpoint_election_delay_ms
+            } else {
+                0
+            }),
+    )
+}
+
 impl Ks {
+    fn accept_placement(&self, selected: Option<&BTreeSet<String>>, node: &Node) -> Result<()> {
+        if let Some(selected) = selected {
+            let members = node.state().membership().members();
+            let mut placement =
+                self.placement.lock().map_err(|_| Error::new("placement lock poisoned"))?;
+            placement.selected =
+                selected.iter().filter(|id| members.contains_key(*id)).cloned().collect();
+            self.applying.store(placement.selected.contains(&self.runtime.id), Ordering::SeqCst);
+        }
+        Ok(())
+    }
+    fn serve_checkpoint(&self, after: u64) -> Result<Option<crate::raft::Snapshot>> {
+        let node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
+        if node.role == Role::Leader || node.role == Role::Stopped || node.journal.failed {
+            return Err(Error::new("primary does not serve checkpoints"));
+        }
+        if node.state().snapshot.index <= after {
+            if self.applying.load(Ordering::SeqCst) && self.unlocked.load(Ordering::SeqCst) {
+                self.checkpoint_requested.store(true, Ordering::SeqCst);
+            }
+            return Ok(None);
+        }
+        Ok(Some(node.state().snapshot.clone()))
+    }
+    fn start_checkpoints(self: &Arc<Self>) -> Result<()> {
+        let weak = Arc::downgrade(self);
+        let handle = std::thread::Builder::new()
+            .name("ks-checkpoints".into())
+            .spawn(move || {
+                while let Some(ks) = weak.upgrade() {
+                    if ks.snapshot_stopping.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    ks.maybe_snapshot();
+                    drop(ks);
+                    std::thread::park_timeout(Duration::from_millis(200));
+                }
+            })
+            .context("starting checkpoint worker")?;
+        self.raft_workers.lock().map_err(|_| Error::new("worker lock poisoned"))?.push(handle);
+        Ok(())
+    }
+    pub fn maybe_snapshot(&self) {
+        if let Err(e) = self.checkpoint_work() {
+            logn!("KS checkpoint deferred; journals retained", "{e}");
+        }
+    }
+    fn checkpoint_work(&self) -> Result<()> {
+        let Ok(_task) = self.snapshot_task.try_lock() else {
+            return Ok(());
+        };
+        let _production = SnapshotProduction(&self.producing_snapshot);
+        let now = TimeSec::now().number();
+        let (pending, peers, after) = {
+            let mut node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
+            if node.journal.failed || matches!(node.role, Role::Stopped | Role::Candidate) {
+                return Ok(());
+            }
+            let needed = self.checkpoint_needed.load(Ordering::SeqCst);
+            let requested = self.checkpoint_requested.load(Ordering::SeqCst)
+                || needed > node.state().snapshot.index;
+            if !requested
+                && !node.journal.snapshot_due(
+                    self.config.snapshot_min_log_bytes,
+                    self.config.snapshot_interval_secs,
+                    now,
+                )
+            {
+                return Ok(());
+            }
+            let members = node.state().membership().members();
+            let producer = needed <= node.state().commit
+                && (node.role == Role::Follower
+                    || (node.role == Role::Leader && members.len() == 1))
+                && (node.role == Role::Leader || self.applying.load(Ordering::SeqCst))
+                && self.unlocked.load(Ordering::SeqCst);
+            if producer {
+                self.refresh_keys(&node)?;
+                if members.len() > 1 {
+                    let lease = self
+                        .checkpoint_lease
+                        .lock()
+                        .map_err(|_| Error::new("checkpoint lease lock poisoned"))?;
+                    if let Some((index, holder)) = lease.holder(
+                        Instant::now(),
+                        Duration::from_secs(self.config.raft.checkpoint_lease_secs),
+                    ) {
+                        if holder != &self.runtime.id
+                            || *index <= self.checkpoint_started.load(Ordering::SeqCst)
+                        {
+                            return Ok(());
+                        }
+                        self.checkpoint_started.store(*index, Ordering::SeqCst);
+                    } else {
+                        let target = node
+                            .leader
+                            .as_ref()
+                            .and_then(|id| members.get(id).map(|address| (id.clone(), *address)));
+                        drop(lease);
+                        drop(node);
+                        if let Some((id, address)) = target {
+                            self.send_raft(&id, address, Message::CheckpointStart)?;
+                        }
+                        return Ok(());
+                    }
+                }
+                self.cancel_snapshot.store(false, Ordering::SeqCst);
+                // Set under the consensus lock, before any campaign can begin.
+                self.producing_snapshot.store(true, Ordering::SeqCst);
+                self.refresh_keys(&node)?;
+                let history =
+                    self.global_lock.read().map_err(|_| Error::new("global lock poisoned"))?;
+                if history.applied != node.state().commit {
+                    return Ok(());
+                }
+                let pending = node.journal.prepare_snapshot(now)?;
+                // Capture and rotate under the execution read lock; disk publication is independent.
+                (pending, vec![], node.state().snapshot.index)
+            } else {
+                let peers: Vec<_> = members
+                    .into_iter()
+                    .filter(|(id, _)| id != &self.runtime.id && Some(id) != node.leader.as_ref())
+                    .collect();
+                (None, peers, node.state().snapshot.index)
+            }
+        };
+        if let Some(pending) = pending {
+            pending.write_cancellable(|| self.cancel_snapshot.load(Ordering::SeqCst))?;
+            self.journal
+                .lock()
+                .map_err(|_| Error::new("Raft lock poisoned"))?
+                .journal
+                .finish_snapshot(&pending)?;
+            self.checkpoint_requested.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
+        for (id, address) in peers {
+            let Ok(response) = self.send_raft(&id, address, Message::Checkpoint { after }) else {
+                continue;
+            };
+            if response.status != Status::Ok {
+                continue;
+            }
+            let (mut body, rest) = structure(&response.args, Op::BytesResp, "checkpoint response")?;
+            let bytes = body.bytes()?;
+            body.done()?;
+            if !rest.is_empty() {
+                return Err(Error::new("trailing checkpoint response"));
+            }
+            let Some(snapshot) = parse::<Option<crate::raft::Snapshot>>(&bytes)? else {
+                continue;
+            };
+            let pending = {
+                let mut node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
+                if node.role == Role::Stopped || node.journal.failed {
+                    return Ok(());
+                }
+                if snapshot.index <= node.state().snapshot.index
+                    || snapshot.term > node.state().term
+                {
+                    continue;
+                }
+                if snapshot.index > node.state().commit {
+                    // Trusted member's durable checkpoint proves commitment; application is separate.
+                    // A primary must re-prove its own log's commitment through Raft.
+                    if node.role == Role::Leader {
+                        continue;
+                    }
+                    node.journal.write(&[crate::raft::Record::Install(snapshot.clone())])?;
+                }
+                let pending = node.journal.prepare_copy(now, snapshot)?;
+                self.refresh_keys(&node)?;
+                pending
+            };
+            if let Some(pending) = pending {
+                pending.write()?;
+                self.journal
+                    .lock()
+                    .map_err(|_| Error::new("Raft lock poisoned"))?
+                    .journal
+                    .finish_snapshot(&pending)?;
+                self.checkpoint_requested.store(false, Ordering::SeqCst);
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
     pub fn refresh_keys(&self, node: &Node) -> Result<()> {
+        // A candidate can keep writing. Only winning requires abandoning production;
+        // singleton primaries remain the explicit checkpoint-production exception.
+        if cancel_checkpoint_after_election(node.role, node.state().membership().members().len())
+            && self.producing_snapshot.load(Ordering::SeqCst)
+        {
+            self.cancel_snapshot.store(true, Ordering::SeqCst);
+        }
+        self.checkpoint_lease
+            .lock()
+            .map_err(|_| Error::new("checkpoint lease lock poisoned"))?
+            .observe(node.state().checkpoint_start(), Instant::now());
+        if node.role != Role::Leader && !self.applying.load(Ordering::SeqCst) {
+            *self.global_lock.write().map_err(|_| Error::new("global lock poisoned"))? =
+                KeyHistory::default();
+            return Ok(());
+        }
         if let Some(key) =
             *self.unlock_key.lock().map_err(|_| Error::new("unlock lock poisoned"))?
         {
             let mut history =
-                self.global_lock.write().map_err(|_| Error::new("key history lock poisoned"))?;
-            if history.applied != node.state().commit {
-                *history = decode_history(node.state(), &key)?;
-            }
+                self.global_lock.write().map_err(|_| Error::new("global lock poisoned"))?;
+            apply_history(node.state(), &key, &mut history)?;
         }
         Ok(())
     }
@@ -304,13 +565,14 @@ impl Ks {
     pub fn raft_status(&self) -> String {
         match self.journal.lock() {
             Ok(node) => format!(
-                "raft_role {:?}\nraft_term {}\nraft_leader {}\nraft_last {}\nraft_commit {}\nraft_failed {}",
+                "raft_role {:?}\nraft_term {}\nraft_leader {}\nraft_last {}\nraft_commit {}\nraft_failed {}\nraft_applying {}",
                 node.role,
                 node.state().term,
                 node.leader.as_deref().unwrap_or("none"),
                 node.state().last(),
                 node.state().commit,
-                node.journal.failed
+                node.journal.failed,
+                node.role == Role::Leader || self.applying.load(Ordering::SeqCst)
             ),
             Err(_) => "raft_failed true".into(),
         }
@@ -334,8 +596,23 @@ impl Ks {
         let mut messaging =
             self.runtime.messaging.clone().ok_or_else(|| Error::new("no Raft transport"))?;
         messaging.expected_peer = Some(peer.into());
+        let applying = {
+            let node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
+            if node.role == Role::Leader {
+                Some(
+                    self.placement
+                        .lock()
+                        .map_err(|_| Error::new("placement lock poisoned"))?
+                        .selected
+                        .clone(),
+                )
+            } else {
+                None
+            }
+        };
         let request = Req::new(Op::Raft).text(&self.runtime.id).bytes(json(&Packet {
             ring: self.runtime.ring.clone(),
+            applying,
             unlocked: self.unlocked.load(Ordering::SeqCst),
             message,
         })?);
@@ -380,13 +657,15 @@ impl Ks {
             }
             {
                 let node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
-                let admitted = if matches!(packet.message, Message::Consensus(_)) {
-                    // A lagging member may not yet know the current leader's configuration.
-                    self.runtime.admitted.contains(sender)
-                        || self.runtime.members.contains_key(sender)
-                } else {
-                    node.state().membership().members().contains_key(sender)
-                };
+                let admitted =
+                    if matches!(packet.message, Message::Consensus(_) | Message::Checkpoint { .. })
+                    {
+                        // A lagging member may not yet know the current leader's configuration.
+                        self.runtime.admitted.contains(sender)
+                            || self.runtime.members.contains_key(sender)
+                    } else {
+                        node.state().membership().members().contains_key(sender)
+                    };
                 if !admitted {
                     return Err(Error::new("Raft sender is not admitted"));
                 }
@@ -398,6 +677,47 @@ impl Ks {
                     .insert(sender.clone());
             }
             match packet.message {
+                Message::CheckpointStart => {
+                    let mut node =
+                        self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
+                    if node.role != Role::Leader || sender == &self.runtime.id {
+                        return Err(Error::new(
+                            "checkpoint announcements require the primary and a secondary writer",
+                        ));
+                    }
+                    if !packet.unlocked
+                        || !self
+                            .placement
+                            .lock()
+                            .map_err(|_| Error::new("placement lock poisoned"))?
+                            .selected
+                            .contains(sender)
+                    {
+                        return Err(Error::new(
+                            "checkpoint writer is not an unlocked applying member",
+                        ));
+                    }
+                    self.refresh_keys(&node)?;
+                    let lease = self
+                        .checkpoint_lease
+                        .lock()
+                        .map_err(|_| Error::new("checkpoint lease lock poisoned"))?;
+                    if lease
+                        .holder(
+                            Instant::now(),
+                            Duration::from_secs(self.config.raft.checkpoint_lease_secs),
+                        )
+                        .is_none()
+                        && node.state().last() == node.state().commit
+                    {
+                        node.propose(Command::CheckpointStart(sender.clone()))?;
+                    }
+                    Ok(Resp::ok())
+                }
+                Message::Checkpoint { after } => {
+                    let snapshot = self.serve_checkpoint(after)?;
+                    Ok(Resp::bytes(json(&snapshot)?))
+                }
                 Message::Consensus(rpc) => {
                     let mut node =
                         self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
@@ -410,6 +730,17 @@ impl Ks {
                     } else {
                         node.receive(sender, &rpc)?
                     };
+                    if !matches!(rpc, Rpc::Vote { .. })
+                        && rpc.term() == node.state().term
+                        && node.leader.as_deref() == Some(sender)
+                    {
+                        self.accept_placement(packet.applying.as_ref(), &node)?;
+                        if let Rpc::Checkpoint { index, .. } = rpc {
+                            if !answer.success {
+                                self.checkpoint_needed.fetch_max(index, Ordering::SeqCst);
+                            }
+                        }
+                    }
                     self.refresh_keys(&node)?;
                     Ok(Resp::bytes(json(&ConsensusReply {
                         member: self.runtime.id.clone(),
@@ -451,7 +782,10 @@ impl Ks {
                 structure(&request.args, Op::RaftMembers, "a Raft membership request")?;
             let members: Members = parse(&payload.bytes()?)?;
             payload.done()?;
-            if !rest.is_empty() || members.is_empty() {
+            if !rest.is_empty()
+                || members.is_empty()
+                || (members.len() > 1 && self.config.raft.apply_members < 2)
+            {
                 return Err(Error::new("invalid Raft membership request"));
             }
             // Machine admission is independent of consensus membership. Every proposed
@@ -509,6 +843,7 @@ impl Ks {
         result.map(|()| Resp::ok()).unwrap_or_else(error)
     }
     pub fn start_raft(self: &Arc<Self>) -> Result<()> {
+        self.start_checkpoints()?;
         let weak = Arc::downgrade(self);
         let handle = std::thread::Builder::new()
             .name("ks-raft-timer".into())
@@ -522,11 +857,7 @@ impl Ks {
                     Err(_) => return,
                 };
                 let timing = &initial.config.raft;
-                let mut deadline = Instant::now()
-                    + Duration::from_millis(
-                        timing.election_min_ms
-                            + random % (timing.election_max_ms - timing.election_min_ms),
-                    );
+                let mut deadline = Instant::now() + election_delay(timing, random, true, false);
                 drop(initial);
                 let mut peers: BTreeSet<String> = BTreeSet::new();
                 loop {
@@ -542,8 +873,18 @@ impl Ks {
                         if node.journal.failed {
                             return Ok(());
                         }
-                        if deadline <= Instant::now() || node.contact != contact {
-                            if deadline <= Instant::now()
+                        // Apply the current penalty to the base deadline: starting or finishing
+                        // a checkpoint between heartbeats must affect election preference too.
+                        let c = &ks.config.raft;
+                        let penalty = election_delay(
+                            c,
+                            0,
+                            ks.applying.load(Ordering::SeqCst),
+                            ks.producing_snapshot.load(Ordering::SeqCst),
+                        ) - election_delay(c, 0, true, false);
+                        let eligible = deadline + penalty;
+                        if eligible <= Instant::now() || node.contact != contact {
+                            if eligible <= Instant::now()
                                 && node.contact == contact
                                 && node.role != Role::Leader
                             {
@@ -555,12 +896,20 @@ impl Ks {
                                     .map_err(|_| Error::new("random timeout"))?,
                             );
                             let c = &ks.config.raft;
-                            deadline = Instant::now()
-                                + Duration::from_millis(
-                                    c.election_min_ms
-                                        + random % (c.election_max_ms - c.election_min_ms),
-                                );
+                            deadline = Instant::now() + election_delay(c, random, true, false);
                             contact = node.contact;
+                        }
+                        if node.role == Role::Leader {
+                            ks.placement
+                                .lock()
+                                .map_err(|_| Error::new("placement lock poisoned"))?
+                                .select(
+                                    &ks.runtime.id,
+                                    &node.state().membership().members(),
+                                    ks.config.raft.apply_members,
+                                    Instant::now(),
+                                    Duration::from_millis(ks.config.raft.cold_election_delay_ms),
+                                );
                         }
                         ks.initial_key(&mut node)?;
                         ks.refresh_keys(&node)?;
@@ -579,7 +928,7 @@ impl Ks {
                     if let Err(e) = result {
                         logn!("KS Raft maintenance failed", "{e}");
                     }
-                    ks.maybe_snapshot();
+
                     drop(ks);
                     std::thread::park_timeout(Duration::from_millis(20));
                 }
@@ -613,7 +962,7 @@ impl Ks {
                             else {
                                 return Ok(());
                             };
-                            (address, node.request(&peer))
+                            (address, node.request_reference(&peer))
                         };
                         let requested = ks
                             .unlock_requests
@@ -656,6 +1005,10 @@ impl Ks {
                                 return Err(Error::new("Raft reply came from the wrong member"));
                             }
                             unlocked = response.unlocked;
+                            ks.placement
+                                .lock()
+                                .map_err(|_| Error::new("placement lock poisoned"))?
+                                .acknowledge(&peer, Instant::now());
                             let mut node =
                                 ks.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
                             node.response(&peer, &request, &response.answer)?;
@@ -688,6 +1041,47 @@ impl Ks {
 mod tests {
     use super::*;
     #[test]
+    fn cold_candidates_wait_longer_without_changing_hot_backup_elections() {
+        let config = RaftConfig::default();
+        let hot = election_delay(&config, 37, true, false);
+        let cold = election_delay(&config, 37, false, false);
+        let writing = election_delay(&config, 37, true, true);
+        assert_eq!(hot, Duration::from_millis(187));
+        assert!(hot < writing && writing < cold);
+        assert_eq!(writing - hot, Duration::from_millis(config.checkpoint_election_delay_ms));
+        assert_eq!(cold - hot, Duration::from_millis(config.cold_election_delay_ms));
+    }
+    #[test]
+    fn application_catches_up_from_snapshot_then_only_decodes_new_commits() {
+        let key = [7; 32];
+        let mut state = State::initial("ring".into(), crate::raft::tests::members(3)).unwrap();
+        state.term = 1;
+        for index in 1..=3 {
+            let epoch = MasterEpoch { since: TimeSec::new(index), key: [index as u8; 32] };
+            let encrypted = seal_key(&key, &state.ring, index, 1, &epoch).unwrap();
+            state.log.push(Entry { index, term: 1, command: Command::Key(encrypted) });
+        }
+        state.commit = 2;
+        let mut history = KeyHistory::default();
+        apply_history(&state, &key, &mut history).unwrap();
+        let committed_count = history.epochs.len();
+        let checkpoint = state.capture();
+        state.apply(&crate::raft::Record::Install(checkpoint)).unwrap();
+        let mut promoted = KeyHistory::default();
+        apply_history(&state, &key, &mut promoted).unwrap();
+        let promoted_count = promoted.epochs.len();
+        // Already applied ciphertext need not be decrypted again.
+        state.snapshot.keys[0].command = Command::Key(vec![]);
+        state.commit = 3;
+        apply_history(&state, &key, &mut history).unwrap();
+        let final_count = history.epochs.len();
+        let final_index = history.applied;
+        assert_eq!(committed_count, 2);
+        assert_eq!(promoted_count, 2);
+        assert_eq!(final_count, 3);
+        assert_eq!(final_index, 3);
+    }
+    #[test]
     fn clients_wait_off_the_raft_worker_including_forwarded_requests() {
         let clients: Vec<_> = SERVES
             .iter()
@@ -699,9 +1093,10 @@ mod tests {
         let unlock = waits_for_quorum(&Req::new(Op::Unlock));
         let registration = waits_for_quorum(&Req::new(Op::Register));
         let packet = |message| {
-            Req::new(Op::Raft)
-                .text("KS0")
-                .bytes(json(&Packet { ring: "test".into(), unlocked: false, message }).unwrap())
+            Req::new(Op::Raft).text("KS0").bytes(
+                json(&Packet { ring: "test".into(), unlocked: false, applying: None, message })
+                    .unwrap(),
+            )
         };
         let consensus = waits_for_quorum(&packet(Message::Consensus(Rpc::Vote {
             term: 1,

@@ -643,6 +643,14 @@ pub struct Knobs {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RaftConfig {
+    /// Primary plus hot backups. Every member still journals and votes.
+    pub apply_members: usize,
+    /// Extra randomized-election delay for members without application state.
+    pub cold_election_delay_ms: u64,
+    /// Suppress other checkpoint producers after a committed start announcement.
+    pub checkpoint_lease_secs: u64,
+    /// Positive, and smaller than cold_election_delay_ms.
+    pub checkpoint_election_delay_ms: u64,
     pub ring: String,
     pub members: BTreeMap<String, SocketAddr>,
     /// Positive; election_min_ms must be at least twice this interval.
@@ -659,6 +667,10 @@ pub struct RaftConfig {
 impl Default for RaftConfig {
     fn default() -> Self {
         Self {
+            apply_members: 3,
+            cold_election_delay_ms: 1000,
+            checkpoint_lease_secs: 300,
+            checkpoint_election_delay_ms: 500,
             ring: "KS0".into(),
             members: BTreeMap::new(),
             heartbeat_ms: 75,
@@ -672,6 +684,19 @@ impl Default for RaftConfig {
 
 impl RaftConfig {
     pub fn validate_timing(&self) -> Result<()> {
+        if self.checkpoint_lease_secs == 0
+            || self.checkpoint_election_delay_ms == 0
+            || self.checkpoint_election_delay_ms >= self.cold_election_delay_ms
+        {
+            return Err(Error::new(
+                "checkpoint lease and election delay must be positive; checkpoint election delay must be less than cold election delay",
+            ));
+        }
+        if self.apply_members == 0 || self.cold_election_delay_ms == 0 {
+            return Err(Error::new(
+                "Raft apply_members and cold_election_delay_ms must be positive",
+            ));
+        }
         if self.heartbeat_ms == 0 || self.request_timeout_ms == 0 || self.primary_wait_ms == 0 {
             return Err(Error::new(
                 "Raft heartbeat, RPC timeout, and primary wait must be positive",

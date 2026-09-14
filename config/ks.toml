@@ -33,6 +33,14 @@ workers = 0
 # with distinct process IDs, listen addresses, and data directories.
 # [raft]
 # ring = "KS0"
+# Primary plus hot backups; at least two in a multi-member ring.
+# apply_members = 3
+# Additional election delay for cold members; hot backups are equally preferred.
+# cold_election_delay_ms = 1000
+# Other secondaries suppress production after a committed checkpoint announcement.
+# checkpoint_lease_secs = 300
+# Smaller than the cold-member delay; a writer continues unless it wins election.
+# checkpoint_election_delay_ms = 500
 # Require election_min_ms >= 2 * heartbeat_ms, election_max_ms > election_min_ms,
 # and primary_wait_ms >= election_min_ms. The clock margin additionally requires
 # 2 * primary_wait_ms < 99 * election_min_ms (clock rates within 1% of real time).

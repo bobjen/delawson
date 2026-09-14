@@ -53,7 +53,7 @@ def main():
         config = work/'ks.toml'
         text = (ROOT/'config/ks.toml').read_text().replace('require_unlock = false', 'require_unlock = true').replace('master_key_delay_secs = 3600', 'master_key_delay_secs = 1').replace('snapshot_interval_secs = 86400', 'snapshot_interval_secs = 1')
         text = 'unlock_verifier = '+json.dumps((ceremony/'verifier').read_text().strip())+'\n'+text
-        text += '\n[raft]\nring = "KS0"\nheartbeat_ms = 75\nelection_min_ms = 150\nelection_max_ms = 300\nrequest_timeout_ms = 200\n[raft.members]\n'+''.join(f'{id} = {json.dumps(address)}\n' for id, address in members.items())
+        text += '\n[raft]\nring = "KS0"\ncheckpoint_lease_secs = 1\nheartbeat_ms = 75\nelection_min_ms = 150\nelection_max_ms = 300\nrequest_timeout_ms = 200\n[raft.members]\n'+''.join(f'{id} = {json.dumps(address)}\n' for id, address in members.items())
         config.write_text(text)
         def command(id, *args, success=True):
             result = run([BIN/'laws', '--config', cluster, '--to', id, '--at', members[id], '--machine-identity', host/'identity.toml', *args], success)
@@ -125,13 +125,17 @@ def main():
             command(primary, 'unlock', '--key-file', ceremony/'unlock-key')
             until(lambda: all(status(id).get('unlocked') == 'true' for id in children))
             assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
-            # A fresh nonvoter learns the compacted history through InstallSnapshot.
+            # A fresh cold nonvoter copies committed state from a nonprimary peer.
             members['KS3'] = f'127.0.0.1:{port()}'
             start('KS3')
             membership_file = work/'members.json'
             membership_file.write_text(json.dumps(members))
             command(primary, 'raft-members', '--members-file', membership_file)
-            until(lambda: status('KS3').get('unlocked') == 'true' and int(status('KS3')['master_keys']) == 2)
+            until(lambda: status('KS3').get('unlocked') == 'true' and int(status('KS3')['raft_commit']) >= int(status(primary)['raft_commit']))
+            until(lambda: sum(status(id).get('raft_applying') == 'true' for id in children) == 3)
+            cold = next(id for id in children if status(id).get('raft_applying') == 'false')
+            assert int(status(cold)['master_keys']) == 0
+            until(lambda: len(list((work/cold/'data/master-keys').glob('snapshot-*.bin'))) > 1)
             assert command('KS3', 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
             removed = next(id for id in members if id not in (primary, 'KS3'))
             membership_file.write_text(json.dumps({id: address for id, address in members.items() if id != removed}))

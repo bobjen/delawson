@@ -1,4 +1,5 @@
 //! KS: process registry and encrypted, journaled master-key epochs.
+mod application;
 mod journal;
 mod lease;
 mod raft;
@@ -15,7 +16,7 @@ use common::{Context, Result};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 #[derive(Clone)]
@@ -41,6 +42,14 @@ struct KeyHistory {
 
 struct Ks {
     config: KsConfig,
+    placement: Mutex<application::Placement>,
+    applying: AtomicBool,
+    producing_snapshot: AtomicBool,
+    cancel_snapshot: AtomicBool,
+    checkpoint_lease: Mutex<application::CheckpointLease>,
+    checkpoint_started: AtomicU64,
+    checkpoint_requested: AtomicBool,
+    checkpoint_needed: AtomicU64,
     snapshot_stopping: AtomicBool,
     snapshot_task: Mutex<()>,
     unlock_verifier: Option<[u8; 32]>,
@@ -258,7 +267,16 @@ impl Ks {
             node.campaign()?;
         }
         let test_mode = !config.require_unlock;
+        let placement = application::Placement::new(&runtime.members, config.raft.apply_members);
         let ks = Ks {
+            applying: AtomicBool::new(placement.selected.contains(&runtime.id)),
+            placement: Mutex::new(placement),
+            producing_snapshot: AtomicBool::new(false),
+            cancel_snapshot: AtomicBool::new(false),
+            checkpoint_lease: Mutex::new(application::CheckpointLease::default()),
+            checkpoint_started: AtomicU64::new(0),
+            checkpoint_requested: AtomicBool::new(false),
+            checkpoint_needed: AtomicU64::new(0),
             config,
             runtime,
             snapshot_stopping: AtomicBool::new(false),
@@ -281,7 +299,12 @@ impl Ks {
 
     fn open_keys(&self, key: [u8; 32]) -> Result<()> {
         let mut node = self.journal.lock().map_err(|_| common::Error::new("Raft lock poisoned"))?;
-        let history = runtime::decode_history(node.state(), &key)?;
+        // The unlock verifier authenticates cold-member unlocks without applying history.
+        let history = if node.role == raft::Role::Leader || self.applying.load(Ordering::SeqCst) {
+            runtime::decode_history(node.state(), &key)?
+        } else {
+            KeyHistory::default()
+        };
         *self.unlock_key.lock().map_err(|_| common::Error::new("unlock lock poisoned"))? =
             Some(key);
         *self.global_lock.write().map_err(|_| common::Error::new("key history lock poisoned"))? =
@@ -301,44 +324,6 @@ impl Ks {
             .checked_add(delay)
             .ok_or_else(|| common::Error::new("key activation time overflow"))?;
         Ok(MasterEpoch { key, since: TimeSec::new(since) })
-    }
-
-    fn maybe_snapshot(&self) {
-        let Ok(_task) = self.snapshot_task.try_lock() else {
-            return;
-        };
-        let pending = {
-            let Ok(mut node) = self.journal.try_lock() else {
-                return;
-            };
-            let now = TimeSec::now().number();
-            if !node.journal.snapshot_due(
-                self.config.snapshot_min_log_bytes,
-                self.config.snapshot_interval_secs,
-                now,
-            ) {
-                return;
-            }
-            match node.journal.prepare_snapshot(now) {
-                Ok(pending) => pending,
-                Err(e) => {
-                    logn!("KS snapshot preparation failed", "{e}");
-                    return;
-                }
-            }
-        };
-        if let Some(pending) = pending {
-            let result = pending.write().and_then(|()| {
-                self.journal
-                    .lock()
-                    .map_err(|_| common::Error::new("Raft lock poisoned"))?
-                    .journal
-                    .finish_snapshot(&pending)
-            });
-            if let Err(e) = result {
-                logn!("KS snapshot failed; journal retained", "{e}");
-            }
-        }
     }
 
     fn unlock(&self, request: &Req) -> Result<()> {

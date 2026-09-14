@@ -222,9 +222,28 @@ impl Journal {
         if self.change_sequence <= self.snapshot_sequence {
             return Ok(None);
         }
-        let snapshot = self.state.capture();
+        self.prepare_copy(now, self.state.capture())
+    }
+    /// Adopt committed application state without importing another member's hard state.
+    pub fn prepare_copy(
+        &mut self,
+        now: u64,
+        snapshot: crate::raft::Snapshot,
+    ) -> Result<Option<PendingSnapshot>> {
+        if self.failed {
+            return Err(Error::new("KS journal fenced"));
+        }
+        snapshot.validate()?;
+        if snapshot.index < self.state.snapshot.index
+            || snapshot.index > self.state.commit
+            || self.state.term_at(snapshot.index) != Some(snapshot.term)
+        {
+            return Err(Error::new("checkpoint does not match local committed history"));
+        }
         let mut state = self.state.clone();
-        state.apply(&Record::Install(snapshot))?;
+        state.log.retain(|e| e.index > snapshot.index);
+        state.commit = snapshot.index;
+        state.snapshot = snapshot;
         let sequence = self.sequence;
         let captured_bytes = self.log_bytes;
         let suffix = std::mem::take(&mut state.log);
@@ -238,11 +257,11 @@ impl Journal {
         } else {
             frame(&Batch {
                 sequence: start,
-                records: vec![Record::Entries { from: suffix[0].index, entries: suffix }],
+                records: vec![Record::Carry { entries: suffix, commit: self.state.commit }],
             })?
         };
         // Rotation precedes snapshot publication. If publication fails, replay the old
-        // snapshot and every subsequent segment, including this successor and its carried uncommitted suffix.
+        // snapshot and every subsequent segment, including this successor and its carried committed/uncommitted suffix.
         if path.exists() && std::fs::metadata(&path)?.len() != 0 {
             return Err(Error::new("nonempty successor journal"));
         }
@@ -330,6 +349,9 @@ impl PendingSnapshot {
     pub fn write(&self) -> Result<()> {
         publish(&self.path, &self.bytes)
     }
+    pub fn write_cancellable(&self, cancelled: impl Fn() -> bool) -> Result<()> {
+        publish_cancellable(&self.path, &self.bytes, cancelled)
+    }
 }
 fn frame(batch: &Batch) -> Result<Vec<u8>> {
     let bytes = encode(batch)?;
@@ -383,13 +405,40 @@ fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all().map_err(Into::into)
 }
 fn publish(path: &Path, bytes: &[u8]) -> Result<()> {
+    publish_cancellable(path, bytes, || false)
+}
+fn write_checkpoint_chunks(
+    writer: &mut impl Write,
+    bytes: &[u8],
+    cancelled: impl Fn() -> bool,
+) -> Result<()> {
+    for chunk in bytes.chunks(1024 * 1024) {
+        if cancelled() {
+            return Err(Error::new("checkpoint cancelled after election victory"));
+        }
+        writer.write_all(chunk)?;
+    }
+    if cancelled() {
+        return Err(Error::new("checkpoint cancelled after election victory"));
+    }
+    Ok(())
+}
+fn publish_cancellable(path: &Path, bytes: &[u8], cancelled: impl Fn() -> bool) -> Result<()> {
+    let check = || {
+        if cancelled() {
+            Err(Error::new("checkpoint cancelled after election victory"))
+        } else {
+            Ok(())
+        }
+    };
     let temporary =
         path.with_extension(format!("{}.tmp", common::shamir::hex(&random_master_key()?)));
     let result = (|| -> Result<()> {
         let mut file =
             OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
-        file.write_all(bytes)?;
+        write_checkpoint_chunks(&mut file, bytes, &cancelled)?;
         file.sync_all()?;
+        check()?;
         std::fs::rename(&temporary, path)?;
         sync_directory(path.parent().unwrap_or(Path::new(".")))
     })();
@@ -405,6 +454,113 @@ mod tests {
     use crate::raft::{Command, Entry, Node};
     fn initial() -> State {
         State::initial("test/KS0".into(), crate::raft::tests::members(1)).unwrap()
+    }
+    #[test]
+    fn checkpoint_writes_continue_as_candidate_but_stop_after_winning() {
+        use crate::raft::Role;
+        use std::cell::Cell;
+        struct Writer<'a> {
+            role: &'a Cell<Role>,
+            next: Role,
+            count: usize,
+        }
+        impl Write for Writer<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.count += bytes.len();
+                self.role.set(self.next);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = vec![0; 2 * 1024 * 1024];
+        let role = Cell::new(Role::Follower);
+        let mut writer = Writer { role: &role, next: Role::Candidate, count: 0 };
+        let campaigning = write_checkpoint_chunks(&mut writer, &bytes, || {
+            crate::runtime::cancel_checkpoint_after_election(role.get(), 3)
+        })
+        .is_ok();
+        let completed = writer.count;
+        writer.next = Role::Leader;
+        writer.count = 0;
+        let elected = write_checkpoint_chunks(&mut writer, &bytes, || {
+            crate::runtime::cancel_checkpoint_after_election(role.get(), 3)
+        })
+        .is_err();
+        let stopped = writer.count;
+        assert!(campaigning);
+        assert_eq!(completed, bytes.len());
+        assert!(elected);
+        assert_eq!(stopped, 1024 * 1024);
+    }
+    #[test]
+    fn carried_suffix_replays_with_or_without_checkpoint_without_regressing_hard_state() {
+        let mut original = initial();
+        original.apply(&Record::Hard { term: 2, vote: Some("KS0".into()) }).unwrap();
+        let entries: Vec<_> =
+            (1..=4).map(|index| Entry { index, term: 2, command: Command::Noop }).collect();
+        original.apply(&Record::Entries { from: 1, entries }).unwrap();
+        original.apply(&Record::Commit(1)).unwrap();
+        let checkpoint = original.capture();
+        original.apply(&Record::Commit(3)).unwrap();
+        let carry = Record::Carry {
+            entries: original.log.iter().filter(|e| e.index > 1).cloned().collect(),
+            commit: 3,
+        };
+        let mut published = original.clone();
+        published.snapshot = checkpoint;
+        published.log.clear();
+        published.commit = 1;
+        published.apply(&carry).unwrap();
+        let before = original.clone();
+        original.apply(&carry).unwrap();
+        let same_log = original.log == before.log;
+        let recovered_suffix = published.log == before.log[1..];
+        let committed = published.commit;
+        let term = published.term;
+        let vote = published.vote.clone();
+        let mut bad = carry.clone();
+        if let Record::Carry { entries, .. } = &mut bad {
+            entries[0].term = 1;
+        }
+        let rejected = original.apply(&bad).is_err();
+        assert!(same_log);
+        assert!(recovered_suffix);
+        assert_eq!(committed, 3);
+        assert_eq!(term, 2);
+        assert_eq!(vote.as_deref(), Some("KS0"));
+        assert!(rejected);
+    }
+    #[test]
+    #[ignore = "filesystem integration; run explicitly with --ignored"]
+    fn copying_older_checkpoint_keeps_committed_and_uncommitted_suffix_across_restart() {
+        for publish_snapshot in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+            let entries =
+                (1..=4).map(|index| Entry { index, term: 2, command: Command::Noop }).collect();
+            journal
+                .write(&[
+                    Record::Hard { term: 2, vote: Some("KS0".into()) },
+                    Record::Entries { from: 1, entries },
+                    Record::Commit(1),
+                ])
+                .unwrap();
+            let checkpoint = journal.state.capture();
+            journal.write(&[Record::Commit(3)]).unwrap();
+            let pending = journal.prepare_copy(100, checkpoint).unwrap().unwrap();
+            if publish_snapshot {
+                pending.write().unwrap();
+                journal.finish_snapshot(&pending).unwrap();
+            }
+            drop(journal);
+            let recovered = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+            let positions = (recovered.state.commit, recovered.state.last(), recovered.state.term);
+            let vote = recovered.state.vote.clone();
+            assert_eq!(positions, (3, 4, 2));
+            assert_eq!(vote.as_deref(), Some("KS0"));
+        }
     }
     #[test]
     #[ignore = "filesystem integration; run explicitly with --ignored"]

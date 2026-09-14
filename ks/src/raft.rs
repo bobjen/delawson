@@ -51,6 +51,7 @@ pub enum Command {
     /// AEGIS envelope of (master key, activation second), never plaintext on disk.
     Key(Vec<u8>),
     Members(Membership),
+    CheckpointStart(String),
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {
@@ -65,12 +66,21 @@ pub struct Snapshot {
     pub membership: Membership,
     /// Committed key commands preserve their original index/term for AEAD binding.
     pub keys: Vec<Entry>,
+    #[serde(default)]
+    pub checkpoint_start: Option<(u64, String)>,
 }
 impl Snapshot {
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         self.membership.validate()?;
         if (self.index == 0) != (self.term == 0) {
             return Err(Error::new("invalid snapshot index/term"));
+        }
+        if self
+            .checkpoint_start
+            .as_ref()
+            .is_some_and(|(index, member)| *index == 0 || *index > self.index || member.is_empty())
+        {
+            return Err(Error::new("invalid checkpoint announcement"));
         }
         let mut previous = 0;
         for entry in &self.keys {
@@ -130,7 +140,13 @@ impl State {
             ring,
             term: 0,
             vote: None,
-            snapshot: Snapshot { index: 0, term: 0, membership, keys: vec![] },
+            snapshot: Snapshot {
+                index: 0,
+                term: 0,
+                membership,
+                keys: vec![],
+                checkpoint_start: None,
+            },
             log: vec![],
             commit: 0,
         })
@@ -176,12 +192,26 @@ impl State {
             })
             .unwrap_or_else(|| self.snapshot.membership.clone())
     }
+    pub fn checkpoint_start(&self) -> Option<(u64, String)> {
+        self.log
+            .iter()
+            .rev()
+            .filter(|e| e.index <= self.commit)
+            .find_map(|e| match &e.command {
+                Command::CheckpointStart(member) => Some((e.index, member.clone())),
+                _ => None,
+            })
+            .or_else(|| self.snapshot.checkpoint_start.clone())
+    }
     pub fn capture(&self) -> Snapshot {
         let mut snapshot = self.snapshot.clone();
         for e in self.log.iter().take_while(|e| e.index <= self.commit) {
             match &e.command {
                 Command::Key(_) => snapshot.keys.push(e.clone()),
                 Command::Members(m) => snapshot.membership = m.clone(),
+                Command::CheckpointStart(member) => {
+                    snapshot.checkpoint_start = Some((e.index, member.clone()))
+                }
                 Command::Noop => {}
             }
             snapshot.index = e.index;
@@ -191,6 +221,21 @@ impl State {
     }
     pub fn apply(&mut self, record: &Record) -> Result<()> {
         match record {
+            Record::Carry { entries, commit } => {
+                // A rotated journal must replay both with and without its checkpoint.
+                // Already committed entries must agree; only the remaining suffix is replaced.
+                for entry in entries.iter().filter(|e| e.index <= self.commit) {
+                    if self.term_at(entry.index) != Some(entry.term) {
+                        return Err(Error::new("carried journal conflicts with committed state"));
+                    }
+                }
+                let suffix: Vec<_> =
+                    entries.iter().filter(|e| e.index > self.commit).cloned().collect();
+                if let Some(first) = suffix.first() {
+                    self.apply(&Record::Entries { from: first.index, entries: suffix })?;
+                }
+                self.apply(&Record::Commit(self.commit.max(*commit)))?;
+            }
             Record::Hard { term, vote } => {
                 if *term < self.term
                     || (*term == self.term && self.vote.is_some() && vote != &self.vote)
@@ -247,6 +292,7 @@ impl State {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Record {
+    Carry { entries: Vec<Entry>, commit: u64 },
     Hard { term: u64, vote: Option<String> },
     Entries { from: u64, entries: Vec<Entry> },
     Commit(u64),
@@ -257,13 +303,15 @@ pub enum Rpc {
     Vote { term: u64, last: u64, last_term: u64 },
     Append { term: u64, previous: u64, previous_term: u64, entries: Vec<Entry>, commit: u64 },
     Install { term: u64, snapshot: Snapshot },
+    Checkpoint { term: u64, index: u64, snapshot_term: u64 },
 }
 impl Rpc {
     pub fn term(&self) -> u64 {
         match self {
-            Self::Vote { term, .. } | Self::Append { term, .. } | Self::Install { term, .. } => {
-                *term
-            }
+            Self::Vote { term, .. }
+            | Self::Append { term, .. }
+            | Self::Install { term, .. }
+            | Self::Checkpoint { term, .. } => *term,
         }
     }
 }
@@ -477,7 +525,15 @@ impl<S: Storage> Node<S> {
             && self.state().term_at(self.state().commit) == Some(self.state().term)
             && self.lease.valid(self.state().term, &self.id, &self.state().membership(), now)
     }
+    #[cfg(test)]
     pub fn request(&self, peer: &str) -> Option<Rpc> {
+        self.make_request(peer, true)
+    }
+    /// Runtime sends a checkpoint reference, never checkpoint contents from a primary.
+    pub fn request_reference(&self, peer: &str) -> Option<Rpc> {
+        self.make_request(peer, false)
+    }
+    fn make_request(&self, peer: &str, contents: bool) -> Option<Rpc> {
         let s = self.state();
         match self.role {
             Role::Follower | Role::Stopped => None,
@@ -487,7 +543,15 @@ impl<S: Storage> Node<S> {
             Role::Leader => {
                 let next = self.next.get(peer).copied().unwrap_or(s.last().saturating_add(1));
                 if next <= s.snapshot.index {
-                    return Some(Rpc::Install { term: s.term, snapshot: s.snapshot.clone() });
+                    return Some(if contents {
+                        Rpc::Install { term: s.term, snapshot: s.snapshot.clone() }
+                    } else {
+                        Rpc::Checkpoint {
+                            term: s.term,
+                            index: s.snapshot.index,
+                            snapshot_term: s.snapshot.term,
+                        }
+                    });
                 }
                 let previous = next - 1;
                 Some(Rpc::Append {
@@ -502,6 +566,13 @@ impl<S: Storage> Node<S> {
     }
     pub fn receive(&mut self, sender: &str, rpc: &Rpc) -> Result<Answer> {
         self.running()?;
+        // A removed/lagging member can still send votes from its old configuration.
+        // It must not repeatedly terminate the primary by advancing its private term.
+        if matches!(rpc, Rpc::Vote { .. })
+            && !self.state().membership().members().contains_key(sender)
+        {
+            return Ok(Answer { term: self.state().term, success: false, matched: 0 });
+        }
         if rpc.term() > self.state().term {
             self.follow(rpc.term())?;
         }
@@ -510,6 +581,20 @@ impl<S: Storage> Node<S> {
             return Ok(answer);
         }
         match rpc {
+            Rpc::Checkpoint { term, index, snapshot_term } => {
+                // A reference is also leader contact. A matching local prefix can acknowledge
+                // immediately; otherwise the runtime fetches committed state from a peer.
+                return self.receive(
+                    sender,
+                    &Rpc::Append {
+                        term: *term,
+                        previous: *index,
+                        previous_term: *snapshot_term,
+                        entries: vec![],
+                        commit: *index,
+                    },
+                );
+            }
             Rpc::Vote { last, last_term, .. } => {
                 let fresh = (*last_term, *last)
                     >= (
@@ -602,6 +687,11 @@ impl<S: Storage> Node<S> {
                     let next = self.next.entry(peer.into()).or_insert(previous.saturating_add(1));
                     *next = next.saturating_sub(1).max(1);
                 }
+            }
+            Rpc::Checkpoint { index, .. } if self.role == Role::Leader && answer.success => {
+                self.matched.insert(peer.into(), *index);
+                self.next.insert(peer.into(), index.saturating_add(1));
+                self.advance()?;
             }
             Rpc::Install { snapshot, .. } if self.role == Role::Leader && answer.success => {
                 self.matched.insert(peer.into(), snapshot.index);
@@ -982,6 +1072,51 @@ pub mod tests {
             &Rpc::Append { term: 1, previous: 0, previous_term: 0, entries: vec![], commit: 0 },
         );
         assert!(result.is_err());
+    }
+    #[test]
+    fn excluded_candidate_cannot_advance_term_or_demote_primary() {
+        let mut nodes = cluster(2);
+        nodes[0].campaign().unwrap();
+        pair(&mut nodes, 0, 1);
+        let term = nodes[0].state().term;
+        let vote = Rpc::Vote { term: term + 100, last: 999, last_term: term + 100 };
+        let answer = nodes[0].receive("KS2", &vote).unwrap();
+        let role = nodes[0].role;
+        let unchanged = nodes[0].state().term == term;
+        assert!(!answer.success);
+        assert!(unchanged);
+        assert_eq!(role, Role::Leader);
+    }
+    #[test]
+    fn checkpoint_reference_acknowledges_only_after_peer_copy_then_resumes_append() {
+        let mut nodes = cluster(3);
+        nodes[0].campaign().unwrap();
+        pair(&mut nodes, 0, 1);
+        pair(&mut nodes, 0, 1);
+        nodes[0].propose(Command::Key(vec![9; 104])).unwrap();
+        pair(&mut nodes, 0, 1);
+        pair(&mut nodes, 0, 1);
+        nodes[1].journal.snapshot(100).unwrap();
+        let checkpoint = nodes[1].state().snapshot.clone();
+        nodes[0].journal.write(&[Record::Install(checkpoint.clone())]).unwrap();
+        nodes[0].next.insert("KS2".into(), 1);
+        let reference = nodes[0].request_reference("KS2").unwrap();
+        let is_reference = matches!(reference, Rpc::Checkpoint { .. });
+        let before = nodes[2].receive("KS0", &reference).unwrap();
+        let known_leader = nodes[2].leader.clone();
+        // The receiver persists a copy obtained from KS1, without decrypting its contents.
+        nodes[2].journal.write(&[Record::Install(checkpoint)]).unwrap();
+        let after = nodes[2].receive("KS0", &reference).unwrap();
+        nodes[0].response("KS2", &reference, &after).unwrap();
+        let next = nodes[0].request_reference("KS2").unwrap();
+        let resumes_append = matches!(next, Rpc::Append { .. });
+        let recovered = nodes[2].state().capture() == nodes[0].state().capture();
+        assert!(is_reference);
+        assert!(!before.success);
+        assert_eq!(known_leader.as_deref(), Some("KS0"));
+        assert!(after.success);
+        assert!(resumes_append);
+        assert!(recovered);
     }
     #[test]
     fn lagging_follower_installs_snapshot_then_replays_suffix() {

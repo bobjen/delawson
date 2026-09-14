@@ -18608,10 +18608,65 @@ local copy. Remote backup is future work and never applies to KS.
 
 KS implements persistent terms and votes, randomized elections, AppendEntries
 conflict repair, current-term majority commitment, a new-primary no-op, and
-primary-to-member InstallSnapshot. Membership changes use joint consensus,
+peer checkpoint transfer. Membership changes use joint consensus,
 requiring majorities of both configurations before completing the transition.
-Locked members participate in all these operations. All unlocked members currently
-apply committed key state; selective materialization is deferred.
+Locked members still journal, vote, and contribute to commitment. `apply_members`
+defaults to 3: the primary and two hot backups maintain applied key state. The
+primary advertises volatile application placement with its consensus messages,
+retaining reachable existing backups and replacing unreachable ones with other
+reachable members. Application placement never changes voting membership or quorum.
+At startup, member-ID order selects the initial backups; a newly elected primary
+always applies state before admitting clients. Cold members discard plaintext
+key history but retain their unlock key and encrypted consensus state. Application
+is incremental between checkpoints. The current in-memory encrypted journal cache
+is unchanged; bounding that cache for SN/DN remains issue #125.
+
+Cold members add `cold_election_delay_ms` (default 1000 ms) to the ordinary randomized
+election timeout. Both hot backups have the same election policy. This is a
+preference, not a voting restriction: a cold member can still win and load state.
+A multi-member ring requires at least two applying members so a nonprimary can
+produce checkpoints; singleton rings may use one.
+
+Only applying, unlocked followers produce checkpoints, except that a singleton
+primary still produces its own. A checkpoint producer can campaign while continuing its write; it cancels
+unfinished production only if elected primary. The primary never serves checkpoint contents: when a follower needs
+compacted history, it sends a boundary reference and the follower fetches a
+checkpoint from another member. Any nonprimary can serve its durable checkpoint,
+including a locked or cold member. On reaching the checkpoint threshold, primaries
+and cold members copy from peers; if necessary they request an applying follower
+to produce a newer checkpoint. If no source is available, journals are retained.
+Checkpoint networking and publication have a worker separate from election timers.
+
+Before producing a checkpoint, a secondary asks the primary to append a
+`CheckpointStart(member)` Raft entry and waits to observe its commitment. Only one
+announcement may be pending, and the primary declines additional announcements
+while the committed announcement's lease is active. Other secondaries suppress
+production for `checkpoint_lease_secs` (default 300 seconds); copying is unaffected.
+Each member starts its monotonic timer when it first observes commitment, without
+extending it on subsequent heartbeats. The latest announcement is included in
+snapshots; after restart, a full lease is conservatively observed again. A writer
+uses an announcement at most once in its process lifetime. Singleton primaries do
+not need announcements. Announcements count normally toward checkpoint thresholds;
+being due is a soft scheduling signal, and the lease may delay the actual write.
+
+Checkpoint writers add `checkpoint_election_delay_ms` (default 500 ms) to their
+ordinary randomized election timeout. It must be positive and smaller than the
+cold-member delay (default 1000 ms). The current writer/cold penalty is applied to
+the base deadline, so starting or finishing a write between heartbeats changes
+eligibility appropriately. Writers continue through candidacy or a lost election;
+winning cancels unfinished production at a write boundary (or after an in-flight
+filesystem operation returns). Cancellation discards the temporary checkpoint,
+retaining the rotated journals for recovery. A checkpoint already published remains
+valid committed state.
+
+
+A copied checkpoint supplies only committed application state, its index and term,
+and membership. The recipient retains its own term, vote, and physical journal
+sequence. Copying an older checkpoint retains both committed and uncommitted local
+entries after its boundary, with a carried-suffix record and commit marker in the
+new journal. Replay accepts that carry whether or not checkpoint publication
+completed. A follower may adopt a newer committed checkpoint; a primary only
+compacts a checkpoint matching its locally committed log.
 
 An explicit `[raft]` configuration gives the ring name and member-ID/address map.
 Without a map, each KS process remains an independent singleton, preserving the
@@ -18629,7 +18684,10 @@ lifetime and the new-primary startup delay. Configuration validation requires po
 RPC timeout and read lease; `election_min_ms >= 2 * heartbeat_ms`,
 `election_max_ms > election_min_ms`, and `primary_wait_ms >= election_min_ms`.
 The election-gap clock margin requires `2 * primary_wait_ms < 99 * election_min_ms`.
-Recent primary contact suppresses ordinary vote requests.
+Recent primary contact suppresses ordinary vote requests. Vote requests from IDs
+excluded by the local voting configuration cannot advance the term or demote the
+primary. Lagging enrolled KS members can still fetch checkpoints to learn a newer
+configuration, including one that removes them.
 Key reads require a committed and applied current-term entry and a live 150 ms
 read lease. A successful current-term AppendEntries response contributes its
 request's send time, never its receive time. A quorum of unexpired acknowledgments
@@ -18724,5 +18782,4 @@ This initial implementation uses whole JSON messages and a 64 MiB journal frame
 limit. Snapshot transfer is not chunked. Large SN/DN state requires bounded-memory
 streaming and different snapshot capture before reusing this implementation there
 (issue #125).
-Leadership handoff, selective execution, and independent execution
-liveness monitoring are deferred.
+Leadership handoff and independent execution liveness monitoring are deferred.
