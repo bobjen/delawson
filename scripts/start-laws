@@ -107,7 +107,9 @@ PYAUTH
 fi
 
 # Names are routing labels. Preserve independently random ring identities across starts.
-"$root/scripts/ring-identities" "$cluster" "$run_dir/cluster-effective.toml" "$run_dir/ring-identities.toml" "$config_dir/ks.toml"
+creating_rings=false
+[[ -e "$run_dir/ring-identities.toml" ]] || creating_rings=true
+"$root/scripts/ring-identities" "$cluster" "$run_dir/cluster-effective.toml" "$run_dir/ring-identities.toml" "$config_dir"
 cluster=$run_dir/cluster-effective.toml
 
 # KS's address is fixed; every other process is handed a port from the base up.
@@ -142,7 +144,8 @@ fi
 started=()
 while read -r identity kind domain _; do
     dir=$run_dir/$identity
-    service_config=$config_dir/$kind.toml
+    service_config=$config_dir/$identity.toml
+    [[ -f $service_config ]] || service_config=$config_dir/$kind.toml
     [[ -f $service_config ]] || { echo "start-laws: no $service_config" >&2; exit 1; }
     [[ -x $bin/$kind ]] || { echo "start-laws: no $bin/$kind" >&2; exit 1; }
 
@@ -157,6 +160,9 @@ while read -r identity kind domain _; do
     cp "$cluster" "$dir/cluster.toml"
     cp "$service_config" "$dir/$kind.toml"
     if [[ $kind == ks ]]; then
+        if [[ $creating_rings == true ]]; then
+            "$root/scripts/member-identity" "$cluster" "$identity" "$dir/data/master-keys"
+        fi
         sed -i '/^require_unlock *=/d; /^unlock_verifier *=/d' "$dir/$kind.toml"
         sed -i "1i require_unlock = true\nunlock_verifier = \"$verifier\"" "$dir/$kind.toml"
     fi

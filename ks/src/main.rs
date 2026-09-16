@@ -62,8 +62,9 @@ struct Ks {
     /// Serializes proposals and disk I/O, without blocking reads of committed keys.
     journal: Mutex<raft::Node>,
     runtime: runtime::Settings,
+    transport: Option<common::peer::Peers>,
     unlock_key: Mutex<Option<[u8; 32]>>,
-    unlock_requests: Mutex<std::collections::BTreeSet<String>>,
+    unlock_requests: Mutex<std::collections::BTreeSet<raft::MemberId>>,
     proposing: Mutex<()>,
     raft_workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// The process-wide global lock: application takes write access; key serving takes read access.
@@ -141,6 +142,7 @@ impl Service for Ks {
         match request.op {
             Op::Raft => self.raft_rpc(process, request),
             Op::Register => self.enroll(process, request),
+            Op::Lookup => self.lookup(request),
             Op::Unlock => match self.unlock(request) {
                 Ok(()) => Resp::ok(),
                 Err(e) => Resp::error(Status::BadRequest, e.to_string()),
@@ -186,7 +188,7 @@ impl Ks {
                 return answer;
             }
         }
-        // Key generation is internal maintenance; it may journal/apply during the wait.
+        // Key generation is internal maintenance; proposals still require write authority.
         if request.op == Op::SnMasterKey && self.unlocked.load(Ordering::SeqCst) {
             if let Err(e) = self.prepare_key_read() {
                 return Resp::error(Status::Internal, e.to_string());
@@ -243,6 +245,15 @@ impl Ks {
     #[cfg(test)]
     fn new(config: KsConfig, path: &std::path::Path) -> Result<Ks> {
         let settings = runtime::Settings::testing(&config);
+        // Test ring creation performs the same explicit provisioning as start-laws.
+        if !path.join("identity").exists() {
+            journal::provision_test_founder(
+                path,
+                &settings.ring,
+                &settings.name,
+                settings.identities[&0].identity.clone(),
+            )?;
+        }
         Self::with_runtime(config, path, settings)
     }
 
@@ -257,20 +268,40 @@ impl Ks {
         if config.require_unlock && unlock_verifier.is_none() {
             return Err(common::Error::new("require_unlock needs unlock_verifier"));
         }
-        let mut initial = raft::State::initial(runtime.ring.clone(), runtime.members.clone())?;
+        let mut initial = raft::State::initial(
+            runtime.ring.clone(),
+            if runtime.identities.is_empty() {
+                Default::default()
+            } else {
+                runtime.members.clone()
+            },
+            runtime.identities.clone(),
+        )?;
         initial.ignore_ring_identity = runtime.ignore_ring_identity;
-        let journal = journal::Journal::open(path, initial, config.snapshot_retain, &runtime.id)?;
-        let mut node = raft::Node::new(runtime.id.clone(), journal);
+        let journal = journal::Journal::open(path, initial, config.snapshot_retain, &runtime.name)?;
+        let id =
+            journal.state.membership().slot(&journal.identity.current).unwrap_or(raft::UNASSIGNED);
+        let mut node = raft::Node::new(id, journal);
+        node.identity = Some(node.journal.identity.current.clone());
         node.lease = lease::Lease::configured(&config.raft);
         if node.state().membership().members().len() == 1
-            && node.state().membership().members().contains_key(&runtime.id)
+            && node.state().membership().members().contains(&id)
         {
             node.campaign()?;
         }
         let test_mode = !config.require_unlock;
         let placement = application::Placement::new(&runtime.members, config.raft.apply_members);
+        let transport = runtime.messaging.as_ref().map(|messaging| {
+            let mut messaging = messaging.clone();
+            messaging.peer_conns = 1;
+            common::peer::Peers::new(
+                messaging,
+                std::time::Duration::from_millis(config.raft.request_timeout_ms),
+            )
+        });
         let ks = Ks {
-            applying: AtomicBool::new(placement.selected.contains(&runtime.id)),
+            transport,
+            applying: AtomicBool::new(placement.selected.contains(&id)),
             placement: Mutex::new(placement),
             producing_snapshot: AtomicBool::new(false),
             cancel_snapshot: AtomicBool::new(false),
@@ -520,12 +551,9 @@ impl Ks {
             );
         }
         let request = Req::new(Op::AssignPeers).structure(forwarded);
-        match server::ask(
-            source_peer.address,
-            &request,
-            process.timeout(),
-            &process.cluster.messaging,
-        ) {
+        let mut messaging = process.cluster.messaging.clone();
+        messaging.expected_peer = Some(source.to_string());
+        match server::ask(source_peer.address, &request, process.timeout(), &messaging) {
             Ok(response) => response,
             Err(e) => Resp::error(Status::Internal, format!("could not relay to {source}: {e}")),
         }
@@ -575,7 +603,7 @@ mod persistence_tests {
             snapshot_interval_secs: 86400,
             snapshot_min_log_bytes: 1048576,
             unlock_verifier: Some(common::shamir::hex(&common::shamir::verifier(&[42; 32]))),
-            knobs: common::config::Knobs { workers: 1 },
+            knobs: common::config::Knobs { workers: 1, allow_stale_reads: false },
             lazy_day_keys: true,
             master_key_delay_secs: common::time::TimeIntSec64::new(1),
             require_unlock: true,

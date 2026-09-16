@@ -175,6 +175,13 @@ pub struct Messaging {
     /// Set by the caller, never accepted from a remote peer.
     #[serde(skip)]
     pub expected_peer: Option<String>,
+    /// Connection setup only. Populated from the trusted cluster roster.
+    #[serde(skip)]
+    pub ring_identities: BTreeMap<String, crate::ring::RingIdentity>,
+    #[serde(skip)]
+    pub local_ring: Option<crate::ring::RingIdentity>,
+    #[serde(skip)]
+    pub ignore_ring_identity: bool,
     pub send: SendMode,
     /// Every message is encrypted. False exists to measure what that costs, and
     /// is not a configuration to run.
@@ -534,7 +541,7 @@ impl ClusterConfig {
             }
         }
 
-        let config = ClusterConfig {
+        let mut config = ClusterConfig {
             schema_version: file.schema_version,
             cluster_name: file.cluster_name,
             ring_identities: file.ring_identities,
@@ -549,6 +556,7 @@ impl ClusterConfig {
             services,
             media_classes: file.media_class,
         };
+        config.messaging.ring_identities = config.ring_identities.clone();
         config.validate()?;
         Ok(config)
     }
@@ -639,6 +647,11 @@ impl ClusterConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Knobs {
+    /// Permit primary reads after its quorum lease expires. Writes still require
+    /// a live lease; committed-term readiness and demotion checks remain enforced.
+    /// Set independently in each service file. Effective where Raft admission exists.
+    #[serde(default)]
+    pub allow_stale_reads: bool,
     /// Threads answering requests off the read loop. Zero means one per core.
     pub workers: usize,
 }
@@ -657,16 +670,17 @@ pub struct RaftConfig {
     /// Positive, and smaller than cold_election_delay_ms.
     pub checkpoint_election_delay_ms: u64,
     pub ring: String,
+    /// Bootstrap endpoint hints, refreshed through registration; not persisted as membership.
     pub members: BTreeMap<String, SocketAddr>,
+    /// Founding slot assignments only. The primary assigns slots to later applicants.
+    pub member_indexes: BTreeMap<String, u32>,
     /// Positive; election_min_ms must be at least twice this interval.
     pub heartbeat_ms: u64,
-    /// At least 2 * heartbeat_ms, and no greater than primary_wait_ms.
+    /// Also the primary read/write lease lifetime, measured from heartbeat send.
+    /// At least 2 * heartbeat_ms; all ring members must use the same value.
     pub election_min_ms: u64,
     /// Strictly greater than election_min_ms; elections randomize within this range.
     pub election_max_ms: u64,
-    /// Both read-lease lifetime (from heartbeat send) and new-primary service delay.
-    /// Must be >= election_min_ms; all ring members must use the same value.
-    pub primary_wait_ms: u64,
     pub request_timeout_ms: u64,
 }
 impl Default for RaftConfig {
@@ -678,10 +692,10 @@ impl Default for RaftConfig {
             checkpoint_election_delay_ms: 500,
             ring: "KS0".into(),
             members: BTreeMap::new(),
+            member_indexes: BTreeMap::new(),
             heartbeat_ms: 75,
             election_min_ms: 150,
             election_max_ms: 300,
-            primary_wait_ms: 150,
             request_timeout_ms: 1000,
         }
     }
@@ -702,24 +716,14 @@ impl RaftConfig {
                 "Raft apply_members and cold_election_delay_ms must be positive",
             ));
         }
-        if self.heartbeat_ms == 0 || self.request_timeout_ms == 0 || self.primary_wait_ms == 0 {
-            return Err(Error::new(
-                "Raft heartbeat, RPC timeout, and primary wait must be positive",
-            ));
+        if self.heartbeat_ms == 0 || self.request_timeout_ms == 0 {
+            return Err(Error::new("Raft heartbeat and RPC timeout must be positive"));
         }
         if self.heartbeat_ms > self.election_min_ms / 2 {
             return Err(Error::new("Raft election_min_ms must be >= 2 * heartbeat_ms"));
         }
         if self.election_max_ms <= self.election_min_ms {
             return Err(Error::new("Raft election_max_ms must be > election_min_ms"));
-        }
-        if self.primary_wait_ms < self.election_min_ms {
-            return Err(Error::new("Raft primary_wait_ms must be >= election_min_ms"));
-        }
-        // At 1% rate error, the election quiet period covers the discrepancy between
-        // equal lease/wait durations: (election_min + wait)/1.01 > wait/0.99.
-        if u128::from(self.primary_wait_ms) * 2 >= u128::from(self.election_min_ms) * 99 {
-            return Err(Error::new("Raft primary wait is too long for the election clock margin"));
         }
         Ok(())
     }
@@ -1215,5 +1219,20 @@ mod tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod stale_read_config_tests {
+    use super::Knobs;
+
+    #[test]
+    fn service_knobs_default_to_fresh_reads_and_allow_independent_override() {
+        let ks: Knobs = toml::from_str("workers = 1").unwrap();
+        let sn: Knobs = toml::from_str("workers = 1\nallow_stale_reads = true").unwrap();
+        let dn: Knobs = toml::from_str("workers = 1\nallow_stale_reads = false").unwrap();
+        assert!(!ks.allow_stale_reads);
+        assert!(sn.allow_stale_reads);
+        assert!(!dn.allow_stale_reads);
     }
 }

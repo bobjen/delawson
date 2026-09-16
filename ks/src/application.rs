@@ -1,31 +1,31 @@
 //! Volatile application placement; this never changes the voting quorum.
+use crate::raft::MemberId;
 use crate::raft::Members;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 pub struct Placement {
-    pub selected: BTreeSet<String>,
-    seen: BTreeMap<String, Instant>,
+    pub selected: BTreeSet<MemberId>,
+    seen: BTreeMap<MemberId, Instant>,
 }
 impl Placement {
     pub fn new(members: &Members, count: usize) -> Self {
-        Self { selected: members.keys().take(count).cloned().collect(), seen: BTreeMap::new() }
+        Self { selected: members.iter().take(count).cloned().collect(), seen: BTreeMap::new() }
     }
-    pub fn acknowledge(&mut self, id: &str, now: Instant) {
-        self.seen.insert(id.into(), now);
+    pub fn acknowledge(&mut self, id: &MemberId, now: Instant) {
+        self.seen.insert(*id, now);
     }
     pub fn select(
         &mut self,
-        primary: &str,
+        primary: &MemberId,
         members: &Members,
         count: usize,
         now: Instant,
         grace: Duration,
     ) {
         let healthy =
-            |id: &String| self.seen.get(id).is_some_and(|seen| now.duration_since(*seen) < grace);
-        let mut candidates: Vec<_> =
-            members.keys().filter(|id| id.as_str() != primary).cloned().collect();
+            |id: &MemberId| self.seen.get(id).is_some_and(|seen| now.duration_since(*seen) < grace);
+        let mut candidates: Vec<_> = members.iter().filter(|id| *id != primary).cloned().collect();
         // Preserve existing healthy backups, then promote reachable cold members.
         candidates.sort_by_key(|id| (!healthy(id), !self.selected.contains(id), id.clone()));
         self.selected = std::iter::once(primary.to_owned())
@@ -38,17 +38,17 @@ impl Placement {
 /// commitment. Recovery conservatively waits a full lease for the last announcement.
 #[derive(Default)]
 pub struct CheckpointLease {
-    pub announcement: Option<(u64, String)>,
+    pub announcement: Option<(u64, MemberId)>,
     observed: Option<Instant>,
 }
 impl CheckpointLease {
-    pub fn observe(&mut self, announcement: Option<(u64, String)>, now: Instant) {
+    pub fn observe(&mut self, announcement: Option<(u64, MemberId)>, now: Instant) {
         if announcement != self.announcement {
             self.announcement = announcement;
             self.observed = Some(now);
         }
     }
-    pub fn holder(&self, now: Instant, duration: Duration) -> Option<&(u64, String)> {
+    pub fn holder(&self, now: Instant, duration: Duration) -> Option<&(u64, MemberId)> {
         self.observed.filter(|seen| now.saturating_duration_since(*seen) < duration)?;
         self.announcement.as_ref()
     }
@@ -62,13 +62,17 @@ mod tests {
         let now = Instant::now();
         let duration = Duration::from_secs(300);
         let mut lease = CheckpointLease::default();
-        let mut state =
-            crate::raft::State::initial("01".repeat(64), crate::raft::tests::members(3)).unwrap();
+        let mut state = crate::raft::State::initial(
+            "01".repeat(64),
+            crate::raft::tests::members(3),
+            crate::raft::tests::names(),
+        )
+        .unwrap();
         state.term = 1;
         state.log.push(crate::raft::Entry {
             index: 1,
             term: 1,
-            command: crate::raft::Command::CheckpointStart("KS1".into()),
+            command: crate::raft::Command::CheckpointStart(1),
         });
         lease.observe(state.checkpoint_start(), now);
         let uncommitted = lease.holder(now, duration).is_none();
@@ -83,26 +87,25 @@ mod tests {
         restarted.observe(state.checkpoint_start(), now + duration);
         let after_recovery = restarted.holder(now + duration, duration).cloned();
         assert!(uncommitted);
-        assert_eq!(holder, Some((1, "KS1".into())));
+        assert_eq!(holder, Some((1, 1)));
         assert!(expired);
         assert_eq!(after_recovery, holder);
     }
     #[test]
     fn placement_preserves_backups_replaces_failed_members_and_keeps_primary() {
-        let members: Members =
-            (0..7).map(|n| (format!("KS{n}"), "127.0.0.1:1".parse().unwrap())).collect();
+        let members: Members = (0..7).collect();
         let mut p = Placement::new(&members, 3);
         let now = Instant::now();
-        for id in members.keys() {
+        for id in members.iter() {
             p.acknowledge(id, now);
         }
-        p.select("KS6", &members, 3, now, Duration::from_secs(2));
+        p.select(&6, &members, 3, now, Duration::from_secs(2));
         let first = p.selected.clone();
-        p.acknowledge("KS2", now + Duration::from_secs(3));
-        p.select("KS6", &members, 3, now + Duration::from_secs(3), Duration::from_secs(2));
-        let replacement = p.selected.contains("KS2");
+        p.acknowledge(&2, now + Duration::from_secs(3));
+        p.select(&6, &members, 3, now + Duration::from_secs(3), Duration::from_secs(2));
+        let replacement = p.selected.contains(&2);
         let count = p.selected.len();
-        assert_eq!(first, BTreeSet::from(["KS0".into(), "KS1".into(), "KS6".into()]));
+        assert_eq!(first, BTreeSet::from([0, 1, 6]));
         assert!(replacement);
         assert_eq!(count, 3);
     }

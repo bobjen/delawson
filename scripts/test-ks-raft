@@ -40,22 +40,30 @@ def main():
     children = {}
     with tempfile.TemporaryDirectory(prefix='delawson-ks-raft-') as temporary:
         work = Path(temporary)
-        members = {f'KS{i}': f'127.0.0.1:{port()}' for i in range(3)}
+        members = {f'KS0-member{i}': f'127.0.0.1:{port()}' for i in range(3)}
         host = work/'host'
         run([ROOT/'scripts/machine-identity', '--output-dir', host, '--software'])
         ceremony = work/'ceremony'
         run([BIN/'laws', 'unlock-generate', '--direct', '--output-dir', ceremony])
         cluster = work/'cluster.toml'
-        text = (ROOT/'config/cluster.toml').read_text().replace('127.0.0.1:9601', members['KS0'])
-        text = text.replace('kind = "ks"\ncount = 3', 'kind = "ks"\ncount = 4')
-        text += '\n[[messaging.authentication.members]]\npublic_key = '+json.dumps((host/'public.hex').read_text().strip())+'\nservices = ["KS0", "KS1", "KS2", "KS3", "EN0"]\n'
+        text = (ROOT/'config/cluster.toml').read_text().replace('127.0.0.1:9601', members['KS0-member0'])
+        text = text.replace('kind = "ks"\ncount = 3', 'kind = "ks"\nidentity = "KS0-member0"')
+        for i in range(1, 4):
+            text += f'\n[[service]]\nkind = "ks"\nidentity = "KS0-member{i}"\ndomain = ["region0", "dc0", "rack0", "box0", "disk0"]\n'
+        indexes = {f'KS0-member{i}': i for i in range(3)}
+        text += '\n[[messaging.authentication.members]]\npublic_key = '+json.dumps((host/'public.hex').read_text().strip())+'\nservices = ["KS0-member0", "KS0-member1", "KS0-member2", "KS0-member3", "EN0"]\n'
         cluster.write_text(text)
         config = work/'ks.toml'
         text = (ROOT/'config/ks.toml').read_text().replace('require_unlock = false', 'require_unlock = true').replace('master_key_delay_secs = 3600', 'master_key_delay_secs = 1').replace('snapshot_interval_secs = 86400', 'snapshot_interval_secs = 1')
         text = 'unlock_verifier = '+json.dumps((ceremony/'verifier').read_text().strip())+'\n'+text
         text += '\n[raft]\nring = "KS0"\ncheckpoint_lease_secs = 1\nheartbeat_ms = 75\nelection_min_ms = 150\nelection_max_ms = 300\nrequest_timeout_ms = 200\n[raft.members]\n'+''.join(f'{id} = {json.dumps(address)}\n' for id, address in members.items())
+        text += '\n[raft.member_indexes]\n' + ''.join(f'{name} = {index}\n' for name, index in indexes.items())
         config.write_text(text)
         run([ROOT/'scripts/ring-identities', cluster, cluster, work/'ring-identities.toml', config])
+        for name in members:
+            run([ROOT/'scripts/member-identity', cluster, name, work/name/'data/master-keys'])
+        markers = list(work.glob('*/data/master-keys/need-bootstrap'))
+        assert len(markers) == 1, markers
         def command(id, *args, success=True):
             result = run([BIN/'laws', '--config', cluster, '--to', id, '--at', members[id], '--machine-identity', host/'identity.toml', *args], success)
             return '\n'.join(line.removeprefix(id+' ') for line in result.splitlines())
@@ -110,8 +118,14 @@ def main():
             assert exit_code == 0, exit_code
             children.pop(primary)
             start(primary)
-            until(lambda: status(primary).get('unlocked') == 'true' and int(status(primary)['master_keys']) == 2)
+            until(lambda: status(primary).get('unlocked') == 'true' and status(primary).get('raft_leader') != 'none' and int(status(primary)['master_keys']) == 2)
             assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
+            moved = next(id for id in members if id != 'KS0-member0' and id != until(leader))
+            stop(moved)
+            members[moved] = f'127.0.0.1:{port()}'
+            start(moved)
+            until(lambda: status(moved).get('unlocked') == 'true' and status(moved).get('raft_leader') != 'none' and int(status(moved)['master_keys']) == 2)
+            assert command(moved, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
             # Two down: the former leader may read until its lease expires, then must refuse.
             survivor = until(leader)
             for id in list(children):
@@ -127,26 +141,35 @@ def main():
             until(lambda: all(status(id).get('unlocked') == 'true' for id in children))
             assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
             # A fresh cold nonvoter copies committed state from a nonprimary peer.
-            members['KS3'] = f'127.0.0.1:{port()}'
-            start('KS3')
+            members['KS0-member3'] = f'127.0.0.1:{port()}'
+            start('KS0-member3')
+            applicant_id = status('KS0-member3')['raft_member_id']
+            assert len(applicant_id) == 128
+            assert status('KS0-member3')['raft_member_slot'] == 'none'
+            stop('KS0-member3')
+            start('KS0-member3')
+            assert status('KS0-member3')['raft_member_id'] == applicant_id
+            assert status('KS0-member3')['raft_member_slot'] == 'none'
             membership_file = work/'members.json'
-            membership_file.write_text(json.dumps(members))
+            membership_file.write_text(json.dumps(list(members)))
             command(primary, 'raft-members', '--members-file', membership_file)
-            until(lambda: status('KS3').get('unlocked') == 'true' and int(status('KS3')['raft_commit']) >= int(status(primary)['raft_commit']))
+            until(lambda: status('KS0-member3').get('unlocked') == 'true' and int(status('KS0-member3')['raft_commit']) >= int(status(primary)['raft_commit']))
+            assert status('KS0-member3')['raft_member_id'] == applicant_id
+            assert status('KS0-member3')['raft_member_slot'] == '3'
             until(lambda: sum(status(id).get('raft_applying') == 'true' for id in children) == 3)
             cold = next(id for id in children if status(id).get('raft_applying') == 'false')
             assert int(status(cold)['master_keys']) == 0
             until(lambda: len(list((work/cold/'data/master-keys').glob('snapshot-*.bin'))) > 1)
-            assert command('KS3', 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
-            removed = next(id for id in members if id not in (primary, 'KS3'))
-            membership_file.write_text(json.dumps({id: address for id, address in members.items() if id != removed}))
+            assert command('KS0-member3', 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
+            removed = next(id for id in members if id not in (primary, 'KS0-member3'))
+            membership_file.write_text(json.dumps([id for id in members if id != removed]))
             command(primary, 'raft-members', '--members-file', membership_file)
             term = status(primary)['raft_term']
             time.sleep(1.5)
             assert status(primary)['raft_term'] == term
             assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
             # Removing the current primary also terminates it after final commitment.
-            membership_file.write_text(json.dumps({id: address for id, address in members.items() if id not in (removed, primary)}))
+            membership_file.write_text(json.dumps([id for id in members if id not in (removed, primary)]))
             command(primary, 'raft-members', '--members-file', membership_file, success=False)
             departed = children[primary]
             until(lambda: departed.poll() is not None)
@@ -156,7 +179,7 @@ def main():
             successor = until(leader)
             actual = command(successor, 'sn-master-key', '--sn', '0', '--creation-second', creation)
             assert actual == expected
-            print('PASS: demoted-primary process exit; primary removal exit; locked quorum; unlock propagation; committed key rotation; follower forwarding; primary failover; restart catch-up; quorum-loss read refusal; full locked restart; snapshot catch-up of a new member; joint membership; removed-member election suppression.')
+            print('PASS: persistent random IDs; slotless applicant restart; primary-assigned slots; member restart on a changed port; demoted-primary process exit; primary removal exit; locked quorum; unlock propagation; committed key rotation; follower forwarding; primary failover; restart catch-up; quorum-loss read refusal; full locked restart; snapshot catch-up of a new member; joint membership; removed-member election suppression.')
         except BaseException:
             for id in members:
                 if id in children:

@@ -1,6 +1,7 @@
 //! KS transport, election timers, and the boundary between consensus and key execution.
 use super::*;
 use crate::raft::{Answer, Command, Entry, Members, Membership, Node, Role, Rpc, State};
+use crate::raft::{Member, MemberId, MemberNames, UNASSIGNED};
 use common::config::{Messaging, RaftConfig, ServiceKind};
 use common::wire::Arg;
 use common::{Error, Result};
@@ -22,10 +23,14 @@ pub struct Admission<'a> {
 
 pub struct Settings {
     pub ignore_ring_identity: bool,
-    pub id: String,
+    pub name: String,
+    pub identities: MemberNames,
+    pub founders: BTreeMap<MemberId, String>,
     pub ring: String,
     pub members: Members,
-    messaging: Option<Messaging>,
+    pub(super) messaging: Option<Messaging>,
+    seeds: BTreeMap<String, std::net::SocketAddr>,
+    registrar: Option<(String, std::net::SocketAddr)>,
     admitted: BTreeSet<String>,
 }
 impl Settings {
@@ -40,13 +45,49 @@ impl Settings {
                 return Err(Error::new(format!("Raft member {id} is not a KS in the roster")));
             }
         }
-        if let Some(address) = members.get(&process.config.identity) {
-            if address != &process.config.listen {
-                return Err(Error::new("KS listen address differs from Raft membership"));
-            }
+        let expected = process
+            .cluster
+            .messaging
+            .local_ring
+            .as_ref()
+            .ok_or_else(|| Error::new("missing local ring identity"))?;
+        let ring_name = if config.raft.members.is_empty() {
+            &process.config.identity
+        } else {
+            &config.raft.ring
+        };
+        if !process.config.ignore_ring_identity
+            && process.cluster.ring_identities.get(ring_name) != Some(expected)
+        {
+            return Err(Error::new("process and Raft configuration name different rings"));
+        }
+        let indexes = if config.raft.members.is_empty() {
+            BTreeMap::from([(process.config.identity.clone(), 0)])
+        } else {
+            config.raft.member_indexes.clone()
+        };
+        let founders: BTreeMap<MemberId, String> = members
+            .keys()
+            .enumerate()
+            .map(|(i, name)| {
+                let slot = indexes.get(name).copied().unwrap_or(i as u32);
+                (slot, name.clone())
+            })
+            .collect();
+        if founders.len() != members.len() || founders.contains_key(&UNASSIGNED) {
+            return Err(Error::new("founding slots must be distinct"));
+        }
+        if !process.config.ignore_ring_identity
+            && founders
+                .values()
+                .any(|name| process.cluster.ring_identities.get(name) != Some(expected))
+        {
+            return Err(Error::new("founding participant belongs to a different ring"));
         }
         Ok(Self {
-            id: process.config.identity.clone(),
+            name: process.config.identity.clone(),
+            identities: BTreeMap::new(),
+            founders: founders.clone(),
             ignore_ring_identity: process.config.ignore_ring_identity,
             ring: process
                 .cluster
@@ -58,7 +99,12 @@ impl Settings {
                 })
                 .ok_or_else(|| Error::new("missing KS ring identity in bootstrap configuration"))?
                 .to_string(),
-            members,
+            members: founders.keys().copied().collect(),
+            seeds: members,
+            registrar: Some((
+                process.cluster.registrar()?.identity.clone(),
+                process.cluster.ks.address,
+            )),
             admitted: process
                 .cluster
                 .services_of_kind(ServiceKind::Ks)
@@ -70,14 +116,21 @@ impl Settings {
     #[cfg(test)]
     pub fn testing(config: &KsConfig) -> Self {
         Self {
-            id: "KS0".into(),
+            name: "member-0".into(),
+            identities: crate::raft::tests::names(),
+            founders: crate::raft::tests::names()
+                .into_iter()
+                .map(|(i, m)| (i, m.process))
+                .collect(),
             ignore_ring_identity: false,
             ring: "01".repeat(64),
             members: if config.raft.members.is_empty() {
-                BTreeMap::from([("KS0".into(), "127.0.0.1:1".parse().unwrap())])
+                BTreeSet::from([0])
             } else {
-                config.raft.members.clone()
+                config.raft.members.keys().map(|name| config.raft.member_indexes[name]).collect()
             },
+            seeds: config.raft.members.clone(),
+            registrar: None,
             admitted: BTreeSet::new(),
             messaging: None,
         }
@@ -97,6 +150,8 @@ impl Settings {
 }
 #[derive(Serialize, Deserialize)]
 enum Message {
+    Identity,
+    Bootstrap(Membership),
     Consensus(Rpc),
     Checkpoint { after: u64 },
     CheckpointStart,
@@ -105,21 +160,26 @@ enum Message {
 }
 #[derive(Serialize, Deserialize)]
 struct Packet {
-    ring: String,
+    member: Sender,
     unlocked: bool,
     #[serde(default)]
-    applying: Option<BTreeSet<String>>,
+    applying: Option<BTreeSet<MemberId>>,
     message: Message,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Sender {
+    Slot(MemberId),
+    Applicant(common::ring::MemberIdentity),
 }
 #[derive(Serialize, Deserialize)]
 struct ConsensusReply {
-    member: String,
+    member: Sender,
     answer: Answer,
     unlocked: bool,
 }
 
 pub fn waits_for_quorum(request: &Req) -> bool {
-    if matches!(request.op, Op::Unlock | Op::Register) {
+    if matches!(request.op, Op::Unlock | Op::Register | Op::Lookup) {
         return false;
     }
     if request.op != Op::Raft {
@@ -237,14 +297,128 @@ fn election_delay(config: &RaftConfig, random: u64, hot: bool, writing: bool) ->
 }
 
 impl Ks {
-    fn accept_placement(&self, selected: Option<&BTreeSet<String>>, node: &Node) -> Result<()> {
+    fn accept_founders(&self, founders: Membership) -> Result<()> {
+        founders.validate()?;
+        let names: BTreeMap<_, _> =
+            founders.identities.iter().map(|(slot, m)| (*slot, m.process.clone())).collect();
+        if founders.new.is_some()
+            || names != self.runtime.founders
+            || founders.old != self.runtime.members
+        {
+            return Err(Error::new("bootstrap participant/slot list differs from configuration"));
+        }
+        let mut node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
+        if let Some((_, member)) =
+            founders.identities.iter().find(|(_, m)| m.process == self.runtime.name)
+        {
+            if member.identity != node.journal.identity.current {
+                return Err(Error::new(
+                    "bootstrap does not name this process's persistent identity",
+                ));
+            }
+        }
+        node.initialize_founders(founders)
+    }
+    fn query_member(&self, name: &str) -> Result<Member> {
+        if name == self.runtime.name {
+            let node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
+            return Ok(Member {
+                identity: node.journal.identity.current.clone(),
+                process: name.into(),
+            });
+        }
+        let response = self.send_named(name, Message::Identity)?;
+        if response.status != Status::Ok {
+            return Err(Error::new("member identity query failed"));
+        }
+        let (mut body, rest) = structure(&response.args, Op::BytesResp, "member identity")?;
+        let member: Member = parse(&body.bytes()?)?;
+        body.done()?;
+        if !rest.is_empty() || member.process != name {
+            return Err(Error::new("member identity reply mismatch"));
+        }
+        Ok(member)
+    }
+    fn bootstrap_step(&self) -> Result<bool> {
+        let chosen = {
+            let node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
+            if !node.journal.needs_bootstrap() {
+                return Ok(true);
+            }
+            node.state().founders.clone()
+        };
+        if !self.runtime.founders.values().any(|name| name == &self.runtime.name) {
+            return Err(Error::new("bootstrap coordinator is not a founding participant"));
+        }
+        let founders = if let Some(chosen) = chosen {
+            chosen
+        } else {
+            let mut identities = MemberNames::new();
+            for (slot, name) in &self.runtime.founders {
+                identities.insert(*slot, self.query_member(name)?);
+            }
+            let membership =
+                Membership { identities, old: self.runtime.members.clone(), new: None };
+            // Persist the single chosen table before distributing it. Retry reuses it.
+            self.accept_founders(membership.clone())?;
+            membership
+        };
+        for member in founders.identities.values() {
+            if member.process == self.runtime.name {
+                continue;
+            }
+            let response =
+                self.send_named(&member.process, Message::Bootstrap(founders.clone()))?;
+            if response.status != Status::Ok {
+                return Err(Error::new("founding member has not accepted bootstrap"));
+            }
+        }
+        self.journal
+            .lock()
+            .map_err(|_| Error::new("Raft lock poisoned"))?
+            .journal
+            .finish_bootstrap()?;
+        Ok(true)
+    }
+    fn start_bootstrap(self: &Arc<Self>) -> Result<()> {
+        if !self
+            .journal
+            .lock()
+            .map_err(|_| Error::new("Raft lock poisoned"))?
+            .journal
+            .needs_bootstrap()
+        {
+            return Ok(());
+        }
+        let weak = Arc::downgrade(self);
+        let handle = std::thread::Builder::new()
+            .name("ks-bootstrap".into())
+            .spawn(move || {
+                while let Some(ks) = weak.upgrade() {
+                    if ks.snapshot_stopping.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match ks.bootstrap_step() {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        Err(e) => logn!("KS bootstrap waiting", "{e}"),
+                    }
+                    drop(ks);
+                    std::thread::park_timeout(Duration::from_millis(200));
+                }
+            })
+            .context("starting bootstrap coordinator")?;
+        self.raft_workers.lock().map_err(|_| Error::new("worker lock poisoned"))?.push(handle);
+        Ok(())
+    }
+    fn accept_placement(&self, selected: Option<&BTreeSet<MemberId>>, node: &Node) -> Result<()> {
         if let Some(selected) = selected {
             let members = node.state().membership().members();
             let mut placement =
                 self.placement.lock().map_err(|_| Error::new("placement lock poisoned"))?;
             placement.selected =
-                selected.iter().filter(|id| members.contains_key(*id)).cloned().collect();
-            self.applying.store(placement.selected.contains(&self.runtime.id), Ordering::SeqCst);
+                selected.iter().filter(|id| members.contains(*id)).cloned().collect();
+            self.applying.store(placement.selected.contains(&node.id), Ordering::SeqCst);
         }
         Ok(())
     }
@@ -324,21 +498,19 @@ impl Ks {
                         Instant::now(),
                         Duration::from_secs(self.config.raft.checkpoint_lease_secs),
                     ) {
-                        if holder != &self.runtime.id
+                        if holder != &node.id
                             || *index <= self.checkpoint_started.load(Ordering::SeqCst)
                         {
                             return Ok(());
                         }
                         self.checkpoint_started.store(*index, Ordering::SeqCst);
                     } else {
-                        let target = node
-                            .leader
-                            .as_ref()
-                            .and_then(|id| members.get(id).map(|address| (id.clone(), *address)));
+                        let target =
+                            node.leader.as_ref().filter(|id| members.contains(*id)).cloned();
                         drop(lease);
                         drop(node);
-                        if let Some((id, address)) = target {
-                            self.send_raft(&id, address, Message::CheckpointStart)?;
+                        if let Some(id) = target {
+                            self.send_raft(&id, Message::CheckpointStart)?;
                         }
                         return Ok(());
                     }
@@ -358,7 +530,7 @@ impl Ks {
             } else {
                 let peers: Vec<_> = members
                     .into_iter()
-                    .filter(|(id, _)| id != &self.runtime.id && Some(id) != node.leader.as_ref())
+                    .filter(|id| id != &node.id && Some(id) != node.leader.as_ref())
                     .collect();
                 (None, peers, node.state().snapshot.index)
             }
@@ -373,8 +545,8 @@ impl Ks {
             self.checkpoint_requested.store(false, Ordering::SeqCst);
             return Ok(());
         }
-        for (id, address) in peers {
-            let Ok(response) = self.send_raft(&id, address, Message::Checkpoint { after }) else {
+        for id in peers {
+            let Ok(response) = self.send_raft(&id, Message::Checkpoint { after }) else {
                 continue;
             };
             if response.status != Status::Ok {
@@ -406,8 +578,10 @@ impl Ks {
                         continue;
                     }
                     node.journal.write(&[crate::raft::Record::Install(snapshot.clone())])?;
+                    node.refresh_slot();
                 }
                 let pending = node.journal.prepare_copy(now, snapshot)?;
+                node.refresh_slot();
                 self.refresh_keys(&node)?;
                 pending
             };
@@ -470,17 +644,18 @@ impl Ks {
     }
     pub fn admit_client(&self, read: bool) -> Result<Admission<'_>> {
         let began = Instant::now();
-        let deadline = began
-            + Duration::from_millis(
-                self.config.raft.election_max_ms.saturating_add(self.config.raft.primary_wait_ms),
-            );
+        let deadline = began + Duration::from_millis(self.config.raft.election_max_ms);
         loop {
             {
                 let node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
                 if node.role != Role::Leader || node.journal.failed {
                     return Err(Error::new("KS is not a healthy Raft leader"));
                 }
-                if node.can_admit(lease::now()?) {
+                if node.can_admit_with_policy(
+                    lease::now()?,
+                    read,
+                    self.config.knobs.allow_stale_reads,
+                ) {
                     self.refresh_keys(&node)?;
                     let history = if read {
                         Some(
@@ -492,7 +667,11 @@ impl Ks {
                         None
                     };
                     // Admission occurs after lock acquisition and application catch-up.
-                    if node.can_admit(lease::now()?) {
+                    if node.can_admit_with_policy(
+                        lease::now()?,
+                        read,
+                        self.config.knobs.allow_stale_reads,
+                    ) {
                         return Ok(Admission { history });
                     }
                 }
@@ -537,13 +716,7 @@ impl Ks {
     }
     pub fn wait_committed(&self, index: u64) -> Result<()> {
         let deadline = Instant::now()
-            + Duration::from_millis(
-                self.config
-                    .raft
-                    .election_max_ms
-                    .saturating_mul(2)
-                    .saturating_add(self.config.raft.primary_wait_ms),
-            );
+            + Duration::from_millis(self.config.raft.election_max_ms.saturating_mul(2));
         loop {
             {
                 let node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
@@ -569,58 +742,105 @@ impl Ks {
     pub fn raft_status(&self) -> String {
         match self.journal.lock() {
             Ok(node) => format!(
-                "raft_role {:?}\nraft_term {}\nraft_leader {}\nraft_last {}\nraft_commit {}\nraft_failed {}\nraft_applying {}",
+                "raft_role {:?}\nraft_term {}\nraft_leader {}\nraft_last {}\nraft_commit {}\nraft_failed {}\nraft_applying {}\nraft_member_id {}\nraft_member_slot {}",
                 node.role,
                 node.state().term,
-                node.leader.as_deref().unwrap_or("none"),
+                node.leader.map(|id| id.to_string()).unwrap_or_else(|| "none".into()),
                 node.state().last(),
                 node.state().commit,
                 node.journal.failed,
-                node.role == Role::Leader || self.applying.load(Ordering::SeqCst)
+                node.role == Role::Leader || self.applying.load(Ordering::SeqCst),
+                node.journal.identity.current,
+                if node.id == UNASSIGNED { "none".into() } else { node.id.to_string() },
             ),
             Err(_) => "raft_failed true".into(),
         }
     }
-    fn send_raft(
-        &self,
-        peer: &str,
-        address: std::net::SocketAddr,
-        message: Message,
-    ) -> Result<Resp> {
+    fn member_address(&self, peer: &str) -> Result<std::net::SocketAddr> {
+        if let Some((registrar, address)) = &self.runtime.registrar {
+            if peer == registrar {
+                return Ok(*address);
+            }
+            if registrar != &self.runtime.name {
+                let mut payload = common::wire::StructWriter::new();
+                payload.text(peer);
+                let response = server::ask(
+                    *address,
+                    &Req::new(Op::Lookup).structure(payload),
+                    Duration::from_millis(self.config.raft.request_timeout_ms),
+                    self.runtime
+                        .messaging
+                        .as_ref()
+                        .ok_or_else(|| Error::new("no endpoint discovery"))?,
+                );
+                if let Ok(response) = response {
+                    if response.status == Status::Ok {
+                        return response
+                            .message()
+                            .ok_or_else(|| Error::new("missing member endpoint"))?
+                            .parse()
+                            .map_err(|_| Error::new("invalid member endpoint"));
+                    }
+                }
+            }
+        }
+        if let Some(peer) =
+            self.peers.lock().map_err(|_| Error::new("registry lock poisoned"))?.get(peer)
+        {
+            return Ok(peer.address);
+        }
+        self.runtime.seeds.get(peer).copied().ok_or_else(|| Error::new("member has not registered"))
+    }
+    fn send_raft(&self, peer: &MemberId, message: Message) -> Result<Resp> {
+        let name = self
+            .journal
+            .lock()
+            .map_err(|_| Error::new("Raft lock poisoned"))?
+            .state()
+            .membership()
+            .identities
+            .get(peer)
+            .map(|m| m.process.clone())
+            .or_else(|| self.runtime.founders.get(peer).cloned())
+            .ok_or_else(|| Error::new("unknown member index"))?;
+        self.send_named(&name, message)
+    }
+    fn send_named(&self, name: &str, message: Message) -> Result<Resp> {
         let timeout = if matches!(message, Message::Forward { .. }) {
             self.config
                 .raft
                 .election_max_ms
                 .saturating_mul(2)
-                .saturating_add(self.config.raft.primary_wait_ms)
                 .saturating_add(self.config.raft.request_timeout_ms)
         } else {
             self.config.raft.request_timeout_ms
         };
-        let mut messaging =
-            self.runtime.messaging.clone().ok_or_else(|| Error::new("no Raft transport"))?;
-        messaging.expected_peer = Some(peer.into());
-        let applying = {
+        let applying = Some(
+            self.placement
+                .lock()
+                .map_err(|_| Error::new("placement lock poisoned"))?
+                .selected
+                .clone(),
+        );
+        let member = {
             let node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
-            if node.role == Role::Leader {
-                Some(
-                    self.placement
-                        .lock()
-                        .map_err(|_| Error::new("placement lock poisoned"))?
-                        .selected
-                        .clone(),
-                )
+            if node.id == UNASSIGNED {
+                Sender::Applicant(node.journal.identity.current.clone())
             } else {
-                None
+                Sender::Slot(node.id)
             }
         };
-        let request = Req::new(Op::Raft).text(&self.runtime.id).bytes(json(&Packet {
-            ring: self.runtime.ring.clone(),
+        let request = Req::new(Op::Raft).text(&self.runtime.name).bytes(json(&Packet {
+            member,
             applying,
             unlocked: self.unlocked.load(Ordering::SeqCst),
             message,
         })?);
-        server::ask(address, &request, Duration::from_millis(timeout), &messaging)
+        self.transport
+            .as_ref()
+            .ok_or_else(|| Error::new("no Raft transport"))?
+            .get(name, || self.member_address(name))?
+            .call_timeout(&request, Duration::from_millis(timeout))
     }
     pub fn forward(&self, request: &Req) -> Option<Resp> {
         let target = {
@@ -631,11 +851,12 @@ impl Ks {
             if node.role == Role::Leader {
                 return None;
             }
-            node.leader.as_ref().and_then(|id| {
-                node.state().membership().members().get(id).map(|address| (id.clone(), *address))
-            })
+            node.leader
+                .as_ref()
+                .filter(|id| node.state().membership().members().contains(*id))
+                .cloned()
         };
-        let Some((id, address)) = target else {
+        let Some(id) = target else {
             return Some(error("KS has no known Raft leader"));
         };
         let [Arg::Struct(_, payload, depth)] = request.args.as_slice() else {
@@ -644,7 +865,6 @@ impl Ks {
         Some(
             self.send_raft(
                 &id,
-                address,
                 Message::Forward { op: request.op.code(), payload: payload.clone(), depth: *depth },
             )
             .unwrap_or_else(error),
@@ -656,35 +876,78 @@ impl Ks {
                 return Err(Error::new("invalid Raft RPC"));
             };
             let packet: Packet = parse(bytes)?;
-            if !self.runtime.ignore_ring_identity && packet.ring != self.runtime.ring {
-                return Err(Error::new("Raft ring mismatch"));
-            }
-            {
+            let sender = {
                 let node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
+                let membership = node.state().membership();
+                let enrolled = self.runtime.admitted.contains(sender)
+                    || self.runtime.founders.values().any(|name| name == sender);
+                if !enrolled {
+                    return Err(Error::new("Raft sender is not admitted"));
+                }
+                if matches!(packet.message, Message::Identity) {
+                    return Ok(Resp::bytes(json(&Member {
+                        identity: node.journal.identity.current.clone(),
+                        process: self.runtime.name.clone(),
+                    })?));
+                }
+                if let Message::Bootstrap(founders) = &packet.message {
+                    let proposed_sender =
+                        founders.identities.iter().find(|(_, m)| &m.process == sender);
+                    let valid = proposed_sender.is_some_and(|(slot, m)| match &packet.member {
+                        Sender::Slot(sent) => sent == slot,
+                        Sender::Applicant(id) => id == &m.identity,
+                    });
+                    if !valid {
+                        return Err(Error::new("bootstrap sender identity mismatch"));
+                    }
+                    drop(node);
+                    self.accept_founders(founders.clone())?;
+                    return Ok(Resp::ok());
+                }
+                let index = match &packet.member {
+                    Sender::Slot(slot) => {
+                        if membership.identities.get(slot).is_none_or(|m| &m.process != sender) {
+                            return Err(Error::new(
+                                "Raft sender slot does not match routing label",
+                            ));
+                        }
+                        *slot
+                    }
+                    Sender::Applicant(identity) => membership.slot(identity).unwrap_or(UNASSIGNED),
+                };
+                if (index == UNASSIGNED && !matches!(packet.message, Message::Checkpoint { .. }))
+                    || (index != UNASSIGNED
+                        && membership.identities.get(&index).is_none_or(|m| &m.process != sender))
+                {
+                    return Err(Error::new("Raft applicant has no assigned slot"));
+                }
                 let admitted =
                     if matches!(packet.message, Message::Consensus(_) | Message::Checkpoint { .. })
                     {
-                        // A lagging member may not yet know the current leader's configuration.
-                        self.runtime.admitted.contains(sender)
-                            || self.runtime.members.contains_key(sender)
+                        true
                     } else {
-                        node.state().membership().members().contains_key(sender)
+                        membership.members().contains(&index)
                     };
                 if !admitted {
-                    return Err(Error::new("Raft sender is not admitted"));
+                    return Err(Error::new("Raft sender is not a member"));
                 }
-            }
-            if !packet.unlocked {
+                index
+            };
+            let sender = &sender;
+            if !packet.unlocked && *sender != UNASSIGNED {
                 self.unlock_requests
                     .lock()
                     .map_err(|_| Error::new("unlock request lock poisoned"))?
-                    .insert(sender.clone());
+                    .insert(*sender);
             }
             match packet.message {
+                Message::Identity | Message::Bootstrap(_) => {
+                    return Err(Error::new("identity query passed its admission handler"));
+                }
                 Message::CheckpointStart => {
                     let mut node =
                         self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
-                    if node.role != Role::Leader || sender == &self.runtime.id {
+                    if node.role != Role::Leader || sender == &node.id {
                         return Err(Error::new(
                             "checkpoint announcements require the primary and a secondary writer",
                         ));
@@ -714,7 +977,7 @@ impl Ks {
                         .is_none()
                         && node.state().last() == node.state().commit
                     {
-                        node.propose(Command::CheckpointStart(sender.clone()))?;
+                        node.propose(Command::CheckpointStart(*sender))?;
                     }
                     Ok(Resp::ok())
                 }
@@ -736,7 +999,7 @@ impl Ks {
                     };
                     if !matches!(rpc, Rpc::Vote { .. })
                         && rpc.term() == node.state().term
-                        && node.leader.as_deref() == Some(sender)
+                        && node.leader.as_ref() == Some(sender)
                     {
                         self.accept_placement(packet.applying.as_ref(), &node)?;
                         if let Rpc::Checkpoint { index, .. } = rpc {
@@ -747,7 +1010,11 @@ impl Ks {
                     }
                     self.refresh_keys(&node)?;
                     Ok(Resp::bytes(json(&ConsensusReply {
-                        member: self.runtime.id.clone(),
+                        member: if node.id == UNASSIGNED {
+                            Sender::Applicant(node.journal.identity.current.clone())
+                        } else {
+                            Sender::Slot(node.id)
+                        },
                         answer,
                         unlocked: self.unlocked.load(Ordering::SeqCst),
                     })?))
@@ -784,10 +1051,12 @@ impl Ks {
         let result = (|| -> Result<()> {
             let (mut payload, rest) =
                 structure(&request.args, Op::RaftMembers, "a Raft membership request")?;
-            let members: Members = parse(&payload.bytes()?)?;
+            let proposed: Vec<String> = parse(&payload.bytes()?)?;
+            let members: BTreeSet<String> = proposed.iter().cloned().collect();
             payload.done()?;
             if !rest.is_empty()
                 || members.is_empty()
+                || members.len() != proposed.len()
                 || (members.len() > 1 && self.config.raft.apply_members < 2)
             {
                 return Err(Error::new("invalid Raft membership request"));
@@ -797,36 +1066,86 @@ impl Ks {
             if let Some(auth) =
                 self.runtime.messaging.as_ref().and_then(|m| m.authentication.as_ref())
             {
-                for id in members.keys() {
+                for id in proposed.iter() {
                     if !auth.members.iter().any(|m| m.services.contains(id)) {
                         return Err(Error::new("new KS member is not enrolled"));
                     }
                 }
             }
             if self.runtime.messaging.is_some()
-                && members.keys().any(|id| !self.runtime.admitted.contains(id))
+                && proposed.iter().any(|id| !self.runtime.admitted.contains(id))
             {
                 return Err(Error::new("new member is not a KS in the roster"));
             }
-            let target = Membership { old: members.clone(), new: None };
+            if !self.runtime.ignore_ring_identity
+                && self.runtime.messaging.as_ref().is_some_and(|m| {
+                    proposed.iter().any(|name| {
+                        m.ring_identities
+                            .get(name)
+                            .is_none_or(|id| id.to_string() != self.runtime.ring)
+                    })
+                })
+            {
+                return Err(Error::new("proposed member belongs to a different ring"));
+            }
+            let mut applicants = Vec::new();
+            for name in &proposed {
+                let known = {
+                    let node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
+                    let membership = node.state().membership();
+                    membership
+                        .members()
+                        .iter()
+                        .filter_map(|slot| membership.identities.get(slot))
+                        .find(|m| &m.process == name)
+                        .cloned()
+                };
+                let member = if let Some(known) = known {
+                    known
+                } else {
+                    let member = self.query_member(name)?;
+                    let founders = self
+                        .journal
+                        .lock()
+                        .map_err(|_| Error::new("Raft lock poisoned"))?
+                        .state()
+                        .founders
+                        .clone()
+                        .ok_or_else(|| Error::new("ring is not bootstrapped"))?;
+                    let response = self.send_named(name, Message::Bootstrap(founders))?;
+                    if response.status != Status::Ok {
+                        return Err(Error::new("applicant cannot initialize founding history"));
+                    }
+                    member
+                };
+                applicants.push(member);
+            }
             let _proposal =
                 self.proposing.lock().map_err(|_| Error::new("proposal lock poisoned"))?;
-            let index = {
+            let (index, target) = {
                 let mut node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
                 let old = node.state().membership();
                 if old.new.is_some() || node.state().commit != node.state().last() {
                     return Err(Error::new("Raft configuration or proposal already pending"));
                 }
-                node.propose(Command::Members(Membership { old: old.old, new: Some(members) }))?
+                let mut assigned = old.clone();
+                let mut members = Members::new();
+                for member in applicants {
+                    members.insert(assigned.assign(member)?);
+                }
+                let identities = assigned.identities;
+                let target =
+                    Membership { identities: identities.clone(), old: members.clone(), new: None };
+                target.validate()?;
+                let index = node.propose(Command::Members(Membership {
+                    identities,
+                    old: old.old,
+                    new: Some(members),
+                }))?;
+                (index, target)
             };
             let deadline = Instant::now()
-                + Duration::from_millis(
-                    self.config
-                        .raft
-                        .election_max_ms
-                        .saturating_mul(2)
-                        .saturating_add(self.config.raft.primary_wait_ms),
-                );
+                + Duration::from_millis(self.config.raft.election_max_ms.saturating_mul(2));
             loop {
                 {
                     let node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
@@ -847,6 +1166,7 @@ impl Ks {
         result.map(|()| Resp::ok()).unwrap_or_else(error)
     }
     pub fn start_raft(self: &Arc<Self>) -> Result<()> {
+        self.start_bootstrap()?;
         self.start_checkpoints()?;
         let weak = Arc::downgrade(self);
         let handle = std::thread::Builder::new()
@@ -863,7 +1183,7 @@ impl Ks {
                 let timing = &initial.config.raft;
                 let mut deadline = Instant::now() + election_delay(timing, random, true, false);
                 drop(initial);
-                let mut peers: BTreeSet<String> = BTreeSet::new();
+                let mut peers: BTreeSet<MemberId> = BTreeSet::new();
                 loop {
                     let Some(ks) = weak.upgrade() else {
                         break;
@@ -908,7 +1228,7 @@ impl Ks {
                                 .lock()
                                 .map_err(|_| Error::new("placement lock poisoned"))?
                                 .select(
-                                    &ks.runtime.id,
+                                    &node.id,
                                     &node.state().membership().members(),
                                     ks.config.raft.apply_members,
                                     Instant::now(),
@@ -918,9 +1238,10 @@ impl Ks {
                         ks.initial_key(&mut node)?;
                         ks.refresh_keys(&node)?;
                         let members = node.state().membership().members();
+                        let local_id = node.id;
                         drop(node);
-                        for id in members.keys() {
-                            if id != &ks.runtime.id
+                        for id in members.iter() {
+                            if id != &local_id
                                 && peers.insert(id.clone())
                                 && ks.runtime.messaging.is_some()
                             {
@@ -941,7 +1262,7 @@ impl Ks {
         self.raft_workers.lock().map_err(|_| Error::new("worker lock poisoned"))?.push(handle);
         Ok(())
     }
-    fn start_peer(self: &Arc<Self>, peer: String) -> Result<()> {
+    fn start_peer(self: &Arc<Self>, peer: MemberId) -> Result<()> {
         let weak = Arc::downgrade(self);
         let handle = std::thread::Builder::new()
             .name(format!("raft-{peer}"))
@@ -955,18 +1276,16 @@ impl Ks {
                         break;
                     }
                     let result = (|| -> Result<()> {
-                        let (address, request) = {
+                        let request = {
                             let node =
                                 ks.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
                             if node.journal.failed {
                                 return Ok(());
                             }
-                            let Some(address) =
-                                node.state().membership().members().get(&peer).copied()
-                            else {
+                            if !node.state().membership().members().contains(&peer) {
                                 return Ok(());
-                            };
-                            (address, node.request_reference(&peer))
+                            }
+                            node.request_reference(&peer)
                         };
                         let requested = ks
                             .unlock_requests
@@ -980,8 +1299,7 @@ impl Ks {
                                 .map_err(|_| Error::new("unlock lock poisoned"))?;
                             if let Some(key) = key {
                                 unlocked =
-                                    ks.send_raft(&peer, address, Message::Unlock(key))?.status
-                                        == Status::Ok;
+                                    ks.send_raft(&peer, Message::Unlock(key))?.status == Status::Ok;
                                 if unlocked {
                                     ks.unlock_requests
                                         .lock()
@@ -993,7 +1311,7 @@ impl Ks {
                         if let Some(request) = request {
                             let sent = lease::now()?;
                             let response =
-                                ks.send_raft(&peer, address, Message::Consensus(request.clone()))?;
+                                ks.send_raft(&peer, Message::Consensus(request.clone()))?;
                             if response.status != Status::Ok {
                                 return Err(Error::new(format!("peer {peer} rejected Raft RPC")));
                             }
@@ -1005,7 +1323,19 @@ impl Ks {
                                 return Err(Error::new("trailing Raft response"));
                             }
                             let response: ConsensusReply = parse(&bytes)?;
-                            if response.member != peer {
+                            let identity_matches = match &response.member {
+                                Sender::Slot(slot) => *slot == peer,
+                                Sender::Applicant(identity) => ks
+                                    .journal
+                                    .lock()
+                                    .map_err(|_| Error::new("Raft lock poisoned"))?
+                                    .state()
+                                    .membership()
+                                    .identities
+                                    .get(&peer)
+                                    .is_some_and(|m| &m.identity == identity),
+                            };
+                            if !identity_matches {
                                 return Err(Error::new("Raft reply came from the wrong member"));
                             }
                             unlocked = response.unlocked;
@@ -1015,14 +1345,7 @@ impl Ks {
                                 .acknowledge(&peer, Instant::now());
                             let mut node =
                                 ks.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
-                            node.response(&peer, &request, &response.answer)?;
-                            if matches!(request, Rpc::Append { .. })
-                                && response.answer.success
-                                && request.term() == node.state().term
-                                && node.role == Role::Leader
-                            {
-                                node.lease.acknowledge(&peer, request.term(), sent);
-                            }
+                            node.response_sent(&peer, &request, &response.answer, sent)?;
                             ks.refresh_keys(&node)?;
                         }
                         Ok(())
@@ -1044,10 +1367,16 @@ impl Ks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn debugging_foreign_checkpoint_preserves_key_binding_but_not_override() {
         let key = [42; 32];
-        let mut source = State::initial("02".repeat(64), crate::raft::tests::members(1)).unwrap();
+        let mut source = State::initial(
+            "02".repeat(64),
+            crate::raft::tests::members(1),
+            crate::raft::tests::names(),
+        )
+        .unwrap();
         source.apply(&crate::raft::Record::Hard { term: 1, vote: None }).unwrap();
         let epoch = MasterEpoch { key: [7; 32], since: TimeSec::new(1) };
         let sealed = seal_key(&key, &source.ring, 1, 1, &epoch).unwrap();
@@ -1058,7 +1387,12 @@ mod tests {
             })
             .unwrap();
         source.apply(&crate::raft::Record::Commit(1)).unwrap();
-        let mut target = State::initial("01".repeat(64), crate::raft::tests::members(1)).unwrap();
+        let mut target = State::initial(
+            "01".repeat(64),
+            crate::raft::tests::members(1),
+            crate::raft::tests::names(),
+        )
+        .unwrap();
         target.ignore_ring_identity = true;
         target.apply(&crate::raft::Record::Hard { term: 1, vote: None }).unwrap();
         target.apply(&crate::raft::Record::Install(source.capture())).unwrap();
@@ -1083,7 +1417,12 @@ mod tests {
     #[test]
     fn application_catches_up_from_snapshot_then_only_decodes_new_commits() {
         let key = [7; 32];
-        let mut state = State::initial("01".repeat(64), crate::raft::tests::members(3)).unwrap();
+        let mut state = State::initial(
+            "01".repeat(64),
+            crate::raft::tests::members(3),
+            crate::raft::tests::names(),
+        )
+        .unwrap();
         state.term = 1;
         for index in 1..=3 {
             let epoch = MasterEpoch { since: TimeSec::new(index), key: [index as u8; 32] };
@@ -1115,7 +1454,7 @@ mod tests {
         let clients: Vec<_> = SERVES
             .iter()
             .copied()
-            .filter(|op| !matches!(op, Op::Raft | Op::Unlock | Op::Register))
+            .filter(|op| !matches!(op, Op::Raft | Op::Unlock | Op::Register | Op::Lookup))
             .collect();
         let all_clients = clients.iter().all(|op| waits_for_quorum(&Req::new(*op)));
         let unknown_client = waits_for_quorum(&Req::new(Op::BytesResp));
@@ -1123,7 +1462,7 @@ mod tests {
         let registration = waits_for_quorum(&Req::new(Op::Register));
         let packet = |message| {
             Req::new(Op::Raft).text("KS0").bytes(
-                json(&Packet { ring: "test".into(), unlocked: false, applying: None, message })
+                json(&Packet { member: Sender::Slot(0), unlocked: false, applying: None, message })
                     .unwrap(),
             )
         };

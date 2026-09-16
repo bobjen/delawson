@@ -47,7 +47,7 @@ def main():
         text = text[:count] + text[count:].replace('count = 4', 'count = 1', 1)
         text = text.replace('seal_bytes = 4096', 'seal_bytes = 8388608\nmax_append_bytes = 8388608')
         (config/'cluster.toml').write_text(text)
-        laws = [ROOT/'target/debug/laws', '--config', config/'cluster.toml']
+        laws = [ROOT/'target/debug/laws', '--config', work/'run/cluster-effective.toml']
         def append(path, data):
             block = work/'block'
             block.write_bytes(data)

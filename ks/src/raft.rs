@@ -4,10 +4,23 @@ use common::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub type Members = BTreeMap<String, std::net::SocketAddr>;
+/// Stable process identities within this ring. Endpoints are discovered, never voted on.
+pub type MemberId = u32;
+pub type Members = BTreeSet<MemberId>;
+/// Reserved in RAM for a process that has not been assigned a voting slot.
+pub const UNASSIGNED: MemberId = u32::MAX;
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Member {
+    pub identity: common::ring::MemberIdentity,
+    /// Existing routing/machine-admission label, not the executable name.
+    pub process: String,
+}
+pub type MemberNames = BTreeMap<MemberId, Member>;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Membership {
+    /// Includes retired slots: a member index is never rebound to another process.
+    pub identities: MemberNames,
     pub old: Members,
     pub new: Option<Members>,
 }
@@ -19,9 +32,9 @@ impl Membership {
         }
         result
     }
-    pub fn quorum(&self, votes: &BTreeSet<String>) -> bool {
+    pub fn quorum(&self, votes: &Members) -> bool {
         let majority = |members: &Members| {
-            members.keys().filter(|id| votes.contains(*id)).count() > members.len() / 2
+            members.iter().filter(|id| votes.contains(*id)).count() > members.len() / 2
         };
         majority(&self.old) && self.new.as_ref().is_none_or(majority)
     }
@@ -29,17 +42,47 @@ impl Membership {
         if self.old.is_empty() || self.new.as_ref().is_some_and(|m| m.is_empty()) {
             return Err(Error::new("empty Raft membership"));
         }
-        let members = self.members();
-        let addresses: BTreeSet<_> = members.values().collect();
-        if addresses.len() != members.len() {
-            return Err(Error::new("Raft members must have distinct addresses"));
+        if self.members().iter().any(|id| !self.identities.contains_key(id)) {
+            return Err(Error::new("missing Raft member identity"));
         }
-        if let Some(new) = &self.new {
-            if self.old.iter().any(|(id, old)| new.get(id).is_some_and(|address| address != old)) {
+        let unique: BTreeSet<_> = self.identities.values().map(|m| &m.identity).collect();
+        let voters = self.members();
+        let processes: BTreeSet<_> =
+            voters.iter().filter_map(|id| self.identities.get(id).map(|m| &m.process)).collect();
+        if self.identities.contains_key(&UNASSIGNED)
+            || unique.len() != self.identities.len()
+            || processes.len() != voters.len()
+            || self.identities.values().any(|m| m.process.is_empty())
+        {
+            return Err(Error::new("duplicate or empty member name"));
+        }
+        Ok(())
+    }
+    pub fn slot(&self, identity: &common::ring::MemberIdentity) -> Option<MemberId> {
+        self.identities.iter().find_map(|(slot, m)| (&m.identity == identity).then_some(*slot))
+    }
+    pub fn assign(&mut self, member: Member) -> Result<MemberId> {
+        if let Some(slot) = self.slot(&member.identity) {
+            if self.identities[&slot] != member {
                 return Err(Error::new(
-                    "retained Raft member cannot change address during membership transition",
+                    "member identity cannot change its registered routing label",
                 ));
             }
+            return Ok(slot);
+        }
+        let slot = match self.identities.last_key_value() {
+            Some((last, _)) => last
+                .checked_add(1)
+                .filter(|i| *i != UNASSIGNED)
+                .ok_or_else(|| Error::new("member slots exhausted"))?,
+            None => 0,
+        };
+        self.identities.insert(slot, member);
+        Ok(slot)
+    }
+    fn extends(&self, previous: &Self) -> Result<()> {
+        if previous.identities.iter().any(|(id, name)| self.identities.get(id) != Some(name)) {
+            return Err(Error::new("member indexes cannot be removed or rebound"));
         }
         Ok(())
     }
@@ -51,7 +94,7 @@ pub enum Command {
     /// AEGIS envelope of (master key, activation second), never plaintext on disk.
     Key(Vec<u8>),
     Members(Membership),
-    CheckpointStart(String),
+    CheckpointStart(MemberId),
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {
@@ -68,19 +111,28 @@ pub struct Snapshot {
     /// Committed key commands preserve their original index/term for AEAD binding.
     pub keys: Vec<Entry>,
     #[serde(default)]
-    pub checkpoint_start: Option<(u64, String)>,
+    pub checkpoint_start: Option<(u64, MemberId)>,
 }
 impl Snapshot {
     pub fn validate(&self) -> Result<()> {
-        self.membership.validate()?;
+        if self.membership.old.is_empty() {
+            if self.index != 0
+                || self.term != 0
+                || !self.keys.is_empty()
+                || !self.membership.identities.is_empty()
+                || self.membership.new.is_some()
+            {
+                return Err(Error::new("invalid unjoined snapshot"));
+            }
+        } else {
+            self.membership.validate()?;
+        }
         if (self.index == 0) != (self.term == 0) {
             return Err(Error::new("invalid snapshot index/term"));
         }
-        if self
-            .checkpoint_start
-            .as_ref()
-            .is_some_and(|(index, member)| *index == 0 || *index > self.index || member.is_empty())
-        {
+        if self.checkpoint_start.as_ref().is_some_and(|(index, member)| {
+            *index == 0 || *index > self.index || !self.membership.identities.contains_key(member)
+        }) {
             return Err(Error::new("invalid checkpoint announcement"));
         }
         let mut previous = 0;
@@ -104,8 +156,10 @@ pub struct State {
     #[serde(skip)]
     pub ignore_ring_identity: bool,
     pub ring: String,
+    /// Initial table learned at creation or before joining; independent of later membership.
+    pub founders: Option<Membership>,
     pub term: u64,
-    pub vote: Option<String>,
+    pub vote: Option<MemberId>,
     pub snapshot: Snapshot,
     pub log: Vec<Entry>,
     pub commit: u64,
@@ -113,6 +167,11 @@ pub struct State {
 impl State {
     pub fn validate(&self) -> Result<()> {
         self.snapshot.validate()?;
+        if let Some(founders) = &self.founders {
+            founders.validate()?;
+        } else if self.term != 0 || self.vote.is_some() || self.last() != 0 || self.commit != 0 {
+            return Err(Error::new("unjoined member has voting history"));
+        }
         if self.term < self.snapshot.term
             || self.commit < self.snapshot.index
             || self.commit > self.last()
@@ -121,6 +180,7 @@ impl State {
         }
         let mut previous = self.snapshot.index;
         let mut term = self.snapshot.term;
+        let mut membership = &self.snapshot.membership;
         for entry in &self.log {
             if previous.checked_add(1) != Some(entry.index)
                 || entry.term < term
@@ -130,6 +190,8 @@ impl State {
             }
             if let Command::Members(m) = &entry.command {
                 m.validate()?;
+                m.extends(membership)?;
+                membership = m;
             }
             previous = entry.index;
             term = entry.term;
@@ -143,11 +205,16 @@ impl State {
         }
         Ok(())
     }
-    pub fn initial(ring: String, members: Members) -> Result<Self> {
+    pub fn initial(ring: String, members: Members, identities: MemberNames) -> Result<Self> {
         common::ring::RingIdentity::try_from(ring.clone())?;
-        let membership = Membership { old: members, new: None };
-        membership.validate()?;
+        let membership = Membership { identities, old: members, new: None };
+        if !membership.old.is_empty() {
+            membership.validate()?;
+        } else if !membership.identities.is_empty() {
+            return Err(Error::new("unjoined state has no assigned identities"));
+        }
         Ok(Self {
+            founders: (!membership.old.is_empty()).then_some(membership.clone()),
             ring: ring.clone(),
             ignore_ring_identity: false,
             term: 0,
@@ -205,7 +272,7 @@ impl State {
             })
             .unwrap_or_else(|| self.snapshot.membership.clone())
     }
-    pub fn checkpoint_start(&self) -> Option<(u64, String)> {
+    pub fn checkpoint_start(&self) -> Option<(u64, MemberId)> {
         self.log
             .iter()
             .rev()
@@ -234,6 +301,27 @@ impl State {
     }
     pub fn apply(&mut self, record: &Record) -> Result<()> {
         match record {
+            Record::Bootstrap(membership) => {
+                membership.validate()?;
+                if membership.new.is_some() {
+                    return Err(Error::new("joint founding membership"));
+                }
+                if let Some(founders) = &self.founders {
+                    if founders != membership {
+                        return Err(Error::new("founding membership cannot be replaced"));
+                    }
+                } else {
+                    if self.term != 0
+                        || self.vote.is_some()
+                        || self.last() != 0
+                        || !self.snapshot.membership.old.is_empty()
+                    {
+                        return Err(Error::new("bootstrap cannot replace existing history"));
+                    }
+                    self.founders = Some(membership.clone());
+                    self.snapshot.membership = membership.clone();
+                }
+            }
             Record::Carry { entries, commit } => {
                 // A rotated journal must replay both with and without its checkpoint.
                 // Already committed entries must agree; only the remaining suffix is replaced.
@@ -309,8 +397,9 @@ impl State {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Record {
+    Bootstrap(Membership),
     Carry { entries: Vec<Entry>, commit: u64 },
-    Hard { term: u64, vote: Option<String> },
+    Hard { term: u64, vote: Option<MemberId> },
     Entries { from: u64, entries: Vec<Entry> },
     Commit(u64),
     Install(Snapshot),
@@ -354,22 +443,26 @@ pub trait Storage {
 }
 
 pub struct Node<S: Storage = Journal> {
-    pub id: String,
+    pub id: MemberId,
+    pub identity: Option<common::ring::MemberIdentity>,
     pub journal: S,
     pub role: Role,
-    pub leader: Option<String>,
-    pub votes: BTreeSet<String>,
-    pub matched: BTreeMap<String, u64>,
-    pub next: BTreeMap<String, u64>,
+    pub leader: Option<MemberId>,
+    pub votes: Members,
+    pub matched: BTreeMap<MemberId, u64>,
+    pub next: BTreeMap<MemberId, u64>,
     /// Runtime resets its election deadline after valid leader contact or a granted vote.
     pub contact: u64,
     pub leader_contact: Option<std::time::Instant>,
     pub lease: crate::lease::Lease,
+    #[cfg(test)]
+    clock: Option<std::time::Duration>,
 }
 impl<S: Storage> Node<S> {
-    pub fn new(id: String, journal: S) -> Self {
+    pub fn new(id: MemberId, journal: S) -> Self {
         Self {
             id,
+            identity: None,
             journal,
             role: Role::Follower,
             leader: None,
@@ -380,13 +473,52 @@ impl<S: Storage> Node<S> {
             // Restart must not erase the quiet period and immediately grant a vote.
             leader_contact: Some(std::time::Instant::now()),
             lease: crate::lease::Lease::default(),
+            #[cfg(test)]
+            clock: None,
         }
     }
     pub fn state(&self) -> &State {
         self.journal.state()
     }
+    fn now(&self) -> Result<std::time::Duration> {
+        #[cfg(test)]
+        if let Some(now) = self.clock {
+            return Ok(now);
+        }
+        crate::lease::now()
+    }
+    fn write_authority(&self) -> Result<bool> {
+        Ok(self.lease.can_write(
+            self.state().term,
+            &self.id,
+            &self.state().membership(),
+            self.now()?,
+        ))
+    }
     fn persist(&mut self, records: Vec<Record>) -> Result<()> {
-        self.journal.write(&records)
+        let membership_changed = records.iter().any(|record| match record {
+            Record::Bootstrap(_) | Record::Install(_) => true,
+            Record::Entries { entries, .. } => {
+                entries.iter().any(|e| matches!(e.command, Command::Members(_)))
+            }
+            _ => false,
+        });
+        self.journal.write(&records)?;
+        if membership_changed {
+            self.refresh_slot();
+        }
+        Ok(())
+    }
+    pub fn initialize_founders(&mut self, membership: Membership) -> Result<()> {
+        if self.state().founders.as_ref() == Some(&membership) {
+            return Ok(());
+        }
+        self.persist(vec![Record::Bootstrap(membership)])
+    }
+    pub fn refresh_slot(&mut self) {
+        if let Some(identity) = &self.identity {
+            self.id = self.state().membership().slot(identity).unwrap_or(UNASSIGNED);
+        }
     }
     fn stop_primary(&mut self) -> Result<()> {
         self.role = Role::Stopped;
@@ -452,7 +584,7 @@ impl<S: Storage> Node<S> {
         if self.role == Role::Leader {
             return self.stop_primary();
         }
-        if !self.state().membership().members().contains_key(&self.id) {
+        if !self.state().membership().members().contains(&self.id) {
             return Ok(());
         }
         let term =
@@ -466,7 +598,7 @@ impl<S: Storage> Node<S> {
     }
     fn win(&mut self) -> Result<()> {
         if self.role == Role::Candidate && self.state().membership().quorum(&self.votes) {
-            self.lease.start(self.state().term, crate::lease::now()?);
+            self.lease.start(self.state().term, self.now()?);
             self.role = Role::Leader;
             self.leader = Some(self.id.clone());
             let next = self
@@ -475,7 +607,7 @@ impl<S: Storage> Node<S> {
                 .checked_add(1)
                 .ok_or_else(|| Error::new("Raft index overflow"))?;
             self.next =
-                self.state().membership().members().keys().map(|id| (id.clone(), next)).collect();
+                self.state().membership().members().iter().map(|id| (id.clone(), next)).collect();
             self.matched.clear();
             self.propose(Command::Noop)?;
         }
@@ -485,6 +617,9 @@ impl<S: Storage> Node<S> {
         if self.role != Role::Leader {
             return Err(Error::new("KS is not the Raft leader"));
         }
+        if !self.write_authority()? {
+            return Err(Error::new("Raft primary lease expired; retry after quorum heartbeat"));
+        }
         let index =
             self.state().last().checked_add(1).ok_or_else(|| Error::new("Raft index overflow"))?;
         let entry = Entry { index, term: self.state().term, command };
@@ -493,7 +628,7 @@ impl<S: Storage> Node<S> {
         Ok(index)
     }
     fn advance(&mut self) -> Result<()> {
-        if self.role != Role::Leader {
+        if self.role != Role::Leader || !self.write_authority()? {
             return Ok(());
         }
         let membership = self.state().membership();
@@ -522,11 +657,15 @@ impl<S: Storage> Node<S> {
         if committed.new.is_some() && committed == self.state().membership() {
             let new =
                 committed.new.clone().ok_or_else(|| Error::new("missing joint configuration"))?;
-            self.propose(Command::Members(Membership { old: new, new: None }))?;
+            self.propose(Command::Members(Membership {
+                identities: membership.identities.clone(),
+                old: new,
+                new: None,
+            }))?;
         }
         let current = self.state().membership();
         let final_committed = self.state().committed_membership() == current;
-        if final_committed && !current.members().contains_key(&self.id) {
+        if final_committed && !current.members().contains(&self.id) {
             self.follow(self.state().term)?;
         }
         Ok(())
@@ -537,20 +676,31 @@ impl<S: Storage> Node<S> {
                 now.checked_duration_since(seen).is_none_or(|elapsed| elapsed < minimum)
             })
     }
+    #[cfg(test)]
     pub fn can_admit(&self, now: std::time::Duration) -> bool {
+        self.can_admit_with_policy(now, false, false)
+    }
+    pub fn can_admit_with_policy(
+        &self,
+        now: std::time::Duration,
+        read: bool,
+        allow_stale_reads: bool,
+    ) -> bool {
         self.role == Role::Leader
             && self.state().term_at(self.state().commit) == Some(self.state().term)
-            && self.lease.valid(self.state().term, &self.id, &self.state().membership(), now)
+            && self.lease.active(self.state().term, now)
+            && ((read && allow_stale_reads)
+                || self.lease.valid(self.state().term, &self.id, &self.state().membership(), now))
     }
     #[cfg(test)]
-    pub fn request(&self, peer: &str) -> Option<Rpc> {
+    pub fn request(&self, peer: &MemberId) -> Option<Rpc> {
         self.make_request(peer, true)
     }
     /// Runtime sends a checkpoint reference, never checkpoint contents from a primary.
-    pub fn request_reference(&self, peer: &str) -> Option<Rpc> {
+    pub fn request_reference(&self, peer: &MemberId) -> Option<Rpc> {
         self.make_request(peer, false)
     }
-    fn make_request(&self, peer: &str, contents: bool) -> Option<Rpc> {
+    fn make_request(&self, peer: &MemberId, contents: bool) -> Option<Rpc> {
         let s = self.state();
         match self.role {
             Role::Follower | Role::Stopped => None,
@@ -581,15 +731,14 @@ impl<S: Storage> Node<S> {
             }
         }
     }
-    pub fn receive(&mut self, sender: &str, rpc: &Rpc) -> Result<Answer> {
+    pub fn receive(&mut self, sender: &MemberId, rpc: &Rpc) -> Result<Answer> {
         self.running()?;
         if let Rpc::Install { snapshot, .. } = rpc {
             self.state().check_ring(snapshot)?;
         }
         // A removed/lagging member can still send votes from its old configuration.
         // It must not repeatedly terminate the primary by advancing its private term.
-        if matches!(rpc, Rpc::Vote { .. })
-            && !self.state().membership().members().contains_key(sender)
+        if matches!(rpc, Rpc::Vote { .. }) && !self.state().membership().members().contains(sender)
         {
             return Ok(Answer { term: self.state().term, success: false, matched: 0 });
         }
@@ -624,7 +773,7 @@ impl<S: Storage> Node<S> {
                 if fresh && self.state().vote.as_ref().is_none_or(|v| v == sender) {
                     self.persist(vec![Record::Hard {
                         term: self.state().term,
-                        vote: Some(sender.into()),
+                        vote: Some(*sender),
                     }])?;
                     self.contact = self.contact.wrapping_add(1);
                     answer.success = true;
@@ -632,7 +781,7 @@ impl<S: Storage> Node<S> {
             }
             Rpc::Append { previous, previous_term, entries, commit, .. } => {
                 self.follow(self.state().term)?;
-                self.leader = Some(sender.into());
+                self.leader = Some(*sender);
                 self.contact = self.contact.wrapping_add(1);
                 self.leader_contact = Some(std::time::Instant::now());
                 if self.state().term_at(*previous) != Some(*previous_term) {
@@ -667,7 +816,7 @@ impl<S: Storage> Node<S> {
             }
             Rpc::Install { snapshot, .. } => {
                 self.follow(self.state().term)?;
-                self.leader = Some(sender.into());
+                self.leader = Some(*sender);
                 self.contact = self.contact.wrapping_add(1);
                 self.leader_contact = Some(std::time::Instant::now());
                 if snapshot.index > self.state().commit {
@@ -679,7 +828,27 @@ impl<S: Storage> Node<S> {
         }
         Ok(answer)
     }
-    pub fn response(&mut self, peer: &str, request: &Rpc, answer: &Answer) -> Result<()> {
+    /// Record send-time authority before a successful response can advance commits.
+    pub fn response_sent(
+        &mut self,
+        peer: &MemberId,
+        request: &Rpc,
+        answer: &Answer,
+        sent: std::time::Duration,
+    ) -> Result<()> {
+        if self.role == Role::Leader
+            && matches!(request, Rpc::Append { .. })
+            && answer.success
+            && request.term() == self.state().term
+            && answer.term == self.state().term
+            && self.state().membership().members().contains(peer)
+        {
+            self.lease.acknowledge(peer, request.term(), sent);
+        }
+        self.response(peer, request, answer)
+    }
+
+    pub fn response(&mut self, peer: &MemberId, request: &Rpc, answer: &Answer) -> Result<()> {
         self.running()?;
         if answer.term > self.state().term {
             return self.follow(answer.term);
@@ -690,7 +859,7 @@ impl<S: Storage> Node<S> {
         match request {
             Rpc::Vote { .. } if self.role == Role::Candidate => {
                 if answer.success {
-                    self.votes.insert(peer.into());
+                    self.votes.insert(*peer);
                     self.win()?;
                 }
             }
@@ -698,24 +867,24 @@ impl<S: Storage> Node<S> {
                 if answer.success {
                     let matched = entries.last().map_or(*previous, |e| e.index);
                     self.matched
-                        .entry(peer.into())
+                        .entry(*peer)
                         .and_modify(|v| *v = (*v).max(matched))
                         .or_insert(matched);
-                    self.next.insert(peer.into(), matched.saturating_add(1));
+                    self.next.insert(*peer, matched.saturating_add(1));
                     self.advance()?;
                 } else {
-                    let next = self.next.entry(peer.into()).or_insert(previous.saturating_add(1));
+                    let next = self.next.entry(*peer).or_insert(previous.saturating_add(1));
                     *next = next.saturating_sub(1).max(1);
                 }
             }
             Rpc::Checkpoint { index, .. } if self.role == Role::Leader && answer.success => {
-                self.matched.insert(peer.into(), *index);
-                self.next.insert(peer.into(), index.saturating_add(1));
+                self.matched.insert(*peer, *index);
+                self.next.insert(*peer, index.saturating_add(1));
                 self.advance()?;
             }
             Rpc::Install { snapshot, .. } if self.role == Role::Leader && answer.success => {
-                self.matched.insert(peer.into(), snapshot.index);
-                self.next.insert(peer.into(), snapshot.index.saturating_add(1));
+                self.matched.insert(*peer, snapshot.index);
+                self.next.insert(*peer, snapshot.index.saturating_add(1));
                 self.advance()?;
             }
             _ => {}
@@ -727,6 +896,36 @@ impl<S: Storage> Node<S> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    #[test]
+    fn bootstrap_assigns_local_slot_and_retries_preserve_voting_history() {
+        let initial = State::initial("01".repeat(64), Members::new(), MemberNames::new()).unwrap();
+        let storage =
+            Memory { state: initial.clone(), initial, records: Vec::new(), failed: false };
+        let mut node = Node::new(UNASSIGNED, storage);
+        let identities = names();
+        node.identity = Some(identities[&0].identity.clone());
+        node.campaign().unwrap();
+        assert_eq!(node.role, Role::Follower);
+        assert!(node.journal.records.is_empty());
+        let founders = Membership { identities, old: members(3), new: None };
+        node.initialize_founders(founders.clone()).unwrap();
+        assert_eq!(node.id, 0);
+        node.campaign().unwrap();
+        let term = node.state().term;
+        let vote = node.state().vote;
+        let count = node.journal.records.len();
+        node.initialize_founders(founders.clone()).unwrap();
+        assert_eq!(node.journal.records.len(), count);
+        let mut conflicting = founders;
+        conflicting.old = members(2);
+        let rejected = node.initialize_founders(conflicting);
+        assert!(rejected.is_err());
+        let recovered = node.journal.recover();
+        assert_eq!(recovered.state.term, term);
+        assert_eq!(recovered.state.vote, vote);
+        assert_eq!(recovered.state.founders, node.state().founders);
+    }
+
     pub struct Memory {
         state: State,
         initial: State,
@@ -774,15 +973,29 @@ pub mod tests {
     pub fn restart(node: &TestNode) -> TestNode {
         Node::new(node.id.clone(), node.journal.recover())
     }
-    pub fn members(n: usize) -> Members {
-        (0..n)
-            .map(|i| (format!("KS{i}"), format!("127.0.0.1:{}", 10000 + i).parse().unwrap()))
+    pub fn names() -> MemberNames {
+        (0..32)
+            .map(|i| {
+                (
+                    i,
+                    Member {
+                        identity: common::ring::MemberIdentity::try_from(
+                            format!("{:02x}", i + 1).repeat(64),
+                        )
+                        .unwrap(),
+                        process: format!("member-{i}"),
+                    },
+                )
+            })
             .collect()
     }
+    pub fn members(n: usize) -> Members {
+        (0..n as u32).collect()
+    }
     pub fn node(id: usize, members: Members) -> TestNode {
-        let state = State::initial("01".repeat(64), members).unwrap();
+        let state = State::initial("01".repeat(64), members, names()).unwrap();
         Node::new(
-            format!("KS{id}"),
+            id as u32,
             Memory { initial: state.clone(), state, records: vec![], failed: false },
         )
     }
@@ -817,6 +1030,70 @@ pub mod tests {
         (0..n).map(|i| node(i, members(n))).collect()
     }
     #[test]
+    fn random_identity_assignment_is_idempotent_and_retires_slots_permanently() {
+        let mut membership = Membership { identities: names(), old: members(3), new: None };
+        let applicant = Member {
+            identity: common::ring::MemberIdentity::try_from("ab".repeat(64)).unwrap(),
+            process: "route-not-slot-32".into(),
+        };
+        let first = membership.assign(applicant.clone()).unwrap();
+        let retry = membership.assign(applicant.clone()).unwrap();
+        membership.old.insert(first);
+        membership.validate().unwrap();
+        let bytes = serde_json::to_vec(&membership).unwrap();
+        let mut recovered: Membership = serde_json::from_slice(&bytes).unwrap();
+        let retained = recovered.slot(&applicant.identity);
+        recovered.old.remove(&first);
+        let replacement = Member {
+            identity: common::ring::MemberIdentity::try_from("ac".repeat(64)).unwrap(),
+            process: applicant.process.clone(),
+        };
+        let next = recovered.assign(replacement).unwrap();
+        let mut impostor = applicant;
+        impostor.process = "different-route".into();
+        let rebound = recovered.assign(impostor);
+        assert_eq!(first, 32);
+        assert_eq!(retry, first);
+        assert_eq!(retained, Some(first));
+        assert_eq!(next, 33);
+        assert!(rebound.is_err());
+    }
+
+    #[test]
+    fn retired_member_slots_remain_bound_after_snapshot_and_restart() {
+        let mut original = State::initial("01".repeat(64), members(3), names()).unwrap();
+        original.apply(&Record::Hard { term: 1, vote: None }).unwrap();
+        let retired = Membership { identities: names(), old: BTreeSet::from([0, 2]), new: None };
+        original
+            .apply(&Record::Entries {
+                from: 1,
+                entries: vec![Entry {
+                    index: 1,
+                    term: 1,
+                    command: Command::Members(retired.clone()),
+                }],
+            })
+            .unwrap();
+        original.apply(&Record::Commit(1)).unwrap();
+        let checkpoint = original.capture();
+        original.apply(&Record::Install(checkpoint)).unwrap();
+        let mut rebound = retired;
+        rebound.identities.get_mut(&1).unwrap().identity =
+            common::ring::MemberIdentity::try_from("ff".repeat(64)).unwrap();
+        let record = Record::Entries {
+            from: 2,
+            entries: vec![Entry { index: 2, term: 1, command: Command::Members(rebound) }],
+        };
+        let mut storage =
+            Memory { initial: original.clone(), state: original, records: vec![], failed: false };
+        let rejected = storage.write(&[record]).is_err();
+        let old_name = storage.state.membership().identities[&1].clone();
+        let vote = serde_json::to_string(&Record::Hard { term: 2, vote: Some(1) }).unwrap();
+        assert!(rejected);
+        assert_eq!(old_name.process, "member-1");
+        assert!(vote.contains("\"vote\":1"));
+    }
+    #[test]
     fn foreign_checkpoint_rejected_before_state_or_term_changes() {
         let mut node = node(0, members(3));
         let mut foreign = node.state().capture();
@@ -824,7 +1101,7 @@ pub mod tests {
         let term = node.state().term;
         let before = node.state().capture();
         let rpc = Rpc::Install { term: term + 10, snapshot: foreign.clone() };
-        let rejected_rpc = node.receive("KS1", &rpc).is_err();
+        let rejected_rpc = node.receive(&1, &rpc).is_err();
         let rejected_replay = node.journal.write(&[Record::Install(foreign)]).is_err();
         assert!(rejected_rpc && rejected_replay);
         assert_eq!(node.state().term, term);
@@ -854,7 +1131,8 @@ pub mod tests {
         pair(&mut nodes, 0, 1); // Elect, but do not yet commit the new term's no-op.
         let term = nodes[0].state().term;
         nodes[0].lease = crate::lease::Lease::elected(term, ms(0));
-        nodes[0].lease.acknowledge("KS1", term, ms(100));
+        nodes[0].clock = Some(ms(0));
+        nodes[0].lease.acknowledge(&1, term, ms(100));
         let no_commit = nodes[0].can_admit(ms(160));
         pair(&mut nodes, 0, 1); // Commit the no-op.
         pair(&mut nodes, 0, 1); // Tell the follower that it is committed.
@@ -868,7 +1146,7 @@ pub mod tests {
         let restart_can_read = restored.can_admit(ms(160));
         let old = nodes[0].state();
         let vote = Rpc::Vote { term: term + 1, last: old.last(), last_term: term };
-        let answer = nodes[0].receive("KS2", &vote);
+        let answer = nodes[0].receive(&2, &vote);
         let stepped_down = nodes[0].can_admit(ms(160));
         assert!(!no_commit);
         assert_eq!(before, after);
@@ -881,7 +1159,110 @@ pub mod tests {
     }
 
     #[test]
-    fn admitted_writes_can_finish_after_expiry_but_demotion_discards_them() {
+    fn elected_primary_admits_as_soon_as_current_term_commits_with_fresh_quorum() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let mut nodes = cluster(3);
+        nodes[0].clock = Some(ms(1000));
+        nodes[0].campaign().unwrap();
+        pair(&mut nodes, 0, 1);
+        let before_commit = nodes[0].can_admit(ms(1001));
+        let request = nodes[0].request(&1).unwrap();
+        let answer = nodes[1].receive(&0, &request).unwrap();
+        nodes[0].clock = Some(ms(1002));
+        nodes[0].response_sent(&1, &request, &answer, ms(1001)).unwrap();
+        let immediate = nodes[0].can_admit(ms(1002));
+        let expired = nodes[0].can_admit(ms(1151));
+        assert!(!before_commit);
+        assert!(immediate);
+        assert!(!expired);
+    }
+
+    #[test]
+    fn stale_read_policy_retains_committed_term_and_leader_checks() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let mut nodes = cluster(3);
+        nodes[0].campaign().unwrap();
+        pair(&mut nodes, 0, 1);
+        let term = nodes[0].state().term;
+        nodes[0].lease = crate::lease::Lease::elected(term, ms(0));
+        nodes[0].clock = Some(ms(0));
+        let uncommitted = nodes[0].can_admit_with_policy(ms(500), true, true);
+        pair(&mut nodes, 0, 1);
+        nodes[0].lease.acknowledge(&1, term, ms(100));
+        let early = nodes[0].can_admit_with_policy(ms(149), true, true);
+        let live_write = nodes[0].can_admit_with_policy(ms(160), false, true);
+        let default_read = nodes[0].can_admit_with_policy(ms(250), true, false);
+        let stale_read = nodes[0].can_admit_with_policy(ms(250), true, true);
+        let expired_write = nodes[0].can_admit_with_policy(ms(250), false, true);
+        let follower = nodes[1].can_admit_with_policy(ms(250), true, true);
+        let restored = restart(&nodes[0]);
+        let restarted = restored.can_admit_with_policy(ms(250), true, true);
+        let vote = Rpc::Vote { term: term + 1, last: nodes[0].state().last(), last_term: term };
+        let demotion = nodes[0].receive(&2, &vote);
+        let demoted_read = nodes[0].can_admit_with_policy(ms(250), true, true);
+        assert!(!uncommitted);
+        assert!(early);
+        assert!(live_write);
+        assert!(!default_read);
+        assert!(stale_read);
+        assert!(!expired_write);
+        assert!(!follower);
+        assert!(!restarted);
+        assert!(demotion.is_err());
+        assert!(!demoted_read);
+    }
+
+    #[test]
+    fn expired_primary_needs_fresh_quorum_before_proposals_or_commits() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let mut nodes = cluster(5);
+        nodes[0].clock = Some(ms(0));
+        nodes[0].campaign().unwrap();
+        pair(&mut nodes, 0, 1);
+        pair(&mut nodes, 0, 2);
+        let pending = nodes[0].propose(Command::Noop).unwrap();
+        let old_commit = nodes[0].state().commit;
+        let request1 = nodes[0].request(&1).unwrap();
+        let request2 = nodes[0].request(&2).unwrap();
+        let answer1 = nodes[1].receive(&0, &request1).unwrap();
+        let answer2 = nodes[2].receive(&0, &request2).unwrap();
+        nodes[0].clock = Some(ms(500));
+        let before = nodes[0].journal.records.len();
+        let rejected = nodes[0].propose(Command::Noop);
+        let after = nodes[0].journal.records.len();
+        // A replication majority is insufficient when both responses are old.
+        nodes[0].response_sent(&1, &request1, &answer1, ms(100)).unwrap();
+        nodes[0].response_sent(&2, &request2, &answer2, ms(100)).unwrap();
+        let delayed_commit = nodes[0].state().commit;
+        let heartbeat1 = nodes[0].request(&1).unwrap();
+        let heartbeat2 = nodes[0].request(&2).unwrap();
+        let fresh1 = nodes[1].receive(&0, &heartbeat1).unwrap();
+        let fresh2 = nodes[2].receive(&0, &heartbeat2).unwrap();
+        nodes[0].response_sent(&1, &heartbeat1, &fresh1, ms(490)).unwrap();
+        let minority_commit = nodes[0].state().commit;
+        nodes[0].response_sent(&2, &heartbeat2, &fresh2, ms(490)).unwrap();
+        let renewed_commit = nodes[0].state().commit;
+        let renewed_proposal = nodes[0].propose(Command::Noop);
+        assert!(rejected.is_err());
+        assert_eq!(before, after);
+        assert_eq!(delayed_commit, old_commit);
+        assert_eq!(minority_commit, old_commit);
+        assert_eq!(renewed_commit, pending);
+        assert!(renewed_proposal.is_ok());
+        // Singleton authority needs no remote heartbeat after the initial interval.
+        let mut single = node(0, members(1));
+        single.clock = Some(ms(0));
+        single.campaign().unwrap();
+        single.clock = Some(ms(500));
+        let singleton = single.propose(Command::Noop);
+        assert!(singleton.is_ok());
+    }
+
+    #[test]
+    fn writes_commit_with_authority_and_demotion_discards_them() {
         use std::time::Duration;
         let mut nodes = cluster(3);
         nodes[0].campaign().unwrap();
@@ -889,15 +1270,16 @@ pub mod tests {
         pair(&mut nodes, 0, 1);
         let term = nodes[0].state().term;
         nodes[0].lease = crate::lease::Lease::elected(term, Duration::ZERO);
-        nodes[0].lease.acknowledge("KS1", term, Duration::from_millis(100));
+        nodes[0].lease.acknowledge(&1, term, Duration::from_millis(100));
         let admitted = nodes[0].can_admit(Duration::from_millis(160));
         let after_expiry = nodes[0].can_admit(Duration::from_millis(250));
+        nodes[0].clock = Some(Duration::from_millis(160));
         let accepted = nodes[0].propose(Command::Noop);
         let index = accepted.unwrap();
         pair(&mut nodes, 0, 1);
         let committed = nodes[0].state().commit;
         let vote = Rpc::Vote { term: term + 1, last: index, last_term: term };
-        let answer = nodes[0].receive("KS2", &vote);
+        let answer = nodes[0].receive(&2, &vote);
         let before = nodes[0].journal.records.len();
         let rejected = nodes[0].propose(Command::Noop);
         let after = nodes[0].journal.records.len();
@@ -925,11 +1307,11 @@ pub mod tests {
             let higher = old_term + 1;
             let result = match trigger {
                 0 => node
-                    .receive("KS1", &Rpc::Vote { term: higher, last: 1, last_term: old_term })
+                    .receive(&1, &Rpc::Vote { term: higher, last: 1, last_term: old_term })
                     .map(|_| ()),
                 1 | 2 => node
                     .receive(
-                        "KS1",
+                        &1,
                         &Rpc::Append {
                             term: if trigger == 1 { higher } else { old_term },
                             previous: 1,
@@ -941,7 +1323,7 @@ pub mod tests {
                     .map(|_| ()),
                 3 | 4 => node
                     .receive(
-                        "KS1",
+                        &1,
                         &Rpc::Install {
                             term: if trigger == 3 { higher } else { old_term },
                             snapshot: node.state().capture(),
@@ -949,8 +1331,8 @@ pub mod tests {
                     )
                     .map(|_| ()),
                 5 => node.response(
-                    "KS1",
-                    &node.request("KS1").unwrap(),
+                    &1,
+                    &node.request(&1).unwrap(),
                     &Answer { term: higher, success: false, matched: 0 },
                 ),
                 _ => node.campaign(),
@@ -959,13 +1341,13 @@ pub mod tests {
             let delayed_proposal = node.propose(Command::Noop);
             let delayed_campaign = node.campaign();
             let delayed_rpc =
-                node.receive("KS1", &Rpc::Vote { term: higher, last: 1, last_term: old_term });
+                node.receive(&1, &Rpc::Vote { term: higher, last: 1, last_term: old_term });
             let delayed_response = node.response(
-                "KS1",
+                &1,
                 &Rpc::Vote { term: higher, last: 1, last_term: old_term },
                 &Answer { term: higher, success: true, matched: 1 },
             );
-            let no_request = node.request("KS1");
+            let no_request = node.request(&1);
             let after = node.journal.records.len();
             let persisted_term = node.state().term;
             let restored = restart(&node);
@@ -989,18 +1371,22 @@ pub mod tests {
         pair(&mut nodes, 0, 1);
         pair(&mut nodes, 0, 1);
         let mut new = members(3);
-        new.remove("KS0");
+        new.remove(&0);
         nodes[0]
-            .propose(Command::Members(Membership { old: members(3), new: Some(new.clone()) }))
+            .propose(Command::Members(Membership {
+                identities: names(),
+                old: members(3),
+                new: Some(new.clone()),
+            }))
             .unwrap();
         for _ in 0..8 {
             for other in 1..3 {
                 if nodes[0].role == Role::Stopped {
                     break;
                 }
-                let request = nodes[0].request(&format!("KS{other}")).unwrap();
-                let answer = nodes[other].receive("KS0", &request).unwrap();
-                let result = nodes[0].response(&format!("KS{other}"), &request, &answer);
+                let request = nodes[0].request(&(other as u32)).unwrap();
+                let answer = nodes[other].receive(&0, &request).unwrap();
+                let result = nodes[0].response(&(other as u32), &request, &answer);
                 if nodes[0].role != Role::Stopped {
                     result.unwrap();
                 }
@@ -1010,7 +1396,7 @@ pub mod tests {
         let committed = nodes[0].state().committed_membership();
         let delayed = nodes[0].propose(Command::Noop);
         assert_eq!(stopped, Role::Stopped);
-        assert_eq!(committed, Membership { old: new, new: None });
+        assert_eq!(committed, Membership { identities: names(), old: new, new: None });
         assert!(delayed.is_err());
     }
 
@@ -1022,11 +1408,11 @@ pub mod tests {
         let term = nodes[1].state().term;
         let mut restored = restart(&nodes[1]);
         let vote = Rpc::Vote { term, last: 0, last_term: 0 };
-        let answer = restored.receive("KS2", &vote).unwrap();
+        let answer = restored.receive(&2, &vote).unwrap();
         assert!(!answer.success);
         exchange(&mut nodes[0], &mut restored);
         let vote = Rpc::Vote { term: term + 1, last: 0, last_term: 0 };
-        let answer = restored.receive("KS2", &vote).unwrap();
+        let answer = restored.receive(&2, &vote).unwrap();
         assert!(!answer.success);
     }
     #[test]
@@ -1061,8 +1447,8 @@ pub mod tests {
         pair(&mut nodes, 0, 1);
         let index = nodes[0].propose(Command::Key(vec![7; 104])).unwrap();
         // The follower journals the entry, but the leader loses the acknowledgment.
-        let request = nodes[0].request("KS1").unwrap();
-        let _answer = nodes[1].receive("KS0", &request).unwrap();
+        let request = nodes[0].request(&1).unwrap();
+        let _answer = nodes[1].receive(&0, &request).unwrap();
         assert!(nodes[1].state().commit < index);
         nodes[1].campaign().unwrap();
         pair(&mut nodes, 1, 2);
@@ -1089,7 +1475,7 @@ pub mod tests {
             entries: vec![],
             commit: last,
         };
-        let answer = nodes[1].receive("KS0", &request).unwrap();
+        let answer = nodes[1].receive(&0, &request).unwrap();
         assert!(answer.success);
         assert_eq!(nodes[1].state().last(), last);
         assert!(nodes[1].state().commit < last);
@@ -1098,11 +1484,11 @@ pub mod tests {
     fn failed_disk_never_acknowledges_vote_or_entry() {
         let mut nodes = cluster(3);
         nodes[1].journal.fail_writes();
-        let result = nodes[1].receive("KS0", &Rpc::Vote { term: 1, last: 0, last_term: 0 });
+        let result = nodes[1].receive(&0, &Rpc::Vote { term: 1, last: 0, last_term: 0 });
         assert!(result.is_err());
         assert_eq!(nodes[1].state().term, 0);
         let result = nodes[1].receive(
-            "KS0",
+            &0,
             &Rpc::Append { term: 1, previous: 0, previous_term: 0, entries: vec![], commit: 0 },
         );
         assert!(result.is_err());
@@ -1114,7 +1500,7 @@ pub mod tests {
         pair(&mut nodes, 0, 1);
         let term = nodes[0].state().term;
         let vote = Rpc::Vote { term: term + 100, last: 999, last_term: term + 100 };
-        let answer = nodes[0].receive("KS2", &vote).unwrap();
+        let answer = nodes[0].receive(&2, &vote).unwrap();
         let role = nodes[0].role;
         let unchanged = nodes[0].state().term == term;
         assert!(!answer.success);
@@ -1133,21 +1519,21 @@ pub mod tests {
         nodes[1].journal.snapshot(100).unwrap();
         let checkpoint = nodes[1].state().snapshot.clone();
         nodes[0].journal.write(&[Record::Install(checkpoint.clone())]).unwrap();
-        nodes[0].next.insert("KS2".into(), 1);
-        let reference = nodes[0].request_reference("KS2").unwrap();
+        nodes[0].next.insert(2, 1);
+        let reference = nodes[0].request_reference(&2).unwrap();
         let is_reference = matches!(reference, Rpc::Checkpoint { .. });
-        let before = nodes[2].receive("KS0", &reference).unwrap();
+        let before = nodes[2].receive(&0, &reference).unwrap();
         let known_leader = nodes[2].leader.clone();
         // The receiver persists a copy obtained from KS1, without decrypting its contents.
         nodes[2].journal.write(&[Record::Install(checkpoint)]).unwrap();
-        let after = nodes[2].receive("KS0", &reference).unwrap();
-        nodes[0].response("KS2", &reference, &after).unwrap();
-        let next = nodes[0].request_reference("KS2").unwrap();
+        let after = nodes[2].receive(&0, &reference).unwrap();
+        nodes[0].response(&2, &reference, &after).unwrap();
+        let next = nodes[0].request_reference(&2).unwrap();
         let resumes_append = matches!(next, Rpc::Append { .. });
         let recovered = nodes[2].state().capture() == nodes[0].state().capture();
         assert!(is_reference);
         assert!(!before.success);
-        assert_eq!(known_leader.as_deref(), Some("KS0"));
+        assert_eq!(known_leader.as_ref(), Some(&0));
         assert!(after.success);
         assert!(resumes_append);
         assert!(recovered);
@@ -1171,10 +1557,10 @@ pub mod tests {
     }
     #[test]
     fn joint_membership_requires_both_majorities() {
-        let joint = Membership { old: members(3), new: Some(members(5)) };
-        let old_only = BTreeSet::from(["KS0".into(), "KS1".into()]);
-        let new_only = BTreeSet::from(["KS2".into(), "KS3".into(), "KS4".into()]);
-        let both = BTreeSet::from(["KS0".into(), "KS1".into(), "KS4".into()]);
+        let joint = Membership { identities: names(), old: members(3), new: Some(members(5)) };
+        let old_only = BTreeSet::from([0, 1]);
+        let new_only = BTreeSet::from([2, 3, 4]);
+        let both = BTreeSet::from([0, 1, 4]);
         assert!(!joint.quorum(&old_only));
         assert!(!joint.quorum(&new_only));
         assert!(joint.quorum(&both));
@@ -1182,10 +1568,13 @@ pub mod tests {
         nodes[0].campaign().unwrap();
         pair(&mut nodes, 0, 1);
         pair(&mut nodes, 0, 1);
-        let new =
-            BTreeMap::from([("KS0".into(), members(3)["KS0"]), ("KS2".into(), members(3)["KS2"])]);
+        let new = BTreeSet::from([0, 2]);
         nodes[0]
-            .propose(Command::Members(Membership { old: members(3), new: Some(new.clone()) }))
+            .propose(Command::Members(Membership {
+                identities: names(),
+                old: members(3),
+                new: Some(new.clone()),
+            }))
             .unwrap();
         pair(&mut nodes, 0, 1);
         assert!(nodes[0].state().membership().new.is_some());
@@ -1193,7 +1582,10 @@ pub mod tests {
             pair(&mut nodes, 0, 2);
             pair(&mut nodes, 0, 1);
         }
-        assert_eq!(nodes[0].state().capture().membership, Membership { old: new, new: None });
+        assert_eq!(
+            nodes[0].state().capture().membership,
+            Membership { identities: names(), old: new, new: None }
+        );
     }
     #[test]
     fn delayed_messages_crashes_and_snapshots_preserve_committed_keys() {
@@ -1235,8 +1627,7 @@ pub mod tests {
                     4 | 5 if !messages.is_empty() => {
                         let index = (random as usize >> 24) % messages.len();
                         let (from, to, request) = messages.swap_remove(index);
-                        let result =
-                            nodes[to].as_mut().unwrap().receive(&format!("KS{from}"), &request);
+                        let result = nodes[to].as_mut().unwrap().receive(&(from as u32), &request);
                         if nodes[to].as_ref().unwrap().role != Role::Stopped {
                             acknowledgments.push((from, to, request, result.unwrap()));
                         }
@@ -1244,18 +1635,14 @@ pub mod tests {
                     6 | 7 if !acknowledgments.is_empty() => {
                         let index = (random as usize >> 24) % acknowledgments.len();
                         let (from, to, request, answer) = acknowledgments.swap_remove(index);
-                        let result = nodes[from].as_mut().unwrap().response(
-                            &format!("KS{to}"),
-                            &request,
-                            &answer,
-                        );
+                        let result =
+                            nodes[from].as_mut().unwrap().response(&(to as u32), &request, &answer);
                         if nodes[from].as_ref().unwrap().role != Role::Stopped {
                             result.unwrap();
                         }
                     }
                     _ if a != b => {
-                        if let Some(request) = nodes[a].as_ref().unwrap().request(&format!("KS{b}"))
-                        {
+                        if let Some(request) = nodes[a].as_ref().unwrap().request(&(b as u32)) {
                             messages.push((a, b, request));
                         }
                     }
@@ -1302,21 +1689,19 @@ pub mod tests {
                             continue;
                         }
                         let Some(request) =
-                            nodes[freshest].as_ref().unwrap().request(&format!("KS{other}"))
+                            nodes[freshest].as_ref().unwrap().request(&(other as u32))
                         else {
                             break;
                         };
-                        let result = nodes[other]
-                            .as_mut()
-                            .unwrap()
-                            .receive(&format!("KS{freshest}"), &request);
+                        let result =
+                            nodes[other].as_mut().unwrap().receive(&(freshest as u32), &request);
                         if nodes[other].as_ref().unwrap().role == Role::Stopped {
                             nodes[other] = Some(restart(nodes[other].as_ref().unwrap()));
                             continue;
                         }
                         let answer = result.unwrap();
                         let result = nodes[freshest].as_mut().unwrap().response(
-                            &format!("KS{other}"),
+                            &(other as u32),
                             &request,
                             &answer,
                         );
@@ -1332,21 +1717,19 @@ pub mod tests {
                             continue;
                         }
                         let Some(request) =
-                            nodes[freshest].as_ref().unwrap().request(&format!("KS{other}"))
+                            nodes[freshest].as_ref().unwrap().request(&(other as u32))
                         else {
                             break;
                         };
-                        let result = nodes[other]
-                            .as_mut()
-                            .unwrap()
-                            .receive(&format!("KS{freshest}"), &request);
+                        let result =
+                            nodes[other].as_mut().unwrap().receive(&(freshest as u32), &request);
                         if nodes[other].as_ref().unwrap().role == Role::Stopped {
                             nodes[other] = Some(restart(nodes[other].as_ref().unwrap()));
                             continue;
                         }
                         let answer = result.unwrap();
                         let result = nodes[freshest].as_mut().unwrap().response(
-                            &format!("KS{other}"),
+                            &(other as u32),
                             &request,
                             &answer,
                         );

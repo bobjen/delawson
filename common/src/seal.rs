@@ -200,6 +200,9 @@ mod tests {
         Messaging {
             authentication: None,
             expected_peer: None,
+            ring_identities: Default::default(),
+            local_ring: None,
+            ignore_ring_identity: false,
             send: crate::config::SendMode::Direct,
             encrypt,
             compress,
@@ -323,6 +326,9 @@ mod sampling {
         Messaging {
             authentication: None,
             expected_peer: None,
+            ring_identities: Default::default(),
+            local_ring: None,
+            ignore_ring_identity: false,
             send: SendMode::Direct,
             encrypt: false,
             compress: Compress::Lz4,

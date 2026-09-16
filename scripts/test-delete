@@ -6,7 +6,7 @@ scratch=$(mktemp -d /tmp/delawson-delete.XXXXXX)
 cp -r config "$scratch/config"
 # Mechanically relocate only the bootstrap ports; do not touch the user's cluster.
 sed -i 's/127.0.0.1:9601/127.0.0.1:29601/;s/port_base = 9602/port_base = 29602/' "$scratch/config/cluster.toml"
-export LAWS_CONFIG="$scratch/config/cluster.toml"
+export LAWS_CONFIG="$scratch/run/cluster-effective.toml"
 trap './scripts/stop-laws --run-dir "$scratch/run" --grace 1 >/dev/null' EXIT
 ./scripts/start-laws --debug --no-build --run-dir "$scratch/run" --config "$scratch/config" >/dev/null
 laws=./target/debug/laws

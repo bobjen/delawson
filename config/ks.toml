@@ -26,6 +26,10 @@ inline_ping = true
 
 # Threads answering requests off the read loop. Zero means one per core.
 [knobs]
+# Opt in to primary reads after quorum lease expiry (may return stale data).
+# Writes, committed-term readiness, and demotion checks are unchanged.
+# SN/DN will enforce this when their Raft admission is implemented.
+allow_stale_reads = false
 workers = 0
 
 # Without explicit raft.members, each KS process is an independent singleton.
@@ -41,15 +45,19 @@ workers = 0
 # checkpoint_lease_secs = 300
 # Smaller than the cold-member delay; a writer continues unless it wins election.
 # checkpoint_election_delay_ms = 500
-# Require election_min_ms >= 2 * heartbeat_ms, election_max_ms > election_min_ms,
-# and primary_wait_ms >= election_min_ms. The clock margin additionally requires
-# 2 * primary_wait_ms < 99 * election_min_ms (clock rates within 1% of real time).
-# Use matching lease/wait values throughout a ring; change them with a full restart.
+# Require election_min_ms >= 2 * heartbeat_ms, election_max_ms > election_min_ms.
+# election_min_ms also sets the primary read/write lease lifetime.
+# There is no additional post-election wait.
+# Use matching election_min_ms values throughout a ring; change them with a full restart.
 # heartbeat_ms = 75
 # election_min_ms = 150
 # election_max_ms = 300
-# primary_wait_ms = 150
 # request_timeout_ms = 1000
+# Founding slots only. Later applicants receive slots from the primary.
+# [raft.member_indexes]
+# KS0 = 0
+# KS1 = 1
+# KS2 = 2
 # [raft.members]
 # KS0 = "127.0.0.1:9400"
 # KS1 = "127.0.0.1:9401"

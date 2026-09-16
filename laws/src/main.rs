@@ -203,7 +203,7 @@ enum Cmd {
     },
     /// Generate today's master key.
     RotateMasterKey,
-    /// Change KS ring membership through Raft joint consensus (JSON identity/address map).
+    /// Change KS ring membership through Raft joint consensus (JSON list of routing labels; primary assigns slots).
     RaftMembers {
         #[arg(long)]
         members_file: PathBuf,

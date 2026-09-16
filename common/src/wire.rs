@@ -1445,6 +1445,7 @@ pub fn connect(stream: TcpStream, config: &Messaging) -> Result<Link> {
     Rng::new().fill_bytes(&mut prefix);
     let mut writing = stream.try_clone()?;
     writing.write_all(&prefix)?;
+    crate::ring::connect(&mut writing, config)?;
     Ok(Link {
         reader: Reader {
             stream: stream.try_clone()?,
@@ -1465,6 +1466,7 @@ pub fn accept(stream: TcpStream, config: &Messaging) -> Result<(Reader, Wire)> {
     let mut prefix = [0u8; 8];
     let mut reading = stream.try_clone()?;
     reading.read_exact(&mut prefix)?;
+    crate::ring::accept(&mut reading, config)?;
     Ok((
         Reader {
             stream: reading,

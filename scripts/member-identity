@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Mark one member per ring to coordinate first creation.
+Usage: member-identity EFFECTIVE_CLUSTER ROUTING_LABEL JOURNAL_DIRECTORY
+The default coordinator is the first KS routing label in that ring's roster.
+Each process generates its own voting identity. No IDs come from configuration.
+Never use this command to recover an existing ring with lost state.
+"""
+import os
+from pathlib import Path
+import sys
+import tomllib
+
+config_path, name, directory = sys.argv[1:4]
+config = tomllib.loads(Path(config_path).read_text())
+ring = config['ring_identities'][name]
+number = 0
+coordinator = None
+for service in config['service']:
+    if service['kind'] != 'ks':
+        continue
+    for _ in range(service.get('count', 1)):
+        candidate = service.get('identity', f'KS{number}')
+        number += 1
+        if config['ring_identities'][candidate] == ring and coordinator is None:
+            coordinator = candidate
+if name != coordinator:
+    sys.exit(0)
+directory = Path(directory)
+directory.mkdir(parents=True, exist_ok=True)
+if any(directory.iterdir()):
+    raise SystemExit('bootstrap marker requires an empty persistence directory')
+fd = os.open(directory/'need-bootstrap', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+for path in (directory, directory.parent):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)

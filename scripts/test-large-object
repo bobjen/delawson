@@ -58,7 +58,7 @@ parallel=${LARGE_PARALLEL:-4}
 ((parallel > 0)) || { echo "large-object: LARGE_PARALLEL must be positive" >&2; exit 2; }
 running=0
 for ((n = 0; n < blocks; n++)); do
-    "$laws" --config "$config/cluster.toml" append-block "$path" --file "$block" &
+    "$laws" --config "$run/cluster-effective.toml" append-block "$path" --file "$block" &
     running=$((running + 1))
     if ((running >= parallel)); then
         wait -n
@@ -69,14 +69,14 @@ wait
 
 if [[ $phase == extent ]]; then
     echo "large-object: one-extent phase complete; inspecting the object"
-    "$laws" --config "$config/cluster.toml" object-info "$path" --want extents
+    "$laws" --config "$run/cluster-effective.toml" object-info "$path" --want extents
     exit 0
 fi
 
 # The final block is deliberately followed by the explicit forced seal, since the
 # extent is full by logical size while per_stream is intentionally very large.
-"$laws" --config "$config/cluster.toml" seal "$path"
-"$laws" --config "$config/cluster.toml" object-info "$path" --want counts
+"$laws" --config "$run/cluster-effective.toml" seal "$path"
+"$laws" --config "$run/cluster-effective.toml" object-info "$path" --want counts
 
 source=$path
 destinations=(
@@ -147,12 +147,12 @@ destinations=(
 )
 for ((n = 0; n < ${#destinations[@]}; n++)); do
     destination=${destinations[n]}
-    if ! "$laws" --config "$config/cluster.toml" concat "$destination" "$source" "$source"; then
+    if ! "$laws" --config "$run/cluster-effective.toml" concat "$destination" "$source" "$source"; then
         echo "large-object: concat stopped at iteration $n (first error)" >&2
         exit 0
     fi
-    "$laws" --config "$config/cluster.toml" seal "$destination"
-    "$laws" --config "$config/cluster.toml" object-info "$destination" --want counts
+    "$laws" --config "$run/cluster-effective.toml" seal "$destination"
+    "$laws" --config "$run/cluster-effective.toml" object-info "$destination" --want counts
     source=$destination
 done
 echo "large-object: reached the script's same-DN name bound without an error" >&2

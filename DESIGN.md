@@ -18590,7 +18590,7 @@ instances as unknown; cross-ring recovery must fail before state installation.
 
 Bootstrap supplies `[ring_identities]` in the effective cluster configuration,
 with 128 hexadecimal characters per identity. `scripts/ring-identities CLUSTER
-OUTPUT IDENTITY_FILE [KS_CONFIG]` generates them with the OS cryptographic random
+OUTPUT IDENTITY_FILE [KS_CONFIG_OR_DIRECTORY]` generates them with the OS cryptographic random
 source and durably preserves them in `IDENTITY_FILE`. `start-laws` keeps this as
 `run/ring-identities.toml` across starts and distributes the effective cluster
 configuration. Preserve this manifest with bootstrap material. No checked-in
@@ -18598,11 +18598,9 @@ constant or name-derived fallback is used. When KS members share a Raft ring,
 their bootstrap aliases carry the same ring identity; current SN and DN rings
 are singletons. Missing identities fail process startup.
 
-Registration checks the claimed identity against the bootstrap roster's expected
-identity. KS checks its Raft packet identity before processing membership,
-consensus, unlock forwarding, or checkpoint requests. KS already checked a ring
-string in these control packets; that field now carries the random identity.
-Ordinary data requests continue to use compact routing labels. Long-identity
+Registration checks the ring identity against the bootstrap roster. Connections
+to KS/SN/DN validate the full ring identifier once before ordinary requests; Raft
+packets do not repeat it. Ordinary data requests use compact routing labels. Long-identity
 checks belong at admission/recovery boundaries, not every extent operation.
 
 Every journal begins with `DLAWKR02` and the 128 ASCII hexadecimal identity
@@ -18612,8 +18610,52 @@ installation checks it before altering terms, membership, or application state;
 recovery compares it against independently supplied bootstrap configuration.
 Checksums and encrypted-key authentication remain separate checks. Key encryption
 also binds to this identity, so keys cannot be silently relabeled across rings.
-The directory identity file continues to bind the member name and prevent two
-processes from opening the same store.
+The directory's `identity` file is a checksummed local record containing the ring
+identifier, routing label, current 64-byte random member identifier, and a list of
+retired member identifiers. It is not copied with peer checkpoints or journals.
+An exclusive lifetime lock on this stable inode prevents two processes from opening
+the same store. Do not rename or replace this file while its owner is running.
+
+Founding slots come from `[raft.member_indexes]` or deterministic enumeration of
+the configured founding roster. Random member identifiers never come from
+configuration: each process generates and persists its own under the directory
+identity lock. An intact restart reuses it.
+
+Only one founder needs an empty `need-bootstrap` file. Startup checks for it once;
+a coordinator worker then collects all founding identities, durably journals the
+chosen membership before distributing it, and removes the marker (with directory
+fsync) after all founders acknowledge. Retries and coordinator restarts reuse the
+recorded table; recipients reject a conflicting table. Other founders need no
+marker. New applicants receive this founding table before catching up, without
+being assigned a slot by bootstrap.
+
+**WARNING: Adding `need-bootstrap` to a running member requests bootstrap on its
+next restart. It is a creation instruction, not a repair procedure.** A running
+process does not poll for the file. Existing history and founding membership are
+not reset by retrying bootstrap. `scripts/member-identity EFFECTIVE_CLUSTER
+ROUTING_LABEL JOURNAL_DIRECTORY` creates the marker only for the first configured
+KS routing label in each ring and refuses a nonempty directory. `start-laws`
+invokes it only when creating its ring manifest, not during ordinary restarts.
+Without a local identity and without history, startup generates a fresh applicant
+ID even if its routing label appears in the founding configuration. Missing
+identity beside history fails startup pending state-loss recovery work. The local
+identity file never acquires a peer's identity during state recovery.
+
+Raft membership persists slot-to-(random identifier, routing label) mappings.
+The primary assigns an unused slot to a newly requested identity; retries preserve
+the assignment and retired slots are not rebound. `laws raft-members --members-file`
+accepts a JSON list of enrolled routing labels. Existing members need not be online
+to retain their assignments; for new applicants the primary queries their persistent
+identifier over the authenticated ring connection before proposing membership.
+Ordinary Raft messages identify senders by slot. Slotless applicants use their full
+identifier for identity queries and checkpoint recovery, and cannot vote or campaign.
+A catching-up member can answer replication with its full identifier until its
+membership entry arrives; afterward it uses the assigned slot. Status exposes
+`raft_member_id` and `raft_member_slot` (`none` until assigned).
+
+The retired-identifier list is reserved for subsequent state-loss handling. Detecting
+a missing current journal, rotating member identities, sending retirement responses,
+and automatic replacement after state loss are not implemented by this identity change.
 
 **DANGER: `ignore_ring_identity = true` in `process.toml` IS A GOOD WAY TO LOSE
 ALL YOUR DATA.** This explicitly requested debugging escape hatch bypasses ring
@@ -18715,22 +18757,22 @@ new journal. Replay accepts that carry whether or not checkpoint publication
 completed. A follower may adopt a newer committed checkpoint; a primary only
 compacts a checkpoint matching its locally committed log.
 
-An explicit `[raft]` configuration gives the ring name and member-ID/address map.
+An explicit `[raft]` configuration gives the ring label and founding routing-label/address hints.
+`[raft.member_indexes]` assigns founding slots; later slots are assigned by the primary.
 Without a map, each KS process remains an independent singleton, preserving the
 existing start-laws topology. Ring members need matching bootstrap configuration,
 distinct IDs and data directories, and machine enrollment in the KS roster.
 An added member can start with the old configuration as a nonvoter before the
 membership proposal includes it. `laws raft-members --members-file FILE` accepts
-a JSON member-ID/address map and proposes a joint transition. Automatic maintenance
+a JSON list of enrolled routing labels and proposes a joint transition. Automatic maintenance
 and pre-admission catch-up policy remain future work.
 
 Defaults are a 75 ms heartbeat, randomized 150–300 ms election timeout, and
 1000 ms RPC timeout. Heartbeat and minimum/maximum election timeouts are separate
-parameters. One `primary_wait_ms`, default 150, supplies both the read-lease
-lifetime and the new-primary startup delay. Configuration validation requires positive heartbeat,
-RPC timeout and read lease; `election_min_ms >= 2 * heartbeat_ms`,
-`election_max_ms > election_min_ms`, and `primary_wait_ms >= election_min_ms`.
-The election-gap clock margin requires `2 * primary_wait_ms < 99 * election_min_ms`.
+parameters. `election_min_ms`, default 150, also supplies the primary read/write
+lease lifetime. There is no additional post-election delay. Configuration validation
+requires positive heartbeat and RPC timeout, `election_min_ms >= 2 * heartbeat_ms`,
+and `election_max_ms > election_min_ms`.
 Recent primary contact suppresses ordinary vote requests. Vote requests from IDs
 excluded by the local voting configuration cannot advance the term or demote the
 primary. Lagging enrolled KS members can still fetch checkpoints to learn a newer
@@ -18740,34 +18782,38 @@ read lease. A successful current-term AppendEntries response contributes its
 request's send time, never its receive time. A quorum of unexpired acknowledgments
 (in both configurations during joint consensus) permits reads without a fresh
 network round. Ordinary heartbeats with no term, log, or commit change do not
-write the journal. Expiry blocks reads but does not force an election.
+write the journal. Expiry blocks reads by default but does not force an election.
 
-A newly elected primary waits 150 ms before serving reads or acknowledging writes.
-It can journal, commit, and apply during this interval. It must commit and apply
-through its current-term no-op before reads. Quorum intersection places an old
-primary's last successful heartbeat send before the replacement's election; the
-election quiet period plus the replacement's wait outlasts the old lease.
-A restarted member also waits the minimum election interval before granting votes,
-so restart cannot erase this quiet period. Membership proposals also pass the
-startup gate before execution. Leadership changes and restart discard lease state.
+A newly elected primary can immediately journal its current-term no-op and send
+AppendEntries. Client admission still requires a committed and applied current-term
+entry, plus a live quorum lease unless stale reads are enabled. An election quorum
+intersects the previous heartbeat quorum: an intersecting voter refuses votes for
+`election_min_ms` after receiving that heartbeat, which follows its send time.
+With equal clock rates this quiet period covers the old primary's lease without
+an additional wait after election. A restarted node initializes the vote quiet
+period when its Raft node is constructed. The longer process-start quarantine and
+strict campaign-response deadline needed for lost-voting-state recovery remain
+separate work. Leadership changes and restart discard lease state.
 
 Leases use Linux CLOCK_BOOTTIME, which is monotonic and includes system suspend.
-The timing assumption is clock rates within 1% of real elapsed time, including
-across suspend or virtual-machine pauses. The minimum-election quiet period is E
-and the common lease/wait duration is D. Safety uses (E+D)/1.01 > D/0.99,
-equivalently 99E > 2D. At the defaults this leaves a large margin. Clock timestamp
-offsets are irrelevant: only elapsed-time rates enter this argument. An immediate
-handoff must preserve this gap or otherwise revoke old read permission before
-bypassing it.
-Clock offsets between hosts need not agree. A host/VM that freezes or resets this
-clock violates the assumption and cannot safely use this protocol. All members
-must obey the same `primary_wait_ms` value (default 150 ms); mixing the previous
-no-wait implementation with this implementation is unsafe. Restart the whole
-ring when introducing this change; do not roll it out member by member.
+Clock timestamp offsets between hosts do not matter. Using equal nominal lease
+and vote-quiet durations accepts clock-rate risk: election communication normally
+adds a gap, but there is no guaranteed minimum network delay to cover unequal
+clock rates. This no-wait policy does not retain the former 1% clock-rate safety
+margin. Members must use matching `election_min_ms` values; coordinate timing
+changes across the ring rather than changing one member independently.
 
-One incoming-client gate enforces startup readiness and a live lease before command
+Each service can independently set `[knobs] allow_stale_reads = true` to allow
+primary reads after quorum lease expiry, accepting possibly stale results during
+a partition or loss of secondaries. The shared knob defaults to false. It does not
+bypass the committed current-term entry requirement, application
+catch-up, or demotion checks, and never relaxes write admission. KS implements
+this policy now; SN and DN will use it when their Raft admission is implemented.
+
+One incoming-client gate enforces committed-term readiness and, except for opted-in stale
+reads, a live lease before command
 dispatch. Direct and forwarded requests use the same gate, including registry
-queries; individual handlers contain no startup timing checks. Raft RPCs, bootstrap
+queries; individual handlers contain no lease checks. Raft RPCs, bootstrap
 registration, unlock operations, and process diagnostics bypass this client gate so bootstrap,
 replication, and elections continue while client admission is stopped.
 
@@ -18776,11 +18822,19 @@ read lock, then rechecks its lease. The handler receives that guarded history an
 holds it while producing its result. A lease expiring after admission does not
 cancel the read or impose a response-delivery deadline. Responses may finish out
 of order. Once accepted, a write still waits for commitment and application,
-without another startup timer. A demoted primary terminates the process, so its
+without a response-delivery deadline. Primary proposal writes and commit advancement
+also require write authority: election supplies the initial `election_min_ms`
+interval, and afterward a quorum of successful AppendEntries responses must have
+unexpired send times. Delayed responses cannot renew authority. Replication RPCs
+continue during expiry so fresh quorum responses can unblock pending commits;
+acknowledgments update authority before commit advancement. This applies to
+internal key generation and membership changes as well as client writes, even
+when stale reads are enabled. Singleton rings supply their own quorum.
+A demoted primary terminates the process, so its
 pending requests cannot become proposals in a later leadership term.
 
-Lazy key preparation is internal maintenance before admission and can commit/apply
-during the startup wait. Followers forward key and membership requests to a known
+Lazy key preparation is internal maintenance before admission; its proposals and
+commit advancement obey the same primary write-authority check. Followers forward key and membership requests to a known
 primary. Registry state remains local and unreplicated; its queries and assignment
 requests require primary admission, while registration must work before quorum
 exists because KS members register before serving. Registrar failover remains

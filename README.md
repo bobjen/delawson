@@ -312,34 +312,54 @@ ring = "KS0"
 heartbeat_ms = 75
 election_min_ms = 150
 election_max_ms = 300
-primary_wait_ms = 150
 request_timeout_ms = 1000
+[raft.member_indexes]
+KS0 = 0
+KS1 = 1
+KS2 = 2
 [raft.members]
 KS0 = "127.0.0.1:9400"
 KS1 = "127.0.0.1:9401"
 KS2 = "127.0.0.1:9402"
 ```
 
-Require `election_min_ms >= 2 * heartbeat_ms`, `election_max_ms > election_min_ms`,
-`primary_wait_ms >= election_min_ms`, and `2 * primary_wait_ms < 99 * election_min_ms`.
-These are checked at startup. Use matching primary-wait settings on every member and
-restart the whole ring when introducing leases or changing those settings.
+Require `election_min_ms >= 2 * heartbeat_ms` and `election_max_ms > election_min_ms`.
+These are checked at startup. The minimum election timeout also controls the
+primary read/write lease lifetime. Use matching values throughout the ring.
+There is no additional post-election wait.
 
-Use the actual configured listen addresses. Locked members can vote and journal
+Use the actual configured listen addresses. Run `scripts/ring-identities` to
+create/reuse ring identifiers before starting members. Each process generates and
+persists its own random member identifier. For new ring creation only, run
+`scripts/member-identity EFFECTIVE_CLUSTER ROUTING_LABEL JOURNAL_DIRECTORY` for
+the founders; it places an empty `need-bootstrap` marker on just one coordinator
+per ring. `start-laws` does this on initial creation. The coordinator collects the
+founders' identifiers, journals the chosen table, distributes it, then removes the
+marker. An interrupted bootstrap reuses that same table.
+
+**WARNING: `need-bootstrap` requests ring creation at the next process startup.
+Do not add it to repair an existing ring.** It is checked only at startup; adding
+it while a process runs has no immediate effect. Existing recorded founders are
+preserved on retry, not replaced. Later applicants have no configured slot: the
+primary assigns one during membership admission.
+The locked local `identity` file preserves that ID across restarts; copy peer
+history without copying their identity file. `status` reports `raft_member_id` and
+`raft_member_slot` (initially `none` for an applicant). Locked members can vote and journal
 entries toward commitment. An unlocked member can unlock authenticated peers.
 Key reads reuse quorum heartbeat acknowledgments for a 150 ms lease measured
-from send time. A shared incoming-client gate waits 150 ms after election and requires the
+from send time. A shared incoming-client gate requires the
 current-term no-op committed/applied before dispatch. Requests admitted under a
 live lease may finish after its expiry; there is no response-delivery deadline. A minority loses read permission when
-its lease expires. The lease clock includes system suspend; safety assumes clock
-rates within 1% of real time. All ring members must use the same lease protocol.
+its lease expires unless its service enables `[knobs] allow_stale_reads = true`.
+The lease clock includes system suspend. Equal lease and vote-quiet durations
+accept clock-rate risk; election messaging adds no guaranteed minimum safety margin. All ring members must use the same lease protocol.
 Followers forward requests to a known primary. A demoted primary exits its process
 before entering a new term, after a bounded log-flush/backtrace attempt (at most
 five seconds). It cannot become primary again during cleanup. A supervisor or
 operator must restart it. Removal of
 the primary also exits the process, so that membership request may lose its reply
 even though the change committed. `laws raft-members --members-file
-FILE` proposes a joint-consensus transition using a JSON ID/address map. New IDs
+FILE` proposes a joint-consensus transition using a JSON list of routing labels. New applicants
 must be admitted KS processes. Automatic ring maintenance and client bootstrap
 failover remain future work; `--to` and `--at` select a member explicitly.
 

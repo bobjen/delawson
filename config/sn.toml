@@ -8,4 +8,8 @@ stream_share = 0.333
 
 # Threads answering requests off the read loop. Zero means one per core.
 [knobs]
+# Opt in to primary reads after quorum lease expiry (may return stale data).
+# Writes, committed-term readiness, and demotion checks are unchanged.
+# SN/DN will enforce this when their Raft admission is implemented.
+allow_stale_reads = false
 workers = 0

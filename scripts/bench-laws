@@ -50,6 +50,6 @@ target=release
 trap '"$root/scripts/stop-laws" > /dev/null' EXIT
 
 laws=$root/target/$target/laws
-cluster=$root/config/cluster.toml
+cluster=$root/run/cluster-effective.toml
 "$laws" --config "$cluster" --to "$to" bench \
     --clients "$clients" --depth "$depth" --warmup "$warmup" --seconds "$seconds"

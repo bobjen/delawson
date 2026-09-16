@@ -177,6 +177,8 @@ impl Process {
                 .load_identity(path)?;
         }
         cluster.messaging.expected_peer = Some(cluster.registrar()?.identity.clone());
+        cluster.messaging.local_ring = cluster.ring_identities.get(&config.identity).cloned();
+        cluster.messaging.ignore_ring_identity = config.ignore_ring_identity;
         let entry = cluster
             .service(&config.identity)
             .ok_or_else(|| {
@@ -193,7 +195,7 @@ impl Process {
                 config.identity, config.kind, entry.kind
             )));
         }
-        if matches!(entry.kind, ServiceKind::Sn | ServiceKind::Dn)
+        if matches!(entry.kind, ServiceKind::Ks | ServiceKind::Sn | ServiceKind::Dn)
             && !cluster.ring_identities.contains_key(&config.identity)
         {
             return Err(Error::new("missing ring identity in bootstrap configuration"));
@@ -244,6 +246,9 @@ impl Process {
         if let Some(address) = self.assigned.read().expect("assigned peers").get(identity) {
             return Ok(*address);
         }
+        self.lookup_peer(identity)
+    }
+    fn lookup_peer(&self, identity: &str) -> Result<SocketAddr> {
         if let Some(address) = self.cluster.fixed_address(identity) {
             return Ok(address);
         }
@@ -262,7 +267,13 @@ impl Process {
                     .map_err(|_| Error::new(format!("KS answered {address:?} for {identity}"))),
                 None => Err(Error::new(format!("KS answered nothing for {identity}"))),
             },
-            status => Err(Error::new(format!("KS answered {status} for {identity}"))),
+            status => self
+                .assigned
+                .read()
+                .expect("assigned peers")
+                .get(identity)
+                .copied()
+                .ok_or_else(|| Error::new(format!("KS answered {status} for {identity}"))),
         }
     }
 
@@ -278,13 +289,17 @@ impl Process {
         request: &Req,
         then: impl FnOnce(Resp) + Send + 'static,
     ) -> Result<()> {
-        let peer = self.peers.get(identity, || self.peer(identity))?;
+        let peer = self.peers.get_refresh(identity, |reconnect| {
+            if reconnect { self.lookup_peer(identity) } else { self.peer(identity) }
+        })?;
         peer.ask(request, then)
     }
 
     /// Ask and wait, for a startup path with nothing else to get on with.
     pub fn call(&self, identity: &str, request: &Req) -> Result<Resp> {
-        let peer = self.peers.get(identity, || self.peer(identity))?;
+        let peer = self.peers.get_refresh(identity, |reconnect| {
+            if reconnect { self.lookup_peer(identity) } else { self.peer(identity) }
+        })?;
         peer.call(request)
     }
 
