@@ -18560,15 +18560,28 @@ before tuning the production defaults. Billing exports are a separate policy.
 
 ## 17.50 Numbered KS files, journal rotation and pruning
 
-The directory contains `identity`, `snapshot-<sequence>.bin`, and
-`journal-<first-sequence>.log`, with zero-padded 20-digit decimal sequences.
-Identity format `DLAWKR02` binds the store to its ring and member; its exclusive
-file lock prevents concurrent opens and survives rotation. There is no backward compatibility requirement yet: earlier formats are
+The directory contains `identity`, `snapshot-<sequence>.bin`, closed journals
+`journal-<first-sequence>.log`, and the active journal `current.log`. Numbered
+filenames use zero-padded 20-digit decimal sequences. The local identity file
+binds the store to its ring and member; its exclusive file lock prevents concurrent
+opens and survives rotation. There is no backward compatibility requirement yet: earlier formats are
 unsupported, with no compatibility reader or migration path.
 
-A snapshot at physical sequence 100 is followed by journal 101. If that snapshot
+Rotation runs under the journal mutex: sync the old file, rename `current.log` to
+its numbered name using the starting sequence retained in RAM, sync the directory,
+then durably publish the successor as `current.log`. The new header stores the
+starting sequence so an empty active file can be named correctly after restart.
+A snapshot retry with no intervening writes reuses the empty active journal.
+Any rotation I/O failure fences further journal writes. A crash between rename
+and publication leaves the fixed name missing. Recovery treats a missing active
+journal in an existing store as possible voting-state loss and refuses to resume
+that identity; it does not promote an older numbered file or create a replacement.
+Automatic retirement and rejoining under a new identity remain subsequent work.
+
+A snapshot at physical sequence 100 is followed by a journal starting at 101. If that snapshot
 never appears, recovery starts with an earlier snapshot and reads every later
-journal, including 101. Sequence continuity is checked. Temporary files are ignored.
+journal, including 101, and finally `current.log`. Header and filename starting
+sequences must agree; sequence continuity is checked. Temporary files are ignored.
 A missing snapshot beside nonempty journals is an error.
 
 `snapshot_retain` defaults to ten and must be positive. Keep the newest configured
@@ -18603,8 +18616,10 @@ to KS/SN/DN validate the full ring identifier once before ordinary requests; Raf
 packets do not repeat it. Ordinary data requests use compact routing labels. Long-identity
 checks belong at admission/recovery boundaries, not every extent operation.
 
-Every journal begins with `DLAWKR02` and the 128 ASCII hexadecimal identity
-characters, checked before replay even for an otherwise empty file. Every local
+Every journal begins with `DLAWKR03`, the 128 ASCII hexadecimal ring identity
+characters, and the starting batch sequence as a little-endian u64 followed by
+its bitwise complement. These are checked before replay even for an otherwise
+empty file. Every local
 snapshot and transferable checkpoint carries its source identity. Checkpoint
 installation checks it before altering terms, membership, or application state;
 recovery compares it against independently supplied bootstrap configuration.
@@ -18653,8 +18668,8 @@ A catching-up member can answer replication with its full identifier until its
 membership entry arrives; afterward it uses the assigned slot. Status exposes
 `raft_member_id` and `raft_member_slot` (`none` until assigned).
 
-The retired-identifier list is reserved for subsequent state-loss handling. Detecting
-a missing current journal, rotating member identities, sending retirement responses,
+The retired-identifier list is reserved for subsequent state-loss handling. Rotating
+member identities after a missing current journal, sending retirement responses,
 and automatic replacement after state loss are not implemented by this identity change.
 
 **DANGER: `ignore_ring_identity = true` in `process.toml` IS A GOOD WAY TO LOSE
@@ -18767,12 +18782,22 @@ membership proposal includes it. `laws raft-members --members-file FILE` accepts
 a JSON list of enrolled routing labels and proposes a joint transition. Automatic maintenance
 and pre-admission catch-up policy remain future work.
 
-Defaults are a 75 ms heartbeat, randomized 150–300 ms election timeout, and
+Defaults are a 75 ms heartbeat, randomized 150–300 ms delay before campaigning, and
 1000 ms RPC timeout. Heartbeat and minimum/maximum election timeouts are separate
 parameters. `election_min_ms`, default 150, also supplies the primary read/write
-lease lifetime. There is no additional post-election delay. Configuration validation
+lease lifetime and strict campaign lifetime. There is no additional post-election delay. Configuration validation
 requires positive heartbeat and RPC timeout, `election_min_ms >= 2 * heartbeat_ms`,
 and `election_max_ms > election_min_ms`.
+Each campaign has an absolute CLOCK_BOOTTIME deadline of its start plus
+`election_min_ms`, set before journaling the self-vote. Sending vote requests and
+accepting vote replies check that deadline directly; replies at or after it cannot
+win, even if the timer thread has not run or the process was suspended. Expiry
+clears volatile campaign votes and returns the candidate to follower status when
+a reply is handled, preserving the durable term/vote. A new campaign increments
+the term and establishes a new deadline, rejecting replies from earlier campaigns.
+Randomization and cold/checkpoint penalties affect when a campaign starts, never
+how long its votes remain acceptable.
+
 Recent primary contact suppresses ordinary vote requests. Vote requests from IDs
 excluded by the local voting configuration cannot advance the term or demote the
 primary. Lagging enrolled KS members can still fetch checkpoints to learn a newer
@@ -18791,9 +18816,10 @@ intersects the previous heartbeat quorum: an intersecting voter refuses votes fo
 `election_min_ms` after receiving that heartbeat, which follows its send time.
 With equal clock rates this quiet period covers the old primary's lease without
 an additional wait after election. A restarted node initializes the vote quiet
-period when its Raft node is constructed. The longer process-start quarantine and
-strict campaign-response deadline needed for lost-voting-state recovery remain
-separate work. Leadership changes and restart discard lease state.
+period when its Raft node is constructed. State-loss recovery and its interaction
+with replacement identities remain separate work; campaign deadlines alone do
+not establish safety across lost voting histories. Leadership changes and restart
+discard lease state.
 
 Leases use Linux CLOCK_BOOTTIME, which is monotonic and includes system suspend.
 Clock timestamp offsets between hosts do not matter. Using equal nominal lease

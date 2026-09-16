@@ -33,6 +33,9 @@ impl Lease {
             acks: BTreeMap::new(),
         }
     }
+    pub fn duration(&self) -> Duration {
+        self.duration
+    }
     pub fn reset(&mut self) {
         self.elected = None;
         self.acks.clear();

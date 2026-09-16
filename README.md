@@ -326,7 +326,11 @@ KS2 = "127.0.0.1:9402"
 Require `election_min_ms >= 2 * heartbeat_ms` and `election_max_ms > election_min_ms`.
 These are checked at startup. The minimum election timeout also controls the
 primary read/write lease lifetime. Use matching values throughout the ring.
-There is no additional post-election wait.
+There is no additional post-election wait. Each campaign expires strictly after
+`election_min_ms` from its start, including time spent journaling the self-vote.
+Expired campaigns cannot count delayed replies, even if the timer thread has not
+run. Randomization and cold/checkpoint penalties delay the next campaign; they
+do not lengthen an active campaign.
 
 Use the actual configured listen addresses. Run `scripts/ring-identities` to
 create/reuse ring identifiers before starting members. Each process generates and
@@ -363,9 +367,15 @@ FILE` proposes a joint-consensus transition using a JSON list of routing labels.
 must be admitted KS processes. Automatic ring maintenance and client bootstrap
 failover remain future work; `--to` and `--at` select a member explicitly.
 
-Recovery starts from the newest snapshot and replays later numbered journals.
+Recovery starts from the newest snapshot, replays later numbered journals, then
+replays `current.log`, the fixed name of the active journal.
 Filenames use a physical journal batch sequence, distinct from the Raft log index.
-Bootstrap creates snapshot zero. Rotation precedes snapshot publication and carries
+Bootstrap creates snapshot zero. Rotation renames `current.log` to its numbered
+name, syncs the directory, then creates and durably publishes a new `current.log`.
+The header records its starting sequence, including when it is empty. A missing
+active journal in an existing store fails startup as possible voting-state loss;
+it is never silently recreated. Automatic rejoining under a new identity remains
+future work. Rotation precedes snapshot publication and carries
 any uncommitted suffix into the new journal. An incomplete final active frame can
 be discarded; complete corruption fails recovery. Earlier pre-Raft formats are
 refused without migration.

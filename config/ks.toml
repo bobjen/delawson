@@ -46,7 +46,8 @@ workers = 0
 # Smaller than the cold-member delay; a writer continues unless it wins election.
 # checkpoint_election_delay_ms = 500
 # Require election_min_ms >= 2 * heartbeat_ms, election_max_ms > election_min_ms.
-# election_min_ms also sets the primary read/write lease lifetime.
+# election_min_ms sets the strict campaign lifetime and primary read/write lease lifetime.
+# Randomized delays and cold/checkpoint penalties postpone campaigns, not their expiry.
 # There is no additional post-election wait.
 # Use matching election_min_ms values throughout a ring; change them with a full restart.
 # heartbeat_ms = 75

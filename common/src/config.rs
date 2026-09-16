@@ -676,10 +676,12 @@ pub struct RaftConfig {
     pub member_indexes: BTreeMap<String, u32>,
     /// Positive; election_min_ms must be at least twice this interval.
     pub heartbeat_ms: u64,
-    /// Also the primary read/write lease lifetime, measured from heartbeat send.
+    /// Also the strict campaign lifetime (from campaign start) and primary read/write
+    /// lease lifetime (from heartbeat send). Campaign scheduling is separate.
     /// At least 2 * heartbeat_ms; all ring members must use the same value.
     pub election_min_ms: u64,
-    /// Strictly greater than election_min_ms; elections randomize within this range.
+    /// Strictly greater than election_min_ms; delays before campaigns randomize
+    /// within this range, plus cold/checkpoint penalties. Does not extend a campaign.
     pub election_max_ms: u64,
     pub request_timeout_ms: u64,
 }

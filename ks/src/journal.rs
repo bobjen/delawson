@@ -10,18 +10,24 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"DLAWKR02";
-const HEADER: u64 = 8 + 128;
-fn journal_header(ring: &str) -> Vec<u8> {
-    [MAGIC.as_slice(), ring.as_bytes()].concat()
+const MAGIC: &[u8; 8] = b"DLAWKR03";
+const CURRENT: &str = "current.log";
+const HEADER: u64 = 8 + 128 + 16;
+fn journal_header(ring: &str, start: u64) -> Vec<u8> {
+    [MAGIC.as_slice(), ring.as_bytes(), &start.to_le_bytes(), &(!start).to_le_bytes()].concat()
 }
-fn check_journal_header(reader: &mut impl Read, ring: &str, ignore: bool) -> Result<()> {
+fn check_journal_header(reader: &mut impl Read, ring: &str, ignore: bool) -> Result<u64> {
     let mut header = [0; HEADER as usize];
     reader.read_exact(&mut header)?;
-    if &header[..8] != MAGIC || (!ignore && header.as_slice() != journal_header(ring)) {
+    if &header[..8] != MAGIC || (!ignore && &header[8..136] != ring.as_bytes()) {
         return Err(Error::new("journal ring identity mismatch"));
     }
-    Ok(())
+    let start = u64::from_le_bytes(header[136..144].try_into().unwrap());
+    let inverse = u64::from_le_bytes(header[144..152].try_into().unwrap());
+    if start == 0 || inverse != !start {
+        return Err(Error::new("invalid journal starting sequence"));
+    }
+    Ok(start)
 }
 const LIMIT: usize = 64 * 1024 * 1024;
 
@@ -55,6 +61,7 @@ pub struct Journal {
     bootstrap_pending: bool,
     _ownership: File,
     file: File,
+    current_start: u64,
     sequence: u64,
     change_sequence: u64,
     snapshot_sequence: u64,
@@ -94,8 +101,10 @@ impl Journal {
         ownership.read_to_end(&mut identity)?;
         let snapshots = numbered(directory, "snapshot")?;
         let segments = numbered(directory, "journal")?;
+        let current = directory.join(CURRENT);
+        let current_exists = current.try_exists()?;
         let local: LocalIdentity = if identity.is_empty() {
-            if !snapshots.is_empty() || !segments.is_empty() {
+            if !snapshots.is_empty() || !segments.is_empty() || current_exists {
                 return Err(Error::new("missing KS identity beside persistence files"));
             }
             let current = common::ring::MemberIdentity::generate()?;
@@ -132,12 +141,10 @@ impl Journal {
             }
             (checkpoint.state, *seq, checkpoint.second, bytes.len() as u64)
         } else {
-            // A crash during initial publication may leave only the empty journal
-            // header. No process could yet have acknowledged a vote or log entry.
+            // Initial publication can leave only an empty current header. It cannot
+            // have acknowledged votes or entries before snapshot zero exists.
             if !segments.is_empty()
-                && !(segments.len() == 1
-                    && segments[0].0 == 1
-                    && std::fs::read(&segments[0].1)? == journal_header(&initial.ring))
+                || (current_exists && std::fs::read(&current)? != journal_header(&initial.ring, 1))
             {
                 return Err(Error::new("KS snapshot missing beside journal"));
             }
@@ -147,7 +154,9 @@ impl Journal {
                 state: initial.clone(),
             };
             let bytes = encode(&checkpoint)?;
-            publish(&named(directory, "journal", 1), &journal_header(&initial.ring))?;
+            if !current_exists {
+                publish(&current, &journal_header(&initial.ring, 1))?;
+            }
             publish(&named(directory, "snapshot", 0), &bytes)?;
             (initial, 0, checkpoint.second, bytes.len() as u64)
         };
@@ -155,13 +164,22 @@ impl Journal {
         state.check_ring(&state.snapshot)?;
         state.validate()?;
         let snapshot_sequence = sequence;
-        let segments: Vec<_> = numbered(directory, "journal")?
+        // Never silently resume an older numbered file as the active journal.
+        let mut current_file = File::open(&current).context(
+            "missing current KS journal: possible voting-state loss; cannot resume this member",
+        )?;
+        let current_start = check_journal_header(&mut current_file, &state.ring, ignore)?;
+        if current_start <= snapshot_sequence {
+            return Err(Error::new("current KS journal predates snapshot"));
+        }
+        let mut segments: Vec<_> = numbered(directory, "journal")?
             .into_iter()
             .filter(|(seq, _)| *seq > snapshot_sequence)
             .collect();
-        if segments.is_empty() {
-            return Err(Error::new("missing journal after KS snapshot"));
+        if segments.iter().any(|(start, _)| *start >= current_start) {
+            return Err(Error::new("numbered KS journal overlaps current journal"));
         }
+        segments.push((current_start, current));
         let mut active = None;
         let mut log_bytes = 0;
         for (n, (start, path)) in segments.iter().enumerate() {
@@ -172,7 +190,10 @@ impl Journal {
             }
             let mut file = OpenOptions::new().read(true).write(true).open(path)?;
             let size = file.metadata()?.len();
-            check_journal_header(&mut file, &state.ring, ignore)?;
+            let header_start = check_journal_header(&mut file, &state.ring, ignore)?;
+            if header_start != *start {
+                return Err(Error::new("journal filename/header sequence mismatch"));
+            }
             let mut offset = HEADER;
             while offset < size {
                 let remaining = size - offset;
@@ -226,6 +247,7 @@ impl Journal {
             bootstrap_pending,
             _ownership: ownership,
             file: active.ok_or_else(|| Error::new("no active KS journal"))?,
+            current_start,
             sequence,
             change_sequence: sequence,
             snapshot_sequence,
@@ -317,7 +339,6 @@ impl Journal {
         let bytes = encode(&checkpoint)?;
         let start =
             self.sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
-        let path = named(&self.directory, "journal", start);
         let carried = if suffix.is_empty() {
             vec![]
         } else {
@@ -326,24 +347,9 @@ impl Journal {
                 records: vec![Record::Carry { entries: suffix, commit: self.state.commit }],
             })?
         };
-        // Rotation precedes snapshot publication. If publication fails, replay the old
-        // snapshot and every subsequent segment, including this successor and its carried committed/uncommitted suffix.
-        if path.exists() && std::fs::metadata(&path)?.len() != HEADER {
-            return Err(Error::new("nonempty successor journal"));
-        }
-        let rotate = (|| -> Result<File> {
-            let bytes = [journal_header(&self.state.ring), carried.clone()].concat();
-            publish(&path, &bytes)?;
-            Ok(OpenOptions::new().read(true).append(true).open(path)?)
-        })();
-        match rotate {
-            Ok(file) => self.file = file,
-            Err(e) => {
-                self.failed = true;
-                return Err(e);
-            }
-        }
-        self.log_bytes += HEADER;
+        // Rotation precedes snapshot publication. Old snapshots remain recoverable
+        // through the closed journals and current.log, including its carried suffix.
+        self.rotate(start, &carried)?;
         if !carried.is_empty() {
             self.sequence = start;
             self.log_bytes += carried.len() as u64;
@@ -356,6 +362,39 @@ impl Journal {
             snapshot: state.snapshot,
             log_bytes: captured_bytes,
         }))
+    }
+    /// Close the old segment before creating its successor. A crash in the gap
+    /// deliberately leaves current.log missing, detecting possible voting-state loss.
+    fn rotate(&mut self, start: u64, carried: &[u8]) -> Result<()> {
+        if start == self.current_start {
+            // Retrying a snapshot without intervening writes needs no new segment.
+            return Ok(());
+        }
+        let result = (|| -> Result<File> {
+            let current = self.directory.join(CURRENT);
+            let closed = named(&self.directory, "journal", self.current_start);
+            if closed.try_exists()? {
+                return Err(Error::new("closed KS journal already exists"));
+            }
+            self.file.sync_all()?;
+            std::fs::rename(&current, closed)?;
+            sync_directory(&self.directory)?;
+            let bytes = [journal_header(&self.state.ring, start), carried.to_vec()].concat();
+            publish(&current, &bytes)?;
+            Ok(OpenOptions::new().read(true).append(true).open(current)?)
+        })();
+        match result {
+            Ok(file) => {
+                self.file = file;
+                self.current_start = start;
+                self.log_bytes += HEADER;
+                Ok(())
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
     }
     pub fn finish_snapshot(&mut self, pending: &PendingSnapshot) -> Result<()> {
         if pending.sequence <= self.snapshot_sequence {
@@ -540,6 +579,72 @@ mod tests {
     }
 
     #[test]
+    fn journal_header_preserves_start_and_rejects_corruption() {
+        let ring = "01".repeat(64);
+        let mut bytes = journal_header(&ring, 12345);
+        let start = check_journal_header(&mut bytes.as_slice(), &ring, false).unwrap();
+        bytes[140] ^= 1;
+        let corrupt = check_journal_header(&mut bytes.as_slice(), &ring, false);
+        let zero = check_journal_header(&mut journal_header(&ring, 0).as_slice(), &ring, false);
+        assert_eq!(start, 12345);
+        assert!(corrupt.is_err());
+        assert!(zero.is_err());
+    }
+
+    #[test]
+    #[ignore = "filesystem integration; run explicitly with --ignored"]
+    fn rotation_preserves_old_bytes_and_recovers_empty_current_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        journal.write(&[Record::Hard { term: 1, vote: Some(0) }]).unwrap();
+        let old = std::fs::read(dir.path().join(CURRENT)).unwrap();
+        let pending = journal.prepare_snapshot(10).unwrap().unwrap();
+        let closed = std::fs::read(named(dir.path(), "journal", 1)).unwrap();
+        let current = std::fs::read(dir.path().join(CURRENT)).unwrap();
+        assert_eq!(old, closed);
+        assert_eq!(current, journal_header(&initial().ring, 2));
+        // A retry before publication should reuse the empty current file.
+        journal.prepare_snapshot(11).unwrap().unwrap();
+        assert_eq!(numbered(dir.path(), "journal").unwrap().len(), 1);
+        pending.write().unwrap();
+        journal.finish_snapshot(&pending).unwrap();
+        drop(journal);
+        let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        assert_eq!(journal.current_start, 2);
+        journal.write(&[Record::Hard { term: 2, vote: Some(0) }]).unwrap();
+        journal.snapshot(12).unwrap();
+        let second_closed = named(dir.path(), "journal", 2).is_file();
+        drop(journal);
+        let recovered = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        assert!(second_closed);
+        assert_eq!(recovered.state.term, 2);
+        assert_eq!(recovered.current_start, 3);
+    }
+
+    #[test]
+    #[ignore = "filesystem integration; run explicitly with --ignored"]
+    fn missing_current_or_rotation_gap_never_resumes_an_old_journal() {
+        for rename in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+            journal.write(&[Record::Hard { term: 1, vote: Some(0) }]).unwrap();
+            journal.snapshot(10).unwrap();
+            journal.write(&[Record::Hard { term: 2, vote: Some(0) }]).unwrap();
+            let start = journal.current_start;
+            drop(journal);
+            if rename {
+                std::fs::rename(dir.path().join(CURRENT), named(dir.path(), "journal", start))
+                    .unwrap();
+            } else {
+                std::fs::remove_file(dir.path().join(CURRENT)).unwrap();
+            }
+            let recovered = Journal::open(dir.path(), initial(), 3, "KS0");
+            assert!(recovered.is_err());
+            assert!(!dir.path().join(CURRENT).exists());
+        }
+    }
+
+    #[test]
     #[ignore = "filesystem integration; run explicitly with --ignored"]
     fn directory_lock_and_member_identity_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -592,7 +697,7 @@ mod tests {
     fn journal_header_requires_expected_ring_even_for_empty_journals() {
         let ring = "01".repeat(64);
         let other = "02".repeat(64);
-        let bytes = journal_header(&ring);
+        let bytes = journal_header(&ring, 1);
         let accepted = check_journal_header(&mut bytes.as_slice(), &ring, false).is_ok();
         let rejected = check_journal_header(&mut bytes.as_slice(), &other, false).is_err();
         let partial = check_journal_header(&mut &bytes[..bytes.len() - 1], &ring, false).is_err();
@@ -611,8 +716,10 @@ mod tests {
             drop(Journal::open(local.path(), initial(), 3, "KS0").unwrap());
             drop(Journal::open(foreign.path(), other, 3, "KS0").unwrap());
             let index = if kind == "journal" { 1 } else { 0 };
-            std::fs::copy(named(foreign.path(), kind, index), named(local.path(), kind, index))
-                .unwrap();
+            let path = |dir: &Path| {
+                if kind == "journal" { dir.join(CURRENT) } else { named(dir, kind, index) }
+            };
+            std::fs::copy(path(foreign.path()), path(local.path())).unwrap();
             let rejected = Journal::open(local.path(), initial(), 3, "KS0").is_err();
             assert!(rejected, "foreign {kind}");
             let mut debug = initial();
@@ -764,13 +871,13 @@ mod tests {
         let mut journal = Journal::open(source.path(), initial(), 3, "KS0").unwrap();
         journal.write(&[Record::Hard { term: 1, vote: Some(0) }]).unwrap();
         drop(journal);
-        let frame = std::fs::read(named(source.path(), "journal", 1)).unwrap();
+        let frame = std::fs::read(source.path().join(CURRENT)).unwrap();
         for count in HEADER as usize..frame.len() {
             let dir = tempfile::tempdir().unwrap();
             for name in ["identity", "snapshot-00000000000000000000.bin"] {
                 std::fs::copy(source.path().join(name), dir.path().join(name)).unwrap();
             }
-            let path = named(dir.path(), "journal", 1);
+            let path = dir.path().join(CURRENT);
             std::fs::write(&path, &frame[..count]).unwrap();
             let result = Journal::open(dir.path(), initial(), 3, "KS0");
             assert!(result.is_ok(), "partial length {count}");
@@ -779,7 +886,7 @@ mod tests {
         }
         let mut bad = frame.clone();
         bad[HEADER as usize + 20] ^= 1;
-        std::fs::write(named(source.path(), "journal", 1), bad).unwrap();
+        std::fs::write(source.path().join(CURRENT), bad).unwrap();
         let result = Journal::open(source.path(), initial(), 3, "KS0");
         assert!(result.is_err());
     }
@@ -808,6 +915,7 @@ mod tests {
                     std::fs::copy(&path, restore.path().join(path.file_name().unwrap())).unwrap();
                 }
             }
+            std::fs::copy(dir.path().join(CURRENT), restore.path().join(CURRENT)).unwrap();
             let restored = Journal::open(restore.path(), initial(), 3, "KS0").unwrap();
             assert_eq!(restored.state.capture(), expected);
         }
@@ -905,7 +1013,7 @@ mod tests {
         drop(journal);
         let wrong_member = Journal::open(dir.path(), initial(), 3, "KS1");
         assert!(wrong_member.is_err());
-        let path = named(dir.path(), "journal", 1);
+        let path = dir.path().join(CURRENT);
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[1] ^= 1;
         std::fs::write(path, bytes).unwrap();

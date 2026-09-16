@@ -449,6 +449,8 @@ pub struct Node<S: Storage = Journal> {
     pub role: Role,
     pub leader: Option<MemberId>,
     pub votes: Members,
+    /// Absolute CLOCK_BOOTTIME deadline; independent of randomized campaign scheduling.
+    campaign_deadline: Option<std::time::Duration>,
     pub matched: BTreeMap<MemberId, u64>,
     pub next: BTreeMap<MemberId, u64>,
     /// Runtime resets its election deadline after valid leader contact or a granted vote.
@@ -467,6 +469,7 @@ impl<S: Storage> Node<S> {
             role: Role::Follower,
             leader: None,
             votes: BTreeSet::new(),
+            campaign_deadline: None,
             matched: BTreeMap::new(),
             next: BTreeMap::new(),
             contact: 0,
@@ -577,6 +580,7 @@ impl<S: Storage> Node<S> {
         self.role = Role::Follower;
         self.leader = None;
         self.votes.clear();
+        self.campaign_deadline = None;
         Ok(())
     }
     pub fn campaign(&mut self) -> Result<()> {
@@ -587,19 +591,39 @@ impl<S: Storage> Node<S> {
         if !self.state().membership().members().contains(&self.id) {
             return Ok(());
         }
+        // Start the lifetime before journaling our vote: disk stalls consume it too.
+        let deadline = self
+            .now()?
+            .checked_add(self.lease.duration())
+            .ok_or_else(|| Error::new("campaign deadline overflow"))?;
         let term =
             self.state().term.checked_add(1).ok_or_else(|| Error::new("Raft term overflow"))?;
         self.persist(vec![Record::Hard { term, vote: Some(self.id.clone()) }])?;
         self.lease.reset();
         self.role = Role::Candidate;
+        self.campaign_deadline = Some(deadline);
         self.leader = None;
         self.votes = BTreeSet::from([self.id.clone()]);
         self.win()
     }
+    fn campaign_live(&self, now: std::time::Duration) -> bool {
+        self.role == Role::Candidate && self.campaign_deadline.is_some_and(|end| now < end)
+    }
+    fn expire_campaign(&mut self) -> Result<()> {
+        if self.role == Role::Candidate && !self.campaign_live(self.now()?) {
+            self.role = Role::Follower;
+            self.campaign_deadline = None;
+            self.votes.clear();
+            // Keep the durable term/vote. Only a fresh campaign may ask again.
+        }
+        Ok(())
+    }
     fn win(&mut self) -> Result<()> {
+        self.expire_campaign()?;
         if self.role == Role::Candidate && self.state().membership().quorum(&self.votes) {
             self.lease.start(self.state().term, self.now()?);
             self.role = Role::Leader;
+            self.campaign_deadline = None;
             self.leader = Some(self.id.clone());
             let next = self
                 .state()
@@ -705,6 +729,9 @@ impl<S: Storage> Node<S> {
         match self.role {
             Role::Follower | Role::Stopped => None,
             Role::Candidate => {
+                if !self.campaign_live(self.now().ok()?) {
+                    return None;
+                }
                 Some(Rpc::Vote { term: s.term, last: s.last(), last_term: s.term_at(s.last())? })
             }
             Role::Leader => {
@@ -858,7 +885,9 @@ impl<S: Storage> Node<S> {
         }
         match request {
             Rpc::Vote { .. } if self.role == Role::Candidate => {
-                if answer.success {
+                // Check on receipt, not just in the timer: it may be stalled or suspended.
+                self.expire_campaign()?;
+                if self.role == Role::Candidate && answer.success {
                     self.votes.insert(*peer);
                     self.win()?;
                 }
@@ -896,6 +925,71 @@ impl<S: Storage> Node<S> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    #[test]
+    fn campaign_deadline_rejects_late_quorum_without_timer_activity() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        for (arrival, elected) in [(1149, true), (1150, false), (1151, false), (10000, false)] {
+            let mut nodes = cluster(5);
+            nodes[0].clock = Some(ms(1000));
+            nodes[0].campaign().unwrap();
+            let request = nodes[0].request(&1).unwrap();
+            let first = nodes[1].receive(&0, &request).unwrap();
+            let second = nodes[2].receive(&0, &request).unwrap();
+            nodes[0].clock = Some(ms(1100));
+            nodes[0].response(&1, &request, &first).unwrap();
+            let records = nodes[0].journal.records.len();
+            // No election timer runs between these replies, even across a long pause.
+            nodes[0].clock = Some(ms(arrival));
+            let sends = nodes[0].request(&2).is_some();
+            nodes[0].response(&2, &request, &second).unwrap();
+            assert_eq!(sends, elected);
+            assert_eq!(nodes[0].role == Role::Leader, elected);
+            if !elected {
+                assert_eq!(nodes[0].role, Role::Follower);
+                assert!(nodes[0].votes.is_empty());
+                assert_eq!(nodes[0].journal.records.len(), records);
+                assert_eq!(nodes[0].state().vote, Some(0));
+                assert_eq!(nodes[0].state().term, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn delayed_campaign_has_its_own_lifetime_and_rejects_previous_campaign_votes() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let mut nodes = cluster(3);
+        let config = common::config::RaftConfig {
+            election_min_ms: 220,
+            election_max_ms: 900,
+            cold_election_delay_ms: 5000,
+            ..Default::default()
+        };
+        nodes[0].lease = crate::lease::Lease::configured(&config);
+        nodes[0].clock = Some(ms(10000));
+        nodes[0].campaign().unwrap();
+        let old_request = nodes[0].request(&1).unwrap();
+        let old_answer = nodes[1].receive(&0, &old_request).unwrap();
+        nodes[0].clock = Some(ms(10219));
+        let live = nodes[0].request(&1).is_some();
+        nodes[0].clock = Some(ms(10220));
+        let expired = nodes[0].request(&1).is_none();
+        assert!(live && expired);
+        // Scheduling may wait much longer than the lifetime of either campaign.
+        nodes[0].clock = Some(ms(20000));
+        nodes[0].campaign().unwrap();
+        nodes[0].response(&1, &old_request, &old_answer).unwrap();
+        assert_eq!(nodes[0].role, Role::Candidate);
+        assert_eq!(nodes[0].votes, Members::from([0]));
+        let new_request = nodes[0].request(&1).unwrap();
+        let new_answer = nodes[1].receive(&0, &new_request).unwrap();
+        nodes[0].clock = Some(ms(20219));
+        nodes[0].response(&1, &new_request, &new_answer).unwrap();
+        assert_eq!(nodes[0].role, Role::Leader);
+        assert_eq!(nodes[0].state().term, 2);
+    }
+
     #[test]
     fn bootstrap_assigns_local_slot_and_retries_preserve_voting_history() {
         let initial = State::initial("01".repeat(64), Members::new(), MemberNames::new()).unwrap();
