@@ -19,8 +19,21 @@ successful action when execution yields within an entry.
 and obtain owned results. **Never call `on_raft` from an owner callback**: nested
 queue waits would deadlock. Call routines directly with that callback's `node`.
 Do not perform network waits, application locking, or client application in owner
-callbacks. Journal persistence is still synchronous and must succeed before an
-acknowledgment; asynchronous disk submission is not introduced by this refactor.
+callbacks. During runtime, `raft-io` performs ordered journal writes, fsync,
+rotation, identity-file updates, pruning, and historical reads. The worker records
+completion and wakes `raft-main` immediately; it does not mutate Node. Startup
+recovery remains synchronous, before the consensus loop starts.
+
+Journal state distinguishes accepted batches from journaled state. The primary
+counts its own entry toward quorum only after it is journaled. Client application
+receives only journaled committed state. `on_raft` returns a result with its I/O
+fence and the calling helper waits outside the owner loop before sending a reply.
+Dependent replies can therefore wait for disk, but the consensus thread does not.
+Do not wait on an I/O fence inside an owner callback. I/O failure fences subsequent
+work and fails waiters. Orderly shutdown drains submitted I/O after stopping the
+other workers. This starts with one ordered I/O worker, not parallel disk writes
+or cross-batch fsync coalescing; queued State copies still need #125's large-state
+memory work.
 
 `raft-application` is a separate thread, with no per-action workers. It receives
 coalesced wakeups and runs queued committed work synchronously. The global write
@@ -32,8 +45,10 @@ Checkpoint helpers hold the global read lock through client capture and file wri
 `checkpoint_actions` can produce a compact restore action list; it need not retain
 all historical commands. KS currently preserves its small list of encrypted key
 entries with their original index/term bindings. Large-state streaming remains
-future work. Encoding and I/O happen outside the consensus loop; journal rotation
-and installing the completed checkpoint happen through it.
+future work. Checkpoint encoding and file writing happen outside the consensus
+loop. Rotation is planned by the owner and executed by the I/O worker; the helper
+waits for that fence before publishing the snapshot. Completed snapshot metadata
+is installed by the owner, and pruning is queued to the I/O worker.
 
 All persisted and transmitted structures use the existing binary StructWriter /
 StructReader format and Op tags. The shared codec includes a depth byte. Journals

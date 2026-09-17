@@ -19024,8 +19024,22 @@ owned work and receive owned results through channels; they cannot retain a Node
 reference or a consensus mutex guard. The loop uses a timed blocking receive for
 maintenance deadlines. Network helpers perform potentially slow RPC calls outside
 that loop and submit responses with the original request and send timestamp.
-Journal writes currently retain synchronous durable-before-acknowledgment
-semantics: moving consensus to one thread does not make disk I/O asynchronous.
+Runtime journal I/O runs on an ordered `raft-io` worker: writes, fsyncs, identity
+updates, rotation, pruning, and historical reads. The worker processes completion
+and wakes the sleeping consensus loop immediately rather than waiting for its
+maintenance timer. Node mutation remains solely on `raft-main`. Startup recovery
+is synchronous before the loop starts.
+
+Accepted journal state and journaled state are distinct. The primary counts its
+own entry toward quorum only once that entry is journaled. Only journaled committed
+state is queued for client application. Owner calls capture a completion fence;
+callers wait outside the consensus loop before returning dependent responses.
+Thus disk-dependent replies may wait, but the owner continues processing work.
+An I/O failure fences later work and fails outstanding waiters. Orderly shutdown
+stops producers and drains queued disk operations. The initial implementation uses
+one ordered worker and one sync per write batch; parallel disk submission and
+cross-batch sync coalescing are not implemented. Pending state copies remain part
+of the large-state memory work tracked by #125.
 
 Committed action lists are queued independently to `raft-application`. This thread
 executes client actions synchronously under the global write lock. It releases and

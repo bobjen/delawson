@@ -79,6 +79,10 @@ impl WorkQueue {
         self.last = state.commit;
     }
 }
+pub enum Deferred {
+    Message(Message),
+    Read(crate::io::Read<Vec<u8>>),
+}
 enum CheckpointPlan {
     Request(MemberId),
     Produce(State),
@@ -98,6 +102,7 @@ pub struct Runtime<S> {
     pub checkpoint_requested: AtomicBool,
     pub checkpoint_needed: AtomicU64,
     pub snapshot_stopping: AtomicBool,
+    pub io_fence: std::sync::OnceLock<crate::io::Fence>,
     pub snapshot_task: Mutex<()>,
     pub transport: Option<common::peer::Peers>,
     pub ready: AtomicBool,
@@ -147,6 +152,7 @@ impl<S: Default> Runtime<S> {
             checkpoint_requested: AtomicBool::new(false),
             checkpoint_needed: AtomicU64::new(0),
             snapshot_stopping: AtomicBool::new(false),
+            io_fence: std::sync::OnceLock::new(),
             snapshot_task: Mutex::new(()),
             ready: AtomicBool::new(false),
             readiness_requests: Mutex::new(BTreeSet::new()),
@@ -438,7 +444,16 @@ pub trait Host:
             .and_then(|weak| weak.upgrade())
             .and_then(|host| host.downcast::<Self>().ok())
             .ok_or_else(|| Error::new("Raft host has not started"))?;
-        self.journal.call(move |node| f(&host, node))
+        let (result, fence) = self.journal.call(move |node| {
+            node.journal.poll_io()?;
+            let result = f(&host, node);
+            Ok((result, node.journal.fence()))
+        })?;
+        // The calling helper can wait; raft-main must never wait for a disk fence.
+        if let Some(fence) = fence {
+            fence.wait()?;
+        }
+        result
     }
     fn accept_founders(&self, founders: Membership) -> Result<()> {
         founders.validate()?;
@@ -633,10 +648,10 @@ pub trait Host:
             if node.role != Role::Leader || node.state().term != term {
                 return Err(Error::new("history proof requires the current primary"));
             }
-            Ok(Some(node.journal.committed_term(index)?))
+            Ok(Some(node.journal.read_history(move |history| history.committed_term(index))?))
         })?;
         if let Some(value) = local {
-            return Ok(value);
+            return value.wait();
         }
         let response = self.send_raft(&primary, Message::JournalTip { index, term })?;
         if response.status != Status::Ok {
@@ -972,12 +987,12 @@ pub trait Host:
         self.checkpoint_lease
             .lock()
             .map_err(|_| Error::new("checkpoint lease lock poisoned"))?
-            .observe(node.state().checkpoint_start(), Instant::now());
+            .observe(node.journal.durable_state().checkpoint_start(), Instant::now());
         let enabled = self.ready.load(Ordering::SeqCst)
             && (node.role == Role::Leader || self.applying.load(Ordering::SeqCst));
         let mut queue =
             self.work_queue.lock().map_err(|_| Error::new("application queue poisoned"))?;
-        queue.enqueue(node.state(), enabled);
+        queue.enqueue(node.journal.durable_state(), enabled);
         let pending = queue.pending.is_some();
         drop(queue);
         if pending {
@@ -1321,14 +1336,17 @@ pub trait Host:
                 Ok((response, deferred))
             })?;
             match deferred {
-                Some(Message::Client(action)) => self.receive_client(process, action),
-                Some(Message::Forward { op, payload, depth }) => {
+                Some(Deferred::Message(Message::Client(action))) => {
+                    self.receive_client(process, action)
+                }
+                Some(Deferred::Message(Message::Forward { op, payload, depth })) => {
                     let op = Op::from_code(op)?;
                     Ok(self.dispatch_forwarded(
                         process,
                         &Req { id: 0, op, args: vec![Arg::Struct(op, payload, depth)] },
                     ))
                 }
+                Some(Deferred::Read(read)) => Ok(Resp::bytes(read.wait()?)),
                 None => Ok(response),
                 _ => Err(Error::new("invalid deferred Raft work")),
             }
@@ -1361,7 +1379,7 @@ pub trait Host:
         node: &mut Node,
         sender: &String,
         packet: Packet,
-        deferred: &mut Option<Message>,
+        deferred: &mut Option<Deferred>,
     ) -> Result<Resp> {
         let sender = {
             let enrolled = self.runtime.admitted.contains(sender)
@@ -1549,8 +1567,11 @@ pub trait Host:
                 if node.role != Role::Leader || node.state().term != term {
                     return Err(Error::new("journal history proof requires the current primary"));
                 }
-                let entry_term = node.journal.committed_term(index)?;
-                Ok(Resp::bytes(binary(&entry_term)?))
+                let read = node
+                    .journal
+                    .read_history(move |history| binary(&history.committed_term(index)?))?;
+                *deferred = Some(Deferred::Read(read));
+                Ok(Resp::ok())
             }
             Message::Journal { after, through, primary_fallback } => {
                 if node.role == Role::Stopped
@@ -1559,7 +1580,11 @@ pub trait Host:
                 {
                     return Err(Error::new("journal source unavailable"));
                 }
-                Ok(Resp::bytes(binary(&node.journal.committed_suffix(after, through)?)?))
+                let read = node.journal.read_history(move |history| {
+                    binary(&history.committed_suffix(after, through)?)
+                })?;
+                *deferred = Some(Deferred::Read(read));
+                Ok(Resp::ok())
             }
             Message::Checkpoint { after, primary_fallback } => {
                 let snapshot = self.checkpoint_from(node, after, primary_fallback)?;
@@ -1622,7 +1647,7 @@ pub trait Host:
                 })?))
             }
             Message::Client(action) => {
-                *deferred = Some(Message::Client(action));
+                *deferred = Some(Deferred::Message(Message::Client(action)));
                 Ok(Resp::ok())
             }
             Message::Forward { op, payload, depth } => {
@@ -1635,7 +1660,11 @@ pub trait Host:
                 if !self.forwardable(op) {
                     return Err(Error::new("operation cannot be forwarded through Raft"));
                 }
-                *deferred = Some(Message::Forward { op: request.op.code(), payload, depth });
+                *deferred = Some(Deferred::Message(Message::Forward {
+                    op: request.op.code(),
+                    payload,
+                    depth,
+                }));
                 Ok(Resp::ok())
             }
         }
@@ -1777,6 +1806,16 @@ pub trait Host:
         let erased: Arc<dyn std::any::Any + Send + Sync> = self.clone();
         self.host.set(Arc::downgrade(&erased)).map_err(|_| Error::new("Raft already started"))?;
         let weak = Arc::downgrade(self);
+        let completion_host = weak.clone();
+        let fence = self.journal.initial_call(move |node| {
+            node.journal.start_io(move || {
+                if let Some(host) = completion_host.upgrade() {
+                    host.journal.wake();
+                }
+            })?;
+            node.journal.fence().ok_or_else(|| Error::new("missing I/O completion fence"))
+        })?;
+        self.io_fence.set(fence).map_err(|_| Error::new("I/O completion already installed"))?;
         let mut contact = 0;
         let random = u64::from_le_bytes(random_bytes()?[..8].try_into().unwrap());
         let mut deadline = Instant::now() + election_delay(&self.options.raft, random, true, false);
@@ -1792,6 +1831,7 @@ pub trait Host:
                 if node.journal.failed {
                     return Ok(());
                 }
+                node.journal.poll_io()?;
                 // Apply the current penalty to the base deadline: starting or finishing
                 // a checkpoint between heartbeats must affect election preference too.
                 let c = &host.options.raft;
@@ -1832,6 +1872,7 @@ pub trait Host:
                             Duration::from_millis(host.options.raft.cold_election_delay_ms),
                         );
                 }
+                node.advance()?;
                 node.accept_replacements()?;
                 host.prepare_primary(node)?;
                 host.refresh_application(&node)?;

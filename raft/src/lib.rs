@@ -27,3 +27,5 @@ pub fn random_bytes() -> Result<[u8; 32]> {
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(bytes)
 }
+
+pub mod io;

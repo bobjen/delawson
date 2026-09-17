@@ -562,10 +562,13 @@ pub enum Role {
     Stopped,
 }
 
-/// A successful write means the whole batch is journaled. A failure must never
-/// publish its state. Keeping this boundary explicit also permits deterministic tests.
+/// Writes accept an ordered batch; durable_state advances only after journal I/O.
+/// Synchronous/in-memory stores use the default immediate durability boundary.
 pub trait Storage {
     fn state(&self) -> &State;
+    fn durable_state(&self) -> &State {
+        self.state()
+    }
     fn write(&mut self, records: &[Record]) -> Result<()>;
     fn pending_replacement(&self) -> Option<Retirement> {
         None
@@ -881,7 +884,7 @@ impl<S: Storage> Node<S> {
         self.advance()?;
         Ok(index)
     }
-    fn advance(&mut self) -> Result<()> {
+    pub fn advance(&mut self) -> Result<()> {
         if self.role != Role::Leader || !self.write_authority()? {
             return Ok(());
         }
@@ -897,7 +900,10 @@ impl<S: Storage> Node<S> {
                 .filter(|(_, matched)| **matched >= index)
                 .map(|(id, _)| id.clone())
                 .collect();
-            votes.insert(self.id.clone());
+            let durable = self.journal.durable_state();
+            if durable.term_at(index) == self.state().term_at(index) {
+                votes.insert(self.id);
+            }
             if membership.quorum(&votes) {
                 commit = index;
                 break;
@@ -1235,6 +1241,39 @@ pub mod tests {
         node.clock = Some(std::time::Duration::ZERO);
         node
     }
+    #[test]
+    fn accepted_local_entries_are_not_quorum_votes_until_journaled() {
+        struct Delayed {
+            accepted: State,
+            durable: State,
+        }
+        impl Storage for Delayed {
+            fn state(&self) -> &State {
+                &self.accepted
+            }
+            fn durable_state(&self) -> &State {
+                &self.durable
+            }
+            fn write(&mut self, records: &[Record]) -> Result<()> {
+                for record in records {
+                    self.accepted.apply(record)?;
+                }
+                Ok(())
+            }
+        }
+        let initial = node(0, members(1)).state().clone();
+        let mut primary = Node::new(0, Delayed { accepted: initial.clone(), durable: initial });
+        primary.campaign().unwrap();
+        assert_eq!(primary.state().last(), 1);
+        assert_eq!(primary.state().commit, 0);
+        primary.journal.durable = primary.state().clone();
+        primary.advance().unwrap();
+        assert_eq!(primary.state().commit, 1);
+        assert_eq!(primary.journal.durable_state().commit, 0);
+        primary.journal.durable = primary.state().clone();
+        assert_eq!(primary.journal.durable_state().commit, 1);
+    }
+
     #[test]
     fn retirements_are_not_votes_and_only_majority_allows_replacement_elections() {
         let mut nodes = cluster(5);

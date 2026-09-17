@@ -5,10 +5,12 @@ use crate::raft::{INCARNATION, Member, MemberId, Membership, Record, Retirement,
 use crate::random_bytes;
 use common::{Context, Error, Result};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 const MAGIC: &[u8; 8] = b"DLAWKR05";
 const CURRENT: &str = "current.log";
@@ -146,13 +148,20 @@ struct RecoveryPlan {
     files: Vec<String>,
 }
 
+struct Disk {
+    ownership: File,
+    file: File,
+}
+
 pub struct Journal {
     pub identity: LocalIdentity,
     pub state: State,
     directory: PathBuf,
     bootstrap_pending: bool,
-    _ownership: File,
-    file: File,
+    disk: Arc<Mutex<Disk>>,
+    io: Option<crate::io::Queue>,
+    durable: State,
+    pending_io: VecDeque<(u64, State)>,
     current_start: u64,
     sequence: u64,
     change_sequence: u64,
@@ -164,6 +173,9 @@ pub struct Journal {
     pub failed: bool,
 }
 impl crate::raft::Storage for Journal {
+    fn durable_state(&self) -> &State {
+        &self.durable
+    }
     fn state(&self) -> &State {
         &self.state
     }
@@ -348,13 +360,18 @@ impl Journal {
         if local != before {
             append_identity(&mut ownership, &local)?;
         }
-        let result = Self {
+        let mut result = Self {
             identity: local,
+            durable: state.clone(),
             state,
             directory: directory.into(),
             bootstrap_pending,
-            _ownership: ownership,
-            file: active.ok_or_else(|| Error::new("no active KS journal"))?,
+            disk: Arc::new(Mutex::new(Disk {
+                ownership,
+                file: active.ok_or_else(|| Error::new("no active KS journal"))?,
+            })),
+            io: None,
+            pending_io: VecDeque::new(),
             current_start,
             sequence,
             change_sequence: sequence,
@@ -368,6 +385,316 @@ impl Journal {
         result.prune()?;
         Ok(result)
     }
+    pub fn start_io(&mut self, wake: impl Fn() + Send + 'static) -> Result<()> {
+        if self.io.is_some() {
+            return Err(Error::new("journal I/O already started"));
+        }
+        self.io = Some(crate::io::Queue::new(wake)?);
+        Ok(())
+    }
+    pub fn fence(&self) -> Option<crate::io::Fence> {
+        self.io.as_ref().map(|io| io.fence())
+    }
+    pub fn durable_state(&self) -> &State {
+        &self.durable
+    }
+    pub fn poll_io(&mut self) -> Result<()> {
+        let Some(io) = &self.io else { return Ok(()) };
+        let completed = match io.fence().completed() {
+            Ok(completed) => completed,
+            Err(error) => {
+                self.failed = true;
+                return Err(error);
+            }
+        };
+        while self.pending_io.front().is_some_and(|(ticket, _)| *ticket <= completed) {
+            self.durable = self.pending_io.pop_front().unwrap().1;
+        }
+        Ok(())
+    }
+    fn track_durability(&mut self) {
+        if let Some(io) = &self.io {
+            self.pending_io.push_back((io.ticket(), self.state.clone()));
+        } else {
+            self.durable = self.state.clone();
+        }
+    }
+    fn perform(
+        &mut self,
+        job: impl FnOnce(&mut Disk) -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        self.poll_io()?;
+        let disk = self.disk.clone();
+        let task = move || {
+            let mut disk = disk.lock().map_err(|_| Error::new("journal disk poisoned"))?;
+            job(&mut disk)
+        };
+        let result = if let Some(io) = &mut self.io { io.submit(task).map(|_| ()) } else { task() };
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    fn history(&self) -> History {
+        History {
+            state: self.state.clone(),
+            directory: self.directory.clone(),
+            current_start: self.current_start,
+        }
+    }
+    pub(crate) fn read_history<R: Send + 'static>(
+        &mut self,
+        f: impl FnOnce(&History) -> Result<R> + Send + 'static,
+    ) -> Result<crate::io::Read<R>> {
+        let history = self.history();
+        if let Some(io) = &mut self.io {
+            io.read(move || f(&history))
+        } else {
+            Ok(crate::io::Read::ready(f(&history)))
+        }
+    }
+    #[cfg(any(test, feature = "testing"))]
+    pub fn committed_term(&self, index: u64) -> Result<Option<u64>> {
+        self.history().committed_term(index)
+    }
+    #[cfg(any(test, feature = "testing"))]
+    pub fn committed_suffix(&self, after: u64, through: u64) -> Result<Option<CommittedJournal>> {
+        self.history().committed_suffix(after, through)
+    }
+    pub fn import_committed(&mut self, copied: &CommittedJournal, through: u64) -> Result<()> {
+        copied.validate(&self.state, through)?;
+        let directory = self.directory.join("copied-journals");
+        let root = self.directory.clone();
+        let name = named(&directory, "journal", copied.after + 1);
+        let bytes = encode(copied)?;
+        self.perform(move |_| {
+            std::fs::create_dir_all(&directory)?;
+            sync_directory(&root)?;
+            publish(&name, &bytes)
+        })?;
+        self.write(&[
+            Record::Entries { from: copied.after + 1, entries: copied.entries.clone() },
+            Record::Commit(copied.entries.last().unwrap().index),
+        ])
+    }
+    pub fn needs_bootstrap(&self) -> bool {
+        self.bootstrap_pending
+    }
+    pub fn finish_bootstrap(&mut self) -> Result<()> {
+        let directory = self.directory.clone();
+        self.perform(move |_| {
+            std::fs::remove_file(directory.join("need-bootstrap"))?;
+            sync_directory(&directory)
+        })?;
+        self.bootstrap_pending = false;
+        Ok(())
+    }
+    pub fn write(&mut self, records: &[Record]) -> Result<()> {
+        if self.failed {
+            return Err(Error::new("KS journal fenced after I/O failure; restart required"));
+        }
+        if records.is_empty() {
+            return Ok(());
+        }
+        // Validate the entire batch before writing; after sync its state is published atomically.
+        let mut state = self.state.clone();
+        for record in records {
+            state.apply(record)?;
+        }
+        let sequence =
+            self.sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
+        let frame = frame(&Batch { sequence, records: records.to_vec() })?;
+        let mut identity = None;
+        self.sequence = sequence;
+        self.change_sequence = sequence;
+        self.state = state;
+        self.log_bytes += frame.len() as u64;
+        if records.iter().any(|record| matches!(record, Record::Bootstrap(_) | Record::Install(_))
+            || matches!(record, Record::Entries { entries, .. } if entries.iter().any(|e| matches!(e.command, crate::raft::Command::Members(_))))) {
+            let membership = self.state.membership();
+            let slot = membership.slot(&self.identity.current);
+            let accepted = slot.is_some_and(|id| membership.members().contains(&id))
+                && self.identity.pending.as_ref().is_none_or(|r| !membership.members().contains(&r.previous));
+            self.identity.slot = slot.or(self.identity.slot);
+            self.identity.membership = Some(membership);
+            self.identity.founders = self.state.founders.clone();
+            if accepted { self.identity.pending = None; }
+            identity = Some(self.identity.clone());
+        }
+        let result = self.perform(move |disk| {
+            disk.file.write_all(&frame)?;
+            disk.file.sync_all()?;
+            if let Some(identity) = identity {
+                append_identity(&mut disk.ownership, &identity)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            self.state = self.durable.clone();
+            return Err(error);
+        }
+        self.track_durability();
+        Ok(())
+    }
+    pub fn snapshot_due(&self, min_bytes: u64, seconds: u64, now: u64) -> bool {
+        self.change_sequence > self.snapshot_sequence
+            && (self.log_bytes >= min_bytes.max(self.snapshot_bytes)
+                || now.saturating_sub(self.snapshot_second) >= seconds)
+    }
+    pub fn prepare_snapshot(&mut self, now: u64) -> Result<Option<PendingSnapshot>> {
+        if self.failed {
+            return Err(Error::new("KS journal fenced"));
+        }
+        if self.change_sequence <= self.snapshot_sequence {
+            return Ok(None);
+        }
+        self.prepare_copy(now, self.state.capture())
+    }
+    /// Adopt committed application state without importing another member's hard state.
+    pub fn prepare_copy(
+        &mut self,
+        now: u64,
+        snapshot: crate::raft::Snapshot,
+    ) -> Result<Option<PendingSnapshot>> {
+        if self.failed {
+            return Err(Error::new("KS journal fenced"));
+        }
+        snapshot.validate()?;
+        self.state.check_ring(&snapshot)?;
+        if snapshot.index < self.state.snapshot.index
+            || snapshot.index > self.state.commit
+            || self.state.term_at(snapshot.index) != Some(snapshot.term)
+        {
+            return Err(Error::new("checkpoint does not match local committed history"));
+        }
+        let mut state = self.state.clone();
+        state.log.retain(|e| e.index > snapshot.index);
+        state.commit = snapshot.index;
+        if self.state.ignore_ring_identity {
+            state.ring = snapshot.ring.clone();
+        }
+        state.snapshot = snapshot;
+        let sequence = self.sequence;
+        let captured_bytes = self.log_bytes;
+        let suffix = std::mem::take(&mut state.log);
+        let checkpoint = Checkpoint { sequence, second: now, state: state.clone() };
+        let start =
+            self.sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
+        let carried = if suffix.is_empty() {
+            vec![]
+        } else {
+            frame(&Batch {
+                sequence: start,
+                records: vec![Record::Carry { entries: suffix, commit: self.state.commit }],
+            })?
+        };
+        // Rotation precedes snapshot publication. Old snapshots remain recoverable
+        // through the closed journals and current.log, including its carried suffix.
+        self.rotate(start, &carried)?;
+        if !carried.is_empty() {
+            self.sequence = start;
+            self.log_bytes += carried.len() as u64;
+        }
+        Ok(Some(PendingSnapshot {
+            path: named(&self.directory, "snapshot", sequence),
+            checkpoint,
+            written_bytes: std::sync::atomic::AtomicU64::new(0),
+            sequence,
+            second: now,
+            snapshot: state.snapshot,
+            log_bytes: captured_bytes,
+        }))
+    }
+    /// Close the old segment before creating its successor. A crash in the gap
+    /// deliberately leaves current.log missing, detecting possible voting-state loss.
+    fn rotate(&mut self, start: u64, carried: &[u8]) -> Result<()> {
+        if start == self.current_start {
+            // Retrying a snapshot without intervening writes needs no new segment.
+            return Ok(());
+        }
+        let directory = self.directory.clone();
+        let current_start = self.current_start;
+        let bytes = [journal_header_after(&self.state, start), carried.to_vec()].concat();
+        self.perform(move |disk| {
+            let current = directory.join(CURRENT);
+            let closed = named(&directory, "journal", current_start);
+            if closed.try_exists()? {
+                return Err(Error::new("closed KS journal already exists"));
+            }
+            disk.file.sync_all()?;
+            std::fs::rename(&current, closed)?;
+            sync_directory(&directory)?;
+            publish(&current, &bytes)?;
+            disk.file = OpenOptions::new().read(true).append(true).open(current)?;
+            Ok(())
+        })?;
+        self.current_start = start;
+        self.log_bytes += HEADER;
+        Ok(())
+    }
+    pub fn finish_snapshot(&mut self, pending: &PendingSnapshot) -> Result<()> {
+        if pending.sequence <= self.snapshot_sequence {
+            return Ok(());
+        }
+        let snapshot = &pending.snapshot;
+        // New entries, commits and terms may have arrived while the file was written.
+        if snapshot.index >= self.state.snapshot.index
+            && self.state.term_at(snapshot.index) == Some(snapshot.term)
+        {
+            self.state.log.retain(|e| e.index > snapshot.index);
+            if self.state.ignore_ring_identity {
+                self.state.ring = snapshot.ring.clone();
+            }
+            self.state.snapshot = snapshot.clone();
+        }
+        self.snapshot_sequence = pending.sequence;
+        self.snapshot_second = pending.second;
+        self.snapshot_bytes = pending.written_bytes.load(std::sync::atomic::Ordering::SeqCst);
+        self.log_bytes = self.log_bytes.saturating_sub(pending.log_bytes);
+        self.prune()?;
+        self.track_durability();
+        Ok(())
+    }
+    #[cfg(any(test, feature = "testing"))]
+    pub fn snapshot(&mut self, now: u64) -> Result<()> {
+        if let Some(pending) = self.prepare_snapshot(now)? {
+            pending.write()?;
+            self.finish_snapshot(&pending)?;
+        }
+        Ok(())
+    }
+    fn prune(&mut self) -> Result<()> {
+        let directory = self.directory.clone();
+        let retain = self.retain;
+        self.perform(move |_| {
+            let snapshots = numbered(&directory, "snapshot")?;
+            let remove = snapshots.len().saturating_sub(retain);
+            let Some((oldest, _)) = snapshots.get(remove) else {
+                return Ok(());
+            };
+            for (_, path) in &snapshots[..remove] {
+                std::fs::remove_file(path)?;
+            }
+            sync_directory(&directory)?;
+            for (start, path) in numbered(&directory, "journal")? {
+                if start <= *oldest {
+                    std::fs::remove_file(path)?;
+                }
+            }
+            sync_directory(&directory)
+        })
+    }
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fail_writes(&mut self) {
+        self.disk.lock().unwrap().file = File::open(self.directory.join("identity")).unwrap();
+    }
+}
+pub(crate) struct History {
+    state: State,
+    directory: PathBuf,
+    current_start: u64,
+}
+impl History {
     // Replays retained files with the same sequence and predecessor checks as restart.
     fn retained_history(&self, after: u64) -> Result<Option<(State, Option<u64>)>> {
         let mut state = self.state.clone();
@@ -453,220 +780,6 @@ impl Journal {
                 .cloned()
                 .collect(),
         }))
-    }
-    pub fn import_committed(&mut self, copied: &CommittedJournal, through: u64) -> Result<()> {
-        copied.validate(&self.state, through)?;
-        let directory = self.directory.join("copied-journals");
-        std::fs::create_dir_all(&directory)?;
-        sync_directory(&self.directory)?;
-        // Persist the peer copy under a historical name. Replay uses the locally
-        // journaled entries/commit below, never another member's active journal.
-        publish(&named(&directory, "journal", copied.after + 1), &encode(copied)?)?;
-        self.write(&[
-            Record::Entries { from: copied.after + 1, entries: copied.entries.clone() },
-            Record::Commit(copied.entries.last().unwrap().index),
-        ])
-    }
-    pub fn needs_bootstrap(&self) -> bool {
-        self.bootstrap_pending
-    }
-    pub fn finish_bootstrap(&mut self) -> Result<()> {
-        std::fs::remove_file(self.directory.join("need-bootstrap"))?;
-        sync_directory(&self.directory)?;
-        self.bootstrap_pending = false;
-        Ok(())
-    }
-    pub fn write(&mut self, records: &[Record]) -> Result<()> {
-        if self.failed {
-            return Err(Error::new("KS journal fenced after I/O failure; restart required"));
-        }
-        if records.is_empty() {
-            return Ok(());
-        }
-        // Validate the entire batch before writing; after sync its state is published atomically.
-        let mut state = self.state.clone();
-        for record in records {
-            state.apply(record)?;
-        }
-        let sequence =
-            self.sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
-        let frame = frame(&Batch { sequence, records: records.to_vec() })?;
-        if let Err(error) = self.file.write_all(&frame).and_then(|()| self.file.sync_all()) {
-            self.failed = true;
-            return Err(error.into());
-        }
-        self.sequence = sequence;
-        self.change_sequence = sequence;
-        self.state = state;
-        self.log_bytes += frame.len() as u64;
-        if records.iter().any(|record| matches!(record, Record::Bootstrap(_) | Record::Install(_))
-            || matches!(record, Record::Entries { entries, .. } if entries.iter().any(|e| matches!(e.command, crate::raft::Command::Members(_))))) {
-            let membership = self.state.membership();
-            let slot = membership.slot(&self.identity.current);
-            let accepted = slot.is_some_and(|id| membership.members().contains(&id))
-                && self.identity.pending.as_ref().is_none_or(|r| !membership.members().contains(&r.previous));
-            self.identity.slot = slot.or(self.identity.slot);
-            self.identity.membership = Some(membership);
-            self.identity.founders = self.state.founders.clone();
-            if accepted { self.identity.pending = None; }
-            if let Err(error) = append_identity(&mut self._ownership, &self.identity) {
-                self.failed = true;
-                return Err(error);
-            }
-        }
-        Ok(())
-    }
-    pub fn snapshot_due(&self, min_bytes: u64, seconds: u64, now: u64) -> bool {
-        self.change_sequence > self.snapshot_sequence
-            && (self.log_bytes >= min_bytes.max(self.snapshot_bytes)
-                || now.saturating_sub(self.snapshot_second) >= seconds)
-    }
-    pub fn prepare_snapshot(&mut self, now: u64) -> Result<Option<PendingSnapshot>> {
-        if self.failed {
-            return Err(Error::new("KS journal fenced"));
-        }
-        if self.change_sequence <= self.snapshot_sequence {
-            return Ok(None);
-        }
-        self.prepare_copy(now, self.state.capture())
-    }
-    /// Adopt committed application state without importing another member's hard state.
-    pub fn prepare_copy(
-        &mut self,
-        now: u64,
-        snapshot: crate::raft::Snapshot,
-    ) -> Result<Option<PendingSnapshot>> {
-        if self.failed {
-            return Err(Error::new("KS journal fenced"));
-        }
-        snapshot.validate()?;
-        self.state.check_ring(&snapshot)?;
-        if snapshot.index < self.state.snapshot.index
-            || snapshot.index > self.state.commit
-            || self.state.term_at(snapshot.index) != Some(snapshot.term)
-        {
-            return Err(Error::new("checkpoint does not match local committed history"));
-        }
-        let mut state = self.state.clone();
-        state.log.retain(|e| e.index > snapshot.index);
-        state.commit = snapshot.index;
-        if self.state.ignore_ring_identity {
-            state.ring = snapshot.ring.clone();
-        }
-        state.snapshot = snapshot;
-        let sequence = self.sequence;
-        let captured_bytes = self.log_bytes;
-        let suffix = std::mem::take(&mut state.log);
-        let checkpoint = Checkpoint { sequence, second: now, state: state.clone() };
-        let start =
-            self.sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
-        let carried = if suffix.is_empty() {
-            vec![]
-        } else {
-            frame(&Batch {
-                sequence: start,
-                records: vec![Record::Carry { entries: suffix, commit: self.state.commit }],
-            })?
-        };
-        // Rotation precedes snapshot publication. Old snapshots remain recoverable
-        // through the closed journals and current.log, including its carried suffix.
-        self.rotate(start, &carried)?;
-        if !carried.is_empty() {
-            self.sequence = start;
-            self.log_bytes += carried.len() as u64;
-        }
-        Ok(Some(PendingSnapshot {
-            path: named(&self.directory, "snapshot", sequence),
-            checkpoint,
-            written_bytes: std::sync::atomic::AtomicU64::new(0),
-            sequence,
-            second: now,
-            snapshot: state.snapshot,
-            log_bytes: captured_bytes,
-        }))
-    }
-    /// Close the old segment before creating its successor. A crash in the gap
-    /// deliberately leaves current.log missing, detecting possible voting-state loss.
-    fn rotate(&mut self, start: u64, carried: &[u8]) -> Result<()> {
-        if start == self.current_start {
-            // Retrying a snapshot without intervening writes needs no new segment.
-            return Ok(());
-        }
-        let result = (|| -> Result<File> {
-            let current = self.directory.join(CURRENT);
-            let closed = named(&self.directory, "journal", self.current_start);
-            if closed.try_exists()? {
-                return Err(Error::new("closed KS journal already exists"));
-            }
-            self.file.sync_all()?;
-            std::fs::rename(&current, closed)?;
-            sync_directory(&self.directory)?;
-            let bytes = [journal_header_after(&self.state, start), carried.to_vec()].concat();
-            publish(&current, &bytes)?;
-            Ok(OpenOptions::new().read(true).append(true).open(current)?)
-        })();
-        match result {
-            Ok(file) => {
-                self.file = file;
-                self.current_start = start;
-                self.log_bytes += HEADER;
-                Ok(())
-            }
-            Err(error) => {
-                self.failed = true;
-                Err(error)
-            }
-        }
-    }
-    pub fn finish_snapshot(&mut self, pending: &PendingSnapshot) -> Result<()> {
-        if pending.sequence <= self.snapshot_sequence {
-            return Ok(());
-        }
-        let snapshot = &pending.snapshot;
-        // New entries, commits and terms may have arrived while the file was written.
-        if snapshot.index >= self.state.snapshot.index
-            && self.state.term_at(snapshot.index) == Some(snapshot.term)
-        {
-            self.state.log.retain(|e| e.index > snapshot.index);
-            if self.state.ignore_ring_identity {
-                self.state.ring = snapshot.ring.clone();
-            }
-            self.state.snapshot = snapshot.clone();
-        }
-        self.snapshot_sequence = pending.sequence;
-        self.snapshot_second = pending.second;
-        self.snapshot_bytes = pending.written_bytes.load(std::sync::atomic::Ordering::SeqCst);
-        self.log_bytes = self.log_bytes.saturating_sub(pending.log_bytes);
-        self.prune()
-    }
-    #[cfg(any(test, feature = "testing"))]
-    pub fn snapshot(&mut self, now: u64) -> Result<()> {
-        if let Some(pending) = self.prepare_snapshot(now)? {
-            pending.write()?;
-            self.finish_snapshot(&pending)?;
-        }
-        Ok(())
-    }
-    fn prune(&self) -> Result<()> {
-        let snapshots = numbered(&self.directory, "snapshot")?;
-        let remove = snapshots.len().saturating_sub(self.retain);
-        let Some((oldest, _)) = snapshots.get(remove) else {
-            return Ok(());
-        };
-        for (_, path) in &snapshots[..remove] {
-            std::fs::remove_file(path)?;
-        }
-        sync_directory(&self.directory)?;
-        for (start, path) in numbered(&self.directory, "journal")? {
-            if start <= *oldest {
-                std::fs::remove_file(path)?;
-            }
-        }
-        sync_directory(&self.directory)
-    }
-    #[cfg(any(test, feature = "testing"))]
-    pub fn fail_writes(&mut self) {
-        self.file = File::open(self.directory.join("identity")).unwrap();
     }
 }
 // Rename, do not delete: the suffix excludes the file from future selection and pruning.
@@ -1065,6 +1178,50 @@ fn publish_cancellable(path: &Path, bytes: &[u8], cancelled: impl Fn() -> bool) 
 mod tests {
     use super::*;
     use crate::raft::{Command, Entry, Members, Node, Storage};
+    #[test]
+    #[ignore = "filesystem integration; run explicitly with --ignored"]
+    fn asynchronous_writes_publish_durability_only_after_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        journal.start_io(|| {}).unwrap();
+        let (release, blocked) = std::sync::mpsc::channel();
+        journal
+            .io
+            .as_mut()
+            .unwrap()
+            .submit(move || {
+                blocked.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        journal
+            .write(&[
+                Record::Hard { term: 1, vote: Some(0) },
+                Record::Entries {
+                    from: 1,
+                    entries: vec![Entry { index: 1, term: 1, command: Command::Noop }],
+                },
+            ])
+            .unwrap();
+        journal.poll_io().unwrap();
+        assert_eq!(journal.state.last(), 1);
+        assert_eq!(journal.durable_state().last(), 0);
+        assert_eq!(journal.durable_state().term, 0);
+        release.send(()).unwrap();
+        journal.fence().unwrap().wait().unwrap();
+        journal.poll_io().unwrap();
+        assert_eq!(journal.durable_state().last(), 1);
+        journal.write(&[Record::Commit(1)]).unwrap();
+        journal.fence().unwrap().wait().unwrap();
+        journal.poll_io().unwrap();
+        assert_eq!(journal.durable_state().commit, 1);
+        journal.io.as_mut().unwrap().submit(|| Err(Error::new("injected disk failure"))).unwrap();
+        let failed = journal.fence().unwrap().wait().is_err();
+        let rejected = journal.poll_io().is_err();
+        assert!(failed && rejected && journal.failed);
+        assert_eq!(journal.durable_state().commit, 1);
+    }
+
     #[test]
     fn checkpoint_proof_is_checked_before_installing_new_history() {
         let mut state = initial();

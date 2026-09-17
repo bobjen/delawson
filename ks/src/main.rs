@@ -229,6 +229,9 @@ impl Ks {
                 handle.join().map_err(|_| common::Error::new("Raft worker panicked"))?;
             }
         }
+        if let Some(fence) = self.io_fence.get() {
+            fence.wait_all()?;
+        }
         Ok(())
     }
 

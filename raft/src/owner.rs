@@ -6,7 +6,7 @@ use std::time::Duration;
 type Job<T> = Box<dyn FnOnce(&mut T) + Send>;
 pub struct Owner<T> {
     initial: Mutex<Option<T>>,
-    sender: OnceLock<mpsc::Sender<Job<T>>>,
+    sender: OnceLock<mpsc::Sender<Option<Job<T>>>>,
 }
 impl<T: Send + 'static> Owner<T> {
     pub fn new(value: T) -> Self {
@@ -24,9 +24,9 @@ impl<T: Send + 'static> Owner<T> {
         if let Some(sender) = self.sender.get() {
             let (reply, receive) = mpsc::sync_channel(1);
             sender
-                .send(Box::new(move |state| {
+                .send(Some(Box::new(move |state| {
                     let _ = reply.send(f(state));
-                }))
+                })))
                 .map_err(|_| Error::new("Raft loop stopped"))?;
             return receive.recv().map_err(|_| Error::new("Raft loop stopped without replying"))?;
         }
@@ -34,19 +34,30 @@ impl<T: Send + 'static> Owner<T> {
             self.initial.lock().map_err(|_| Error::new("Raft initialization poisoned"))?;
         f(initial.as_mut().ok_or_else(|| Error::new("Raft loop starting"))?)
     }
+    pub fn wake(&self) {
+        if let Some(sender) = self.sender.get() {
+            let _ = sender.send(None);
+        }
+    }
     pub fn start(
         &self,
+        tick: impl FnMut(&mut T) -> bool + Send + 'static,
+    ) -> Result<std::thread::JoinHandle<()>> {
+        self.start_with_interval(Duration::from_millis(20), tick)
+    }
+    pub(crate) fn start_with_interval(
+        &self,
+        interval: Duration,
         mut tick: impl FnMut(&mut T) -> bool + Send + 'static,
     ) -> Result<std::thread::JoinHandle<()>> {
         let mut initial =
             self.initial.lock().map_err(|_| Error::new("Raft initialization poisoned"))?;
-        let (sender, receive) = mpsc::channel::<Job<T>>();
+        let (sender, receive) = mpsc::channel::<Option<Job<T>>>();
         if self.sender.get().is_some() {
             return Err(Error::new("Raft loop already started"));
         }
         let mut state = initial.take().ok_or_else(|| Error::new("missing Raft state"))?;
         let handle = std::thread::Builder::new().name("raft-main".into()).spawn(move || {
-            let interval = Duration::from_millis(20);
             let mut deadline = std::time::Instant::now();
             loop {
                 if std::time::Instant::now() >= deadline {
@@ -58,7 +69,8 @@ impl<T: Send + 'static> Owner<T> {
                 match receive
                     .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
                 {
-                    Ok(job) => job(&mut state),
+                    Ok(Some(job)) => job(&mut state),
+                    Ok(None) => deadline = std::time::Instant::now(),
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
