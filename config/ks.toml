@@ -45,6 +45,8 @@ workers = 0
 # checkpoint_lease_secs = 300
 # Smaller than the cold-member delay; a writer continues unless it wins election.
 # checkpoint_election_delay_ms = 500
+# Added on every campaign while a same-slot replacement awaits primary acceptance.
+# lost_state_election_delay_ms = 200
 # Require election_min_ms >= 2 * heartbeat_ms, election_max_ms > election_min_ms.
 # election_min_ms sets the strict campaign lifetime and primary read/write lease lifetime.
 # Randomized delays and cold/checkpoint penalties postpone campaigns, not their expiry.

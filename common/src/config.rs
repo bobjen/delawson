@@ -665,6 +665,8 @@ pub struct RaftConfig {
     pub apply_members: usize,
     /// Extra randomized-election delay for members without application state.
     pub cold_election_delay_ms: u64,
+    /// Added to every campaign schedule until a primary accepts a replacement.
+    pub lost_state_election_delay_ms: u64,
     /// Suppress other checkpoint producers after a committed start announcement.
     pub checkpoint_lease_secs: u64,
     /// Positive, and smaller than cold_election_delay_ms.
@@ -690,6 +692,7 @@ impl Default for RaftConfig {
         Self {
             apply_members: 3,
             cold_election_delay_ms: 1000,
+            lost_state_election_delay_ms: 200,
             checkpoint_lease_secs: 300,
             checkpoint_election_delay_ms: 500,
             ring: "KS0".into(),

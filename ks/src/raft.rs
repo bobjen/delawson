@@ -5,10 +5,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Stable process identities within this ring. Endpoints are discovered, never voted on.
-pub type MemberId = u32;
+// Low 32 bits are the logical slot; high 32 bits distinguish replacements.
+// Incarnations prevent a reply from a replacement from counting as its predecessor.
+pub type MemberId = u64;
+pub const INCARNATION: u64 = 1 << 32;
 pub type Members = BTreeSet<MemberId>;
 /// Reserved in RAM for a process that has not been assigned a voting slot.
-pub const UNASSIGNED: MemberId = u32::MAX;
+pub const UNASSIGNED: MemberId = u64::MAX;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Member {
     pub identity: common::ring::MemberIdentity,
@@ -23,6 +26,7 @@ pub struct Membership {
     pub identities: MemberNames,
     pub old: Members,
     pub new: Option<Members>,
+    pub retired: BTreeMap<MemberId, Retirement>,
 }
 impl Membership {
     pub fn members(&self) -> Members {
@@ -32,11 +36,53 @@ impl Membership {
         }
         result
     }
-    pub fn quorum(&self, votes: &Members) -> bool {
-        let majority = |members: &Members| {
-            members.iter().filter(|id| votes.contains(*id)).count() > members.len() / 2
+    fn majority(&self, members: &Members, votes: &Members) -> bool {
+        members.iter().filter(|id| !self.retired.contains_key(id) && votes.contains(id)).count()
+            > members.len() / 2
+    }
+    pub fn retirement_quorum(&self, members: &Members) -> bool {
+        members.iter().filter(|id| self.retired.contains_key(id)).count() > members.len() / 2
+    }
+    pub fn replacements(&self, members: &Members) -> Members {
+        members
+            .iter()
+            .map(|id| {
+                let mut id = *id;
+                while let Some(retired) = self.retired.get(&id) {
+                    id = retired.next;
+                }
+                id
+            })
+            .collect()
+    }
+    pub fn voters(&self) -> Members {
+        let mut voters = if self.retirement_quorum(&self.old) {
+            self.replacements(&self.old)
+        } else {
+            self.old.clone()
         };
-        majority(&self.old) && self.new.as_ref().is_none_or(majority)
+        if let Some(new) = &self.new {
+            voters.extend(new);
+        }
+        voters.retain(|id| !self.retired.contains_key(id));
+        voters
+    }
+    pub fn participants(&self) -> Members {
+        let mut members = self.members();
+        members.extend(self.replacements(&members.clone()));
+        members
+    }
+    pub fn quorum(&self, votes: &Members) -> bool {
+        match &self.new {
+            Some(new) => {
+                (self.majority(&self.old, votes) || self.retirement_quorum(&self.old))
+                    && self.majority(new, votes)
+            }
+            None if self.retirement_quorum(&self.old) => {
+                self.majority(&self.replacements(&self.old), votes)
+            }
+            None => self.majority(&self.old, votes),
+        }
     }
     pub fn validate(&self) -> Result<()> {
         if self.old.is_empty() || self.new.as_ref().is_some_and(|m| m.is_empty()) {
@@ -46,15 +92,34 @@ impl Membership {
             return Err(Error::new("missing Raft member identity"));
         }
         let unique: BTreeSet<_> = self.identities.values().map(|m| &m.identity).collect();
-        let voters = self.members();
+        let voters = self.voters();
         let processes: BTreeSet<_> =
             voters.iter().filter_map(|id| self.identities.get(id).map(|m| &m.process)).collect();
         if self.identities.contains_key(&UNASSIGNED)
             || unique.len() != self.identities.len()
-            || processes.len() != voters.len()
+            || (self.new.is_none() && processes.len() != voters.len())
             || self.identities.values().any(|m| m.process.is_empty())
         {
             return Err(Error::new("duplicate or empty member name"));
+        }
+        for members in std::iter::once(&self.old).chain(self.new.iter()) {
+            let slots: BTreeSet<_> = members.iter().map(|id| id % INCARNATION).collect();
+            let routes: BTreeSet<_> = members
+                .iter()
+                .filter_map(|id| self.identities.get(id).map(|m| &m.process))
+                .collect();
+            if slots.len() != members.len() || routes.len() != members.len() {
+                return Err(Error::new("multiple members occupy one logical slot or route"));
+            }
+        }
+        for (id, retired) in &self.retired {
+            retired.validate()?;
+            if *id != retired.previous
+                || self.identities.get(id) != Some(&retired.old)
+                || self.identities.get(&retired.next) != Some(&retired.member)
+            {
+                return Err(Error::new("retirement identity mismatch"));
+            }
         }
         Ok(())
     }
@@ -70,19 +135,41 @@ impl Membership {
             }
             return Ok(slot);
         }
-        let slot = match self.identities.last_key_value() {
-            Some((last, _)) => last
-                .checked_add(1)
-                .filter(|i| *i != UNASSIGNED)
-                .ok_or_else(|| Error::new("member slots exhausted"))?,
-            None => 0,
-        };
+        let slot = self
+            .identities
+            .keys()
+            .map(|id| id % INCARNATION)
+            .max()
+            .map_or(Some(0), |last| last.checked_add(1))
+            .filter(|slot| *slot < INCARNATION - 1)
+            .ok_or_else(|| Error::new("member slots exhausted"))?;
         self.identities.insert(slot, member);
         Ok(slot)
     }
     fn extends(&self, previous: &Self) -> Result<()> {
         if previous.identities.iter().any(|(id, name)| self.identities.get(id) != Some(name)) {
             return Err(Error::new("member indexes cannot be removed or rebound"));
+        }
+        Ok(())
+    }
+}
+
+/// One irreversible, one-for-one replacement. This is not a successful vote.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Retirement {
+    pub previous: MemberId,
+    pub old: Member,
+    pub next: MemberId,
+    pub member: Member,
+}
+impl Retirement {
+    pub fn validate(&self) -> Result<()> {
+        if self.previous.checked_add(INCARNATION) != Some(self.next)
+            || self.next == UNASSIGNED
+            || self.old.process != self.member.process
+            || self.old.identity == self.member.identity
+        {
+            return Err(Error::new("invalid member retirement"));
         }
         Ok(())
     }
@@ -158,6 +245,9 @@ pub struct State {
     pub ring: String,
     /// Initial table learned at creation or before joining; independent of later membership.
     pub founders: Option<Membership>,
+    /// Learned routing identities only; never changes the electorate.
+    pub contacts: MemberNames,
+    pub retirements: BTreeMap<MemberId, Retirement>,
     pub term: u64,
     pub vote: Option<MemberId>,
     pub snapshot: Snapshot,
@@ -207,7 +297,8 @@ impl State {
     }
     pub fn initial(ring: String, members: Members, identities: MemberNames) -> Result<Self> {
         common::ring::RingIdentity::try_from(ring.clone())?;
-        let membership = Membership { identities, old: members, new: None };
+        let membership =
+            Membership { retired: BTreeMap::new(), identities, old: members, new: None };
         if !membership.old.is_empty() {
             membership.validate()?;
         } else if !membership.identities.is_empty() {
@@ -215,6 +306,8 @@ impl State {
         }
         Ok(Self {
             founders: (!membership.old.is_empty()).then_some(membership.clone()),
+            retirements: BTreeMap::new(),
+            contacts: MemberNames::new(),
             ring: ring.clone(),
             ignore_ring_identity: false,
             term: 0,
@@ -245,14 +338,21 @@ impl State {
             .map(|e| e.term)
     }
     pub fn membership(&self) -> Membership {
-        self.log
+        let mut membership = self
+            .log
             .iter()
             .rev()
             .find_map(|e| match &e.command {
                 Command::Members(m) => Some(m.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| self.snapshot.membership.clone())
+            .unwrap_or_else(|| self.snapshot.membership.clone());
+        for retirement in self.retirements.values() {
+            membership.identities.insert(retirement.previous, retirement.old.clone());
+            membership.identities.insert(retirement.next, retirement.member.clone());
+            membership.retired.insert(retirement.previous, retirement.clone());
+        }
+        membership
     }
     pub fn has_keys(&self) -> bool {
         !self.snapshot.keys.is_empty()
@@ -301,6 +401,33 @@ impl State {
     }
     pub fn apply(&mut self, record: &Record) -> Result<()> {
         match record {
+            Record::Contacts(contacts) => {
+                let membership = self.membership();
+                for (slot, member) in contacts {
+                    if *slot == UNASSIGNED
+                        || member.process.is_empty()
+                        || membership.identities.get(slot).is_some_and(|old| old != member)
+                        || self.contacts.get(slot).is_some_and(|old| old != member)
+                    {
+                        return Err(Error::new("conflicting catch-up peer identity"));
+                    }
+                }
+                self.contacts.extend(contacts.clone());
+            }
+            Record::Retired(retired) => {
+                retired.validate()?;
+                let membership = self.membership();
+                if membership.identities.get(&retired.previous) != Some(&retired.old)
+                    || membership.retired.get(&retired.previous).is_some_and(|old| old != retired)
+                    || membership
+                        .identities
+                        .get(&retired.next)
+                        .is_some_and(|m| m != &retired.member)
+                {
+                    return Err(Error::new("unknown or conflicting retirement"));
+                }
+                self.retirements.insert(retired.previous, retired.clone());
+            }
             Record::Bootstrap(membership) => {
                 membership.validate()?;
                 if membership.new.is_some() {
@@ -397,6 +524,8 @@ impl State {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Record {
+    Contacts(MemberNames),
+    Retired(Retirement),
     Bootstrap(Membership),
     Carry { entries: Vec<Entry>, commit: u64 },
     Hard { term: u64, vote: Option<MemberId> },
@@ -440,6 +569,9 @@ pub enum Role {
 pub trait Storage {
     fn state(&self) -> &State;
     fn write(&mut self, records: &[Record]) -> Result<()>;
+    fn pending_replacement(&self) -> Option<Retirement> {
+        None
+    }
 }
 
 pub struct Node<S: Storage = Journal> {
@@ -500,7 +632,10 @@ impl<S: Storage> Node<S> {
     }
     fn persist(&mut self, records: Vec<Record>) -> Result<()> {
         let membership_changed = records.iter().any(|record| match record {
-            Record::Bootstrap(_) | Record::Install(_) => true,
+            Record::Bootstrap(_)
+            | Record::Install(_)
+            | Record::Retired(_)
+            | Record::Contacts(_) => true,
             Record::Entries { entries, .. } => {
                 entries.iter().any(|e| matches!(e.command, Command::Members(_)))
             }
@@ -511,6 +646,35 @@ impl<S: Storage> Node<S> {
             self.refresh_slot();
         }
         Ok(())
+    }
+    pub fn observe_retirement(&mut self, retired: Retirement) -> Result<()> {
+        if self.state().membership().retired.get(&retired.previous) == Some(&retired) {
+            return Ok(());
+        }
+        self.persist(vec![Record::Retired(retired)])
+    }
+    pub fn accept_replacements(&mut self) -> Result<()> {
+        if self.role != Role::Leader
+            || !self.write_authority()?
+            || self.state().last() != self.state().commit
+        {
+            return Ok(());
+        }
+        let old = self.state().membership();
+        if old.new.is_some() {
+            return Ok(());
+        }
+        let new = old.replacements(&old.old);
+        if new != old.old {
+            self.propose(Command::Members(Membership { new: Some(new), ..old }))?;
+        }
+        Ok(())
+    }
+    pub fn learn_contacts(&mut self, contacts: MemberNames) -> Result<()> {
+        if contacts.iter().all(|(slot, member)| self.state().contacts.get(slot) == Some(member)) {
+            return Ok(());
+        }
+        self.persist(vec![Record::Contacts(contacts)])
     }
     pub fn initialize_founders(&mut self, membership: Membership) -> Result<()> {
         if self.state().founders.as_ref() == Some(&membership) {
@@ -588,7 +752,9 @@ impl<S: Storage> Node<S> {
         if self.role == Role::Leader {
             return self.stop_primary();
         }
-        if !self.state().membership().members().contains(&self.id) {
+        if !self.state().membership().voters().contains(&self.id)
+            && self.journal.pending_replacement().is_none()
+        {
             return Ok(());
         }
         // Start the lifetime before journaling our vote: disk stalls consume it too.
@@ -630,8 +796,13 @@ impl<S: Storage> Node<S> {
                 .last()
                 .checked_add(1)
                 .ok_or_else(|| Error::new("Raft index overflow"))?;
-            self.next =
-                self.state().membership().members().iter().map(|id| (id.clone(), next)).collect();
+            self.next = self
+                .state()
+                .membership()
+                .participants()
+                .iter()
+                .map(|id| (id.clone(), next))
+                .collect();
             self.matched.clear();
             self.propose(Command::Noop)?;
         }
@@ -682,6 +853,7 @@ impl<S: Storage> Node<S> {
             let new =
                 committed.new.clone().ok_or_else(|| Error::new("missing joint configuration"))?;
             self.propose(Command::Members(Membership {
+                retired: membership.retired.clone(),
                 identities: membership.identities.clone(),
                 old: new,
                 new: None,
@@ -689,7 +861,7 @@ impl<S: Storage> Node<S> {
         }
         let current = self.state().membership();
         let final_committed = self.state().committed_membership() == current;
-        if final_committed && !current.members().contains(&self.id) {
+        if final_committed && !current.voters().contains(&self.id) {
             self.follow(self.state().term)?;
         }
         Ok(())
@@ -763,10 +935,12 @@ impl<S: Storage> Node<S> {
         if let Rpc::Install { snapshot, .. } = rpc {
             self.state().check_ring(snapshot)?;
         }
+        if self.state().membership().retired.contains_key(sender) {
+            return Ok(Answer { term: self.state().term, success: false, matched: 0 });
+        }
         // A removed/lagging member can still send votes from its old configuration.
         // It must not repeatedly terminate the primary by advancing its private term.
-        if matches!(rpc, Rpc::Vote { .. }) && !self.state().membership().members().contains(sender)
-        {
+        if matches!(rpc, Rpc::Vote { .. }) && !self.state().membership().voters().contains(sender) {
             return Ok(Answer { term: self.state().term, success: false, matched: 0 });
         }
         if rpc.term() > self.state().term {
@@ -792,6 +966,9 @@ impl<S: Storage> Node<S> {
                 );
             }
             Rpc::Vote { last, last_term, .. } => {
+                if !self.state().membership().voters().contains(&self.id) {
+                    return Ok(answer);
+                }
                 let fresh = (*last_term, *last)
                     >= (
                         self.state().term_at(self.state().last()).unwrap_or(0),
@@ -868,7 +1045,7 @@ impl<S: Storage> Node<S> {
             && answer.success
             && request.term() == self.state().term
             && answer.term == self.state().term
-            && self.state().membership().members().contains(peer)
+            && self.state().membership().voters().contains(peer)
         {
             self.lease.acknowledge(peer, request.term(), sent);
         }
@@ -887,7 +1064,10 @@ impl<S: Storage> Node<S> {
             Rpc::Vote { .. } if self.role == Role::Candidate => {
                 // Check on receipt, not just in the timer: it may be stalled or suspended.
                 self.expire_campaign()?;
-                if self.role == Role::Candidate && answer.success {
+                if self.role == Role::Candidate
+                    && answer.success
+                    && self.state().membership().voters().contains(peer)
+                {
                     self.votes.insert(*peer);
                     self.win()?;
                 }
@@ -925,6 +1105,136 @@ impl<S: Storage> Node<S> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    fn retirement(id: MemberId) -> Retirement {
+        Retirement {
+            previous: id,
+            old: names()[&id].clone(),
+            next: id + INCARNATION,
+            member: Member {
+                process: names()[&id].process.clone(),
+                identity: common::ring::MemberIdentity::try_from(
+                    format!("{:02x}", 100 + id).repeat(64),
+                )
+                .unwrap(),
+            },
+        }
+    }
+    fn replace_node(old: &TestNode, retired: &Retirement) -> TestNode {
+        let mut state = old.state().clone();
+        state.snapshot = state.capture();
+        state.log.clear();
+        state.vote = None;
+        state.apply(&Record::Retired(retired.clone())).unwrap();
+        let mut node = Node::new(
+            retired.next,
+            Memory {
+                initial: state.clone(),
+                state,
+                pending: Some(retired.clone()),
+                records: vec![],
+                failed: false,
+            },
+        );
+        node.identity = Some(retired.member.identity.clone());
+        node.clock = Some(std::time::Duration::ZERO);
+        node
+    }
+    #[test]
+    fn retirements_are_not_votes_and_only_majority_allows_replacement_elections() {
+        let mut nodes = cluster(5);
+        let lost: Vec<_> = (2..5).map(retirement).collect();
+        for retired in &lost {
+            nodes[retired.previous as usize] =
+                replace_node(&nodes[retired.previous as usize], retired);
+        }
+        // Everyone has heard of two retirements. That is not an old quorum.
+        for node in &mut nodes {
+            for retired in &lost[..2] {
+                node.observe_retirement(retired.clone()).unwrap();
+            }
+        }
+        nodes[2].campaign().unwrap();
+        pair(&mut nodes, 2, 0);
+        pair(&mut nodes, 2, 1);
+        pair(&mut nodes, 2, 3);
+        assert_eq!(nodes[2].role, Role::Candidate);
+        assert_eq!(nodes[0].state().term, 0); // Unauthorized campaign did not advance it.
+        // With three known retirements, the replacement electorate can act.
+        for node in &mut nodes {
+            node.observe_retirement(lost[2].clone()).unwrap();
+        }
+        nodes[2].campaign().unwrap();
+        for _ in 0..4 {
+            pair(&mut nodes, 2, 3);
+            pair(&mut nodes, 2, 4);
+        }
+        assert_eq!(nodes[2].role, Role::Leader);
+        assert!(nodes[2].journal.pending_replacement().is_some());
+        nodes[2].accept_replacements().unwrap();
+        for _ in 0..6 {
+            pair(&mut nodes, 2, 3);
+            pair(&mut nodes, 2, 4);
+        }
+        for node in &nodes[2..] {
+            let membership = node.state().membership();
+            assert!(membership.new.is_none());
+            assert_eq!(membership.old.len(), 5);
+            assert!(membership.old.contains(&node.id));
+            assert!(node.journal.pending_replacement().is_none());
+        }
+    }
+    #[test]
+    fn live_primary_replaces_a_minority_using_joint_consensus() {
+        let mut nodes = cluster(5);
+        for node in &mut nodes {
+            node.clock = Some(std::time::Duration::ZERO);
+        }
+        nodes[0].campaign().unwrap();
+        for _ in 0..4 {
+            pair(&mut nodes, 0, 1);
+            pair(&mut nodes, 0, 2);
+        }
+        let lost = retirement(4);
+        nodes[4] = replace_node(&nodes[4], &lost);
+        nodes[0].observe_retirement(lost.clone()).unwrap();
+        let proof_only = nodes[0].state().membership();
+        assert!(!proof_only.quorum(&Members::from([0, lost.next])));
+        nodes[0].accept_replacements().unwrap();
+        // The old quorum and new quorum overlap in the three surviving originals.
+        for _ in 0..6 {
+            pair(&mut nodes, 0, 1);
+            pair(&mut nodes, 0, 2);
+            pair(&mut nodes, 0, 4);
+        }
+        assert!(nodes[4].journal.pending_replacement().is_none());
+        let membership = nodes[0].state().membership();
+        assert_eq!(membership.old.len(), 5);
+        assert!(!membership.old.contains(&lost.previous));
+        assert!(membership.old.contains(&lost.next));
+        let term = nodes[0].state().term;
+        let reply = nodes[0]
+            .receive(
+                &lost.previous,
+                &Rpc::Vote { term: term + 10, last: u64::MAX, last_term: u64::MAX },
+            )
+            .unwrap();
+        assert!(!reply.success);
+        assert_eq!(nodes[0].state().term, term);
+    }
+    #[test]
+    fn retirement_cannot_rebind_an_unrelated_identity_or_slot() {
+        let mut node = node(0, members(5));
+        let mut bad = retirement(1);
+        bad.next += 1;
+        let wrong_slot = node.observe_retirement(bad);
+        let mut bad = retirement(1);
+        bad.old = names()[&2].clone();
+        let wrong_member = node.observe_retirement(bad);
+        assert!(wrong_slot.is_err());
+        assert!(wrong_member.is_err());
+        assert!(node.state().retirements.is_empty());
+    }
+
     #[test]
     fn campaign_deadline_rejects_late_quorum_without_timer_activity() {
         use std::time::Duration;
@@ -991,17 +1301,42 @@ pub mod tests {
     }
 
     #[test]
+    fn catch_up_contacts_do_not_grant_votes_or_rebind_identities() {
+        let mut nodes = cluster(3);
+        let before = nodes[0].state().membership();
+        let contact = Member {
+            identity: common::ring::MemberIdentity::generate().unwrap(),
+            process: "later-member".into(),
+        };
+        nodes[0].learn_contacts(MemberNames::from([(99, contact.clone())])).unwrap();
+        assert_eq!(nodes[0].state().membership(), before);
+        assert_eq!(nodes[0].state().contacts.get(&99), Some(&contact));
+        let vote = Rpc::Vote { term: 100, last: 0, last_term: 0 };
+        let answer = nodes[0].receive(&99, &vote).unwrap();
+        assert!(!answer.success);
+        assert_eq!(nodes[0].state().term, 0);
+        let conflicting = nodes[0].learn_contacts(MemberNames::from([(0, contact)]));
+        assert!(conflicting.is_err());
+    }
+
+    #[test]
     fn bootstrap_assigns_local_slot_and_retries_preserve_voting_history() {
         let initial = State::initial("01".repeat(64), Members::new(), MemberNames::new()).unwrap();
-        let storage =
-            Memory { state: initial.clone(), initial, records: Vec::new(), failed: false };
+        let storage = Memory {
+            pending: None,
+            state: initial.clone(),
+            initial,
+            records: Vec::new(),
+            failed: false,
+        };
         let mut node = Node::new(UNASSIGNED, storage);
         let identities = names();
         node.identity = Some(identities[&0].identity.clone());
         node.campaign().unwrap();
         assert_eq!(node.role, Role::Follower);
         assert!(node.journal.records.is_empty());
-        let founders = Membership { identities, old: members(3), new: None };
+        let founders =
+            Membership { retired: BTreeMap::new(), identities, old: members(3), new: None };
         node.initialize_founders(founders.clone()).unwrap();
         assert_eq!(node.id, 0);
         node.campaign().unwrap();
@@ -1021,12 +1356,19 @@ pub mod tests {
     }
 
     pub struct Memory {
+        pending: Option<Retirement>,
         state: State,
         initial: State,
         pub records: Vec<Record>,
         failed: bool,
     }
     impl Storage for Memory {
+        fn pending_replacement(&self) -> Option<Retirement> {
+            self.pending.clone().filter(|r| {
+                let members = self.state.membership().members();
+                !(members.contains(&r.next) && !members.contains(&r.previous))
+            })
+        }
         fn state(&self) -> &State {
             &self.state
         }
@@ -1056,6 +1398,7 @@ pub mod tests {
                 state.apply(record).unwrap();
             }
             Self {
+                pending: self.pending.clone(),
                 state,
                 initial: self.initial.clone(),
                 records: self.records.clone(),
@@ -1084,13 +1427,13 @@ pub mod tests {
             .collect()
     }
     pub fn members(n: usize) -> Members {
-        (0..n as u32).collect()
+        (0..n as u64).collect()
     }
     pub fn node(id: usize, members: Members) -> TestNode {
         let state = State::initial("01".repeat(64), members, names()).unwrap();
         Node::new(
-            id as u32,
-            Memory { initial: state.clone(), state, records: vec![], failed: false },
+            id as u64,
+            Memory { pending: None, initial: state.clone(), state, records: vec![], failed: false },
         )
     }
     fn exchange(a: &mut TestNode, b: &mut TestNode) {
@@ -1125,7 +1468,12 @@ pub mod tests {
     }
     #[test]
     fn random_identity_assignment_is_idempotent_and_retires_slots_permanently() {
-        let mut membership = Membership { identities: names(), old: members(3), new: None };
+        let mut membership = Membership {
+            retired: BTreeMap::new(),
+            identities: names(),
+            old: members(3),
+            new: None,
+        };
         let applicant = Member {
             identity: common::ring::MemberIdentity::try_from("ab".repeat(64)).unwrap(),
             process: "route-not-slot-32".into(),
@@ -1157,7 +1505,12 @@ pub mod tests {
     fn retired_member_slots_remain_bound_after_snapshot_and_restart() {
         let mut original = State::initial("01".repeat(64), members(3), names()).unwrap();
         original.apply(&Record::Hard { term: 1, vote: None }).unwrap();
-        let retired = Membership { identities: names(), old: BTreeSet::from([0, 2]), new: None };
+        let retired = Membership {
+            retired: BTreeMap::new(),
+            identities: names(),
+            old: BTreeSet::from([0, 2]),
+            new: None,
+        };
         original
             .apply(&Record::Entries {
                 from: 1,
@@ -1178,8 +1531,13 @@ pub mod tests {
             from: 2,
             entries: vec![Entry { index: 2, term: 1, command: Command::Members(rebound) }],
         };
-        let mut storage =
-            Memory { initial: original.clone(), state: original, records: vec![], failed: false };
+        let mut storage = Memory {
+            pending: None,
+            initial: original.clone(),
+            state: original,
+            records: vec![],
+            failed: false,
+        };
         let rejected = storage.write(&[record]).is_err();
         let old_name = storage.state.membership().identities[&1].clone();
         let vote = serde_json::to_string(&Record::Hard { term: 2, vote: Some(1) }).unwrap();
@@ -1468,6 +1826,7 @@ pub mod tests {
         new.remove(&0);
         nodes[0]
             .propose(Command::Members(Membership {
+                retired: BTreeMap::new(),
                 identities: names(),
                 old: members(3),
                 new: Some(new.clone()),
@@ -1478,9 +1837,9 @@ pub mod tests {
                 if nodes[0].role == Role::Stopped {
                     break;
                 }
-                let request = nodes[0].request(&(other as u32)).unwrap();
+                let request = nodes[0].request(&(other as u64)).unwrap();
                 let answer = nodes[other].receive(&0, &request).unwrap();
-                let result = nodes[0].response(&(other as u32), &request, &answer);
+                let result = nodes[0].response(&(other as u64), &request, &answer);
                 if nodes[0].role != Role::Stopped {
                     result.unwrap();
                 }
@@ -1490,7 +1849,10 @@ pub mod tests {
         let committed = nodes[0].state().committed_membership();
         let delayed = nodes[0].propose(Command::Noop);
         assert_eq!(stopped, Role::Stopped);
-        assert_eq!(committed, Membership { identities: names(), old: new, new: None });
+        assert_eq!(
+            committed,
+            Membership { retired: BTreeMap::new(), identities: names(), old: new, new: None }
+        );
         assert!(delayed.is_err());
     }
 
@@ -1651,7 +2013,12 @@ pub mod tests {
     }
     #[test]
     fn joint_membership_requires_both_majorities() {
-        let joint = Membership { identities: names(), old: members(3), new: Some(members(5)) };
+        let joint = Membership {
+            retired: BTreeMap::new(),
+            identities: names(),
+            old: members(3),
+            new: Some(members(5)),
+        };
         let old_only = BTreeSet::from([0, 1]);
         let new_only = BTreeSet::from([2, 3, 4]);
         let both = BTreeSet::from([0, 1, 4]);
@@ -1665,6 +2032,7 @@ pub mod tests {
         let new = BTreeSet::from([0, 2]);
         nodes[0]
             .propose(Command::Members(Membership {
+                retired: BTreeMap::new(),
                 identities: names(),
                 old: members(3),
                 new: Some(new.clone()),
@@ -1678,7 +2046,7 @@ pub mod tests {
         }
         assert_eq!(
             nodes[0].state().capture().membership,
-            Membership { identities: names(), old: new, new: None }
+            Membership { retired: BTreeMap::new(), identities: names(), old: new, new: None }
         );
     }
     #[test]
@@ -1721,7 +2089,7 @@ pub mod tests {
                     4 | 5 if !messages.is_empty() => {
                         let index = (random as usize >> 24) % messages.len();
                         let (from, to, request) = messages.swap_remove(index);
-                        let result = nodes[to].as_mut().unwrap().receive(&(from as u32), &request);
+                        let result = nodes[to].as_mut().unwrap().receive(&(from as u64), &request);
                         if nodes[to].as_ref().unwrap().role != Role::Stopped {
                             acknowledgments.push((from, to, request, result.unwrap()));
                         }
@@ -1730,13 +2098,13 @@ pub mod tests {
                         let index = (random as usize >> 24) % acknowledgments.len();
                         let (from, to, request, answer) = acknowledgments.swap_remove(index);
                         let result =
-                            nodes[from].as_mut().unwrap().response(&(to as u32), &request, &answer);
+                            nodes[from].as_mut().unwrap().response(&(to as u64), &request, &answer);
                         if nodes[from].as_ref().unwrap().role != Role::Stopped {
                             result.unwrap();
                         }
                     }
                     _ if a != b => {
-                        if let Some(request) = nodes[a].as_ref().unwrap().request(&(b as u32)) {
+                        if let Some(request) = nodes[a].as_ref().unwrap().request(&(b as u64)) {
                             messages.push((a, b, request));
                         }
                     }
@@ -1783,19 +2151,19 @@ pub mod tests {
                             continue;
                         }
                         let Some(request) =
-                            nodes[freshest].as_ref().unwrap().request(&(other as u32))
+                            nodes[freshest].as_ref().unwrap().request(&(other as u64))
                         else {
                             break;
                         };
                         let result =
-                            nodes[other].as_mut().unwrap().receive(&(freshest as u32), &request);
+                            nodes[other].as_mut().unwrap().receive(&(freshest as u64), &request);
                         if nodes[other].as_ref().unwrap().role == Role::Stopped {
                             nodes[other] = Some(restart(nodes[other].as_ref().unwrap()));
                             continue;
                         }
                         let answer = result.unwrap();
                         let result = nodes[freshest].as_mut().unwrap().response(
-                            &(other as u32),
+                            &(other as u64),
                             &request,
                             &answer,
                         );
@@ -1811,19 +2179,19 @@ pub mod tests {
                             continue;
                         }
                         let Some(request) =
-                            nodes[freshest].as_ref().unwrap().request(&(other as u32))
+                            nodes[freshest].as_ref().unwrap().request(&(other as u64))
                         else {
                             break;
                         };
                         let result =
-                            nodes[other].as_mut().unwrap().receive(&(freshest as u32), &request);
+                            nodes[other].as_mut().unwrap().receive(&(freshest as u64), &request);
                         if nodes[other].as_ref().unwrap().role == Role::Stopped {
                             nodes[other] = Some(restart(nodes[other].as_ref().unwrap()));
                             continue;
                         }
                         let answer = result.unwrap();
                         let result = nodes[freshest].as_mut().unwrap().response(
-                            &(other as u32),
+                            &(other as u64),
                             &request,
                             &answer,
                         );

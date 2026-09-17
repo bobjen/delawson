@@ -290,7 +290,11 @@ impl Ks {
             node.campaign()?;
         }
         let test_mode = !config.require_unlock;
-        let placement = application::Placement::new(&runtime.members, config.raft.apply_members);
+        let membership = node.state().membership();
+        let placement = application::Placement::new(
+            &membership.replacements(&membership.members()),
+            config.raft.apply_members,
+        );
         let transport = runtime.messaging.as_ref().map(|messaging| {
             let mut messaging = messaging.clone();
             messaging.peer_conns = 1;

@@ -140,6 +140,46 @@ def main():
             command(primary, 'unlock', '--key-file', ceremony/'unlock-key')
             until(lambda: all(status(id).get('unlocked') == 'true' for id in children))
             assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
+            # Losing current.log retires one identity and implicitly requests replacement.
+            replacing = next(id for id in members if id != primary)
+            old_identity = status(replacing)['raft_member_id']
+            old_slot = int(status(replacing)['raft_member_slot'])
+            old_incarnation = int(status(replacing)['raft_member_incarnation'])
+            stop(replacing)
+            (work/replacing/'data/master-keys/current.log').unlink()
+            start(replacing)
+            until(lambda: status(replacing).get('raft_lost_state') == 'false')
+            assert status(replacing)['raft_member_id'] != old_identity
+            assert int(status(replacing)['raft_member_slot']) == old_slot
+            assert int(status(replacing)['raft_member_incarnation']) == old_incarnation + 1
+            assert until(leader) == primary
+            until(lambda: status(replacing).get('unlocked') == 'true')
+            assert command(replacing, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
+            # A retirement majority recovers without an old quorum. Keep snapshots;
+            # this exercises recovery, not the deferred divergent-history problem #127.
+            retiring = list(members)[:2]
+            prior_ids = {id: status(id)['raft_member_id'] for id in retiring}
+            for id in list(children): stop(id)
+            for id in retiring:
+                (work/id/'data/master-keys/current.log').unlink()
+            for id in members: start(id)
+            def recovered_ring():
+                # Demoted primaries intentionally exit. Supply the supervisor
+                # restart that production uses, without hiding abnormal exits.
+                for id, child in list(children.items()):
+                    result = child.poll()
+                    if result is not None:
+                        assert result == 0, (id, result)
+                        children.pop(id)
+                        start(id)
+                current = leader()
+                if current and all(status(id).get('raft_lost_state') == 'false' for id in children):
+                    return current
+            primary = until(recovered_ring)
+            assert all(status(id)['raft_member_id'] != prior_ids[id] for id in retiring)
+            command(primary, 'unlock', '--key-file', ceremony/'unlock-key')
+            until(lambda: all(status(id).get('unlocked') == 'true' for id in children))
+            assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
             # A fresh cold nonvoter copies committed state from a nonprimary peer.
             members['KS0-member3'] = f'127.0.0.1:{port()}'
             start('KS0-member3')
@@ -152,7 +192,7 @@ def main():
             assert status('KS0-member3')['raft_member_slot'] == 'none'
             membership_file = work/'members.json'
             membership_file.write_text(json.dumps(list(members)))
-            command(primary, 'raft-members', '--members-file', membership_file)
+            until(lambda: command(primary, 'raft-members', '--members-file', membership_file) or True)
             until(lambda: status('KS0-member3').get('unlocked') == 'true' and int(status('KS0-member3')['raft_commit']) >= int(status(primary)['raft_commit']))
             assert status('KS0-member3')['raft_member_id'] == applicant_id
             assert status('KS0-member3')['raft_member_slot'] == '3'
@@ -163,7 +203,7 @@ def main():
             assert command('KS0-member3', 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
             removed = next(id for id in members if id not in (primary, 'KS0-member3'))
             membership_file.write_text(json.dumps([id for id in members if id != removed]))
-            command(primary, 'raft-members', '--members-file', membership_file)
+            until(lambda: command(primary, 'raft-members', '--members-file', membership_file) or True)
             term = status(primary)['raft_term']
             time.sleep(1.5)
             assert status(primary)['raft_term'] == term
@@ -179,7 +219,7 @@ def main():
             successor = until(leader)
             actual = command(successor, 'sn-master-key', '--sn', '0', '--creation-second', creation)
             assert actual == expected
-            print('PASS: persistent random IDs; slotless applicant restart; primary-assigned slots; member restart on a changed port; demoted-primary process exit; primary removal exit; locked quorum; unlock propagation; committed key rotation; follower forwarding; primary failover; restart catch-up; quorum-loss read refusal; full locked restart; snapshot catch-up of a new member; joint membership; removed-member election suppression.')
+            print('PASS: automatic same-slot replacement; retirement-majority recovery; persistent random IDs; slotless applicant restart; primary-assigned slots; member restart on a changed port; demoted-primary process exit; primary removal exit; locked quorum; unlock propagation; committed key rotation; follower forwarding; primary failover; restart catch-up; quorum-loss read refusal; full locked restart; snapshot catch-up of a new member; joint membership; removed-member election suppression.')
         except BaseException:
             for id in members:
                 if id in children:

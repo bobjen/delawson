@@ -1,6 +1,6 @@
 //! One ordered journal for Raft entries, terms/votes, commit markers and installs.
 //! Key commands are already encrypted; consensus metadata remains readable while locked.
-use crate::raft::{Record, State};
+use crate::raft::{INCARNATION, Member, MemberId, Membership, Record, Retirement, State};
 use crate::random_master_key;
 use common::{Context, Error, Result};
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,18 @@ pub struct LocalIdentity {
     pub current: common::ring::MemberIdentity,
     /// Kept until membership no longer needs their state-loss responses.
     pub retired: Vec<common::ring::MemberIdentity>,
+    pub slot: Option<MemberId>,
+    membership: Option<Membership>,
+    founders: Option<Membership>,
+    initialized: bool,
+    pending: Option<Retirement>,
+    recovery: Option<RecoveryPlan>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct RecoveryPlan {
+    archive: String,
+    checkpoint: String,
+    files: Vec<String>,
 }
 
 pub struct Journal {
@@ -78,6 +90,9 @@ impl crate::raft::Storage for Journal {
     fn write(&mut self, records: &[Record]) -> Result<()> {
         Journal::write(self, records)
     }
+    fn pending_replacement(&self) -> Option<Retirement> {
+        self.identity.pending.clone()
+    }
 }
 impl Journal {
     pub fn open(directory: &Path, initial: State, retain: usize, member: &str) -> Result<Self> {
@@ -97,13 +112,12 @@ impl Journal {
         ownership.try_lock().context("locking KS persistence directory")?;
         // Observe creation intent once at startup, never by polling a running store.
         let bootstrap_pending = directory.join("need-bootstrap").try_exists()?;
-        let mut identity = Vec::new();
-        ownership.read_to_end(&mut identity)?;
+        let saved_identity = read_identity(&mut ownership)?;
         let snapshots = numbered(directory, "snapshot")?;
         let segments = numbered(directory, "journal")?;
         let current = directory.join(CURRENT);
         let current_exists = current.try_exists()?;
-        let local: LocalIdentity = if identity.is_empty() {
+        let mut local: LocalIdentity = if saved_identity.is_none() {
             if !snapshots.is_empty() || !segments.is_empty() || current_exists {
                 return Err(Error::new("missing KS identity beside persistence files"));
             }
@@ -113,13 +127,18 @@ impl Journal {
                 process: member.into(),
                 current,
                 retired: vec![],
+                slot: None,
+                membership: None,
+                founders: None,
+                initialized: false,
+                pending: None,
+                recovery: None,
             };
-            ownership.write_all(&encode(&local)?)?;
-            ownership.sync_all()?;
+            append_identity(&mut ownership, &local)?;
             sync_directory(directory)?;
             local
         } else {
-            let local: LocalIdentity = decode(&identity)?;
+            let local = saved_identity.ok_or_else(|| Error::new("missing local identity"))?;
             if local.process != member || (!ignore && local.ring != initial.ring) {
                 return Err(Error::new("KS persistence ring/member mismatch"));
             }
@@ -131,6 +150,11 @@ impl Journal {
             }
             local
         };
+        if local.recovery.is_some() {
+            finish_recovery(directory, &mut ownership, &mut local)?;
+            drop(ownership);
+            return Self::open(directory, initial, retain, member);
+        }
         let (mut state, mut sequence, second, snapshot_bytes) = if let Some((seq, path)) =
             snapshots.last()
         {
@@ -141,6 +165,12 @@ impl Journal {
             }
             (checkpoint.state, *seq, checkpoint.second, bytes.len() as u64)
         } else {
+            if local.initialized {
+                let recovered = initial.clone();
+                prepare_recovery(directory, &mut ownership, &mut local, recovered)?;
+                drop(ownership);
+                return Self::open(directory, initial, retain, member);
+            }
             // Initial publication can leave only an empty current header. It cannot
             // have acknowledged votes or entries before snapshot zero exists.
             if !segments.is_empty()
@@ -158,17 +188,19 @@ impl Journal {
                 publish(&current, &journal_header(&initial.ring, 1))?;
             }
             publish(&named(directory, "snapshot", 0), &bytes)?;
-            (initial, 0, checkpoint.second, bytes.len() as u64)
+            (initial.clone(), 0, checkpoint.second, bytes.len() as u64)
         };
         state.ignore_ring_identity = ignore;
         state.check_ring(&state.snapshot)?;
         state.validate()?;
         let snapshot_sequence = sequence;
-        // Never silently resume an older numbered file as the active journal.
-        let mut current_file = File::open(&current).context(
-            "missing current KS journal: possible voting-state loss; cannot resume this member",
-        )?;
-        let current_start = check_journal_header(&mut current_file, &state.ring, ignore)?;
+        let current_exists = current.try_exists()?;
+        let mut lost = !current_exists;
+        let current_start = if current_exists {
+            check_journal_header(&mut File::open(&current)?, &state.ring, ignore)?
+        } else {
+            u64::MAX
+        };
         if current_start <= snapshot_sequence {
             return Err(Error::new("current KS journal predates snapshot"));
         }
@@ -179,14 +211,25 @@ impl Journal {
         if segments.iter().any(|(start, _)| *start >= current_start) {
             return Err(Error::new("numbered KS journal overlaps current journal"));
         }
-        segments.push((current_start, current));
+        if current_exists {
+            segments.push((current_start, current.clone()));
+        }
+        // Even history beyond a hole must belong to this ring before recovery
+        // is allowed to retire an identity or move any files.
+        for (start, path) in &segments {
+            let header_start = check_journal_header(&mut File::open(path)?, &state.ring, ignore)?;
+            if header_start != *start {
+                return Err(Error::new("journal filename/header sequence mismatch"));
+            }
+        }
         let mut active = None;
         let mut log_bytes = 0;
-        for (n, (start, path)) in segments.iter().enumerate() {
+        'segments: for (start, path) in &segments {
             if *start
                 != sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?
             {
-                return Err(Error::new("KS journal sequence gap"));
+                lost = true;
+                break;
             }
             let mut file = OpenOptions::new().read(true).write(true).open(path)?;
             let size = file.metadata()?.len();
@@ -198,7 +241,7 @@ impl Journal {
             while offset < size {
                 let remaining = size - offset;
                 if remaining < 16 {
-                    if n + 1 != segments.len() {
+                    if path != &current {
                         return Err(Error::new("partial closed KS journal"));
                     }
                     break;
@@ -215,7 +258,7 @@ impl Journal {
                     return Err(Error::new("invalid KS journal frame length"));
                 }
                 if remaining < 16 + length {
-                    if n + 1 != segments.len() {
+                    if path != &current {
                         return Err(Error::new("partial closed KS journal frame"));
                     }
                     break;
@@ -224,7 +267,8 @@ impl Journal {
                 file.read_exact(&mut bytes)?;
                 let batch: Batch = decode(&bytes)?;
                 if batch.sequence != sequence + 1 {
-                    return Err(Error::new("KS journal record sequence gap"));
+                    lost = true;
+                    break 'segments;
                 }
                 for record in batch.records {
                     state.apply(&record)?;
@@ -232,13 +276,32 @@ impl Journal {
                 sequence = batch.sequence;
                 offset += 16 + length;
             }
-            if n + 1 == segments.len() {
+            if path == &current {
                 file.set_len(offset)?;
                 file.sync_all()?;
                 file.seek(SeekFrom::End(0))?;
                 active = Some(file);
             }
             log_bytes += offset;
+        }
+        if lost {
+            prepare_recovery(directory, &mut ownership, &mut local, state)?;
+            drop(ownership);
+            return Self::open(directory, initial, retain, member);
+        }
+        let before = local.clone();
+        local.initialized = true;
+        let membership = state.membership();
+        local.slot = membership.slot(&local.current).or(local.slot);
+        if local.slot.is_some_and(|id| membership.members().contains(&id))
+            && local.pending.as_ref().is_none_or(|r| !membership.members().contains(&r.previous))
+        {
+            local.pending = None;
+        }
+        local.membership = Some(membership);
+        local.founders = state.founders.clone();
+        if local != before {
+            append_identity(&mut ownership, &local)?;
         }
         let result = Self {
             identity: local,
@@ -292,6 +355,21 @@ impl Journal {
         self.change_sequence = sequence;
         self.state = state;
         self.log_bytes += frame.len() as u64;
+        if records.iter().any(|record| matches!(record, Record::Bootstrap(_) | Record::Install(_))
+            || matches!(record, Record::Entries { entries, .. } if entries.iter().any(|e| matches!(e.command, crate::raft::Command::Members(_))))) {
+            let membership = self.state.membership();
+            let slot = membership.slot(&self.identity.current);
+            let accepted = slot.is_some_and(|id| membership.members().contains(&id))
+                && self.identity.pending.as_ref().is_none_or(|r| !membership.members().contains(&r.previous));
+            self.identity.slot = slot.or(self.identity.slot);
+            self.identity.membership = Some(membership);
+            self.identity.founders = self.state.founders.clone();
+            if accepted { self.identity.pending = None; }
+            if let Err(error) = append_identity(&mut self._ownership, &self.identity) {
+                self.failed = true;
+                return Err(error);
+            }
+        }
         Ok(())
     }
     pub fn snapshot_due(&self, min_bytes: u64, seconds: u64, now: u64) -> bool {
@@ -447,6 +525,134 @@ impl Journal {
         self.file = File::open(self.directory.join("identity")).unwrap();
     }
 }
+// Identity updates are append-only on the locked inode. Only membership/recovery
+// changes write here; votes still require just the existing journal write.
+fn append_identity(file: &mut File, local: &LocalIdentity) -> Result<()> {
+    let bytes = encode(local)?;
+    let length = bytes.len() as u64;
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(&length.to_le_bytes())?;
+    file.write_all(&(!length).to_le_bytes())?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+fn read_identity(file: &mut File) -> Result<Option<LocalIdentity>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let mut offset = 0;
+    let mut last = None;
+    while bytes.len() - offset >= 16 {
+        let length = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let inverse = u64::from_le_bytes(bytes[offset + 8..offset + 16].try_into().unwrap());
+        if inverse != !length || length > LIMIT as u64 || length < 32 {
+            return Err(Error::new("invalid local identity frame"));
+        }
+        let end = offset + 16 + length as usize;
+        if end > bytes.len() {
+            break;
+        }
+        last = Some(decode(&bytes[offset + 16..end])?);
+        offset = end;
+    }
+    if offset != bytes.len() {
+        // No process could advertise an update until this whole frame was synced.
+        file.set_len(offset as u64)?;
+        file.sync_all()?;
+    }
+    Ok(last)
+}
+fn prepare_recovery(
+    directory: &Path,
+    ownership: &mut File,
+    local: &mut LocalIdentity,
+    mut state: State,
+) -> Result<()> {
+    let current = common::ring::MemberIdentity::generate()?;
+    let membership = local
+        .membership
+        .clone()
+        .filter(|m| !m.old.is_empty())
+        .unwrap_or_else(|| state.membership());
+    let slot = local.slot.or_else(|| membership.slot(&local.current));
+    let pending = if let Some(previous) = slot {
+        let next = previous
+            .checked_add(INCARNATION)
+            .filter(|id| *id != crate::raft::UNASSIGNED)
+            .ok_or_else(|| Error::new("member incarnations exhausted"))?;
+        Some(Retirement {
+            previous,
+            old: Member { identity: local.current.clone(), process: local.process.clone() },
+            next,
+            member: Member { identity: current.clone(), process: local.process.clone() },
+        })
+    } else {
+        None
+    };
+    // Keep the last verified committed prefix. Never apply records across a hole.
+    let mut snapshot = state.capture();
+    snapshot.membership = membership;
+    state.snapshot = snapshot;
+    state.log.clear();
+    state.vote = None;
+    state.founders = state.founders.or_else(|| local.founders.clone());
+    if let Some(retired) = &pending {
+        state.apply(&Record::Retired(retired.clone()))?;
+    }
+    state.validate()?;
+    let checkpoint_name = format!("recovery-{current}.bin");
+    let checkpoint =
+        Checkpoint { sequence: 0, second: common::time::TimeSec::now().number(), state };
+    publish(&directory.join(&checkpoint_name), &encode(&checkpoint)?)?;
+    let mut files: Vec<String> = numbered(directory, "snapshot")?
+        .into_iter()
+        .chain(numbered(directory, "journal")?)
+        .map(|(_, path)| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    if directory.join(CURRENT).try_exists()? {
+        files.push(CURRENT.into());
+    }
+    local.retired.push(local.current.clone());
+    local.current = current.clone();
+    local.slot = pending.as_ref().map(|r| r.next);
+    local.pending = pending;
+    local.recovery = Some(RecoveryPlan {
+        archive: format!("retired-{current}"),
+        checkpoint: checkpoint_name,
+        files,
+    });
+    // Retirement is durable before moving history or advertising the replacement.
+    append_identity(ownership, local)?;
+    finish_recovery(directory, ownership, local)
+}
+fn finish_recovery(
+    directory: &Path,
+    ownership: &mut File,
+    local: &mut LocalIdentity,
+) -> Result<()> {
+    let plan = local.recovery.clone().ok_or_else(|| Error::new("missing recovery plan"))?;
+    let bytes = std::fs::read(directory.join(&plan.checkpoint))?;
+    let checkpoint: Checkpoint = decode(&bytes)?;
+    let archive = directory.join(&plan.archive);
+    std::fs::create_dir_all(&archive)?;
+    sync_directory(directory)?;
+    for name in &plan.files {
+        let destination = archive.join(name);
+        if !destination.try_exists()? {
+            std::fs::rename(directory.join(name), destination)?;
+        }
+    }
+    sync_directory(&archive)?;
+    sync_directory(directory)?;
+    publish(&directory.join(CURRENT), &journal_header(&checkpoint.state.ring, 1))?;
+    publish(&named(directory, "snapshot", 0), &bytes)?;
+    local.initialized = true;
+    local.recovery = None;
+    append_identity(ownership, local)?;
+    Ok(())
+}
+
 pub struct PendingSnapshot {
     path: PathBuf,
     bytes: Vec<u8>,
@@ -561,7 +767,7 @@ fn publish_cancellable(path: &Path, bytes: &[u8], cancelled: impl Fn() -> bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::{Command, Entry, Node};
+    use crate::raft::{Command, Entry, Members, Node, Storage};
     #[test]
     fn local_identity_keeps_retired_ids_and_detects_corruption() {
         let local = LocalIdentity {
@@ -569,6 +775,12 @@ mod tests {
             process: "routing-label".into(),
             current: common::ring::MemberIdentity::try_from("02".repeat(64)).unwrap(),
             retired: vec![common::ring::MemberIdentity::try_from("03".repeat(64)).unwrap()],
+            slot: None,
+            membership: None,
+            founders: None,
+            initialized: false,
+            pending: None,
+            recovery: None,
         };
         let mut bytes = encode(&local).unwrap();
         let restored: LocalIdentity = decode(&bytes).unwrap();
@@ -589,6 +801,95 @@ mod tests {
         assert_eq!(start, 12345);
         assert!(corrupt.is_err());
         assert!(zero.is_err());
+    }
+
+    #[test]
+    #[ignore = "filesystem integration; run explicitly with --ignored"]
+    fn record_hole_retires_identity_and_primary_list_ends_pending_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = crate::raft::tests::names()[&0].identity.clone();
+        provision_test_founder(dir.path(), &initial().ring, "member-0", old.clone()).unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
+        for term in 1..=3 {
+            journal.write(&[Record::Hard { term, vote: Some(0) }]).unwrap();
+        }
+        drop(journal);
+        let path = dir.path().join(CURRENT);
+        let bytes = std::fs::read(&path).unwrap();
+        let frame_end = |offset: usize| {
+            offset + 16 + u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize
+        };
+        let first_end = frame_end(HEADER as usize);
+        let second_end = frame_end(first_end);
+        std::fs::write(&path, [&bytes[..first_end], &bytes[second_end..]].concat()).unwrap();
+        let mut recovered = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
+        let retired = recovered.pending_replacement().unwrap();
+        assert_eq!(retired.previous, 0);
+        assert_eq!(retired.next, INCARNATION);
+        assert_eq!(retired.old.identity, old);
+        assert_eq!(recovered.state.term, 1); // Never replayed term 3 across the missing record.
+        assert_eq!(recovered.state.vote, None);
+        let mut membership = recovered.state.membership();
+        membership.old = Members::from([retired.next]);
+        // Receipt of the primary's final list clears pending state, even before
+        // a later commit marker is observed, as required by the admission protocol.
+        recovered
+            .write(&[Record::Entries {
+                from: 1,
+                entries: vec![Entry { index: 1, term: 1, command: Command::Members(membership) }],
+            }])
+            .unwrap();
+        assert!(recovered.pending_replacement().is_none());
+        let current = recovered.identity.current.clone();
+        drop(recovered);
+        let restarted = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
+        assert_eq!(restarted.identity.current, current);
+        assert!(restarted.pending_replacement().is_none());
+        assert_eq!(restarted.identity.retired, vec![old]);
+    }
+
+    #[test]
+    #[ignore = "filesystem integration; run explicitly with --ignored"]
+    fn interrupted_recovery_resumes_the_recorded_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = crate::raft::tests::names()[&0].identity.clone();
+        provision_test_founder(dir.path(), &initial().ring, "member-0", old.clone()).unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
+        journal.write(&[Record::Hard { term: 2, vote: Some(0) }]).unwrap();
+        let mut local = journal.identity.clone();
+        drop(journal);
+        let new = common::ring::MemberIdentity::generate().unwrap();
+        let retirement = Retirement {
+            previous: 0,
+            old: Member { identity: old.clone(), process: "member-0".into() },
+            next: INCARNATION,
+            member: Member { identity: new.clone(), process: "member-0".into() },
+        };
+        let mut state = initial();
+        state.apply(&Record::Retired(retirement.clone())).unwrap();
+        let checkpoint = Checkpoint { sequence: 0, second: 1, state };
+        publish(&dir.path().join("recovery-test.bin"), &encode(&checkpoint).unwrap()).unwrap();
+        local.retired.push(old);
+        local.current = new.clone();
+        local.slot = Some(INCARNATION);
+        local.pending = Some(retirement);
+        local.recovery = Some(RecoveryPlan {
+            archive: "retired-test".into(),
+            checkpoint: "recovery-test.bin".into(),
+            files: vec![CURRENT.into(), "snapshot-00000000000000000000.bin".into()],
+        });
+        let mut file =
+            OpenOptions::new().read(true).write(true).open(dir.path().join("identity")).unwrap();
+        append_identity(&mut file, &local).unwrap();
+        drop(file);
+        std::fs::create_dir(dir.path().join("retired-test")).unwrap();
+        std::fs::rename(dir.path().join(CURRENT), dir.path().join("retired-test").join(CURRENT))
+            .unwrap();
+        let recovered = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
+        assert_eq!(recovered.identity.current, new);
+        assert_eq!(recovered.identity.retired.len(), 1);
+        assert!(recovered.identity.recovery.is_none());
+        assert!(recovered.pending_replacement().is_some());
     }
 
     #[test]
@@ -638,9 +939,13 @@ mod tests {
             } else {
                 std::fs::remove_file(dir.path().join(CURRENT)).unwrap();
             }
-            let recovered = Journal::open(dir.path(), initial(), 3, "KS0");
-            assert!(recovered.is_err());
-            assert!(!dir.path().join(CURRENT).exists());
+            let recovered = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+            assert_eq!(recovered.identity.retired.len(), 1);
+            assert!(dir.path().join(CURRENT).exists());
+            let replacement = recovered.identity.current.clone();
+            drop(recovered);
+            let restarted = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+            assert_eq!(restarted.identity.current, replacement);
         }
     }
 
@@ -672,6 +977,7 @@ mod tests {
         let mut journal = Journal::open(dir.path(), empty.clone(), 3, "member-0").unwrap();
         let id = journal.identity.current.clone();
         let membership = crate::raft::Membership {
+            retired: Default::default(),
             identities: std::collections::BTreeMap::from([(
                 0,
                 crate::raft::Member { identity: id.clone(), process: "member-0".into() },
@@ -1036,12 +1342,21 @@ pub fn provision_test_founder(
         .mode(0o600)
         .open(directory.join("identity"))?;
     file.try_lock().context("locking founding identity")?;
-    file.write_all(&encode(&LocalIdentity {
-        ring: ring.into(),
-        process: process.into(),
-        current,
-        retired: vec![],
-    })?)?;
+    append_identity(
+        &mut file,
+        &LocalIdentity {
+            ring: ring.into(),
+            process: process.into(),
+            current,
+            retired: vec![],
+            slot: None,
+            membership: None,
+            founders: None,
+            initialized: false,
+            pending: None,
+            recovery: None,
+        },
+    )?;
     file.sync_all()?;
     sync_directory(directory)
 }

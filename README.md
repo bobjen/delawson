@@ -348,7 +348,8 @@ preserved on retry, not replaced. Later applicants have no configured slot: the
 primary assigns one during membership admission.
 The locked local `identity` file preserves that ID across restarts; copy peer
 history without copying their identity file. `status` reports `raft_member_id` and
-`raft_member_slot` (initially `none` for an applicant). Locked members can vote and journal
+`raft_member_slot` (initially `none` for an ordinary applicant),
+`raft_member_incarnation`, and `raft_lost_state`. Locked members can vote and journal
 entries toward commitment. An unlocked member can unlock authenticated peers.
 Key reads reuse quorum heartbeat acknowledgments for a 150 ms lease measured
 from send time. A shared incoming-client gate requires the
@@ -373,12 +374,31 @@ Filenames use a physical journal batch sequence, distinct from the Raft log inde
 Bootstrap creates snapshot zero. Rotation renames `current.log` to its numbered
 name, syncs the directory, then creates and durably publishes a new `current.log`.
 The header records its starting sequence, including when it is empty. A missing
-active journal in an existing store fails startup as possible voting-state loss;
-it is never silently recreated. Automatic rejoining under a new identity remains
-future work. Rotation precedes snapshot publication and carries
+active journal or a gap in the required replay suffix retires the local identity.
+Recovery archives the old files, preserves the verified committed prefix, and
+starts a fresh random identity in the same logical slot with a new incarnation.
+Retirement is durable before the new member can send messages; interrupted
+recovery resumes the same identity. Corrupt frames and wrong-ring files still
+fail recovery. Rotation precedes snapshot publication and carries
 any uncommitted suffix into the new journal. An incomplete final active frame can
 be discarded; complete corruption fails recovery. Earlier pre-Raft formats are
 refused without migration.
+
+A pending replacement sends an old-to-new retirement pair along with its campaigns.
+It adds `lost_state_election_delay_ms = 200` to every campaign schedule, in addition
+to any cold/checkpoint delay; the campaign lifetime remains `election_min_ms`.
+Retirement is no successful vote. Ordinary joint membership requires both quorums;
+a retirement majority of the old set allows the replacement electorate to act.
+A primary treats validated same-slot retirement as an implicit replacement request,
+not as permission to admit unrelated applicants. Receipt of its member list
+including the new member and excluding the old ends both retirement replies and
+the extra delay. The old identity remains recorded locally.
+
+Checkpoint fetching tries secondaries first, then the primary's existing checkpoint
+if no secondary supplies one. Primaries still write checkpoints only in singleton
+rings. Divergent forgotten histories with reused term/index values remain the
+known limitation tracked in [#127](https://github.com/bobjen/delawson/issues/127);
+SCN/fingerprint detection and undo/redo repair are deferred.
 
 Snapshot defaults are one day or new journal bytes reaching the larger of the
 previous snapshot size and `snapshot_min_log_bytes = 1048576`. Only changed state

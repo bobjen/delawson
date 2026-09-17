@@ -99,8 +99,12 @@ mod tests {
     }
     #[test]
     fn no_post_election_wait_and_send_time_expiry_boundaries() {
-        let membership =
-            Membership { identities: crate::raft::tests::names(), old: members(3), new: None };
+        let membership = Membership {
+            retired: Default::default(),
+            identities: crate::raft::tests::names(),
+            old: members(3),
+            new: None,
+        };
         let mut lease = Lease::elected(2, ms(1000));
         lease.acknowledge(&1, 2, ms(1100));
         let early = lease.valid(2, &0, &membership, ms(1149));
@@ -114,8 +118,12 @@ mod tests {
     }
     #[test]
     fn delayed_responses_old_terms_and_restart_do_not_extend_lease() {
-        let membership =
-            Membership { identities: crate::raft::tests::names(), old: members(3), new: None };
+        let membership = Membership {
+            retired: Default::default(),
+            identities: crate::raft::tests::names(),
+            old: members(3),
+            new: None,
+        };
         let mut lease = Lease::elected(4, ms(1000));
         lease.acknowledge(&1, 3, ms(1200));
         lease.acknowledge(&2, 4, ms(999));
@@ -137,8 +145,12 @@ mod tests {
     fn joint_configuration_needs_both_majorities() {
         let old = members(3);
         let new = members(5).into_iter().filter(|id| id != &1 && id != &2).collect();
-        let membership =
-            Membership { identities: crate::raft::tests::names(), old, new: Some(new) };
+        let membership = Membership {
+            retired: Default::default(),
+            identities: crate::raft::tests::names(),
+            old,
+            new: Some(new),
+        };
         let mut lease = Lease::elected(1, ms(0));
         lease.acknowledge(&1, 1, ms(100));
         let old_only = lease.valid(1, &0, &membership, ms(160));
@@ -169,8 +181,12 @@ mod tests {
 
         config = RaftConfig { election_min_ms: 220, ..RaftConfig::default() };
         let valid_config = config.validate_timing();
-        let membership =
-            Membership { identities: crate::raft::tests::names(), old: members(3), new: None };
+        let membership = Membership {
+            retired: Default::default(),
+            identities: crate::raft::tests::names(),
+            old: members(3),
+            new: None,
+        };
         let mut lease = Lease::configured(&config);
         lease.start(1, ms(0));
         lease.acknowledge(&1, 1, ms(100));

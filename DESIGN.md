@@ -18574,15 +18574,16 @@ starting sequence so an empty active file can be named correctly after restart.
 A snapshot retry with no intervening writes reuses the empty active journal.
 Any rotation I/O failure fences further journal writes. A crash between rename
 and publication leaves the fixed name missing. Recovery treats a missing active
-journal in an existing store as possible voting-state loss and refuses to resume
-that identity; it does not promote an older numbered file or create a replacement.
-Automatic retirement and rejoining under a new identity remain subsequent work.
+journal in an existing store, or a missing batch/segment in its required replay
+suffix, as voting-state loss. It retires that identity before creating its
+replacement; an older numbered file is never promoted to current.log.
 
 A snapshot at physical sequence 100 is followed by a journal starting at 101. If that snapshot
 never appears, recovery starts with an earlier snapshot and reads every later
 journal, including 101, and finally `current.log`. Header and filename starting
 sequences must agree; sequence continuity is checked. Temporary files are ignored.
-A missing snapshot beside nonempty journals is an error.
+Missing all snapshots in an initialized store also triggers identity retirement.
+Wrong-ring headers, inconsistent filenames, and corrupt frames remain errors.
 
 `snapshot_retain` defaults to ten and must be positive. Keep the newest configured
 count and every journal after the oldest retained snapshot. If fewer snapshots
@@ -18627,7 +18628,11 @@ Checksums and encrypted-key authentication remain separate checks. Key encryptio
 also binds to this identity, so keys cannot be silently relabeled across rings.
 The directory's `identity` file is a checksummed local record containing the ring
 identifier, routing label, current 64-byte random member identifier, and a list of
-retired member identifiers. It is not copied with peer checkpoints or journals.
+retired member identifiers, the last known slot/member list, and any pending
+recovery plan. It uses checksummed append-only frames, so updates preserve the
+locked inode and an incomplete final update can be discarded. Identity updates
+occur for membership and recovery changes, not on every vote. It is not copied
+with peer checkpoints or journals.
 An exclusive lifetime lock on this stable inode prevents two processes from opening
 the same store. Do not rename or replace this file while its owner is running.
 
@@ -18642,7 +18647,12 @@ chosen membership before distributing it, and removes the marker (with directory
 fsync) after all founders acknowledge. Retries and coordinator restarts reuse the
 recorded table; recipients reject a conflicting table. Other founders need no
 marker. New applicants receive this founding table before catching up, without
-being assigned a slot by bootstrap.
+being assigned a slot by bootstrap. The bootstrap message also supplies the current
+peer identity mappings, so a replacement or later-added primary can deliver
+catch-up traffic even though it was not a founder. These mappings are journaled
+as local contact metadata, separate from voting membership; learning a contact
+neither grants votes nor changes the electorate. Membership entries establish
+that view as the applicant catches up.
 
 **WARNING: Adding `need-bootstrap` to a running member requests bootstrap on its
 next restart. It is a creation instruction, not a repair procedure.** A running
@@ -18653,24 +18663,73 @@ KS routing label in each ring and refuses a nonempty directory. `start-laws`
 invokes it only when creating its ring manifest, not during ordinary restarts.
 Without a local identity and without history, startup generates a fresh applicant
 ID even if its routing label appears in the founding configuration. Missing
-identity beside history fails startup pending state-loss recovery work. The local
+identity beside history fails startup; recovery cannot invent a retirement identity. The local
 identity file never acquires a peer's identity during state recovery.
 
 Raft membership persists slot-to-(random identifier, routing label) mappings.
 The primary assigns an unused slot to a newly requested identity; retries preserve
-the assignment and retired slots are not rebound. `laws raft-members --members-file`
+the assignment. Compact member addresses use a 32-bit logical slot and a 32-bit
+incarnation in a u64. Ordinary new members get fresh logical slots; same-slot
+replacements advance the incarnation. Full member addresses are never rebound. `laws raft-members --members-file`
 accepts a JSON list of enrolled routing labels. Existing members need not be online
 to retain their assignments; for new applicants the primary queries their persistent
 identifier over the authenticated ring connection before proposing membership.
 Ordinary Raft messages identify senders by slot. Slotless applicants use their full
 identifier for identity queries and checkpoint recovery, and cannot vote or campaign.
+A recovering replacement has a known logical slot and may campaign as described below.
 A catching-up member can answer replication with its full identifier until its
 membership entry arrives; afterward it uses the assigned slot. Status exposes
 `raft_member_id` and `raft_member_slot` (`none` until assigned).
 
-The retired-identifier list is reserved for subsequent state-loss handling. Rotating
-member identities after a missing current journal, sending retirement responses,
-and automatic replacement after state loss are not implemented by this identity change.
+### Detected state loss and replacement admission
+
+Recovery keeps the last verified committed prefix, stops at a journal gap, and
+clears the lost identity's vote. Before moving files it durably appends a fresh
+random identity, the old-to-new pair, and a recovery plan to the local identity
+file. Existing snapshots/journals are moved into `retired-<new-identity>/`; a
+checksummed recovery checkpoint initializes a fresh snapshot zero and current.log.
+Restart during this sequence resumes the recorded plan and identity, never chooses
+another replacement. The archived files and recovery checkpoint are retained for
+investigation; normal snapshot pruning does not remove these recovery archives.
+
+Retirement pairs retain the logical slot, advance its incarnation, and bind both
+random identities to the same admitted route/machine. They are recorded locally
+in the Raft journal as metadata, independently of log commitment. Messages carry
+a target member address, so an old incarnation's request cannot be answered with
+a successful vote/ack from its replacement. Retired senders cannot advance terms
+or renew leadership. Pending replacements attach their retirement pair to traffic
+and return it when addressed as the old member on a consensus request.
+
+A replacement may campaign, adding `lost_state_election_delay_ms` (default 200 ms)
+to each randomized campaign schedule plus any cold/checkpoint penalty. This is a
+constant addition each time, not a cumulative backoff, and it does not extend the
+strict `election_min_ms` campaign lifetime. Ordinary slotless applicants still
+cannot campaign. Voters without a retirement majority reject the replacement's
+campaign unless an ordinary joint configuration has admitted it.
+
+Retirement is no successful vote. Normally a joint membership requires majorities
+of both sets. If a majority of the old set has irreversibly retired, its quorum
+requirement can be waived; the replacement set still needs a real voting quorum.
+Before a primary has published the replacement list, an observer with a retirement
+majority uses the known one-for-one replacements to form its electorate. Different
+observers can temporarily have different replacement knowledge. Incarnations keep
+old and new responses distinct; retirement does not change the logical ring size.
+
+A primary hearing a validated retirement pair for an existing slot implicitly
+proposes the corresponding replacement membership. It does not automatically admit
+unrelated applicants. Once the primary's member list includes the replacement and
+excludes the old member, both the retirement replies and extra campaign penalty
+end, including after restart. This is based on receipt of that list, rather than
+waiting for a later commit marker. Permanent local identity history still prevents
+reviving the retired identity.
+
+Forgetting history can later expose a conflicting old prefix with matching
+(term,index), even when all elections respected their deadlines. Detection and
+repair are explicitly deferred in [#127](https://github.com/bobjen/delawson/issues/127).
+The intended resolution is that the current primary wins, with either full history
+replacement or eventual rollback to the common point and replay of its suffix.
+SCNs/history fingerprints and undo/redo remain future work. This recovery extension
+does not claim ordinary Raft's committed-history preservation after state loss.
 
 **DANGER: `ignore_ring_identity = true` in `process.toml` IS A GOOD WAY TO LOSE
 ALL YOUR DATA.** This explicitly requested debugging escape hatch bypasses ring
@@ -18733,9 +18792,15 @@ produce checkpoints; singleton rings may use one.
 
 Only applying, unlocked followers produce checkpoints, except that a singleton
 primary still produces its own. A checkpoint producer can campaign while continuing its write; it cancels
-unfinished production only if elected primary. The primary never serves checkpoint contents: when a follower needs
+unfinished production only if elected primary. The primary normally does not serve checkpoint contents: when a follower needs
 compacted history, it sends a boundary reference and the follower fetches a
-checkpoint from another member. Any nonprimary can serve its durable checkpoint,
+checkpoint from another member. After all secondary sources fail to provide a
+newer checkpoint, it can ask the primary for the primary's existing checkpoint.
+This fallback does not request checkpoint production on a multi-member primary.
+The ordering avoids load on the primary. Extent-instance replacement follows the
+same rationale: consult other copies before asking the vacating machine for its
+instance.
+Any nonprimary can serve its durable checkpoint,
 including a locked or cold member. On reaching the checkpoint threshold, primaries
 and cold members copy from peers; if necessary they request an applying follower
 to produce a newer checkpoint. If no source is available, journals are retained.
