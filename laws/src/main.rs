@@ -7,6 +7,7 @@
 //! configuration, to find the service directory.
 
 mod client;
+mod offline_logs;
 mod operator;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -218,10 +219,12 @@ enum Cmd {
     /// What a process logs, by site, busiest first: the live counters.
     Sites,
     /// A histogram of a process's log files: a row per place in the code that said
-    /// anything, most frequent first. Read the bottom for what happened once, which
+    /// anything, rarest first. Read the top for what happened once, which
     /// is how a rare event is found without knowing what to look for; then grep for
     /// that row.
     LogHistogram {
+        #[command(flatten)]
+        local: offline_logs::LocalLogs,
         /// Narrow it to a window, which is usually what a rare event wants.
         #[arg(long, default_value = "")]
         from: String,
@@ -233,6 +236,8 @@ enum Cmd {
     },
     /// Whole log lines containing something.
     LogGrep {
+        #[command(flatten)]
+        local: offline_logs::LocalLogs,
         what: String,
         #[arg(long, default_value = "")]
         from: String,
@@ -245,6 +250,8 @@ enum Cmd {
     },
     /// Log lines between two times, or the last few.
     LogLines {
+        #[command(flatten)]
+        local: offline_logs::LocalLogs,
         #[arg(long, default_value = "")]
         from: String,
         #[arg(long, default_value = "")]
@@ -622,6 +629,9 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::UnlockRecover { share, output } => return operator::reconstruct(share, output),
         _ => {}
+    }
+    if offline_logs::run(&cli.cmd)? {
+        return Ok(());
     }
     let mut cluster = ClusterConfig::load(&cli.config)?;
     if let Some(path) = &cli.machine_identity {
@@ -2225,21 +2235,26 @@ fn build(cmd: &Cmd) -> Result<Req> {
         }
         Cmd::RaftMembers { members_file } => {
             let mut payload = common::wire::StructWriter::new();
-            payload.bytes(&std::fs::read(members_file)?);
+            let members: Vec<String> = serde_json::from_slice(&std::fs::read(members_file)?)
+                .map_err(|e| common::Error::new(e.to_string()))?;
+            payload.number_u64(members.len() as u64);
+            for member in members {
+                payload.text(&member);
+            }
             Req::new(Op::RaftMembers).structure(payload)
         }
         Cmd::RotateMasterKey => {
             Req::new(Op::RotateMasterKey).structure(common::wire::StructWriter::new())
         }
 
-        Cmd::LogHistogram { from, to, which } => {
+        Cmd::LogHistogram { from, to, which, .. } => {
             let mut payload = common::wire::StructWriter::new();
             payload.text(which);
             payload.text(from);
             payload.text(to);
             Req::new(Op::LogHistogram).structure(payload)
         }
-        Cmd::LogGrep { what, from, to, limit, which } => {
+        Cmd::LogGrep { what, from, to, limit, which, .. } => {
             let mut payload = common::wire::StructWriter::new();
             payload.text(which);
             payload.text(what);
@@ -2248,7 +2263,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
             payload.number_u64(*limit as u64);
             Req::new(Op::LogGrep).structure(payload)
         }
-        Cmd::LogLines { from, to, limit, which } => {
+        Cmd::LogLines { from, to, limit, which, .. } => {
             let mut payload = common::wire::StructWriter::new();
             payload.text(which);
             payload.text(from);

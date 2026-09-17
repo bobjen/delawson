@@ -29,7 +29,9 @@ scripts/stop-laws               # stop everything, either flavour
 
 laws create /bob/notes --flavor keyed   # laws -> FE -> DN -> SN
 laws object-info /bob/notes             # laws -> FE -> DN
-laws log-histogram --to DN0 --width 1   # what DN0 is mostly saying
+laws log-histogram --to DN0           # what DN0 is mostly saying
+laws log-histogram --path /saved/logs --log-name dn0  # no running cluster needed
+laws log-grep "Raft" --path /saved/ks0-member0-0000000.zst
 logs --dir run/DN0/logs --of dn0 grep "an error"   # or read the files directly
 ```
 
@@ -350,7 +352,10 @@ The locked local `identity` file preserves that ID across restarts; copy peer
 history without copying their identity file. `status` reports `raft_member_id` and
 `raft_member_slot` (initially `none` for an ordinary applicant),
 `raft_member_incarnation`, and `raft_lost_state`. Locked members can vote and journal
-entries toward commitment. An unlocked member can unlock authenticated peers.
+entries toward commitment. Shared consensus and persistence live in [`raft/`](raft/README.md).
+One `raft-main` thread owns consensus state; a separate `raft-application` thread
+synchronously applies committed client action lists under the global write lock.
+Both use blocking queue wakeups rather than idle application polling. An unlocked member can unlock authenticated peers.
 Key reads reuse quorum heartbeat acknowledgments for a 150 ms lease measured
 from send time. A shared incoming-client gate requires the
 current-term no-op committed/applied before dispatch. Requests admitted under a
@@ -419,7 +424,7 @@ cargo test -p delawson-ks --features delawson-common/testing
 Occasional filesystem and process integration checks:
 
 ```sh
-cargo test -p delawson-ks --features delawson-common/testing -- --ignored
+cargo test -p delawson-raft -p delawson-ks --features delawson-common/testing -- --ignored
 cargo build --workspace
 scripts/test-ks-raft
 scripts/test-machine-auth

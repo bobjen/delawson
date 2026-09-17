@@ -1,8 +1,6 @@
 //! KS: process registry and encrypted, journaled master-key epochs.
-mod application;
-mod journal;
-mod lease;
-mod raft;
+use raft::runtime::Host;
+use raft::{journal, lease};
 mod runtime;
 
 use common::config::KsConfig;
@@ -16,7 +14,7 @@ use common::{Context, Result};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, RwLock};
 
 #[derive(Clone)]
@@ -40,36 +38,27 @@ struct KeyHistory {
     applied: u64,
 }
 
+impl raft::execution::Application for KeyHistory {
+    fn applied(&self) -> u64 {
+        self.applied
+    }
+    fn set_applied(&mut self, index: u64) {
+        self.applied = index;
+    }
+}
+
 struct Ks {
+    common: raft::runtime::Runtime<KeyHistory>,
     config: KsConfig,
-    placement: Mutex<application::Placement>,
-    applying: AtomicBool,
-    producing_snapshot: AtomicBool,
-    cancel_snapshot: AtomicBool,
-    checkpoint_lease: Mutex<application::CheckpointLease>,
-    checkpoint_started: AtomicU64,
-    checkpoint_requested: AtomicBool,
-    checkpoint_needed: AtomicU64,
-    snapshot_stopping: AtomicBool,
-    snapshot_task: Mutex<()>,
     unlock_verifier: Option<[u8; 32]>,
-    /// Whether the operator-and-hardware ceremony has been performed. Until it
-    /// has, the master keys on disk cannot be decrypted, so no key request can
-    /// be answered.
-    unlocked: AtomicBool,
-    /// In memory only, so a KS restart makes every other process re-register.
-    peers: Mutex<BTreeMap<String, Peer>>,
-    /// Serializes proposals and disk I/O, without blocking reads of committed keys.
-    journal: Mutex<raft::Node>,
-    runtime: runtime::Settings,
-    transport: Option<common::peer::Peers>,
     unlock_key: Mutex<Option<[u8; 32]>>,
-    unlock_requests: Mutex<std::collections::BTreeSet<raft::MemberId>>,
-    proposing: Mutex<()>,
-    raft_workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
-    /// The process-wide global lock: application takes write access; key serving takes read access.
-    /// Master keys are sorted by the second at which each becomes effective.
-    global_lock: RwLock<KeyHistory>,
+    peers: Mutex<BTreeMap<String, Peer>>,
+}
+impl std::ops::Deref for Ks {
+    type Target = raft::runtime::Runtime<KeyHistory>;
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
 }
 
 const SERVES: &[Op] = &[
@@ -98,7 +87,7 @@ impl Service for Ks {
     }
 
     fn defers(&self, op: Op) -> bool {
-        SERVES.contains(&op) && !matches!(op, Op::Unlock | Op::Register)
+        SERVES.contains(&op) && op != Op::Register
     }
     fn handle(
         self: &std::sync::Arc<Self>,
@@ -106,7 +95,7 @@ impl Service for Ks {
         request: Req,
         reply: server::Reply,
     ) {
-        if !runtime::waits_for_quorum(&request) {
+        if !runtime::needs_request_worker(&request) {
             reply.send(self.answer(process, &request));
             return;
         }
@@ -169,7 +158,7 @@ impl Service for Ks {
             format!("lazy_day_keys {}", self.config.lazy_day_keys),
             format!("require_unlock {}", self.config.require_unlock),
             format!("inline_ping {}", self.config.inline_ping),
-            format!("unlocked {}", self.unlocked.load(Ordering::SeqCst)),
+            format!("unlocked {}", self.ready.load(Ordering::SeqCst)),
             format!("registered {}", self.peers.lock().expect("peers").len()),
             format!("master_keys {key_count}"),
             format!("applied_commit {applied}"),
@@ -189,7 +178,7 @@ impl Ks {
             }
         }
         // Key generation is internal maintenance; proposals still require write authority.
-        if request.op == Op::SnMasterKey && self.unlocked.load(Ordering::SeqCst) {
+        if request.op == Op::SnMasterKey && self.ready.load(Ordering::SeqCst) {
             if let Err(e) = self.prepare_key_read() {
                 return Resp::error(Status::Internal, e.to_string());
             }
@@ -208,7 +197,7 @@ impl Ks {
                 None => Resp::error(Status::Internal, "missing admitted key history"),
             },
             Op::RotateMasterKey => {
-                if !self.unlocked.load(Ordering::SeqCst) {
+                if !self.ready.load(Ordering::SeqCst) {
                     return Resp::error(Status::Locked, "KS is locked");
                 }
                 match self.rotate_master_key(request) {
@@ -222,6 +211,7 @@ impl Ks {
 
     fn stop_snapshot_worker(&self) -> Result<()> {
         self.snapshot_stopping.store(true, Ordering::SeqCst);
+        self.wake_execution();
         loop {
             let handles = std::mem::take(
                 &mut *self
@@ -244,7 +234,7 @@ impl Ks {
 
     #[cfg(test)]
     fn new(config: KsConfig, path: &std::path::Path) -> Result<Ks> {
-        let settings = runtime::Settings::testing(&config);
+        let settings = runtime::Settings::testing(&config.raft);
         // Test ring creation performs the same explicit provisioning as start-laws.
         if !path.join("identity").exists() {
             journal::provision_test_founder(
@@ -290,42 +280,18 @@ impl Ks {
             node.campaign()?;
         }
         let test_mode = !config.require_unlock;
-        let membership = node.state().membership();
-        let placement = application::Placement::new(
-            &membership.replacements(&membership.members()),
-            config.raft.apply_members,
-        );
-        let transport = runtime.messaging.as_ref().map(|messaging| {
-            let mut messaging = messaging.clone();
-            messaging.peer_conns = 1;
-            common::peer::Peers::new(
-                messaging,
-                std::time::Duration::from_millis(config.raft.request_timeout_ms),
-            )
-        });
+        let options = raft::runtime::Options {
+            raft: config.raft.clone(),
+            snapshot_min_log_bytes: config.snapshot_min_log_bytes,
+            snapshot_interval_secs: config.snapshot_interval_secs,
+            allow_stale_reads: config.knobs.allow_stale_reads,
+        };
         let ks = Ks {
-            transport,
-            applying: AtomicBool::new(placement.selected.contains(&id)),
-            placement: Mutex::new(placement),
-            producing_snapshot: AtomicBool::new(false),
-            cancel_snapshot: AtomicBool::new(false),
-            checkpoint_lease: Mutex::new(application::CheckpointLease::default()),
-            checkpoint_started: AtomicU64::new(0),
-            checkpoint_requested: AtomicBool::new(false),
-            checkpoint_needed: AtomicU64::new(0),
             config,
-            runtime,
-            snapshot_stopping: AtomicBool::new(false),
-            snapshot_task: Mutex::new(()),
-            raft_workers: Mutex::new(vec![]),
-            proposing: Mutex::new(()),
-            unlock_key: Mutex::new(None),
-            unlock_requests: Mutex::new(std::collections::BTreeSet::new()),
             unlock_verifier,
-            unlocked: AtomicBool::new(false),
+            unlock_key: Mutex::new(None),
             peers: Mutex::new(BTreeMap::new()),
-            journal: Mutex::new(node),
-            global_lock: RwLock::new(KeyHistory::default()),
+            common: raft::runtime::Runtime::new(runtime, node, options),
         };
         if test_mode {
             ks.open_keys(crypto::MASTER_KEY)?;
@@ -334,21 +300,36 @@ impl Ks {
     }
 
     fn open_keys(&self, key: [u8; 32]) -> Result<()> {
-        let mut node = self.journal.lock().map_err(|_| common::Error::new("Raft lock poisoned"))?;
-        // The unlock verifier authenticates cold-member unlocks without applying history.
-        let history = if node.role == raft::Role::Leader || self.applying.load(Ordering::SeqCst) {
-            runtime::decode_history(node.state(), &key)?
-        } else {
-            KeyHistory::default()
-        };
+        let _active =
+            self.active_work.lock().map_err(|_| common::Error::new("active execution poisoned"))?;
+        if self.ready.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let (state, apply) = self.on_raft(|host, node| {
+            Ok((
+                node.state().clone(),
+                node.role == raft::Role::Leader || host.applying.load(Ordering::SeqCst),
+            ))
+        })?;
+        // Decryption and application locking happen outside the consensus loop.
+        let history =
+            if apply { runtime::decode_history(&state, &key)? } else { KeyHistory::default() };
         *self.unlock_key.lock().map_err(|_| common::Error::new("unlock lock poisoned"))? =
             Some(key);
         *self.global_lock.write().map_err(|_| common::Error::new("key history lock poisoned"))? =
             history;
-        self.unlocked.store(true, Ordering::SeqCst);
+        *self.execution.lock().map_err(|_| common::Error::new("execution cursor poisoned"))? =
+            raft::execution::Cursor::default();
+        self.ready.store(true, Ordering::SeqCst);
         // Only a leader establishes the first key, and never over an uncommitted proposal.
-        self.initial_key(&mut node)?;
-        self.refresh_keys(&node)?;
+        self.on_raft(|host, node| {
+            host.initial_key(node)?;
+            host.refresh_application(node)
+        })?;
+        drop(_active);
+        if !self.execution_started.load(Ordering::SeqCst) {
+            self.execute_pending()?;
+        }
         Ok(())
     }
 
@@ -382,7 +363,7 @@ impl Ks {
     }
 
     fn sn_key(&self, request: &Req, history: &KeyHistory) -> Resp {
-        if !self.unlocked.load(Ordering::SeqCst) {
+        if !self.ready.load(Ordering::SeqCst) {
             return Resp::error(Status::Locked, "KS is locked");
         }
         let (mut payload, rest) =
@@ -411,12 +392,10 @@ impl Ks {
     }
 
     fn prepare_key_read(&self) -> Result<()> {
-        let index = {
-            let mut node =
-                self.journal.lock().map_err(|_| common::Error::new("Raft lock poisoned"))?;
-            self.initial_key(&mut node)?;
-            node.state().last()
-        };
+        let index = self.on_raft(|host, node| {
+            host.initial_key(node)?;
+            Ok(node.state().last())
+        })?;
         self.wait_committed(index)?;
         self.ensure_future_key()
     }
@@ -588,7 +567,7 @@ fn main() {
         if !config.require_unlock {
             logn!("no unlock ceremony required because this is a test configuration");
         }
-        let settings = runtime::Settings::for_process(process, &config)?;
+        let settings = runtime::Settings::for_process(process, &config.raft)?;
         Ks::with_runtime(config, &process.config.data_dir.join("master-keys"), settings)
     });
     if let Err(e) = result {
@@ -628,7 +607,7 @@ mod persistence_tests {
             let result = ks.unlock(&request);
             assert!(result.is_err());
         }
-        let locked = ks.unlocked.load(Ordering::SeqCst);
+        let locked = ks.ready.load(Ordering::SeqCst);
         assert!(!locked);
         ks.unlock(&unlock(&[42; 32])).unwrap();
         let initial = ks.global_lock.read().unwrap().epochs[0].clone();
@@ -640,7 +619,7 @@ mod persistence_tests {
         assert!(duplicate.is_err());
         drop(ks);
         let ks = Ks::new(config(), dir.path()).unwrap();
-        let locked = ks.unlocked.load(Ordering::SeqCst);
+        let locked = ks.ready.load(Ordering::SeqCst);
         assert!(!locked);
         ks.unlock(&unlock(&[42; 32])).unwrap();
         let history = ks.global_lock.read().unwrap();
@@ -654,7 +633,11 @@ mod persistence_tests {
         let dir = tempfile::tempdir().unwrap();
         let ks = Ks::new(config(), dir.path()).unwrap();
         ks.open_keys([42; 32]).unwrap();
-        ks.journal.lock().unwrap().journal.fail_writes();
+        ks.on_raft(|_, node| {
+            node.journal.fail_writes();
+            Ok(())
+        })
+        .unwrap();
         let epoch = ks.choose_key().unwrap();
         let result = ks.propose_key(epoch);
         assert!(result.is_err());
@@ -679,7 +662,7 @@ mod persistence_tests {
         let sealed =
             runtime::seal_key(&key, &leader.state().ring, index, leader.state().term, &epoch)
                 .unwrap();
-        leader.propose(raft::Command::Key(sealed)).unwrap();
+        leader.propose(raft::Command::Client(vec![raft::Action::new(Op::KsKey, sealed)])).unwrap();
         exchange(&mut leader, &mut follower);
         exchange(&mut leader, &mut follower);
         follower.journal.snapshot(100).unwrap();
@@ -688,7 +671,7 @@ mod persistence_tests {
         assert_eq!(history.epochs[0].key, epoch.key);
         let wrong = runtime::decode_history(follower.state(), &[1; 32]);
         assert!(wrong.is_err());
-        let bytes = serde_json::to_vec(&follower.journal.records).unwrap();
+        let bytes = raft::codec::encode(&follower.journal.records).unwrap();
         let contains = bytes.windows(32).any(|w| w == key || w == epoch.key);
         assert!(!contains);
     }

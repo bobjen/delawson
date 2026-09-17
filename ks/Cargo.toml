@@ -11,12 +11,10 @@ name = "ks"
 path = "src/main.rs"
 
 [dependencies]
+delawson-raft.workspace = true
 delawson-common.workspace = true
 aegis = "0.9.15"
-serde.workspace = true
-serde_json = "1"
-sha2 = "0.10.8"
-libc = "0.2.189"
 
 [dev-dependencies]
+delawson-raft = { workspace = true, features = ["testing"] }
 tempfile = "3"

@@ -226,6 +226,56 @@ ops! {
     ByteSeekResp = 81, "byte-seek-response";
     Raft = 82, "raft";
     RaftMembers = 83, "raft-members";
+    KsKey = 84, "ks-key-action";
+    RaftIdentity = 85, "raftidentity";
+    RaftList = 86, "raftlist";
+    RaftOptional = 87, "raftoptional";
+    RaftPair = 88, "raftpair";
+    RaftSet = 89, "raftset";
+    RaftMap = 90, "raftmap";
+    RaftState = 91, "raftstate";
+    RaftMember = 92, "raftmember";
+    RaftMembership = 93, "raftmembership";
+    RaftRetirement = 94, "raftretirement";
+    RaftEntry = 95, "raftentry";
+    RaftSnapshot = 96, "raftsnapshot";
+    RaftAnswer = 97, "raftanswer";
+    RaftBatch = 98, "raftbatch";
+    RaftCheckpoint = 99, "raftcheckpoint";
+    RaftCommittedJournal = 100, "raftcommittedjournal";
+    RaftLocalIdentity = 101, "raftlocalidentity";
+    RaftRecoveryPlan = 102, "raftrecoveryplan";
+    RaftPacket = 103, "raftpacket";
+    RaftConsensusReply = 104, "raftconsensusreply";
+    RaftCommandNoop = 105, "raftcommandnoop";
+    RaftCommandClient = 106, "raftcommandclient";
+    RaftCommandMembers = 107, "raftcommandmembers";
+    RaftCommandCheckpointStart = 108, "raftcommandcheckpointstart";
+    RaftRecordContacts = 109, "raftrecordcontacts";
+    RaftRecordRetired = 110, "raftrecordretired";
+    RaftRecordBootstrap = 111, "raftrecordbootstrap";
+    RaftRecordCarry = 112, "raftrecordcarry";
+    RaftRecordHard = 113, "raftrecordhard";
+    RaftRecordEntries = 114, "raftrecordentries";
+    RaftRecordCommit = 115, "raftrecordcommit";
+    RaftRecordInstall = 116, "raftrecordinstall";
+    RaftRpcVote = 117, "raftrpcvote";
+    RaftRpcAppend = 118, "raftrpcappend";
+    RaftRpcInstall = 119, "raftrpcinstall";
+    RaftRpcCheckpoint = 120, "raftrpccheckpoint";
+    RaftMessageIdentity = 121, "raftmessageidentity";
+    RaftMessageBootstrap = 122, "raftmessagebootstrap";
+    RaftMessageConsensus = 123, "raftmessageconsensus";
+    RaftMessageCheckpoint = 124, "raftmessagecheckpoint";
+    RaftMessageJournal = 125, "raftmessagejournal";
+    RaftMessageCheckpointStart = 126, "raftmessagecheckpointstart";
+    RaftMessageClient = 127, "raftmessageclient";
+    RaftMessageForward = 128, "raftmessageforward";
+    RaftSenderSlot = 129, "raftsenderslot";
+    RaftSenderApplicant = 130, "raftsenderapplicant";
+
+    KsEnvelope = 131, "ks-encrypted-action";
+    RaftMessageJournalTip = 132, "raft-journal-tip";
 }
 
 impl std::fmt::Display for Op {
@@ -599,6 +649,23 @@ impl<'a> StructReader<'a> {
         let result = read(self);
         self.depth -= 1;
         result
+    }
+
+    /// Decode a tagged union while accounting for nesting depth.
+    pub fn nested_any<T>(&mut self, read: impl FnOnce(Op, &mut Self) -> Result<T>) -> Result<T> {
+        let op = Op::from_code(self.number_u16()?)?;
+        let depth =
+            self.depth.checked_add(1).ok_or_else(|| Error::new("recursion depth overflow"))?;
+        if depth > self.maximum_depth {
+            return Err(Error::new("message recursion depth exceeded"));
+        }
+        self.depth = depth;
+        let result = read(op, self);
+        self.depth -= 1;
+        result
+    }
+    pub fn remaining(&self) -> usize {
+        self.bytes.len() - self.at
     }
 
     pub fn done(&self) -> Result<()> {

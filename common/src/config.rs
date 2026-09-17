@@ -661,6 +661,8 @@ pub struct Knobs {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RaftConfig {
+    /// Maximum execution time before yielding the global write lock between actions.
+    pub execution_lock_ms: u64,
     /// Primary plus hot backups. Every member still journals and votes.
     pub apply_members: usize,
     /// Extra randomized-election delay for members without application state.
@@ -690,6 +692,7 @@ pub struct RaftConfig {
 impl Default for RaftConfig {
     fn default() -> Self {
         Self {
+            execution_lock_ms: 10,
             apply_members: 3,
             cold_election_delay_ms: 1000,
             lost_state_election_delay_ms: 200,

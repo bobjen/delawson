@@ -69,6 +69,14 @@ pub struct Logs {
 }
 
 impl Logs {
+    /// Read exactly one local plain or Zstd log file, without service discovery.
+    pub fn file(path: &Path) -> Result<Logs> {
+        if !std::fs::metadata(path)?.is_file() {
+            return Err(Error::new("log path must be a regular file"));
+        }
+        Ok(Logs { paths: vec![path.to_path_buf()] })
+    }
+
     /// The files of one log, oldest first, the newest `budget` bytes of them.
     /// `u64::MAX` is all of it, which is the normal thing to want.
     pub fn open(dir: &Path, name: &str, budget: u64) -> Result<Logs> {
@@ -226,6 +234,41 @@ fn merge(into: &mut HashMap<String, u64>, rows: HashMap<String, u64>) {
             None => {}
         }
     }
+}
+
+/// Check framing boundaries before reopening a log for append. This seeks past
+/// compressed payloads; it does not decompress or build a histogram at startup.
+/// A partial last write must remain preserved in a closed file, since appending
+/// after it would hide later records from the reader.
+pub(crate) fn appendable(path: &Path) -> std::io::Result<bool> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    if length == 0 {
+        return Ok(true);
+    }
+    if !path.extension().is_some_and(|kind| kind == "zst") {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0];
+        file.read_exact(&mut last)?;
+        return Ok(last[0] == b'\n');
+    }
+    let mut offset = 0;
+    while offset < length {
+        if length - offset < 8 {
+            return Ok(false);
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut sizes = [0; 8];
+        file.read_exact(&mut sizes)?;
+        let loose = u32::from_le_bytes(sizes[..4].try_into().unwrap()) as usize;
+        let tight = u32::from_le_bytes(sizes[4..].try_into().unwrap()) as usize;
+        if loose > MAX_BLOCK || tight > MAX_BLOCK {
+            return Ok(false);
+        }
+        offset += 8 + tight as u64;
+    }
+    Ok(offset == length)
 }
 
 fn scan_file(path: &Path, mut each: impl FnMut(&str)) -> Result<u64> {
@@ -416,6 +459,17 @@ n,2026-08-17 01:00:01.000000,pid=1,tid=1,file=common/src/server.rs,line=99,liste
         let kind = if packed { "zst" } else { "log" };
         std::fs::write(dir.join(format!("dn0-0000000.{kind}")), bytes).unwrap();
         Logs::open(&dir, "dn0", u64::MAX).unwrap()
+    }
+
+    #[test]
+    fn explicit_file_uses_the_same_reader() {
+        for packed in [false, true] {
+            let original = logs(packed);
+            let file = Logs::file(&original.paths[0]).unwrap();
+            assert_eq!(file.histogram("", "").unwrap(), original.histogram("", "").unwrap());
+            assert_eq!(file.grep("listening", "", "", 10).unwrap().1.len(), 1);
+            assert_eq!(file.range("", "", 2).unwrap().1.len(), 2);
+        }
     }
 
     /// A row per site, whole, with nothing cut and nothing to choose — the rare one

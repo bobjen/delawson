@@ -110,3 +110,7 @@ mod tests {
         assert_eq!(count, 3);
     }
 }
+
+pub fn cancel_checkpoint_after_election(role: crate::Role, members: usize) -> bool {
+    role == crate::Role::Leader && members > 1
+}

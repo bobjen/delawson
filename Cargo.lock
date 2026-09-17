@@ -266,10 +266,7 @@ version = "0.0.1"
 dependencies = [
  "aegis",
  "delawson-common",
- "libc",
- "serde",
- "serde_json",
- "sha2",
+ "delawson-raft",
  "tempfile",
 ]
 
@@ -279,6 +276,7 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "delawson-common",
+ "serde_json",
 ]
 
 [[package]]
@@ -287,6 +285,16 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "delawson-common",
+]
+
+[[package]]
+name = "delawson-raft"
+version = "0.0.1"
+dependencies = [
+ "delawson-common",
+ "libc",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

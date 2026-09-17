@@ -46,7 +46,7 @@
 use crate::{Context, Result};
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -514,6 +514,8 @@ struct Rotating {
     keep: usize,
     seq: usize,
     written: u64,
+    // Counters only describe this process; a resumed file is scanned at rotation.
+    resumed: bool,
     file: File,
     /// Written at the top of every file. Rotation means a reader may hold only
     /// one of them, and a line alone does not say which process or machine it
@@ -546,14 +548,48 @@ impl Rotating {
         info: bool,
     ) -> Result<Rotating> {
         std::fs::create_dir_all(dir).context(dir.display())?;
+        let latest = files(dir, name)?.pop();
+        let mut seq = 0;
+        let mut written = 0;
+        if let Some(latest) = latest {
+            let filename = latest.file_name().and_then(|v| v.to_str()).unwrap_or("");
+            seq = filename
+                .strip_prefix(&format!("{name}-"))
+                .and_then(|v| v.split('.').next())
+                .and_then(|v| v.parse::<usize>().ok())
+                .ok_or_else(|| crate::Error::new("invalid numbered log filename"))?;
+            // Preserve a partial crash tail; readers cannot continue past it.
+            // Changing compression also starts a new file instead of mixing encodings.
+            if latest == path(dir, name, seq, compression) && crate::logread::appendable(&latest)? {
+                written = std::fs::metadata(&latest)?.len();
+            } else {
+                seq = seq
+                    .checked_add(1)
+                    .ok_or_else(|| crate::Error::new("log sequence exhausted"))?;
+            }
+        }
+        let filename = path(dir, name, seq, compression);
+        // A reader may have cached this file while it was closed. It is active again.
+        let sidecar = histogram_path(dir, name, seq, compression);
+        match std::fs::remove_file(sidecar) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&filename)
+            .context(filename.display())?;
         let mut rotating = Rotating {
             dir: dir.to_path_buf(),
             name: name.to_string(),
             size,
             keep: keep.max(1),
-            seq: 0,
-            written: 0,
-            file: File::create(path(dir, name, 0, compression)).context(dir.display())?,
+            seq,
+            written,
+            resumed: written != 0,
+            file,
             header,
             pending: Vec::with_capacity(block),
             pending_first: String::new(),
@@ -565,7 +601,7 @@ impl Rotating {
             info,
         };
         let header = rotating.header.clone();
-        let _ = rotating.write(header.as_bytes(), true, None, None);
+        rotating.write(header.as_bytes(), true, None, None)?;
         rotating.set_time(&header);
         Ok(rotating)
     }
@@ -658,15 +694,30 @@ impl Rotating {
 
     fn roll(&mut self) -> std::io::Result<()> {
         self.file.flush()?;
-        let histogram = self.histogram();
+        let counters = self.histogram(); // Also clears this process's per-file counters.
+        let histogram = if self.resumed {
+            crate::logread::make_histogram(&path(&self.dir, &self.name, self.seq, self.compression))
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+        } else {
+            counters
+        };
         crate::logread::write_histogram(
             &histogram_path(&self.dir, &self.name, self.seq, self.compression),
             &histogram,
         )
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-        self.seq += 1;
-        self.file = File::create(path(&self.dir, &self.name, self.seq, self.compression))?;
+        self.seq = self
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("log sequence exhausted"))?;
+        self.file = OpenOptions::new().write(true).create_new(true).open(path(
+            &self.dir,
+            &self.name,
+            self.seq,
+            self.compression,
+        ))?;
         self.written = 0;
+        self.resumed = false;
         // The header goes at the top of the new file as its own block.
         let header = self.header.clone();
         let mut first = Vec::new();
@@ -771,13 +822,21 @@ pub fn files(dir: &Path, name: &str) -> crate::Result<Vec<PathBuf>> {
         // `<name>-0000000.log` or `.zst`, and not `<name>-info-0000000.log` when
         // asked for `<name>`.
         if let Some(tail) = file.strip_prefix(&format!("{name}-")) {
-            let numbered = tail.split('.').next().is_some_and(|n| n.len() == 7);
+            let numbered = tail
+                .split('.')
+                .next()
+                .is_some_and(|n| n.len() >= 7 && n.bytes().all(|b| b.is_ascii_digit()));
             if numbered && (tail.ends_with(".log") || tail.ends_with(".zst")) {
                 found.push(path);
             }
         }
     }
-    found.sort();
+    found.sort_by_key(|path| {
+        path.file_stem()
+            .and_then(|v| v.to_str())
+            .and_then(|v| v.rsplit('-').next())
+            .and_then(|v| v.parse::<usize>().ok())
+    });
     Ok(found)
 }
 
@@ -981,6 +1040,89 @@ mod tests {
         // 2024-02-29, a leap day, is day 19782.
         assert_eq!(civil(19_782), (2024, 2, 29));
         assert_eq!(civil(20_682), (2026, 8, 17));
+    }
+
+    #[test]
+    fn restart_appends_then_rotates_without_losing_history() {
+        for compression in [Compression::Plain, Compression::Zstd] {
+            let suffix = if matches!(compression, Compression::Plain) { "plain" } else { "zstd" };
+            let dir =
+                std::env::temp_dir().join(format!("laws-restart-{}-{suffix}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let header = "h,2026-09-16 01:00:00,pid=1,tid=1,file=,line=0,opened\n";
+            let before = "i,2026-09-16 01:00:01,pid=1,tid=1,file=x.rs,line=1,exiting\n";
+            let after = "i,2026-09-16 01:00:02,pid=2,tid=1,file=x.rs,line=2,restarted\n";
+            let mut first =
+                Rotating::new(&dir, "test", u64::MAX, 3, header.into(), compression, 1, false)
+                    .unwrap();
+            first.write(before.as_bytes(), true, None, None).unwrap();
+            let old_size = first.written;
+            drop(first);
+            let filename = path(&dir, "test", 0, compression);
+            let original = std::fs::read(&filename).unwrap();
+            let stale = crate::logread::make_histogram(&filename).unwrap();
+            crate::logread::write_histogram(&histogram_path(&dir, "test", 0, compression), &stale)
+                .unwrap();
+            let mut second =
+                Rotating::new(&dir, "test", u64::MAX, 3, header.into(), compression, 1, false)
+                    .unwrap();
+            assert_eq!(second.seq, 0);
+            assert!(second.written > old_size);
+            second.write(after.as_bytes(), true, None, None).unwrap();
+            let appended = std::fs::read(&filename).unwrap();
+            assert!(appended.starts_with(&original));
+            assert!(!histogram_path(&dir, "test", 0, compression).exists());
+            // The next buffered write exceeds the resumed file's byte budget.
+            second.size = second.written;
+            second.write(after.as_bytes(), true, None, None).unwrap();
+            assert_eq!(second.seq, 1);
+            let logs = crate::logread::Logs::file(&filename).unwrap();
+            let expected = logs.histogram("", "").unwrap();
+            assert_eq!(expected.0, 4); // Two headers plus each process's line.
+            let all = crate::logread::Logs::open(&dir, "test", u64::MAX).unwrap();
+            let (seen, rows) = all.histogram("", "").unwrap();
+            assert_eq!(seen, 6); // Uses the old file's sidecar plus the current file.
+            assert!(
+                rows.iter().any(|row| row.starts_with("000000001,") && row.ends_with("exiting"))
+            );
+            assert!(
+                rows.iter().any(|row| row.starts_with("000000002,") && row.ends_with("restarted"))
+            );
+            drop(second);
+            let third =
+                Rotating::new(&dir, "test", u64::MAX, 3, header.into(), compression, 1, false)
+                    .unwrap();
+            assert_eq!(third.seq, 1, "restart selects the latest numbered file");
+            drop(third);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn restart_preserves_partial_tail_and_writes_a_readable_new_file() {
+        for compression in [Compression::Plain, Compression::Zstd] {
+            let suffix = if matches!(compression, Compression::Plain) { "plain" } else { "zstd" };
+            let dir =
+                std::env::temp_dir().join(format!("laws-tail-{}-{suffix}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let header = "h,2026-09-16 01:00:00,pid=1,tid=1,file=,line=0,opened\n";
+            let first =
+                Rotating::new(&dir, "test", u64::MAX, 3, header.into(), compression, 1, false)
+                    .unwrap();
+            drop(first);
+            let filename = path(&dir, "test", 0, compression);
+            OpenOptions::new().append(true).open(&filename).unwrap().write_all(b"partial").unwrap();
+            let original = std::fs::read(&filename).unwrap();
+            let second =
+                Rotating::new(&dir, "test", u64::MAX, 3, header.into(), compression, 1, false)
+                    .unwrap();
+            assert_eq!(second.seq, 1);
+            assert_eq!(std::fs::read(&filename).unwrap(), original);
+            let logs = crate::logread::Logs::file(&path(&dir, "test", 1, compression)).unwrap();
+            assert_eq!(logs.scan(|_| {}).unwrap(), 1);
+            drop(second);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

@@ -1,16 +1,16 @@
 //! One ordered journal for Raft entries, terms/votes, commit markers and installs.
 //! Key commands are already encrypted; consensus metadata remains readable while locked.
+use crate::codec::{self, Wire};
 use crate::raft::{INCARNATION, Member, MemberId, Membership, Record, Retirement, State};
-use crate::random_master_key;
+use crate::random_bytes;
 use common::{Context, Error, Result};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"DLAWKR03";
+const MAGIC: &[u8; 8] = b"DLAWKR04";
 const CURRENT: &str = "current.log";
 const HEADER: u64 = 8 + 128 + 16;
 fn journal_header(ring: &str, start: u64) -> Vec<u8> {
@@ -31,12 +31,10 @@ fn check_journal_header(reader: &mut impl Read, ring: &str, ignore: bool) -> Res
 }
 const LIMIT: usize = 64 * 1024 * 1024;
 
-#[derive(Serialize, Deserialize)]
 struct Batch {
     sequence: u64,
     records: Vec<Record>,
 }
-#[derive(Serialize, Deserialize)]
 struct Checkpoint {
     sequence: u64,
     second: u64,
@@ -44,7 +42,7 @@ struct Checkpoint {
 }
 
 /// A peer copy contains committed entries only, never term/vote records.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct CommittedJournal {
     pub ring: String,
     pub after: u64,
@@ -52,6 +50,11 @@ pub struct CommittedJournal {
     pub entries: Vec<crate::raft::Entry>,
 }
 impl CommittedJournal {
+    /// Ordinary Raft log matching against the chosen primary. This does not detect
+    /// forgotten histories that reuse BOTH term and index (issue #127).
+    pub fn matches_tip(&self, index: u64, term: u64) -> bool {
+        self.entries.last().is_some_and(|entry| entry.index == index && entry.term == term)
+    }
     pub fn validate(&self, state: &State, through: u64) -> Result<()> {
         if !state.ignore_ring_identity && self.ring != state.ring {
             return Err(Error::new("copied journal ring mismatch"));
@@ -81,7 +84,7 @@ impl CommittedJournal {
 }
 /// Directory-local identity; never imported from another member's history.
 /// This inode is also the lifetime lock and must not be replaced while in use.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalIdentity {
     pub ring: String,
     pub process: String,
@@ -95,7 +98,7 @@ pub struct LocalIdentity {
     pending: Option<Retirement>,
     recovery: Option<RecoveryPlan>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RecoveryPlan {
     archive: String,
     checkpoint: String,
@@ -484,7 +487,6 @@ impl Journal {
         let captured_bytes = self.log_bytes;
         let suffix = std::mem::take(&mut state.log);
         let checkpoint = Checkpoint { sequence, second: now, state: state.clone() };
-        let bytes = encode(&checkpoint)?;
         let start =
             self.sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
         let carried = if suffix.is_empty() {
@@ -504,7 +506,8 @@ impl Journal {
         }
         Ok(Some(PendingSnapshot {
             path: named(&self.directory, "snapshot", sequence),
-            bytes,
+            checkpoint,
+            written_bytes: std::sync::atomic::AtomicU64::new(0),
             sequence,
             second: now,
             snapshot: state.snapshot,
@@ -561,11 +564,11 @@ impl Journal {
         }
         self.snapshot_sequence = pending.sequence;
         self.snapshot_second = pending.second;
-        self.snapshot_bytes = pending.bytes.len() as u64;
+        self.snapshot_bytes = pending.written_bytes.load(std::sync::atomic::Ordering::SeqCst);
         self.log_bytes = self.log_bytes.saturating_sub(pending.log_bytes);
         self.prune()
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn snapshot(&mut self, now: u64) -> Result<()> {
         if let Some(pending) = self.prepare_snapshot(now)? {
             pending.write()?;
@@ -590,7 +593,7 @@ impl Journal {
         }
         sync_directory(&self.directory)
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn fail_writes(&mut self) {
         self.file = File::open(self.directory.join("identity")).unwrap();
     }
@@ -818,7 +821,8 @@ fn finish_recovery(
 
 pub struct PendingSnapshot {
     path: PathBuf,
-    bytes: Vec<u8>,
+    checkpoint: Checkpoint,
+    written_bytes: std::sync::atomic::AtomicU64,
     sequence: u64,
     second: u64,
     snapshot: crate::raft::Snapshot,
@@ -826,10 +830,13 @@ pub struct PendingSnapshot {
 }
 impl PendingSnapshot {
     pub fn write(&self) -> Result<()> {
-        publish(&self.path, &self.bytes)
+        self.write_cancellable(|| false)
     }
     pub fn write_cancellable(&self, cancelled: impl Fn() -> bool) -> Result<()> {
-        publish_cancellable(&self.path, &self.bytes, cancelled)
+        let bytes = encode(&self.checkpoint)?;
+        publish_cancellable(&self.path, &bytes, cancelled)?;
+        self.written_bytes.store(bytes.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 }
 fn frame(batch: &Batch) -> Result<Vec<u8>> {
@@ -837,21 +844,21 @@ fn frame(batch: &Batch) -> Result<Vec<u8>> {
     let length = bytes.len() as u64;
     Ok([length.to_le_bytes().as_slice(), (!length).to_le_bytes().as_slice(), &bytes].concat())
 }
-fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let mut bytes = serde_json::to_vec(value).map_err(|e| Error::new(e.to_string()))?;
+fn encode<T: Wire>(value: &T) -> Result<Vec<u8>> {
+    let mut bytes = codec::encode(value)?;
     bytes.extend(Sha256::digest(&bytes));
     if bytes.len() > LIMIT {
         return Err(Error::new("KS persistence frame too large"));
     }
     Ok(bytes)
 }
-fn decode<T: for<'a> Deserialize<'a>>(bytes: &[u8]) -> Result<T> {
+fn decode<T: Wire>(bytes: &[u8]) -> Result<T> {
     let body =
         bytes.len().checked_sub(32).ok_or_else(|| Error::new("short KS persistence frame"))?;
     if Sha256::digest(&bytes[..body]).as_slice() != &bytes[body..] {
         return Err(Error::new("KS persistence checksum mismatch"));
     }
-    serde_json::from_slice(&bytes[..body]).map_err(|e| Error::new(e.to_string()))
+    codec::decode(&bytes[..body])
 }
 fn named(directory: &Path, kind: &str, sequence: u64) -> PathBuf {
     directory
@@ -910,8 +917,7 @@ fn publish_cancellable(path: &Path, bytes: &[u8], cancelled: impl Fn() -> bool) 
             Ok(())
         }
     };
-    let temporary =
-        path.with_extension(format!("{}.tmp", common::shamir::hex(&random_master_key()?)));
+    let temporary = path.with_extension(format!("{}.tmp", common::shamir::hex(&random_bytes()?)));
     let result = (|| -> Result<()> {
         let mut file =
             OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
@@ -931,6 +937,32 @@ fn publish_cancellable(path: &Path, bytes: &[u8], cancelled: impl Fn() -> bool) 
 mod tests {
     use super::*;
     use crate::raft::{Command, Entry, Members, Node, Storage};
+    #[test]
+    fn old_committed_copy_cannot_replace_the_new_primary_history() {
+        let mut state = initial();
+        state.snapshot.index = 9;
+        state.snapshot.term = 4;
+        state.commit = 9;
+        state.term = 6;
+        let mut copied = CommittedJournal {
+            ring: state.ring.clone(),
+            after: 9,
+            previous_term: 4,
+            entries: vec![crate::Entry { index: 10, term: 4, command: crate::Command::Noop }],
+        };
+        // Ring identity and the retained prefix alone accept this abandoned history.
+        let structurally_valid = copied.validate(&state, 10).is_ok();
+        let matches_primary = copied.matches_tip(10, 6);
+        assert!(structurally_valid);
+        assert!(!matches_primary);
+        copied.entries[0].term = 6;
+        let valid = copied.validate(&state, 10).is_ok() && copied.matches_tip(10, 6);
+        assert!(valid);
+        state.apply(&Record::Entries { from: 10, entries: copied.entries }).unwrap();
+        state.apply(&Record::Commit(10)).unwrap();
+        assert_eq!(state.term_at(10), Some(6));
+        assert_eq!(state.commit, 10);
+    }
     #[test]
     fn copied_journal_is_bounded_contiguous_and_ring_checked() {
         let mut state = initial();
@@ -961,7 +993,7 @@ mod tests {
         let path = numbered(dir.path(), "snapshot").unwrap().last().unwrap().1.clone();
         drop(journal);
         // Valid existing checksum over an invalid JSON body exercises parsing detection.
-        let mut bad = b"not-json".to_vec();
+        let mut bad = b"not-a-tagged-frame".to_vec();
         bad.extend(Sha256::digest(&bad));
         std::fs::write(&path, &bad).unwrap();
         let recovered = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
@@ -1318,14 +1350,14 @@ mod tests {
         let role = Cell::new(Role::Follower);
         let mut writer = Writer { role: &role, next: Role::Candidate, count: 0 };
         let campaigning = write_checkpoint_chunks(&mut writer, &bytes, || {
-            crate::runtime::cancel_checkpoint_after_election(role.get(), 3)
+            crate::application::cancel_checkpoint_after_election(role.get(), 3)
         })
         .is_ok();
         let completed = writer.count;
         writer.next = Role::Leader;
         writer.count = 0;
         let elected = write_checkpoint_chunks(&mut writer, &bytes, || {
-            crate::runtime::cancel_checkpoint_after_election(role.get(), 3)
+            crate::application::cancel_checkpoint_after_election(role.get(), 3)
         })
         .is_err();
         let stopped = writer.count;
@@ -1461,7 +1493,11 @@ mod tests {
         let mut node = Node::new(0, Journal::open(dir.path(), initial(), 3, "KS0").unwrap());
         node.campaign().unwrap();
         for n in 0..5 {
-            node.propose(Command::Key(vec![n; 104])).unwrap();
+            node.propose(Command::Client(vec![crate::Action::new(
+                common::wire::Op::BytesResp,
+                vec![n; 104],
+            )]))
+            .unwrap();
             node.journal.snapshot(n as u64 + 1).unwrap();
         }
         let expected = node.state().capture();
@@ -1534,7 +1570,10 @@ mod tests {
                     entries: vec![crate::raft::Entry {
                         index: 1,
                         term: 1,
-                        command: Command::Key(vec![8; 104]),
+                        command: Command::Client(vec![crate::Action::new(
+                            common::wire::Op::BytesResp,
+                            vec![8; 104],
+                        )]),
                     }],
                 },
                 Record::Commit(1),
@@ -1549,7 +1588,10 @@ mod tests {
                     entries: vec![crate::raft::Entry {
                         index: 2,
                         term: 1,
-                        command: Command::Key(vec![9; 104]),
+                        command: Command::Client(vec![crate::Action::new(
+                            common::wire::Op::BytesResp,
+                            vec![9; 104],
+                        )]),
                     }],
                 },
                 Record::Commit(2),
@@ -1587,7 +1629,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub fn provision_test_founder(
     directory: &Path,
     ring: &str,
@@ -1619,3 +1661,13 @@ pub fn provision_test_founder(
     file.sync_all()?;
     sync_directory(directory)
 }
+
+crate::wire_struct!(Batch, RaftBatch, {sequence,records});
+
+crate::wire_struct!(Checkpoint, RaftCheckpoint, {sequence,second,state});
+
+crate::wire_struct!(CommittedJournal, RaftCommittedJournal, {ring,after,previous_term,entries});
+
+crate::wire_struct!(LocalIdentity, RaftLocalIdentity, {ring,process,current,retired,slot,membership,founders,initialized,pending,recovery});
+
+crate::wire_struct!(RecoveryPlan, RaftRecoveryPlan, {archive,checkpoint,files});

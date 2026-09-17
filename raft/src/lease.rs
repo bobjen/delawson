@@ -44,7 +44,7 @@ impl Lease {
         self.reset();
         self.elected = Some((term, at));
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn elected(term: u64, at: Duration) -> Self {
         let mut lease = Self::default();
         lease.start(term, at);

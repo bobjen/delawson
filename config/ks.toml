@@ -39,6 +39,9 @@ workers = 0
 # ring = "KS0"
 # Primary plus hot backups; at least two in a multi-member ring.
 # apply_members = 3
+# Release/reacquire the global write lock between actions after this much execution.
+# A single action runs to completion on the application worker.
+# execution_lock_ms = 10
 # Additional election delay for cold members; hot backups are equally preferred.
 # cold_election_delay_ms = 1000
 # Other secondaries suppress production after a committed checkpoint announcement.

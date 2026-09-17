@@ -172,7 +172,7 @@ def main():
             prior_ids = {id: status(id)['raft_member_id'] for id in retiring}
             for id in list(children): stop(id)
             for id in retiring:
-                (work/id/'data/master-keys/current.log').unlink()
+                (work/id/'data/master-keys/current.log').unlink(missing_ok=True)
             for id in members: start(id)
             def recovered_ring():
                 # Demoted primaries intentionally exit. Supply the supervisor

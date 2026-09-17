@@ -1,7 +1,6 @@
 //! Raft consensus. Disk mutations complete before the corresponding response is sent.
 use crate::journal::Journal;
 use common::{Error, Result};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Stable process identities within this ring. Endpoints are discovered, never voted on.
@@ -12,7 +11,7 @@ pub const INCARNATION: u64 = 1 << 32;
 pub type Members = BTreeSet<MemberId>;
 /// Reserved in RAM for a process that has not been assigned a voting slot.
 pub const UNASSIGNED: MemberId = u64::MAX;
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Member {
     pub identity: common::ring::MemberIdentity,
     /// Existing routing/machine-admission label, not the executable name.
@@ -20,7 +19,7 @@ pub struct Member {
 }
 pub type MemberNames = BTreeMap<MemberId, Member>;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Membership {
     /// Includes retired slots: a member index is never rebound to another process.
     pub identities: MemberNames,
@@ -155,7 +154,7 @@ impl Membership {
 }
 
 /// One irreversible, one-for-one replacement. This is not a successful vote.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Retirement {
     pub previous: MemberId,
     pub old: Member,
@@ -175,29 +174,29 @@ impl Retirement {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Noop,
-    /// AEGIS envelope of (master key, activation second), never plaintext on disk.
-    Key(Vec<u8>),
+    /// Opaque client actions. Only the owning service dispatches these tags.
+    Client(Vec<crate::Action>),
     Members(Membership),
     CheckpointStart(MemberId),
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub index: u64,
     pub term: u64,
     pub command: Command,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub ring: String,
     pub index: u64,
     pub term: u64,
     pub membership: Membership,
-    /// Committed key commands preserve their original index/term for AEAD binding.
-    pub keys: Vec<Entry>,
-    #[serde(default)]
+    /// Committed client actions preserve their original index and term.
+    pub application: Vec<Entry>,
+
     pub checkpoint_start: Option<(u64, MemberId)>,
 }
 impl Snapshot {
@@ -205,7 +204,7 @@ impl Snapshot {
         if self.membership.old.is_empty() {
             if self.index != 0
                 || self.term != 0
-                || !self.keys.is_empty()
+                || !self.application.is_empty()
                 || !self.membership.identities.is_empty()
                 || self.membership.new.is_some()
             {
@@ -223,12 +222,12 @@ impl Snapshot {
             return Err(Error::new("invalid checkpoint announcement"));
         }
         let mut previous = 0;
-        for entry in &self.keys {
+        for entry in &self.application {
             if entry.index <= previous
                 || entry.index > self.index
                 || entry.term == 0
                 || entry.term > self.term
-                || !matches!(entry.command, Command::Key(_))
+                || !matches!(entry.command, Command::Client(_))
             {
                 return Err(Error::new("invalid snapshot key entry"));
             }
@@ -237,10 +236,9 @@ impl Snapshot {
         Ok(())
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct State {
     /// Process-local debugging override: never inherited from a snapshot or journal.
-    #[serde(skip)]
     pub ignore_ring_identity: bool,
     pub ring: String,
     /// Initial table learned at creation or before joining; independent of later membership.
@@ -317,7 +315,7 @@ impl State {
                 index: 0,
                 term: 0,
                 membership,
-                keys: vec![],
+                application: vec![],
                 checkpoint_start: None,
             },
             log: vec![],
@@ -354,12 +352,12 @@ impl State {
         }
         membership
     }
-    pub fn has_keys(&self) -> bool {
-        !self.snapshot.keys.is_empty()
+    pub fn has_actions(&self) -> bool {
+        !self.snapshot.application.is_empty()
             || self
                 .log
                 .iter()
-                .any(|e| e.index <= self.commit && matches!(e.command, Command::Key(_)))
+                .any(|e| e.index <= self.commit && matches!(e.command, Command::Client(_)))
     }
     pub fn committed_membership(&self) -> Membership {
         self.log
@@ -387,7 +385,7 @@ impl State {
         let mut snapshot = self.snapshot.clone();
         for e in self.log.iter().take_while(|e| e.index <= self.commit) {
             match &e.command {
-                Command::Key(_) => snapshot.keys.push(e.clone()),
+                Command::Client(_) => snapshot.application.push(e.clone()),
                 Command::Members(m) => snapshot.membership = m.clone(),
                 Command::CheckpointStart(member) => {
                     snapshot.checkpoint_start = Some((e.index, member.clone()))
@@ -522,7 +520,7 @@ impl State {
         self.validate()
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub enum Record {
     Contacts(MemberNames),
     Retired(Retirement),
@@ -533,7 +531,7 @@ pub enum Record {
     Commit(u64),
     Install(Snapshot),
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub enum Rpc {
     Vote { term: u64, last: u64, last_term: u64 },
     Append { term: u64, previous: u64, previous_term: u64, entries: Vec<Entry>, commit: u64 },
@@ -550,7 +548,7 @@ impl Rpc {
         }
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Answer {
     pub term: u64,
     pub success: bool,
@@ -589,7 +587,7 @@ pub struct Node<S: Storage = Journal> {
     pub contact: u64,
     pub leader_contact: Option<std::time::Instant>,
     pub lease: crate::lease::Lease,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     clock: Option<std::time::Duration>,
 }
 impl<S: Storage> Node<S> {
@@ -608,7 +606,7 @@ impl<S: Storage> Node<S> {
             // Restart must not erase the quiet period and immediately grant a vote.
             leader_contact: Some(std::time::Instant::now()),
             lease: crate::lease::Lease::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             clock: None,
         }
     }
@@ -616,7 +614,7 @@ impl<S: Storage> Node<S> {
         self.journal.state()
     }
     fn now(&self) -> Result<std::time::Duration> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         if let Some(now) = self.clock {
             return Ok(now);
         }
@@ -641,9 +639,46 @@ impl<S: Storage> Node<S> {
             }
             _ => false,
         });
+        let previous_commit = self.state().commit;
         self.journal.write(&records)?;
+        for record in &records {
+            if let Record::Entries { entries, .. } = record {
+                for entry in entries {
+                    common::logn!(
+                        "Raft entry accepted",
+                        "member {},index {},term {}",
+                        self.id,
+                        entry.index,
+                        entry.term
+                    );
+                }
+            }
+        }
+        let state = self.state();
+        if state.commit > previous_commit {
+            let first = state.log.partition_point(|entry| entry.index <= previous_commit);
+            for entry in state.log[first..].iter().take_while(|entry| entry.index <= state.commit) {
+                common::logn!(
+                    "Raft entry committed",
+                    "member {},index {},term {}",
+                    self.id,
+                    entry.index,
+                    entry.term
+                );
+            }
+        }
         if membership_changed {
             self.refresh_slot();
+            let membership = self.state().membership();
+            common::logn!(
+                "Raft membership history changed",
+                "member {},term {},old {:?},new {:?},retired {:?}",
+                self.id,
+                self.state().term,
+                membership.old,
+                membership.new,
+                membership.retired.keys().collect::<Vec<_>>()
+            );
         }
         Ok(())
     }
@@ -694,7 +729,7 @@ impl<S: Storage> Node<S> {
         // A process has only one primary tenure; exit discards its delayed messages.
         // If demotion ever keeps this process alive, delayed messages must retain
         // their admission term and check it before proposing work in a new term.
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "testing")))]
         {
             // Arm the hard deadline before any logging or stack symbolization can block.
             let watchdog = std::thread::Builder::new().name("raft-exit".into()).spawn(|| {
@@ -723,7 +758,7 @@ impl<S: Storage> Node<S> {
             unsafe { libc::_exit(0) }
         }
         // Unit tests simulate process death without terminating the whole test runner.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         Err(Error::new("Raft primary process ended"))
     }
     fn running(&self) -> Result<()> {
@@ -767,6 +802,14 @@ impl<S: Storage> Node<S> {
         self.persist(vec![Record::Hard { term, vote: Some(self.id.clone()) }])?;
         self.lease.reset();
         self.role = Role::Candidate;
+        common::logn!(
+            "Raft campaign started",
+            "member {},term {},last {},commit {}",
+            self.id,
+            term,
+            self.state().last(),
+            self.state().commit
+        );
         self.campaign_deadline = Some(deadline);
         self.leader = None;
         self.votes = BTreeSet::from([self.id.clone()]);
@@ -777,6 +820,13 @@ impl<S: Storage> Node<S> {
     }
     fn expire_campaign(&mut self) -> Result<()> {
         if self.role == Role::Candidate && !self.campaign_live(self.now()?) {
+            common::logn!(
+                "Raft campaign expired",
+                "member {},term {},votes {:?}",
+                self.id,
+                self.state().term,
+                self.votes
+            );
             self.role = Role::Follower;
             self.campaign_deadline = None;
             self.votes.clear();
@@ -789,6 +839,15 @@ impl<S: Storage> Node<S> {
         if self.role == Role::Candidate && self.state().membership().quorum(&self.votes) {
             self.lease.start(self.state().term, self.now()?);
             self.role = Role::Leader;
+            common::logn!(
+                "Raft primary elected",
+                "member {},term {},votes {:?},last {},commit {}",
+                self.id,
+                self.state().term,
+                self.votes,
+                self.state().last(),
+                self.state().commit
+            );
             self.campaign_deadline = None;
             self.leader = Some(self.id.clone());
             let next = self
@@ -872,7 +931,7 @@ impl<S: Storage> Node<S> {
                 now.checked_duration_since(seen).is_none_or(|elapsed| elapsed < minimum)
             })
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn can_admit(&self, now: std::time::Duration) -> bool {
         self.can_admit_with_policy(now, false, false)
     }
@@ -888,7 +947,7 @@ impl<S: Storage> Node<S> {
             && ((read && allow_stale_reads)
                 || self.lease.valid(self.state().term, &self.id, &self.state().membership(), now))
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn request(&self, peer: &MemberId) -> Option<Rpc> {
         self.make_request(peer, true)
     }
@@ -932,6 +991,19 @@ impl<S: Storage> Node<S> {
     }
     pub fn receive(&mut self, sender: &MemberId, rpc: &Rpc) -> Result<Answer> {
         self.running()?;
+        if let Rpc::Append { term, previous, previous_term, entries, commit } = rpc {
+            common::logn!(
+                "Raft heartbeat received",
+                "member {},primary {},term {},previous {},previous_term {},entries {},commit {}",
+                self.id,
+                sender,
+                term,
+                previous,
+                previous_term,
+                entries.len(),
+                commit
+            );
+        }
         if let Rpc::Install { snapshot, .. } = rpc {
             self.state().check_ring(snapshot)?;
         }
@@ -984,11 +1056,33 @@ impl<S: Storage> Node<S> {
                 }
             }
             Rpc::Append { previous, previous_term, entries, commit, .. } => {
+                let changed = self.leader != Some(*sender) || self.role != Role::Follower;
                 self.follow(self.state().term)?;
+                if changed {
+                    common::logn!(
+                        "Raft primary recognized",
+                        "member {},primary {},term {}",
+                        self.id,
+                        sender,
+                        self.state().term
+                    );
+                }
                 self.leader = Some(*sender);
                 self.contact = self.contact.wrapping_add(1);
                 self.leader_contact = Some(std::time::Instant::now());
                 if self.state().term_at(*previous) != Some(*previous_term) {
+                    common::logn!(
+                        "Raft append prefix mismatch",
+                        "member {},primary {},term {},previous {},expected_term {},local_term {:?},last {},commit {}",
+                        self.id,
+                        sender,
+                        self.state().term,
+                        previous,
+                        previous_term,
+                        self.state().term_at(*previous),
+                        self.state().last(),
+                        self.state().commit
+                    );
                     return Ok(answer);
                 }
                 let mut expected =
@@ -1102,9 +1196,10 @@ impl<S: Storage> Node<S> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub mod tests {
     use super::*;
+    #[cfg(test)]
     fn retirement(id: MemberId) -> Retirement {
         Retirement {
             previous: id,
@@ -1119,6 +1214,7 @@ pub mod tests {
             },
         }
     }
+    #[cfg(test)]
     fn replace_node(old: &TestNode, retired: &Retirement) -> TestNode {
         let mut state = old.state().clone();
         state.snapshot = state.capture();
@@ -1436,6 +1532,7 @@ pub mod tests {
             Memory { pending: None, initial: state.clone(), state, records: vec![], failed: false },
         )
     }
+    #[cfg(test)]
     fn exchange(a: &mut TestNode, b: &mut TestNode) {
         if let Some(request) = a.request(&b.id) {
             let response = match b.receive(&a.id, &request) {
@@ -1454,6 +1551,7 @@ pub mod tests {
             }
         }
     }
+    #[cfg(test)]
     fn pair(nodes: &mut [TestNode], a: usize, b: usize) {
         if a < b {
             let (left, right) = nodes.split_at_mut(b);
@@ -1463,6 +1561,7 @@ pub mod tests {
             exchange(&mut right[0], &mut left[b]);
         }
     }
+    #[cfg(test)]
     fn cluster(n: usize) -> Vec<TestNode> {
         (0..n).map(|i| node(i, members(n))).collect()
     }
@@ -1482,8 +1581,8 @@ pub mod tests {
         let retry = membership.assign(applicant.clone()).unwrap();
         membership.old.insert(first);
         membership.validate().unwrap();
-        let bytes = serde_json::to_vec(&membership).unwrap();
-        let mut recovered: Membership = serde_json::from_slice(&bytes).unwrap();
+        let bytes = crate::codec::encode(&membership).unwrap();
+        let mut recovered: Membership = crate::codec::decode(&bytes).unwrap();
         let retained = recovered.slot(&applicant.identity);
         recovered.old.remove(&first);
         let replacement = Member {
@@ -1540,10 +1639,11 @@ pub mod tests {
         };
         let rejected = storage.write(&[record]).is_err();
         let old_name = storage.state.membership().identities[&1].clone();
-        let vote = serde_json::to_string(&Record::Hard { term: 2, vote: Some(1) }).unwrap();
+        let vote = crate::codec::encode(&Record::Hard { term: 2, vote: Some(1) }).unwrap();
         assert!(rejected);
         assert_eq!(old_name.process, "member-1");
-        assert!(vote.contains("\"vote\":1"));
+        let decoded: Record = crate::codec::decode(&vote).unwrap();
+        assert!(matches!(decoded, Record::Hard { term: 2, vote: Some(1) }));
     }
     #[test]
     fn foreign_checkpoint_rejected_before_state_or_term_changes() {
@@ -1880,10 +1980,15 @@ pub mod tests {
         pair(&mut nodes, 0, 2);
         pair(&mut nodes, 0, 1);
         let committed = nodes[0].state().commit;
-        let abandoned = nodes[0].propose(Command::Key(vec![1; 104])).unwrap();
+        let abandoned = nodes[0]
+            .propose(Command::Client(vec![crate::Action::new(
+                common::wire::Op::BytesResp,
+                vec![1; 104],
+            )]))
+            .unwrap();
         assert!(abandoned > committed);
         assert_eq!(nodes[0].state().commit, committed);
-        assert!(nodes[0].state().capture().keys.is_empty());
+        assert!(nodes[0].state().capture().application.is_empty());
         nodes[1].campaign().unwrap();
         pair(&mut nodes, 1, 2);
         for _ in 0..4 {
@@ -1892,7 +1997,7 @@ pub mod tests {
         }
         assert_eq!(nodes[0].role, Role::Follower);
         assert_eq!(nodes[0].state().log, nodes[1].state().log);
-        assert!(nodes[0].state().capture().keys.is_empty());
+        assert!(nodes[0].state().capture().application.is_empty());
         assert!(nodes[1].state().commit > abandoned - 1);
     }
     #[test]
@@ -1901,7 +2006,12 @@ pub mod tests {
         nodes[0].campaign().unwrap();
         pair(&mut nodes, 0, 1);
         pair(&mut nodes, 0, 1);
-        let index = nodes[0].propose(Command::Key(vec![7; 104])).unwrap();
+        let index = nodes[0]
+            .propose(Command::Client(vec![crate::Action::new(
+                common::wire::Op::BytesResp,
+                vec![7; 104],
+            )]))
+            .unwrap();
         // The follower journals the entry, but the leader loses the acknowledgment.
         let request = nodes[0].request(&1).unwrap();
         let _answer = nodes[1].receive(&0, &request).unwrap();
@@ -1913,7 +2023,7 @@ pub mod tests {
             pair(&mut nodes, 1, 2);
         }
         assert!(nodes[1].state().commit > index);
-        assert_eq!(nodes[1].state().capture().keys.len(), 1);
+        assert_eq!(nodes[1].state().capture().application.len(), 1);
     }
     #[test]
     fn short_heartbeat_never_truncates_a_longer_matching_log() {
@@ -1921,7 +2031,12 @@ pub mod tests {
         nodes[0].campaign().unwrap();
         pair(&mut nodes, 0, 1);
         pair(&mut nodes, 0, 1);
-        nodes[0].propose(Command::Key(vec![2; 104])).unwrap();
+        nodes[0]
+            .propose(Command::Client(vec![crate::Action::new(
+                common::wire::Op::BytesResp,
+                vec![2; 104],
+            )]))
+            .unwrap();
         pair(&mut nodes, 0, 1);
         let last = nodes[1].state().last();
         let request = Rpc::Append {
@@ -1969,7 +2084,12 @@ pub mod tests {
         nodes[0].campaign().unwrap();
         pair(&mut nodes, 0, 1);
         pair(&mut nodes, 0, 1);
-        nodes[0].propose(Command::Key(vec![9; 104])).unwrap();
+        nodes[0]
+            .propose(Command::Client(vec![crate::Action::new(
+                common::wire::Op::BytesResp,
+                vec![9; 104],
+            )]))
+            .unwrap();
         pair(&mut nodes, 0, 1);
         pair(&mut nodes, 0, 1);
         nodes[1].journal.snapshot(100).unwrap();
@@ -2000,10 +2120,20 @@ pub mod tests {
         nodes[0].campaign().unwrap();
         pair(&mut nodes, 0, 1);
         pair(&mut nodes, 0, 1);
-        nodes[0].propose(Command::Key(vec![9; 104])).unwrap();
+        nodes[0]
+            .propose(Command::Client(vec![crate::Action::new(
+                common::wire::Op::BytesResp,
+                vec![9; 104],
+            )]))
+            .unwrap();
         pair(&mut nodes, 0, 1);
         nodes[0].journal.snapshot(100).unwrap();
-        nodes[0].propose(Command::Key(vec![10; 104])).unwrap();
+        nodes[0]
+            .propose(Command::Client(vec![crate::Action::new(
+                common::wire::Op::BytesResp,
+                vec![10; 104],
+            )]))
+            .unwrap();
         pair(&mut nodes, 0, 1);
         for _ in 0..8 {
             pair(&mut nodes, 0, 2);
@@ -2078,7 +2208,10 @@ pub mod tests {
                         nodes[a]
                             .as_mut()
                             .unwrap()
-                            .propose(Command::Key(vec![(step % 251) as u8; 104]))
+                            .propose(Command::Client(vec![crate::Action::new(
+                                common::wire::Op::BytesResp,
+                                vec![(step % 251) as u8; 104],
+                            )]))
                             .unwrap();
                     }
                     2 => {
@@ -2113,14 +2246,14 @@ pub mod tests {
                 for node in &nodes {
                     let state = node.as_ref().unwrap().state();
                     let snapshot = state.capture();
-                    for key in &snapshot.keys {
+                    for key in &snapshot.application {
                         if let Some(previous) = known.insert(key.index, key.clone()) {
                             assert_eq!(&previous, key, "seed {seed}, step {step}");
                         }
                     }
                     for (index, key) in &known {
                         if *index <= state.commit {
-                            let actual = snapshot.keys.iter().find(|e| e.index == *index);
+                            let actual = snapshot.application.iter().find(|e| e.index == *index);
                             assert_eq!(actual, Some(key), "seed {seed}, step {step}");
                         }
                     }
@@ -2173,7 +2306,14 @@ pub mod tests {
                     }
                 }
                 if nodes[freshest].as_ref().unwrap().role == Role::Leader {
-                    nodes[freshest].as_mut().unwrap().propose(Command::Key(vec![77; 104])).unwrap();
+                    nodes[freshest]
+                        .as_mut()
+                        .unwrap()
+                        .propose(Command::Client(vec![crate::Action::new(
+                            common::wire::Op::BytesResp,
+                            vec![77; 104],
+                        )]))
+                        .unwrap();
                     for other in 0..5 {
                         if other == freshest {
                             continue;
@@ -2199,7 +2339,8 @@ pub mod tests {
                             result.unwrap();
                         }
                     }
-                    let count = nodes[freshest].as_ref().unwrap().state().capture().keys.len();
+                    let count =
+                        nodes[freshest].as_ref().unwrap().state().capture().application.len();
                     assert!(count > 0);
                     converged = true;
                     break;
@@ -2207,5 +2348,193 @@ pub mod tests {
             }
             assert!(converged, "seed {seed} failed to elect with a connected network");
         }
+    }
+}
+
+crate::wire_struct!(Member, RaftMember, {identity,process});
+
+crate::wire_struct!(Membership, RaftMembership, {identities,old,new,retired});
+
+crate::wire_struct!(Retirement, RaftRetirement, {previous,old,next,member});
+
+crate::wire_struct!(Entry, RaftEntry, {index,term,command});
+
+crate::wire_struct!(Snapshot, RaftSnapshot, {ring,index,term,membership,application,checkpoint_start});
+
+crate::wire_struct!(Answer, RaftAnswer, {term,success,matched});
+
+impl crate::codec::Wire for Command {
+    fn write(&self, w: &mut common::wire::StructWriter) {
+        match self {
+            Self::Noop => w.nested(common::wire::Op::RaftCommandNoop, |_| {}),
+            Self::Client(value) => w.nested(common::wire::Op::RaftCommandClient, |w| {
+                value.write(w);
+            }),
+            Self::Members(value) => w.nested(common::wire::Op::RaftCommandMembers, |w| {
+                value.write(w);
+            }),
+            Self::CheckpointStart(value) => {
+                w.nested(common::wire::Op::RaftCommandCheckpointStart, |w| {
+                    value.write(w);
+                })
+            }
+        }
+    }
+    fn read(r: &mut common::wire::StructReader<'_>) -> common::Result<Self> {
+        use crate::codec::Wire;
+        r.nested_any(|op, r| match op {
+            common::wire::Op::RaftCommandNoop => Ok(Self::Noop),
+            common::wire::Op::RaftCommandClient => Ok(Self::Client(Wire::read(r)?)),
+            common::wire::Op::RaftCommandMembers => Ok(Self::Members(Wire::read(r)?)),
+            common::wire::Op::RaftCommandCheckpointStart => {
+                Ok(Self::CheckpointStart(Wire::read(r)?))
+            }
+            _ => Err(common::Error::new("unexpected Command tag")),
+        })
+    }
+}
+
+impl crate::codec::Wire for Record {
+    fn write(&self, w: &mut common::wire::StructWriter) {
+        match self {
+            Self::Contacts(value) => w.nested(common::wire::Op::RaftRecordContacts, |w| {
+                value.write(w);
+            }),
+            Self::Retired(value) => w.nested(common::wire::Op::RaftRecordRetired, |w| {
+                value.write(w);
+            }),
+            Self::Bootstrap(value) => w.nested(common::wire::Op::RaftRecordBootstrap, |w| {
+                value.write(w);
+            }),
+            Self::Carry { entries, commit } => w.nested(common::wire::Op::RaftRecordCarry, |w| {
+                entries.write(w);
+                commit.write(w);
+            }),
+            Self::Hard { term, vote } => w.nested(common::wire::Op::RaftRecordHard, |w| {
+                term.write(w);
+                vote.write(w);
+            }),
+            Self::Entries { from, entries } => w.nested(common::wire::Op::RaftRecordEntries, |w| {
+                from.write(w);
+                entries.write(w);
+            }),
+            Self::Commit(value) => w.nested(common::wire::Op::RaftRecordCommit, |w| {
+                value.write(w);
+            }),
+            Self::Install(value) => w.nested(common::wire::Op::RaftRecordInstall, |w| {
+                value.write(w);
+            }),
+        }
+    }
+    fn read(r: &mut common::wire::StructReader<'_>) -> common::Result<Self> {
+        use crate::codec::Wire;
+        r.nested_any(|op, r| match op {
+            common::wire::Op::RaftRecordContacts => Ok(Self::Contacts(Wire::read(r)?)),
+            common::wire::Op::RaftRecordRetired => Ok(Self::Retired(Wire::read(r)?)),
+            common::wire::Op::RaftRecordBootstrap => Ok(Self::Bootstrap(Wire::read(r)?)),
+            common::wire::Op::RaftRecordCarry => {
+                Ok(Self::Carry { entries: Wire::read(r)?, commit: Wire::read(r)? })
+            }
+            common::wire::Op::RaftRecordHard => {
+                Ok(Self::Hard { term: Wire::read(r)?, vote: Wire::read(r)? })
+            }
+            common::wire::Op::RaftRecordEntries => {
+                Ok(Self::Entries { from: Wire::read(r)?, entries: Wire::read(r)? })
+            }
+            common::wire::Op::RaftRecordCommit => Ok(Self::Commit(Wire::read(r)?)),
+            common::wire::Op::RaftRecordInstall => Ok(Self::Install(Wire::read(r)?)),
+            _ => Err(common::Error::new("unexpected Record tag")),
+        })
+    }
+}
+
+impl crate::codec::Wire for Rpc {
+    fn write(&self, w: &mut common::wire::StructWriter) {
+        match self {
+            Self::Vote { term, last, last_term } => w.nested(common::wire::Op::RaftRpcVote, |w| {
+                term.write(w);
+                last.write(w);
+                last_term.write(w);
+            }),
+            Self::Append { term, previous, previous_term, entries, commit } => {
+                w.nested(common::wire::Op::RaftRpcAppend, |w| {
+                    term.write(w);
+                    previous.write(w);
+                    previous_term.write(w);
+                    entries.write(w);
+                    commit.write(w);
+                })
+            }
+            Self::Install { term, snapshot } => w.nested(common::wire::Op::RaftRpcInstall, |w| {
+                term.write(w);
+                snapshot.write(w);
+            }),
+            Self::Checkpoint { term, index, snapshot_term } => {
+                w.nested(common::wire::Op::RaftRpcCheckpoint, |w| {
+                    term.write(w);
+                    index.write(w);
+                    snapshot_term.write(w);
+                })
+            }
+        }
+    }
+    fn read(r: &mut common::wire::StructReader<'_>) -> common::Result<Self> {
+        use crate::codec::Wire;
+        r.nested_any(|op, r| match op {
+            common::wire::Op::RaftRpcVote => Ok(Self::Vote {
+                term: Wire::read(r)?,
+                last: Wire::read(r)?,
+                last_term: Wire::read(r)?,
+            }),
+            common::wire::Op::RaftRpcAppend => Ok(Self::Append {
+                term: Wire::read(r)?,
+                previous: Wire::read(r)?,
+                previous_term: Wire::read(r)?,
+                entries: Wire::read(r)?,
+                commit: Wire::read(r)?,
+            }),
+            common::wire::Op::RaftRpcInstall => {
+                Ok(Self::Install { term: Wire::read(r)?, snapshot: Wire::read(r)? })
+            }
+            common::wire::Op::RaftRpcCheckpoint => Ok(Self::Checkpoint {
+                term: Wire::read(r)?,
+                index: Wire::read(r)?,
+                snapshot_term: Wire::read(r)?,
+            }),
+            _ => Err(common::Error::new("unexpected Rpc tag")),
+        })
+    }
+}
+
+impl crate::codec::Wire for State {
+    fn write(&self, w: &mut common::wire::StructWriter) {
+        w.nested(common::wire::Op::RaftState, |w| {
+            self.ring.write(w);
+            self.founders.write(w);
+            self.contacts.write(w);
+            self.retirements.write(w);
+            self.term.write(w);
+            self.vote.write(w);
+            self.snapshot.write(w);
+            self.log.write(w);
+            self.commit.write(w);
+        });
+    }
+    fn read(r: &mut common::wire::StructReader<'_>) -> common::Result<Self> {
+        use crate::codec::Wire;
+        r.nested(common::wire::Op::RaftState, "state", |r| {
+            Ok(Self {
+                ignore_ring_identity: false,
+                ring: Wire::read(r)?,
+                founders: Wire::read(r)?,
+                contacts: Wire::read(r)?,
+                retirements: Wire::read(r)?,
+                term: Wire::read(r)?,
+                vote: Wire::read(r)?,
+                snapshot: Wire::read(r)?,
+                log: Wire::read(r)?,
+                commit: Wire::read(r)?,
+            })
+        })
     }
 }

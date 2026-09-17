@@ -18483,7 +18483,7 @@ activation TimeSec), and a 32-byte AEGIS-256 tag. The independent 256-bit unlock
 key encrypts it. Associated data binds `DLAW-RAFT-KEY-1`, ring identity, Raft index,
 and term. Snapshots preserve these encrypted entries and their original positions;
 master keys and activation seconds are encrypted in both journals and snapshots.
-Outer JSON records have SHA-256 checksums for accidental corruption, not malicious
+Outer binary tagged records have SHA-256 checksums for accidental corruption, not malicious
 metadata modification or rollback protection.
 
 The first key may activate immediately after commitment and application. Later
@@ -18539,7 +18539,7 @@ This small-state copy is not the future large SN/DN snapshot implementation.
 Publication writes a temporary file, syncs it, renames it, and syncs the directory.
 An incomplete final frame in the active journal can be trimmed; a partial closed
 segment or complete corrupt frame is preserved as corrupt and triggers identity
-retirement and peer recovery. Frames carry a length and its complement, a JSON
+retirement and peer recovery. Frames carry a length and its complement, a binary tagged
 batch, and checksum. An unusable snapshot is preserved and recovery tries earlier
 local checkpoints without retiring the identity merely for that fallback. A journal
 I/O failure fences further writes until restart. Snapshot publication failure
@@ -18637,7 +18637,7 @@ to KS/SN/DN validate the full ring identifier once before ordinary requests; Raf
 packets do not repeat it. Ordinary data requests use compact routing labels. Long-identity
 checks belong at admission/recovery boundaries, not every extent operation.
 
-Every journal begins with `DLAWKR03`, the 128 ASCII hexadecimal ring identity
+Every journal begins with `DLAWKR04`, the 128 ASCII hexadecimal ring identity
 characters, and the starting batch sequence as a little-endian u64 followed by
 its bitwise complement. These are checked before replay even for an otherwise
 empty file. Every local
@@ -18993,8 +18993,106 @@ Filesystem recovery tests are ignored by default and run explicitly. The separat
 `scripts/test-ks-raft` integration test exercises locked quorum, unlock transfer,
 key reads, failover, minority rejection, restart, and membership changes.
 
-This initial implementation uses whole JSON messages and a 64 MiB journal frame
+This implementation uses whole binary Op-tagged messages and a 64 MiB journal frame
 limit. Snapshot transfer is not chunked. Large SN/DN state requires bounded-memory
 streaming and different snapshot capture before reusing this implementation there
 (issue #125).
 Leadership handoff and independent execution liveness monitoring are deferred.
+
+
+### Shared Raft implementation and application execution
+
+`raft/` is the shared implementation for ring services. KS supplies the first
+client; SN and DN can supply their own action dispatch and checkpoint capture.
+Raft commands distinguish consensus commands from one `Client(Vec<Action>)`
+command. Every action carries an `Op` tag and serialized fields. KS encrypts each
+action payload independently, leaving its outer action tag visible. Authenticated
+encryption binds KS key actions to the ring identity, entry index, and term.
+Raft metadata remains readable without the unlock key. Other clients may choose
+plaintext actions. Entries, checkpoints, journal records, and Raft RPCs use the
+existing tagged binary serializer, including Op-tagged substructures; old JSON
+persistence formats are not retained. The membership administration command still
+accepts a human-supplied JSON file and serializes its contents for transmission.
+
+A single `raft-main` loop owns Node and its journal state. Other threads submit
+owned work and receive owned results through channels; they cannot retain a Node
+reference or a consensus mutex guard. The loop uses a timed blocking receive for
+maintenance deadlines. Network helpers perform potentially slow RPC calls outside
+that loop and submit responses with the original request and send timestamp.
+Journal writes currently retain synchronous durable-before-acknowledgment
+semantics: moving consensus to one thread does not make disk I/O asynchronous.
+
+Committed action lists are queued independently to `raft-application`. This thread
+executes client actions synchronously under the global write lock. It releases and
+reacquires the lock between actions once `raft.execution_lock_ms` (default 10 ms)
+has elapsed; it never interrupts an action. The cursor retains its position within
+a partly applied entry. The applied index advances only after the whole entry.
+Read admission and write completion require the relevant committed state to have
+been applied. Errors do not make a partially executed entry appear fully applied.
+A bounded, coalescing wakeup channel puts the application worker to sleep when idle;
+queued work remains in the shared queue, so a coalesced notification loses no work.
+Shutdown explicitly wakes the worker. There are no per-action worker threads.
+
+Checkpoint helpers obtain the global read lock, capture applied committed state,
+serialize and write it while retaining that lock, then release it. They never make
+the Raft loop wait for the application lock. Client checkpoint callbacks and binary
+checkpoint encoding run on the helper, outside consensus ownership. Journal
+rotation/publication bookkeeping goes through the Raft loop. Capturing large SN/DN
+state and streaming transfers still require the bounded-memory work in issue #125.
+
+
+Raft logs one record at each entry's acceptance, commitment, and completed
+application, plus each received heartbeat. These logs identify terms/indexes and
+members without action contents or keys. Elections, leadership recognition,
+membership history, checkpoint/catch-up work, and failures have additional logs.
+Peer failures log on error changes, and successful communication logs recovery.
+Application failures likewise log on transitions. This keeps persistent identical
+failures from adding a second repetitive log on every heartbeat.
+
+
+Committed peer-journal copies also require a small `JournalTip` query to the
+current primary. The request names the election term and the copied range's last
+index; the primary returns the term at that index only if it is committed and
+still primary in the requested election term. A mismatching or unavailable proof
+rejects that source. Before installation, the recipient rechecks its leader,
+election term, and starting commit position. This prevents old committed secondary
+history (for example index 10/term 4) from overwriting the new primary's history
+(index 10/term 6). Bulk data remains secondary-first, primary-last. The query is
+only on catch-up, not normal reads, appends, or heartbeats. Histories reusing both
+term and index still require the detection/repair work in #127.
+
+
+### Offline log inspection
+
+`laws log-histogram`, `log-grep`, and `log-lines` accept `--path` to read local
+plain or Zstd log files using the same `common::logread::Logs` reader as the
+service commands. A file path selects exactly that file. A directory path
+requires `--log-name` (for example `ks0-member0`), selects numbered files in
+order, and honors `--which full|info`. Time filters and line limits retain
+their existing meaning; histograms return every site, rarest first.
+Local mode runs before loading cluster configuration, does not contact KS or
+any service, and relies on local filesystem permissions. Histogram inspection
+may create the reader's existing cache sidecars for closed files. Without
+`--path`, discovery and service-side configured log selection remain unchanged;
+no arbitrary remote path is added to the protocol. This resolves #132.
+
+
+Log writer restart reopens the latest numbered file for append and retains its
+on-disk byte count for rotation. Each process appends an opening header, leaving
+previous exit diagnostics intact. A resumed file's histogram is rebuilt from
+the whole file when it rotates; ordinary new files keep using live counters.
+Startup invalidates a resumed file's cached histogram. It checks framing
+boundaries without decompressing payloads; an incomplete crash tail is preserved
+in its old file and logging continues in a new numbered file. A compression
+setting change likewise starts a new file. Rotation never truncates an existing
+numbered file. This resolves #131; forced termination can still lose buffered,
+unwritten lines, so orderly shutdown should flush logs.
+
+
+Known recovery boundary (#127): primary confirmation of copied journal tips
+catches differing terms, but does not cover all abandoned checkpoint histories.
+A follower installing a peer checkpoint beyond its local commit still needs a
+proof against the current primary's chosen history; checking the installed
+checkpoint against itself is insufficient. Reused (term, index) values also
+remain undetectable without stronger history identity. The latest recovery
+integration passes, but does not establish correctness for those deferred cases.
