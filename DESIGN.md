@@ -18637,10 +18637,15 @@ to KS/SN/DN validate the full ring identifier once before ordinary requests; Raf
 packets do not repeat it. Ordinary data requests use compact routing labels. Long-identity
 checks belong at admission/recovery boundaries, not every extent operation.
 
-Every journal begins with `DLAWKR04`, the 128 ASCII hexadecimal ring identity
+Every journal begins with `DLAWKR05`, the 128 ASCII hexadecimal ring identity
 characters, and the starting batch sequence as a little-endian u64 followed by
-its bitwise complement. These are checked before replay even for an otherwise
-empty file. Every local
+its bitwise complement, followed by the predecessor Raft index and term (two
+little-endian u64s). Physical batch sequences are member-local. Local replay checks
+both sequence continuity and the logical predecessor. A snapshot may omit a
+carried suffix; only its initial Carry record may reconstruct that suffix, and
+its ending index/term must match the header before replay proceeds. Peer journal
+copies use logical positions, never another member's physical batch sequence.
+These checks also apply during archived-history lookup. Every local
 snapshot and transferable checkpoint carries its source identity. Checkpoint
 installation checks it before altering terms, membership, or application state;
 recovery compares it against independently supplied bootstrap configuration.
@@ -19089,10 +19094,16 @@ numbered file. This resolves #131; forced termination can still lose buffered,
 unwritten lines, so orderly shutdown should flush logs.
 
 
-Known recovery boundary (#127): primary confirmation of copied journal tips
-catches differing terms, but does not cover all abandoned checkpoint histories.
-A follower installing a peer checkpoint beyond its local commit still needs a
-proof against the current primary's chosen history; checking the installed
-checkpoint against itself is insufficient. Reused (term, index) values also
-remain undetectable without stronger history identity. The latest recovery
-integration passes, but does not establish correctness for those deferred cases.
+Copied checkpoints, like copied journal ranges, require the current primary to
+confirm their ending (index, term) before installation. The primary searches
+retained local snapshots/journals when the index is compacted out of RAM;
+replay validates file boundaries and must join its current history. An unrelated
+checkpoint install invalidates proofs of the abandoned prefix. Missing history
+or a different term makes a peer checkpoint unusable. The receiver rechecks the
+primary and election term before installation; a primary copying a checkpoint
+uses its own history as authority. Bulk transfer remains secondary-first.
+
+Known recovery boundary (#127): reused (term, index) values remain undetectable
+without stronger history identity. These checks reject unsuitable copies; they
+do not implement rollback of members whose committed state is already from an
+abandoned history.

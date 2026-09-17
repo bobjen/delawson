@@ -82,7 +82,7 @@ impl WorkQueue {
 enum CheckpointPlan {
     Request(MemberId),
     Produce(State),
-    Copy { after: u64, peers: Vec<(MemberId, bool)> },
+    Copy { after: u64, primary: Option<(MemberId, u64)>, peers: Vec<(MemberId, bool)> },
 }
 pub struct Runtime<S> {
     pub options: Options,
@@ -620,6 +620,36 @@ pub trait Host:
             logn!("Raft checkpoint deferred; journals retained", "{e}");
         }
     }
+    fn primary_history_term(
+        &self,
+        primary: MemberId,
+        term: u64,
+        index: u64,
+    ) -> Result<Option<u64>> {
+        let local = self.on_raft(move |_, node| {
+            if node.id != primary {
+                return Ok(None);
+            }
+            if node.role != Role::Leader || node.state().term != term {
+                return Err(Error::new("history proof requires the current primary"));
+            }
+            Ok(Some(node.journal.committed_term(index)?))
+        })?;
+        if let Some(value) = local {
+            return Ok(value);
+        }
+        let response = self.send_raft(&primary, Message::JournalTip { index, term })?;
+        if response.status != Status::Ok {
+            return Err(Error::new("primary history proof unavailable"));
+        }
+        let (mut body, rest) = structure(&response.args, Op::BytesResp, "journal tip response")?;
+        let value = parse(&body.bytes()?)?;
+        body.done()?;
+        if !rest.is_empty() {
+            return Err(Error::new("trailing journal tip response"));
+        }
+        Ok(value)
+    }
     fn copy_committed_journal(&self) -> Result<bool> {
         let plan = self.on_raft(|host, node| {
             let through = host.checkpoint_needed.load(Ordering::SeqCst);
@@ -812,6 +842,7 @@ pub trait Host:
             } else {
                 Ok(Some(CheckpointPlan::Copy {
                     after: node.state().snapshot.index,
+                    primary: node.leader.map(|id| (id, node.state().term)),
                     peers: recovery_sources(
                         node.state().membership().participants(),
                         node.id,
@@ -846,8 +877,9 @@ pub trait Host:
                 }
                 Ok(())
             }
-            Some(CheckpointPlan::Copy { after, peers }) => {
+            Some(CheckpointPlan::Copy { after, primary, peers }) => {
                 drop(history);
+                let Some((primary, election_term)) = primary else { return Ok(()) };
                 for (id, primary_fallback) in peers {
                     let Ok(response) =
                         self.send_raft(&id, Message::Checkpoint { after, primary_fallback })
@@ -875,22 +907,35 @@ pub trait Host:
                             continue;
                         }
                     };
+                    let proof = self.primary_history_term(primary, election_term, snapshot.index);
+                    if !matches!(proof, Ok(Some(term)) if term == snapshot.term) {
+                        logn!(
+                            "Raft checkpoint history rejected",
+                            "peer {},primary {},index {},checkpoint_term {},proof {:?}",
+                            id,
+                            primary,
+                            snapshot.index,
+                            snapshot.term,
+                            proof
+                        );
+                        continue;
+                    }
+                    let verified_term = proof?;
                     let pending = self.on_raft(move |host, node| {
-                        if node.role == Role::Stopped || node.journal.failed {
-                            return Ok(None);
-                        }
-                        if snapshot.validate().is_err()
-                            || node.state().check_ring(&snapshot).is_err()
-                            || snapshot.index <= node.state().snapshot.index
-                            || snapshot.term > node.state().term
+                        if node.role == Role::Stopped
+                            || node.journal.failed
+                            || node.leader != Some(primary)
+                            || node.state().term != election_term
                         {
                             return Ok(None);
                         }
-                        if snapshot.index > node.state().commit {
+                        let install =
+                            journal::checkpoint_install(node.state(), &snapshot, verified_term)?;
+                        if let Some(install) = install {
                             if node.role == Role::Leader {
                                 return Ok(None);
                             }
-                            node.journal.write(&[raft::Record::Install(snapshot.clone())])?;
+                            node.journal.write(&[install])?;
                             node.refresh_slot();
                         }
                         logn!(
@@ -1504,8 +1549,7 @@ pub trait Host:
                 if node.role != Role::Leader || node.state().term != term {
                     return Err(Error::new("journal history proof requires the current primary"));
                 }
-                let entry_term =
-                    if index <= node.state().commit { node.state().term_at(index) } else { None };
+                let entry_term = node.journal.committed_term(index)?;
                 Ok(Resp::bytes(binary(&entry_term)?))
             }
             Message::Journal { after, through, primary_fallback } => {

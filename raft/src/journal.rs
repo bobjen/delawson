@@ -10,13 +10,27 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"DLAWKR04";
+const MAGIC: &[u8; 8] = b"DLAWKR05";
 const CURRENT: &str = "current.log";
-const HEADER: u64 = 8 + 128 + 16;
+const HEADER: u64 = 8 + 128 + 16 + 16;
 fn journal_header(ring: &str, start: u64) -> Vec<u8> {
-    [MAGIC.as_slice(), ring.as_bytes(), &start.to_le_bytes(), &(!start).to_le_bytes()].concat()
+    [MAGIC.as_slice(), ring.as_bytes(), &start.to_le_bytes(), &(!start).to_le_bytes(), &[0; 16]]
+        .concat()
+}
+fn journal_header_after(state: &State, start: u64) -> Vec<u8> {
+    let mut bytes = journal_header(&state.ring, start);
+    bytes[152..160].copy_from_slice(&state.last().to_le_bytes());
+    bytes[160..168].copy_from_slice(&state.term_at(state.last()).unwrap().to_le_bytes());
+    bytes
 }
 fn check_journal_header(reader: &mut impl Read, ring: &str, ignore: bool) -> Result<u64> {
+    Ok(read_journal_header(reader, ring, ignore)?.0)
+}
+fn read_journal_header(
+    reader: &mut impl Read,
+    ring: &str,
+    ignore: bool,
+) -> Result<(u64, u64, u64)> {
     let mut header = [0; HEADER as usize];
     reader.read_exact(&mut header)?;
     if &header[..8] != MAGIC || (!ignore && &header[8..136] != ring.as_bytes()) {
@@ -27,7 +41,34 @@ fn check_journal_header(reader: &mut impl Read, ring: &str, ignore: bool) -> Res
     if start == 0 || inverse != !start {
         return Err(Error::new("invalid journal starting sequence"));
     }
-    Ok(start)
+    Ok((
+        start,
+        u64::from_le_bytes(header[152..160].try_into().unwrap()),
+        u64::from_le_bytes(header[160..168].try_into().unwrap()),
+    ))
+}
+/// Validate before Install can make an untrusted checkpoint look locally committed.
+pub(crate) fn checkpoint_install(
+    state: &State,
+    snapshot: &crate::Snapshot,
+    proof: Option<u64>,
+) -> Result<Option<Record>> {
+    snapshot.validate()?;
+    state.check_ring(snapshot)?;
+    if proof != Some(snapshot.term) || snapshot.term > state.term {
+        return Err(Error::new("checkpoint does not match primary history"));
+    }
+    if snapshot.index <= state.snapshot.index {
+        return Err(Error::new("checkpoint does not advance snapshot"));
+    }
+    if snapshot.index <= state.commit {
+        if state.term_at(snapshot.index) != Some(snapshot.term) {
+            return Err(Error::new("checkpoint differs from local committed history"));
+        }
+        Ok(None)
+    } else {
+        Ok(Some(Record::Install(snapshot.clone())))
+    }
 }
 const LIMIT: usize = 64 * 1024 * 1024;
 
@@ -224,7 +265,7 @@ impl Journal {
             };
             let bytes = encode(&checkpoint)?;
             if !current_exists {
-                publish(&current, &journal_header(&initial.ring, 1))?;
+                publish(&current, &journal_header_after(&initial, 1))?;
             }
             publish(&named(directory, "snapshot", 0), &bytes)?;
             (initial.clone(), 0, checkpoint.second, bytes.len() as u64)
@@ -327,8 +368,10 @@ impl Journal {
         result.prune()?;
         Ok(result)
     }
-    pub fn committed_suffix(&self, after: u64, through: u64) -> Result<Option<CommittedJournal>> {
+    // Replays retained files with the same sequence and predecessor checks as restart.
+    fn retained_history(&self, after: u64) -> Result<Option<(State, Option<u64>)>> {
         let mut state = self.state.clone();
+        let mut found = state.term_at(after);
         if after < state.snapshot.index {
             // Retained closed journals can outlive their in-memory entries.
             let mut base = None;
@@ -354,17 +397,45 @@ impl Journal {
                 if start != sequence + 1 {
                     return Ok(None);
                 }
-                replay_segment(
+                if let Some(term) = restored.term_at(after) {
+                    found = Some(term);
+                }
+                let mut proof = (after, found);
+                replay_segment_checked(
                     &path,
                     start,
                     &mut restored,
                     &mut sequence,
                     false,
                     state.ignore_ring_identity,
+                    Some(&mut proof),
                 )?;
+                found = proof.1;
+            }
+            if restored.last() != self.state.last()
+                || restored.term_at(self.state.last()) != self.state.term_at(self.state.last())
+                || restored.commit != self.state.commit
+            {
+                return Err(Error::new("archived journals differ from current history"));
+            }
+            if let Some(term) = restored.term_at(after) {
+                found = Some(term);
             }
             state = restored;
         }
+        Ok(Some((state, found)))
+    }
+    pub fn committed_term(&self, index: u64) -> Result<Option<u64>> {
+        if index > self.state.commit {
+            return Ok(None);
+        }
+        if let Some(term) = self.state.term_at(index) {
+            return Ok(Some(term));
+        }
+        Ok(self.retained_history(index)?.and_then(|(_, term)| term))
+    }
+    pub fn committed_suffix(&self, after: u64, through: u64) -> Result<Option<CommittedJournal>> {
+        let Some((state, _)) = self.retained_history(after)? else { return Ok(None) };
         if after < state.snapshot.index || after >= state.commit.min(through) {
             return Ok(None);
         }
@@ -530,7 +601,7 @@ impl Journal {
             self.file.sync_all()?;
             std::fs::rename(&current, closed)?;
             sync_directory(&self.directory)?;
-            let bytes = [journal_header(&self.state.ring, start), carried.to_vec()].concat();
+            let bytes = [journal_header_after(&self.state, start), carried.to_vec()].concat();
             publish(&current, &bytes)?;
             Ok(OpenOptions::new().read(true).append(true).open(current)?)
         })();
@@ -640,9 +711,28 @@ fn replay_segment(
     active: bool,
     ignore: bool,
 ) -> Result<(File, u64)> {
+    replay_segment_checked(path, start, state, sequence, active, ignore, None)
+}
+fn replay_segment_checked(
+    path: &Path,
+    start: u64,
+    state: &mut State,
+    sequence: &mut u64,
+    active: bool,
+    ignore: bool,
+    mut proof: Option<&mut (u64, Option<u64>)>,
+) -> Result<(File, u64)> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-    if check_journal_header(&mut file, &state.ring, ignore)? != start {
+    let (found_start, previous, previous_term) =
+        read_journal_header(&mut file, &state.ring, ignore)?;
+    if found_start != start {
         return Err(Error::new("journal filename/header sequence mismatch"));
+    }
+    let mut boundary = state.last() == previous && state.term_at(previous) == Some(previous_term);
+    // Starting from a compact checkpoint can omit the carried uncommitted suffix.
+    let can_restore_carry = state.last() == state.snapshot.index && state.last() < previous;
+    if !boundary && !can_restore_carry {
+        return Err(Error::new("journal predecessor index/term mismatch"));
     }
     let size = file.metadata()?.len();
     let mut offset = HEADER;
@@ -676,13 +766,51 @@ fn replay_segment(
             return Err(Error::new("journal sequence gap"));
         }
         let mut next = state.clone();
+        if !boundary {
+            match batch.records.as_slice() {
+                [Record::Carry { entries, commit }]
+                    if *commit >= state.snapshot.index
+                        && *commit <= previous
+                        && entries
+                            .last()
+                            .is_some_and(|e| e.index == previous && e.term == previous_term) => {}
+                _ => return Err(Error::new("journal carried predecessor mismatch")),
+            }
+        }
         for record in &batch.records {
+            if let Some((index, found)) = proof.as_deref_mut() {
+                // An Install can replace history we cannot link. Never carry a proof
+                // from that abandoned prefix through an unrelated checkpoint.
+                if let Record::Install(snapshot) = record {
+                    if snapshot.index > *index
+                        && next.term_at(snapshot.index) != Some(snapshot.term)
+                    {
+                        *found = None;
+                    }
+                }
+            }
             next.apply(record)?;
+            if let Some((index, found)) = proof.as_deref_mut() {
+                if *index <= next.commit {
+                    if let Some(term) = next.term_at(*index) {
+                        *found = Some(term);
+                    }
+                }
+            }
         }
         next.validate()?;
+        if !boundary {
+            if next.last() != previous || next.term_at(previous) != Some(previous_term) {
+                return Err(Error::new("journal restored predecessor mismatch"));
+            }
+            boundary = true;
+        }
         *state = next;
         *sequence = batch.sequence;
         offset += 16 + length;
+    }
+    if !boundary {
+        return Err(Error::new("missing carried journal predecessor"));
     }
     if active {
         file.set_len(offset)?;
@@ -811,7 +939,7 @@ fn finish_recovery(
     }
     sync_directory(&archive)?;
     sync_directory(directory)?;
-    publish(&directory.join(CURRENT), &journal_header(&checkpoint.state.ring, 1))?;
+    publish(&directory.join(CURRENT), &journal_header_after(&checkpoint.state, 1))?;
     publish(&named(directory, "snapshot", 0), &bytes)?;
     local.initialized = true;
     local.recovery = None;
@@ -937,6 +1065,77 @@ fn publish_cancellable(path: &Path, bytes: &[u8], cancelled: impl Fn() -> bool) 
 mod tests {
     use super::*;
     use crate::raft::{Command, Entry, Members, Node, Storage};
+    #[test]
+    fn checkpoint_proof_is_checked_before_installing_new_history() {
+        let mut state = initial();
+        state.term = 9;
+        let mut snapshot = state.capture();
+        snapshot.index = 20;
+        snapshot.term = 7;
+        for proof in [None, Some(9)] {
+            let rejected = checkpoint_install(&state, &snapshot, proof).is_err();
+            assert!(rejected);
+            assert_eq!(state.commit, 0);
+        }
+        snapshot.term = 9;
+        let install = checkpoint_install(&state, &snapshot, Some(9)).unwrap().unwrap();
+        state.apply(&install).unwrap();
+        assert_eq!(state.commit, 20);
+        assert_eq!(state.term_at(20), Some(9));
+    }
+
+    #[test]
+    #[ignore = "filesystem integration; run explicitly with --ignored"]
+    fn retained_journals_prove_compacted_terms_and_reject_wrong_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 5, "KS0").unwrap();
+        for index in 1..=3 {
+            journal
+                .write(&[
+                    Record::Hard { term: index, vote: Some(0) },
+                    Record::Entries {
+                        from: index,
+                        entries: vec![Entry { index, term: index, command: Command::Noop }],
+                    },
+                    Record::Commit(index),
+                ])
+                .unwrap();
+            let pending = journal.prepare_snapshot(index).unwrap().unwrap();
+            pending.write().unwrap();
+            journal.finish_snapshot(&pending).unwrap();
+        }
+        assert_eq!(journal.state.term_at(1), None);
+        assert_eq!(journal.committed_term(1).unwrap(), Some(1));
+        assert_eq!(journal.committed_term(3).unwrap(), Some(3));
+        assert_eq!(journal.committed_term(4).unwrap(), None);
+        // Physical sequence/ring still match, but the next file claims another predecessor term.
+        let journals = numbered(dir.path(), "journal").unwrap();
+        let (_, path) = &journals[1];
+        let original = std::fs::read(path).unwrap();
+        for offset in [152, 160] {
+            let mut bad = original.clone();
+            bad[offset..offset + 8].copy_from_slice(&99u64.to_le_bytes());
+            std::fs::write(path, bad).unwrap();
+            let rejected = journal.committed_term(0).is_err();
+            assert!(rejected);
+        }
+        std::fs::write(path, original).unwrap();
+        // A later installed checkpoint that cannot be linked must invalidate
+        // an older proof, even if that term was present earlier in the same file.
+        let mut replacement = journal.state.capture();
+        replacement.index = 5;
+        replacement.term = 9;
+        journal
+            .write(&[Record::Hard { term: 9, vote: None }, Record::Install(replacement)])
+            .unwrap();
+        assert_eq!(journal.committed_term(1).unwrap(), None);
+        // Losing all retained bases makes proof unavailable, not an assumed match.
+        for (_, path) in numbered(dir.path(), "snapshot").unwrap() {
+            std::fs::remove_file(path).unwrap();
+        }
+        assert_eq!(journal.committed_term(1).unwrap(), None);
+    }
+
     #[test]
     fn old_committed_copy_cannot_replace_the_new_primary_history() {
         let mut state = initial();

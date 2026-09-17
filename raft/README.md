@@ -52,7 +52,15 @@ Normal logging includes entry acceptance, commitment, application, and received
 heartbeats. Additional logs cover elections, membership changes, checkpoint work,
 and failure/recovery transitions. Logs contain metadata, not action contents.
 
-Copied journal ranges require the current primary to confirm the ending
-(index, term), with the election term checked again before installation. This is
-a small metadata request; bulk transfer remains secondary-first. It catches
-visible term mismatches, not #127's reuse of both term and index.
+Copied journal ranges and checkpoints require the current primary to confirm the
+ending (index, term), with the leader and election term checked again before
+installation. Compacted positions can be proved from retained snapshots and
+journals. Unavailable history and mismatching terms reject a checkpoint. Bulk
+transfer remains secondary-first; the proof is a small metadata request.
+
+Journal headers (DLAWKR05) include the preceding logical index and term. Local
+replay checks these plus member-local batch sequences at file boundaries. When
+starting from a snapshot, an initial Carry record can restore the omitted suffix,
+but must end at the header's predecessor. Peer transfers never compare different
+members' physical sequences. These checks do not detect #127's reuse of both term
+and index, or repair already-divergent committed histories.
