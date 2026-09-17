@@ -378,10 +378,15 @@ active journal or a gap in the required replay suffix retires the local identity
 Recovery archives the old files, preserves the verified committed prefix, and
 starts a fresh random identity in the same logical slot with a new incarnation.
 Retirement is durable before the new member can send messages; interrupted
-recovery resumes the same identity. Corrupt frames and wrong-ring files still
-fail recovery. Rotation precedes snapshot publication and carries
-any uncommitted suffix into the new journal. An incomplete final active frame can
-be discarded; complete corruption fails recovery. Earlier pre-Raft formats are
+recovery resumes the same identity. Unparseable or wrong-ring files are renamed
+with a `.corrupt-N` suffix and preserved. Recovery retries older local checkpoints;
+checkpoint fallback alone does not retire the identity. Corrupt journals trigger
+retirement and peer catch-up. Committed journal ranges are fetched from secondaries
+first, then the primary, and saved in `copied-journals/journal-<index>.log`, never
+as `current.log`. The primary supplies the uncommitted suffix. Missing identity
+starts a new slotless applicant, without inferring ownership from recovered data.
+Rotation precedes snapshot publication and carries any uncommitted suffix into
+the new journal. An incomplete final active frame can be discarded. Earlier pre-Raft formats are
 refused without migration.
 
 A pending replacement sends an old-to-new retirement pair along with its campaigns.

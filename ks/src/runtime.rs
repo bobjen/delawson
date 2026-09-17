@@ -159,6 +159,7 @@ enum Message {
     Bootstrap { founders: Membership, membership: Membership },
     Consensus(Rpc),
     Checkpoint { after: u64, primary_fallback: bool },
+    Journal { after: u64, through: u64, primary_fallback: bool },
     CheckpointStart,
     Unlock([u8; 32]),
     Forward { op: u16, payload: Vec<u8>, depth: u8 },
@@ -311,6 +312,22 @@ fn election_delay(config: &RaftConfig, random: u64, hot: bool, writing: bool) ->
     )
 }
 
+fn recovery_sources(
+    members: crate::raft::Members,
+    local: MemberId,
+    primary: Option<MemberId>,
+) -> Vec<(MemberId, bool)> {
+    let mut sources: Vec<_> = members
+        .into_iter()
+        .filter(|id| *id != local && Some(*id) != primary)
+        .map(|id| (id, false))
+        .collect();
+    if let Some(primary) = primary.filter(|id| *id != local) {
+        sources.push((primary, true));
+    }
+    sources
+}
+
 impl Ks {
     fn accept_founders(&self, founders: Membership) -> Result<()> {
         founders.validate()?;
@@ -326,7 +343,9 @@ impl Ks {
         if let Some((_, member)) =
             founders.identities.iter().find(|(_, m)| m.process == self.runtime.name)
         {
-            if member.identity != node.journal.identity.current {
+            if member.identity != node.journal.identity.current
+                && node.state().founders.as_ref() != Some(&founders)
+            {
                 return Err(Error::new(
                     "bootstrap does not name this process's persistent identity",
                 ));
@@ -493,10 +512,68 @@ impl Ks {
             logn!("KS checkpoint deferred; journals retained", "{e}");
         }
     }
+    fn copy_committed_journal(&self) -> Result<bool> {
+        let (after, through, leader, term, peers) = {
+            let node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
+            let through = self.checkpoint_needed.load(Ordering::SeqCst);
+            if node.role != Role::Follower || node.journal.failed || through <= node.state().commit
+            {
+                return Ok(false);
+            }
+            let Some(leader) = node.leader else {
+                return Ok(false);
+            };
+            let peers =
+                recovery_sources(node.state().membership().participants(), node.id, Some(leader));
+            (node.state().commit, through, leader, node.state().term, peers)
+        };
+        for (peer, primary_fallback) in peers {
+            let Ok(response) =
+                self.send_raft(&peer, Message::Journal { after, through, primary_fallback })
+            else {
+                continue;
+            };
+            if response.status != Status::Ok {
+                continue;
+            }
+            let decoded = (|| -> Result<Option<crate::journal::CommittedJournal>> {
+                let (mut body, rest) =
+                    structure(&response.args, Op::BytesResp, "journal response")?;
+                let value = parse(&body.bytes()?)?;
+                body.done()?;
+                if !rest.is_empty() {
+                    return Err(Error::new("trailing journal response"));
+                }
+                Ok(value)
+            })();
+            let Ok(Some(copied)) = decoded else {
+                continue;
+            };
+            let mut node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
+            if node.role != Role::Follower
+                || node.leader != Some(leader)
+                || node.state().term != term
+                || node.state().commit != after
+            {
+                return Ok(false);
+            }
+            if copied.validate(node.state(), through).is_err() {
+                continue;
+            }
+            node.journal.import_committed(&copied, through)?;
+            node.refresh_slot();
+            self.refresh_keys(&node)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
     fn checkpoint_work(&self) -> Result<()> {
         let Ok(_task) = self.snapshot_task.try_lock() else {
             return Ok(());
         };
+        if self.copy_committed_journal()? {
+            return Ok(());
+        }
         let _production = SnapshotProduction(&self.producing_snapshot);
         let now = TimeSec::now().number();
         let (pending, peers, after) = {
@@ -563,19 +640,11 @@ impl Ks {
                 // Capture and rotate under the execution read lock; disk publication is independent.
                 (pending, vec![], node.state().snapshot.index)
             } else {
-                let mut peers: Vec<_> = node
-                    .state()
-                    .membership()
-                    .participants()
-                    .into_iter()
-                    .filter(|id| id != &node.id && Some(id) != node.leader.as_ref())
-                    .map(|id| (id, false))
-                    .collect();
-                // Only after every secondary failed to supply a newer checkpoint
-                // may the primary serve its already-existing checkpoint.
-                if let Some(primary) = node.leader.filter(|id| id != &node.id) {
-                    peers.push((primary, true));
-                }
+                let peers = recovery_sources(
+                    node.state().membership().participants(),
+                    node.id,
+                    node.leader,
+                );
                 (None, peers, node.state().snapshot.index)
             }
         };
@@ -597,13 +666,17 @@ impl Ks {
             if response.status != Status::Ok {
                 continue;
             }
-            let (mut body, rest) = structure(&response.args, Op::BytesResp, "checkpoint response")?;
-            let bytes = body.bytes()?;
-            body.done()?;
-            if !rest.is_empty() {
-                return Err(Error::new("trailing checkpoint response"));
-            }
-            let Some(snapshot) = parse::<Option<crate::raft::Snapshot>>(&bytes)? else {
+            let decoded = (|| -> Result<Option<crate::raft::Snapshot>> {
+                let (mut body, rest) =
+                    structure(&response.args, Op::BytesResp, "checkpoint response")?;
+                let bytes = body.bytes()?;
+                body.done()?;
+                if !rest.is_empty() {
+                    return Err(Error::new("trailing checkpoint response"));
+                }
+                parse(&bytes)
+            })();
+            let Ok(Some(snapshot)) = decoded else {
                 continue;
             };
             let pending = {
@@ -611,7 +684,9 @@ impl Ks {
                 if node.role == Role::Stopped || node.journal.failed {
                     return Ok(());
                 }
-                if snapshot.index <= node.state().snapshot.index
+                if snapshot.validate().is_err()
+                    || node.state().check_ring(&snapshot).is_err()
+                    || snapshot.index <= node.state().snapshot.index
                     || snapshot.term > node.state().term
                 {
                     continue;
@@ -1038,7 +1113,11 @@ impl Ks {
                     }
                     Sender::Applicant(identity) => membership.slot(identity).unwrap_or(UNASSIGNED),
                 };
-                if (index == UNASSIGNED && !matches!(packet.message, Message::Checkpoint { .. }))
+                if (index == UNASSIGNED
+                    && !matches!(
+                        packet.message,
+                        Message::Checkpoint { .. } | Message::Journal { .. }
+                    ))
                     || (index != UNASSIGNED
                         && membership
                             .identities
@@ -1048,13 +1127,14 @@ impl Ks {
                 {
                     return Err(Error::new("Raft applicant has no assigned slot"));
                 }
-                let admitted =
-                    if matches!(packet.message, Message::Consensus(_) | Message::Checkpoint { .. })
-                    {
-                        true
-                    } else {
-                        membership.members().contains(&index)
-                    };
+                let admitted = if matches!(
+                    packet.message,
+                    Message::Consensus(_) | Message::Checkpoint { .. } | Message::Journal { .. }
+                ) {
+                    true
+                } else {
+                    membership.members().contains(&index)
+                };
                 if !admitted {
                     return Err(Error::new("Raft sender is not a member"));
                 }
@@ -1108,6 +1188,16 @@ impl Ks {
                     }
                     Ok(Resp::ok())
                 }
+                Message::Journal { after, through, primary_fallback } => {
+                    let node = self.journal.lock().map_err(|_| Error::new("Raft lock poisoned"))?;
+                    if node.role == Role::Stopped
+                        || node.journal.failed
+                        || (node.role == Role::Leader && !primary_fallback)
+                    {
+                        return Err(Error::new("journal source unavailable"));
+                    }
+                    Ok(Resp::bytes(json(&node.journal.committed_suffix(after, through)?)?))
+                }
                 Message::Checkpoint { after, primary_fallback } => {
                     let snapshot = self.serve_checkpoint(after, primary_fallback)?;
                     Ok(Resp::bytes(json(&snapshot)?))
@@ -1119,7 +1209,30 @@ impl Ks {
                         Instant::now(),
                         Duration::from_millis(self.config.raft.election_min_ms),
                     );
-                    let answer = if matches!(rpc, Rpc::Vote { .. }) && recent_leader {
+                    let copy_first = match &rpc {
+                        Rpc::Append { commit, .. }
+                            if node.journal.pending_replacement().is_some()
+                                && *commit > node.state().commit =>
+                        {
+                            Some(*commit)
+                        }
+                        _ => None,
+                    };
+                    let answer = if let Some(commit) = copy_first {
+                        let contact = Rpc::Append {
+                            term: rpc.term(),
+                            previous: node.state().last(),
+                            previous_term: node.state().term_at(node.state().last()).unwrap_or(0),
+                            entries: vec![],
+                            commit: node.state().commit,
+                        };
+                        let mut answer = node.receive(sender, &contact)?;
+                        if rpc.term() == node.state().term && node.leader == Some(*sender) {
+                            self.checkpoint_needed.fetch_max(commit, Ordering::SeqCst);
+                        }
+                        answer.success = false;
+                        answer
+                    } else if matches!(rpc, Rpc::Vote { .. }) && recent_leader {
                         Answer { term: node.state().term, success: false, matched: 0 }
                     } else {
                         node.receive(sender, &rpc)?
@@ -1228,10 +1341,14 @@ impl Ks {
                         .find(|m| &m.process == name)
                         .cloned()
                 };
-                let member = if let Some(known) = known {
-                    known
+                let observed = self.query_member(name);
+                let unchanged = known
+                    .as_ref()
+                    .is_some_and(|old| observed.as_ref().map_or(true, |member| member == old));
+                let member = if unchanged {
+                    known.unwrap()
                 } else {
-                    let member = self.query_member(name)?;
+                    let member = observed?;
                     let founders = self
                         .journal
                         .lock()
@@ -1449,7 +1566,10 @@ impl Ks {
                             let response =
                                 ks.send_raft(&peer, Message::Consensus(request.clone()))?;
                             if response.status != Status::Ok {
-                                return Err(Error::new(format!("peer {peer} rejected Raft RPC")));
+                                return Err(Error::new(format!(
+                                    "peer {peer} rejected Raft RPC: {:?}",
+                                    response.message()
+                                )));
                             }
                             let (mut body, rest) =
                                 structure(&response.args, Op::BytesResp, "Raft response")?;
@@ -1519,6 +1639,14 @@ impl Ks {
 mod tests {
     use super::*;
 
+    #[test]
+    fn recovery_tries_all_secondaries_before_primary() {
+        let peers = crate::raft::Members::from([0, 1, 2, 3]);
+        let sources = recovery_sources(peers.clone(), 1, Some(0));
+        assert_eq!(sources, vec![(2, false), (3, false), (0, true)]);
+        let own_primary = recovery_sources(peers, 0, Some(0));
+        assert_eq!(own_primary, vec![(1, false), (2, false), (3, false)]);
+    }
     #[test]
     fn debugging_foreign_checkpoint_preserves_key_binding_but_not_override() {
         let key = [42; 32];

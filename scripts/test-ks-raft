@@ -82,6 +82,11 @@ def main():
             child.kill()
             child.wait(timeout=10)
         def status(id):
+            child = children[id]
+            if child.poll() is not None:
+                assert child.returncode == 0, (id, child.returncode)
+                children.pop(id)
+                start(id)
             text = command(id, 'status')
             return dict(line.split(' ', 1) for line in text.splitlines() if ' ' in line)
         def leader(exclude=()):
@@ -122,10 +127,14 @@ def main():
             assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
             moved = next(id for id in members if id != 'KS0-member0' and id != until(leader))
             stop(moved)
+            old_address = members[moved]
             members[moved] = f'127.0.0.1:{port()}'
             start(moved)
             until(lambda: status(moved).get('unlocked') == 'true' and status(moved).get('raft_leader') != 'none' and int(status(moved)['master_keys']) == 2)
             assert command(moved, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
+            # The changed-port test above used discovery. Preserve the new seed before
+            # later tests destroy the entire in-memory registration service.
+            config.write_text(config.read_text().replace(old_address, members[moved]))
             # Two down: the former leader may read until its lease expires, then must refuse.
             survivor = until(leader)
             for id in list(children):
@@ -146,9 +155,11 @@ def main():
             old_slot = int(status(replacing)['raft_member_slot'])
             old_incarnation = int(status(replacing)['raft_member_incarnation'])
             stop(replacing)
-            (work/replacing/'data/master-keys/current.log').unlink()
+            (work/replacing/'data/master-keys/current.log').write_bytes(b'not a journal')
+
             start(replacing)
             until(lambda: status(replacing).get('raft_lost_state') == 'false')
+            assert list((work/replacing/'data/master-keys').glob('current.log.corrupt-*'))
             assert status(replacing)['raft_member_id'] != old_identity
             assert int(status(replacing)['raft_member_slot']) == old_slot
             assert int(status(replacing)['raft_member_incarnation']) == old_incarnation + 1
@@ -201,6 +212,18 @@ def main():
             assert int(status(cold)['master_keys']) == 0
             until(lambda: len(list((work/cold/'data/master-keys').glob('snapshot-*.bin'))) > 1)
             assert command('KS0-member3', 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
+            # Losing identity cannot claim the old slot, even when its data survives.
+            stop('KS0-member3')
+            (work/'KS0-member3/data/master-keys/identity').unlink()
+            start('KS0-member3')
+            assert status('KS0-member3')['raft_member_slot'] == 'none'
+            assert status('KS0-member3')['raft_lost_state'] == 'false'
+            assert status('KS0-member3')['raft_member_id'] != applicant_id
+            until(lambda: command(primary, 'raft-members', '--members-file', membership_file) or True)
+            until(lambda: status('KS0-member3').get('unlocked') == 'true')
+            until(lambda: status('KS0-member3')['raft_member_slot'] != 'none')
+            assert int(status('KS0-member3')['raft_member_slot']) > 3
+            assert command('KS0-member3', 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
             removed = next(id for id in members if id not in (primary, 'KS0-member3'))
             membership_file.write_text(json.dumps([id for id in members if id != removed]))
             until(lambda: command(primary, 'raft-members', '--members-file', membership_file) or True)
@@ -219,7 +242,7 @@ def main():
             successor = until(leader)
             actual = command(successor, 'sn-master-key', '--sn', '0', '--creation-second', creation)
             assert actual == expected
-            print('PASS: automatic same-slot replacement; retirement-majority recovery; persistent random IDs; slotless applicant restart; primary-assigned slots; member restart on a changed port; demoted-primary process exit; primary removal exit; locked quorum; unlock propagation; committed key rotation; follower forwarding; primary failover; restart catch-up; quorum-loss read refusal; full locked restart; snapshot catch-up of a new member; joint membership; removed-member election suppression.')
+            print('PASS: corrupt-journal recovery; missing-identity slotless readmission; automatic same-slot replacement; retirement-majority recovery; persistent random IDs; slotless applicant restart; primary-assigned slots; member restart on a changed port; demoted-primary process exit; primary removal exit; locked quorum; unlock propagation; committed key rotation; follower forwarding; primary failover; restart catch-up; quorum-loss read refusal; full locked restart; snapshot catch-up of a new member; joint membership; removed-member election suppression.')
         except BaseException:
             for id in members:
                 if id in children:

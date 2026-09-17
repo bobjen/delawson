@@ -18538,10 +18538,12 @@ This small-state copy is not the future large SN/DN snapshot implementation.
 
 Publication writes a temporary file, syncs it, renames it, and syncs the directory.
 An incomplete final frame in the active journal can be trimmed; a partial closed
-segment or complete corrupt frame fails recovery. Frames carry a length and its
-complement, a JSON batch, and checksum. Corruption of the newest snapshot fails
-recovery rather than silently selecting older state. A journal I/O failure fences
-further writes until restart. Snapshot publication failure alone permits retry.
+segment or complete corrupt frame is preserved as corrupt and triggers identity
+retirement and peer recovery. Frames carry a length and its complement, a JSON
+batch, and checksum. An unusable snapshot is preserved and recovery tries earlier
+local checkpoints without retiring the identity merely for that fallback. A journal
+I/O failure fences further writes until restart. Snapshot publication failure
+alone permits retry.
 
 ### 17.49.1 Snapshot frequency
 
@@ -18582,8 +18584,26 @@ A snapshot at physical sequence 100 is followed by a journal starting at 101. If
 never appears, recovery starts with an earlier snapshot and reads every later
 journal, including 101, and finally `current.log`. Header and filename starting
 sequences must agree; sequence continuity is checked. Temporary files are ignored.
-Missing all snapshots in an initialized store also triggers identity retirement.
-Wrong-ring headers, inconsistent filenames, and corrupt frames remain errors.
+Unparseable frames, inconsistent header positions, and wrong-ring files are
+unusable recovery sources. Rename such a file with a `.corrupt-N` suffix and sync
+the directory; preserve its bytes and exclude it from selection and pruning.
+Try earlier local checkpoints without retiring the voting identity. If no usable
+checkpoint remains, a complete journal starting at sequence one can reconstruct
+the initial state. If the required voting history cannot be reconstructed, retire
+the identity and recover the committed data from peers.
+
+Journal damage or gaps retire the identity before any network participation.
+Request committed journal ranges from other members first and the primary last;
+retained closed journals can serve ranges no longer held in RAM. Peer transfers
+contain entries only, never hard term/vote records, and are bounded by the source's
+commit index and the primary-advertised recovery point. Persist them under
+`copied-journals/journal-<first-index>.log`, then journal their entries and commit
+marker locally under the new identity. These copied files are never `current.log`.
+Only the primary supplies entries beyond the committed recovery point. Existing
+checkpoint transfer is the fallback when the needed journal range is unavailable.
+Malformed or wrong-ring peer responses are rejected and the next source tried.
+Additional integrity detection beyond existing parsing, ring checks, and SHA-256
+framing is an open decision in #129; no new CRC scheme is introduced here.
 
 `snapshot_retain` defaults to ten and must be positive. Keep the newest configured
 count and every journal after the oldest retained snapshot. If fewer snapshots
@@ -18663,8 +18683,11 @@ KS routing label in each ring and refuses a nonempty directory. `start-laws`
 invokes it only when creating its ring manifest, not during ordinary restarts.
 Without a local identity and without history, startup generates a fresh applicant
 ID even if its routing label appears in the founding configuration. Missing
-identity beside history fails startup; recovery cannot invent a retirement identity. The local
-identity file never acquires a peer's identity during state recovery.
+identity beside history creates a fresh slotless applicant. Recovery cannot invent
+an old-to-new retirement pair or infer ownership from those files. Reuse only
+verified committed data, clear the copied vote, and create a fresh local journal;
+explicit membership administration assigns a new logical slot. The local identity
+file never acquires a peer's identity during state recovery.
 
 Raft membership persists slot-to-(random identifier, routing label) mappings.
 The primary assigns an unused slot to a newly requested identity; retries preserve
