@@ -10,6 +10,12 @@ cluster_name = "laws-test"
 # Requests above the cap are rejected, not silently shortened.
 max_soft_delete_retention_secs = 2592000
 
+# Process-wide system change numbers track UTC nanoseconds. Allocation uses no clock
+# reads; periodic synchronization stalls allocation if it exceeds max_ahead_ms.
+[scn]
+sync_interval_ms = 10
+max_ahead_ms = 60000
+
 # KS's address is the one address a cluster cannot discover: every other process
 # is handed a port by whatever starts it, announces that port here, and asks here
 # where its peers are. start-laws hands out ports from port_base upward.

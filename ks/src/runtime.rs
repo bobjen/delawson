@@ -149,8 +149,8 @@ impl Ks {
                     return Err(Error::new("Raft is not a healthy leader"));
                 }
                 host.refresh_application(node)?;
-                Ok(node
-                    .can_admit_with_policy(lease::now()?, false, false)
+                Ok((node.can_admit_with_policy(lease::now()?, false, false)
+                    && host.metadata_generation.load(Ordering::SeqCst) == node.state().generation)
                     .then_some(node.state().commit))
             })?;
             if commit.is_some_and(|index| self.peers.read().is_ok_and(|p| p.applied >= index)) {
@@ -364,11 +364,13 @@ mod tests {
             State::initial("01".repeat(64), raft::tests::members(3), raft::tests::names()).unwrap();
         state.term = 1;
         state.log.push(Entry {
+            scn: common::scn::Scn::new(1),
             index: 1,
             term: 1,
             command: Command::Client(vec![registration_action(&peer(9001))]),
         });
         state.log.push(Entry {
+            scn: common::scn::Scn::new(2),
             index: 2,
             term: 1,
             command: Command::Client(vec![registration_action(&peer(9002))]),
@@ -392,6 +394,7 @@ mod tests {
         let epoch = MasterEpoch { key: [89; 32], since: TimeSec::new(100) };
         let sealed = seal_key(&key, &state.ring, 3, 1, &epoch).unwrap();
         state.log.push(Entry {
+            scn: common::scn::Scn::new(3),
             index: 3,
             term: 1,
             command: Command::Client(vec![raft::Action::new(Op::KsKey, sealed)]),
@@ -426,7 +429,12 @@ mod tests {
                 raft::Action::new(Op::KsKey, seal_key(&key, &state.ring, 1, 1, &epoch).unwrap())
             })
             .collect();
-        state.log.push(Entry { index: 1, term: 1, command: Command::Client(actions) });
+        state.log.push(Entry {
+            scn: common::scn::Scn::new(1),
+            index: 1,
+            term: 1,
+            command: Command::Client(actions),
+        });
         state.commit = 1;
         let history = decode_history(&state, &key).unwrap();
         assert_eq!(history.epochs.len(), 2);
@@ -446,6 +454,7 @@ mod tests {
             .apply(&raft::Record::Entries {
                 from: 1,
                 entries: vec![Entry {
+                    scn: common::scn::Scn::new(1),
                     index: 1,
                     term: 1,
                     command: Command::Client(vec![raft::Action::new(Op::KsKey, sealed)]),
@@ -476,6 +485,7 @@ mod tests {
             let epoch = MasterEpoch { since: TimeSec::new(index), key: [index as u8; 32] };
             let encrypted = seal_key(&key, &state.ring, index, 1, &epoch).unwrap();
             state.log.push(Entry {
+                scn: common::scn::Scn::new(index),
                 index,
                 term: 1,
                 command: Command::Client(vec![raft::Action::new(Op::KsKey, encrypted)]),

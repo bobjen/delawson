@@ -20,6 +20,7 @@ pub mod registry;
 pub mod retry;
 pub mod ring;
 pub mod routing;
+pub mod scn;
 pub mod seal;
 pub mod server;
 #[cfg(any(test, feature = "testing"))]

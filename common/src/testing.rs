@@ -37,6 +37,7 @@ pub fn cluster() -> ClusterConfig {
 
     ClusterConfig {
         schema_version: SCHEMA_VERSION,
+        scn: crate::scn::Config::default(),
         cluster_name: "test".to_string(),
         ring_identities: Default::default(),
         max_soft_delete_retention_secs: crate::config::default_max_soft_delete_retention_secs(),

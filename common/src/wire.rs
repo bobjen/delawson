@@ -411,6 +411,10 @@ impl StructWriter {
         self.number_u32(value.get());
     }
 
+    pub fn scn(&mut self, value: crate::scn::Scn) {
+        self.number_u64(value.number());
+    }
+
     pub fn time_sec(&mut self, value: TimeSec) {
         self.number_u64(value.number());
     }
@@ -557,6 +561,10 @@ impl<'a> StructReader<'a> {
 
     pub fn extent_id(&mut self) -> Result<ExtentId> {
         Ok(ExtentId::new(self.number_u32()?))
+    }
+
+    pub fn scn(&mut self) -> Result<crate::scn::Scn> {
+        Ok(crate::scn::Scn::new(self.number_u64()?))
     }
 
     pub fn time_sec(&mut self) -> Result<TimeSec> {

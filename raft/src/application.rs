@@ -70,6 +70,7 @@ mod tests {
         .unwrap();
         state.term = 1;
         state.log.push(crate::raft::Entry {
+            scn: common::scn::Scn::new(1),
             index: 1,
             term: 1,
             command: crate::raft::Command::CheckpointStart(1),

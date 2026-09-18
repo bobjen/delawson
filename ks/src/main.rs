@@ -278,6 +278,7 @@ impl Ks {
         let id =
             journal.state.membership().slot(&journal.identity.current).unwrap_or(raft::UNASSIGNED);
         let mut node = raft::Node::new(id, journal);
+        node.merge_history_scn()?;
         node.identity = Some(node.journal.identity.current.clone());
         node.lease = lease::Lease::configured(&config.raft);
         if node.state().membership().members().len() == 1

@@ -462,6 +462,8 @@ struct ClusterFile {
     messaging: Messaging,
     logging: Logging,
     timeouts: Timeouts,
+    #[serde(default)]
+    scn: crate::scn::Config,
     #[serde(default, rename = "service")]
     service: Vec<ServiceSpec>,
     #[serde(default, rename = "media_class")]
@@ -485,6 +487,7 @@ pub struct ClusterConfig {
     pub messaging: Messaging,
     pub logging: Logging,
     pub timeouts: Timeouts,
+    pub scn: crate::scn::Config,
     pub services: Vec<ServiceEntry>,
     pub media_classes: Vec<MediaClass>,
 }
@@ -553,6 +556,7 @@ impl ClusterConfig {
             messaging: file.messaging,
             logging: file.logging,
             timeouts: file.timeouts,
+            scn: file.scn,
             services,
             media_classes: file.media_class,
         };
@@ -562,6 +566,7 @@ impl ClusterConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        self.scn.validate()?;
         self.max_soft_delete_retention_secs.to_duration()?;
         crate::time::TimeIntSec32::try_from(self.max_soft_delete_retention_secs)?;
         if self.schema_version != SCHEMA_VERSION {

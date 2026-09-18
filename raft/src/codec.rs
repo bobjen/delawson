@@ -40,6 +40,7 @@ macro_rules! primitive {
     };
 }
 primitive!(u64, number_u64, number_u64);
+primitive!(common::scn::Scn, scn, scn);
 primitive!(u16, number_u16, number_u16);
 primitive!(u8, number_u8, number_u8);
 primitive!(bool, flag, flag);
@@ -200,6 +201,7 @@ mod tests {
     #[test]
     fn tagged_entries_round_trip_and_reject_every_truncation() {
         let entry = crate::Entry {
+            scn: common::scn::Scn::new(42),
             index: 42,
             term: 7,
             command: crate::Command::Client(vec![

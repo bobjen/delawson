@@ -2,8 +2,8 @@
 //!
 //! Seconds are the unit throughout: an extent's creation second selects its key
 //! (§7.3.3), a stream's says when a user made it (§17.25.1), and a hint's expiry is
-//! the window in §10.1. Nothing in the store needs finer than that, and the one place
-//! that does — log timestamps — is not a stored fact about an object.
+//! the window in §10.1. Log timestamps have microsecond precision. System change
+//! numbers (`crate::scn`) use a separate nanosecond-based logical counter.
 //!
 //! ⚠️ **A type rather than a `u64`** (Asserted, Bob, 2026-08-20), for the same reason
 //! `ELoff` is not an `ECoff`: the store is full of `u64`s that are counts of records,

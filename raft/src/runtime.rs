@@ -28,6 +28,7 @@ pub enum PendingWork {
 }
 #[derive(Default)]
 pub struct WorkQueue {
+    generation: u64,
     pending: Option<PendingWork>,
     last: u64,
     snapshot: Option<Arc<crate::Snapshot>>,
@@ -35,6 +36,11 @@ pub struct WorkQueue {
 }
 impl WorkQueue {
     fn enqueue(&mut self, state: &State, enabled: bool) {
+        let changed = self.generation != state.generation;
+        if changed {
+            *self = Self { generation: state.generation, ..Self::default() };
+        }
+
         if !enabled {
             if self.enabled {
                 self.pending = Some(PendingWork::Unload);
@@ -50,7 +56,7 @@ impl WorkQueue {
             self.pending = None;
         }
         self.enabled = true;
-        if state.commit <= self.last {
+        if state.commit <= self.last && !changed {
             return;
         }
         let snapshot = self.snapshot.get_or_insert_with(|| Arc::new(state.snapshot.clone()));
@@ -70,6 +76,7 @@ impl WorkQueue {
             work.commit = state.commit;
         } else {
             self.pending = Some(PendingWork::Apply(crate::execution::Work {
+                generation: state.generation,
                 ring: state.ring.clone(),
                 snapshot: snapshot.clone(),
                 entries,
@@ -111,6 +118,8 @@ pub struct Runtime<S> {
     pub raft_workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     pub global_lock: RwLock<S>,
     pub execution: Mutex<crate::execution::Cursor>,
+    pub application_generation: AtomicU64,
+    pub metadata_generation: AtomicU64,
     pub work_queue: Mutex<WorkQueue>,
     metadata_queue: Mutex<WorkQueue>,
     metadata_active: Mutex<Option<PendingWork>>,
@@ -162,6 +171,8 @@ impl<S: Default> Runtime<S> {
             raft_workers: Mutex::new(vec![]),
             global_lock: RwLock::new(S::default()),
             execution: Mutex::new(crate::execution::Cursor::default()),
+            application_generation: AtomicU64::new(0),
+            metadata_generation: AtomicU64::new(0),
             work_queue: Mutex::new(WorkQueue::default()),
             metadata_queue: Mutex::new(WorkQueue::default()),
             metadata_active: Mutex::new(None),
@@ -609,11 +620,12 @@ pub trait Host:
     ) -> Result<Option<raft::Snapshot>> {
         if (node.role == Role::Leader && !primary_fallback)
             || node.role == Role::Stopped
+            || node.repairing
             || node.journal.failed
         {
             return Err(Error::new("primary does not serve checkpoints"));
         }
-        if node.state().snapshot.index <= after {
+        if after != u64::MAX && node.state().snapshot.index <= after {
             if node.role != Role::Leader
                 && self.applying.load(Ordering::SeqCst)
                 && self.ready.load(Ordering::SeqCst)
@@ -647,12 +659,12 @@ pub trait Host:
             logn!("Raft checkpoint deferred; journals retained", "{e}");
         }
     }
-    fn primary_history_term(
+    fn primary_history_tip(
         &self,
         primary: MemberId,
         term: u64,
         index: u64,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Option<(u64, common::scn::Scn)>> {
         let local = self.on_raft(move |_, node| {
             if node.id != primary {
                 return Ok(None);
@@ -660,7 +672,7 @@ pub trait Host:
             if node.role != Role::Leader || node.state().term != term {
                 return Err(Error::new("history proof requires the current primary"));
             }
-            Ok(Some(node.journal.read_history(move |history| history.committed_term(index))?))
+            Ok(Some(node.journal.read_history(move |history| history.committed_tip(index))?))
         })?;
         if let Some(value) = local {
             return value.wait();
@@ -680,7 +692,10 @@ pub trait Host:
     fn copy_committed_journal(&self) -> Result<bool> {
         let plan = self.on_raft(|host, node| {
             let through = host.checkpoint_needed.load(Ordering::SeqCst);
-            if node.role != Role::Follower || node.journal.failed || through <= node.state().commit
+            if node.role != Role::Follower
+                || node.repairing
+                || node.journal.failed
+                || through <= node.state().commit
             {
                 return Ok(None);
             }
@@ -731,7 +746,7 @@ pub trait Host:
                     Ok(response) if response.status == Status::Ok => response,
                     _ => continue,
                 };
-            let proof = (|| -> Result<Option<u64>> {
+            let proof = (|| -> Result<Option<(u64, common::scn::Scn)>> {
                 let (mut body, rest) =
                     structure(&response.args, Op::BytesResp, "journal tip response")?;
                 let value = parse(&body.bytes()?)?;
@@ -766,13 +781,19 @@ pub trait Host:
             if !copied.matches_tip(last.index, primary_term) {
                 logn!(
                     "Raft copied journal differs from primary",
-                    "peer {},primary {},index {},copied_term {},primary_term {}",
+                    "peer {},primary {},index {},copied_term {},primary_tip {:?}",
                     peer,
                     leader,
                     last.index,
                     last.term,
                     primary_term
                 );
+                continue;
+            }
+            // A proved range tip cannot by itself authorize replacing our
+            // committed prefix. Ask the primary about the copied range's base.
+            let prefix_proof = self.primary_history_tip(leader, term, copied.after)?;
+            if prefix_proof != Some((copied.previous_term, copied.previous_scn)) {
                 continue;
             }
             if self.on_raft(move |host, node| {
@@ -783,8 +804,21 @@ pub trait Host:
                 {
                     return Ok(false);
                 }
+                if node.state().history_at(copied.after) != prefix_proof {
+                    node.repairing = true;
+                    node.journal.require_history_repair()?;
+                    logn!(
+                        "Raft journal proves committed history conflict",
+                        "index {}",
+                        copied.after
+                    );
+                    return Ok(false);
+                }
                 if copied.validate(node.state(), through).is_err() {
                     return Ok(false);
+                }
+                if let Some(scn) = copied.largest_scn() {
+                    node.merge_scn(scn)?;
                 }
                 node.journal.import_committed(&copied, through)?;
                 logn!(
@@ -820,7 +854,8 @@ pub trait Host:
                 return Ok(None);
             }
             let needed = host.checkpoint_needed.load(Ordering::SeqCst);
-            if !host.checkpoint_requested.load(Ordering::SeqCst)
+            if !node.repairing
+                && !host.checkpoint_requested.load(Ordering::SeqCst)
                 && needed <= node.state().snapshot.index
                 && !node.journal.snapshot_due(
                     host.options.snapshot_min_log_bytes,
@@ -831,7 +866,9 @@ pub trait Host:
                 return Ok(None);
             }
             let members = node.state().membership().members();
-            let producer = needed <= node.state().commit
+            let producer = !node.repairing
+                && host.application_generation.load(Ordering::SeqCst) == node.state().generation
+                && needed <= node.state().commit
                 && (node.role == Role::Follower
                     || (node.role == Role::Leader && members.len() == 1))
                 && (node.role == Role::Leader || host.applying.load(Ordering::SeqCst))
@@ -868,7 +905,7 @@ pub trait Host:
                 Ok(Some(CheckpointPlan::Produce(node.state().clone())))
             } else {
                 Ok(Some(CheckpointPlan::Copy {
-                    after: node.state().snapshot.index,
+                    after: if node.repairing { u64::MAX } else { node.state().snapshot.index },
                     primary: node.leader.map(|id| (id, node.state().term)),
                     peers: recovery_sources(
                         node.state().membership().participants(),
@@ -934,8 +971,8 @@ pub trait Host:
                             continue;
                         }
                     };
-                    let proof = self.primary_history_term(primary, election_term, snapshot.index);
-                    if !matches!(proof, Ok(Some(term)) if term == snapshot.term) {
+                    let proof = self.primary_history_tip(primary, election_term, snapshot.index);
+                    if !matches!(proof, Ok(Some(tip)) if tip == (snapshot.term, snapshot.scn)) {
                         logn!(
                             "Raft checkpoint history rejected",
                             "peer {},primary {},index {},checkpoint_term {},proof {:?}",
@@ -956,11 +993,36 @@ pub trait Host:
                         {
                             return Ok(None);
                         }
+                        if node.repairing {
+                            if let Some(scn) = snapshot.largest_scn() {
+                                node.merge_scn(scn)?;
+                            }
+                            node.journal.repair_history(snapshot.clone(), verified_term)?;
+                            node.identity = Some(node.journal.identity.current.clone());
+                            node.refresh_slot();
+                            return Ok(None);
+                        }
+                        if snapshot.index <= node.state().commit
+                            && node.state().history_at(snapshot.index)
+                                != Some((snapshot.term, snapshot.scn))
+                        {
+                            logn!(
+                                "Raft checkpoint proves committed history conflict",
+                                "index {}",
+                                snapshot.index
+                            );
+                            node.repairing = true;
+                            node.journal.require_history_repair()?;
+                            return Ok(None);
+                        }
                         let install =
                             journal::checkpoint_install(node.state(), &snapshot, verified_term)?;
                         if let Some(install) = install {
                             if node.role == Role::Leader {
                                 return Ok(None);
+                            }
+                            if let Some(scn) = snapshot.largest_scn() {
+                                node.merge_scn(scn)?;
                             }
                             node.journal.write(&[install])?;
                             node.refresh_slot();
@@ -977,6 +1039,22 @@ pub trait Host:
                         host.refresh_application(node)?;
                         Ok(pending)
                     })?;
+                    if after == u64::MAX {
+                        self.on_raft(|host, node| {
+                            if !node.journal.identity.repairing {
+                                node.repairing = false;
+                                host.refresh_application(node)?;
+                                logn!(
+                                    "Raft conflicting history rebuilt",
+                                    "index {},term {}",
+                                    node.state().commit,
+                                    node.state().term
+                                );
+                            }
+                            Ok(())
+                        })?;
+                        break;
+                    }
                     if let Some(pending) = pending {
                         pending.write()?;
                         self.on_raft(move |_, node| node.journal.finish_snapshot(&pending))?;
@@ -989,6 +1067,9 @@ pub trait Host:
         }
     }
     fn refresh_application(&self, node: &Node) -> Result<()> {
+        if node.repairing {
+            return Ok(());
+        }
         // A candidate can keep writing. Only winning requires abandoning production;
         // singleton primaries remain the explicit checkpoint-production exception.
         if cancel_checkpoint_after_election(node.role, node.state().membership().members().len())
@@ -1057,6 +1138,7 @@ pub trait Host:
             }
             if let Some(PendingWork::Apply(work)) = active.as_ref() {
                 if self.apply_metadata(work)? {
+                    self.metadata_generation.store(work.generation, Ordering::SeqCst);
                     *active = None;
                 }
             }
@@ -1088,12 +1170,16 @@ pub trait Host:
                 }
                 PendingWork::Apply(work) => {
                     self.apply_client(work)?;
-                    Ok(self
+                    let complete = self
                         .global_lock
                         .read()
                         .map_err(|_| Error::new("global lock poisoned"))?
                         .applied()
-                        >= work.commit)
+                        >= work.commit;
+                    if complete {
+                        self.application_generation.store(work.generation, Ordering::SeqCst);
+                    }
+                    Ok(complete)
                 }
             }
         })();
@@ -1164,8 +1250,12 @@ pub trait Host:
                     return Err(Error::new("Raft is not a healthy leader"));
                 }
                 host.refresh_application(node)?;
-                Ok(node
-                    .can_admit_with_policy(lease::now()?, read, host.options.allow_stale_reads)
+                Ok((node.can_admit_with_policy(
+                    lease::now()?,
+                    read,
+                    host.options.allow_stale_reads,
+                ) && host.application_generation.load(Ordering::SeqCst)
+                    == node.state().generation)
                     .then_some(node.state().commit))
             })?;
             if let Some(commit) = commit {
@@ -1206,7 +1296,9 @@ pub trait Host:
                     ));
                 }
                 host.refresh_application(node)?;
-                Ok(node.state().commit >= index)
+                Ok(node.state().commit >= index
+                    && host.application_generation.load(Ordering::SeqCst)
+                        == node.state().generation)
             })?;
             if committed && self.global_lock.try_read().is_ok_and(|data| data.applied() >= index) {
                 return Ok(());
@@ -1230,7 +1322,7 @@ pub trait Host:
     }
     fn raft_status(&self) -> String {
         self.on_raft(|host, node| Ok(format!(
-                "raft_role {:?}\nraft_term {}\nraft_leader {}\nraft_last {}\nraft_commit {}\nraft_failed {}\nraft_applying {}\nraft_member_id {}\nraft_member_slot {}\nraft_member_incarnation {}\nraft_lost_state {}",
+                "raft_role {:?}\nraft_term {}\nraft_leader {}\nraft_last {}\nraft_commit {}\nraft_failed {}\nraft_applying {}\nraft_member_id {}\nraft_member_slot {}\nraft_member_incarnation {}\nraft_lost_state {}\nraft_repairing {}",
                 node.role,
                 node.state().term,
                 node.leader.map(|id| id.to_string()).unwrap_or_else(|| "none".into()),
@@ -1250,6 +1342,7 @@ pub trait Host:
                     (node.id / raft::INCARNATION).to_string()
                 },
                 node.journal.pending_replacement().is_some(),
+                node.repairing,
             ))).unwrap_or_else(|_| "raft_failed true".into())
     }
     fn member_address(&self, peer: &str) -> Result<std::net::SocketAddr> {
@@ -1621,12 +1714,13 @@ pub trait Host:
                 }
                 let read = node
                     .journal
-                    .read_history(move |history| binary(&history.committed_term(index)?))?;
+                    .read_history(move |history| binary(&history.committed_tip(index)?))?;
                 *deferred = Some(Deferred::Read(read));
                 Ok(Resp::ok())
             }
             Message::Journal { after, through, primary_fallback } => {
                 if node.role == Role::Stopped
+                    || node.repairing
                     || node.journal.failed
                     || (node.role == Role::Leader && !primary_fallback)
                 {
@@ -1643,6 +1737,7 @@ pub trait Host:
                 Ok(Resp::bytes(binary(&snapshot)?))
             }
             Message::Consensus(rpc) => {
+                let was_repairing = node.repairing;
                 let recent_leader = node.election_quiet(
                     Instant::now(),
                     Duration::from_millis(self.options.raft.election_min_ms),
@@ -1661,6 +1756,10 @@ pub trait Host:
                         term: rpc.term(),
                         previous: node.state().last(),
                         previous_term: node.state().term_at(node.state().last()).unwrap_or(0),
+                        previous_scn: node
+                            .state()
+                            .scn_at(node.state().last())
+                            .unwrap_or(common::scn::Scn::new(0)),
                         entries: vec![],
                         commit: node.state().commit,
                     };
@@ -1675,6 +1774,21 @@ pub trait Host:
                 } else {
                     node.receive(sender, &rpc)?
                 };
+                if node.repairing {
+                    if !was_repairing {
+                        logn!(
+                            "Raft committed history conflict; rebuilding follower",
+                            "member {},primary {:?},commit {}",
+                            node.id,
+                            node.leader,
+                            node.state().commit
+                        );
+                        node.journal.require_history_repair()?;
+                    }
+                    if let Rpc::Append { commit, .. } = &rpc {
+                        self.checkpoint_needed.fetch_max(*commit, Ordering::SeqCst);
+                    }
+                }
                 if !matches!(rpc, Rpc::Vote { .. })
                     && rpc.term() == node.state().term
                     && node.leader.as_ref() == Some(sender)
@@ -2278,6 +2392,7 @@ mod tests {
             )
         };
         let consensus = needs_request_worker(&packet(Message::Consensus(Rpc::Vote {
+            last_scn: common::scn::Scn::new(0),
             term: 1,
             last: 0,
             last_term: 0,

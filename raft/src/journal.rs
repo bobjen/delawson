@@ -3,6 +3,7 @@
 use crate::codec::{self, Wire};
 use crate::raft::{INCARNATION, Member, MemberId, Membership, Record, Retirement, State};
 use crate::random_bytes;
+use common::scn::Scn;
 use common::{Context, Error, Result};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
@@ -12,17 +13,18 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const MAGIC: &[u8; 8] = b"DLAWKR05";
+const MAGIC: &[u8; 8] = b"DLAWKR06";
 const CURRENT: &str = "current.log";
-const HEADER: u64 = 8 + 128 + 16 + 16;
+const HEADER: u64 = 8 + 128 + 16 + 24;
 fn journal_header(ring: &str, start: u64) -> Vec<u8> {
-    [MAGIC.as_slice(), ring.as_bytes(), &start.to_le_bytes(), &(!start).to_le_bytes(), &[0; 16]]
+    [MAGIC.as_slice(), ring.as_bytes(), &start.to_le_bytes(), &(!start).to_le_bytes(), &[0; 24]]
         .concat()
 }
 fn journal_header_after(state: &State, start: u64) -> Vec<u8> {
     let mut bytes = journal_header(&state.ring, start);
     bytes[152..160].copy_from_slice(&state.last().to_le_bytes());
     bytes[160..168].copy_from_slice(&state.term_at(state.last()).unwrap().to_le_bytes());
+    bytes[168..176].copy_from_slice(&state.scn_at(state.last()).unwrap().number().to_le_bytes());
     bytes
 }
 fn check_journal_header(reader: &mut impl Read, ring: &str, ignore: bool) -> Result<u64> {
@@ -32,7 +34,7 @@ fn read_journal_header(
     reader: &mut impl Read,
     ring: &str,
     ignore: bool,
-) -> Result<(u64, u64, u64)> {
+) -> Result<(u64, u64, u64, Scn)> {
     let mut header = [0; HEADER as usize];
     reader.read_exact(&mut header)?;
     if &header[..8] != MAGIC || (!ignore && &header[8..136] != ring.as_bytes()) {
@@ -47,24 +49,25 @@ fn read_journal_header(
         start,
         u64::from_le_bytes(header[152..160].try_into().unwrap()),
         u64::from_le_bytes(header[160..168].try_into().unwrap()),
+        Scn::new(u64::from_le_bytes(header[168..176].try_into().unwrap())),
     ))
 }
 /// Validate before Install can make an untrusted checkpoint look locally committed.
 pub(crate) fn checkpoint_install(
     state: &State,
     snapshot: &crate::Snapshot,
-    proof: Option<u64>,
+    proof: Option<(u64, Scn)>,
 ) -> Result<Option<Record>> {
     snapshot.validate()?;
     state.check_ring(snapshot)?;
-    if proof != Some(snapshot.term) || snapshot.term > state.term {
+    if proof != Some((snapshot.term, snapshot.scn)) || snapshot.term > state.term {
         return Err(Error::new("checkpoint does not match primary history"));
     }
     if snapshot.index <= state.snapshot.index {
         return Err(Error::new("checkpoint does not advance snapshot"));
     }
     if snapshot.index <= state.commit {
-        if state.term_at(snapshot.index) != Some(snapshot.term) {
+        if state.history_at(snapshot.index) != Some((snapshot.term, snapshot.scn)) {
             return Err(Error::new("checkpoint differs from local committed history"));
         }
         Ok(None)
@@ -84,26 +87,94 @@ struct Checkpoint {
     state: State,
 }
 
+impl Checkpoint {
+    fn bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = encode(self)?;
+        bytes.extend(scn_footer(self.state.largest_scn()));
+        Ok(bytes)
+    }
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let length = bytes
+            .len()
+            .checked_sub(SCN_FOOTER as usize)
+            .ok_or_else(|| Error::new("missing snapshot SCN footer"))?;
+        let maximum = parse_scn_footer(&bytes[length..])?;
+        let checkpoint: Self = decode(&bytes[..length])?;
+        if checkpoint.state.largest_scn() != maximum {
+            return Err(Error::new("snapshot SCN footer mismatch"));
+        }
+        Ok(checkpoint)
+    }
+}
+const SCN_MAGIC: &[u8; 8] = b"DLAWSCN1";
+const SCN_FOOTER: u64 = 64;
+fn scn_footer(maximum: Option<Scn>) -> Vec<u8> {
+    let value = maximum.map_or(0, Scn::number);
+    let mut bytes = [
+        SCN_MAGIC.as_slice(),
+        &(maximum.is_some() as u64).to_le_bytes(),
+        &value.to_le_bytes(),
+        &(!value).to_le_bytes(),
+    ]
+    .concat();
+    bytes.extend(Sha256::digest(&bytes));
+    bytes
+}
+fn parse_scn_footer(bytes: &[u8]) -> Result<Option<Scn>> {
+    if bytes.len() != SCN_FOOTER as usize
+        || &bytes[..8] != SCN_MAGIC
+        || Sha256::digest(&bytes[..32]).as_slice() != &bytes[32..]
+    {
+        return Err(Error::new("invalid SCN footer"));
+    }
+    let present = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let value = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    let inverse = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+    if present > 1 || value != !inverse || (present == 0 && value != 0) {
+        return Err(Error::new("invalid SCN footer fields"));
+    }
+    Ok((present == 1).then_some(Scn::new(value)))
+}
+/// Fast high-water lookup for a snapshot or CLOSED journal. current.log has no
+/// footer during normal operation and must be replayed. This validates the footer;
+/// callers must still validate the file's ring, contents and history before use.
+pub fn file_scn(path: &Path) -> Result<Option<Scn>> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::End(-(SCN_FOOTER as i64)))?;
+    let mut footer = [0; SCN_FOOTER as usize];
+    file.read_exact(&mut footer)?;
+    parse_scn_footer(&footer)
+}
+
 /// A peer copy contains committed entries only, never term/vote records.
 #[derive(Clone)]
 pub struct CommittedJournal {
     pub ring: String,
     pub after: u64,
     pub previous_term: u64,
+    pub previous_scn: Scn,
     pub entries: Vec<crate::raft::Entry>,
 }
 impl CommittedJournal {
-    /// Ordinary Raft log matching against the chosen primary. This does not detect
-    /// forgotten histories that reuse BOTH term and index (issue #127).
-    pub fn matches_tip(&self, index: u64, term: u64) -> bool {
-        self.entries.last().is_some_and(|entry| entry.index == index && entry.term == term)
+    pub fn largest_scn(&self) -> Option<Scn> {
+        self.entries
+            .iter()
+            .map(|entry| entry.scn)
+            .reduce(|a, b| if b.compare(a).is_gt() { b } else { a })
+    }
+
+    /// Match the creator SCN as well as the primary's term/index proof.
+    pub fn matches_tip(&self, index: u64, tip: (u64, Scn)) -> bool {
+        self.entries
+            .last()
+            .is_some_and(|entry| entry.index == index && (entry.term, entry.scn) == tip)
     }
     pub fn validate(&self, state: &State, through: u64) -> Result<()> {
         if !state.ignore_ring_identity && self.ring != state.ring {
             return Err(Error::new("copied journal ring mismatch"));
         }
         if self.after != state.commit
-            || state.term_at(self.after) != Some(self.previous_term)
+            || state.history_at(self.after) != Some((self.previous_term, self.previous_scn))
             || self.entries.is_empty()
         {
             return Err(Error::new("copied journal prefix mismatch"));
@@ -129,6 +200,7 @@ impl CommittedJournal {
 /// This inode is also the lifetime lock and must not be replaced while in use.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalIdentity {
+    pub repairing: bool,
     pub ring: String,
     pub process: String,
     pub current: common::ring::MemberIdentity,
@@ -173,6 +245,9 @@ pub struct Journal {
     pub failed: bool,
 }
 impl crate::raft::Storage for Journal {
+    fn history_repair_required(&self) -> bool {
+        self.identity.repairing
+    }
     fn durable_state(&self) -> &State {
         &self.durable
     }
@@ -213,6 +288,7 @@ impl Journal {
         let mut local: LocalIdentity = if saved_identity.is_none() {
             let current = common::ring::MemberIdentity::generate()?;
             let local = LocalIdentity {
+                repairing: false,
                 ring: initial.ring.clone(),
                 process: member.into(),
                 current,
@@ -275,7 +351,7 @@ impl Journal {
                 second: common::time::TimeSec::now().number(),
                 state: initial.clone(),
             };
-            let bytes = encode(&checkpoint)?;
+            let bytes = checkpoint.bytes()?;
             if !current_exists {
                 publish(&current, &journal_header_after(&initial, 1))?;
             }
@@ -455,7 +531,7 @@ impl Journal {
     }
     #[cfg(any(test, feature = "testing"))]
     pub fn committed_term(&self, index: u64) -> Result<Option<u64>> {
-        self.history().committed_term(index)
+        self.history().committed_tip(index).map(|tip| tip.map(|(term, _)| term))
     }
     #[cfg(any(test, feature = "testing"))]
     pub fn committed_suffix(&self, after: u64, through: u64) -> Result<Option<CommittedJournal>> {
@@ -466,7 +542,8 @@ impl Journal {
         let directory = self.directory.join("copied-journals");
         let root = self.directory.clone();
         let name = named(&directory, "journal", copied.after + 1);
-        let bytes = encode(copied)?;
+        let mut bytes = encode(copied)?;
+        bytes.extend(scn_footer(copied.largest_scn()));
         self.perform(move |_| {
             std::fs::create_dir_all(&directory)?;
             sync_directory(&root)?;
@@ -476,6 +553,84 @@ impl Journal {
             Record::Entries { from: copied.after + 1, entries: copied.entries.clone() },
             Record::Commit(copied.entries.last().unwrap().index),
         ])
+    }
+    /// Fence voting durably before attempting a history replacement. This does
+    /// not discard files until a verified replacement checkpoint is available.
+    pub fn require_history_repair(&mut self) -> Result<()> {
+        if self.identity.repairing {
+            return Ok(());
+        }
+        self.identity.repairing = true;
+        let identity = self.identity.clone();
+        self.perform(move |disk| append_identity(&mut disk.ownership, &identity))
+    }
+    pub fn repair_history(
+        &mut self,
+        snapshot: crate::Snapshot,
+        proof: Option<(u64, Scn)>,
+    ) -> Result<()> {
+        snapshot.validate()?;
+        self.state.check_ring(&snapshot)?;
+        if !self.identity.repairing
+            || proof != Some((snapshot.term, snapshot.scn))
+            || snapshot.term > self.state.term
+        {
+            return Err(Error::new("history repair needs a verified primary checkpoint"));
+        }
+        let mut state = self.state.clone();
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| Error::new("history generation exhausted"))?;
+        state.commit = snapshot.index;
+        state.snapshot = snapshot;
+        state.log.clear();
+        // Keep the SCN high water, but retire the old voting identity exactly
+        // as for a corrupt journal. The replacement retains only verified history.
+        state.max_scn = state.largest_scn();
+        state.validate()?;
+        let directory = self.directory.clone();
+        let mut identity = self.identity.clone();
+        retire_identity(&mut identity, &mut state)?;
+        let accepted_identity = identity.clone();
+        let checkpoint = Checkpoint {
+            sequence: 0,
+            second: common::time::TimeSec::now().number(),
+            state: state.clone(),
+        };
+        let second = checkpoint.second;
+        let bytes = checkpoint.bytes()?;
+        let snapshot_bytes = bytes.len() as u64;
+        self.perform(move |disk| {
+            let name = format!("repair-{}.bin", common::ring::MemberIdentity::generate()?);
+            publish(&directory.join(&name), &bytes)?;
+            let mut files: Vec<_> = numbered(&directory, "snapshot")?
+                .into_iter()
+                .chain(numbered(&directory, "journal")?)
+                .map(|(_, path)| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            files.push(CURRENT.into());
+            identity.recovery =
+                Some(RecoveryPlan { archive: format!("rejected-{name}"), checkpoint: name, files });
+            // The durable plan makes interrupted copying/renames restartable.
+            append_identity(&mut disk.ownership, &identity)?;
+            finish_recovery(&directory, &mut disk.ownership, &mut identity)?;
+            disk.file = OpenOptions::new().read(true).append(true).open(directory.join(CURRENT))?;
+            identity.repairing = false;
+            append_identity(&mut disk.ownership, &identity)
+        })?;
+        self.state = state;
+        self.identity = accepted_identity;
+        self.identity.repairing = false;
+        self.sequence = 0;
+        self.current_start = 1;
+        self.change_sequence = 0;
+        self.snapshot_sequence = 0;
+        self.snapshot_second = second;
+        self.snapshot_bytes = snapshot_bytes;
+        self.log_bytes = HEADER;
+        self.track_durability();
+        Ok(())
     }
     pub fn needs_bootstrap(&self) -> bool {
         self.bootstrap_pending
@@ -563,7 +718,7 @@ impl Journal {
         self.state.check_ring(&snapshot)?;
         if snapshot.index < self.state.snapshot.index
             || snapshot.index > self.state.commit
-            || self.state.term_at(snapshot.index) != Some(snapshot.term)
+            || self.state.history_at(snapshot.index) != Some((snapshot.term, snapshot.scn))
         {
             return Err(Error::new("checkpoint does not match local committed history"));
         }
@@ -615,12 +770,14 @@ impl Journal {
         let directory = self.directory.clone();
         let current_start = self.current_start;
         let bytes = [journal_header_after(&self.state, start), carried.to_vec()].concat();
+        let footer = scn_footer(self.state.largest_scn());
         self.perform(move |disk| {
             let current = directory.join(CURRENT);
             let closed = named(&directory, "journal", current_start);
             if closed.try_exists()? {
                 return Err(Error::new("closed KS journal already exists"));
             }
+            disk.file.write_all(&footer)?;
             disk.file.sync_all()?;
             std::fs::rename(&current, closed)?;
             sync_directory(&directory)?;
@@ -629,7 +786,7 @@ impl Journal {
             Ok(())
         })?;
         self.current_start = start;
-        self.log_bytes += HEADER;
+        self.log_bytes += HEADER + SCN_FOOTER;
         Ok(())
     }
     pub fn finish_snapshot(&mut self, pending: &PendingSnapshot) -> Result<()> {
@@ -639,7 +796,7 @@ impl Journal {
         let snapshot = &pending.snapshot;
         // New entries, commits and terms may have arrived while the file was written.
         if snapshot.index >= self.state.snapshot.index
-            && self.state.term_at(snapshot.index) == Some(snapshot.term)
+            && self.state.history_at(snapshot.index) == Some((snapshot.term, snapshot.scn))
         {
             self.state.log.retain(|e| e.index > snapshot.index);
             if self.state.ignore_ring_identity {
@@ -696,9 +853,9 @@ pub(crate) struct History {
 }
 impl History {
     // Replays retained files with the same sequence and predecessor checks as restart.
-    fn retained_history(&self, after: u64) -> Result<Option<(State, Option<u64>)>> {
+    fn retained_history(&self, after: u64) -> Result<Option<(State, Option<(u64, Scn)>)>> {
         let mut state = self.state.clone();
-        let mut found = state.term_at(after);
+        let mut found = state.history_at(after);
         if after < state.snapshot.index {
             // Retained closed journals can outlive their in-memory entries.
             let mut base = None;
@@ -724,7 +881,7 @@ impl History {
                 if start != sequence + 1 {
                     return Ok(None);
                 }
-                if let Some(term) = restored.term_at(after) {
+                if let Some(term) = restored.history_at(after) {
                     found = Some(term);
                 }
                 let mut proof = (after, found);
@@ -740,23 +897,24 @@ impl History {
                 found = proof.1;
             }
             if restored.last() != self.state.last()
-                || restored.term_at(self.state.last()) != self.state.term_at(self.state.last())
+                || restored.history_at(self.state.last())
+                    != self.state.history_at(self.state.last())
                 || restored.commit != self.state.commit
             {
                 return Err(Error::new("archived journals differ from current history"));
             }
-            if let Some(term) = restored.term_at(after) {
+            if let Some(term) = restored.history_at(after) {
                 found = Some(term);
             }
             state = restored;
         }
         Ok(Some((state, found)))
     }
-    pub fn committed_term(&self, index: u64) -> Result<Option<u64>> {
+    pub fn committed_tip(&self, index: u64) -> Result<Option<(u64, Scn)>> {
         if index > self.state.commit {
             return Ok(None);
         }
-        if let Some(term) = self.state.term_at(index) {
+        if let Some(term) = self.state.history_at(index) {
             return Ok(Some(term));
         }
         Ok(self.retained_history(index)?.and_then(|(_, term)| term))
@@ -772,6 +930,9 @@ impl History {
             previous_term: state
                 .term_at(after)
                 .ok_or_else(|| Error::new("missing journal prefix"))?,
+            previous_scn: state
+                .scn_at(after)
+                .ok_or_else(|| Error::new("missing journal prefix SCN"))?,
             entries: state
                 .log
                 .iter()
@@ -806,8 +967,12 @@ fn read_checkpoint(
     ring: &str,
     ignore: bool,
 ) -> Result<(State, u64, u64, u64)> {
+    let maximum = file_scn(path)?;
     let bytes = std::fs::read(path)?;
-    let mut checkpoint: Checkpoint = decode(&bytes)?;
+    let mut checkpoint = Checkpoint::decode(&bytes)?;
+    if checkpoint.state.largest_scn() != maximum {
+        return Err(Error::new("snapshot SCN changed while reading"));
+    }
     if checkpoint.sequence != sequence || (!ignore && checkpoint.state.ring != ring) {
         return Err(Error::new("KS snapshot identity mismatch"));
     }
@@ -833,21 +998,41 @@ fn replay_segment_checked(
     sequence: &mut u64,
     active: bool,
     ignore: bool,
-    mut proof: Option<&mut (u64, Option<u64>)>,
+    mut proof: Option<&mut (u64, Option<(u64, Scn)>)>,
 ) -> Result<(File, u64)> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-    let (found_start, previous, previous_term) =
+    let (found_start, previous, previous_term, previous_scn) =
         read_journal_header(&mut file, &state.ring, ignore)?;
     if found_start != start {
         return Err(Error::new("journal filename/header sequence mismatch"));
     }
-    let mut boundary = state.last() == previous && state.term_at(previous) == Some(previous_term);
+    let mut boundary = state.last() == previous
+        && state.history_at(previous) == Some((previous_term, previous_scn));
     // Starting from a compact checkpoint can omit the carried uncommitted suffix.
     let can_restore_carry = state.last() == state.snapshot.index && state.last() < previous;
     if !boundary && !can_restore_carry {
         return Err(Error::new("journal predecessor index/term mismatch"));
     }
-    let size = file.metadata()?.len();
+    let physical_size = file.metadata()?.len();
+    let current = path.file_name().is_some_and(|name| name == CURRENT);
+    let footer = if physical_size >= HEADER + SCN_FOOTER {
+        file.seek(SeekFrom::End(-(SCN_FOOTER as i64)))?;
+        let mut bytes = [0; SCN_FOOTER as usize];
+        file.read_exact(&mut bytes)?;
+        if &bytes[..8] == SCN_MAGIC {
+            Some(parse_scn_footer(&bytes)?)
+        } else if current {
+            None
+        } else {
+            return Err(Error::new("missing closed journal SCN footer"));
+        }
+    } else if current {
+        None
+    } else {
+        return Err(Error::new("short closed journal SCN footer"));
+    };
+    let size = physical_size - if footer.is_some() { SCN_FOOTER } else { 0 };
+    file.seek(SeekFrom::Start(HEADER))?;
     let mut offset = HEADER;
     while offset < size {
         let remaining = size - offset;
@@ -859,6 +1044,9 @@ fn replay_segment_checked(
         }
         let mut lengths = [0; 16];
         file.read_exact(&mut lengths)?;
+        if current && remaining < SCN_FOOTER && &lengths[..8] == SCN_MAGIC {
+            break;
+        }
         let length = u64::from_le_bytes(lengths[..8].try_into().unwrap());
         let inverse = u64::from_le_bytes(lengths[8..].try_into().unwrap());
         if inverse != !length || length < 32 || length > LIMIT as u64 {
@@ -884,9 +1072,9 @@ fn replay_segment_checked(
                 [Record::Carry { entries, commit }]
                     if *commit >= state.snapshot.index
                         && *commit <= previous
-                        && entries
-                            .last()
-                            .is_some_and(|e| e.index == previous && e.term == previous_term) => {}
+                        && entries.last().is_some_and(|e| {
+                            e.index == previous && e.term == previous_term && e.scn == previous_scn
+                        }) => {}
                 _ => return Err(Error::new("journal carried predecessor mismatch")),
             }
         }
@@ -896,7 +1084,7 @@ fn replay_segment_checked(
                 // from that abandoned prefix through an unrelated checkpoint.
                 if let Record::Install(snapshot) = record {
                     if snapshot.index > *index
-                        && next.term_at(snapshot.index) != Some(snapshot.term)
+                        && next.history_at(snapshot.index) != Some((snapshot.term, snapshot.scn))
                     {
                         *found = None;
                     }
@@ -905,7 +1093,7 @@ fn replay_segment_checked(
             next.apply(record)?;
             if let Some((index, found)) = proof.as_deref_mut() {
                 if *index <= next.commit {
-                    if let Some(term) = next.term_at(*index) {
+                    if let Some(term) = next.history_at(*index) {
                         *found = Some(term);
                     }
                 }
@@ -913,7 +1101,9 @@ fn replay_segment_checked(
         }
         next.validate()?;
         if !boundary {
-            if next.last() != previous || next.term_at(previous) != Some(previous_term) {
+            if next.last() != previous
+                || next.history_at(previous) != Some((previous_term, previous_scn))
+            {
                 return Err(Error::new("journal restored predecessor mismatch"));
             }
             boundary = true;
@@ -925,12 +1115,17 @@ fn replay_segment_checked(
     if !boundary {
         return Err(Error::new("missing carried journal predecessor"));
     }
+    if let Some(maximum) = footer {
+        if state.largest_scn() != maximum {
+            return Err(Error::new("journal SCN footer mismatch"));
+        }
+    }
     if active {
         file.set_len(offset)?;
         file.sync_all()?;
         file.seek(SeekFrom::End(0))?;
     }
-    Ok((file, offset))
+    Ok((file, offset + if !active && footer.is_some() { SCN_FOOTER } else { 0 }))
 }
 // Identity updates are append-only on the locked inode. Only membership/recovery
 // changes write here; votes still require just the existing journal write.
@@ -970,12 +1165,7 @@ fn read_identity(file: &mut File) -> Result<Option<LocalIdentity>> {
     }
     Ok(last)
 }
-fn prepare_recovery(
-    directory: &Path,
-    ownership: &mut File,
-    local: &mut LocalIdentity,
-    mut state: State,
-) -> Result<()> {
+fn retire_identity(local: &mut LocalIdentity, state: &mut State) -> Result<()> {
     let current = common::ring::MemberIdentity::generate()?;
     let membership = local
         .membership
@@ -1003,15 +1193,29 @@ fn prepare_recovery(
     state.snapshot = snapshot;
     state.log.clear();
     state.vote = None;
-    state.founders = state.founders.or_else(|| local.founders.clone());
+    state.founders = state.founders.clone().or_else(|| local.founders.clone());
     if let Some(retired) = &pending {
         state.apply(&Record::Retired(retired.clone()))?;
     }
+    local.retired.push(local.current.clone());
+    local.current = current;
+    local.slot = pending.as_ref().map(|r| r.next);
+    local.pending = pending;
     state.validate()?;
+    Ok(())
+}
+fn prepare_recovery(
+    directory: &Path,
+    ownership: &mut File,
+    local: &mut LocalIdentity,
+    mut state: State,
+) -> Result<()> {
+    retire_identity(local, &mut state)?;
+    let current = local.current.clone();
     let checkpoint_name = format!("recovery-{current}.bin");
     let checkpoint =
         Checkpoint { sequence: 0, second: common::time::TimeSec::now().number(), state };
-    publish(&directory.join(&checkpoint_name), &encode(&checkpoint)?)?;
+    publish(&directory.join(&checkpoint_name), &checkpoint.bytes()?)?;
     let mut files: Vec<String> = numbered(directory, "snapshot")?
         .into_iter()
         .chain(numbered(directory, "journal")?)
@@ -1020,10 +1224,6 @@ fn prepare_recovery(
     if directory.join(CURRENT).try_exists()? {
         files.push(CURRENT.into());
     }
-    local.retired.push(local.current.clone());
-    local.current = current.clone();
-    local.slot = pending.as_ref().map(|r| r.next);
-    local.pending = pending;
     local.recovery = Some(RecoveryPlan {
         archive: format!("retired-{current}"),
         checkpoint: checkpoint_name,
@@ -1040,7 +1240,7 @@ fn finish_recovery(
 ) -> Result<()> {
     let plan = local.recovery.clone().ok_or_else(|| Error::new("missing recovery plan"))?;
     let bytes = std::fs::read(directory.join(&plan.checkpoint))?;
-    let checkpoint: Checkpoint = decode(&bytes)?;
+    let checkpoint = Checkpoint::decode(&bytes)?;
     let archive = directory.join(&plan.archive);
     std::fs::create_dir_all(&archive)?;
     sync_directory(directory)?;
@@ -1074,7 +1274,7 @@ impl PendingSnapshot {
         self.write_cancellable(|| false)
     }
     pub fn write_cancellable(&self, cancelled: impl Fn() -> bool) -> Result<()> {
-        let bytes = encode(&self.checkpoint)?;
+        let bytes = self.checkpoint.bytes()?;
         publish_cancellable(&self.path, &bytes, cancelled)?;
         self.written_bytes.store(bytes.len() as u64, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -1199,7 +1399,12 @@ mod tests {
                 Record::Hard { term: 1, vote: Some(0) },
                 Record::Entries {
                     from: 1,
-                    entries: vec![Entry { index: 1, term: 1, command: Command::Noop }],
+                    entries: vec![Entry {
+                        scn: common::scn::Scn::new(1),
+                        index: 1,
+                        term: 1,
+                        command: Command::Noop,
+                    }],
                 },
             ])
             .unwrap();
@@ -1223,19 +1428,135 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "filesystem integration; run explicitly with --ignored"]
+    fn conflicting_history_retires_identity_and_rebuilds_from_older_verified_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(
+            dir.path(),
+            State::initial("01".repeat(64), Default::default(), Default::default()).unwrap(),
+            3,
+            "KS0",
+        )
+        .unwrap();
+        let mut membership = initial().membership();
+        membership.identities.insert(
+            0,
+            Member { identity: journal.identity.current.clone(), process: "KS0".into() },
+        );
+        journal.write(&[Record::Bootstrap(membership)]).unwrap();
+        journal
+            .write(&[
+                Record::Hard { term: 2, vote: Some(0) },
+                Record::Entries {
+                    from: 1,
+                    entries: (1..=3)
+                        .map(|index| Entry {
+                            index,
+                            term: 2,
+                            scn: Scn::new(index),
+                            command: Command::Noop,
+                        })
+                        .collect(),
+                },
+                Record::Commit(3),
+            ])
+            .unwrap();
+        journal.snapshot(10).unwrap();
+        {
+            let mut disk = journal.disk.lock().unwrap();
+            append_identity(&mut disk.ownership, &journal.identity).unwrap();
+        }
+        let old = journal.identity.current.clone();
+        journal.require_history_repair().unwrap();
+        drop(journal);
+        let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        assert!(journal.identity.repairing);
+        let mut replacement = initial().capture();
+        replacement.index = 1;
+        replacement.term = 2;
+        replacement.scn = Scn::new(500);
+        let rejected = journal.repair_history(replacement.clone(), Some((2, Scn::new(1)))).is_err();
+        assert!(rejected);
+        assert_eq!(journal.identity.current, old);
+        journal.repair_history(replacement, Some((2, Scn::new(500)))).unwrap();
+        let new = journal.identity.current.clone();
+        let retirement = journal.pending_replacement().unwrap();
+        let archive = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("rejected-"))
+            .unwrap();
+        assert!(archive.join(CURRENT).is_file());
+        assert_ne!(old, new);
+        assert_eq!(retirement.previous, 0);
+        assert_eq!(retirement.next, INCARNATION);
+        assert_eq!(retirement.old.identity, old);
+        assert_eq!(journal.state.commit, 1);
+        assert_eq!(journal.state.vote, None);
+        assert_eq!(journal.state.generation, 1);
+        assert!(!journal.identity.repairing);
+        drop(journal);
+        let restarted = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        assert_eq!(restarted.identity.current, new);
+        assert_eq!(restarted.pending_replacement().unwrap(), retirement);
+        assert_eq!(restarted.state.history_at(1), Some((2, Scn::new(500))));
+        assert_eq!(restarted.state.commit, 1);
+    }
+
+    #[test]
+    fn scn_footer_detects_corruption_and_preserves_wrapped_zero() {
+        for maximum in [None, Some(Scn::new(0)), Some(Scn::new(u64::MAX))] {
+            let bytes = scn_footer(maximum);
+            let decoded = parse_scn_footer(&bytes).unwrap();
+            assert_eq!(decoded, maximum);
+            for offset in 0..bytes.len() {
+                let mut corrupt = bytes.clone();
+                corrupt[offset] ^= 1;
+                let rejected = parse_scn_footer(&corrupt).is_err();
+                assert!(rejected);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "filesystem integration; run explicitly with --ignored"]
+    fn interrupted_footer_write_keeps_current_journal_and_identity() {
+        for length in [1, 7, 16, 32, 63, 64] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+            journal.write(&[Record::Hard { term: 1, vote: Some(0) }]).unwrap();
+            let identity = journal.identity.current.clone();
+            let path = dir.path().join(CURRENT);
+            let size = std::fs::metadata(&path).unwrap().len();
+            drop(journal);
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&scn_footer(None)[..length]).unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            let recovered = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+            let restored_size = std::fs::metadata(&path).unwrap().len();
+            assert_eq!(recovered.identity.current, identity);
+            assert_eq!(recovered.state.vote, Some(0));
+            assert_eq!(restored_size, size);
+            assert!(recovered.pending_replacement().is_none());
+        }
+    }
+
+    #[test]
     fn checkpoint_proof_is_checked_before_installing_new_history() {
         let mut state = initial();
         state.term = 9;
         let mut snapshot = state.capture();
         snapshot.index = 20;
         snapshot.term = 7;
-        for proof in [None, Some(9)] {
+        for proof in [None, Some((9, snapshot.scn)), Some((7, Scn::new(123)))] {
             let rejected = checkpoint_install(&state, &snapshot, proof).is_err();
             assert!(rejected);
             assert_eq!(state.commit, 0);
         }
         snapshot.term = 9;
-        let install = checkpoint_install(&state, &snapshot, Some(9)).unwrap().unwrap();
+        let install =
+            checkpoint_install(&state, &snapshot, Some((9, snapshot.scn))).unwrap().unwrap();
         state.apply(&install).unwrap();
         assert_eq!(state.commit, 20);
         assert_eq!(state.term_at(20), Some(9));
@@ -1252,7 +1573,12 @@ mod tests {
                     Record::Hard { term: index, vote: Some(0) },
                     Record::Entries {
                         from: index,
-                        entries: vec![Entry { index, term: index, command: Command::Noop }],
+                        entries: vec![Entry {
+                            scn: common::scn::Scn::new(index),
+                            index,
+                            term: index,
+                            command: Command::Noop,
+                        }],
                     },
                     Record::Commit(index),
                 ])
@@ -1265,11 +1591,11 @@ mod tests {
         assert_eq!(journal.committed_term(1).unwrap(), Some(1));
         assert_eq!(journal.committed_term(3).unwrap(), Some(3));
         assert_eq!(journal.committed_term(4).unwrap(), None);
-        // Physical sequence/ring still match, but the next file claims another predecessor term.
+        // Physical sequence/ring still match, but predecessor index, term or SCN differs.
         let journals = numbered(dir.path(), "journal").unwrap();
         let (_, path) = &journals[1];
         let original = std::fs::read(path).unwrap();
-        for offset in [152, 160] {
+        for offset in [152, 160, 168] {
             let mut bad = original.clone();
             bad[offset..offset + 8].copy_from_slice(&99u64.to_le_bytes());
             std::fs::write(path, bad).unwrap();
@@ -1304,15 +1630,22 @@ mod tests {
             ring: state.ring.clone(),
             after: 9,
             previous_term: 4,
-            entries: vec![crate::Entry { index: 10, term: 4, command: crate::Command::Noop }],
+            previous_scn: state.snapshot.scn,
+            entries: vec![crate::Entry {
+                scn: common::scn::Scn::new(10),
+                index: 10,
+                term: 4,
+                command: crate::Command::Noop,
+            }],
         };
         // Ring identity and the retained prefix alone accept this abandoned history.
         let structurally_valid = copied.validate(&state, 10).is_ok();
-        let matches_primary = copied.matches_tip(10, 6);
+        let matches_primary = copied.matches_tip(10, (6, Scn::new(10)));
         assert!(structurally_valid);
         assert!(!matches_primary);
         copied.entries[0].term = 6;
-        let valid = copied.validate(&state, 10).is_ok() && copied.matches_tip(10, 6);
+        let valid =
+            copied.validate(&state, 10).is_ok() && copied.matches_tip(10, (6, Scn::new(10)));
         assert!(valid);
         state.apply(&Record::Entries { from: 10, entries: copied.entries }).unwrap();
         state.apply(&Record::Commit(10)).unwrap();
@@ -1327,7 +1660,13 @@ mod tests {
             ring: state.ring.clone(),
             after: 0,
             previous_term: 0,
-            entries: vec![Entry { index: 1, term: 1, command: Command::Noop }],
+            previous_scn: Scn::new(0),
+            entries: vec![Entry {
+                scn: common::scn::Scn::new(1),
+                index: 1,
+                term: 1,
+                command: Command::Noop,
+            }],
         };
         assert!(good.validate(&state, 1).is_ok());
         let mut wrong = good.clone();
@@ -1380,7 +1719,12 @@ mod tests {
                 Record::Entries {
                     from: 1,
                     entries: (1..=3)
-                        .map(|index| Entry { index, term: 2, command: Command::Noop })
+                        .map(|index| Entry {
+                            scn: common::scn::Scn::new(index),
+                            index,
+                            term: 2,
+                            command: Command::Noop,
+                        })
                         .collect(),
                 },
                 Record::Commit(2),
@@ -1405,6 +1749,7 @@ mod tests {
     #[test]
     fn local_identity_keeps_retired_ids_and_detects_corruption() {
         let local = LocalIdentity {
+            repairing: false,
             ring: "01".repeat(64),
             process: "routing-label".into(),
             current: common::ring::MemberIdentity::try_from("02".repeat(64)).unwrap(),
@@ -1470,7 +1815,12 @@ mod tests {
         recovered
             .write(&[Record::Entries {
                 from: 1,
-                entries: vec![Entry { index: 1, term: 1, command: Command::Members(membership) }],
+                entries: vec![Entry {
+                    scn: common::scn::Scn::new(1),
+                    index: 1,
+                    term: 1,
+                    command: Command::Members(membership),
+                }],
             }])
             .unwrap();
         assert!(recovered.pending_replacement().is_none());
@@ -1502,7 +1852,7 @@ mod tests {
         let mut state = initial();
         state.apply(&Record::Retired(retirement.clone())).unwrap();
         let checkpoint = Checkpoint { sequence: 0, second: 1, state };
-        publish(&dir.path().join("recovery-test.bin"), &encode(&checkpoint).unwrap()).unwrap();
+        publish(&dir.path().join("recovery-test.bin"), &checkpoint.bytes().unwrap()).unwrap();
         local.retired.push(old);
         local.current = new.clone();
         local.slot = Some(INCARNATION);
@@ -1536,7 +1886,8 @@ mod tests {
         let pending = journal.prepare_snapshot(10).unwrap().unwrap();
         let closed = std::fs::read(named(dir.path(), "journal", 1)).unwrap();
         let current = std::fs::read(dir.path().join(CURRENT)).unwrap();
-        assert_eq!(old, closed);
+        assert_eq!(old, closed[..closed.len() - SCN_FOOTER as usize]);
+        assert_eq!(parse_scn_footer(&closed[old.len()..]).unwrap(), None);
         assert_eq!(current, journal_header(&initial().ring, 2));
         // A retry before publication should reuse the empty current file.
         journal.prepare_snapshot(11).unwrap().unwrap();
@@ -1662,10 +2013,10 @@ mod tests {
             let bytes = if kind == "journal" {
                 journal_header(&"02".repeat(64), 2)
             } else {
-                let mut checkpoint: Checkpoint = decode(&std::fs::read(&path).unwrap()).unwrap();
+                let mut checkpoint = Checkpoint::decode(&std::fs::read(&path).unwrap()).unwrap();
                 checkpoint.state.ring = "02".repeat(64);
                 checkpoint.state.snapshot.ring = checkpoint.state.ring.clone();
-                encode(&checkpoint).unwrap()
+                checkpoint.bytes().unwrap()
             };
             std::fs::write(&path, &bytes).unwrap();
             let recovered = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
@@ -1726,8 +2077,14 @@ mod tests {
     fn carried_suffix_replays_with_or_without_checkpoint_without_regressing_hard_state() {
         let mut original = initial();
         original.apply(&Record::Hard { term: 2, vote: Some(0) }).unwrap();
-        let entries: Vec<_> =
-            (1..=4).map(|index| Entry { index, term: 2, command: Command::Noop }).collect();
+        let entries: Vec<_> = (1..=4)
+            .map(|index| Entry {
+                scn: common::scn::Scn::new(index),
+                index,
+                term: 2,
+                command: Command::Noop,
+            })
+            .collect();
         original.apply(&Record::Entries { from: 1, entries }).unwrap();
         original.apply(&Record::Commit(1)).unwrap();
         let checkpoint = original.capture();
@@ -1766,8 +2123,14 @@ mod tests {
         for publish_snapshot in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
-            let entries =
-                (1..=4).map(|index| Entry { index, term: 2, command: Command::Noop }).collect();
+            let entries = (1..=4)
+                .map(|index| Entry {
+                    scn: common::scn::Scn::new(index),
+                    index,
+                    term: 2,
+                    command: Command::Noop,
+                })
+                .collect();
             journal
                 .write(&[
                     Record::Hard { term: 2, vote: Some(0) },
@@ -1800,7 +2163,12 @@ mod tests {
                 Record::Hard { term: 3, vote: Some(0) },
                 Record::Entries {
                     from: 1,
-                    entries: vec![Entry { index: 1, term: 3, command: Command::Noop }],
+                    entries: vec![Entry {
+                        scn: common::scn::Scn::new(1),
+                        index: 1,
+                        term: 3,
+                        command: Command::Noop,
+                    }],
                 },
             ])
             .unwrap();
@@ -1886,7 +2254,12 @@ mod tests {
                 Record::Hard { term: 1, vote: None },
                 Record::Entries {
                     from: 1,
-                    entries: vec![Entry { index: 1, term: 1, command: Command::Noop }],
+                    entries: vec![Entry {
+                        scn: common::scn::Scn::new(1),
+                        index: 1,
+                        term: 1,
+                        command: Command::Noop,
+                    }],
                 },
             ])
             .unwrap();
@@ -1924,6 +2297,7 @@ mod tests {
                 Record::Entries {
                     from: 1,
                     entries: vec![crate::raft::Entry {
+                        scn: common::scn::Scn::new(1),
                         index: 1,
                         term: 1,
                         command: Command::Client(vec![crate::Action::new(
@@ -1942,6 +2316,7 @@ mod tests {
                 Record::Entries {
                     from: 2,
                     entries: vec![crate::raft::Entry {
+                        scn: common::scn::Scn::new(2),
                         index: 2,
                         term: 1,
                         command: Command::Client(vec![crate::Action::new(
@@ -2002,6 +2377,7 @@ pub fn provision_test_founder(
     append_identity(
         &mut file,
         &LocalIdentity {
+            repairing: false,
             ring: ring.into(),
             process: process.into(),
             current,
@@ -2022,8 +2398,8 @@ crate::wire_struct!(Batch, RaftBatch, {sequence,records});
 
 crate::wire_struct!(Checkpoint, RaftCheckpoint, {sequence,second,state});
 
-crate::wire_struct!(CommittedJournal, RaftCommittedJournal, {ring,after,previous_term,entries});
+crate::wire_struct!(CommittedJournal, RaftCommittedJournal, {ring,after,previous_term,previous_scn,entries});
 
-crate::wire_struct!(LocalIdentity, RaftLocalIdentity, {ring,process,current,retired,slot,membership,founders,initialized,pending,recovery});
+crate::wire_struct!(LocalIdentity, RaftLocalIdentity, {ring,process,current,retired,slot,membership,founders,initialized,pending,recovery,repairing});
 
 crate::wire_struct!(RecoveryPlan, RaftRecoveryPlan, {archive,checkpoint,files});

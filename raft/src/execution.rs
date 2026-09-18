@@ -7,18 +7,23 @@ use std::time::{Duration, Instant};
 
 /// A detached, immutable view of committed work. No consensus lock is retained.
 pub struct Work {
+    pub generation: u64,
     pub ring: String,
     pub snapshot: Arc<Snapshot>,
     pub entries: Vec<Entry>,
     pub commit: u64,
 }
 pub trait Committed {
+    fn generation(&self) -> u64;
     fn ring(&self) -> &str;
     fn snapshot(&self) -> &Snapshot;
     fn entries(&self) -> &[Entry];
     fn commit(&self) -> u64;
 }
 impl Committed for State {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
     fn ring(&self) -> &str {
         &self.ring
     }
@@ -33,6 +38,9 @@ impl Committed for State {
     }
 }
 impl Committed for Work {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
     fn ring(&self) -> &str {
         &self.ring
     }
@@ -52,6 +60,7 @@ pub trait Application: Default + Send + Sync {
 }
 #[derive(Default)]
 pub struct Cursor {
+    generation: u64,
     restoring: Option<u64>,
     entry: u64,
     action: usize,
@@ -103,6 +112,10 @@ fn execute_with_lock<S: Application>(
         Err(TryLockError::WouldBlock) => return Ok(false),
         Err(TryLockError::Poisoned(_)) => return Err(Error::new("global lock poisoned")),
     };
+    if cursor.generation != state.generation() {
+        *data = S::default();
+        *cursor = Cursor { generation: state.generation(), ..Cursor::default() };
+    }
     if data.applied() == state.commit() && cursor.restoring.is_none() {
         return Ok(true);
     }
@@ -191,6 +204,7 @@ mod tests {
         state.term = 1;
         state.log = (1..=2)
             .map(|index| Entry {
+                scn: common::scn::Scn::new(index),
                 index,
                 term: 1,
                 command: Command::Client(
@@ -204,6 +218,21 @@ mod tests {
     fn apply(data: &mut Values, _: Context<'_>, action: &Action) -> Result<()> {
         data.values.push(action.fields[0]);
         Ok(())
+    }
+    #[test]
+    fn new_history_generation_resets_applied_state_even_when_commit_regresses() {
+        let global = RwLock::new(Values::default());
+        let cursor = Mutex::new(Cursor::default());
+        let mut old = state();
+        old.commit = 2;
+        execute_blocking(&global, &cursor, &old, Duration::MAX, apply).unwrap();
+        let mut replacement = state();
+        replacement.generation = 1;
+        replacement.log[0].command = Command::Client(vec![Action::new(Op::BytesResp, vec![9])]);
+        execute_blocking(&global, &cursor, &replacement, Duration::MAX, apply).unwrap();
+        let data = global.read().unwrap();
+        assert_eq!(data.applied, 1);
+        assert_eq!(data.values, vec![9]);
     }
     #[test]
     fn blocked_client_action_does_not_block_heartbeat_or_commit() {
@@ -241,6 +270,7 @@ mod tests {
                         term: 1,
                         previous: 0,
                         previous_term: 0,
+                        previous_scn: common::scn::Scn::new(0),
                         entries: vec![],
                         commit: 0,
                     },
@@ -251,7 +281,13 @@ mod tests {
                         term: 1,
                         previous: 0,
                         previous_term: 0,
-                        entries: vec![Entry { index: 1, term: 1, command: Command::Noop }],
+                        previous_scn: common::scn::Scn::new(0),
+                        entries: vec![Entry {
+                            scn: common::scn::Scn::new(1),
+                            index: 1,
+                            term: 1,
+                            command: Command::Noop,
+                        }],
                         commit: 1,
                     },
                 )?;

@@ -1152,6 +1152,10 @@ fn status(process: &Process, service: &impl Service) -> String {
     if let Some(media_class) = &process.entry.media_class {
         lines.push(format!("media_class {media_class}"));
     }
+    if let (Ok(scn), Ok(stalled)) = (crate::scn::current(), crate::scn::is_stalled()) {
+        lines.push(format!("scn {scn}"));
+        lines.push(format!("scn_stalled {stalled}"));
+    }
     lines.extend(service.status(process));
     lines.join("\n")
 }
@@ -1164,6 +1168,7 @@ pub fn main<S: Service>(build: impl FnOnce(&Process) -> Result<S>) -> Result<()>
         return Err(Error::new("usage: <daemon> <process-config.toml>"));
     }
     let process = Arc::new(Process::load(Path::new(&path))?);
+    crate::scn::initialize(process.cluster.scn)?;
     let service = Arc::new(build(&process)?);
     service.start()?;
     serve(process, service)

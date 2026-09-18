@@ -1,5 +1,6 @@
 //! Raft consensus. Disk mutations complete before the corresponding response is sent.
 use crate::journal::Journal;
+use common::scn::Scn;
 use common::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -184,12 +185,14 @@ pub enum Command {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
+    pub scn: Scn,
     pub index: u64,
     pub term: u64,
     pub command: Command,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
+    pub scn: Scn,
     pub ring: String,
     pub index: u64,
     pub term: u64,
@@ -200,6 +203,13 @@ pub struct Snapshot {
     pub checkpoint_start: Option<(u64, MemberId)>,
 }
 impl Snapshot {
+    pub fn largest_scn(&self) -> Option<Scn> {
+        self.application
+            .iter()
+            .map(|entry| entry.scn)
+            .chain((self.index != 0).then_some(self.scn))
+            .reduce(|a, b| if b.compare(a).is_gt() { b } else { a })
+    }
     pub fn validate(&self) -> Result<()> {
         if self.membership.old.is_empty() {
             if self.index != 0
@@ -228,6 +238,7 @@ impl Snapshot {
                 || entry.term == 0
                 || entry.term > self.term
                 || !matches!(entry.command, Command::Client(_))
+                || (entry.index == self.index && (entry.term, entry.scn) != (self.term, self.scn))
             {
                 return Err(Error::new("invalid snapshot key entry"));
             }
@@ -238,6 +249,10 @@ impl Snapshot {
 }
 #[derive(Clone, Debug)]
 pub struct State {
+    /// Local application generation; changes when abandoned history is replaced.
+    pub generation: u64,
+    /// Largest observed entry SCN, including a subsequently replaced suffix.
+    pub max_scn: Option<Scn>,
     /// Process-local debugging override: never inherited from a snapshot or journal.
     pub ignore_ring_identity: bool,
     pub ring: String,
@@ -303,6 +318,8 @@ impl State {
             return Err(Error::new("unjoined state has no assigned identities"));
         }
         Ok(Self {
+            generation: 0,
+            max_scn: None,
             founders: (!membership.old.is_empty()).then_some(membership.clone()),
             retirements: BTreeMap::new(),
             contacts: MemberNames::new(),
@@ -311,6 +328,7 @@ impl State {
             term: 0,
             vote: None,
             snapshot: Snapshot {
+                scn: Scn::new(0),
                 ring,
                 index: 0,
                 term: 0,
@@ -324,6 +342,40 @@ impl State {
     }
     pub fn last(&self) -> u64 {
         self.log.last().map_or(self.snapshot.index, |e| e.index)
+    }
+    pub fn scn_at(&self, index: u64) -> Option<Scn> {
+        if index == self.snapshot.index {
+            return Some(self.snapshot.scn);
+        }
+        index
+            .checked_sub(self.snapshot.index)
+            .and_then(|i| i.checked_sub(1))
+            .and_then(|i| self.log.get(i as usize))
+            .map(|e| e.scn)
+    }
+    pub fn history_at(&self, index: u64) -> Option<(u64, Scn)> {
+        self.term_at(index).zip(self.scn_at(index))
+    }
+    pub fn largest_scn(&self) -> Option<Scn> {
+        let mut maximum = self.max_scn;
+        for scn in self
+            .snapshot
+            .application
+            .iter()
+            .map(|e| e.scn)
+            .chain((self.snapshot.index != 0).then_some(self.snapshot.scn))
+            .chain(self.log.iter().map(|e| e.scn))
+        {
+            if maximum.is_none_or(|old| scn.compare(old).is_gt()) {
+                maximum = Some(scn);
+            }
+        }
+        maximum
+    }
+    fn observe_scn(&mut self, scn: Scn) {
+        if self.max_scn.is_none_or(|old| scn.compare(old).is_gt()) {
+            self.max_scn = Some(scn);
+        }
     }
     pub fn term_at(&self, index: u64) -> Option<u64> {
         if index == self.snapshot.index {
@@ -394,6 +446,7 @@ impl State {
             }
             snapshot.index = e.index;
             snapshot.term = e.term;
+            snapshot.scn = e.scn;
         }
         snapshot
     }
@@ -451,7 +504,7 @@ impl State {
                 // A rotated journal must replay both with and without its checkpoint.
                 // Already committed entries must agree; only the remaining suffix is replaced.
                 for entry in entries.iter().filter(|e| e.index <= self.commit) {
-                    if self.term_at(entry.index) != Some(entry.term) {
+                    if self.history_at(entry.index) != Some((entry.term, entry.scn)) {
                         return Err(Error::new("carried journal conflicts with committed state"));
                     }
                 }
@@ -491,6 +544,9 @@ impl State {
                 }
                 self.log.truncate((*from - self.snapshot.index - 1) as usize);
                 self.log.extend(entries.clone());
+                for entry in entries {
+                    self.observe_scn(entry.scn);
+                }
             }
             Record::Commit(index) => {
                 if *index < self.commit || *index > self.last() {
@@ -504,7 +560,7 @@ impl State {
                 if snapshot.index < self.commit || snapshot.term > self.term {
                     return Err(Error::new("invalid Raft snapshot boundary"));
                 }
-                let keep = self.term_at(snapshot.index) == Some(snapshot.term);
+                let keep = self.history_at(snapshot.index) == Some((snapshot.term, snapshot.scn));
                 self.log = if keep {
                     self.log.iter().filter(|e| e.index > snapshot.index).cloned().collect()
                 } else {
@@ -515,6 +571,12 @@ impl State {
                     self.ring = snapshot.ring.clone();
                 }
                 self.snapshot = snapshot.clone();
+                if snapshot.index != 0 {
+                    self.observe_scn(snapshot.scn);
+                }
+                for entry in &snapshot.application {
+                    self.observe_scn(entry.scn);
+                }
             }
         }
         self.validate()
@@ -533,10 +595,30 @@ pub enum Record {
 }
 #[derive(Clone, Debug)]
 pub enum Rpc {
-    Vote { term: u64, last: u64, last_term: u64 },
-    Append { term: u64, previous: u64, previous_term: u64, entries: Vec<Entry>, commit: u64 },
-    Install { term: u64, snapshot: Snapshot },
-    Checkpoint { term: u64, index: u64, snapshot_term: u64 },
+    Vote {
+        term: u64,
+        last: u64,
+        last_term: u64,
+        last_scn: Scn,
+    },
+    Append {
+        term: u64,
+        previous: u64,
+        previous_term: u64,
+        previous_scn: Scn,
+        entries: Vec<Entry>,
+        commit: u64,
+    },
+    Install {
+        term: u64,
+        snapshot: Snapshot,
+    },
+    Checkpoint {
+        term: u64,
+        index: u64,
+        snapshot_term: u64,
+        snapshot_scn: Scn,
+    },
 }
 impl Rpc {
     pub fn term(&self) -> u64 {
@@ -565,6 +647,9 @@ pub enum Role {
 /// Writes accept an ordered batch; durable_state advances only after journal I/O.
 /// Synchronous/in-memory stores use the default immediate durability boundary.
 pub trait Storage {
+    fn history_repair_required(&self) -> bool {
+        false
+    }
     fn state(&self) -> &State;
     fn durable_state(&self) -> &State {
         self.state()
@@ -580,6 +665,7 @@ pub struct Node<S: Storage = Journal> {
     pub identity: Option<common::ring::MemberIdentity>,
     pub journal: S,
     pub role: Role,
+    pub repairing: bool,
     pub leader: Option<MemberId>,
     pub votes: Members,
     /// Absolute CLOCK_BOOTTIME deadline; independent of randomized campaign scheduling.
@@ -592,12 +678,21 @@ pub struct Node<S: Storage = Journal> {
     pub lease: crate::lease::Lease,
     #[cfg(any(test, feature = "testing"))]
     clock: Option<std::time::Duration>,
+    #[cfg(any(test, feature = "testing"))]
+    scn_clock: Scn,
+    #[cfg(any(test, feature = "testing"))]
+    scn_stalled: bool,
 }
 impl<S: Storage> Node<S> {
     pub fn new(id: MemberId, journal: S) -> Self {
         Self {
+            #[cfg(any(test, feature = "testing"))]
+            scn_clock: journal.state().largest_scn().unwrap_or(Scn::new(0)),
+            #[cfg(any(test, feature = "testing"))]
+            scn_stalled: false,
             id,
             identity: None,
+            repairing: journal.history_repair_required(),
             journal,
             role: Role::Follower,
             leader: None,
@@ -631,6 +726,43 @@ impl<S: Storage> Node<S> {
             self.now()?,
         ))
     }
+    pub fn merge_scn(&mut self, scn: Scn) -> Result<()> {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            if scn.compare(self.scn_clock).is_gt() {
+                self.scn_clock = scn;
+            }
+            Ok(())
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            common::scn::merge(scn).map(|_| ())
+        }
+    }
+    pub fn merge_history_scn(&mut self) -> Result<()> {
+        if let Some(scn) = self.state().largest_scn() {
+            self.merge_scn(scn)?;
+        }
+        Ok(())
+    }
+    fn next_scn(&mut self) -> Result<Option<Scn>> {
+        // The cached high-water avoids scanning the log on every proposal.
+        if let Some(scn) = self.state().max_scn {
+            self.merge_scn(scn)?;
+        }
+        #[cfg(any(test, feature = "testing"))]
+        {
+            if self.scn_stalled {
+                return Ok(None);
+            }
+            self.scn_clock = Scn::new(self.scn_clock.number().wrapping_add(1));
+            Ok(Some(self.scn_clock))
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            common::scn::try_next()
+        }
+    }
     fn persist(&mut self, records: Vec<Record>) -> Result<()> {
         let membership_changed = records.iter().any(|record| match record {
             Record::Bootstrap(_)
@@ -649,10 +781,11 @@ impl<S: Storage> Node<S> {
                 for entry in entries {
                     common::logn!(
                         "Raft entry accepted",
-                        "member {},index {},term {}",
+                        "member {},index {},term {},scn {}",
                         self.id,
                         entry.index,
-                        entry.term
+                        entry.term,
+                        entry.scn
                     );
                 }
             }
@@ -787,6 +920,9 @@ impl<S: Storage> Node<S> {
     }
     pub fn campaign(&mut self) -> Result<()> {
         self.running()?;
+        if self.repairing {
+            return Ok(());
+        }
         if self.role == Role::Leader {
             return self.stop_primary();
         }
@@ -866,7 +1002,7 @@ impl<S: Storage> Node<S> {
                 .map(|id| (id.clone(), next))
                 .collect();
             self.matched.clear();
-            self.propose(Command::Noop)?;
+            self.advance()?;
         }
         Ok(())
     }
@@ -879,7 +1015,10 @@ impl<S: Storage> Node<S> {
         }
         let index =
             self.state().last().checked_add(1).ok_or_else(|| Error::new("Raft index overflow"))?;
-        let entry = Entry { index, term: self.state().term, command };
+        let scn = self.next_scn()?.ok_or_else(|| {
+            Error::new("SCN allocation stalled; retry after clock synchronization")
+        })?;
+        let entry = Entry { scn, index, term: self.state().term, command };
         self.persist(vec![Record::Entries { from: index, entries: vec![entry] }])?;
         self.advance()?;
         Ok(index)
@@ -887,6 +1026,27 @@ impl<S: Storage> Node<S> {
     pub fn advance(&mut self) -> Result<()> {
         if self.role != Role::Leader || !self.write_authority()? {
             return Ok(());
+        }
+        // A stalled SCN allocator must not stall the consensus owner. Retry the
+        // mandatory current-term entry on maintenance ticks; heartbeats still run.
+        if self.state().term_at(self.state().last()) != Some(self.state().term) {
+            let Some(scn) = self.next_scn()? else {
+                return Ok(());
+            };
+            let index = self
+                .state()
+                .last()
+                .checked_add(1)
+                .ok_or_else(|| Error::new("Raft index overflow"))?;
+            self.persist(vec![Record::Entries {
+                from: index,
+                entries: vec![Entry {
+                    scn,
+                    index,
+                    term: self.state().term,
+                    command: Command::Noop,
+                }],
+            }])?;
         }
         let membership = self.state().membership();
         let mut commit = self.state().commit;
@@ -901,7 +1061,7 @@ impl<S: Storage> Node<S> {
                 .map(|(id, _)| id.clone())
                 .collect();
             let durable = self.journal.durable_state();
-            if durable.term_at(index) == self.state().term_at(index) {
+            if durable.history_at(index) == self.state().history_at(index) {
                 votes.insert(self.id);
             }
             if membership.quorum(&votes) {
@@ -969,7 +1129,12 @@ impl<S: Storage> Node<S> {
                 if !self.campaign_live(self.now().ok()?) {
                     return None;
                 }
-                Some(Rpc::Vote { term: s.term, last: s.last(), last_term: s.term_at(s.last())? })
+                Some(Rpc::Vote {
+                    term: s.term,
+                    last: s.last(),
+                    last_term: s.term_at(s.last())?,
+                    last_scn: s.scn_at(s.last())?,
+                })
             }
             Role::Leader => {
                 let next = self.next.get(peer).copied().unwrap_or(s.last().saturating_add(1));
@@ -981,6 +1146,7 @@ impl<S: Storage> Node<S> {
                             term: s.term,
                             index: s.snapshot.index,
                             snapshot_term: s.snapshot.term,
+                            snapshot_scn: s.snapshot.scn,
                         }
                     });
                 }
@@ -989,6 +1155,7 @@ impl<S: Storage> Node<S> {
                     term: s.term,
                     previous,
                     previous_term: s.term_at(previous)?,
+                    previous_scn: s.scn_at(previous)?,
                     entries: s.log.iter().filter(|e| e.index >= next).take(128).cloned().collect(),
                     commit: s.commit,
                 })
@@ -997,15 +1164,16 @@ impl<S: Storage> Node<S> {
     }
     pub fn receive(&mut self, sender: &MemberId, rpc: &Rpc) -> Result<Answer> {
         self.running()?;
-        if let Rpc::Append { term, previous, previous_term, entries, commit } = rpc {
+        if let Rpc::Append { term, previous, previous_term, previous_scn, entries, commit } = rpc {
             common::logn!(
                 "Raft heartbeat received",
-                "member {},primary {},term {},previous {},previous_term {},entries {},commit {}",
+                "member {},primary {},term {},previous {},previous_term {},previous_scn {},entries {},commit {}",
                 self.id,
                 sender,
                 term,
                 previous,
                 previous_term,
+                previous_scn,
                 entries.len(),
                 commit
             );
@@ -1021,6 +1189,28 @@ impl<S: Storage> Node<S> {
         if matches!(rpc, Rpc::Vote { .. }) && !self.state().membership().voters().contains(sender) {
             return Ok(Answer { term: self.state().term, success: false, matched: 0 });
         }
+        // Network entries retain the creator's SCN, even when the local prefix
+        // does not match yet. Bulk history imports merge their maximum once.
+        match rpc {
+            Rpc::Append { previous, previous_scn, entries, .. } => {
+                if *previous != 0 {
+                    self.merge_scn(*previous_scn)?;
+                }
+                for entry in entries {
+                    self.merge_scn(entry.scn)?;
+                }
+            }
+            Rpc::Vote { last, last_scn, .. } if *last != 0 => self.merge_scn(*last_scn)?,
+            Rpc::Install { snapshot, .. } => {
+                if let Some(scn) = snapshot.largest_scn() {
+                    self.merge_scn(scn)?;
+                }
+            }
+            Rpc::Checkpoint { index, snapshot_scn, .. } if *index != 0 => {
+                self.merge_scn(*snapshot_scn)?
+            }
+            _ => {}
+        }
         if rpc.term() > self.state().term {
             self.follow(rpc.term())?;
         }
@@ -1029,7 +1219,7 @@ impl<S: Storage> Node<S> {
             return Ok(answer);
         }
         match rpc {
-            Rpc::Checkpoint { term, index, snapshot_term } => {
+            Rpc::Checkpoint { term, index, snapshot_term, snapshot_scn } => {
                 // A reference is also leader contact. A matching local prefix can acknowledge
                 // immediately; otherwise the runtime fetches committed state from a peer.
                 return self.receive(
@@ -1038,12 +1228,16 @@ impl<S: Storage> Node<S> {
                         term: *term,
                         previous: *index,
                         previous_term: *snapshot_term,
+                        previous_scn: *snapshot_scn,
                         entries: vec![],
                         commit: *index,
                     },
                 );
             }
             Rpc::Vote { last, last_term, .. } => {
+                if self.repairing {
+                    return Ok(answer);
+                }
                 if !self.state().membership().voters().contains(&self.id) {
                     return Ok(answer);
                 }
@@ -1061,7 +1255,7 @@ impl<S: Storage> Node<S> {
                     answer.success = true;
                 }
             }
-            Rpc::Append { previous, previous_term, entries, commit, .. } => {
+            Rpc::Append { previous, previous_term, previous_scn, entries, commit, .. } => {
                 let changed = self.leader != Some(*sender) || self.role != Role::Follower;
                 self.follow(self.state().term)?;
                 if changed {
@@ -1076,16 +1270,26 @@ impl<S: Storage> Node<S> {
                 self.leader = Some(*sender);
                 self.contact = self.contact.wrapping_add(1);
                 self.leader_contact = Some(std::time::Instant::now());
-                if self.state().term_at(*previous) != Some(*previous_term) {
+                if self.repairing {
+                    return Ok(answer);
+                }
+                if self.state().history_at(*previous) != Some((*previous_term, *previous_scn)) {
+                    // Uncommitted differences are ordinary Raft suffix replacement.
+                    // A conflict in committed/compacted history requires a full rebuild.
+                    if *previous <= self.state().commit {
+                        self.repairing = true;
+                    }
+
                     common::logn!(
                         "Raft append prefix mismatch",
-                        "member {},primary {},term {},previous {},expected_term {},local_term {:?},last {},commit {}",
+                        "member {},primary {},term {},previous {},expected_term {},expected_scn {},local_tip {:?},last {},commit {}",
                         self.id,
                         sender,
                         self.state().term,
                         previous,
                         previous_term,
-                        self.state().term_at(*previous),
+                        previous_scn,
+                        self.state().history_at(*previous),
                         self.state().last(),
                         self.state().commit
                     );
@@ -1101,9 +1305,14 @@ impl<S: Storage> Node<S> {
                         expected.checked_add(1).ok_or_else(|| Error::new("Raft index overflow"))?;
                 }
                 let mut records = vec![];
-                if let Some(start) =
-                    entries.iter().position(|e| self.state().term_at(e.index) != Some(e.term))
+                if let Some(start) = entries
+                    .iter()
+                    .position(|e| self.state().history_at(e.index) != Some((e.term, e.scn)))
                 {
+                    if entries[start].index <= self.state().commit {
+                        self.repairing = true;
+                        return Ok(answer);
+                    }
                     records.push(Record::Entries {
                         from: entries[start].index,
                         entries: entries[start..].to_vec(),
@@ -1119,6 +1328,9 @@ impl<S: Storage> Node<S> {
                 answer.matched = matched;
             }
             Rpc::Install { snapshot, .. } => {
+                if self.repairing {
+                    return Ok(answer);
+                }
                 self.follow(self.state().term)?;
                 self.leader = Some(*sender);
                 self.contact = self.contact.wrapping_add(1);
@@ -1242,6 +1454,81 @@ pub mod tests {
         node
     }
     #[test]
+    fn creator_scns_survive_replication_and_advance_the_next_primary() {
+        let mut nodes = cluster(3);
+        nodes[0].scn_clock = Scn::new(1000);
+        nodes[0].campaign().unwrap();
+        pair(&mut nodes, 0, 1);
+        pair(&mut nodes, 0, 1);
+        let original = nodes[0].state().log[0].scn;
+        let copied = nodes[1].state().log[0].scn;
+        nodes[1].campaign().unwrap();
+        pair(&mut nodes, 1, 2);
+        let next = nodes[1].state().log.last().unwrap().scn;
+        assert_eq!(original, Scn::new(1001));
+        assert_eq!(copied, original);
+        assert!(next.compare(original).is_gt());
+    }
+    #[test]
+    fn votes_merge_the_candidates_entry_scn_without_copying_its_log() {
+        let mut member = node(1, members(3));
+        let vote = Rpc::Vote { term: 1, last: 9, last_term: 1, last_scn: Scn::new(5000) };
+        let answer = member.receive(&0, &vote).unwrap();
+        let next = member.next_scn().unwrap().unwrap();
+        assert!(answer.success);
+        assert_eq!(member.state().last(), 0);
+        assert_eq!(next, Scn::new(5001));
+    }
+    #[test]
+    fn matching_term_and_index_with_a_different_scn_is_not_a_matching_prefix() {
+        let mut nodes = cluster(3);
+        nodes[0].campaign().unwrap();
+        pair(&mut nodes, 0, 1);
+        pair(&mut nodes, 0, 1);
+        pair(&mut nodes, 0, 1); // Deliver the commit marker before corrupting the prefix.
+        let mut request = nodes[0].request(&1).unwrap();
+        if let Rpc::Append { previous_scn, .. } = &mut request {
+            *previous_scn = Scn::new(previous_scn.number() + 1);
+        } else {
+            panic!("heartbeat");
+        }
+        let before = nodes[1].journal.records.len();
+        let rejected = nodes[1].receive(&0, &request).unwrap();
+        assert!(!rejected.success);
+        assert_eq!(nodes[1].journal.records.len(), before);
+        assert!(nodes[1].repairing);
+        let old_term = nodes[1].state().term;
+        nodes[1].campaign().unwrap();
+        assert_eq!(nodes[1].state().term, old_term);
+        let vote = nodes[1]
+            .receive(
+                &2,
+                &Rpc::Vote {
+                    term: old_term + 1,
+                    last: 99,
+                    last_term: old_term,
+                    last_scn: Scn::new(100),
+                },
+            )
+            .unwrap();
+        assert!(!vote.success);
+    }
+    #[test]
+    fn scn_stall_defers_new_term_entry_without_blocking_heartbeats() {
+        let mut primary = node(0, members(1));
+        primary.scn_stalled = true;
+        primary.campaign().unwrap();
+        let heartbeat = primary.request(&0);
+        let blocked = primary.propose(Command::Noop).is_err();
+        assert_eq!(primary.role, Role::Leader);
+        assert_eq!(primary.state().last(), 0);
+        assert!(matches!(heartbeat, Some(Rpc::Append { .. })));
+        assert!(blocked);
+        primary.scn_stalled = false;
+        primary.advance().unwrap();
+        assert_eq!(primary.state().commit, 1);
+    }
+    #[test]
     fn accepted_local_entries_are_not_quorum_votes_until_journaled() {
         struct Delayed {
             accepted: State,
@@ -1350,7 +1637,12 @@ pub mod tests {
         let reply = nodes[0]
             .receive(
                 &lost.previous,
-                &Rpc::Vote { term: term + 10, last: u64::MAX, last_term: u64::MAX },
+                &Rpc::Vote {
+                    last_scn: Scn::new(0),
+                    term: term + 10,
+                    last: u64::MAX,
+                    last_term: u64::MAX,
+                },
             )
             .unwrap();
         assert!(!reply.success);
@@ -1446,7 +1738,7 @@ pub mod tests {
         nodes[0].learn_contacts(MemberNames::from([(99, contact.clone())])).unwrap();
         assert_eq!(nodes[0].state().membership(), before);
         assert_eq!(nodes[0].state().contacts.get(&99), Some(&contact));
-        let vote = Rpc::Vote { term: 100, last: 0, last_term: 0 };
+        let vote = Rpc::Vote { last_scn: Scn::new(0), term: 100, last: 0, last_term: 0 };
         let answer = nodes[0].receive(&99, &vote).unwrap();
         assert!(!answer.success);
         assert_eq!(nodes[0].state().term, 0);
@@ -1653,6 +1945,7 @@ pub mod tests {
             .apply(&Record::Entries {
                 from: 1,
                 entries: vec![Entry {
+                    scn: common::scn::Scn::new(1),
                     index: 1,
                     term: 1,
                     command: Command::Members(retired.clone()),
@@ -1667,7 +1960,12 @@ pub mod tests {
             common::ring::MemberIdentity::try_from("ff".repeat(64)).unwrap();
         let record = Record::Entries {
             from: 2,
-            entries: vec![Entry { index: 2, term: 1, command: Command::Members(rebound) }],
+            entries: vec![Entry {
+                scn: common::scn::Scn::new(2),
+                index: 2,
+                term: 1,
+                command: Command::Members(rebound),
+            }],
         };
         let mut storage = Memory {
             pending: None,
@@ -1736,7 +2034,8 @@ pub mod tests {
         let restored = restart(&nodes[0]);
         let restart_can_read = restored.can_admit(ms(160));
         let old = nodes[0].state();
-        let vote = Rpc::Vote { term: term + 1, last: old.last(), last_term: term };
+        let vote =
+            Rpc::Vote { last_scn: Scn::new(0), term: term + 1, last: old.last(), last_term: term };
         let answer = nodes[0].receive(&2, &vote);
         let stepped_down = nodes[0].can_admit(ms(160));
         assert!(!no_commit);
@@ -1790,7 +2089,12 @@ pub mod tests {
         let follower = nodes[1].can_admit_with_policy(ms(250), true, true);
         let restored = restart(&nodes[0]);
         let restarted = restored.can_admit_with_policy(ms(250), true, true);
-        let vote = Rpc::Vote { term: term + 1, last: nodes[0].state().last(), last_term: term };
+        let vote = Rpc::Vote {
+            last_scn: Scn::new(0),
+            term: term + 1,
+            last: nodes[0].state().last(),
+            last_term: term,
+        };
         let demotion = nodes[0].receive(&2, &vote);
         let demoted_read = nodes[0].can_admit_with_policy(ms(250), true, true);
         assert!(!uncommitted);
@@ -1869,7 +2173,8 @@ pub mod tests {
         let index = accepted.unwrap();
         pair(&mut nodes, 0, 1);
         let committed = nodes[0].state().commit;
-        let vote = Rpc::Vote { term: term + 1, last: index, last_term: term };
+        let vote =
+            Rpc::Vote { last_scn: Scn::new(0), term: term + 1, last: index, last_term: term };
         let answer = nodes[0].receive(&2, &vote);
         let before = nodes[0].journal.records.len();
         let rejected = nodes[0].propose(Command::Noop);
@@ -1898,7 +2203,15 @@ pub mod tests {
             let higher = old_term + 1;
             let result = match trigger {
                 0 => node
-                    .receive(&1, &Rpc::Vote { term: higher, last: 1, last_term: old_term })
+                    .receive(
+                        &1,
+                        &Rpc::Vote {
+                            last_scn: Scn::new(0),
+                            term: higher,
+                            last: 1,
+                            last_term: old_term,
+                        },
+                    )
                     .map(|_| ()),
                 1 | 2 => node
                     .receive(
@@ -1907,6 +2220,7 @@ pub mod tests {
                             term: if trigger == 1 { higher } else { old_term },
                             previous: 1,
                             previous_term: old_term,
+                            previous_scn: common::scn::Scn::new(1),
                             entries: vec![],
                             commit: 1,
                         },
@@ -1931,11 +2245,13 @@ pub mod tests {
             let stopped = node.role;
             let delayed_proposal = node.propose(Command::Noop);
             let delayed_campaign = node.campaign();
-            let delayed_rpc =
-                node.receive(&1, &Rpc::Vote { term: higher, last: 1, last_term: old_term });
+            let delayed_rpc = node.receive(
+                &1,
+                &Rpc::Vote { last_scn: Scn::new(0), term: higher, last: 1, last_term: old_term },
+            );
             let delayed_response = node.response(
                 &1,
-                &Rpc::Vote { term: higher, last: 1, last_term: old_term },
+                &Rpc::Vote { last_scn: Scn::new(0), term: higher, last: 1, last_term: old_term },
                 &Answer { term: higher, success: true, matched: 1 },
             );
             let no_request = node.request(&1);
@@ -2002,11 +2318,11 @@ pub mod tests {
         pair(&mut nodes, 0, 1);
         let term = nodes[1].state().term;
         let mut restored = restart(&nodes[1]);
-        let vote = Rpc::Vote { term, last: 0, last_term: 0 };
+        let vote = Rpc::Vote { last_scn: Scn::new(0), term, last: 0, last_term: 0 };
         let answer = restored.receive(&2, &vote).unwrap();
         assert!(!answer.success);
         exchange(&mut nodes[0], &mut restored);
-        let vote = Rpc::Vote { term: term + 1, last: 0, last_term: 0 };
+        let vote = Rpc::Vote { last_scn: Scn::new(0), term: term + 1, last: 0, last_term: 0 };
         let answer = restored.receive(&2, &vote).unwrap();
         assert!(!answer.success);
     }
@@ -2082,6 +2398,7 @@ pub mod tests {
             term: nodes[0].state().term,
             previous: 1,
             previous_term: 1,
+            previous_scn: common::scn::Scn::new(1),
             entries: vec![],
             commit: last,
         };
@@ -2094,12 +2411,20 @@ pub mod tests {
     fn failed_disk_never_acknowledges_vote_or_entry() {
         let mut nodes = cluster(3);
         nodes[1].journal.fail_writes();
-        let result = nodes[1].receive(&0, &Rpc::Vote { term: 1, last: 0, last_term: 0 });
+        let result = nodes[1]
+            .receive(&0, &Rpc::Vote { last_scn: Scn::new(0), term: 1, last: 0, last_term: 0 });
         assert!(result.is_err());
         assert_eq!(nodes[1].state().term, 0);
         let result = nodes[1].receive(
             &0,
-            &Rpc::Append { term: 1, previous: 0, previous_term: 0, entries: vec![], commit: 0 },
+            &Rpc::Append {
+                term: 1,
+                previous: 0,
+                previous_term: 0,
+                previous_scn: common::scn::Scn::new(0),
+                entries: vec![],
+                commit: 0,
+            },
         );
         assert!(result.is_err());
     }
@@ -2109,7 +2434,8 @@ pub mod tests {
         nodes[0].campaign().unwrap();
         pair(&mut nodes, 0, 1);
         let term = nodes[0].state().term;
-        let vote = Rpc::Vote { term: term + 100, last: 999, last_term: term + 100 };
+        let vote =
+            Rpc::Vote { last_scn: Scn::new(0), term: term + 100, last: 999, last_term: term + 100 };
         let answer = nodes[0].receive(&2, &vote).unwrap();
         let role = nodes[0].role;
         let unchanged = nodes[0].state().term == term;
@@ -2396,9 +2722,9 @@ crate::wire_struct!(Membership, RaftMembership, {identities,old,new,retired});
 
 crate::wire_struct!(Retirement, RaftRetirement, {previous,old,next,member});
 
-crate::wire_struct!(Entry, RaftEntry, {index,term,command});
+crate::wire_struct!(Entry, RaftEntry, {index,term,scn,command});
 
-crate::wire_struct!(Snapshot, RaftSnapshot, {ring,index,term,membership,application,checkpoint_start});
+crate::wire_struct!(Snapshot, RaftSnapshot, {ring,index,term,scn,membership,application,checkpoint_start});
 
 crate::wire_struct!(Answer, RaftAnswer, {term,success,matched});
 
@@ -2490,29 +2816,33 @@ impl crate::codec::Wire for Record {
 impl crate::codec::Wire for Rpc {
     fn write(&self, w: &mut common::wire::StructWriter) {
         match self {
-            Self::Vote { term, last, last_term } => w.nested(common::wire::Op::RaftRpcVote, |w| {
-                term.write(w);
-                last.write(w);
-                last_term.write(w);
-            }),
-            Self::Append { term, previous, previous_term, entries, commit } => {
-                w.nested(common::wire::Op::RaftRpcAppend, |w| {
+            Self::Vote { term, last, last_term, last_scn } => {
+                w.nested(common::wire::Op::RaftRpcVote, |w| {
+                    term.write(w);
+                    last.write(w);
+                    last_term.write(w);
+                    last_scn.write(w);
+                })
+            }
+            Self::Append { term, previous, previous_term, previous_scn, entries, commit } => w
+                .nested(common::wire::Op::RaftRpcAppend, |w| {
                     term.write(w);
                     previous.write(w);
                     previous_term.write(w);
+                    previous_scn.write(w);
                     entries.write(w);
                     commit.write(w);
-                })
-            }
+                }),
             Self::Install { term, snapshot } => w.nested(common::wire::Op::RaftRpcInstall, |w| {
                 term.write(w);
                 snapshot.write(w);
             }),
-            Self::Checkpoint { term, index, snapshot_term } => {
+            Self::Checkpoint { term, index, snapshot_term, snapshot_scn } => {
                 w.nested(common::wire::Op::RaftRpcCheckpoint, |w| {
                     term.write(w);
                     index.write(w);
                     snapshot_term.write(w);
+                    snapshot_scn.write(w);
                 })
             }
         }
@@ -2524,11 +2854,13 @@ impl crate::codec::Wire for Rpc {
                 term: Wire::read(r)?,
                 last: Wire::read(r)?,
                 last_term: Wire::read(r)?,
+                last_scn: Wire::read(r)?,
             }),
             common::wire::Op::RaftRpcAppend => Ok(Self::Append {
                 term: Wire::read(r)?,
                 previous: Wire::read(r)?,
                 previous_term: Wire::read(r)?,
+                previous_scn: Wire::read(r)?,
                 entries: Wire::read(r)?,
                 commit: Wire::read(r)?,
             }),
@@ -2539,6 +2871,7 @@ impl crate::codec::Wire for Rpc {
                 term: Wire::read(r)?,
                 index: Wire::read(r)?,
                 snapshot_term: Wire::read(r)?,
+                snapshot_scn: Wire::read(r)?,
             }),
             _ => Err(common::Error::new("unexpected Rpc tag")),
         })
@@ -2557,6 +2890,8 @@ impl crate::codec::Wire for State {
             self.snapshot.write(w);
             self.log.write(w);
             self.commit.write(w);
+            self.max_scn.write(w);
+            self.generation.write(w);
         });
     }
     fn read(r: &mut common::wire::StructReader<'_>) -> common::Result<Self> {
@@ -2573,6 +2908,8 @@ impl crate::codec::Wire for State {
                 snapshot: Wire::read(r)?,
                 log: Wire::read(r)?,
                 commit: Wire::read(r)?,
+                max_scn: Wire::read(r)?,
+                generation: Wire::read(r)?,
             })
         })
     }

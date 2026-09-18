@@ -2915,7 +2915,9 @@ to be valid for only ~10 minutes. Only open consistent reads and retained versio
 to be comparable, so capping validity caps the range, and the window bounds *version
 age* rather than cluster age — exactly as with extents.
 
-**SCNs are never persisted in cold data.** They live only in the short-lived replicated
+**Transactional row SCNs are not retained in cold extent data.** This planned row
+versioning policy is separate from Raft entry SCNs, which persist in journals and
+checkpoints (§4.6.3). Row SCNs live in the short-lived replicated
 extents — the open base and its log — and are **dropped when those are coalesced into a
 sealed, erasure-coded extent** (§10). So an SCN's lifetime is bounded by how long an
 extent stays hot, which is short by construction rather than by policy. This is the
@@ -2968,9 +2970,48 @@ Every expensive or intricate mechanism lives in the small hot tier; the tier hol
 essentially all the bytes stays simple, cheap, and immutable. Coalescing is the
 transition, and it is where each of these is given up at once.
 
-⚠️ SCN width and scope are undesigned. A Raft log index is a natural per-ring SCN and
-needs no separate counter, but §2 rules out cross-object transactions while an object
-spans many rings, so what an SCN is scoped to is not yet settled.
+SCNs now use eight bytes and one counter shared by all threads in a process
+(Asserted, Bob, 2026-09-18). They approximate UTC nanoseconds rather than using a
+Raft index: indexes remain sequential per ring, while SCNs may advance through
+clock synchronization or a merge from another process. Transaction visibility,
+propagation rules, and the consistent-read validity window remain future work.
+
+`common::scn::Scn` is a distinct `u64` type, serialized as eight little-endian
+bytes. Daemon startup initializes the process-global counter from UTC nanoseconds
+since the Unix epoch and starts one `scn-clock` thread. `scn::next()` atomically
+increments the counter and returns the new value. It checks the stalled flag but
+never reads the clock or tests whether it should set that flag. When stalled,
+callers sleep on a condition variable until synchronization clears the flag.
+
+`scn::merge(incoming)` advances the counter to `max(local, incoming)`. A forward
+jump exceeding the configured allowance reads UTC and fails without changing
+state if the incoming value exceeds UTC by more than that allowance. Smaller
+jumps, equal values, and older values do not read the clock. Merge never clears
+a stall and does not wait for one. A sequence of small merges can temporarily
+overshoot the allowance; detecting that is the periodic synchronizer's job.
+
+The cluster configuration's `[scn] sync_interval_ms` defaults to **10**, and
+`max_ahead_ms` defaults to **60000**. At each scheduled synchronization, the counter
+merges UTC and the synchronizer sets or clears the stalled flag according to
+whether the resulting counter is more than the allowance ahead. Exactly the
+allowance is permitted. The interval is a scheduling target, not a real-time
+execution guarantee. Allocation already in progress can finish when a stall is
+set. A backward clock adjustment never regresses the counter; a sufficiently
+large adjustment stalls allocation until UTC catches up. An unavailable UTC clock also stalls allocation until a successful tick recovers.
+Only stall transitions and synchronization failures/recovery are logged; normal
+100 Hz synchronization is silent. Process status exposes `scn` and `scn_stalled`.
+
+These counters give process-local monotonicity and, when explicitly merged,
+causal ordering for subsequent allocations. They do not by themselves guarantee
+unique values across different processes or across restart. Raft entries now preserve the creator's SCN through replication and restart;
+transaction/consistent-read integration remains future work. SCNs wrap: incrementing `u64::MAX` gives zero,
+and UTC conversion keeps the low 64 bits of epoch nanoseconds. `Scn::compare(other)`
+uses the sign of an eight-byte signed wrapping subtraction. All values being
+compared must represent a range no larger than `u64::MAX / 2` ticks; beyond that,
+ordering is invalid. No unrestricted `Ord` or `PartialOrd` is provided. Merge,
+clock synchronization, and overshoot checks all use this wrapping ordering;
+ordinary unsigned max would incorrectly keep a pre-wrap value. Configuration
+intervals must fit within the comparison window.
 
 ##### Two questions this settles
 
@@ -7684,8 +7725,9 @@ caution: nothing about the in-memory version is evidence about what the durable 
 
 #### 8.1.5.3 When transactions arrive, the EN's part of them lives in the journal
 
-**Not being attempted yet: system change numbers and transactions.** But the place they will go is
-already decided, and it is worth writing down because it constrains the journal being designed now:
+**Transactions and SCN integration with the EN journal are not implemented yet.**
+The common SCN generator exists (§4.6.3), and the place transaction state will go is
+already decided because it constrains the journal being designed now:
 **the EN's portion will be purely in the disk journal, never in the final extents** (Asserted, Bob,
 2026-08-17).
 
@@ -13540,9 +13582,11 @@ Roughly in order of how much else depends on them.
 56. **Primary EN selection and handover** (§8.1.1). The 3-of-4 intersection makes handover
     safe, but who chooses the primary, and how a new one is appointed when it fails, is
     undesigned.
-57. **SCN width, scope, and validity window** (§4.6.3). The width and the 10-minute cap
-    must be chosen together; a Raft log index is a natural per-ring counter, but what an
-    SCN is scoped to is unsettled while objects span many rings.
+57. **SCN propagation, restart, and validity window** (§4.6.3). Eight-byte,
+    process-wide UTC-nanosecond-based counters and bounded merge are implemented.
+    Raft propagates creator SCNs and merges restored history maxima at restart.
+    Transaction propagation, long-term era semantics, and the consistent-read
+    horizon remain open.
 58. **Expected object count** (§14.5). DN cost scales with object count rather than
     bytes, so the DN tier's share of the cost budget cannot be computed until this is
     pinned — it is the one part of §1.2 still unquantified.
@@ -18637,13 +18681,13 @@ to KS/SN/DN validate the full ring identifier once before ordinary requests; Raf
 packets do not repeat it. Ordinary data requests use compact routing labels. Long-identity
 checks belong at admission/recovery boundaries, not every extent operation.
 
-Every journal begins with `DLAWKR05`, the 128 ASCII hexadecimal ring identity
+Every journal begins with `DLAWKR06`, the 128 ASCII hexadecimal ring identity
 characters, and the starting batch sequence as a little-endian u64 followed by
-its bitwise complement, followed by the predecessor Raft index and term (two
+its bitwise complement, followed by the predecessor Raft index, term, and SCN (three
 little-endian u64s). Physical batch sequences are member-local. Local replay checks
 both sequence continuity and the logical predecessor. A snapshot may omit a
 carried suffix; only its initial Carry record may reconstruct that suffix, and
-its ending index/term must match the header before replay proceeds. Peer journal
+its ending index/term/SCN must match the header before replay proceeds. Peer journal
 copies use logical positions, never another member's physical batch sequence.
 These checks also apply during archived-history lookup. Every local
 snapshot and transferable checkpoint carries its source identity. Checkpoint
@@ -18651,6 +18695,26 @@ installation checks it before altering terms, membership, or application state;
 recovery compares it against independently supplied bootstrap configuration.
 Checksums and encrypted-key authentication remain separate checks. Key encryption
 also binds to this identity, so keys cannot be silently relabeled across rings.
+Each new Raft entry receives an eight-byte process SCN; copies retain it unchanged.
+Network append entries and candidate log-tip SCNs merge into the receiving process
+counter. Election freshness still uses term/index; prefix and checkpoint history
+proofs compare index, term, and SCN. A stalled SCN allocator does not block the
+consensus owner: proposals return a retry error and the initial leader no-op waits
+for a later maintenance tick while heartbeats continue.
+
+Snapshots and closed journals end with a fixed 64-byte SCN footer containing a
+format marker, presence flag, maximum SCN and complement, and SHA-256 of those
+footer fields. The maximum uses wrapping SCN comparison, including replaced
+suffixes remembered by the store. Recovery validates it against decoded history
+and merges the restored maximum once, rather than merging every replayed entry.
+Bulk checkpoint/journal imports likewise merge their maximum once. `current.log`
+has no footer while accepting writes: rotation appends and syncs the footer before
+renaming the file. A restart before that rename strips a complete or partial
+footer and resumes the current journal. The open journal's maximum is accumulated
+during replay. SCN collisions remain possible; matching SCNs do not prove that
+payloads are identical, and a detected committed-history conflict triggers the retirement and rebuild
+protocol below (#127).
+
 The directory's `identity` file is a checksummed local record containing the ring
 identifier, routing label, current 64-byte random member identifier, and a list of
 retired member identifiers, the last known slot/member list, and any pending
@@ -18752,12 +18816,44 @@ waiting for a later commit marker. Permanent local identity history still preven
 reviving the retired identity.
 
 Forgetting history can later expose a conflicting old prefix with matching
-(term,index), even when all elections respected their deadlines. Detection and
-repair are explicitly deferred in [#127](https://github.com/bobjen/delawson/issues/127).
-The intended resolution is that the current primary wins, with either full history
-replacement or eventual rollback to the common point and replay of its suffix.
-SCNs/history fingerprints and undo/redo remain future work. This recovery extension
-does not claim ordinary Raft's committed-history preservation after state loss.
+(term,index), even when all elections respected their deadlines. Prefix, journal
+boundary, and checkpoint proofs now also compare the creator's SCN. When a
+follower detects a conflict in committed or compacted history, it durably marks
+itself as needing repair, refuses votes and campaigns, and stops acknowledging
+new entries. Ordinary uncommitted suffix conflicts still use normal Raft repair.
+
+The checkpoint worker requests a replacement checkpoint from secondaries first,
+then from the primary if necessary, allowing an older checkpoint than the local
+one. It verifies the checkpoint's (index,term,SCN) against the current primary,
+then rechecks the leader and election term before installation. A missing proof
+or unavailable source leaves the member fenced and retrying. Proven conflicts
+at copied-journal boundaries use the same recovery path.
+
+Replacing history is state loss, just like a corrupt journal: generate a new
+random identity, durably retire the old identity in its slot, and respond
+"I lost state" under the existing replacement protocol. A durable recovery plan
+archives the rejected journals/checkpoints without deleting them, writes a new
+initial snapshot/current journal, and resumes safely after an interrupted copy.
+The replacement copies committed journals from secondaries first (primary
+fallback) and obtains subsequent entries from the primary. Admission of the new
+identity ends the old retirement replies and campaign penalty as usual.
+
+A local persisted application generation changes with a history rebuild. Both
+client state and public metadata reset and replay the new generation, even when
+the commit index decreases or is unchanged. Requests and checkpoint production
+wait for application of that generation; the consensus owner never waits on the
+global execution lock. File replacement runs through the ordered I/O worker.
+
+SCNs are not collision-proof fingerprints, so matching triples cannot guarantee
+identical payloads. The residual accidental-collision risk is accepted for the
+non-Byzantine fault model (Bob, 2026-09-18), including clock-skew coincidences and
+histories outside the roughly 292-year comparison window. SCN checks plus rebuild
+on detected mismatch resolve [#127](https://github.com/bobjen/delawson/issues/127);
+stronger fingerprints are not required for this implementation. Undo/redo could
+eventually make recovery cheaper by rolling back to a common point without
+discarding the member's voting identity; this future optimization is tracked in
+[#133](https://github.com/bobjen/delawson/issues/133) and is not required for resolution.
+The state-loss extension does not preserve all previously committed data.
 
 **DANGER: `ignore_ring_identity = true` in `process.toml` IS A GOOD WAY TO LOSE
 ALL YOUR DATA.** This explicitly requested debugging escape hatch bypasses ring
@@ -19094,7 +19190,8 @@ election term, and starting commit position. This prevents old committed seconda
 history (for example index 10/term 4) from overwriting the new primary's history
 (index 10/term 6). Bulk data remains secondary-first, primary-last. The query is
 only on catch-up, not normal reads, appends, or heartbeats. Histories reusing both
-term and index still require the detection/repair work in #127.
+term and index are additionally checked by SCN; detected committed conflicts
+now retire the member and rebuild its history as described in #127.
 
 
 ### Offline log inspection
@@ -19125,15 +19222,15 @@ unwritten lines, so orderly shutdown should flush logs.
 
 
 Copied checkpoints, like copied journal ranges, require the current primary to
-confirm their ending (index, term) before installation. The primary searches
+confirm their ending (index, term, SCN) before installation. The primary searches
 retained local snapshots/journals when the index is compacted out of RAM;
 replay validates file boundaries and must join its current history. An unrelated
 checkpoint install invalidates proofs of the abandoned prefix. Missing history
-or a different term makes a peer checkpoint unusable. The receiver rechecks the
+or a different term or SCN makes a peer checkpoint unusable. The receiver rechecks the
 primary and election term before installation; a primary copying a checkpoint
 uses its own history as authority. Bulk transfer remains secondary-first.
 
-Known recovery boundary (#127): reused (term, index) values remain undetectable
-without stronger history identity. These checks reject unsuitable copies; they
-do not implement rollback of members whose committed state is already from an
-abandoned history.
+History checks now include SCNs. A detected conflict in committed state retires
+the member's old identity and rebuilds from verified peer history, as described
+above. The residual SCN collision risk is accepted; #127 is resolved. Efficient
+rollback through undo/redo remains a possible future optimization.
