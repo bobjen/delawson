@@ -52,7 +52,8 @@ struct Ks {
     config: KsConfig,
     unlock_verifier: Option<[u8; 32]>,
     unlock_key: Mutex<Option<[u8; 32]>>,
-    peers: Mutex<BTreeMap<String, Peer>>,
+    peers: RwLock<runtime::Registrations>,
+    peer_cursor: Mutex<raft::execution::Cursor>,
 }
 impl std::ops::Deref for Ks {
     type Target = raft::runtime::Runtime<KeyHistory>;
@@ -87,7 +88,7 @@ impl Service for Ks {
     }
 
     fn defers(&self, op: Op) -> bool {
-        SERVES.contains(&op) && op != Op::Register
+        SERVES.contains(&op)
     }
     fn handle(
         self: &std::sync::Arc<Self>,
@@ -130,7 +131,7 @@ impl Service for Ks {
     fn answer(&self, process: &Process, request: &Req) -> Resp {
         match request.op {
             Op::Raft => self.raft_rpc(process, request),
-            Op::Register => self.enroll(process, request),
+            Op::Register => self.register_request(process, request, true),
             Op::Lookup => self.lookup(request),
             Op::Unlock => match self.unlock(request) {
                 Ok(()) => Resp::ok(),
@@ -159,7 +160,7 @@ impl Service for Ks {
             format!("require_unlock {}", self.config.require_unlock),
             format!("inline_ping {}", self.config.inline_ping),
             format!("unlocked {}", self.ready.load(Ordering::SeqCst)),
-            format!("registered {}", self.peers.lock().expect("peers").len()),
+            format!("registered {}", self.peers.read().expect("peers").peers.len()),
             format!("master_keys {key_count}"),
             format!("applied_commit {applied}"),
             self.raft_status(),
@@ -191,7 +192,9 @@ impl Ks {
             Op::RaftMembers => self.change_members(request),
             Op::Lookup => self.lookup(request),
             Op::AssignPeers => self.assign_peers(process, request),
-            Op::Registry => registry::response(self.peers.lock().expect("peers").values().cloned()),
+            Op::Registry => {
+                registry::response(self.peers.read().expect("peers").peers.values().cloned())
+            }
             Op::SnMasterKey => match admission.history.as_deref() {
                 Some(history) => self.sn_key(request, history),
                 None => Resp::error(Status::Internal, "missing admitted key history"),
@@ -293,9 +296,20 @@ impl Ks {
             config,
             unlock_verifier,
             unlock_key: Mutex::new(None),
-            peers: Mutex::new(BTreeMap::new()),
+            peers: RwLock::new(runtime::Registrations::default()),
+            peer_cursor: Mutex::new(raft::execution::Cursor::default()),
             common: raft::runtime::Runtime::new(runtime, node, options),
         };
+        // Routing must be recovered before transport starts, even while locked.
+        let commit = ks.on_raft(|host, node| {
+            host.refresh_application(node)?;
+            Ok(node.state().commit)
+        })?;
+        while ks.peers.read().map_err(|_| common::Error::new("registrations poisoned"))?.applied
+            < commit
+        {
+            ks.execute_pending()?;
+        }
         if test_mode {
             ks.open_keys(crypto::MASTER_KEY)?;
         }
@@ -454,6 +468,16 @@ impl Ks {
     /// A registration announces a port; it does not invent an identity. The
     /// roster says who may exist, so a mismatch is a misconfiguration to report
     /// rather than a peer to record.
+    fn register_request(&self, process: &Process, request: &Req, allow_forward: bool) -> Resp {
+        // Direct registration was machine-authenticated by server::read_loop;
+        // forwarded registration comes only from an authenticated ring member.
+        if allow_forward {
+            if let Some(answer) = self.forward(request) {
+                return answer;
+            }
+        }
+        self.enroll(process, request)
+    }
     fn enroll(&self, process: &Process, request: &Req) -> Resp {
         let peer = match Peer::from_args(&request.args) {
             Ok(peer) => peer,
@@ -477,9 +501,10 @@ impl Ks {
         ) {
             return Resp::error(Status::BadRequest, e.to_string());
         }
-        logn!("registered a peer", "identity {},at {}", peer.identity, peer.address);
-        self.peers.lock().expect("peers").insert(peer.identity.clone(), peer);
-        Resp::ok()
+        match self.propose_registration(peer) {
+            Ok(()) => Resp::ok(),
+            Err(e) => Resp::error(Status::Internal, e.to_string()),
+        }
     }
 
     fn assign_peers(&self, process: &Process, request: &Req) -> Resp {
@@ -492,7 +517,8 @@ impl Ks {
             Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let Some(source_peer) = self.peers.lock().expect("peers").get(&source).cloned() else {
+        let Some(source_peer) = self.peers.read().expect("peers").peers.get(&source).cloned()
+        else {
             return Resp::error(Status::NotFound, format!("{source} has not registered"));
         };
         let count = match payload.number_u64() {
@@ -521,7 +547,7 @@ impl Ks {
                     );
                 }
             };
-            if self.peers.lock().expect("peers").get(&identity).is_none() {
+            if self.peers.read().expect("peers").peers.get(&identity).is_none() {
                 return Resp::error(Status::NotFound, format!("{identity} has not registered"));
             }
             if address.parse::<std::net::SocketAddr>().is_err() {
@@ -557,7 +583,7 @@ impl Ks {
             Ok(identity) => identity,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        match self.peers.lock().expect("peers").get(&identity) {
+        match self.peers.read().expect("peers").peers.get(&identity) {
             Some(peer) => Resp::text(peer.address.to_string()),
             None => Resp::error(Status::NotFound, format!("{identity} has not registered")),
         }
@@ -629,6 +655,41 @@ mod persistence_tests {
         assert_eq!(history.epochs.len(), 2);
         assert_eq!(history.epochs[0].key, initial.key);
         assert_eq!(history.epochs[1].key, epoch.key);
+    }
+    #[test]
+    #[ignore = "filesystem integration; run explicitly with --ignored"]
+    fn locked_registration_is_idempotent_survives_restart_and_rejects_disk_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Ks::new(config(), dir.path()).unwrap();
+        let mut peer = Peer {
+            identity: "EN0".into(),
+            kind: common::config::ServiceKind::En,
+            address: "127.0.0.1:9001".parse().unwrap(),
+            domain: vec!["dc0".into()],
+            media_class: None,
+            ring_identity: None,
+        };
+        ks.propose_registration(peer.clone()).unwrap();
+        let before = ks.on_raft(|_, node| Ok(node.state().last())).unwrap();
+        ks.propose_registration(peer.clone()).unwrap();
+        let after = ks.on_raft(|_, node| Ok(node.state().last())).unwrap();
+        assert_eq!(before, after);
+        drop(ks);
+        let ks = Ks::new(config(), dir.path()).unwrap();
+        let restored = ks.peers.read().unwrap().peers["EN0"].clone();
+        let unlocked = ks.ready.load(Ordering::SeqCst);
+        assert_eq!(restored, peer);
+        assert!(!unlocked);
+        ks.on_raft(|_, node| {
+            node.journal.fail_writes();
+            Ok(())
+        })
+        .unwrap();
+        peer.address.set_port(9002);
+        let failed = ks.propose_registration(peer).is_err();
+        let retained = ks.peers.read().unwrap().peers["EN0"].address.port();
+        assert!(failed);
+        assert_eq!(retained, 9001);
     }
     #[test]
     #[ignore = "filesystem integration; run explicitly with --ignored"]

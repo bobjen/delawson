@@ -495,12 +495,44 @@ pub fn serve(process: Arc<Process>, service: Arc<impl Service>) -> Result<()> {
 
     // KS cannot register with itself, and needs no one's permission to serve.
     if process.cluster.fixed_address(process.identity()).is_none() {
-        process.register()?;
-        logn!("registered with KS", "at {}", process.cluster.ks.address);
+        if process.entry.kind == ServiceKind::Ks {
+            // A registration now needs a committed Raft entry. Accept consensus
+            // connections while registering, otherwise startup waits on itself.
+            let registering = Arc::clone(&process);
+            std::thread::Builder::new()
+                .name("ks-registration".into())
+                .spawn(move || {
+                    let mut previous = None;
+                    while !registering.stopping.load(Ordering::SeqCst) {
+                        match registering.register() {
+                            Ok(()) => {
+                                logn!(
+                                    "registered with KS",
+                                    "at {}",
+                                    registering.cluster.ks.address
+                                );
+                                return;
+                            }
+                            Err(error) => {
+                                let error = error.to_string();
+                                if previous.as_ref() != Some(&error) {
+                                    logn!("KS registration pending", "error {}", error);
+                                    previous = Some(error);
+                                }
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                })
+                .context("starting KS registration")?;
+        } else {
+            process.register()?;
+            logn!("registered with KS", "at {}", process.cluster.ks.address);
+        }
     }
 
     // Ready last: a process is ready when it can be found, not merely when it is
-    // listening.
+    // listening. KS is the bootstrap exception: it must serve Raft before registration commits.
     std::fs::write(
         process.ready_file(),
         format!("pid={}\naddress={address}\n", std::process::id()),

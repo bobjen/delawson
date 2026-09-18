@@ -112,6 +112,8 @@ pub struct Runtime<S> {
     pub global_lock: RwLock<S>,
     pub execution: Mutex<crate::execution::Cursor>,
     pub work_queue: Mutex<WorkQueue>,
+    metadata_queue: Mutex<WorkQueue>,
+    metadata_active: Mutex<Option<PendingWork>>,
     pub active_work: Mutex<Option<PendingWork>>,
     pub execution_started: AtomicBool,
     pub execution_error: Mutex<Option<String>>,
@@ -161,6 +163,8 @@ impl<S: Default> Runtime<S> {
             global_lock: RwLock::new(S::default()),
             execution: Mutex::new(crate::execution::Cursor::default()),
             work_queue: Mutex::new(WorkQueue::default()),
+            metadata_queue: Mutex::new(WorkQueue::default()),
+            metadata_active: Mutex::new(None),
             active_work: Mutex::new(None),
             execution_started: AtomicBool::new(false),
             execution_error: Mutex::new(None),
@@ -417,6 +421,14 @@ pub trait Host:
 {
     type Application: crate::execution::Application;
     fn apply_client(&self, state: &crate::execution::Work) -> Result<()>;
+    /// Small public routing state needed even by locked or non-applying members.
+    /// Runs on the application worker, never on the consensus owner.
+    fn has_metadata(&self) -> bool {
+        false
+    }
+    fn apply_metadata(&self, _state: &crate::execution::Work) -> Result<bool> {
+        Ok(true)
+    }
     fn prepare_primary(&self, node: &mut Node) -> Result<()>;
     fn checkpoint_actions(
         &self,
@@ -988,6 +1000,14 @@ pub trait Host:
             .lock()
             .map_err(|_| Error::new("checkpoint lease lock poisoned"))?
             .observe(node.journal.durable_state().checkpoint_start(), Instant::now());
+        if self.has_metadata() {
+            let mut queue =
+                self.metadata_queue.lock().map_err(|_| Error::new("metadata queue poisoned"))?;
+            queue.enqueue(node.journal.durable_state(), true);
+            if queue.pending.is_some() {
+                self.wake_execution();
+            }
+        }
         let enabled = self.ready.load(Ordering::SeqCst)
             && (node.role == Role::Leader || self.applying.load(Ordering::SeqCst));
         let mut queue =
@@ -1004,6 +1024,43 @@ pub trait Host:
     /// Runs without the journal/consensus mutex. Only the execution worker owns
     /// active work; the consensus thread merely appends immutable committed work.
     fn execute_pending(&self) -> Result<()> {
+        let result = self.execute_pending_work();
+        let mut previous_error =
+            self.execution_error.lock().map_err(|_| Error::new("execution error lock poisoned"))?;
+        let current_error = result.as_ref().err().map(ToString::to_string);
+        if *previous_error != current_error {
+            if let Some(error) = &current_error {
+                logn!("Raft client application failed", "error {}", error);
+            } else {
+                logn!("Raft client application recovered", "");
+            }
+        }
+        *previous_error = current_error;
+        drop(previous_error);
+        result
+    }
+    fn execute_pending_work(&self) -> Result<()> {
+        // Keep routing usable without loading the service's bulk application state.
+        // Retain failed work for retry, just as for normal application work.
+        if self.has_metadata() {
+            let mut active = self
+                .metadata_active
+                .lock()
+                .map_err(|_| Error::new("metadata execution poisoned"))?;
+            if active.is_none() {
+                *active = self
+                    .metadata_queue
+                    .lock()
+                    .map_err(|_| Error::new("metadata queue poisoned"))?
+                    .pending
+                    .take();
+            }
+            if let Some(PendingWork::Apply(work)) = active.as_ref() {
+                if self.apply_metadata(work)? {
+                    *active = None;
+                }
+            }
+        }
         let mut active =
             self.active_work.lock().map_err(|_| Error::new("active execution poisoned"))?;
         if active.is_none() {
@@ -1040,18 +1097,6 @@ pub trait Host:
                 }
             }
         })();
-        let mut previous_error =
-            self.execution_error.lock().map_err(|_| Error::new("execution error lock poisoned"))?;
-        let current_error = result.as_ref().err().map(ToString::to_string);
-        if *previous_error != current_error {
-            if let Some(error) = &current_error {
-                logn!("Raft client application failed", "error {}", error);
-            } else {
-                logn!("Raft client application recovered", "");
-            }
-        }
-        *previous_error = current_error;
-        drop(previous_error);
         if result? {
             *active = None;
         }
@@ -1090,7 +1135,14 @@ pub trait Host:
                             .lock()
                             .map(|queue| queue.pending.is_some())
                             .unwrap_or(false);
-                        if !active && !queued {
+                        let metadata =
+                            host.metadata_active.lock().map(|work| work.is_some()).unwrap_or(false)
+                                || host
+                                    .metadata_queue
+                                    .lock()
+                                    .map(|q| q.pending.is_some())
+                                    .unwrap_or(false);
+                        if !active && !queued && !metadata {
                             break;
                         }
                         if host.snapshot_stopping.load(Ordering::SeqCst) {
@@ -1201,6 +1253,9 @@ pub trait Host:
             ))).unwrap_or_else(|_| "raft_failed true".into())
     }
     fn member_address(&self, peer: &str) -> Result<std::net::SocketAddr> {
+        if let Some(address) = self.registered_endpoint(peer) {
+            return Ok(address);
+        }
         if let Some((registrar, address)) = &self.runtime.registrar {
             if peer == registrar {
                 return Ok(*address);
@@ -1227,9 +1282,6 @@ pub trait Host:
                     }
                 }
             }
-        }
-        if let Some(address) = self.registered_endpoint(peer) {
-            return Ok(address);
         }
         self.runtime.seeds.get(peer).copied().ok_or_else(|| Error::new("member has not registered"))
     }

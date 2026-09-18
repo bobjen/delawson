@@ -6,7 +6,59 @@ pub use raft::runtime::Settings;
 use raft::{Command, Entry, Node, Role, State};
 use std::time::Duration;
 pub fn needs_request_worker(request: &Req) -> bool {
-    raft::runtime::needs_request_worker(request)
+    request.op == Op::Register || raft::runtime::needs_request_worker(request)
+}
+/// Public routing projection, retained even when this member is locked/cold.
+#[derive(Default)]
+pub struct Registrations {
+    pub peers: BTreeMap<String, Peer>,
+    pub(super) applied: u64,
+}
+impl raft::execution::Application for Registrations {
+    fn applied(&self) -> u64 {
+        self.applied
+    }
+    fn set_applied(&mut self, index: u64) {
+        self.applied = index;
+    }
+}
+fn registration_action(peer: &Peer) -> raft::Action {
+    let common::wire::Arg::Struct(_, bytes, depth) = peer.request().args.remove(0) else {
+        unreachable!()
+    };
+    let mut fields = vec![depth];
+    fields.extend(bytes);
+    raft::Action::new(Op::Register, fields)
+}
+fn registration_peer(action: &raft::Action) -> Result<Peer> {
+    let (&depth, bytes) =
+        action.fields.split_first().ok_or_else(|| Error::new("empty registration action"))?;
+    if depth == 0
+        || depth > common::wire::MAX_RECURSION_DEPTH
+        || bytes.len() >= common::wire::MAX_FRAME_BYTES
+    {
+        return Err(Error::new("invalid registration action limits"));
+    }
+    Peer::from_args(&[common::wire::Arg::Struct(Op::Register, bytes.to_vec(), depth)])
+}
+fn apply_registration(
+    state: &mut Registrations,
+    _context: raft::execution::Context<'_>,
+    action: &raft::Action,
+) -> Result<()> {
+    match action.op {
+        Op::Register => {
+            let peer = registration_peer(action)?;
+            state.peers.insert(peer.identity.clone(), peer);
+            Ok(())
+        }
+        Op::KsKey => Ok(()), // Opaque ciphertext is not needed for routing.
+        _ => Err(Error::new("unknown KS action tag")),
+    }
+}
+fn has_keys(state: &State) -> bool {
+    state.snapshot.application.iter().chain(state.log.iter().filter(|e| e.index <= state.commit))
+        .any(|e| matches!(&e.command, Command::Client(actions) if actions.iter().any(|a| a.op == Op::KsKey)))
 }
 struct KeyFields {
     key: [u8; 32],
@@ -42,8 +94,9 @@ fn apply_action(
     context: raft::execution::Context<'_>,
     action: &raft::Action,
 ) -> Result<()> {
-    // The only client action dispatch: Raft never interprets KS action contents.
+    // KS dispatches encrypted key actions; routing has its own always-loaded projection.
     match action.op {
+        Op::Register => registration_peer(action).map(|_| ()),
         Op::KsKey => {
             let envelope: KeyEnvelope = raft::codec::decode(&action.fields)?;
             let plain = aegis::aegis256::Aegis256::<32>::new(key, &envelope.nonce)
@@ -84,10 +137,91 @@ fn apply_history(state: &State, key: &[u8; 32], history: &mut KeyHistory) -> Res
 }
 
 impl Ks {
+    pub fn propose_registration(&self, peer: Peer) -> Result<()> {
+        let _proposal = self.proposing.lock().map_err(|_| Error::new("proposal lock poisoned"))?;
+        let deadline = std::time::Instant::now()
+            + Duration::from_millis(self.config.raft.election_max_ms.saturating_mul(2));
+        // Routing is available while locked, so admission uses metadata progress,
+        // not decrypted master-key application progress.
+        loop {
+            let commit = self.on_raft(|host, node| {
+                if node.role != Role::Leader || node.journal.failed {
+                    return Err(Error::new("Raft is not a healthy leader"));
+                }
+                host.refresh_application(node)?;
+                Ok(node
+                    .can_admit_with_policy(lease::now()?, false, false)
+                    .then_some(node.state().commit))
+            })?;
+            if commit.is_some_and(|index| self.peers.read().is_ok_and(|p| p.applied >= index)) {
+                break;
+            }
+            if !self.execution_started.load(Ordering::SeqCst) {
+                self.execute_pending()?;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::new("registration quorum timeout"));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (identical, applied) = {
+            let routes = self.peers.read().map_err(|_| Error::new("registrations poisoned"))?;
+            (routes.peers.get(&peer.identity) == Some(&peer), routes.applied)
+        };
+        if identical
+            && self.on_raft(move |_, node| {
+                Ok(node.state().last() == applied
+                    && node.state().commit == applied
+                    && !node.journal.failed
+                    && node.can_admit_with_policy(lease::now()?, false, false))
+            })?
+        {
+            return Ok(());
+        }
+        // Do not deduplicate against old applied state while a prior timed-out
+        // registration could still commit a different endpoint.
+        let action = registration_action(&peer);
+        let index = self.on_raft(move |host, node| {
+            let index = node.propose(Command::Client(vec![action]))?;
+            host.refresh_application(node)?;
+            Ok(index)
+        })?;
+        loop {
+            self.on_raft(|host, node| {
+                if node.role != Role::Leader || node.journal.failed {
+                    return Err(Error::new(
+                        "registration leadership changed; outcome may be unknown",
+                    ));
+                }
+                host.refresh_application(node)
+            })?;
+            if self.peers.read().map_err(|_| Error::new("registrations poisoned"))?.applied >= index
+            {
+                break;
+            }
+            if !self.execution_started.load(Ordering::SeqCst) {
+                self.execute_pending()?;
+            }
+            if let Some(error) = self
+                .execution_error
+                .lock()
+                .map_err(|_| Error::new("execution error lock poisoned"))?
+                .as_ref()
+            {
+                return Err(Error::new(error.clone()));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::new("registration quorum timeout; outcome may be unknown"));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        logn!("registered a peer", "identity {},at {}", peer.identity, peer.address);
+        Ok(())
+    }
     pub fn initial_key(&self, node: &mut Node) -> Result<()> {
         if node.role != Role::Leader
             || node.state().last() != node.state().commit
-            || node.state().has_actions()
+            || has_keys(node.state())
         {
             return Ok(());
         }
@@ -137,6 +271,18 @@ impl Ks {
 }
 impl Host for Ks {
     type Application = KeyHistory;
+    fn has_metadata(&self) -> bool {
+        true
+    }
+    fn apply_metadata(&self, state: &raft::execution::Work) -> Result<bool> {
+        raft::execution::execute_blocking(
+            &self.peers,
+            &self.peer_cursor,
+            state,
+            Duration::from_millis(self.config.raft.execution_lock_ms),
+            apply_registration,
+        )
+    }
     fn apply_client(&self, state: &raft::execution::Work) -> Result<()> {
         let key = self
             .unlock_key
@@ -178,19 +324,96 @@ impl Host for Ks {
         }
     }
     fn dispatch_forwarded(&self, process: &Process, request: &Req) -> Resp {
-        self.client_request(process, request, false)
+        if request.op == Op::Register {
+            self.register_request(process, request, false)
+        } else {
+            self.client_request(process, request, false)
+        }
     }
     fn forwardable(&self, op: Op) -> bool {
-        matches!(op, Op::SnMasterKey | Op::RotateMasterKey | Op::RaftMembers)
+        matches!(op, Op::Register | Op::SnMasterKey | Op::RotateMasterKey | Op::RaftMembers)
     }
     fn registered_endpoint(&self, name: &str) -> Option<std::net::SocketAddr> {
-        self.peers.lock().ok()?.get(name).map(|peer| peer.address)
+        self.peers.read().ok()?.peers.get(name).map(|peer| peer.address)
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn peer(port: u16) -> Peer {
+        Peer {
+            identity: "KS0-member1".into(),
+            kind: common::config::ServiceKind::Ks,
+            address: ([127, 0, 0, 1], port).into(),
+            domain: vec!["dc0".into(), "box0".into()],
+            media_class: Some("ssd".into()),
+            ring_identity: Some(common::ring::RingIdentity::try_from("01".repeat(64)).unwrap()),
+        }
+    }
+    fn routes(state: &State) -> Registrations {
+        let routes = RwLock::new(Registrations::default());
+        let cursor = Mutex::new(raft::execution::Cursor::default());
+        raft::execution::execute(&routes, &cursor, state, Duration::MAX, apply_registration)
+            .unwrap();
+        routes.into_inner().unwrap()
+    }
+    #[test]
+    fn registrations_replay_only_committed_changes_without_unlock_material() {
+        let mut state =
+            State::initial("01".repeat(64), raft::tests::members(3), raft::tests::names()).unwrap();
+        state.term = 1;
+        state.log.push(Entry {
+            index: 1,
+            term: 1,
+            command: Command::Client(vec![registration_action(&peer(9001))]),
+        });
+        state.log.push(Entry {
+            index: 2,
+            term: 1,
+            command: Command::Client(vec![registration_action(&peer(9002))]),
+        });
+        state.commit = 1;
+        let before_commit = routes(&state);
+        let key_present = has_keys(&state);
+        assert_eq!(before_commit.peers["KS0-member1"], peer(9001));
+        assert!(!key_present); // A registration must not suppress initial-key creation.
+        let snapshot = state.capture();
+        state.apply(&raft::Record::Install(snapshot)).unwrap();
+        // Snapshot plus a later journal registration survives a binary round trip.
+        state.commit = 2;
+        let saved = raft::codec::encode(&state).unwrap();
+        let recovered: State = raft::codec::decode(&saved).unwrap();
+        let after_commit = routes(&recovered);
+        assert_eq!(after_commit.peers["KS0-member1"], peer(9002));
+        assert_eq!(after_commit.applied, 2);
+        // Routing and key application can replay the same mixed checkpoint independently.
+        let key = [55; 32];
+        let epoch = MasterEpoch { key: [89; 32], since: TimeSec::new(100) };
+        let sealed = seal_key(&key, &state.ring, 3, 1, &epoch).unwrap();
+        state.log.push(Entry {
+            index: 3,
+            term: 1,
+            command: Command::Client(vec![raft::Action::new(Op::KsKey, sealed)]),
+        });
+        state.commit = 3;
+        let snapshot = state.capture();
+        state.apply(&raft::Record::Install(snapshot)).unwrap();
+        let locked = routes(&state);
+        let unlocked = decode_history(&state, &key).unwrap();
+        assert_eq!(locked.peers["KS0-member1"], peer(9002));
+        assert_eq!(unlocked.epochs[0].key, epoch.key);
+        assert!(has_keys(&state));
+    }
+    #[test]
+    fn registration_decoder_rejects_malformed_actions() {
+        let mut action = registration_action(&peer(9001));
+        action.fields.pop();
+        let malformed = registration_peer(&action).is_err();
+        let worker = needs_request_worker(&peer(9001).request());
+        assert!(malformed);
+        assert!(worker);
+    }
     #[test]
     fn one_entry_dispatches_multiple_encrypted_key_actions() {
         let key = [19; 32];

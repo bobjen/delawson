@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Three KS processes: election, encrypted recovery, failover and quorum loss. No TPM required."""
+import argparse
 import json
 import os
 import signal
@@ -37,6 +38,9 @@ def until(check, timeout=15):
     raise RuntimeError(f'condition timed out: {last}')
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--registrations-only', action='store_true', help='test endpoint persistence without destructive state-loss recovery')
+    args = parser.parse_args()
     children = {}
     with tempfile.TemporaryDirectory(prefix='delawson-ks-raft-') as temporary:
         work = Path(temporary)
@@ -127,14 +131,13 @@ def main():
             assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
             moved = next(id for id in members if id != 'KS0-member0' and id != until(leader))
             stop(moved)
-            old_address = members[moved]
             members[moved] = f'127.0.0.1:{port()}'
             start(moved)
             until(lambda: status(moved).get('unlocked') == 'true' and status(moved).get('raft_leader') != 'none' and int(status(moved)['master_keys']) == 2)
             assert command(moved, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
-            # The changed-port test above used discovery. Preserve the new seed before
-            # later tests destroy the entire in-memory registration service.
-            config.write_text(config.read_text().replace(old_address, members[moved]))
+            # Keep the obsolete seed: locked restart must recover the changed
+            # endpoint from the replicated registration, including on secondaries.
+            until(lambda: members[moved] in command(until(leader), 'registry'))
             # Two down: the former leader may read until its lease expires, then must refuse.
             survivor = until(leader)
             for id in list(children):
@@ -146,9 +149,27 @@ def main():
             for id in members: start(id)
             primary = until(leader)
             assert all(status(id).get('unlocked') == 'false' for id in children)
+            until(lambda: all(int(status(id)['registered']) >= 2 for id in children))
             command(primary, 'unlock', '--key-file', ceremony/'unlock-key')
             until(lambda: all(status(id).get('unlocked') == 'true' for id in children))
             assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
+            if args.registrations_only:
+                # Add a fourth member so one stops applying key state, but must
+                # retain the public routing projection. The new process registers
+                # before it has a voting slot; registration does not grant a slot.
+                members['KS0-member3'] = f'127.0.0.1:{port()}'
+                start('KS0-member3')
+                until(lambda: members['KS0-member3'] in command(primary, 'registry'))
+                assert status('KS0-member3')['raft_member_slot'] == 'none'
+                membership_file = work/'members.json'
+                membership_file.write_text(json.dumps(list(members)))
+                until(lambda: command(primary, 'raft-members', '--members-file', membership_file) or True)
+                until(lambda: sum(status(id).get('raft_applying') == 'true' for id in children) == 3)
+                until(lambda: all(int(status(id)['registered']) == 3 for id in children))
+                cold = next(id for id in children if status(id).get('raft_applying') == 'false')
+                assert int(status(cold)['master_keys']) == 0
+                print('PASS: replicated registrations; changed-port discovery with obsolete seeds; locked restart; primary failover; routing retained by cold member; registration does not grant a voting slot.')
+                return
             # Losing current.log retires one identity and implicitly requests replacement.
             replacing = next(id for id in members if id != primary)
             old_identity = status(replacing)['raft_member_id']

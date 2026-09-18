@@ -18932,9 +18932,10 @@ this policy now; SN and DN will use it when their Raft admission is implemented.
 One incoming-client gate enforces committed-term readiness and, except for opted-in stale
 reads, a live lease before command
 dispatch. Direct and forwarded requests use the same gate, including registry
-queries; individual handlers contain no lease checks. Raft RPCs, bootstrap
-registration, unlock operations, and process diagnostics bypass this client gate so bootstrap,
-replication, and elections continue while client admission is stopped.
+queries; individual handlers contain no lease checks. Raft RPCs, endpoint lookups, unlock operations, and process diagnostics bypass this
+client gate so bootstrap, replication, and elections continue while client admission
+is stopped. Registration has an equivalent lease/committed-term gate based on public
+routing progress, so it can commit while master-key state is locked.
 
 Before admitting a key read, the gate catches execution up and acquires the global
 read lock, then rechecks its lease. The handler receives that guarded history and
@@ -18954,10 +18955,24 @@ pending requests cannot become proposals in a later leadership term.
 
 Lazy key preparation is internal maintenance before admission; its proposals and
 commit advancement obey the same primary write-authority check. Followers forward key and membership requests to a known
-primary. Registry state remains local and unreplicated; its queries and assignment
-requests require primary admission, while registration must work before quorum
-exists because KS members register before serving. Registrar failover remains
-unfinished (#36).
+primary. Registrations are public `Op::Register` client actions committed through
+KS Raft; follower registrars forward authenticated requests to the primary. Roster,
+service kind, ring identity, and machine admission checks still apply. A repeated
+identical registration succeeds without another journal entry; an endpoint change
+is acknowledged only after commitment and routing replay. Registration does not
+assign a Raft slot or authorize a membership change.
+
+The application worker maintains a small public routing projection on every member,
+including locked members and members not applying decrypted key state. It uses a
+separate routing lock and replay cursor; unloading key state does not discard it.
+Routing replay is restored from the snapshot and committed journal suffix before
+transport starts, with subsequent updates queued from journaled committed state.
+Endpoint lookup can use this local committed view while locked; it is a discovery
+hint, not a linearizable data read. Local recovered endpoints take precedence over
+seed addresses. KS members accept Raft traffic before their own asynchronous
+registration commits, avoiding a startup/quorum dependency; other services still
+register before advertising readiness. The configured registrar remains a bootstrap
+anchor; registrar failover remains unfinished (#36).
 Requests waiting at the gate run outside the shared worker pool, leaving its
 workers available for consensus RPCs. Future SN/DN integration should preserve
 this central admission boundary and the distinction between admission and response.
@@ -19011,7 +19026,8 @@ Leadership handoff and independent execution liveness monitoring are deferred.
 client; SN and DN can supply their own action dispatch and checkpoint capture.
 Raft commands distinguish consensus commands from one `Client(Vec<Action>)`
 command. Every action carries an `Op` tag and serialized fields. KS encrypts each
-action payload independently, leaving its outer action tag visible. Authenticated
+master-key action payload independently, leaving its outer action tag visible;
+registration actions remain plaintext routing metadata. Authenticated
 encryption binds KS key actions to the ring identity, entry index, and term.
 Raft metadata remains readable without the unlock key. Other clients may choose
 plaintext actions. Entries, checkpoints, journal records, and Raft RPCs use the
