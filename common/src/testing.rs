@@ -190,6 +190,7 @@ pub fn reply() -> crate::server::Reply {
 pub fn process() -> Arc<Process> {
     Arc::new(Process {
         config: crate::config::ProcessConfig {
+            block_bytes: crate::pool::DEFAULT_BYTES,
             ignore_ring_identity: false,
             machine_identity: None,
             identity: "EN0".to_string(),

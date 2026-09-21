@@ -14,6 +14,7 @@ pub mod logread;
 pub mod offset;
 pub mod peer;
 pub mod placement;
+pub mod pool;
 pub mod random;
 pub mod range;
 pub mod registry;

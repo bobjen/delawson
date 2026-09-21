@@ -880,6 +880,9 @@ loaders!(DNConfig, SNConfig, ENConfig, FEConfig);
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
+    /// Process-wide allocation block size, fixed at startup.
+    #[serde(default = "crate::pool::default_bytes")]
+    pub block_bytes: usize,
     /// DANGER: A GOOD WAY TO LOSE ALL YOUR DATA. Debugging only: bypass ring
     /// identity checks for admission and recovery, e.g. a production copy in test.
     /// Does not bypass machine authentication, checksums, or key authentication.

@@ -925,7 +925,8 @@ structure recursion depth.
 to the bytes and checked counts it parses, is linear in the input it parses, uses bounded lookahead,
 and performs no side effects. Shared readers reject excessive recursion and parse operations.
 *Argued* §17.42.3 · *Enforced* **code and parser review**: bounded readers, depth checks, and parse
-operation checks · *Checked* malformed-depth, parse-count, truncation, and trailing-byte tests
+attempt checks at recursive structural entry points, excluding nonrecursive leaves · *Checked*
+malformed-depth, structural-retry budget, truncation, and trailing-byte tests
 *Breaks* an ordinary message can become an allocation, CPU, or rollback attack before operation-level
 authorization and resource estimation can run.
 

@@ -7723,6 +7723,17 @@ much more than it does — and that is worth deciding rather than assuming (#46)
 after — the same stand-in bargain as DN's in-memory object index (§17.5g), and the same
 caution: nothing about the in-memory version is evidence about what the durable one costs.
 
+The shared `common::pool` interface now owns fixed-size, uninitialized memory blocks.
+Each process defaults to 64 KiB blocks; its process configuration may set `block_bytes`
+(for example, 4194304 for 4 MiB) before service startup. The size cannot change after
+initialization. For now allocation and return call the system's `malloc` and `free`;
+there is no custom free list, staging area, or segmented array. Callers retain a
+reference from `pool::global()`, call `alloc()`, and return ownership by dropping the
+block or calling `pool::free(block)`. The allocation/free methods are inline, with no
+pool lock, reference counting, or separate bookkeeping allocation. Global lookup
+checks initialization once per lookup; retaining the reference avoids that check
+on each allocation. A future pool backend can replace malloc/free behind this interface.
+
 #### 8.1.5.3 When transactions arrive, the EN's part of them lives in the journal
 
 **Transactions and SCN integration with the EN journal are not implemented yet.**
@@ -18077,8 +18088,10 @@ the work begins.
 
 The parser permits only bounded lookahead and is intended to be single-pass. A parser routine may
 charge additional work after reading a parameter such as a count, but it may not perform significant
-speculative parsing and roll it back. Shared readers count parse operations against the message byte
-count. A routine that violates these rules is a software bug; process-level liveness supervision is
+speculative parsing and roll it back. Shared readers count attempts to enter potentially recursive structural parsers against the
+message byte count, including failed attempts; retries do not refund that budget. Nonrecursive leaf
+reads only check bounds and do not charge parse work. The flat message cursor has no recursion and
+needs no parse counter. Recursion depth remains a separate bound on simultaneously nested parsers. A routine that violates these rules is a software bug; process-level liveness supervision is
 the backstop for a routine that never returns.
 
 ## 17.43 Read and append contract repairs

@@ -500,12 +500,17 @@ impl<'a> StructReader<'a> {
         StructReader { bytes, at: 0, depth: 1, maximum_depth, parse_count: 0 }
     }
 
-    fn take(&mut self, count: usize) -> Result<&'a [u8]> {
+    // Charge structural attempts, including failures, without charging leaf reads.
+    fn count_parse(&mut self) -> Result<()> {
         self.parse_count =
             self.parse_count.checked_add(1).ok_or_else(|| Error::new("parse count overflow"))?;
         if self.parse_count > self.bytes.len() {
             return Err(Error::new("too many parse routines for structure size"));
         }
+        Ok(())
+    }
+
+    fn take(&mut self, count: usize) -> Result<&'a [u8]> {
         let end = self.at.checked_add(count).ok_or_else(|| Error::new("length overflow"))?;
         if end > self.bytes.len() {
             return Err(Error::new("structure payload ends mid-value"));
@@ -647,6 +652,7 @@ impl<'a> StructReader<'a> {
         what: &str,
         read: impl FnOnce(&mut StructReader<'a>) -> Result<T>,
     ) -> Result<T> {
+        self.count_parse()?;
         self.tag(expected, what)?;
         let depth =
             self.depth.checked_add(1).ok_or_else(|| Error::new("recursion depth overflow"))?;
@@ -661,6 +667,7 @@ impl<'a> StructReader<'a> {
 
     /// Decode a tagged union while accounting for nesting depth.
     pub fn nested_any<T>(&mut self, read: impl FnOnce(Op, &mut Self) -> Result<T>) -> Result<T> {
+        self.count_parse()?;
         let op = Op::from_code(self.number_u16()?)?;
         let depth =
             self.depth.checked_add(1).ok_or_else(|| Error::new("recursion depth overflow"))?;
@@ -1208,20 +1215,14 @@ fn message_depth(args: &[Arg]) -> u8 {
 struct Cursor<'a> {
     bytes: &'a [u8],
     at: usize,
-    parse_count: usize,
 }
 
 impl<'a> Cursor<'a> {
     fn new(bytes: &'a [u8]) -> Cursor<'a> {
-        Cursor { bytes, at: 0, parse_count: 0 }
+        Cursor { bytes, at: 0 }
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        self.parse_count =
-            self.parse_count.checked_add(1).ok_or_else(|| Error::new("parse count overflow"))?;
-        if self.parse_count > self.bytes.len() {
-            return Err(Error::new("too many parse routines for message size"));
-        }
         let end = self.at.checked_add(n).ok_or_else(|| Error::new("length overflow"))?;
         if end > self.bytes.len() {
             return Err(Error::new("frame ends mid-value"));
@@ -1622,10 +1623,49 @@ mod tests {
     }
 
     #[test]
-    fn parsing_more_routines_than_bytes_is_refused() {
+    fn leaf_reads_only_check_bounds() {
         let mut reader = StructReader::new(&[7], 1);
+        reader.parse_count = usize::MAX;
         assert_eq!(reader.number_u8().unwrap(), 7);
-        assert!(reader.number_u8().is_err());
+        assert_eq!(reader.number_u8().unwrap_err().to_string(), "structure payload ends mid-value");
+        assert_eq!(reader.parse_count, usize::MAX);
+        assert!(reader.take(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn structural_retries_keep_their_work_charge() {
+        let bytes = Op::Ping.code().to_le_bytes();
+        for any in [false, true] {
+            let mut reader = StructReader::new(&bytes, 2);
+            let mut calls = 0;
+            for _ in 0..bytes.len() {
+                // Simulate speculative retry without refunding the work budget.
+                reader.at = 0;
+                let mut read = |_: &mut StructReader<'_>| -> Result<()> {
+                    calls += 1;
+                    Err(Error::new("failed attempt"))
+                };
+                let result = if any {
+                    reader.nested_any(|_, r| read(r))
+                } else {
+                    reader.nested(Op::Ping, "test", read)
+                };
+                assert_eq!(result.unwrap_err().to_string(), "failed attempt");
+                assert_eq!(reader.depth, 1);
+            }
+            reader.at = 0;
+            let result = if any {
+                reader.nested_any(|_, _| panic!("budget must stop dispatch"))
+            } else {
+                reader.nested(Op::Ping, "test", |_| panic!("budget must stop dispatch"))
+            };
+            let result: Result<()> = result;
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "too many parse routines for structure size"
+            );
+            assert_eq!(calls, bytes.len());
+        }
     }
 
     #[test]
