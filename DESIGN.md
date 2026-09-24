@@ -8359,6 +8359,39 @@ than mean time for the intended SN/DN use. The CPU-first benchmark code and its
 selector tests were removed; the measurements above remain as experiment history.
 The CPU-first mode names in that history are no longer supported by the benchmark.
 
+**Pool-backed segmented byte buffer.** `pool::SegmentedBuffer` uses
+`pool::ChunkPool` (`Pool<4096, 4096, ExternalLinks>`) for both data leaves and
+index nodes. Every node is 4KiB aligned and every index node holds 1,024 u32
+pool indexes, with u32::MAX as the absent-child sentinel. These indexes describe
+an in-memory tree, not a disk serialization. Depth zero holds 2^12 bytes;
+depths one and two cover 2^22 and 2^32 bytes. Depth six covers all u64 offsets;
+internal span calculations use u128 to avoid overflow. Actual resident capacity
+is still bounded by the shared pool's configured maximum, including index nodes.
+
+The buffer stores one packed initialized range with absolute start/end offsets.
+Append grows the tree on demand without moving existing bytes. Prefix discard
+returns fully consumed leaves and empty index nodes, and collapses single-child
+roots. A partial first leaf remains until consumed. Empty buffers own no blocks
+and retain their absolute end for later appends. `with_start` starts a scan window
+at an arbitrary offset without allocating its preceding address space. The
+exclusive end must fit in u64, so the byte at u64::MAX itself is not representable.
+
+`chunk` and `chunks` borrow contiguous initialized slices; `read_at` and `write_at`
+copy across boundaries, and append takes a caller-supplied RNG callback for pool
+allocations. Allocation errors roll back the append's logical range and release
+new storage. Pool ownership is held by the tree's indexes and returned on drop;
+there is no extra heap allocation or ownership handle per tree node. Recycled
+leaf bytes are not cleared, and bytes outside the initialized range are never
+exposed by the safe API. Index nodes are initialized to the absent-child sentinel.
+Serialization, tail padding, and asynchronous I/O ownership are separate layers;
+a submitted I/O buffer must remain alive and unchanged until completion.
+
+Tests cover packed fields crossing leaves, all six depth transitions using small
+windows at large offsets, 4MiB growth, index-node reclamation, rolling windows
+against a contiguous reference model, range/offset overflow, allocation failure
+at every level, and unwinding through an RNG panic. Ownership audits and draining
+the pool after destruction check duplicate and lost blocks.
+
 Two rules are essential. **POOL-REUSE-AFTER-GRACE:** a popped index cannot reappear
 on the free list until every pool operation that could hold its old head value
 has ended. Shared participation, selector revalidation, and exclusive locking through
@@ -8369,7 +8402,8 @@ head CAS must fail, and the candidate next index is never dereferenced before
 success. This is why an inline link cannot become ordinary mutable payload.
 Deterministic stalled-participant tests cover both same-group and cross-group
 retirement, and concurrent tests exercise both link layouts and exclusive ownership.
-There is no segmented array, disk staging area, or extent persistence in this change.
+The segmented buffer now builds on this pool; disk staging and extent persistence
+remain to be implemented.
 
 The randomized pool tests follow Bob's [coverage-flags pattern](https://burtleburtle.net/bob/testing/concurrencyflags.html).
 There are two top-level tests, one per link layout, sharing a generic runner and
