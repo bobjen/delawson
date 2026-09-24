@@ -25,6 +25,11 @@
 //! nonce, a tag and a compression attempt are paid per write. Inside the segment
 //! the messages are just length-prefixed.
 
+mod buffer;
+#[cfg(test)]
+mod segmented_tests;
+pub use buffer::{FrameBuffer, Message, MessageBuffer};
+
 use crate::config::Messaging;
 use crate::ids::{DiskId, DnId, EnId, ExtentId, ObjectId, RangeId, SnId, StreamId};
 use crate::offset::{ECoff, ELoff, ERoff, OCoff, OEoff, OLoff, ORoff, SCoff, SLoff, SRoff};
@@ -32,7 +37,7 @@ use crate::random::Rng;
 use crate::seal::{self, Seal};
 use crate::time::TimeSec;
 use crate::{Context, Error, Result};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -773,21 +778,31 @@ impl Req {
     }
 
     pub fn encode(&self, out: &mut Vec<u8>) {
-        out.extend(self.id.to_le_bytes());
-        out.extend(self.op.code().to_le_bytes());
-        out.push(message_depth(&self.args));
+        self.encode_to(out).expect("writing a message into Vec");
+    }
+
+    fn encode_to(&self, out: &mut impl Write) -> std::io::Result<()> {
+        out.write_all(&self.id.to_le_bytes())?;
+        out.write_all(&self.op.code().to_le_bytes())?;
+        out.write_all(&[message_depth(&self.args)])?;
         if let [Arg::Struct(op, bytes, _)] = self.args.as_slice()
             && *op == self.op
         {
-            out.extend(COMMAND_PAYLOAD.to_le_bytes());
-            out.extend(bytes);
+            out.write_all(&COMMAND_PAYLOAD.to_le_bytes())?;
+            out.write_all(bytes)?;
         } else {
-            encode_args(&self.args, out);
+            encode_args(&self.args, out)?;
         }
+        Ok(())
     }
 
+    #[cfg(test)]
     fn decode(payload: &[u8]) -> Result<Req> {
-        let mut reader = Cursor::new(payload);
+        Self::decode_from(payload, payload.len())
+    }
+
+    fn decode_from(input: impl BufRead, length: usize) -> Result<Req> {
+        let mut reader = Cursor::new(input, length);
         let id = reader.u32()?;
         let op = Op::from_code(reader.u16()?)?;
         let maximum_depth = reader.u8()?;
@@ -799,7 +814,7 @@ impl Req {
         }
         let count = reader.u16()?;
         let args = if count == COMMAND_PAYLOAD {
-            vec![Arg::Struct(op, reader.remaining().to_vec(), maximum_depth)]
+            vec![Arg::Struct(op, reader.take(reader.remaining)?, maximum_depth)]
         } else {
             reader.args_with_count_and_depth(count, maximum_depth)?
         };
@@ -862,14 +877,24 @@ impl Resp {
     }
 
     pub fn encode(&self, out: &mut Vec<u8>) {
-        out.extend(self.id.to_le_bytes());
-        out.extend((self.status as u16).to_le_bytes());
-        out.push(message_depth(&self.args));
-        encode_args(&self.args, out);
+        self.encode_to(out).expect("writing a message into Vec");
     }
 
+    fn encode_to(&self, out: &mut impl Write) -> std::io::Result<()> {
+        out.write_all(&self.id.to_le_bytes())?;
+        out.write_all(&(self.status as u16).to_le_bytes())?;
+        out.write_all(&[message_depth(&self.args)])?;
+        encode_args(&self.args, out)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn decode(payload: &[u8]) -> Result<Resp> {
-        let mut reader = Cursor::new(payload);
+        Self::decode_from(payload, payload.len())
+    }
+
+    fn decode_from(input: impl BufRead, length: usize) -> Result<Resp> {
+        let mut reader = Cursor::new(input, length);
         let id = reader.u32()?;
         let status = Status::from_code(reader.u16()?)?;
         let maximum_depth = reader.u8()?;
@@ -1173,36 +1198,37 @@ impl AppendBlock {
     }
 }
 
-fn encode_args(args: &[Arg], out: &mut Vec<u8>) {
-    out.extend((args.len() as u16).to_le_bytes());
+fn encode_args(args: &[Arg], out: &mut impl Write) -> std::io::Result<()> {
+    out.write_all(&(args.len() as u16).to_le_bytes())?;
     for arg in args {
         match arg {
             Arg::Text(text) => {
-                out.push(0);
-                out.extend((text.len() as u32).to_le_bytes());
-                out.extend(text.as_bytes());
+                out.write_all(&[0])?;
+                out.write_all(&(text.len() as u32).to_le_bytes())?;
+                out.write_all(text.as_bytes())?;
             }
             Arg::Number(n) => {
-                out.push(1);
-                out.extend(n.to_le_bytes());
+                out.write_all(&[1])?;
+                out.write_all(&n.to_le_bytes())?;
             }
             Arg::Flag(b) => {
-                out.push(2);
-                out.push(*b as u8);
+                out.write_all(&[2])?;
+                out.write_all(&[*b as u8])?;
             }
             Arg::Bytes(bytes) => {
-                out.push(3);
-                out.extend((bytes.len() as u32).to_le_bytes());
-                out.extend(bytes);
+                out.write_all(&[3])?;
+                out.write_all(&(bytes.len() as u32).to_le_bytes())?;
+                out.write_all(bytes)?;
             }
             Arg::Struct(op, bytes, _) => {
-                out.push(4);
-                out.extend(op.code().to_le_bytes());
-                out.extend((bytes.len() as u32).to_le_bytes());
-                out.extend(bytes);
+                out.write_all(&[4])?;
+                out.write_all(&op.code().to_le_bytes())?;
+                out.write_all(&(bytes.len() as u32).to_le_bytes())?;
+                out.write_all(bytes)?;
             }
         }
     }
+    Ok(())
 }
 
 fn message_depth(args: &[Arg]) -> u8 {
@@ -1212,44 +1238,56 @@ fn message_depth(args: &[Arg]) -> u8 {
     })
 }
 
-struct Cursor<'a> {
-    bytes: &'a [u8],
-    at: usize,
+struct Cursor<R> {
+    input: R,
+    remaining: usize,
 }
-
-impl<'a> Cursor<'a> {
-    fn new(bytes: &'a [u8]) -> Cursor<'a> {
-        Cursor { bytes, at: 0 }
+impl<R: BufRead> Cursor<R> {
+    fn new(input: R, remaining: usize) -> Self {
+        Self { input, remaining }
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.at.checked_add(n).ok_or_else(|| Error::new("length overflow"))?;
-        if end > self.bytes.len() {
+    fn take(&mut self, n: usize) -> Result<Vec<u8>> {
+        if n > self.remaining {
             return Err(Error::new("frame ends mid-value"));
         }
-        let slice = &self.bytes[self.at..end];
-        self.at = end;
-        Ok(slice)
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(n).context("frame field allocation")?;
+        bytes.resize(n, 0);
+        self.input.read_exact(&mut bytes)?;
+        self.remaining -= n;
+        Ok(bytes)
     }
 
+    #[inline]
+    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        let current = self.input.fill_buf()?;
+        if current.len().min(self.remaining) >= N {
+            let value = current[..N].try_into().unwrap();
+            self.input.consume(N);
+            self.remaining -= N;
+            Ok(value)
+        } else {
+            if N > self.remaining {
+                return Err(Error::new("frame ends mid-value"));
+            }
+            let mut value = [0; N];
+            self.input.read_exact(&mut value)?;
+            self.remaining -= N;
+            Ok(value)
+        }
+    }
     fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
+        Ok(self.array::<1>()?[0])
     }
-
     fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(u16::from_le_bytes(self.array()?))
     }
-
     fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_le_bytes(self.array()?))
     }
-
     fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-
-    fn remaining(&self) -> &'a [u8] {
-        &self.bytes[self.at..]
+        Ok(u64::from_le_bytes(self.array()?))
     }
 
     fn args_with_depth(&mut self, maximum_depth: u8) -> Result<Vec<Arg>> {
@@ -1258,29 +1296,29 @@ impl<'a> Cursor<'a> {
     }
 
     fn args_with_count_and_depth(&mut self, count: u16, maximum_depth: u8) -> Result<Vec<Arg>> {
-        let mut args = checked_vec(count, self.bytes.len() - self.at)?;
+        let mut args = checked_vec(count, self.remaining)?;
         for _ in 0..count {
             args.push(match self.u8()? {
                 0 => {
                     let len = self.u32()? as usize;
                     let bytes = self.take(len)?;
-                    Arg::Text(String::from_utf8(bytes.to_vec()).context("text argument")?)
+                    Arg::Text(String::from_utf8(bytes).context("text argument")?)
                 }
                 1 => Arg::Number(self.u64()?),
                 2 => Arg::Flag(self.u8()? != 0),
                 3 => {
                     let len = self.u32()? as usize;
-                    Arg::Bytes(self.take(len)?.to_vec())
+                    Arg::Bytes(self.take(len)?)
                 }
                 4 => {
                     let op = Op::from_code(self.u16()?)?;
                     let len = self.u32()? as usize;
-                    Arg::Struct(op, self.take(len)?.to_vec(), maximum_depth)
+                    Arg::Struct(op, self.take(len)?, maximum_depth)
                 }
                 tag => return Err(Error::new(format!("unknown argument tag {tag}"))),
             });
         }
-        if self.at != self.bytes.len() {
+        if self.remaining != 0 {
             return Err(Error::new("trailing bytes in frame"));
         }
         Ok(args)
@@ -1314,19 +1352,30 @@ pub fn frame_into(buf: &mut Vec<u8>, body: impl FnOnce(&mut Vec<u8>)) -> Result<
 pub struct Wire {
     stream: crate::machine::Stream,
     seal: Seal,
-    sealed: Vec<u8>,
+    sealed: MessageBuffer,
+    plain_scratch: Vec<u8>,
 }
 
 impl Wire {
-    /// Seal everything in `plain` and send it, leaving `plain` empty. A batch
-    /// larger than a segment is split at a message boundary rather than refused.
-    pub fn send(&mut self, plain: &mut Vec<u8>) -> Result<()> {
-        let mut at = 0;
-        while at < plain.len() {
-            let end = segment_end(&plain[at..])? + at;
+    /// Create an empty batch sharing this connection's process-wide pool.
+    pub fn new_buffer(&self) -> MessageBuffer {
+        self.sealed.empty_like()
+    }
+
+    /// Seal and send a batch, splitting large batches at message boundaries.
+    /// Success releases all of the batch's blocks.
+    pub fn send(&mut self, plain: &mut MessageBuffer) -> Result<()> {
+        let mut at = plain.bytes.start();
+        while at < plain.bytes.end() {
+            let end = segment_end(plain, at)?;
+            plain.copy_to(at..end, &mut self.plain_scratch)?;
             self.sealed.clear();
-            self.seal.seal(&mut plain[at..end].to_vec(), &mut self.sealed)?;
-            self.stream.write_all(&self.sealed)?;
+            buffer::with_random(|rng| {
+                self.seal
+                    .seal_to(&self.plain_scratch, &mut self.sealed.bytes.writer(|| rng.next_u64()))
+            })?;
+            self.sealed.write_to(&mut self.stream)?;
+            self.sealed.clear();
             at = end;
         }
         plain.clear();
@@ -1340,8 +1389,10 @@ impl Wire {
 pub struct Reader {
     stream: crate::machine::Stream,
     seal: Seal,
-    open: Vec<u8>,
-    at: usize,
+    open: MessageBuffer,
+    sealed: MessageBuffer,
+    sealed_scratch: Vec<u8>,
+    at: u64,
     /// When the segment now being read arrived. A batch arrives at one moment, so
     /// this is one clock read for however many messages it holds — and it is the
     /// honest start for a duration, being when the bytes got here rather than
@@ -1354,7 +1405,7 @@ impl Reader {
         self.stream.peer_key.as_deref()
     }
     pub fn more(&self) -> bool {
-        self.at < self.open.len()
+        self.at < self.open.bytes.end()
     }
 
     pub fn arrived(&self) -> Instant {
@@ -1362,20 +1413,22 @@ impl Reader {
     }
 
     /// The next message, reading and opening a segment if none is in hand.
-    fn next(&mut self) -> Result<&[u8]> {
+    fn next(&mut self) -> Result<pool::SegmentedReader<'_, 'static>> {
         if !self.more() {
             self.fill()?;
         }
-        let bytes = &self.open[self.at..];
-        if bytes.len() < 4 {
-            return Err(Error::new("a segment ending mid-message"));
+        self.open.bytes.discard_before(self.at).context("discard consumed messages")?;
+        let mut reader = self.open.bytes.reader();
+        let length = reader.read_u32_le()? as u64;
+        if length > MAX_FRAME_BYTES as u64 {
+            return Err(Error::new("frame exceeds maximum size"));
         }
-        let length = u32::from_le_bytes(bytes[..4].try_into().expect("length")) as usize;
-        if bytes.len() < 4 + length {
+        if length > reader.remaining() {
             return Err(Error::new("a message longer than its segment"));
         }
-        self.at += 4 + length;
-        Ok(&bytes[4..4 + length])
+        let start = self.at + 4;
+        self.at = start + length;
+        Ok(self.open.bytes.reader_range(start..self.at)?)
     }
 
     fn fill(&mut self) -> Result<()> {
@@ -1386,36 +1439,59 @@ impl Reader {
         if length > MAX_SEGMENT_BYTES + seal::OVERHEAD {
             return Err(Error::new(format!("peer announced a {length}-byte segment")));
         }
-        let mut sealed = vec![0u8; length];
-        self.stream.read_exact(&mut sealed)?;
+        self.sealed.receive(&mut self.stream, length)?;
+        self.sealed.copy_to(0..length as u64, &mut self.sealed_scratch)?;
+        self.sealed.clear();
         self.open.clear();
         self.at = 0;
-        self.seal.open(&header, &sealed, &mut self.open)
+        let result = buffer::with_random(|rng| {
+            self.seal.open_to(
+                &header,
+                &self.sealed_scratch,
+                &mut self.open.bytes.writer(|| rng.next_u64()),
+            )
+        });
+        if result.is_err() {
+            self.open.clear();
+        }
+        result
     }
 
     pub fn request(&mut self) -> Result<Req> {
-        Req::decode(self.next()?)
+        let reader = self.next()?;
+        let length = reader.remaining() as usize;
+        let result = Req::decode_from(reader, length);
+        self.open.bytes.discard_before(self.at).context("discard consumed request")?;
+        result
     }
 
     pub fn response(&mut self) -> Result<Resp> {
-        Resp::decode(self.next()?)
+        let reader = self.next()?;
+        let length = reader.remaining() as usize;
+        let result = Resp::decode_from(reader, length);
+        self.open.bytes.discard_before(self.at).context("discard consumed response")?;
+        result
     }
 }
 
 /// How much of a batch fits in one segment, cut at a message boundary. At least
 /// one message always goes, since a message cannot exceed a segment.
-fn segment_end(plain: &[u8]) -> Result<usize> {
-    let mut at = 0;
-    while at < plain.len() {
-        if plain.len() - at < 4 {
-            return Err(Error::new("a batch ending mid-message"));
+fn segment_end(plain: &MessageBuffer, start: u64) -> Result<u64> {
+    segment_end_with_limit(plain, start, MAX_SEGMENT_BYTES as u64)
+}
+fn segment_end_with_limit(plain: &MessageBuffer, start: u64, limit: u64) -> Result<u64> {
+    let mut at = start;
+    while at < plain.bytes.end() {
+        let mut reader = plain.bytes.reader_range(at..plain.bytes.end())?;
+        let length = reader.read_u32_le()? as u64;
+        if length > MAX_FRAME_BYTES as u64 {
+            return Err(Error::new("frame exceeds maximum size"));
         }
-        let length = u32::from_le_bytes(plain[at..at + 4].try_into().expect("length")) as usize;
-        let next = at + 4 + length;
-        if next > plain.len() {
+        let next = at.checked_add(4 + length).ok_or_else(|| Error::new("frame offset overflow"))?;
+        if next > plain.bytes.end() {
             return Err(Error::new("a message longer than its batch"));
         }
-        if next > MAX_SEGMENT_BYTES && at > 0 {
+        if next - start > limit && at > start {
             return Ok(at);
         }
         at = next;
@@ -1431,7 +1507,7 @@ fn segment_end(plain: &[u8]) -> Result<usize> {
 /// Both sides of a process want this — answers to clients and requests to peers —
 /// so it lives here rather than twice.
 pub struct Outbox {
-    filling: Mutex<Vec<u8>>,
+    filling: Mutex<MessageBuffer>,
     ready: Condvar,
     open: AtomicBool,
 }
@@ -1440,7 +1516,7 @@ impl Outbox {
     /// Start a sender on `wire`, and return the box to append to.
     pub fn start(wire: Wire) -> Arc<Outbox> {
         let outbox = Arc::new(Outbox {
-            filling: Mutex::new(Vec::with_capacity(BUF_BYTES)),
+            filling: Mutex::new(wire.new_buffer()),
             ready: Condvar::new(),
             open: AtomicBool::new(true),
         });
@@ -1450,15 +1526,16 @@ impl Outbox {
     }
 
     /// Append one framed message. The lock is held for a copy, never for a write.
-    pub fn put(&self, framed: &[u8]) {
+    pub fn put(&self, framed: &[u8]) -> Result<()> {
         let mut filling = self.filling.lock().expect("outbox");
         let woke = filling.is_empty();
-        filling.extend_from_slice(framed);
+        filling.append(framed)?;
         drop(filling);
         // Waking is only needed when the sender has nothing else to find.
         if woke {
             self.ready.notify_one();
         }
+        Ok(())
     }
 
     pub fn close(&self) {
@@ -1467,7 +1544,7 @@ impl Outbox {
     }
 
     fn run(&self, mut wire: Wire) {
-        let mut batch = Vec::with_capacity(BUF_BYTES);
+        let mut batch = wire.new_buffer();
         loop {
             {
                 let mut filling = self.filling.lock().expect("outbox");
@@ -1488,19 +1565,19 @@ impl Outbox {
 }
 
 /// Append a message to a plain buffer, to be sealed with whatever else is there.
-pub fn put_request(plain: &mut Vec<u8>, request: &Req) -> Result<()> {
-    frame_into(plain, |buf| request.encode(buf))
+pub fn put_request(plain: &mut impl FrameBuffer, request: &Req) -> Result<()> {
+    plain.append_message(request)
 }
 
-pub fn put_response(plain: &mut Vec<u8>, response: &Resp) -> Result<()> {
-    frame_into(plain, |buf| response.encode(buf))
+pub fn put_response(plain: &mut impl FrameBuffer, response: &Resp) -> Result<()> {
+    plain.append_message(response)
 }
 
 /// The two halves of one connection, for a caller that uses both from one thread.
 pub struct Link {
     pub reader: Reader,
     pub wire: Wire,
-    pub plain: Vec<u8>,
+    pub plain: MessageBuffer,
 }
 
 impl Link {
@@ -1515,6 +1592,7 @@ impl Link {
 /// sealed. Directions differ by a byte in the nonce, so one prefix is enough for
 /// both and no two segments under one key can share a nonce.
 pub fn connect(stream: TcpStream, config: &Messaging) -> Result<Link> {
+    let pool = buffer::shared_pool(config.buffer_pool)?;
     stream.set_nodelay(true)?;
     let stream = crate::machine::Stream::new(stream, config, false)?;
     let mut prefix = [0u8; 8];
@@ -1526,17 +1604,25 @@ pub fn connect(stream: TcpStream, config: &Messaging) -> Result<Link> {
         reader: Reader {
             stream: stream.try_clone()?,
             seal: Seal::new(config, prefix, 1)?,
-            open: Vec::with_capacity(BUF_BYTES),
+            open: MessageBuffer::new(pool),
+            sealed: MessageBuffer::new(pool),
+            sealed_scratch: Vec::new(),
             at: 0,
             arrived: Instant::now(),
         },
-        wire: Wire { stream: writing, seal: Seal::new(config, prefix, 0)?, sealed: Vec::new() },
-        plain: Vec::with_capacity(BUF_BYTES),
+        wire: Wire {
+            stream: writing,
+            seal: Seal::new(config, prefix, 0)?,
+            sealed: MessageBuffer::new(pool),
+            plain_scratch: Vec::new(),
+        },
+        plain: MessageBuffer::new(pool),
     })
 }
 
 /// The accepting side takes the prefix it is given.
 pub fn accept(stream: TcpStream, config: &Messaging) -> Result<(Reader, Wire)> {
+    let pool = buffer::shared_pool(config.buffer_pool)?;
     stream.set_nodelay(true)?;
     let stream = crate::machine::Stream::new(stream, config, true)?;
     let mut prefix = [0u8; 8];
@@ -1547,11 +1633,18 @@ pub fn accept(stream: TcpStream, config: &Messaging) -> Result<(Reader, Wire)> {
         Reader {
             stream: reading,
             seal: Seal::new(config, prefix, 0)?,
-            open: Vec::with_capacity(BUF_BYTES),
+            open: MessageBuffer::new(pool),
+            sealed: MessageBuffer::new(pool),
+            sealed_scratch: Vec::new(),
             at: 0,
             arrived: Instant::now(),
         },
-        Wire { stream, seal: Seal::new(config, prefix, 1)?, sealed: Vec::new() },
+        Wire {
+            stream,
+            seal: Seal::new(config, prefix, 1)?,
+            sealed: MessageBuffer::new(pool),
+            plain_scratch: Vec::new(),
+        },
     ))
 }
 

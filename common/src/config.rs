@@ -167,9 +167,24 @@ pub enum Compress {
     Lz4,
 }
 
+/// One process-wide pool, shared by all message buffers. Values are block counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BufferPoolConfig {
+    pub max_blocks: u32,
+    pub initial_blocks: u32,
+}
+impl Default for BufferPoolConfig {
+    fn default() -> Self {
+        Self { max_blocks: 1 << 20, initial_blocks: 0 }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Messaging {
+    #[serde(default)]
+    pub buffer_pool: BufferPoolConfig,
     #[serde(default)]
     pub authentication: Option<crate::machine::Authentication>,
     /// Set by the caller, never accepted from a remote peer.

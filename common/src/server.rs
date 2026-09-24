@@ -47,8 +47,8 @@ use crate::random::Rng;
 use crate::registry::Peer;
 use crate::routing;
 use crate::wire::{
-    self, Arg, BUF_BYTES, MAX_FRAME_BYTES, Op, Req, Resp, Status, StructWriter, Wire, put_response,
-    structure,
+    self, Arg, BUF_BYTES, MAX_FRAME_BYTES, MessageBuffer, Op, Req, Resp, Status, StructWriter,
+    Wire, put_response, structure,
 };
 use crate::{Context, Error, Result};
 use crate::{logd, logi, logn, logsec, logw};
@@ -719,18 +719,14 @@ impl Reply {
 /// the sender writes the other. The next batch is whatever piled up during the
 /// last write, so batch size follows load with nothing to tune and no timer.
 pub(crate) struct Batch {
-    pub(crate) filling: Mutex<Vec<u8>>,
+    pub(crate) filling: Mutex<MessageBuffer>,
     pub(crate) ready: Condvar,
     pub(crate) open: AtomicBool,
 }
 
 impl Batch {
-    fn new() -> Batch {
-        Batch {
-            filling: Mutex::new(Vec::with_capacity(BUF_BYTES)),
-            ready: Condvar::new(),
-            open: AtomicBool::new(true),
-        }
+    fn new(buffer: MessageBuffer) -> Batch {
+        Batch { filling: Mutex::new(buffer), ready: Condvar::new(), open: AtomicBool::new(true) }
     }
 
     /// Frame outside the lock, then hold it only for the copy. Wake the sender
@@ -739,10 +735,10 @@ impl Batch {
         SCRATCH.with(|scratch| {
             let mut framed = scratch.borrow_mut();
             framed.clear();
-            put_response(&mut framed, response)?;
+            put_response(&mut *framed, response)?;
             let mut filling = self.filling.lock().expect("connection");
             let woke = filling.is_empty();
-            filling.extend_from_slice(&framed);
+            filling.append(&framed)?;
             drop(filling);
             if woke {
                 self.ready.notify_one();
@@ -758,7 +754,7 @@ impl Batch {
 
     /// Take everything waiting, leaving the caller's empty buffer in its place.
     /// Returns false when the connection is done.
-    fn take(&self, buf: &mut Vec<u8>) -> bool {
+    fn take(&self, buf: &mut MessageBuffer) -> bool {
         let mut filling = self.filling.lock().expect("connection");
         while filling.is_empty() {
             if !self.open.load(Ordering::SeqCst) {
@@ -772,7 +768,7 @@ impl Batch {
 }
 
 fn run_sender(mut wire: Wire, batch: Arc<Batch>) {
-    let mut buf = Vec::with_capacity(BUF_BYTES);
+    let mut buf = wire.new_buffer();
     while batch.take(&mut buf) {
         // One segment per batch: sealing happens here, off every other thread.
         if wire.send(&mut buf).is_err() {
@@ -794,20 +790,20 @@ pub struct Out {
 #[cfg(not(feature = "testing"))]
 pub(crate) struct Direct {
     pub(crate) wire: Wire,
-    pub(crate) plain: Vec<u8>,
+    pub(crate) plain: MessageBuffer,
 }
 
 #[cfg(feature = "testing")]
 pub struct Direct {
     pub(crate) wire: Wire,
-    pub(crate) plain: Vec<u8>,
+    pub(crate) plain: MessageBuffer,
 }
 
 impl Out {
     #[cfg(feature = "testing")]
     pub fn direct(wire: Wire) -> Out {
         Out {
-            direct: Mutex::new(Some(Direct { wire, plain: Vec::with_capacity(BUF_BYTES) })),
+            direct: Mutex::new(Some(Direct { plain: wire.new_buffer(), wire })),
             batch: OnceLock::new(),
         }
     }
@@ -815,7 +811,7 @@ impl Out {
     #[cfg(not(feature = "testing"))]
     pub(crate) fn direct(wire: Wire) -> Out {
         Out {
-            direct: Mutex::new(Some(Direct { wire, plain: Vec::with_capacity(BUF_BYTES) })),
+            direct: Mutex::new(Some(Direct { plain: wire.new_buffer(), wire })),
             batch: OnceLock::new(),
         }
     }
@@ -835,7 +831,7 @@ impl Out {
         };
         // Anything already accumulated goes first, so the switch cannot reorder.
         let _ = direct.wire.send(&mut direct.plain);
-        let batch = Arc::new(Batch::new());
+        let batch = Arc::new(Batch::new(direct.wire.new_buffer()));
         let sending = Arc::clone(&batch);
         std::thread::spawn(move || run_sender(direct.wire, sending));
         let _ = self.batch.set(batch);

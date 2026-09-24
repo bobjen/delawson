@@ -11,6 +11,7 @@
 use crate::config::{Compress, Messaging};
 use crate::{Error, Result};
 use aegis::aegis128x2::Aegis128X2;
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bytes a sealed segment adds: the length, the counter, and the tag.
@@ -81,6 +82,11 @@ impl Seal {
 
     /// Seal `plain` into `out` as one segment. `plain` is left usable as scratch.
     pub fn seal(&mut self, plain: &mut [u8], out: &mut Vec<u8>) -> Result<()> {
+        self.seal_to(plain, out)
+    }
+
+    /// Write the unchanged segment format to a contiguous or segmented sink.
+    pub fn seal_to(&mut self, plain: &[u8], out: &mut impl Write) -> Result<()> {
         let counter = self.counter;
         self.counter += 1;
 
@@ -106,19 +112,19 @@ impl Seal {
         let length = body.len() + if self.key.is_some() { TAG } else { 0 };
         PLAIN_BYTES.fetch_add(plain.len() as u64, Ordering::Relaxed);
         WIRE_BYTES.fetch_add((length + HEADER) as u64, Ordering::Relaxed);
-        let start = out.len();
-        out.extend((length as u32).to_le_bytes());
-        out.extend(counter.to_le_bytes());
-        let header: [u8; HEADER] = out[start..start + HEADER].try_into().expect("header");
+        let mut header = [0; HEADER];
+        header[..4].copy_from_slice(&(length as u32).to_le_bytes());
+        header[4..].copy_from_slice(&counter.to_le_bytes());
+        out.write_all(&header)?;
 
         match &self.key {
             Some(key) => {
                 let cipher = Aegis128X2::<TAG>::new(key, &self.nonce(counter));
                 let (sealed, tag) = cipher.encrypt(&body, &header);
-                out.extend(sealed);
-                out.extend(tag);
+                out.write_all(&sealed)?;
+                out.write_all(&tag)?;
             }
-            None => out.extend(&body),
+            None => out.write_all(&body)?,
         }
         Ok(())
     }
@@ -147,6 +153,16 @@ impl Seal {
     /// Open a segment whose header has already been read, leaving the messages
     /// in `out`.
     pub fn open(&mut self, header: &[u8; HEADER], sealed: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        self.open_to(header, sealed, out)
+    }
+
+    /// Authenticate/decompress before exposing messages to the output sink.
+    pub fn open_to(
+        &mut self,
+        header: &[u8; HEADER],
+        sealed: &[u8],
+        out: &mut impl Write,
+    ) -> Result<()> {
         let counter = u64::from_le_bytes(header[4..12].try_into().expect("counter"));
         if counter != self.counter {
             return Err(Error::new(format!(
@@ -172,15 +188,23 @@ impl Seal {
         };
 
         match body.split_first() {
-            Some((&PLAIN, messages)) => out.extend_from_slice(messages),
+            Some((&PLAIN, messages)) => {
+                if messages.len() > crate::wire::MAX_SEGMENT_BYTES + 4 {
+                    return Err(Error::new("opened segment exceeds maximum size"));
+                }
+                out.write_all(messages)?;
+            }
             Some((&LZ4, rest)) => {
                 if rest.len() < 4 {
                     return Err(Error::new("a compressed segment with no size"));
                 }
                 let size = u32::from_le_bytes(rest[..4].try_into().expect("size")) as usize;
+                if size > crate::wire::MAX_SEGMENT_BYTES + 4 {
+                    return Err(Error::new("expanded segment exceeds maximum size"));
+                }
                 let loose = lz4_flex::decompress(&rest[4..], size)
                     .map_err(|e| Error::new(format!("segment {counter} did not expand: {e}")))?;
-                out.extend_from_slice(&loose);
+                out.write_all(&loose)?;
             }
             Some((&other, _)) => {
                 return Err(Error::new(format!("segment {counter} has form {other}")));
@@ -207,6 +231,7 @@ mod tests {
             encrypt,
             compress,
             compress_min: 64,
+            buffer_pool: Default::default(),
             compress_sample: 4096,
             peer_conns: 2,
             key: "000102030405060708090a0b0c0d0e0f".to_string(),
@@ -235,6 +260,24 @@ mod tests {
             at += HEADER + length;
         }
         assert_eq!(at, wire.len());
+    }
+
+    #[test]
+    fn oversized_expansion_is_rejected_before_allocation() {
+        let (_, mut receiver) = pair(&messaging(false, Compress::Lz4));
+        let mut body = vec![LZ4];
+        body.extend(((crate::wire::MAX_SEGMENT_BYTES + 5) as u32).to_le_bytes());
+        let mut header = [0; HEADER];
+        header[..4].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        let mut out = Vec::new();
+        assert!(
+            receiver
+                .open(&header, &body, &mut out)
+                .unwrap_err()
+                .to_string()
+                .contains("maximum size")
+        );
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -333,6 +376,7 @@ mod sampling {
             encrypt: false,
             compress: Compress::Lz4,
             compress_min: 64,
+            buffer_pool: Default::default(),
             compress_sample: sample,
             peer_conns: 2,
             key: "000102030405060708090a0b0c0d0e0f".to_string(),

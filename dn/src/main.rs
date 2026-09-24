@@ -2618,7 +2618,7 @@ mod tests {
                             Resp::ok()
                         };
                         response.id = request.id;
-                        let mut bytes = Vec::new();
+                        let mut bytes = writer.new_buffer();
                         common::wire::put_response(&mut bytes, &response).unwrap();
                         writer.send(&mut bytes).unwrap();
                     }

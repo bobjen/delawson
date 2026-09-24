@@ -8408,9 +8408,55 @@ Each write returns an error without extending the buffer if allocation fails;
 a sequence of writes is not a transaction. `flush` is a no-op, not a durability
 operation. Neither adapter adds a contiguous staging buffer or virtual dispatch.
 The APIs are available as `buffer.reader()`, `buffer.reader_range(range)`, and
-`buffer.writer(rng_callback)`. Existing wire codecs remain on their current
-contiguous storage; compatibility tests check that the new scalar encoding is
-identical, including tags and lengths crossing leaves.
+`buffer.writer(rng_callback)`. Compatibility tests check that scalar encoding is
+identical, including tags and lengths crossing leaves. Message framing now uses
+these cursors; individual tagged-structure payloads still use their existing
+contiguous representation.
+
+**Segmented message batches.** Outgoing peer queues, server response queues,
+direct connection buffers, sealed network output, incoming sealed segments, and
+opened message batches now use `wire::MessageBuffer`, backed by the segmented
+tree. Empty batches allocate no blocks. A process-wide pool is initialized once
+from `messaging.buffer_pool = { max_blocks = 1048576, initial_blocks = 0 }` before
+the first connection handshake; omitted settings use those defaults. This
+reserves 4GiB of payload virtual address space plus packed external links, with
+physical pages supplied on demand. Subsequent connections must use the same pool
+configuration. Thread-local RNGs choose allocation buckets. Pool exhaustion
+propagates as an error rather than publishing a partially framed message.
+
+Small per-message framing scratch remains a reusable Vec in producer threads;
+messages are copied into packed batch leaves while holding the existing queue
+lock. Direct-mode requests/responses encode straight into the batch through a
+statically dispatched writer. Frame lengths are backfilled across boundaries.
+An encoding error rolls back that frame. Batching and send timing are unchanged,
+including one-message batches; large batches split only between complete frames.
+The existing wire byte format, compression selection, authentication tags, and
+nonce sequencing are preserved.
+
+Pool buffers provide vectored send and receive helpers. They build bounded
+arrays of at most 64 pointer/length descriptors on the stack and handle short
+I/O, EINTR, EOF, and lack of progress. Plain TCP uses writev/readv via Rust's
+vectored socket methods, directly referencing the leaves. Receiving uses the
+safe Read interface, which requires initialized destinations: newly exposed
+receive bytes are zeroed before I/O. Failed receives restore the buffer's old
+logical end. This does not restore bytes already consumed from the socket.
+TLS retains its own record buffers; its vectored adapter preserves the existing
+send ordering and separate reader/writer locking.
+
+LZ4 and AEGIS still require contiguous codec inputs. The sender retains a plain
+scratch Vec and the receiver retains a sealed-input scratch Vec for this bridge.
+`Seal::seal_to` and `open_to` write their outputs directly into segmented buffers,
+so there is no additional whole-batch output Vec. This is not an end-to-end
+zero-copy codec pipeline. Compression/encryption still have their own temporary
+allocations. Expanded segment sizes are checked before decompression allocation.
+
+Requests and responses are decoded directly from bounded segmented readers;
+scalar fields spanning leaves use stack storage, while owned argument payloads
+are copied into their existing representations. A frame cannot read into the next
+frame, and consumed leaves/index nodes are returned after decoding each message.
+Tests cover byte compatibility at leaf boundaries, framing rollback, malformed
+lengths, shared pool identity, partial vectored operations and interrupts, socket
+round trips with every compression/encryption combination, and authenticated TLS.
 
 Tests cover packed fields crossing leaves, all six depth transitions using small
 windows at large offsets, 4MiB growth, index-node reclamation, rolling windows

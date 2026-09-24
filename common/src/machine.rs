@@ -453,6 +453,17 @@ impl Stream {
     }
 }
 impl Read for Stream {
+    fn read_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+        if self.tls.is_none() {
+            return self.socket.read_vectored(bufs);
+        }
+        // TLS decrypts into its own buffers. Drain a slice and let the caller
+        // advance; the plain TCP path scatters directly into the supplied leaves.
+        match bufs.iter_mut().find(|b| !b.is_empty()) {
+            Some(buf) => self.read(buf),
+            None => Ok(0),
+        }
+    }
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         let Some(tls) = &self.tls else {
             return self.socket.read(out);
@@ -496,14 +507,17 @@ impl Read for Stream {
 }
 impl Write for Stream {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        self.write_vectored(&[io::IoSlice::new(input)])
+    }
+    fn write_vectored(&mut self, input: &[io::IoSlice<'_>]) -> io::Result<usize> {
         let Some(tls) = &self.tls else {
-            return self.socket.write(input);
+            return self.socket.write_vectored(input);
         };
         let _sending = self.sending.as_ref().unwrap().lock().unwrap();
         let mut encrypted = Vec::new();
         let written = {
             let mut conn = tls.lock().unwrap();
-            let written = conn.writer().write(input)?;
+            let written = conn.writer().write_vectored(input)?;
             while conn.wants_write() {
                 conn.write_tls(&mut encrypted)?;
             }

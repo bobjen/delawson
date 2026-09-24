@@ -96,6 +96,7 @@ pub fn messaging() -> Messaging {
         encrypt: false,
         compress: Compress::None,
         compress_min: 256,
+        buffer_pool: Default::default(),
         compress_sample: 4096,
         peer_conns: 2,
         key: "0f1e2d3c4b5a69788796a5b4c3d2e1f0".to_string(),

@@ -263,6 +263,27 @@ impl<'a> SegmentedBuffer<'a> {
         Ok(())
     }
 
+    /// Return the pool shared by this buffer's nodes.
+    pub fn pool(&self) -> &'a ChunkPool {
+        self.pool
+    }
+
+    /// Release bytes at and after an absolute offset within the live range.
+    pub fn truncate(&mut self, end: u64) -> Result<()> {
+        self.check_range(end, 0)?;
+        self.end = end;
+        self.prune();
+        Ok(())
+    }
+
+    /// Borrow disjoint initialized leaf slices for a writable range.
+    pub fn chunks_mut_range(&mut self, range: std::ops::Range<u64>) -> Result<ChunksMut<'_, 'a>> {
+        if range.start < self.start || range.end > self.end || range.start > range.end {
+            return Err(Error::new("range outside segmented buffer"));
+        }
+        Ok(ChunksMut { buffer: self, offset: range.start, end: range.end })
+    }
+
     /// Release all blocks, retaining the absolute end as the next append offset.
     pub fn clear(&mut self) {
         self.start = self.end;
@@ -354,6 +375,29 @@ impl<'b> Iterator for Chunks<'b, '_> {
     }
 }
 impl std::iter::FusedIterator for Chunks<'_, '_> {}
+
+/// Mutable initialized slices, each belonging to a distinct leaf.
+pub struct ChunksMut<'b, 'p> {
+    buffer: &'b mut SegmentedBuffer<'p>,
+    offset: u64,
+    end: u64,
+}
+impl<'b> Iterator for ChunksMut<'b, '_> {
+    type Item = &'b mut [u8];
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset == self.end {
+            return None;
+        }
+        let index = self.buffer.leaf(self.offset / CHUNK_BYTES as u64);
+        let within = self.offset as usize % CHUNK_BYTES;
+        let count = (self.end - self.offset).min((CHUNK_BYTES - within) as u64) as usize;
+        self.offset += count as u64;
+        // SAFETY: the iterator exclusively borrows the tree for 'b and yields
+        // each leaf at most once. All bytes in its validated range are initialized.
+        Some(unsafe { std::slice::from_raw_parts_mut(self.buffer.ptr(index).add(within), count) })
+    }
+}
+impl std::iter::FusedIterator for ChunksMut<'_, '_> {}
 
 #[cfg(test)]
 mod tests {

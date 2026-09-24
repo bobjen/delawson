@@ -107,8 +107,8 @@ impl Peer {
             .with(|scratch| -> Result<()> {
                 let mut framed = scratch.borrow_mut();
                 framed.clear();
-                put_request(&mut framed, &request.clone().id(id))?;
-                self.sending.put(&framed);
+                put_request(&mut *framed, &request.clone().id(id))?;
+                self.sending.put(&framed)?;
                 Ok(())
             })
             .inspect_err(|_| {

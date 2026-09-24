@@ -281,6 +281,103 @@ impl<'p> SegmentedBuffer<'p> {
     }
 }
 
+// Well below Linux IOV_MAX. Each syscall transfers at most 256KiB of leaves.
+const IO_SLICES: usize = 64;
+
+impl SegmentedBuffer<'_> {
+    /// Send initialized leaves directly, retrying interrupted and short writes.
+    pub fn write_to(&self, output: &mut impl Write) -> io::Result<()> {
+        let mut at = self.start();
+        while at < self.end() {
+            let mut slices: [io::IoSlice<'_>; IO_SLICES] =
+                std::array::from_fn(|_| io::IoSlice::new(&[]));
+            let mut next = at;
+            let mut count = 0;
+            while count < IO_SLICES && next < self.end() {
+                let chunk = self.chunk(next).unwrap();
+                slices[count] = io::IoSlice::new(chunk);
+                next += chunk.len() as u64;
+                count += 1;
+            }
+            match output.write_vectored(&slices[..count]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "segmented write made no progress",
+                    ));
+                }
+                Ok(n) if n as u64 <= next - at => at += n as u64,
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "writer exceeded supplied buffers",
+                    ));
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Append exactly count bytes from vectored reads into the leaves. The safe
+    /// Read trait requires initialized destinations, so newly exposed bytes are
+    /// zeroed before I/O. On EOF, I/O error, or allocation failure, roll back the
+    /// logical append. Bytes already consumed from the input cannot be restored.
+    pub fn read_exact_from(
+        &mut self,
+        input: &mut impl Read,
+        count: usize,
+        mut random: impl FnMut() -> u64,
+    ) -> io::Result<()> {
+        let start = self.end();
+        let end = start.checked_add(count as u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "receive offset overflow")
+        })?;
+        let result = (|| {
+            let mut at = start;
+            while at < end {
+                let window_end = end.min(at.saturating_add(((IO_SLICES - 1) * CHUNK_BYTES) as u64));
+                while self.end() < window_end {
+                    let n = (window_end - self.end()).min(CHUNK_BYTES as u64) as usize;
+                    self.append(&[0; CHUNK_BYTES][..n], &mut random).map_err(io::Error::other)?;
+                }
+                while at < window_end {
+                    let mut slices: [io::IoSliceMut<'_>; IO_SLICES] =
+                        std::array::from_fn(|_| io::IoSliceMut::new(&mut []));
+                    let mut count = 0;
+                    for chunk in self.chunks_mut_range(at..window_end).map_err(io::Error::other)? {
+                        slices[count] = io::IoSliceMut::new(chunk);
+                        count += 1;
+                    }
+                    match input.read_vectored(&mut slices[..count]) {
+                        Ok(0) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "segmented input ended early",
+                            ));
+                        }
+                        Ok(n) if n as u64 <= window_end - at => at += n as u64,
+                        Ok(_) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "reader exceeded supplied buffers",
+                            ));
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.truncate(start).map_err(io::Error::other)?;
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,5 +656,127 @@ mod tests {
             assert_eq!(&reader.read_array::<16>().unwrap(), b"crossing a block");
             assert_eq!(reader.remaining(), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod vectored_tests {
+    use super::*;
+    use crate::ChunkPool;
+
+    struct Transport {
+        bytes: Vec<u8>,
+        at: usize,
+        calls: usize,
+        largest_vector: usize,
+    }
+    impl Transport {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self { bytes, at: 0, calls: 0, largest_vector: 0 }
+        }
+        fn step(&mut self, vectors: usize) -> io::Result<()> {
+            self.calls += 1;
+            self.largest_vector = self.largest_vector.max(vectors);
+            if self.calls % 3 == 1 {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            Ok(())
+        }
+    }
+    impl Write for Transport {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            panic!("expected vectored write")
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn write_vectored(&mut self, slices: &[io::IoSlice<'_>]) -> io::Result<usize> {
+            self.step(slices.len())?;
+            let mut n = 0;
+            for slice in slices {
+                let count = slice.len().min(5003 - n);
+                self.bytes.extend_from_slice(&slice[..count]);
+                n += count;
+                if n == 5003 {
+                    break;
+                }
+            }
+            Ok(n)
+        }
+    }
+    impl Read for Transport {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            panic!("expected vectored read")
+        }
+        fn read_vectored(&mut self, slices: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+            self.step(slices.len())?;
+            let mut n = 0;
+            for slice in slices {
+                let count = slice.len().min(5003 - n).min(self.bytes.len() - self.at);
+                slice[..count].copy_from_slice(&self.bytes[self.at..self.at + count]);
+                self.at += count;
+                n += count;
+                if n == 5003 || self.at == self.bytes.len() {
+                    break;
+                }
+            }
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn vectored_io_handles_short_calls_interrupts_and_multiple_windows() {
+        let pool = ChunkPool::with_buckets(200, 0, 1).unwrap();
+        let mut source = SegmentedBuffer::with_start(&pool, 4093);
+        let bytes: Vec<u8> = (0..300_000).map(|n| (n % 251) as u8).collect();
+        source.append(&bytes, || 0).unwrap();
+        let mut transport = Transport::new(Vec::new());
+        source.write_to(&mut transport).unwrap();
+        assert_eq!(transport.bytes, bytes);
+        assert_eq!(transport.largest_vector, IO_SLICES);
+        let mut dest = SegmentedBuffer::with_start(&pool, 17);
+        dest.append(&[9; 5], || 0).unwrap();
+        dest.read_exact_from(&mut transport, bytes.len(), || 0).unwrap();
+        let mut actual = vec![0; bytes.len()];
+        dest.read_at(22, &mut actual).unwrap();
+        assert_eq!(actual, bytes);
+        assert_eq!(dest.reader().read_array::<5>().unwrap(), [9; 5]);
+        assert!(transport.calls > 100);
+    }
+
+    #[test]
+    fn failed_receive_rolls_back_and_mutable_slices_stay_within_the_range() {
+        let pool = ChunkPool::with_buckets(8, 0, 1).unwrap();
+        let mut dest = SegmentedBuffer::new(&pool);
+        dest.append(&[7; 5000], || 0).unwrap();
+        let mut input = Transport::new(vec![8; 100]);
+        assert_eq!(
+            dest.read_exact_from(&mut input, 9000, || 0).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(dest.len(), 5000);
+        assert!(dest.chunks().all(|c| c.iter().all(|&b| b == 7)));
+        let mut chunks: Vec<_> = dest.chunks_mut_range(4093..4100).unwrap().collect();
+        assert_eq!(chunks.len(), 2);
+        chunks[0].fill(1);
+        chunks[1].fill(2);
+        let mut result = [0; 9];
+        dest.read_at(4092, &mut result).unwrap();
+        assert_eq!(result, [7, 1, 1, 1, 2, 2, 2, 2, 7]);
+        assert!(dest.chunks_mut_range(5000..5001).is_err());
+        dest.truncate(4095).unwrap();
+        assert_eq!(dest.depth(), Some(0));
+    }
+
+    #[test]
+    fn receive_allocation_failure_preserves_existing_bytes() {
+        let pool = ChunkPool::with_buckets(1, 0, 1).unwrap();
+        let mut dest = SegmentedBuffer::new(&pool);
+        dest.append(&[7; 3], || 0).unwrap();
+        let mut input = Transport::new(vec![8; 9000]);
+        assert!(dest.read_exact_from(&mut input, 9000, || 0).is_err());
+        assert_eq!(dest.len(), 3);
+        assert_eq!(dest.reader().read_array::<3>().unwrap(), [7; 3]);
+        assert_eq!(dest.depth(), Some(0));
     }
 }

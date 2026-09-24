@@ -227,6 +227,7 @@ dependencies = [
  "aegis",
  "aes-gcm",
  "crc64-nvme",
+ "delawson-pool",
  "hkdf",
  "libc",
  "lz4_flex",
