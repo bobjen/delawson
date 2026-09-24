@@ -253,37 +253,39 @@ impl Report {
     }
 }
 
-fn audit<L: Links>(
-    pool: &TestPool<L>,
-    owners: &[AtomicU32; BLOCKS],
-) -> std::result::Result<(), String> {
+fn audit<L: Links>(pool: &TestPool<L>, owners: &[AtomicU32]) -> std::result::Result<(), String> {
     if owners.iter().any(|owner| owner.load(SeqCst) != 0) {
         return Err("owner remains after all handles were returned".into());
     }
     let issued = pool.next.load(SeqCst) as usize;
-    if issued > BLOCKS {
-        return Err(format!("issued {issued} blocks, capacity {BLOCKS}"));
+    if issued > owners.len() {
+        return Err(format!("issued {issued} blocks, owner capacity {}", owners.len()));
     }
-    let mut seen = [false; BLOCKS];
-    for list in 0..3 {
-        let mut index = if list == 0 {
-            pool.free.load(SeqCst)
-        } else {
-            pool.deleted[list - 1].head.load(SeqCst)
-        };
-        let mut tail = NONE;
-        while index != NONE {
-            if index as usize >= issued {
-                return Err(format!("list {list} contains unissued index {index}"));
+    let mut seen = vec![false; owners.len()];
+    for (bucket_id, bucket) in pool.buckets.iter().enumerate() {
+        for list in 0..3 {
+            let mut index = if list == 0 {
+                bucket.free.load(SeqCst)
+            } else {
+                bucket.deleted[list - 1].head.load(SeqCst)
+            };
+            let mut tail = NONE;
+            while index != NONE {
+                if index as usize >= issued {
+                    return Err(format!("list {list} contains unissued index {index}"));
+                }
+                if index as usize & (pool.buckets.len() - 1) != bucket_id {
+                    return Err(format!("index {index} in wrong bucket {bucket_id}"));
+                }
+                if std::mem::replace(&mut seen[index as usize], true) {
+                    return Err(format!("duplicate or cycle at index {index}, list {list}"));
+                }
+                tail = index;
+                index = pool.link(index).load(SeqCst);
             }
-            if std::mem::replace(&mut seen[index as usize], true) {
-                return Err(format!("duplicate or cycle at index {index}, list {list}"));
+            if list != 0 && bucket.deleted[list - 1].tail.load(SeqCst) != tail {
+                return Err(format!("incorrect tail for deleted list {}", list - 1));
             }
-            tail = index;
-            index = pool.link(index).load(SeqCst);
-        }
-        if list != 0 && pool.deleted[list - 1].tail.load(SeqCst) != tail {
-            return Err(format!("incorrect tail for deleted list {}", list - 1));
         }
     }
     if seen[..issued].iter().any(|&present| !present) {
@@ -434,12 +436,32 @@ fn validate_windows<L: Links>() {
     let mut counts = [0u32; CASES];
     let mut elapsed = Duration::ZERO;
     let mut longest = Duration::ZERO;
+    let mut total_ops = 0usize;
+    let mut trial_min = usize::MAX;
+    let mut trial_max = 0usize;
+    let mut worker_min = usize::MAX;
+    let mut worker_max = 0usize;
+    let mut full_workers = 0usize;
     for _ in 0..trials {
         let start = Instant::now();
         let report = run_loop::<L>(rng.next_u64(), start + BUDGET, false);
         assert!(report.error.is_none(), "{}", report.dump());
         let flags = report.flags;
         let duration = start.elapsed();
+        // Histories already record every attempted allocation and every return,
+        // including final cleanup. Count them after the measured trial finishes.
+        let mut trial_ops = 0;
+        for history in &report.history {
+            assert!(history.iter().all(|record| record.end != usize::MAX));
+            let ops = history.len();
+            trial_ops += ops;
+            worker_min = worker_min.min(ops);
+            worker_max = worker_max.max(ops);
+            full_workers += usize::from(ops >= HISTORY - BLOCKS);
+        }
+        total_ops += trial_ops;
+        trial_min = trial_min.min(trial_ops);
+        trial_max = trial_max.max(trial_ops);
         elapsed += duration;
         longest = longest.max(duration);
         for (bit, count) in counts.iter_mut().enumerate() {
@@ -451,6 +473,13 @@ fn validate_windows<L: Links>() {
         std::any::type_name::<L>(),
         elapsed / trials,
         longest
+    );
+    eprintln!(
+        "operations: mean {:.1}/trial (range {trial_min}..{trial_max}), mean {:.1}/worker (range {worker_min}..{worker_max}); {full_workers}/{} workers recorded at least {} ops; includes cleanup and failed allocations",
+        total_ops as f64 / trials as f64,
+        total_ops as f64 / (trials as usize * THREADS) as f64,
+        trials as usize * THREADS,
+        HISTORY - BLOCKS,
     );
     for (name, count) in NAMES.iter().zip(counts) {
         eprintln!("{name:40} {count}/{trials}");
@@ -515,4 +544,108 @@ fn calibrate_external_links() {
 #[ignore = "three one-second event-rate measurements"]
 fn calibrate_inline_links() {
     measure_rates::<InlineLinks<8>>();
+}
+
+// The coverage trials deliberately use one bucket to exercise contention. This
+// separately checks ownership, conservation and bucket membership with multiple buckets.
+fn bucketed_ownership<L: Links>(choices: usize, reclaim_each: bool, buckets: usize) {
+    const CAPACITY: usize = 256;
+    let pool = TestPool::<L>::with_buckets(CAPACITY as u32, 64, buckets).unwrap();
+    let mask = buckets - 1;
+    let shift = buckets.trailing_zeros();
+    let owners = std::array::from_fn::<_, CAPACITY, _>(|_| AtomicU32::new(0));
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let pool = &pool;
+            let owners = &owners;
+            scope.spawn(move || {
+                let id = thread as u32 + 1;
+                let mut rng = Rng::from_seed(id as u64);
+                let mut held = Vec::new();
+                for _ in 0..4096 {
+                    if held.is_empty() || rng.next_u32() & 1 == 0 {
+                        let val = rng.next_u64() as usize;
+                        let first = (val ^ mask) & mask;
+                        let delta = (((val >> shift) & (buckets / 2 - 1)) << 1) | 1;
+                        let walk = (0..choices).map(|step| (first + step * delta) & mask);
+                        let result = if reclaim_each {
+                            pool.alloc_reclaiming_each(walk)
+                        } else {
+                            pool.alloc_from_buckets(walk)
+                        };
+                        if let Ok(block) = result {
+                            assert_eq!(
+                                owners[block.index() as usize]
+                                    .compare_exchange(0, id, SeqCst, SeqCst),
+                                Ok(0)
+                            );
+                            block.link().store(id, SeqCst);
+                            held.push(block);
+                        }
+                    } else {
+                        let block = held.swap_remove(rng.next_u32() as usize % held.len());
+                        assert_eq!(block.link().load(SeqCst), id);
+                        assert_eq!(owners[block.index() as usize].swap(0, SeqCst), id);
+                        drop(block);
+                    }
+                }
+                for block in held {
+                    assert_eq!(block.link().load(SeqCst), id);
+                    assert_eq!(owners[block.index() as usize].swap(0, SeqCst), id);
+                    drop(block);
+                }
+            });
+        }
+    });
+    audit(&pool, &owners).unwrap();
+}
+
+#[test]
+fn bucketed_external_ownership() {
+    bucketed_ownership::<ExternalLinks>(1, false, 32);
+}
+
+#[test]
+fn bucketed_inline_ownership() {
+    bucketed_ownership::<InlineLinks<8>>(1, false, 32);
+}
+
+#[test]
+fn two_choice_external_ownership() {
+    bucketed_ownership::<ExternalLinks>(2, false, 32);
+}
+
+#[test]
+fn two_choice_inline_ownership() {
+    bucketed_ownership::<InlineLinks<8>>(2, false, 32);
+}
+
+#[test]
+fn four_choice_external_ownership() {
+    bucketed_ownership::<ExternalLinks>(4, false, 32);
+}
+
+#[test]
+fn four_choice_inline_ownership() {
+    bucketed_ownership::<InlineLinks<8>>(4, false, 32);
+}
+
+#[test]
+fn reclaim_each_external_ownership() {
+    bucketed_ownership::<ExternalLinks>(4, true, 32);
+}
+
+#[test]
+fn reclaim_each_inline_ownership() {
+    bucketed_ownership::<InlineLinks<8>>(4, true, 32);
+}
+
+#[test]
+fn sixty_four_external_ownership() {
+    bucketed_ownership::<ExternalLinks>(4, true, 64);
+}
+
+#[test]
+fn sixty_four_inline_ownership() {
+    bucketed_ownership::<InlineLinks<8>>(4, true, 64);
 }

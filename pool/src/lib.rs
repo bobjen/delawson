@@ -237,15 +237,31 @@ impl Deleted {
     }
 }
 
+// Keep independent buckets off each other's cache lines.
+#[repr(align(64))]
+struct Bucket {
+    free: AtomicU32,
+    deleted: [Deleted; 2],
+    current: AtomicUsize,
+}
+
+impl Bucket {
+    fn new() -> Self {
+        Self {
+            free: AtomicU32::new(NONE),
+            deleted: [Deleted::new(), Deleted::new()],
+            current: AtomicUsize::new(0),
+        }
+    }
+}
+
 pub struct Pool<const ALIGN: usize, const BYTES: usize, L: Links = ExternalLinks> {
     // Links must be dropped before the mapping they may refer to.
     links: L,
     mapping: Mapping,
     max_blocks: u32,
     next: AtomicU32,
-    free: AtomicU32,
-    deleted: [Deleted; 2],
-    current: AtomicUsize,
+    buckets: Box<[Bucket]>,
     #[cfg(test)]
     probe: concurrency::Probe,
 }
@@ -257,6 +273,15 @@ unsafe impl<const A: usize, const B: usize, L: Links> Sync for Pool<A, B, L> {}
 
 impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
     pub fn new(max_blocks: u32, initial_blocks: u32) -> Result<Self> {
+        Self::with_buckets(max_blocks, initial_blocks, 1)
+    }
+
+    /// Each index permanently belongs to index & (bucket_count - 1).
+    /// Call alloc_from_bucket with a caller-generated random value to spread work.
+    pub fn with_buckets(max_blocks: u32, initial_blocks: u32, bucket_count: usize) -> Result<Self> {
+        if !bucket_count.is_power_of_two() || bucket_count > u32::MAX as usize {
+            return Err(Error::new("bucket count must be a representable power of two"));
+        }
         if !A.is_power_of_two() || B == 0 || B % A != 0 {
             return Err(Error::new(
                 "block size must be a positive multiple of power-of-two alignment",
@@ -278,20 +303,19 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
             mapping,
             max_blocks,
             next: AtomicU32::new(initial_blocks),
-            free: AtomicU32::new(NONE),
-            deleted: [Deleted::new(), Deleted::new()],
-            current: AtomicUsize::new(0),
+            buckets: (0..bucket_count).map(|_| Bucket::new()).collect(),
             #[cfg(test)]
             probe: concurrency::Probe::default(),
         };
         for index in 0..initial_blocks {
             // SAFETY: initialization is single-threaded and each index is new.
             unsafe { pool.links.init(index) };
+            let next = index as u64 + bucket_count as u64;
             pool.link(index)
-                .store(if index + 1 == initial_blocks { NONE } else { index + 1 }, SeqCst);
+                .store(if next < initial_blocks as u64 { next as u32 } else { NONE }, SeqCst);
         }
-        if initial_blocks != 0 {
-            pool.free.store(0, SeqCst);
+        for index in 0..initial_blocks.min(bucket_count as u32) {
+            pool.buckets[index as usize].free.store(index, SeqCst);
         }
         Ok(pool)
     }
@@ -307,32 +331,43 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
         unsafe { self.links.link(index) }
     }
 
+    /// Number of indexes issued from the shared virtual array, including initial blocks.
+    /// During concurrent allocation, some issued indexes may still be initializing.
+    pub fn issued_blocks(&self) -> u32 {
+        self.next.load(SeqCst)
+    }
+
     pub const fn block_bytes(&self) -> usize {
         B
     }
 
-    fn pop(&self) -> Option<u32> {
+    fn pop(&self, bucket: &Bucket) -> Option<u32> {
         loop {
+            // This is only an empty hint: never dereference a link until protected
+            // by the shared guard, and reload the head after taking that guard.
+            if bucket.free.load(SeqCst) == NONE {
+                return None;
+            }
             #[cfg(test)]
             if self.probe.cancelled() {
                 return None;
             }
-            let current = self.current.load(SeqCst);
-            let Some(_guard) = self.deleted[current].gate.try_read() else {
+            let current = bucket.current.load(SeqCst);
+            let Some(_guard) = bucket.deleted[current].gate.try_read() else {
                 std::hint::spin_loop();
                 continue;
             };
-            if self.current.load(SeqCst) != current {
+            if bucket.current.load(SeqCst) != current {
                 continue;
             }
-            let mut head = self.free.load(SeqCst);
+            let mut head = bucket.free.load(SeqCst);
             while head != NONE {
                 #[cfg(test)]
                 if self.probe.cancelled() {
                     return None;
                 }
                 let next = self.link(head).load(SeqCst);
-                match self.free.compare_exchange_weak(head, next, SeqCst, SeqCst) {
+                match bucket.free.compare_exchange_weak(head, next, SeqCst, SeqCst) {
                     Ok(_) => {
                         pool_hit!(self, Reused);
                         return Some(head);
@@ -349,18 +384,72 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
         }
     }
 
-    /// Returns an error at capacity if no block is currently safe to reuse.
+    /// Allocates using bucket zero; use alloc_from_bucket to spread bucketed work.
+    /// Returns an error at capacity if no block in that bucket is safe to reuse.
     /// Retired blocks may become available after concurrent operations finish.
     pub fn alloc(&self) -> Result<Block<'_, A, B, L>> {
-        if let Some(index) = self.pop() {
-            return Ok(Block { pool: self, index });
-        }
-        // Two turns can make both retired lists available, including a return to
-        // the initially active list. Neither turn waits for exclusive access.
+        self.alloc_from_bucket(0)
+    }
+
+    /// Tries one bucket, selected by the low bits, then issues a fresh index.
+    /// A fresh index may belong to a different bucket; returns always use its index.
+    /// Other buckets are not searched, even at capacity.
+    pub fn alloc_from_bucket(&self, choice: usize) -> Result<Block<'_, A, B, L>> {
+        self.alloc_from_buckets(std::iter::once(choice))
+    }
+
+    /// Tries caller-selected buckets in order before issuing a fresh index.
+    /// Earlier buckets only try their free lists; only the last choice attempts
+    /// reclamation. Choices are consumed lazily until a free block is found.
+    pub fn alloc_from_buckets(
+        &self,
+        choices: impl IntoIterator<Item = usize>,
+    ) -> Result<Block<'_, A, B, L>> {
+        self.alloc_choices::<false>(choices)
+    }
+
+    /// Tries each free list and its two reclamation turns before the next choice.
+    pub fn alloc_reclaiming_each(
+        &self,
+        choices: impl IntoIterator<Item = usize>,
+    ) -> Result<Block<'_, A, B, L>> {
+        self.alloc_choices::<true>(choices)
+    }
+
+    fn reclaim_pop(&self, bucket: &Bucket) -> Option<u32> {
+        // Two turns can make both retired lists available. Neither waits for
+        // exclusive access.
         for _ in 0..2 {
-            self.recycle();
-            if let Some(index) = self.pop() {
+            self.recycle(bucket);
+            if let Some(index) = self.pop(bucket) {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    fn alloc_choices<const EACH: bool>(
+        &self,
+        choices: impl IntoIterator<Item = usize>,
+    ) -> Result<Block<'_, A, B, L>> {
+        let mut last = None;
+        for choice in choices {
+            let bucket = &self.buckets[choice & (self.buckets.len() - 1)];
+            if let Some(index) = self.pop(bucket) {
                 return Ok(Block { pool: self, index });
+            }
+            if EACH {
+                if let Some(index) = self.reclaim_pop(bucket) {
+                    return Ok(Block { pool: self, index });
+                }
+            }
+            last = Some(bucket);
+        }
+        if !EACH {
+            if let Some(bucket) = last {
+                if let Some(index) = self.reclaim_pop(bucket) {
+                    return Ok(Block { pool: self, index });
+                }
             }
         }
         #[cfg(test)]
@@ -381,18 +470,19 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
     }
 
     fn retire(&self, index: u32) {
+        let bucket = &self.buckets[index as usize & (self.buckets.len() - 1)];
         loop {
             #[cfg(test)]
             if self.probe.cancelled() {
                 return;
             }
-            let current = self.current.load(SeqCst);
-            let list = &self.deleted[current];
+            let current = bucket.current.load(SeqCst);
+            let list = &bucket.deleted[current];
             let Some(_guard) = list.gate.try_read() else {
                 std::hint::spin_loop();
                 continue;
             };
-            if self.current.load(SeqCst) != current {
+            if bucket.current.load(SeqCst) != current {
                 continue;
             }
             let mut head = list.head.load(SeqCst);
@@ -421,19 +511,19 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
         }
     }
 
-    fn recycle(&self) {
+    fn recycle(&self, bucket: &Bucket) {
         #[cfg(test)]
         if self.probe.cancelled() {
             return;
         }
-        let current = self.current.load(SeqCst);
+        let current = bucket.current.load(SeqCst);
         let inactive = 1 - current;
-        let list = &self.deleted[inactive];
+        let list = &bucket.deleted[inactive];
         let Some(_guard) = list.gate.try_write() else {
             pool_hit!(self, RecycleBusy);
             return;
         };
-        if self.current.load(SeqCst) != current {
+        if bucket.current.load(SeqCst) != current {
             return;
         }
         // Any other switch to this list also needs its exclusive lock, so the
@@ -442,14 +532,14 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
         let head = list.head.swap(NONE, SeqCst);
         let tail = list.tail.swap(NONE, SeqCst);
         if head != NONE {
-            let mut free = self.free.load(SeqCst);
+            let mut free = bucket.free.load(SeqCst);
             loop {
                 #[cfg(test)]
                 if self.probe.cancelled() {
                     return;
                 }
                 self.link(tail).store(free, SeqCst);
-                match self.free.compare_exchange_weak(free, head, SeqCst, SeqCst) {
+                match bucket.free.compare_exchange_weak(free, head, SeqCst, SeqCst) {
                     Ok(_) => {
                         if free == NONE {
                             pool_hit!(self, SpliceEmpty);
@@ -470,7 +560,7 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
         }
         // Keep the exclusive lock through the switch; releasing it first would
         // allow a delayed recycler to switch after an intervening full rotation.
-        self.current.store(inactive, SeqCst);
+        bucket.current.store(inactive, SeqCst);
     }
 }
 
@@ -596,11 +686,11 @@ mod tests {
         let second = pool.alloc().unwrap();
         drop(first);
         drop(second);
-        assert_eq!(pool.deleted[0].head.load(SeqCst), 1);
-        assert_eq!(pool.deleted[0].tail.load(SeqCst), 0);
-        pool.recycle();
-        pool.recycle();
-        assert_eq!(pool.free.load(SeqCst), 1);
+        assert_eq!(pool.buckets[0].deleted[0].head.load(SeqCst), 1);
+        assert_eq!(pool.buckets[0].deleted[0].tail.load(SeqCst), 0);
+        pool.recycle(&pool.buckets[0]);
+        pool.recycle(&pool.buckets[0]);
+        assert_eq!(pool.buckets[0].free.load(SeqCst), 1);
         assert_eq!(pool.link(1).load(SeqCst), 0);
         assert_eq!(pool.link(0).load(SeqCst), 2);
         assert_eq!(pool.link(2).load(SeqCst), 3);
@@ -612,22 +702,24 @@ mod tests {
     #[test]
     fn stalled_reader_delays_reuse_but_not_growth_or_retirement() {
         let pool = Pool::<4, 16, InlineLinks<4>>::new(3, 1).unwrap();
-        let old = pool.current.load(SeqCst);
-        let guard = pool.deleted[old].gate.try_read().unwrap();
-        let stale_head = pool.free.load(SeqCst);
+        let old = pool.buckets[0].current.load(SeqCst);
+        let guard = pool.buckets[0].deleted[old].gate.try_read().unwrap();
+        let stale_head = pool.buckets[0].free.load(SeqCst);
         let first = pool.alloc().unwrap();
         first.link().store(0xdeadbeef, SeqCst);
         let stale_next = pool.link(stale_head).load(SeqCst);
         assert_eq!(stale_next, 0xdeadbeef);
-        assert!(pool.free.compare_exchange(stale_head, stale_next, SeqCst, SeqCst).is_err());
+        assert!(
+            pool.buckets[0].free.compare_exchange(stale_head, stale_next, SeqCst, SeqCst).is_err()
+        );
         drop(first);
         let second = pool.alloc().unwrap();
         assert_eq!(second.index(), 1);
-        assert_ne!(pool.current.load(SeqCst), old);
+        assert_ne!(pool.buckets[0].current.load(SeqCst), old);
         drop(second);
         let third = pool.alloc().unwrap();
         assert_eq!(third.index(), 2);
-        assert_eq!(pool.current.load(SeqCst), 1 - old);
+        assert_eq!(pool.buckets[0].current.load(SeqCst), 1 - old);
         assert!(pool.alloc().is_err());
         drop(guard);
         let reused: Vec<_> = (0..2).map(|_| pool.alloc().unwrap()).collect();
@@ -637,11 +729,11 @@ mod tests {
     #[test]
     fn older_group_protects_items_retired_in_new_group() {
         let pool = Pool::<4, 16>::new(2, 1).unwrap();
-        let old = pool.current.load(SeqCst);
-        let guard = pool.deleted[old].gate.try_read().unwrap();
-        let stale_head = pool.free.load(SeqCst);
-        pool.recycle();
-        assert_eq!(pool.current.load(SeqCst), 1 - old);
+        let old = pool.buckets[0].current.load(SeqCst);
+        let guard = pool.buckets[0].deleted[old].gate.try_read().unwrap();
+        let stale_head = pool.buckets[0].free.load(SeqCst);
+        pool.recycle(&pool.buckets[0]);
+        assert_eq!(pool.buckets[0].current.load(SeqCst), 1 - old);
         let block = pool.alloc().unwrap();
         assert_eq!(block.index(), stale_head);
         drop(block); // Retires into the NEW group, with an OLD reader outstanding.
@@ -650,6 +742,96 @@ mod tests {
         assert!(pool.alloc().is_err());
         drop(guard);
         assert_eq!(pool.alloc().unwrap().index(), stale_head);
+    }
+
+    #[test]
+    fn bucket_returns_preserve_identity_and_grace() {
+        let pool = Pool::<4, 16>::with_buckets(64, 64, 32).unwrap();
+        let bucket = &pool.buckets[7];
+        let guard = bucket.deleted[0].gate.try_read().unwrap();
+        let block = pool.alloc_from_bucket(7).unwrap();
+        assert_eq!(block.index(), 7);
+        drop(block);
+        let other = pool.alloc_from_bucket(7).unwrap();
+        assert_eq!(other.index(), 39);
+        drop(other);
+        assert!(pool.alloc_from_bucket(7).is_err());
+        // Bucket 8 can still recycle despite the stalled participant in bucket 7.
+        for _ in 0..4 {
+            drop(pool.alloc_from_bucket(8).unwrap());
+        }
+        drop(guard);
+        let reused = pool.alloc_from_bucket(7).unwrap();
+        assert_eq!(reused.index() & 31, 7);
+        assert_eq!(pool.issued_blocks(), 64);
+    }
+
+    #[test]
+    fn second_bucket_avoids_growth_and_choices_are_lazy() {
+        let pool = Pool::<4, 16>::with_buckets(64, 1, 32).unwrap();
+        let mut draws = 0;
+        let choices = [31, 0, 1].into_iter().inspect(|_| draws += 1);
+        let block = pool.alloc_from_buckets(choices).unwrap();
+        assert_eq!(draws, 2);
+        assert_eq!(block.index(), 0);
+        assert_eq!(pool.issued_blocks(), 1);
+        drop(block);
+        assert_eq!(pool.alloc_from_buckets([31, 0]).unwrap().index(), 0);
+        assert_eq!(pool.issued_blocks(), 1);
+    }
+
+    #[test]
+    fn first_empty_bucket_is_not_reclaimed() {
+        let pool = Pool::<4, 16>::with_buckets(64, 2, 32).unwrap();
+        drop(pool.alloc_from_bucket(0).unwrap());
+        let first = &pool.buckets[0];
+        let current = first.current.load(SeqCst);
+        let head = first.deleted[current].head.load(SeqCst);
+        assert_eq!(head, 0);
+        let _writer = first.deleted[current].gate.try_write().unwrap();
+        // No lock or rotation of the first bucket, even though it has a retiree.
+        let block = pool.alloc_from_buckets([0, 1]).unwrap();
+        assert_eq!(block.index(), 1);
+        assert_eq!(first.current.load(SeqCst), current);
+        assert_eq!(first.deleted[current].head.load(SeqCst), head);
+        assert_eq!(pool.issued_blocks(), 2);
+        // If the second bucket is empty, grow instead of reclaiming the first.
+        assert_eq!(pool.alloc_from_buckets([0, 2]).unwrap().index(), 2);
+        assert_eq!(first.current.load(SeqCst), current);
+        assert_eq!(first.deleted[current].head.load(SeqCst), head);
+    }
+
+    #[test]
+    fn reclaim_each_reuses_first_retiree_before_next_choice() {
+        let pool = Pool::<4, 16>::with_buckets(32, 1, 32).unwrap();
+        drop(pool.alloc_from_bucket(0).unwrap());
+        let mut tried = 0;
+        let block =
+            pool.alloc_reclaiming_each([0, 1, 2, 3].into_iter().inspect(|_| tried += 1)).unwrap();
+        assert_eq!(block.index(), 0);
+        assert_eq!(tried, 1);
+        assert_eq!(pool.issued_blocks(), 1);
+    }
+
+    #[test]
+    fn empty_pop_does_not_take_shared_lock() {
+        let pool = Pool::<4, 16>::new(1, 0).unwrap();
+        let bucket = &pool.buckets[0];
+        let _writer = bucket.deleted[0].gate.try_write().unwrap();
+        assert_eq!(pool.pop(bucket), None);
+    }
+
+    #[test]
+    fn fresh_index_returns_to_its_own_bucket() {
+        let pool = Pool::<4, 16>::with_buckets(1, 0, 32).unwrap();
+        let block = pool.alloc_from_bucket(31).unwrap();
+        assert_eq!(block.index(), 0);
+        drop(block);
+        assert!(pool.alloc_from_bucket(31).is_err());
+        assert_eq!(pool.alloc_from_bucket(0).unwrap().index(), 0);
+        assert_eq!(pool.issued_blocks(), 1);
+        assert!(Pool::<4, 16>::with_buckets(1, 0, 0).is_err());
+        assert!(Pool::<4, 16>::with_buckets(1, 0, 3).is_err());
     }
 
     #[test]

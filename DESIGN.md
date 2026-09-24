@@ -7734,7 +7734,7 @@ available on the free list, not necessarily prefaulted. Mappings stay until pool
 destruction; returning a block does not call `munmap` or discard its pages.
 
 The implementation is a standalone workspace crate in `pool/`, imported as `pool`.
-It is intended for indexed items in SN and DN virtual arrays. Each consumer creates
+It is intended for indexed items in SN and DN virtual arrays. Their motivation is compact, persistable 4-byte indexes instead of 8-byte pointers, dense item storage in a virtual array, and efficient address calculation for lookup by index. The pool need not outperform malloc/free to provide these representation benefits. Persisting indexes still requires preserving or reconstructing the corresponding array layout and allocation state. Each consumer creates
 its own pool with runtime maximum and initial counts; there is no process-global
 pool or automatic daemon initialization. Its only production dependency is libc;
 its tests and benchmark reuse common's RNG through a development dependency.
@@ -7757,7 +7757,7 @@ reference spanning the link or non-atomic writes to it. Other link layouts can
 implement the unsafe `Links` contract. Index `u32::MAX` is reserved as the empty-list
 sentinel, permitting at most `u32::MAX` blocks.
 
-Recycling uses one free list and two deleted lists, each deleted list protected by
+Recycling within each bucket uses one free list and two deleted lists, each deleted list protected by
 an `AtomicI64` reader/writer counter. An atomic selector identifies the current group. Both allocation from
 the free list and return to a deleted list try its shared lock and recheck the
 selector before reading list state. Returns push onto the current deleted list;
@@ -7920,6 +7920,234 @@ execution or exact malloc speedup ratios at four and fifteen threads: malloc was
 not measured in this experiment. SMT also means fifteen workers do not represent
 fifteen physical cores. No implementation changes were made.
 
+The timing benchmark now defaults to 1,000,000 maximum blocks, still with zero
+initial blocks, to measure the normal non-exhausted workload. The correctness and
+coverage tests retain their small capacity because exhaustion is a required case.
+Three alternating-layout release runs, eight workers with one million calls each,
+capacity 1,000,000, seeds 42/43/44:
+
+| Links | Run 1 (s) | Run 2 (s) | Run 3 (s) | Mean (s) | Million calls/s |
+|---|---:|---:|---:|---:|---:|
+| External | 1.204 | 1.153 | 0.960 | 1.106 | 7.24 |
+| Inline | 0.968 | 0.933 | 1.541 | 1.147 | 6.97 |
+
+Every run had zero failed allocations. Successful allocation counts were
+4,003,439 / 4,003,637 / 4,004,053 in both layouts, with matching return counts
+including final cleanup. Earlier 16-block scaling runs averaged 2.256 s external
+and 1.905 s inline; these are historical comparisons, not interleaved controls.
+Exhaustion materially affected the earlier workload. These results establish the
+larger-capacity baseline before any multiple-pool experiment; no pool algorithm
+changes were made. The same-thread-free and untouched-payload limitations remain.
+
+System allocation benchmark modes now have no maximum-block limit and no shared
+live counter. Their `blocks` argument only reserves the worker handle Vec's initial
+capacity; it does not limit allocation. Pool modes still require a capacity for
+virtual address reservation. This supersedes the capped malloc/aligned wrappers
+used in the historical comparisons above.
+
+Uncapped malloc/free, eight workers with one million calls each, starting empty,
+three warmed release runs with seeds 42/43/44: 69.489 / 67.606 / 68.125 ms, mean
+68.407 ms. All runs had zero failures and exactly the same successful allocation
+and cleanup return counts as the million-block pool runs. The mean corresponds to
+0.0684 microseconds per call per concurrent worker, or 0.00855 microseconds per call
+in aggregate throughput terms (about 117 million calls/s). The million-block pools
+were about 16–17 times slower by mean. These are separate measurements, not
+interleaved controls. Actual malloc/free calls were verified in disassembly.
+
+Removing the shared counter more than offset the extra successful allocations
+relative to the historical capped malloc workload (mean 0.265 s). This is consistent
+with shared-counter contention being expensive; it is not an isolated measurement
+of that counter's cost because the capacity and success mix also changed. Same-thread
+frees and untouched payloads still apply. The aligned mode also no longer caps
+allocations, but was not remeasured in this experiment.
+
+The pool also supports independent reuse buckets over the same virtual array and
+link mapping. `Pool::new` retains one bucket; `Pool::with_buckets(max, initial, 32)`
+creates 32. Bucket count must be a power of two. Each bucket has its own free list,
+two deleted lists, AtomicI64 locks and selector, aligned to a 64-byte boundary to
+avoid sharing cache lines with adjacent buckets. A block's permanent home is
+`index & (bucket_count - 1)`. Initial free chains use that same partition.
+`alloc_from_bucket(choice)` masks a caller-supplied random value, tries that bucket
+and its two reclamation turns, then issues a fresh sequential index from the shared
+cursor. The new index may belong to a different bucket than the one tried; it has
+never been published on any free list. Every return goes to the index's permanent
+home. No other bucket is searched when the selected bucket is empty. At capacity,
+allocation can fail despite reusable blocks in another bucket. `alloc()` selects
+bucket zero, so bucketed callers should use `alloc_from_bucket`.
+
+Grace periods remain per bucket. Permanent membership ensures that every free-list
+reader of an index participates in the same bucket's reclamation protocol, preserving
+the original ABA argument. `issued_blocks()` reports the shared cursor (initial
+plus freshly issued indexes), not the number currently held or resident pages.
+Unused blocks in other buckets are retained reusable capacity, not lost indexes.
+
+The benchmark modes `external32` and `inline32` select random buckets. Every worker
+has its own operation RNG and its own separate bucket RNG: the latter does not
+perturb allocation/free decisions, allowing paired seeds to produce identical
+operation counts across variants. The extra RNG draw is included in timing. CSV
+output now appends issued indexes (empty for system allocation). Three warmed,
+interleaved runs, eight workers times one million calls, capacity one million,
+starting empty, seeds 42/43/44:
+
+| Links | Buckets | Run 1 (ms) | Run 2 (ms) | Run 3 (ms) | Mean (ms) | Issued indexes, runs 1/2/3 |
+|---|---:|---:|---:|---:|---:|---|
+| External | 1 | 887.079 | 888.919 | 893.000 | 889.666 | 7,255 / 7,473 / 7,548 |
+| External | 32 | 113.907 | 119.918 | 118.476 | 117.434 | 8,952 / 9,282 / 9,870 |
+| Inline | 1 | 951.976 | 953.835 | 956.688 | 954.166 | 7,163 / 7,343 / 7,971 |
+| Inline | 32 | 126.734 | 127.417 | 129.210 | 127.787 | 8,987 / 9,239 / 9,898 |
+
+The bucketed variants are 7.58x and 7.47x faster by mean, issuing about 26% and 25%
+more indexes respectively. All twelve runs had zero failures, identical per-seed
+successful allocation counts, and all handles returned. In addition to existing
+one-bucket coverage tests, bucketed tests check simultaneous ownership, unchanged
+atomic application markers, conservation across all 96 lists, correct home buckets,
+initial partitioning, fresh-index home assignment, and independent progress while
+a participant stalls in a different bucket. The existing same-thread-free and
+untouched-payload benchmark limitations still apply.
+
+Allocation now checks a bucket's free-list head with an atomic load before taking
+the shared guard. An empty head returns immediately. A nonempty hint is never
+followed to its link: the protected path acquires and validates the guard, then
+reloads the head, so the early check does not weaken the ABA protection.
+
+The first version of `alloc_from_buckets(choices)` accepted a statically dispatched
+iterator of choices, consuming them lazily. It tried each bucket with its two reclamation turns
+before trying the next, and only then issues a fresh index. The original one-choice
+API delegates to a one-element iterator. Benchmark modes `external32x2` and
+`inline32x2` try two distinct random buckets: the second choice is generated only
+when the first cannot supply a block. Operation RNG streams remain unchanged.
+This API also supports later experiments with more choices without virtual calls.
+
+Three paired, interleaved runs compared the saved previous binary, the empty-list
+check alone, and two choices with that check. Eight threads, one million calls per
+thread, one million maximum blocks, starting empty:
+
+| Links | Variant | Mean ms (range) | Issued indexes, runs 1/2/3 |
+|---|---|---:|---|
+| External | Previous one choice | 123.740 (121.483–125.473) | 8,922 / 9,339 / 9,846 |
+| External | One choice, empty check | 114.555 (113.039–115.338) | 10,897 / 11,279 / 11,298 |
+| External | Two choices, empty check | 124.710 (121.267–126.475) | 7,922 / 8,376 / 8,918 |
+| Inline | Previous one choice | 121.671 (116.328–125.293) | 8,848 / 9,245 / 9,699 |
+| Inline | One choice, empty check | 120.465 (119.850–120.865) | 10,909 / 11,154 / 11,205 |
+| Inline | Two choices, empty check | 127.726 (122.061–131.251) | 8,068 / 7,541 / 8,621 |
+
+Two choices reduce issued indexes by about 25% external and 27% inline relative
+to one choice with the same empty check, at about 9% and 6% greater mean time.
+Compared with the previous binary, elapsed time is similar and issued counts are
+lower. The empty check alone increased issued counts in these runs; the timing
+and reclamation opportunities changed, so this is not solely a fixed-distribution
+bucket occupancy comparison. All eighteen runs had zero failures and matched
+per-seed successful allocation counts. Tests cover lazy choice consumption,
+second-bucket reuse without growth, skipping the shared guard for an empty list,
+and concurrent ownership/conservation for two-choice allocation.
+
+Bob corrected the two-choice policy: only the final bucket may attempt
+reclamation. Earlier choices try their free lists only; if the first head is empty,
+the only access to that bucket is the atomic head check. The implementation now
+keeps the last unsuccessful choice and performs its two reclamation turns after
+all free-list attempts fail. Single-choice behavior is unchanged.
+
+The two-choice benchmark now consumes exactly one random value per allocation:
+`first = (val ^ 0x1f) & 0x1f`, `delta = ((val >> 5) & 0xf) + 1`, and
+`second = (first + delta) & 0x1f`. The delta ranges from 1 through 16, guaranteeing
+a different second bucket without another draw. It still uses each worker's separate
+bucket RNG, leaving the operation sequence unchanged. Tests verify no locking or
+rotation of an empty first bucket even when it has retirees and a held write lock.
+
+Three paired runs with the same eight-thread/eight-million-call setup:
+
+| Links | Variant | Mean ms (range) | Issued indexes, runs 1/2/3 |
+|---|---|---:|---|
+| External | One choice | 119.155 (117.673–121.889) | 10,874 / 11,016 / 11,685 |
+| External | Previous two choices, both reclaim | 119.185 (113.848–125.324) | 8,382 / 8,190 / 8,939 |
+| External | Corrected two choices, final reclaims | 121.594 (119.788–123.624) | 8,276 / 8,842 / 8,987 |
+| Inline | One choice | 121.584 (118.147–124.759) | 10,685 / 10,946 / 11,233 |
+| Inline | Previous two choices, both reclaim | 130.888 (129.156–133.720) | 7,858 / 8,406 / 8,450 |
+| Inline | Corrected two choices, final reclaims | 132.145 (131.469–132.817) | 8,459 / 8,518 / 9,149 |
+
+All runs had zero failures and matching per-seed operation counts. The corrected
+version has similar timings to the prior two-choice variant and slightly higher
+issued counts. Both the reclamation order and bucket selection changed in this
+comparison, so it does not isolate either change's individual effect.
+
+The four-choice variant (`external32x4` / `inline32x4`) walks
+`(first + step * delta) & 31` for steps 0 through 3, using the same one-draw first
+and delta formula. Only the last choice attempts reclamation; preceding choices
+only try free lists. Delta 16 therefore visits two buckets twice, intentionally
+preserving the requested walk rather than substituting a distinct-bucket policy.
+
+Three paired, interleaved release runs at eight threads, one million calls per
+thread, one million maximum blocks, initially empty:
+
+| Links | Choices | Mean ms (range) | Issued indexes, runs 1/2/3 |
+|---|---:|---:|---|
+| External | 2 | 121.085 (112.443–126.715) | 8,481 / 8,504 / 9,293 |
+| External | 4 | 160.513 (158.204–163.530) | 8,296 / 8,603 / 9,154 |
+| Inline | 2 | 127.243 (121.508–132.388) | 8,508 / 7,732 / 9,364 |
+| Inline | 4 | 165.540 (164.667–166.282) | 8,344 / 8,678 / 9,315 |
+
+Four choices cost about 30–33% more time, without a consistent capacity saving:
+mean issued indexes decreased about 0.9% for external links and increased about
+2.9% for inline links. All runs had zero failures and identical per-seed successful
+allocation counts. Four-choice concurrent ownership and conservation tests pass.
+
+The delta formula was then corrected to be odd by construction:
+`delta = (((val >> 5) & 0xf) << 1) | 1` (equivalently multiply by two and add one).
+This supersedes the earlier 1-through-16 delta: the current step is an odd value
+from 1 through 31 and walks all 32 buckets without repeating. First-bucket selection
+and final-choice-only reclamation are unchanged. Three paired runs with the same
+settings, using the corrected formula in both benchmark and concurrency tests:
+
+| Links | Choices | Mean ms (range) | Issued indexes, runs 1/2/3 |
+|---|---:|---:|---|
+| External | 2 | 121.269 (115.466–127.078) | 8,178 / 8,803 / 9,396 |
+| External | 4 | 159.168 (148.968–167.698) | 8,578 / 8,674 / 8,937 |
+| Inline | 2 | 132.236 (130.799–133.539) | 8,273 / 8,808 / 9,298 |
+| Inline | 4 | 169.870 (168.640–171.347) | 8,279 / 8,526 / 9,278 |
+
+All runs had zero failures and identical per-seed operation counts. Four choices
+remain about 28–31% slower, with only about 0.7–1.1% lower mean issued counts.
+
+A further four-choice variant calls `alloc_reclaiming_each(choices)`, attempting
+the free list and then the usual two nonblocking reclamation turns at every choice
+before advancing. Benchmark modes `external32x4all` and `inline32x4all` retain the
+same odd-delta walk, RNG streams, capacity, and operation counts. The two policies
+share the allocation code with a compile-time reclamation-policy parameter.
+Three paired eight-thread/eight-million-call runs:
+
+| Links | Reclaim at | Mean ms (range) | Issued indexes, runs 1/2/3 |
+|---|---|---:|---|
+| External | Fourth choice only | 152.185 (148.896–154.217) | 8,208 / 8,701 / 9,223 |
+| External | Every choice | 126.832 (125.187–129.207) | 7,803 / 7,916 / 8,505 |
+| Inline | Fourth choice only | 163.786 (161.513–167.108) | 8,160 / 8,592 / 9,195 |
+| Inline | Every choice | 140.040 (138.469–141.830) | 7,713 / 7,721 / 8,613 |
+
+Reclaiming at every choice reduced time by about 15–17% and mean issued indexes by
+about 7%. All runs had zero allocation failures and matched per-seed operation
+counts. Tests verify that a first-bucket retiree is reused before later choices
+are consumed, plus concurrent ownership and conservation under this policy.
+
+The `external64x4all` / `inline64x4all` variants use 64 buckets, four choices,
+and reclamation at each choice. Bucket constants are derived from the count:
+`mask = buckets - 1`, `shift = log2(buckets)`,
+`first = (val ^ mask) & mask`, and
+`delta = (((val >> shift) & (buckets / 2 - 1)) << 1) | 1`.
+For 64 buckets these are mask 0x3f, shift 6, and half-count mask 0x1f;
+the delta is odd from 1 through 63. The pool's permanent-home mask already derives
+from its bucket count. Three paired runs, eight threads and eight million calls:
+
+| Links | Buckets | Mean ms (range) | Issued indexes, runs 1/2/3 |
+|---|---:|---:|---|
+| External | 32 | 128.569 (124.636–134.233) | 7,430 / 7,772 / 8,736 |
+| External | 64 | 98.966 (96.926–100.399) | 8,099 / 8,118 / 8,562 |
+| Inline | 32 | 137.369 (136.401–138.053) | 7,883 / 7,684 / 8,349 |
+| Inline | 64 | 108.661 (107.331–109.622) | 8,089 / 8,362 / 8,619 |
+
+64 buckets reduced mean time by 21–23% with about 4–5% more issued indexes.
+All runs had zero allocation failures and identical per-seed operation counts.
+Concurrent ownership/conservation tests now also cover 64 buckets with the derived
+selection formula.
+
 Two rules are essential. **POOL-REUSE-AFTER-GRACE:** a popped index cannot reappear
 on the free list until every pool operation that could hold its old head value
 has ended. Shared participation, selector revalidation, and exclusive locking through
@@ -7943,6 +8171,25 @@ Histories include thread identity, indexes, and tickets bracketing each API call
 the tickets describe observed invocation/completion order, not linearization points.
 A failure prints the loop seed and histories. `POOL_TEST_SEED` selects the initial
 seed for repeating operation choices, although thread scheduling is not replayed.
+
+Counting completed records from the existing histories after each trial (no new
+worker-loop instrumentation), 1,000 trials per layout and build profile measured:
+
+| Build | Links | Mean operations/trial | Trial operation range | Mean operations/worker | Mean elapsed/trial |
+|---|---|---:|---:|---:|---:|
+| Debug | External | 5,644.7 | 4,659–7,066 | 705.6 | 3.326 ms |
+| Debug | Inline | 5,700.6 | 4,885–6,971 | 712.6 | 3.329 ms |
+| Release | External | 8,672.8 | 7,372–9,430 | 1,084.1 | 3.273 ms |
+| Release | Inline | 7,651.0 | 6,642–8,951 | 956.4 | 3.281 ms |
+
+Counts include failed allocation attempts and cleanup returns, across eight
+workers per trial; elapsed time includes setup and auditing. None of the 32,000
+worker loops reached even 4,080 records, so the time limit, not the history limit,
+stopped these trials. All twelve coverage flags appeared in every trial. The
+3 ms worker interval divided by mean operations per worker is approximately
+2.77 microseconds for external links and 3.14 for inline links in release mode;
+these are approximate concurrent per-worker costs, not single-thread latency.
+The ignored `validate_` tests now print these operation counts and ranges.
 
 The flags cover recycled allocation, fresh allocation, exhaustion, return to empty
 and nonempty deleted lists, recycling an empty deleted list, splicing onto empty
