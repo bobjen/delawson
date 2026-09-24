@@ -7740,7 +7740,7 @@ pool or automatic daemon initialization. Its only production dependency is libc;
 its tests and benchmark reuse common's RNG through a development dependency.
 Checkpoints and EN buffers can use system allocation directly; the malloc and
 aligned-allocation variants exist only in the comparison benchmark, not the pool
-API. `alloc()` returns a result
+API. `alloc(random)` returns a result
 containing an owning handle, and drop or `pool::free` returns the block. The handle
 borrows the pool, so its mappings cannot disappear while a block is live. Exhaustion
 is reported if neither a reusable nor a new index is available; delayed reclamation
@@ -7962,8 +7962,9 @@ frees and untouched payloads still apply. The aligned mode also no longer caps
 allocations, but was not remeasured in this experiment.
 
 The pool also supports independent reuse buckets over the same virtual array and
-link mapping. `Pool::new` retains one bucket; `Pool::with_buckets(max, initial, 32)`
-creates 32. Bucket count must be a power of two. Each bucket has its own free list,
+link mapping. The initial experiment retained one bucket in `Pool::new`;
+`Pool::with_buckets(max, initial, 32)` creates 32. The selected default described
+below now uses 256 buckets. Bucket count must be a power of two. Each bucket has its own free list,
 two deleted lists, AtomicI64 locks and selector, aligned to a 64-byte boundary to
 avoid sharing cache lines with adjacent buckets. A block's permanent home is
 `index & (bucket_count - 1)`. Initial free chains use that same partition.
@@ -7972,8 +7973,9 @@ and its two reclamation turns, then issues a fresh sequential index from the sha
 cursor. The new index may belong to a different bucket than the one tried; it has
 never been published on any free list. Every return goes to the index's permanent
 home. No other bucket is searched when the selected bucket is empty. At capacity,
-allocation can fail despite reusable blocks in another bucket. `alloc()` selects
-bucket zero, so bucketed callers should use `alloc_from_bucket`.
+allocation can fail despite reusable blocks in another bucket. The experimental
+`alloc_from_bucket` API selects exactly one bucket; the current default `alloc(random)`
+uses the four-choice policy described below.
 
 Grace periods remain per bucket. Permanent membership ensures that every free-list
 reader of an index participates in the same bucket's reclamation protocol, preserving
@@ -8147,6 +8149,140 @@ from its bucket count. Three paired runs, eight threads and eight million calls:
 All runs had zero allocation failures and identical per-seed operation counts.
 Concurrent ownership/conservation tests now also cover 64 buckets with the derived
 selection formula.
+
+The 128-bucket variants (`external128x4all` / `inline128x4all`) retain four choices
+and reclamation at every choice. Derived constants are mask 0x7f, shift 7, and
+half-count mask 0x3f, giving odd deltas 1 through 127. Three paired, interleaved
+runs compared them with 64 buckets and uncapped malloc/free, eight threads and
+eight million calls, starting empty:
+
+| Implementation | Mean ms (range) | Issued indexes, runs 1/2/3 |
+|---|---:|---|
+| malloc/free | 68.819 (65.990–71.161) | Not applicable |
+| External, 64 buckets | 99.915 (97.599–102.267) | 7,925 / 7,849 / 8,870 |
+| External, 128 buckets | 86.815 (84.527–88.407) | 7,932 / 8,424 / 8,576 |
+| Inline, 64 buckets | 108.318 (106.250–112.161) | 7,682 / 8,206 / 8,035 |
+| Inline, 128 buckets | 93.969 (92.421–95.469) | 7,589 / 8,250 / 9,048 |
+
+128 buckets reduced mean time by about 13% versus 64, with mean issued indexes
+about 1% higher for external links and 4% higher for inline links. Relative to malloc,
+the 128-bucket means are 1.26x external and 1.37x inline. All variants made exactly
+4,003,439 / 4,003,637 / 4,004,053 successful allocations in the three runs, with
+matching returns including cleanup and zero failures. Issued indexes count distinct
+pool slots, not allocation calls; the number of distinct underlying malloc blocks
+is not measured. Concurrent ownership/conservation tests also cover 128 buckets.
+
+The benchmark also supports `external256x4all`, `external512x4all`,
+`inline256x4all`, and `inline512x4all`, with all masks and shifts derived from
+bucket count. Three paired runs against uncapped malloc/free, unchanged eight
+threads, eight million calls, four choices with reclamation at each choice:
+
+| Implementation | Mean ms (range) | Issued indexes, runs 1/2/3 |
+|---|---:|---|
+| malloc/free | 71.424 (70.090–72.525) | Not applicable |
+| External, 256 buckets | 81.768 (81.080–82.199) | 8,402 / 7,273 / 9,130 |
+| External, 512 buckets | 79.963 (77.292–82.403) | 8,094 / 8,588 / 9,640 |
+| Inline, 256 buckets | 88.864 (86.808–91.307) | 7,427 / 7,764 / 9,036 |
+| Inline, 512 buckets | 87.112 (85.147–90.283) | 8,865 / 8,919 / 9,756 |
+
+The 512-bucket means are about 12% slower than malloc for external links and 22%
+slower for inline links. Moving from 256 to 512 reduces mean time only about 2%,
+with overlapping ranges, while increasing mean issued indexes about 6% external
+and 14% inline. All runs had zero failures and the same per-seed successful
+allocation counts as earlier paired runs. Ownership/conservation tests cover both
+new bucket counts; their helper uses capacity 1,024 and initially one block per
+bucket so every bucket participates in the initial partition.
+
+An experimental reclamation fast path first atomically read both deleted-list heads and returned if
+both are empty, avoiding exclusive-lock acquisition and rotation in that case.
+These observations are hints: a concurrent return can be missed until a later
+attempt. Checking only the inactive list would prevent needed rotation when the
+current list contains retirees, so the optimization explicitly checks both.
+Regression tests cover skipping an empty pair and still rotating an empty inactive
+list when the current list contains a retiree. The older-group grace-period test
+now seeds a retiree to drive its intentional rotation.
+
+Three paired 256-bucket runs (four choices, reclaim each, eight threads/eight
+million calls) found no measurable speed benefit:
+
+| Links | Both-empty check | Mean ms (range) | Issued indexes, runs 1/2/3 |
+|---|---|---:|---|
+| External | Before | 84.708 (83.932–85.232) | 7,935 / 7,949 / 9,117 |
+| External | After | 84.642 (82.534–86.569) | 7,888 / 8,336 / 8,316 |
+| Inline | Before | 89.231 (88.315–90.265) | 7,599 / 8,258 / 8,065 |
+| Inline | After | 89.446 (87.739–91.511) | 8,359 / 8,483 / 8,289 |
+
+The mean differences are below 0.3% and the timing ranges overlap. All runs had
+zero failures and matching operation counts. The check and its test adjustments were removed at Bob's request because it showed
+no measurable benefit. Reclamation retains the previous exclusive-lock and rotation
+behavior, including for empty deleted lists.
+
+The `external256x8all` / `inline256x8all` variants check up to eight buckets along
+the same odd-delta walk, attempting reclamation at each. The rejected both-deleted-
+lists-empty check is absent. Three paired runs against four choices and uncapped
+malloc/free, eight threads/eight million calls:
+
+| Implementation | Mean ms (range) | Issued indexes, runs 1/2/3 |
+|---|---:|---|
+| malloc/free | 67.746 (66.901–68.442) | Not applicable |
+| External, four choices | 86.421 (84.163–87.621) | 8,051 / 8,426 / 8,908 |
+| External, eight choices | 101.818 (99.526–103.606) | 7,626 / 8,443 / 8,299 |
+| Inline, four choices | 89.846 (88.210–92.644) | 8,126 / 8,432 / 8,547 |
+| Inline, eight choices | 103.134 (102.397–103.559) | 8,102 / 8,230 / 8,268 |
+
+Eight choices cost 15–18% more mean time for only 2–4% fewer issued indexes.
+Compared with malloc, four-choice means are 1.28x external and 1.33x inline;
+eight-choice means are 1.50x and 1.52x. All runs had zero failures and matched
+per-seed operation counts. Eight-choice ownership/conservation tests pass.
+
+The `external256x2all` / `inline256x2all` modes compare two choices with reclamation
+at each against four choices and uncapped malloc/free. Optional `--count-live`
+after the seed enables separate accounting runs: a shared live counter increments
+on a successful allocation result and decrements immediately before returning the
+handle; a shared maximum records peak caller-held blocks. This counts owned handles,
+not allocator-internal caches or allocations in flight. Both counters are absent
+from the ordinary timing loop through compile-time specialization. CSV appends the
+peak count (empty in timing mode). The accounting counters change scheduling, so
+peaks and issued indexes from these runs are reported separately from timing runs.
+
+Three paired eight-thread/eight-million-call timing runs, capacity one million:
+
+| Implementation | Mean ms (range) | Issued indexes, timing runs 1/2/3 |
+|---|---:|---|
+| malloc/free | 69.103 (68.387–69.954) | Not applicable |
+| External, two choices | 69.434 (67.240–73.056) | 9,095 / 8,140 / 10,048 |
+| External, four choices | 84.474 (82.218–87.014) | 8,552 / 8,295 / 9,090 |
+| Inline, two choices | 75.233 (73.592–76.409) | 9,163 / 9,696 / 9,458 |
+| Inline, four choices | 87.932 (86.272–89.704) | 8,218 / 8,032 / 8,679 |
+
+Separate accounting runs with the same seeds:
+
+| Implementation | Peak live handles, runs 1/2/3 | Issued indexes, runs 1/2/3 |
+|---|---|---|
+| malloc/free | 7,256 / 8,089 / 8,457 | Not applicable |
+| External, two choices | 7,365 / 7,782 / 8,051 | 8,916 / 9,432 / 9,482 |
+| External, four choices | 7,284 / 8,081 / 8,381 | 7,822 / 8,625 / 8,922 |
+| Inline, two choices | 7,925 / 7,605 / 7,883 | 9,362 / 9,042 / 9,576 |
+| Inline, four choices | 6,928 / 7,934 / 7,884 | 7,568 / 8,347 / 8,485 |
+
+Two-choice external links effectively tie malloc in this batch (69.434 versus
+69.103 ms, with overlapping ranges); inline links take 75.233 ms, about 9% more.
+Two choices are 14–18% faster than four, but issue more indexes. Malloc peak live
+handles provide the requested useful-block demand comparison, though not physical
+heap residency. Accounting runs took roughly 225–348 ms because of shared counters;
+those elapsed times are not used in throughput comparisons. All thirty runs had
+zero failures, matching allocation/return counts, and accounting ended at zero live
+handles. Tests also cover two-choice reclaim-each concurrency at 256 buckets.
+
+The selected production default is **256 buckets, up to four choices, reclamation
+at every choice**. Bob preferred fewer retained blocks over the two-choice speed
+advantage. `Pool::new(max, initial)` uses `DEFAULT_BUCKETS = 256`; `alloc(random)`
+takes one u64 from the calling thread's RNG and walks up to `DEFAULT_CHOICES = 4`
+buckets with the odd-delta formula. No RNG is shared or hidden inside the pool.
+Explicit bucket counts and allocation policies remain available for experiments.
+Single-bucket coverage and grace-period tests construct one bucket explicitly.
+The benchmark's default mode is `external256x4all`; both external and inline
+256/four/reclaim-each benchmark modes exercise the selected public `alloc` API.
 
 Two rules are essential. **POOL-REUSE-AFTER-GRACE:** a popped index cannot reappear
 on the free list until every pool operation that could hold its old head value

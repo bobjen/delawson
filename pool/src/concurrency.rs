@@ -169,7 +169,7 @@ impl<L: Links> Worker<'_, L> {
             }
             if held.is_empty() || rng.next_u32() & 1 == 0 {
                 self.begin('A', NONE);
-                match self.pool.alloc() {
+                match self.pool.alloc_from_bucket(0) {
                     Ok(block) => {
                         let index = block.index();
                         self.end(index);
@@ -295,7 +295,7 @@ fn audit<L: Links>(pool: &TestPool<L>, owners: &[AtomicU32]) -> std::result::Res
 }
 
 fn run_loop<L: Links>(seed: u64, deadline: Instant, count_hits: bool) -> Report {
-    let mut pool = TestPool::<L>::new(BLOCKS as u32, 0).unwrap();
+    let mut pool = TestPool::<L>::with_buckets(BLOCKS as u32, 0, 1).unwrap();
     pool.probe.deadline = Some(deadline);
     pool.probe.count_hits = count_hits;
     let owners = std::array::from_fn(|_| AtomicU32::new(0));
@@ -549,8 +549,8 @@ fn calibrate_inline_links() {
 // The coverage trials deliberately use one bucket to exercise contention. This
 // separately checks ownership, conservation and bucket membership with multiple buckets.
 fn bucketed_ownership<L: Links>(choices: usize, reclaim_each: bool, buckets: usize) {
-    const CAPACITY: usize = 256;
-    let pool = TestPool::<L>::with_buckets(CAPACITY as u32, 64, buckets).unwrap();
+    const CAPACITY: usize = 1024;
+    let pool = TestPool::<L>::with_buckets(CAPACITY as u32, buckets as u32, buckets).unwrap();
     let mask = buckets - 1;
     let shift = buckets.trailing_zeros();
     let owners = std::array::from_fn::<_, CAPACITY, _>(|_| AtomicU32::new(0));
@@ -648,4 +648,54 @@ fn sixty_four_external_ownership() {
 #[test]
 fn sixty_four_inline_ownership() {
     bucketed_ownership::<InlineLinks<8>>(4, true, 64);
+}
+
+#[test]
+fn one_twenty_eight_external_ownership() {
+    bucketed_ownership::<ExternalLinks>(4, true, 128);
+}
+
+#[test]
+fn one_twenty_eight_inline_ownership() {
+    bucketed_ownership::<InlineLinks<8>>(4, true, 128);
+}
+
+#[test]
+fn two_fifty_six_external_ownership() {
+    bucketed_ownership::<ExternalLinks>(4, true, 256);
+}
+
+#[test]
+fn two_fifty_six_inline_ownership() {
+    bucketed_ownership::<InlineLinks<8>>(4, true, 256);
+}
+
+#[test]
+fn five_twelve_external_ownership() {
+    bucketed_ownership::<ExternalLinks>(4, true, 512);
+}
+
+#[test]
+fn five_twelve_inline_ownership() {
+    bucketed_ownership::<InlineLinks<8>>(4, true, 512);
+}
+
+#[test]
+fn eight_choice_external_ownership() {
+    bucketed_ownership::<ExternalLinks>(8, true, 256);
+}
+
+#[test]
+fn eight_choice_inline_ownership() {
+    bucketed_ownership::<InlineLinks<8>>(8, true, 256);
+}
+
+#[test]
+fn two_choice_reclaim_each_external_ownership() {
+    bucketed_ownership::<ExternalLinks>(2, true, 256);
+}
+
+#[test]
+fn two_choice_reclaim_each_inline_ownership() {
+    bucketed_ownership::<InlineLinks<8>>(2, true, 256);
 }

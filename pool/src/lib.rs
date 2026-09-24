@@ -13,6 +13,8 @@ macro_rules! pool_hit {
     };
 }
 
+pub const DEFAULT_BUCKETS: usize = 256;
+pub const DEFAULT_CHOICES: usize = 4;
 const NONE: u32 = u32::MAX;
 
 #[derive(Debug)]
@@ -273,7 +275,7 @@ unsafe impl<const A: usize, const B: usize, L: Links> Sync for Pool<A, B, L> {}
 
 impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
     pub fn new(max_blocks: u32, initial_blocks: u32) -> Result<Self> {
-        Self::with_buckets(max_blocks, initial_blocks, 1)
+        Self::with_buckets(max_blocks, initial_blocks, DEFAULT_BUCKETS)
     }
 
     /// Each index permanently belongs to index & (bucket_count - 1).
@@ -384,11 +386,21 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
         }
     }
 
-    /// Allocates using bucket zero; use alloc_from_bucket to spread bucketed work.
-    /// Returns an error at capacity if no block in that bucket is safe to reuse.
-    /// Retired blocks may become available after concurrent operations finish.
-    pub fn alloc(&self) -> Result<Block<'_, A, B, L>> {
-        self.alloc_from_bucket(0)
+    /// Tries up to four buckets, reclaiming at each before issuing a fresh index.
+    /// Supply one value from the calling thread's RNG; no shared RNG is used.
+    /// Returns can remain temporarily unavailable while protected by readers.
+    pub fn alloc(&self, random: u64) -> Result<Block<'_, A, B, L>> {
+        let count = self.buckets.len();
+        let mask = count - 1;
+        let first = ((random as usize) ^ mask) & mask;
+        let delta = if count == 1 {
+            1
+        } else {
+            ((((random >> count.trailing_zeros()) as usize) & (count / 2 - 1)) << 1) | 1
+        };
+        self.alloc_reclaiming_each(
+            (0..DEFAULT_CHOICES.min(count)).map(|step| (first + step * delta) & mask),
+        )
     }
 
     /// Tries one bucket, selected by the low bits, then issues a fresh index.
@@ -616,6 +628,20 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn default_configuration_uses_four_reclaiming_choices() {
+        let pool = Pool::<4, 16>::new(256, 256).unwrap();
+        assert_eq!(pool.buckets.len(), 256);
+        assert_eq!(DEFAULT_CHOICES, 4);
+        // random=0 selects 255,0,1,2 with odd delta 1.
+        let held: Vec<_> = (0..4).map(|_| pool.alloc(0).unwrap()).collect();
+        assert_eq!(held.iter().map(Block::index).collect::<Vec<_>>(), [255, 0, 1, 2]);
+        assert!(pool.alloc(0).is_err());
+        drop(held);
+        assert!(pool.alloc(0).is_ok());
+        assert_eq!(pool.issued_blocks(), 256);
+    }
+
+    #[test]
     fn shared_and_exclusive_counts() {
         let gate = ListLock::new();
         let first = gate.try_read().unwrap();
@@ -655,8 +681,8 @@ mod tests {
 
     #[test]
     fn aligned_contiguous_and_reused() {
-        let pool = Pool::<65536, 65536>::new(4, 2).unwrap();
-        let mut blocks: Vec<_> = (0..4).map(|_| pool.alloc().unwrap()).collect();
+        let pool = Pool::<65536, 65536>::with_buckets(4, 2, 1).unwrap();
+        let mut blocks: Vec<_> = (0..4).map(|_| pool.alloc_from_bucket(0).unwrap()).collect();
         let base = blocks[0].as_ptr() as usize;
         for (index, block) in blocks.iter_mut().enumerate() {
             assert_eq!(block.index(), index as u32);
@@ -664,11 +690,11 @@ mod tests {
             assert_eq!(block.as_ptr() as usize % 65536, 0);
             block.as_mut_slice().fill(MaybeUninit::new(index as u8));
         }
-        assert!(pool.alloc().is_err());
+        assert!(pool.alloc_from_bucket(0).is_err());
         std::thread::scope(|scope| {
             scope.spawn(move || drop(blocks));
         });
-        let blocks: Vec<_> = (0..4).map(|_| pool.alloc().unwrap()).collect();
+        let blocks: Vec<_> = (0..4).map(|_| pool.alloc_from_bucket(0).unwrap()).collect();
         assert_eq!(blocks.iter().map(Block::index).collect::<HashSet<_>>().len(), 4);
         for block in &blocks {
             // SAFETY: initialized above and never overwritten by the free list.
@@ -681,9 +707,9 @@ mod tests {
 
     #[test]
     fn retired_tail_preserves_existing_free_chain() {
-        let pool = Pool::<4, 16>::new(4, 4).unwrap();
-        let first = pool.alloc().unwrap();
-        let second = pool.alloc().unwrap();
+        let pool = Pool::<4, 16>::with_buckets(4, 4, 1).unwrap();
+        let first = pool.alloc_from_bucket(0).unwrap();
+        let second = pool.alloc_from_bucket(0).unwrap();
         drop(first);
         drop(second);
         assert_eq!(pool.buckets[0].deleted[0].head.load(SeqCst), 1);
@@ -695,17 +721,17 @@ mod tests {
         assert_eq!(pool.link(0).load(SeqCst), 2);
         assert_eq!(pool.link(2).load(SeqCst), 3);
         assert_eq!(pool.link(3).load(SeqCst), NONE);
-        let blocks: Vec<_> = (0..4).map(|_| pool.alloc().unwrap()).collect();
+        let blocks: Vec<_> = (0..4).map(|_| pool.alloc_from_bucket(0).unwrap()).collect();
         assert_eq!(blocks.iter().map(Block::index).collect::<Vec<_>>(), [1, 0, 2, 3]);
     }
 
     #[test]
     fn stalled_reader_delays_reuse_but_not_growth_or_retirement() {
-        let pool = Pool::<4, 16, InlineLinks<4>>::new(3, 1).unwrap();
+        let pool = Pool::<4, 16, InlineLinks<4>>::with_buckets(3, 1, 1).unwrap();
         let old = pool.buckets[0].current.load(SeqCst);
         let guard = pool.buckets[0].deleted[old].gate.try_read().unwrap();
         let stale_head = pool.buckets[0].free.load(SeqCst);
-        let first = pool.alloc().unwrap();
+        let first = pool.alloc_from_bucket(0).unwrap();
         first.link().store(0xdeadbeef, SeqCst);
         let stale_next = pool.link(stale_head).load(SeqCst);
         assert_eq!(stale_next, 0xdeadbeef);
@@ -713,35 +739,35 @@ mod tests {
             pool.buckets[0].free.compare_exchange(stale_head, stale_next, SeqCst, SeqCst).is_err()
         );
         drop(first);
-        let second = pool.alloc().unwrap();
+        let second = pool.alloc_from_bucket(0).unwrap();
         assert_eq!(second.index(), 1);
         assert_ne!(pool.buckets[0].current.load(SeqCst), old);
         drop(second);
-        let third = pool.alloc().unwrap();
+        let third = pool.alloc_from_bucket(0).unwrap();
         assert_eq!(third.index(), 2);
         assert_eq!(pool.buckets[0].current.load(SeqCst), 1 - old);
-        assert!(pool.alloc().is_err());
+        assert!(pool.alloc_from_bucket(0).is_err());
         drop(guard);
-        let reused: Vec<_> = (0..2).map(|_| pool.alloc().unwrap()).collect();
+        let reused: Vec<_> = (0..2).map(|_| pool.alloc_from_bucket(0).unwrap()).collect();
         assert_eq!(reused.iter().map(Block::index).collect::<HashSet<_>>(), HashSet::from([0, 1]));
     }
 
     #[test]
     fn older_group_protects_items_retired_in_new_group() {
-        let pool = Pool::<4, 16>::new(2, 1).unwrap();
+        let pool = Pool::<4, 16>::with_buckets(2, 1, 1).unwrap();
         let old = pool.buckets[0].current.load(SeqCst);
         let guard = pool.buckets[0].deleted[old].gate.try_read().unwrap();
         let stale_head = pool.buckets[0].free.load(SeqCst);
         pool.recycle(&pool.buckets[0]);
         assert_eq!(pool.buckets[0].current.load(SeqCst), 1 - old);
-        let block = pool.alloc().unwrap();
+        let block = pool.alloc_from_bucket(0).unwrap();
         assert_eq!(block.index(), stale_head);
         drop(block); // Retires into the NEW group, with an OLD reader outstanding.
-        let fresh = pool.alloc().unwrap();
+        let fresh = pool.alloc_from_bucket(0).unwrap();
         assert_ne!(fresh.index(), stale_head);
-        assert!(pool.alloc().is_err());
+        assert!(pool.alloc_from_bucket(0).is_err());
         drop(guard);
-        assert_eq!(pool.alloc().unwrap().index(), stale_head);
+        assert_eq!(pool.alloc_from_bucket(0).unwrap().index(), stale_head);
     }
 
     #[test]
@@ -815,7 +841,7 @@ mod tests {
 
     #[test]
     fn empty_pop_does_not_take_shared_lock() {
-        let pool = Pool::<4, 16>::new(1, 0).unwrap();
+        let pool = Pool::<4, 16>::with_buckets(1, 0, 1).unwrap();
         let bucket = &pool.buckets[0];
         let _writer = bucket.deleted[0].gate.try_write().unwrap();
         assert_eq!(pool.pop(bucket), None);
@@ -836,17 +862,17 @@ mod tests {
 
     #[test]
     fn validates_geometry_and_limits() {
-        assert!(Pool::<0, 4>::new(1, 0).is_err());
-        assert!(Pool::<3, 12>::new(1, 0).is_err());
-        assert!(Pool::<4, 6>::new(1, 0).is_err());
-        assert!(Pool::<4, 0>::new(1, 0).is_err());
-        assert!(Pool::<4, 4>::new(0, 0).is_err());
-        assert!(Pool::<4, 4>::new(1, 2).is_err());
-        assert!(Pool::<1, { usize::MAX }>::new(2, 0).is_err());
-        assert!(Pool::<4, 4, InlineLinks<4>>::new(1, 0).is_err());
-        assert!(Pool::<4, 8, InlineLinks<1>>::new(1, 0).is_err());
-        let pool = Pool::<4, 4>::new(1, 0).unwrap();
-        assert_eq!(pool.alloc().unwrap().index(), 0);
-        assert_eq!(pool.alloc().unwrap().index(), 0);
+        assert!(Pool::<0, 4>::with_buckets(1, 0, 1).is_err());
+        assert!(Pool::<3, 12>::with_buckets(1, 0, 1).is_err());
+        assert!(Pool::<4, 6>::with_buckets(1, 0, 1).is_err());
+        assert!(Pool::<4, 0>::with_buckets(1, 0, 1).is_err());
+        assert!(Pool::<4, 4>::with_buckets(0, 0, 1).is_err());
+        assert!(Pool::<4, 4>::with_buckets(1, 2, 1).is_err());
+        assert!(Pool::<1, { usize::MAX }>::with_buckets(2, 0, 1).is_err());
+        assert!(Pool::<4, 4, InlineLinks<4>>::with_buckets(1, 0, 1).is_err());
+        assert!(Pool::<4, 8, InlineLinks<1>>::with_buckets(1, 0, 1).is_err());
+        let pool = Pool::<4, 4>::with_buckets(1, 0, 1).unwrap();
+        assert_eq!(pool.alloc_from_bucket(0).unwrap().index(), 0);
+        assert_eq!(pool.alloc_from_bucket(0).unwrap().index(), 0);
     }
 }
