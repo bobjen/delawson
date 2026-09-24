@@ -8284,6 +8284,81 @@ Single-bucket coverage and grace-period tests construct one bucket explicitly.
 The benchmark's default mode is `external256x4all`; both external and inline
 256/four/reclaim-each benchmark modes exercise the selected public `alloc` API.
 
+A benchmark-only CPU-first experiment (`external256cpu` / `inline256cpu`) calls
+`sched_getcpu()` on each allocation and starts at that logical CPU number modulo
+256. It treats the CPU number only as a preference, not exclusive ownership;
+workers are not pinned. Only if that bucket's free/reclamation attempts fail does
+the lazy suffix draw a value from the worker's bucket RNG, derive the usual odd
+delta, and walk three further buckets from the CPU-selected first bucket. Thus
+there are still up to four choices, reclaiming at each. Returns continue using
+the index's permanent home. On this 16-logical-CPU machine, first choices use
+buckets 0–15; fallback choices can use all 256. The CPU lookup cost is included.
+
+Three paired runs against random-first and uncapped malloc/free, eight threads
+and eight million calls, unchanged capacity and operation seeds:
+
+| Implementation | Mean ms (range) | Issued indexes, runs 1/2/3 |
+|---|---:|---|
+| malloc/free | 70.025 (67.815–72.642) | Not applicable |
+| External, random-first | 84.668 (80.890–87.341) | 8,392 / 8,615 / 9,238 |
+| External, CPU-first | 85.849 (85.273–86.219) | 9,444 / 10,340 / 10,531 |
+| Inline, random-first | 89.364 (86.662–91.293) | 8,136 / 8,436 / 8,986 |
+| Inline, CPU-first | 92.609 (90.731–95.595) | 9,666 / 11,124 / 11,268 |
+
+CPU-first showed no speed benefit: means were 1–4% slower with overlapping ranges,
+and mean issued indexes increased about 16% external and 25% inline. All runs had
+zero allocation failures and identical operation counts. A selector test verifies
+modulo selection, no RNG consumption on first-choice success, and one draw for
+three distinct fallbacks. The production random-first default remains unchanged.
+
+The follow-up CPU-first experiment uses 16 buckets and only two choices
+(`external16cpu` / `inline16cpu`). The second bucket is a delta from the CPU-first
+bucket, not an independently chosen starting point: `first = sched_getcpu() & 15`,
+`delta = (((val >> 4) & 7) << 1) | 1`, `second = (first + delta) & 15`.
+Randomness is still drawn only if the first bucket fails; each choice attempts
+reclamation. The reference modes `external16x2all` / `inline16x2all` use a random
+first bucket and the same odd-delta walk. Three paired runs, eight threads/eight
+million calls, no affinity pinning:
+
+| Implementation | Mean ms (range) | Issued indexes, runs 1/2/3 |
+|---|---:|---|
+| malloc/free | 71.171 (67.997–77.477) | Not applicable |
+| External, random-first | 174.918 (172.224–177.166) | 7,955 / 8,263 / 8,883 |
+| External, CPU-first | 52.174 (48.362–54.776) | 18,330 / 19,127 / 18,878 |
+| Inline, random-first | 182.437 (180.781–183.392) | 7,802 / 8,330 / 8,837 |
+| Inline, CPU-first | 53.809 (52.555–55.488) | 18,412 / 18,457 / 19,292 |
+
+CPU-first is 24–27% faster than malloc by mean here and roughly 70% faster than
+random-first with 16 buckets, but issues about 2.2 times as many indexes as the
+random-first pools. All runs had zero failures and identical allocation/free
+counts. Selector tests check the exact second-bucket delta formula. Returns still
+use the index's home bucket, and production defaults remain unchanged.
+
+CPU-first with 16 buckets also supports four choices (`external16x4cpu` /
+`inline16x4cpu`), continuing the same odd-delta walk from the initial CPU bucket
+and reclaiming at each. Three paired runs against CPU-first two choices and
+malloc/free, eight threads/eight million calls:
+
+| Implementation | Mean ms (range) | Issued indexes, runs 1/2/3 |
+|---|---:|---|
+| malloc/free | 68.349 (67.350–69.362) | Not applicable |
+| External, two choices | 54.542 (53.186–55.810) | 18,275 / 15,976 / 18,388 |
+| External, four choices | 100.805 (89.440–110.203) | 10,705 / 9,242 / 10,844 |
+| Inline, two choices | 56.387 (53.894–58.558) | 18,967 / 19,942 / 19,266 |
+| Inline, four choices | 111.819 (94.394–126.790) | 8,170 / 10,870 / 8,587 |
+
+Four choices reduced mean issued counts by about 41% external and 52% inline,
+but took 1.85x and 1.98x as long. Two choices remained faster than malloc;
+four choices did not. All runs had zero failures and matched operation counts.
+The selector test also checks four distinct choices within the 16-bucket range.
+
+After reviewing the CPU-first experiments, Bob retained the existing production
+policy: 256 buckets, up to four random choices, reclamation at each choice, and
+returns to the bucket selected by block index. Blocks issued matter slightly more
+than mean time for the intended SN/DN use. The CPU-first benchmark code and its
+selector tests were removed; the measurements above remain as experiment history.
+The CPU-first mode names in that history are no longer supported by the benchmark.
+
 Two rules are essential. **POOL-REUSE-AFTER-GRACE:** a popped index cannot reappear
 on the free list until every pool operation that could hold its old head value
 has ended. Shared participation, selector revalidation, and exclusive locking through
