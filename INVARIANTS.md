@@ -907,7 +907,8 @@ stays constant — `SN-NOT-IN-WRITE-PATH` in a different guise.
 until all pool operations that could retain its old head value have ended.
 *Argued* §8.1.5.2 · *Enforced* `common::pool`: shared participation, selector revalidation,
 exclusive draining, and holding the inactive lock through each selector switch · *Checked* deterministic stalled-reader
-and cross-group retirement tests, plus concurrent ownership tests for both link layouts
+and cross-group retirement tests, plus randomized ownership and quiescent-list audits
+for both link layouts, each requiring twelve observed coverage flags
 *Breaks* ABA lets a stale successful CAS lose free blocks or allocate an owned block.
 
 **`POOL-LINK-STAYS-ATOMIC`** — the link remains a stable atomic 32-bit field even
@@ -915,7 +916,8 @@ when its item is allocated; stale candidate next indexes are not dereferenced be
 successful head CAS.
 *Argued* §8.1.5.2 · *Enforced* `Links` safety contract, atomic lookup, and no safe whole-item
 mutable slice for inline links · *Checked* tests overwrite allocated links with non-index
-values while an older reader remains active; concurrent tests exercise both layouts
+values while an older reader remains active; randomized tests exercise both layouts
+and check that application values remain unchanged until return
 *Breaks* non-atomic payload writes race stale link reads, or an application value is
 incorrectly treated as an index.
 

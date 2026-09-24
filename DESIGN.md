@@ -7794,6 +7794,64 @@ Deterministic stalled-participant tests cover both same-group and cross-group
 retirement, and concurrent tests exercise both link layouts and exclusive ownership.
 There is no segmented array, disk staging area, or extent persistence in this change.
 
+The randomized pool tests follow Bob's [coverage-flags pattern](https://burtleburtle.net/bob/testing/concurrencyflags.html).
+There are two top-level tests, one per link layout, sharing a generic runner and
+12 branch flags. Eight workers randomly allocate or return one of their held
+blocks from a 16-block pool. Every loop starts with no issued blocks and retains
+at most 4096 operation records per worker, including final returns. Each trial is exactly one loop: its 3 ms clock starts when the workers are ready,
+without charging thread startup against that interval. Workers stop at the time
+or history limit, then the pool is audited and discarded.
+Histories include thread identity, indexes, and tickets bracketing each API call;
+the tickets describe observed invocation/completion order, not linearization points.
+A failure prints the loop seed and histories. `POOL_TEST_SEED` selects the initial
+seed for repeating operation choices, although thread scheduling is not replayed.
+
+The flags cover recycled allocation, fresh allocation, exhaustion, return to empty
+and nonempty deleted lists, recycling an empty deleted list, splicing onto empty
+and nonempty free lists, retries of each of the three head CAS operations, and an
+unavailable inactive-list write lock. Invariants do not need flags: no simultaneous
+owners, no change to an allocated atomic field, aligned/index-consistent addresses,
+and, after all returns, every issued index appears exactly once across the three
+lists, with no cycles, invalid indexes, lost blocks, or incorrect deleted-list tails.
+
+Each top-level test stops once all flags are observed, with at most forty 3 ms
+trials (120 ms of work plus setup and teardown). A separate one-second cooperative
+watchdog bounds retry-loop failures; it does not shorten the forty trials to absorb
+normal setup overhead. Test-only cancellation checks in
+the pool's retry loops prevent an algorithmic spin from hanging the test; a
+cancelled pool is failed and discarded. OS scheduling, thread teardown and printing
+failure histories can extend wall-clock time beyond the deadline. Probes, bounds
+checks and cancellation are all compiled out of non-test pool code.
+
+The ignored `calibrate_external_links` and `calibrate_inline_links` tests count
+all event hits with per-thread counters for one second, three times. Dividing
+elapsed time by the rarest count estimates its mean interval; under an independent
+arrival model, multiplying that interval by ln(2) estimates the half-hit time.
+The initial debug-build measurements found 511–600 rare hits/second externally
+and 386–426 inline: estimated half-hit times no greater than 1.8 ms. Bob chose one
+3 ms loop per trial; the repetition count supplies the confidence rather than
+padding each trial. These measurements are about coverage reachability, not
+production pool throughput.
+
+The ignored `validate_external_windows` and `validate_inline_windows` tests each
+check 1000 single-loop trials without early success and report every flag's frequency.
+Hits after a trial's 3 ms deadline do not count. Run rate measurement with
+`cargo test -p delawson-common --features testing pool::concurrency::calibrate_
+-- --ignored --nocapture --test-threads=1`; replace `calibrate_` with `validate_`
+for the window-frequency check. `POOL_CALIBRATION_WINDOWS` can shorten validation.
+The per-case miss bound of 2^-40 assumes a conditional hit probability of at least
+one half in every trial. Measured frequencies support that assumption for the
+tested workload and machine, not all hardware or scheduling. For twelve cases
+the union bound on missing any case is twelve times 2^-40. Coverage is explicit,
+so missing a case fails the test.
+
+Validation of single 3 ms loops hit the least frequent external-link case in
+856/1000 trials; the least frequent inline-link case hit in 999/1000 trials. Deliberately
+dropping the existing free chain during a splice made the test fail its lost-block
+audit and print history. Deliberately holding the current list's write lock made
+it fail at the watchdog deadline. Both injected faults were removed before the
+final tests.
+
 #### 8.1.5.3 When transactions arrive, the EN's part of them lives in the journal
 
 **Transactions and SCN integration with the EN journal are not implemented yet.**

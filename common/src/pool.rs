@@ -5,6 +5,16 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::SeqCst};
 use std::sync::{OnceLock, RwLock, TryLockError, TryLockResult};
 
+#[cfg(test)]
+mod concurrency;
+
+macro_rules! pool_hit {
+    ($pool:ident, $case:ident) => {
+        #[cfg(test)]
+        $pool.probe.hit(concurrency::Case::$case);
+    };
+}
+
 pub const DEFAULT_BYTES: usize = 4096;
 pub const DEFAULT_ALIGN: usize = 4096;
 pub const DEFAULT_MAX: u32 = 1 << 20;
@@ -210,6 +220,8 @@ pub struct Pool<const ALIGN: usize, const BYTES: usize, L: Links = ExternalLinks
     free: AtomicU32,
     deleted: [Deleted; 2],
     current: AtomicUsize,
+    #[cfg(test)]
+    probe: concurrency::Probe,
 }
 
 // SAFETY: pool metadata is synchronized; each live block has one owner. Mapping
@@ -244,6 +256,8 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
             free: AtomicU32::new(NONE),
             deleted: [Deleted::new(), Deleted::new()],
             current: AtomicUsize::new(0),
+            #[cfg(test)]
+            probe: concurrency::Probe::default(),
         };
         for index in 0..initial_blocks {
             // SAFETY: initialization is single-threaded and each index is new.
@@ -266,6 +280,11 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
 
     #[inline]
     fn link(&self, index: u32) -> &AtomicU32 {
+        #[cfg(test)]
+        if index >= self.next.load(SeqCst) || index >= self.max_blocks {
+            self.probe.abort();
+            panic!("pool link index {index} outside issued range");
+        }
         // SAFETY: internal callers use initialized, owned or published indexes.
         unsafe { self.links.link(index) }
     }
@@ -276,6 +295,10 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
 
     fn pop(&self) -> Option<u32> {
         loop {
+            #[cfg(test)]
+            if self.probe.cancelled() {
+                return None;
+            }
             let current = self.current.load(SeqCst);
             let Some(_guard) = try_guard(self.deleted[current].gate.try_read()) else {
                 std::hint::spin_loop();
@@ -286,10 +309,20 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
             }
             let mut head = self.free.load(SeqCst);
             while head != NONE {
+                #[cfg(test)]
+                if self.probe.cancelled() {
+                    return None;
+                }
                 let next = self.link(head).load(SeqCst);
                 match self.free.compare_exchange_weak(head, next, SeqCst, SeqCst) {
-                    Ok(_) => return Some(head),
-                    Err(actual) => head = actual,
+                    Ok(_) => {
+                        pool_hit!(self, Reused);
+                        return Some(head);
+                    }
+                    Err(actual) => {
+                        pool_hit!(self, PopRetry);
+                        head = actual;
+                    }
                 }
                 // A stale link may contain an application value: never dereference
                 // it unless the head CAS succeeded. Retirement prevents head ABA.
@@ -312,17 +345,29 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
                 return Ok(Block { pool: self, index });
             }
         }
+        #[cfg(test)]
+        if self.probe.cancelled() {
+            return Err(Error::new("pool test cancelled"));
+        }
         let index = self
             .next
             .fetch_update(SeqCst, SeqCst, |next| (next < self.max_blocks).then(|| next + 1))
-            .map_err(|_| Error::new("block pool exhausted; some blocks may await reclamation"))?;
+            .map_err(|_| {
+                pool_hit!(self, Exhausted);
+                Error::new("block pool exhausted; some blocks may await reclamation")
+            })?;
         // SAFETY: fetch_update granted this caller a unique new index.
         unsafe { self.links.init(index) };
+        pool_hit!(self, Fresh);
         Ok(Block { pool: self, index })
     }
 
     fn retire(&self, index: u32) {
         loop {
+            #[cfg(test)]
+            if self.probe.cancelled() {
+                return;
+            }
             let current = self.current.load(SeqCst);
             let list = &self.deleted[current];
             let Some(_guard) = try_guard(list.gate.try_read()) else {
@@ -334,25 +379,42 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
             }
             let mut head = list.head.load(SeqCst);
             loop {
+                #[cfg(test)]
+                if self.probe.cancelled() {
+                    return;
+                }
                 self.link(index).store(head, SeqCst);
                 match list.head.compare_exchange_weak(head, index, SeqCst, SeqCst) {
                     Ok(_) => {
                         if head == NONE {
                             list.tail.store(index, SeqCst);
+                            pool_hit!(self, RetiredEmpty);
+                        } else {
+                            pool_hit!(self, RetiredNonempty);
                         }
                         return;
                     }
-                    Err(actual) => head = actual,
+                    Err(actual) => {
+                        pool_hit!(self, RetireRetry);
+                        head = actual;
+                    }
                 }
             }
         }
     }
 
     fn recycle(&self) {
+        #[cfg(test)]
+        if self.probe.cancelled() {
+            return;
+        }
         let current = self.current.load(SeqCst);
         let inactive = 1 - current;
         let list = &self.deleted[inactive];
-        let Some(_guard) = try_guard(list.gate.try_write()) else { return };
+        let Some(_guard) = try_guard(list.gate.try_write()) else {
+            pool_hit!(self, RecycleBusy);
+            return;
+        };
         if self.current.load(SeqCst) != current {
             return;
         }
@@ -364,12 +426,29 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
         if head != NONE {
             let mut free = self.free.load(SeqCst);
             loop {
+                #[cfg(test)]
+                if self.probe.cancelled() {
+                    return;
+                }
                 self.link(tail).store(free, SeqCst);
                 match self.free.compare_exchange_weak(free, head, SeqCst, SeqCst) {
-                    Ok(_) => break,
-                    Err(actual) => free = actual,
+                    Ok(_) => {
+                        if free == NONE {
+                            pool_hit!(self, SpliceEmpty);
+                        } else {
+                            pool_hit!(self, SpliceNonempty);
+                        }
+                        break;
+                    }
+                    Err(actual) => {
+                        pool_hit!(self, SpliceRetry);
+                        free = actual;
+                    }
                 }
             }
+        }
+        if head == NONE {
+            pool_hit!(self, RecycleEmpty);
         }
         // Keep the exclusive lock through the switch; releasing it first would
         // allow a delayed recycler to switch after an intervening full rotation.
@@ -515,47 +594,6 @@ mod tests {
         assert!(pool.alloc().is_err());
         drop(guard);
         assert_eq!(pool.alloc().unwrap().index(), stale_head);
-    }
-
-    fn concurrent<L: Links>() {
-        let pool = Pool::<8, 128, L>::new(64, 4).unwrap();
-        let owners: Vec<_> = (0..64).map(|_| AtomicU32::new(0)).collect();
-        std::thread::scope(|scope| {
-            for _ in 0..8 {
-                let pool = &pool;
-                let owners = &owners;
-                scope.spawn(move || {
-                    for _ in 0..5000 {
-                        let block = loop {
-                            if let Ok(block) = pool.alloc() {
-                                break block;
-                            }
-                            std::thread::yield_now();
-                        };
-                        let owner = &owners[block.index() as usize];
-                        assert_eq!(owner.swap(1, SeqCst), 0);
-                        block.link().store(0xdeadbeef, SeqCst);
-                        std::hint::spin_loop();
-                        assert_eq!(block.link().load(SeqCst), 0xdeadbeef);
-                        assert_eq!(owner.swap(0, SeqCst), 1);
-                        drop(block);
-                    }
-                });
-            }
-        });
-        let blocks: Vec<_> = (0..64).map(|_| pool.alloc().unwrap()).collect();
-        assert_eq!(blocks.iter().map(Block::index).collect::<HashSet<_>>().len(), 64);
-        assert!(pool.alloc().is_err());
-    }
-
-    #[test]
-    fn concurrent_external_links() {
-        concurrent::<ExternalLinks>();
-    }
-
-    #[test]
-    fn concurrent_inline_links() {
-        concurrent::<InlineLinks<8>>();
     }
 
     #[test]
