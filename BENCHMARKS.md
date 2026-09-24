@@ -61,10 +61,12 @@ records cleanup separately. Do not launch another cluster until cleanup finishes
 temporary run directories still use the same configured TCP ports. Do not run
 this while another development cluster is using those ports.
 
-A fresh startup can fail with `Raft has no known Raft leader` while registering
-DN0. That is a startup election race, not benchmark output or a timeout. Allow
-the runner to finish cleanup, then retry. Never interpret a failed startup or
-lookups of nonexistent objects as a performance result.
+`start-laws` waits for the registrar to report a healthy known Raft leader after
+starting/unlocking the KS members and before starting DNs. Preserve this gate:
+a ready file only proves the listener is up. Older launchers without it can fail
+DN0 registration with `Raft has no known Raft leader`; check historical launchers
+before running. If startup fails, allow cleanup to finish before another attempt.
+Never interpret failed startup or nonexistent-object lookups as a performance result.
 
 ## Interpreting results
 
@@ -130,3 +132,21 @@ Rates are objects/names per second. Historical ObjectInfo ranged from
 All creates completed and all lookups were answered and found. The detached
 runner exited 0 after cleanup. Logs and the ten detail-verification responses
 are in `/tmp/delawson-rich-bench-8bb860e/` (temporary files).
+
+
+## Hybrid individual messages, 2026-09-24
+
+Revision `a2ff50d`, same standard workload, flags 23, pool cap 32GiB and 2KiB
+small-message threshold. Create: 1,492,484 objects/sec (20M in 13.40 seconds).
+All lookups were answered and found.
+
+| Workload | Segmented batches only | Hybrid individual messages | Change |
+| --- | ---: | ---: | ---: |
+| ObjectInfo | 77,976 | 72,367 | -7.2% |
+| BatchObjectInfo, batch 1,000 | 381,962 | 282,079 | -26.2% |
+
+Rates are names/sec; three-trial means. ObjectInfo trials: 71,557, 72,595,
+72,949 (1.9% spread). Batch trials: 291,127, 270,048, 285,063 (7.5% spread).
+Logs: `/tmp/delawson-object-bench-_yf7nygn/`. The runner exited 0 after cleanup.
+The first startup hit the known Raft election race; the retry succeeded. The
+startup readiness gate was added afterward and did not affect these measurements.

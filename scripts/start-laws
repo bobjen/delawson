@@ -142,7 +142,26 @@ else
 fi
 
 started=()
+registrar_ready=no
 while read -r identity kind domain _; do
+    # A ready file means the listener is up, not that Raft can register peers.
+    # Start/unlock all KS members first so a replicated ring can form a quorum.
+    if [[ $kind != ks && $registrar_ready == no ]]; then
+        deadline=$((SECONDS + ready_wait))
+        while true; do
+            state=$("$laws" --config "$cluster" --at "$ks_address" --to "$ks_registrar" status 2>&1) || state=""
+            if [[ $state =~ raft_leader[[:space:]]+[0-9]+ && $state == *"raft_failed false"* ]]; then
+                registrar_ready=yes
+                break
+            fi
+            if ((SECONDS >= deadline)); then
+                echo "start-laws: $ks_registrar has no healthy Raft leader after ${ready_wait}s" >&2
+                echo "$state" >&2
+                exit 1
+            fi
+            sleep 0.02
+        done
+    fi
     dir=$run_dir/$identity
     service_config=$config_dir/$identity.toml
     [[ -f $service_config ]] || service_config=$config_dir/$kind.toml
