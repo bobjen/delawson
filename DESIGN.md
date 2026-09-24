@@ -7890,6 +7890,36 @@ limitations apply. Select `aligned` in the benchmark command to reproduce this
 mode. One-block and zero-capacity paths also passed; every run checks the final
 live count after timing. This experiment leaves the production pool unchanged.
 
+An AtomicI64-only thread-scaling experiment kept one million calls per worker,
+first with 16 total blocks and then with two blocks per worker. Each setting had
+three warmed, interleaved runs with paired seeds; the 8-thread/16-block setting is
+shared between both comparisons. The host reports an AMD Ryzen 7 5825U, eight
+physical cores and sixteen logical CPUs, all allowed by process affinity. Workers
+were not pinned. Results below include failed allocation attempts in operation
+throughput, just as the earlier benchmarks do.
+
+| Links | Threads | Blocks | Run 1 (s) | Run 2 (s) | Run 3 (s) | Mean (s) | Million calls/s | Failed calls |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| External | 4 | 16 | 0.599 | 1.027 | 1.016 | 0.881 | 4.54 | 13.1% |
+| External | 8 | 16 | 1.724 | 2.560 | 2.484 | 2.256 | 3.55 | 24.8% |
+| External | 15 | 16 | 4.340 | 4.352 | 4.524 | 4.405 | 3.40 | 39.2% |
+| External | 4 | 8 | 1.179 | 1.192 | 1.163 | 1.178 | 3.40 | 24.3% |
+| External | 15 | 30 | 3.952 | 3.833 | 3.872 | 3.886 | 3.86 | 23.5% |
+| Inline | 4 | 16 | 1.057 | 1.000 | 0.988 | 1.015 | 3.94 | 12.7% |
+| Inline | 8 | 16 | 1.651 | 2.402 | 1.663 | 1.905 | 4.20 | 25.4% |
+| Inline | 15 | 16 | 4.940 | 4.299 | 4.318 | 4.519 | 3.32 | 40.5% |
+| Inline | 4 | 8 | 1.175 | 0.734 | 1.142 | 1.017 | 3.93 | 25.2% |
+| Inline | 15 | 30 | 3.781 | 3.806 | 3.722 | 3.770 | 3.98 | 23.9% |
+
+With two blocks per worker, aggregate throughput remains roughly flat: external
+links achieve 3.40/3.55/3.86 million calls/s at 4/8/15 threads, inline links
+3.93/4.20/3.98. Failure fractions remain near 24–25%, whereas fixed capacity raises
+failures from about 13% at four threads to 39–41% at fifteen. These measurements
+support a shared-contention bottleneck, but do not establish literal single-thread
+execution or exact malloc speedup ratios at four and fifteen threads: malloc was
+not measured in this experiment. SMT also means fifteen workers do not represent
+fifteen physical cores. No implementation changes were made.
+
 Two rules are essential. **POOL-REUSE-AFTER-GRACE:** a popped index cannot reappear
 on the free list until every pool operation that could hold its old head value
 has ended. Shared participation, selector revalidation, and exclusive locking through
