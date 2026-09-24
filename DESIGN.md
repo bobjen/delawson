@@ -8386,6 +8386,32 @@ exposed by the safe API. Index nodes are initialized to the absent-child sentine
 Serialization, tail padding, and asynchronous I/O ownership are separate layers;
 a submitted I/O buffer must remain alive and unchanged until completion.
 
+`SegmentedReader` implements `Read` and `BufRead` over a borrowed whole buffer
+or a bounded absolute range. Its cached slice ends at the earlier of the current
+leaf boundary and the logical input end. `fill_buf` exposes that slice without
+copying; `consume` advances within it and does not release storage. Consuming
+beyond the exposed slice is a caller error. After exhausting a leaf, the next
+`fill_buf` walks the tree for the following leaf. A reader borrow must end before
+the caller discards the consumed prefix or appends more input.
+
+Integer helpers read u8 and little-endian u16/u32/u64. Their common path checks
+the cached slice length, extracts the value, and advances. The boundary-crossing
+path collects bytes into a fixed-size stack array. `read_exact` checks the bounded
+remaining length before copying, so truncated resident input leaves the cursor
+and destination unchanged. These readers currently operate on resident memory;
+future loading/prefetching belongs to a separate input layer.
+
+`SegmentedWriter` implements `Write` and matching integer helpers. It caches the
+tail's pool index and available bytes so small writes neither walk the tree nor
+call the RNG. Boundary-crossing writes use the segmented buffer's fallible append.
+Each write returns an error without extending the buffer if allocation fails;
+a sequence of writes is not a transaction. `flush` is a no-op, not a durability
+operation. Neither adapter adds a contiguous staging buffer or virtual dispatch.
+The APIs are available as `buffer.reader()`, `buffer.reader_range(range)`, and
+`buffer.writer(rng_callback)`. Existing wire codecs remain on their current
+contiguous storage; compatibility tests check that the new scalar encoding is
+identical, including tags and lengths crossing leaves.
+
 Tests cover packed fields crossing leaves, all six depth transitions using small
 windows at large offsets, 4MiB growth, index-node reclamation, rolling windows
 against a contiguous reference model, range/offset overflow, allocation failure

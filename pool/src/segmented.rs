@@ -5,6 +5,9 @@
 //! in-memory indexes, not a serialized disk format. Depth zero is a leaf.
 //! Depth six covers the entire u64 byte-offset space (using u128 internally
 //! for tree spans). The pool's capacity independently limits resident storage.
+mod stream;
+pub use stream::{SegmentedReader, SegmentedWriter};
+
 use crate::{Block, Error, NONE, Pool, Result};
 
 pub const CHUNK_BYTES: usize = 4096;
