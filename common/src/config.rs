@@ -173,10 +173,12 @@ pub enum Compress {
 pub struct BufferPoolConfig {
     pub max_blocks: u32,
     pub initial_blocks: u32,
+    /// Individual serialized payloads stay contiguous through this many bytes.
+    pub small_message_bytes: usize,
 }
 impl Default for BufferPoolConfig {
     fn default() -> Self {
-        Self { max_blocks: 1 << 20, initial_blocks: 0 }
+        Self { max_blocks: 1 << 23, initial_blocks: 0, small_message_bytes: 2048 }
     }
 }
 
@@ -525,7 +527,9 @@ impl ServiceEntry {
 impl ClusterConfig {
     pub fn load(path: &Path) -> Result<ClusterConfig> {
         let text = std::fs::read_to_string(path).context(path.display())?;
-        ClusterConfig::parse(&text).context(path.display())
+        let config = ClusterConfig::parse(&text).context(path.display())?;
+        crate::wire::configure_message_pool(config.messaging.buffer_pool)?;
+        Ok(config)
     }
 
     pub fn parse(text: &str) -> Result<ClusterConfig> {

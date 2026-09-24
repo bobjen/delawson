@@ -327,7 +327,7 @@ pub enum Message {
     JournalTip { index: u64, term: u64 },
     CheckpointStart,
     Client(crate::Action),
-    Forward { op: u16, payload: Vec<u8>, depth: u8 },
+    Forward { op: u16, payload: common::wire::MessageBytes, depth: u8 },
 }
 pub struct Packet {
     member: Sender,
@@ -360,12 +360,13 @@ pub fn needs_request_worker(request: &Req) -> bool {
         return true;
     }
     match request.args.as_slice() {
-        [Arg::Text(_), Arg::Bytes(bytes)] => parse::<Packet>(bytes).is_ok_and(|p| {
-            matches!(
-                p.message,
-                Message::Forward { .. } | Message::Checkpoint { .. } | Message::Client(_)
-            )
-        }),
+        [Arg::Text(_), Arg::Bytes(bytes)] => crate::codec::decode_message::<Packet>(bytes)
+            .is_ok_and(|p| {
+                matches!(
+                    p.message,
+                    Message::Forward { .. } | Message::Checkpoint { .. } | Message::Client(_)
+                )
+            }),
         _ => false,
     }
 }
@@ -1427,14 +1428,16 @@ pub trait Host:
                 node.journal.pending_replacement(),
             ))
         })?;
-        let request = Req::new(Op::Raft).text(&self.runtime.name).bytes(binary(&Packet {
-            member,
-            target,
-            retirement,
-            applying,
-            ready: self.ready.load(Ordering::SeqCst),
-            message,
-        })?);
+        let request = Req::new(Op::Raft).text(&self.runtime.name).bytes(
+            crate::codec::encode_message(&Packet {
+                member,
+                target,
+                retirement,
+                applying,
+                ready: self.ready.load(Ordering::SeqCst),
+                message,
+            })?,
+        );
         self.transport
             .as_ref()
             .ok_or_else(|| Error::new("no Raft transport"))?
@@ -1474,7 +1477,7 @@ pub trait Host:
                 return Err(Error::new("invalid Raft RPC"));
             };
             let sender = sender.clone();
-            let packet: Packet = parse(bytes)?;
+            let packet: Packet = crate::codec::decode_message(bytes)?;
             let (response, deferred) = self.on_raft(move |host, node| {
                 let mut deferred = None;
                 let response = host.raft_packet(node, &sender, packet, &mut deferred)?;
@@ -1552,7 +1555,7 @@ pub trait Host:
                         }
                         // This is no vote/ack from the retired member. Do not execute
                         // the old member's RPC using the replacement's identity.
-                        return Ok(Resp::bytes(binary(&ConsensusReply {
+                        return Ok(Resp::bytes(crate::codec::encode_message(&ConsensusReply {
                             member: Sender::Slot(retired.next),
                             retirement: Some(retired),
                             answer: Answer { term: node.state().term, success: false, matched: 0 },
@@ -1567,7 +1570,7 @@ pub trait Host:
                 }
             }
             if matches!(packet.message, Message::Identity) {
-                return Ok(Resp::bytes(binary(&Member {
+                return Ok(Resp::bytes(crate::codec::encode_message(&Member {
                     identity: node.journal.identity.current.clone(),
                     process: self.runtime.name.clone(),
                 })?));
@@ -1734,7 +1737,7 @@ pub trait Host:
             }
             Message::Checkpoint { after, primary_fallback } => {
                 let snapshot = self.checkpoint_from(node, after, primary_fallback)?;
-                Ok(Resp::bytes(binary(&snapshot)?))
+                Ok(Resp::bytes(crate::codec::encode_message(&snapshot)?))
             }
             Message::Consensus(rpc) => {
                 let was_repairing = node.repairing;
@@ -1801,7 +1804,7 @@ pub trait Host:
                     }
                 }
                 self.refresh_application(&node)?;
-                Ok(Resp::bytes(binary(&ConsensusReply {
+                Ok(Resp::bytes(crate::codec::encode_message(&ConsensusReply {
                     member: if node.id == UNASSIGNED {
                         Sender::Applicant(node.journal.identity.current.clone())
                     } else {
@@ -2403,7 +2406,7 @@ mod tests {
         ))));
         let forwarded = needs_request_worker(&packet(Message::Forward {
             op: Op::SnMasterKey.code(),
-            payload: vec![],
+            payload: common::wire::MessageBytes::new(),
             depth: 0,
         }));
         assert!(all_clients);

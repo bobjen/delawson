@@ -9,6 +9,10 @@ use std::io::Write;
 use std::sync::OnceLock;
 
 static POOL: OnceLock<Result<(BufferPoolConfig, ChunkPool)>> = OnceLock::new();
+pub(super) fn pool_config() -> BufferPoolConfig {
+    POOL.get().and_then(|p| p.as_ref().ok()).map_or_else(BufferPoolConfig::default, |p| p.0)
+}
+
 thread_local! { static RANDOM: RefCell<Rng> = RefCell::new(Rng::new()); }
 
 pub(super) fn with_random<T>(f: impl FnOnce(&mut Rng) -> T) -> T {
@@ -126,5 +130,35 @@ impl FrameBuffer for MessageBuffer {
             return Err(Error::new(format!("frame of {length} bytes is too large")));
         }
         self.bytes.write_at(start, &(length as u32).to_le_bytes()).context("frame length")
+    }
+}
+
+impl FrameBuffer for super::MessageBytes {
+    fn append_message(&mut self, message: &impl Message) -> Result<()> {
+        let start = self.len();
+        let result = (|| -> std::io::Result<()> {
+            self.write_all(&[0; 4])?;
+            message.encode_into(self)?;
+            let length = self.len() - start - 4;
+            if length > MAX_FRAME_BYTES {
+                return Err(std::io::Error::other("frame exceeds maximum size"));
+            }
+            self.write_at(start, &(length as u32).to_le_bytes())
+        })();
+        if result.is_err() {
+            self.truncate(start);
+        }
+        result.map_err(Into::into)
+    }
+}
+impl MessageBuffer {
+    pub fn append_payload(&mut self, bytes: &super::MessageBytes) -> Result<()> {
+        bytes.check()?;
+        let start = self.bytes.end();
+        let result = with_random(|rng| bytes.write_to(&mut self.bytes.writer(|| rng.next_u64())));
+        if result.is_err() {
+            self.bytes.truncate(start).context("batch rollback")?;
+        }
+        result.map_err(Into::into)
     }
 }

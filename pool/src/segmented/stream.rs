@@ -632,7 +632,7 @@ mod tests {
             writer.write_all(b"crossing a block").unwrap();
             let buffer = writer.into_inner();
             let actual = buffer.chunks().flatten().copied().collect::<Vec<_>>();
-            assert_eq!(actual, expected);
+            assert_eq!(actual, expected.to_vec());
             let mut old_reader = StructReader::new(&actual, depth);
             assert_eq!(old_reader.number_u8().unwrap(), 7);
             old_reader

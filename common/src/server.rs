@@ -47,8 +47,8 @@ use crate::random::Rng;
 use crate::registry::Peer;
 use crate::routing;
 use crate::wire::{
-    self, Arg, BUF_BYTES, MAX_FRAME_BYTES, MessageBuffer, Op, Req, Resp, Status, StructWriter,
-    Wire, put_response, structure,
+    self, Arg, MAX_FRAME_BYTES, MessageBuffer, Op, Req, Resp, Status, StructWriter, Wire,
+    put_response, structure,
 };
 use crate::{Context, Error, Result};
 use crate::{logd, logi, logn, logsec, logw};
@@ -65,7 +65,7 @@ pub const READY_FILE: &str = "ready";
 
 thread_local! {
     /// Framing scratch for a worker, so answering allocates nothing.
-    static SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(BUF_BYTES));
+    static SCRATCH: RefCell<crate::wire::MessageBytes> = RefCell::new(crate::wire::MessageBytes::new());
     /// One generator per thread, so padding needs no lock.
     static NOISE: RefCell<Rng> = RefCell::new(Rng::new());
 }
@@ -738,7 +738,7 @@ impl Batch {
             put_response(&mut *framed, response)?;
             let mut filling = self.filling.lock().expect("connection");
             let woke = filling.is_empty();
-            filling.append(&framed)?;
+            filling.append_payload(&framed)?;
             drop(filling);
             if woke {
                 self.ready.notify_one();

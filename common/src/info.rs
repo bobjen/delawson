@@ -994,7 +994,7 @@ mod tests {
     fn an_impossible_framing_is_refused() {
         let mut args = one(1).args();
         let Arg::Struct(_, payload, _) = &mut args[0] else { panic!("a self-contained row") };
-        payload[57] = 99;
+        payload.write_at(57, &[99]).unwrap();
         assert!(Described::of_args(&args).is_err());
     }
 
@@ -1170,7 +1170,7 @@ mod tests {
     fn an_extent_lying_about_its_instances_is_refused() {
         let mut args = extent(1, 0, 40).args();
         let Arg::Struct(_, payload, _) = &mut args[0] else { panic!("a self-contained extent") };
-        payload[40..44].copy_from_slice(&99u32.to_le_bytes());
+        payload.write_at(40, &99u32.to_le_bytes()).unwrap();
         assert!(ExtentRow::of_args(&args).is_err());
         assert!(ExtentRow::of_args(&args[..0]).is_err(), "and a short row too");
     }

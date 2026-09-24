@@ -8409,29 +8409,54 @@ a sequence of writes is not a transaction. `flush` is a no-op, not a durability
 operation. Neither adapter adds a contiguous staging buffer or virtual dispatch.
 The APIs are available as `buffer.reader()`, `buffer.reader_range(range)`, and
 `buffer.writer(rng_callback)`. Compatibility tests check that scalar encoding is
-identical, including tags and lengths crossing leaves. Message framing now uses
-these cursors; individual tagged-structure payloads still use their existing
-contiguous representation.
+identical, including tags and lengths crossing leaves. Message framing uses these cursors; individual tagged structures use the hybrid
+message storage described below.
 
 **Segmented message batches.** Outgoing peer queues, server response queues,
 direct connection buffers, sealed network output, incoming sealed segments, and
 opened message batches now use `wire::MessageBuffer`, backed by the segmented
 tree. Empty batches allocate no blocks. A process-wide pool is initialized once
-from `messaging.buffer_pool = { max_blocks = 1048576, initial_blocks = 0 }` before
-the first connection handshake; omitted settings use those defaults. This
-reserves 4GiB of payload virtual address space plus packed external links, with
+from `messaging.buffer_pool = { max_blocks = 8388608, initial_blocks = 0,
+small_message_bytes = 2048 }` when loading the cluster configuration, before
+constructing messages. Omitted settings use those defaults. This reserves
+32GiB of block virtual address space plus 32MiB of packed external links, with
 physical pages supplied on demand. Subsequent connections must use the same pool
 configuration. Thread-local RNGs choose allocation buckets. Pool exhaustion
 propagates as an error rather than publishing a partially framed message.
 
-Small per-message framing scratch remains a reusable Vec in producer threads;
-messages are copied into packed batch leaves while holding the existing queue
-lock. Direct-mode requests/responses encode straight into the batch through a
+Per-message framing scratch uses hybrid storage in producer threads; its small
+Vec allocation is reused. Messages are copied by chunk into packed batch leaves
+while holding the existing queue lock. Direct-mode requests/responses encode straight into the batch through a
 statically dispatched writer. Frame lengths are backfilled across boundaries.
 An encoding error rolls back that frame. Batching and send timing are unchanged,
 including one-message batches; large batches split only between complete frames.
 The existing wire byte format, compression selection, authentication tags, and
 nonce sequencing are preserved.
+
+**Hybrid individual messages.** `MessageBytes` begins with an empty Vec. Up to
+and including `small_message_bytes` (default 2KiB) it remains contiguous. A write
+that exceeds that threshold allocates from the same process-wide pool, copies
+the small prefix once, and releases the Vec. Further growth adds leaves without
+moving the prefix. Clearing a large scratch buffer releases its blocks and
+returns it to the small state. The threshold and block cap are independently
+configurable; setting the threshold to zero pools every nonempty payload.
+
+Tagged payloads (`Arg::Struct`), opaque arguments (`Arg::Bytes`), their receive
+buffers, and serialized per-message framing scratch use this storage. Strings
+and decoded application objects keep their natural Rust representations.
+`StructReader` reads hybrid payloads directly, caching the current leaf slice;
+scalar fields crossing leaves use a stack array. Tags, lengths, recursion-depth
+checks, and structural parse-count checks retain their wire semantics. Large
+received serialized fields are copied into owned pool leaves rather than a
+whole-field Vec. Raft network encoding and forwarded serialized payloads also
+use hybrid storage; persistent record APIs that require Vec remain explicit
+contiguous adapters.
+
+The existing infallible StructWriter field API retains allocation errors in the
+payload. Encoding checks that error and fails; framing rolls back before a
+partial message can be queued. Fallible writes preserve the previous prefix on
+pool exhaustion. Tests cover threshold promotion, a configured 1KiB threshold,
+leaf-crossing tags and lengths, pool exhaustion, and unchanged Raft wire bytes.
 
 Pool buffers provide vectored send and receive helpers. They build bounded
 arrays of at most 64 pointer/length descriptors on the stack and handle short

@@ -26,8 +26,14 @@
 //! the messages are just length-prefixed.
 
 mod buffer;
+mod payload;
 #[cfg(test)]
 mod segmented_tests;
+pub use payload::MessageBytes;
+pub fn configure_message_pool(config: crate::config::BufferPoolConfig) -> Result<()> {
+    buffer::shared_pool(config).map(|_| ())
+}
+
 pub use buffer::{FrameBuffer, Message, MessageBuffer};
 
 use crate::config::Messaging;
@@ -349,27 +355,27 @@ pub enum Arg {
     /// The third value is the maximum tagged-structure depth observed while
     /// constructing this value. It is not serialized separately; the enclosing
     /// message carries the maximum for all of its values.
-    Struct(Op, Vec<u8>, u8),
+    Struct(Op, MessageBytes, u8),
     Text(String),
     Number(u64),
     Flag(bool),
-    Bytes(Vec<u8>),
+    Bytes(MessageBytes),
 }
 
 /// Build the self-contained payload of one tagged structure.
 pub struct StructWriter {
-    bytes: Vec<u8>,
+    bytes: MessageBytes,
     depth: u8,
     maximum_depth: u8,
 }
 
 impl StructWriter {
     pub fn new() -> StructWriter {
-        StructWriter { bytes: Vec::new(), depth: 1, maximum_depth: 1 }
+        StructWriter { bytes: MessageBytes::new(), depth: 1, maximum_depth: 1 }
     }
 
     pub fn number_u64(&mut self, value: u64) {
-        self.bytes.extend(value.to_le_bytes());
+        self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
     pub fn number_u8(&mut self, value: u8) {
@@ -377,11 +383,11 @@ impl StructWriter {
     }
 
     pub fn number_u16(&mut self, value: u16) {
-        self.bytes.extend(value.to_le_bytes());
+        self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
     pub fn number_u32(&mut self, value: u32) {
-        self.bytes.extend(value.to_le_bytes());
+        self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
     pub fn dn_id(&mut self, value: DnId) {
@@ -469,8 +475,21 @@ impl StructWriter {
     }
 
     pub fn bytes(&mut self, value: &[u8]) {
-        self.bytes.extend((value.len() as u32).to_le_bytes());
-        self.bytes.extend(value);
+        self.bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        self.bytes.extend_from_slice(value);
+    }
+
+    /// Embed an already serialized payload without flattening its leaves.
+    pub fn message_bytes(&mut self, value: &MessageBytes) {
+        self.number_u32(value.len() as u32);
+        self.raw_message_bytes(value);
+    }
+
+    /// Copy serialized bytes whose length is supplied by the enclosing schema.
+    pub fn raw_message_bytes(&mut self, value: &MessageBytes) {
+        if let Err(e) = value.write_to(&mut self.bytes) {
+            self.bytes.fail(e);
+        }
     }
 
     pub fn text(&mut self, value: &str) {
@@ -479,7 +498,7 @@ impl StructWriter {
 
     /// Write a nested tagged structure while tracking its depth in the enclosing value.
     pub fn nested(&mut self, op: Op, write: impl FnOnce(&mut StructWriter)) {
-        self.bytes.extend(op.code().to_le_bytes());
+        self.bytes.extend_from_slice(&op.code().to_le_bytes());
         self.depth = self.depth.checked_add(1).expect("serialization nesting depth overflow");
         self.maximum_depth = self.maximum_depth.max(self.depth);
         write(self);
@@ -492,8 +511,27 @@ impl StructWriter {
 }
 
 /// Read the self-contained payload of one tagged structure.
+enum StructureInput<'a> {
+    Slice(&'a [u8]),
+    Message(&'a MessageBytes),
+}
+impl<'a> StructureInput<'a> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Slice(b) => b.len(),
+            Self::Message(b) => b.len(),
+        }
+    }
+    fn chunk(&self, at: usize) -> &'a [u8] {
+        match self {
+            Self::Slice(b) => &b[at..],
+            Self::Message(b) => b.chunk(at),
+        }
+    }
+}
 pub struct StructReader<'a> {
-    bytes: &'a [u8],
+    bytes: StructureInput<'a>,
+    current: &'a [u8],
     at: usize,
     depth: u8,
     maximum_depth: u8,
@@ -502,7 +540,25 @@ pub struct StructReader<'a> {
 
 impl<'a> StructReader<'a> {
     pub fn new(bytes: &'a [u8], maximum_depth: u8) -> StructReader<'a> {
-        StructReader { bytes, at: 0, depth: 1, maximum_depth, parse_count: 0 }
+        StructReader {
+            bytes: StructureInput::Slice(bytes),
+            current: bytes,
+            at: 0,
+            depth: 1,
+            maximum_depth,
+            parse_count: 0,
+        }
+    }
+
+    pub fn from_message(bytes: &'a MessageBytes, maximum_depth: u8) -> StructReader<'a> {
+        StructReader {
+            bytes: StructureInput::Message(bytes),
+            current: bytes.chunk(0),
+            at: 0,
+            depth: 1,
+            maximum_depth,
+            parse_count: 0,
+        }
     }
 
     // Charge structural attempts, including failures, without charging leaf reads.
@@ -515,30 +571,53 @@ impl<'a> StructReader<'a> {
         Ok(())
     }
 
-    fn take(&mut self, count: usize) -> Result<&'a [u8]> {
-        let end = self.at.checked_add(count).ok_or_else(|| Error::new("length overflow"))?;
-        if end > self.bytes.len() {
+    fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        if self.current.len() >= N {
+            let value = self.current[..N].try_into().unwrap();
+            self.current = &self.current[N..];
+            self.at += N;
+            Ok(value)
+        } else {
+            let mut value = [0; N];
+            self.read_into(&mut value)?;
+            Ok(value)
+        }
+    }
+
+    fn read_into(&mut self, mut out: &mut [u8]) -> Result<()> {
+        if let StructureInput::Message(bytes) = &self.bytes {
+            bytes.check()?;
+        }
+        if out.len() > self.remaining() {
             return Err(Error::new("structure payload ends mid-value"));
         }
-        let value = &self.bytes[self.at..end];
-        self.at = end;
-        Ok(value)
+        while !out.is_empty() {
+            if self.current.is_empty() {
+                self.current = self.bytes.chunk(self.at);
+            }
+            let n = self.current.len().min(out.len());
+            out[..n].copy_from_slice(&self.current[..n]);
+            self.current = &self.current[n..];
+            self.at += n;
+            out = &mut out[n..];
+        }
+        Ok(())
     }
 
     pub fn number_u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(u64::from_le_bytes(self.read_array::<8>()?))
     }
 
     pub fn number_u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
+        Ok(self.read_array::<1>()?[0])
     }
 
     pub fn number_u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(u16::from_le_bytes(self.read_array::<2>()?))
     }
 
     pub fn number_u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_le_bytes(self.read_array::<4>()?))
     }
 
     pub fn dn_id(&mut self) -> Result<DnId> {
@@ -630,12 +709,40 @@ impl<'a> StructReader<'a> {
     }
 
     pub fn flag(&mut self) -> Result<bool> {
-        Ok(self.take(1)?[0] != 0)
+        Ok(self.read_array::<1>()?[0] != 0)
     }
 
     pub fn bytes(&mut self) -> Result<Vec<u8>> {
-        let length = u32::from_le_bytes(self.take(4)?.try_into().unwrap()) as usize;
-        Ok(self.take(length)?.to_vec())
+        let length = u32::from_le_bytes(self.read_array::<4>()?) as usize;
+        if length > self.remaining() {
+            return Err(Error::new("structure payload ends mid-value"));
+        }
+        let mut bytes = vec![0; length];
+        self.read_into(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Read an owned serialized field without flattening large fields.
+    pub fn raw_message_bytes(&mut self, length: usize) -> Result<MessageBytes> {
+        if let StructureInput::Message(bytes) = &self.bytes {
+            bytes.check()?;
+        }
+        if length > self.remaining() {
+            return Err(Error::new("structure payload ends mid-value"));
+        }
+        let mut out = MessageBytes::new();
+        let mut left = length;
+        while left != 0 {
+            if self.current.is_empty() {
+                self.current = self.bytes.chunk(self.at);
+            }
+            let n = self.current.len().min(left);
+            out.write_all(&self.current[..n])?;
+            self.current = &self.current[n..];
+            self.at += n;
+            left -= n;
+        }
+        Ok(out)
     }
 
     pub fn text(&mut self) -> Result<String> {
@@ -643,7 +750,7 @@ impl<'a> StructReader<'a> {
     }
 
     pub fn tag(&mut self, expected: Op, what: &str) -> Result<()> {
-        let actual = Op::from_code(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))?;
+        let actual = Op::from_code(u16::from_le_bytes(self.read_array::<2>()?))?;
         if actual == expected {
             Ok(())
         } else {
@@ -689,6 +796,9 @@ impl<'a> StructReader<'a> {
     }
 
     pub fn done(&self) -> Result<()> {
+        if let StructureInput::Message(bytes) = &self.bytes {
+            bytes.check()?;
+        }
         if self.at == self.bytes.len() {
             Ok(())
         } else {
@@ -708,7 +818,8 @@ pub fn structure<'a>(
     if *actual != expected {
         return Err(Error::new(format!("expected {expected}, got {actual}")));
     }
-    Ok((StructReader::new(bytes, *maximum_depth), rest))
+    bytes.check()?;
+    Ok((StructReader::from_message(bytes, *maximum_depth), rest))
 }
 
 impl std::fmt::Display for Arg {
@@ -764,8 +875,8 @@ impl Req {
         self
     }
 
-    pub fn bytes(mut self, bytes: Vec<u8>) -> Req {
-        self.args.push(Arg::Bytes(bytes));
+    pub fn bytes(mut self, bytes: impl Into<MessageBytes>) -> Req {
+        self.args.push(Arg::Bytes(bytes.into()));
         self
     }
 
@@ -789,7 +900,7 @@ impl Req {
             && *op == self.op
         {
             out.write_all(&COMMAND_PAYLOAD.to_le_bytes())?;
-            out.write_all(bytes)?;
+            bytes.write_to(out)?;
         } else {
             encode_args(&self.args, out)?;
         }
@@ -847,9 +958,9 @@ impl Resp {
         Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::FlagResp)] }
     }
 
-    pub fn bytes(bytes: Vec<u8>) -> Resp {
+    pub fn bytes(bytes: impl Into<MessageBytes>) -> Resp {
         let mut payload = StructWriter::new();
-        payload.bytes(&bytes);
+        payload.message_bytes(&bytes.into());
         Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::BytesResp)] }
     }
 
@@ -1218,13 +1329,13 @@ fn encode_args(args: &[Arg], out: &mut impl Write) -> std::io::Result<()> {
             Arg::Bytes(bytes) => {
                 out.write_all(&[3])?;
                 out.write_all(&(bytes.len() as u32).to_le_bytes())?;
-                out.write_all(bytes)?;
+                bytes.write_to(out)?;
             }
             Arg::Struct(op, bytes, _) => {
                 out.write_all(&[4])?;
                 out.write_all(&op.code().to_le_bytes())?;
                 out.write_all(&(bytes.len() as u32).to_le_bytes())?;
-                out.write_all(bytes)?;
+                bytes.write_to(out)?;
             }
         }
     }
@@ -1247,14 +1358,22 @@ impl<R: BufRead> Cursor<R> {
         Self { input, remaining }
     }
 
-    fn take(&mut self, n: usize) -> Result<Vec<u8>> {
+    fn take(&mut self, n: usize) -> Result<MessageBytes> {
         if n > self.remaining {
             return Err(Error::new("frame ends mid-value"));
         }
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(n).context("frame field allocation")?;
-        bytes.resize(n, 0);
-        self.input.read_exact(&mut bytes)?;
+        let mut bytes = MessageBytes::new();
+        let mut left = n;
+        while left != 0 {
+            let chunk = self.input.fill_buf()?;
+            if chunk.is_empty() {
+                return Err(Error::new("frame ends mid-value"));
+            }
+            let count = chunk.len().min(left);
+            bytes.write_all(&chunk[..count])?;
+            self.input.consume(count);
+            left -= count;
+        }
         self.remaining -= n;
         Ok(bytes)
     }
@@ -1302,7 +1421,7 @@ impl<R: BufRead> Cursor<R> {
                 0 => {
                     let len = self.u32()? as usize;
                     let bytes = self.take(len)?;
-                    Arg::Text(String::from_utf8(bytes).context("text argument")?)
+                    Arg::Text(String::from_utf8(bytes.to_vec()).context("text argument")?)
                 }
                 1 => Arg::Number(self.u64()?),
                 2 => Arg::Flag(self.u8()? != 0),
@@ -1526,10 +1645,10 @@ impl Outbox {
     }
 
     /// Append one framed message. The lock is held for a copy, never for a write.
-    pub fn put(&self, framed: &[u8]) -> Result<()> {
+    pub fn put(&self, framed: &MessageBytes) -> Result<()> {
         let mut filling = self.filling.lock().expect("outbox");
         let woke = filling.is_empty();
-        filling.append(framed)?;
+        filling.append_payload(framed)?;
         drop(filling);
         // Waking is only needed when the sender has nothing else to find.
         if woke {
@@ -1722,7 +1841,7 @@ mod tests {
         assert_eq!(reader.number_u8().unwrap(), 7);
         assert_eq!(reader.number_u8().unwrap_err().to_string(), "structure payload ends mid-value");
         assert_eq!(reader.parse_count, usize::MAX);
-        assert!(reader.take(0).unwrap().is_empty());
+        assert!(reader.read_array::<0>().unwrap().is_empty());
     }
 
     #[test]

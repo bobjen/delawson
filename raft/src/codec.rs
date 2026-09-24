@@ -14,7 +14,7 @@ pub fn encode<T: Wire>(value: &T) -> Result<Vec<u8>> {
         return Err(Error::new("Raft encoding exceeds limits"));
     }
     let mut encoded = vec![depth];
-    encoded.extend(bytes);
+    bytes.write_to(&mut encoded)?;
     Ok(encoded)
 }
 pub fn decode<T: Wire>(bytes: &[u8]) -> Result<T> {
@@ -233,5 +233,69 @@ mod tests {
         let mut shallow = encode(&Some(vec![Some(1u64)])).unwrap();
         shallow[0] = 1;
         assert!(decode::<Option<Vec<Option<u64>>>>(&shallow).is_err());
+    }
+}
+
+/// Decode a message payload directly across its pool leaves.
+pub fn decode_message<T: Wire>(bytes: &common::wire::MessageBytes) -> Result<T> {
+    bytes.check()?;
+    let depth = *bytes.chunk(0).first().ok_or_else(|| Error::new("empty Raft encoding"))?;
+    if depth == 0 || depth > MAX_RECURSION_DEPTH || bytes.len() > MAX_FRAME_BYTES {
+        return Err(Error::new("invalid Raft encoding limits"));
+    }
+    let mut r = StructReader::from_message(bytes, depth);
+    r.number_u8()?;
+    let value = T::read(&mut r)?;
+    r.done()?;
+    Ok(value)
+}
+
+/// Network encoding retains pool leaves instead of flattening for the caller.
+pub fn encode_message<T: Wire>(value: &T) -> Result<common::wire::MessageBytes> {
+    let mut writer = StructWriter::new();
+    value.write(&mut writer);
+    let Arg::Struct(_, bytes, depth) = writer.finish(Op::Raft) else { unreachable!() };
+    if bytes.len() >= MAX_FRAME_BYTES || depth > MAX_RECURSION_DEPTH {
+        return Err(Error::new("Raft encoding exceeds limits"));
+    }
+    let mut out = common::wire::MessageBytes::new();
+    out.push(depth);
+    bytes.write_to(&mut out)?;
+    out.check()?;
+    Ok(out)
+}
+
+// Preserve Vec<u8>'s existing tagged-list representation for forwarded payloads.
+impl Wire for common::wire::MessageBytes {
+    fn write(&self, writer: &mut StructWriter) {
+        writer.nested(Op::RaftList, |writer| {
+            writer.number_u64(self.len() as u64);
+            writer.raw_message_bytes(self);
+        });
+    }
+    fn read(reader: &mut StructReader<'_>) -> Result<Self> {
+        reader.nested(Op::RaftList, "list", |reader| {
+            let n = reader.number_u64()?;
+            if n > reader.remaining() as u64 {
+                return Err(Error::new("byte list exceeds remaining payload"));
+            }
+            reader.raw_message_bytes(n as usize)
+        })
+    }
+}
+
+#[cfg(test)]
+mod message_storage_tests {
+    use super::*;
+    #[test]
+    fn segmented_network_encoding_matches_contiguous_byte_list() {
+        let bytes: Vec<u8> = (0..12000).map(|i| i as u8).collect();
+        let payload = common::wire::MessageBytes::from(bytes.clone());
+        let encoded = encode_message(&payload).unwrap();
+        assert!(encoded.is_segmented());
+        assert_eq!(encoded.to_vec(), encode(&bytes).unwrap());
+        let decoded: common::wire::MessageBytes = decode_message(&encoded).unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(decode_message::<Vec<u8>>(&encoded).unwrap(), bytes);
     }
 }

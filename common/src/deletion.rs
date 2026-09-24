@@ -842,7 +842,11 @@ mod tests {
                 let Arg::Struct(op, bytes, depth) = &request.args[0] else { panic!() };
                 for len in 0..bytes.len() {
                     let mut short = Req::new(*op);
-                    short.args.push(Arg::Struct(*op, bytes[..len].to_vec(), *depth));
+                    short.args.push(Arg::Struct(
+                        *op,
+                        bytes.to_vec()[..len].to_vec().into(),
+                        *depth,
+                    ));
                     assert!(Delete::of(&short).is_err(), "accepted truncation at {len}");
                 }
                 let mut trailing = delete.request().unwrap();

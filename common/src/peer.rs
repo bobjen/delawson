@@ -27,7 +27,7 @@ struct Slot {
 
 thread_local! {
     /// Framing scratch, so asking allocates nothing.
-    static FRAME: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FRAME: std::cell::RefCell<wire::MessageBytes> = std::cell::RefCell::new(wire::MessageBytes::new());
 
 }
 
