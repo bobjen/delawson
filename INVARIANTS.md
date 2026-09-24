@@ -903,6 +903,22 @@ asks and the rest join it.
 *Breaks* the request rate to the tier below climbs towards the append rate while the work it does
 stays constant — `SN-NOT-IN-WRITE-PATH` in a different guise.
 
+**`POOL-REUSE-AFTER-GRACE`** — an index removed from the free list cannot return
+until all pool operations that could retain its old head value have ended.
+*Argued* §8.1.5.2 · *Enforced* `common::pool`: shared participation, selector revalidation,
+exclusive draining, and holding the inactive lock through each selector switch · *Checked* deterministic stalled-reader
+and cross-group retirement tests, plus concurrent ownership tests for both link layouts
+*Breaks* ABA lets a stale successful CAS lose free blocks or allocate an owned block.
+
+**`POOL-LINK-STAYS-ATOMIC`** — the link remains a stable atomic 32-bit field even
+when its item is allocated; stale candidate next indexes are not dereferenced before
+successful head CAS.
+*Argued* §8.1.5.2 · *Enforced* `Links` safety contract, atomic lookup, and no safe whole-item
+mutable slice for inline links · *Checked* tests overwrite allocated links with non-index
+values while an older reader remains active; concurrent tests exercise both layouts
+*Breaks* non-atomic payload writes race stale link reads, or an application value is
+incorrectly treated as an index.
+
 ## Wire protocol and compatibility
 
 **`SHIPPED-OP-TAGS-STAY-STABLE-UNTIL-EXHAUSTION`** — an `Op::` tag released in a client-visible
@@ -998,6 +1014,7 @@ the index's real use beyond navigation. §8.1.6 records the cost of not doing it
 | **stream** | §4.1 | `STREAM-IDENTITY-OWNED`, `SN-NOT-IN-WRITE-PATH`, `ONE-REQUEST-IN-FLIGHT-PER-STREAM`, `EXTENT-KEY-FROM-CREATING-SN`, `READ-NAMES-THE-OBJECT`, `THE-OFFICIAL-FLAG-STAYS-PERMISSIVE-UNTIL-CLEANUP-ENDS` |
 | **`Op::` tag** | §17.42.1 | `SHIPPED-OP-TAGS-STAY-STABLE-UNTIL-EXHAUSTION`, `NEW-WIRE-FORMATS-REQUIRE-CLIENT-CAPABILITY`, `UNKNOWN-NESTED-TAGS-FAIL-CLOSED` |
 | **summary** | §4.5 | `TAIL-ONLY-SUMMARIES-EXACT`, `UNKEYED-COUNT-EXACT`, `COUNTS-ARE-RECOMPUTABLE` |
+| **pool block** | §8.1.5.2 | `POOL-REUSE-AFTER-GRACE`, `POOL-LINK-STAYS-ATOMIC` |
 | **watermark** | §8.1.1 | `WRITTEN-IS-A-PREFIX`, `DURABLE-IS-QUORUM-WATERMARK`, `TRUNCATE-ABOVE-WATERMARK-ON-HANDOVER`, `SEAL-NEVER-BELOW-DURABLE`, `INCOMPLETE-RECORD-NOT-DURABLE` |
 
 ## What the index shows

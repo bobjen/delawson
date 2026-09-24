@@ -7723,16 +7723,76 @@ much more than it does — and that is worth deciding rather than assuming (#46)
 after — the same stand-in bargain as DN's in-memory object index (§17.5g), and the same
 caution: nothing about the in-memory version is evidence about what the durable one costs.
 
-The shared `common::pool` interface now owns fixed-size, uninitialized memory blocks.
-Each process defaults to 64 KiB blocks; its process configuration may set `block_bytes`
-(for example, 4194304 for 4 MiB) before service startup. The size cannot change after
-initialization. For now allocation and return call the system's `malloc` and `free`;
-there is no custom free list, staging area, or segmented array. Callers retain a
-reference from `pool::global()`, call `alloc()`, and return ownership by dropping the
-block or calling `pool::free(block)`. The allocation/free methods are inline, with no
-pool lock, reference counting, or separate bookkeeping allocation. Global lookup
-checks initialization once per lookup; retaining the reference avoids that check
-on each allocation. A future pool backend can replace malloc/free behind this interface.
+The shared `common::pool` interface owns fixed-size blocks in a contiguous virtual
+reservation. `Pool<ALIGN, BYTES, Links>` selects alignment, block size, and link layout
+at compile time, using static trait dispatch. Block size must be a positive multiple
+of the power-of-two alignment. Construction takes maximum and initial block counts;
+it reserves `BYTES * max_blocks + ALIGN - 1` bytes with anonymous `mmap` and rounds
+the base up to alignment. An atomic cursor hands out previously unused indexes in
+ascending order. Physical pages are supplied on demand: initial blocks are made
+available on the free list, not necessarily prefaulted. Mappings stay until pool
+destruction; returning a block does not call `munmap` or discard its pages.
+
+The process-wide instance uses 4 KiB blocks aligned to 4 KiB. Process parameters
+`pool_max_blocks` and `pool_initial_blocks` default to 1,048,576 and 16 respectively
+(a 4 GiB payload address reservation, plus alignment slack). They are read before
+initialization and cannot change afterward. These replace the earlier runtime
+`block_bytes` parameter. `pool::global()` requires initialization; retaining its
+reference avoids subsequent initialization checks. `alloc()` returns a result
+containing an owning handle, and drop or `pool::free` returns the block. The handle
+borrows the pool, so its mappings cannot disappear while a block is live. Exhaustion
+is reported if neither a reusable nor a new index is available; delayed reclamation
+can make that failure temporary.
+
+`ExternalLinks` reserves `4 * max_blocks + 3` bytes separately and aligns a packed
+array of atomic 32-bit links. It allows the full payload to be exposed as mutable
+uninitialized bytes. `InlineLinks<OFFSET>` instead locates the link inside each item;
+`offset_of!(Item, field)` can supply the offset. Inline links remain atomic throughout
+the item's lifetime, though their values may serve another purpose while allocated.
+The inline handle exposes a raw item pointer and the atomic link, not a mutable
+slice covering the link. Typed item access must likewise avoid an exclusive
+reference spanning the link or non-atomic writes to it. Other link layouts can
+implement the unsafe `Links` contract. Index `u32::MAX` is reserved as the empty-list
+sentinel, permitting at most `u32::MAX` blocks.
+
+Recycling uses one free list and two deleted lists, each deleted list protected by
+an `RwLock`. An atomic selector identifies the current group. Both allocation from
+the free list and return to a deleted list try its shared lock and recheck the
+selector before reading list state. Returns push onto the current deleted list;
+allocations pop from the free list. Empty-list allocation releases the shared lock,
+tries reclamation, then retries the free list before taking a fresh index.
+
+A recycler tries the inactive list's exclusive lock and rechecks the selector.
+It splices that retired chain onto the free list with a head CAS, appending the
+existing free list to the remembered tail of the chain. This makes transfer
+constant-time. It then selects the emptied list as current before releasing its
+exclusive lock. No separate rotation mutex or pending-group state is needed:
+another switch to that list also requires its exclusive lock. Acquiring that lock
+establishes that the list's previous participants have drained, including any
+that could have observed items retired into the other group. Holding it through
+the selector update prevents a delayed recycler from switching after intervening
+rotations. New operations retry during the short interval between selection and
+write-lock release; a suspended recycler at that point can delay them.
+
+Empty-list allocation attempts up to two such turns, retrying the free list after
+each, before taking a fresh index. Two turns allow a return to the initially active
+list to become reusable on the next allocation, without a spurious capacity error
+in a single-threaded pool. Exclusive acquisition uses try-locks throughout, so an
+undrained inactive group does not prevent allocation from the free list, growth,
+or return to the current group. The initial implementation conservatively uses
+sequentially consistent atomics.
+
+Two rules are essential. **POOL-REUSE-AFTER-GRACE:** a popped index cannot reappear
+on the free list until every pool operation that could hold its old head value
+has ended. Shared participation, selector revalidation, and exclusive locking through
+each switch establish this, preventing ABA. **POOL-LINK-STAYS-ATOMIC:** a stale allocator may
+read an item's link after another allocator has given the item to its caller.
+That read is atomic even if the field now holds an application value. The stale
+head CAS must fail, and the candidate next index is never dereferenced before
+success. This is why an inline link cannot become ordinary mutable payload.
+Deterministic stalled-participant tests cover both same-group and cross-group
+retirement, and concurrent tests exercise both link layouts and exclusive ownership.
+There is no segmented array, disk staging area, or extent persistence in this change.
 
 #### 8.1.5.3 When transactions arrive, the EN's part of them lives in the journal
 
