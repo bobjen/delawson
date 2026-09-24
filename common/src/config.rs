@@ -880,11 +880,6 @@ loaders!(DNConfig, SNConfig, ENConfig, FEConfig);
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
-    /// Capacity and initially available blocks in the process-wide 4 KiB pool.
-    #[serde(default = "crate::pool::default_max")]
-    pub pool_max_blocks: u32,
-    #[serde(default = "crate::pool::default_initial")]
-    pub pool_initial_blocks: u32,
     /// DANGER: A GOOD WAY TO LOSE ALL YOUR DATA. Debugging only: bypass ring
     /// identity checks for admission and recovery, e.g. a production copy in test.
     /// Does not bypass machine authentication, checksums, or key authentication.

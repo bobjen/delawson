@@ -905,7 +905,7 @@ stays constant — `SN-NOT-IN-WRITE-PATH` in a different guise.
 
 **`POOL-REUSE-AFTER-GRACE`** — an index removed from the free list cannot return
 until all pool operations that could retain its old head value have ended.
-*Argued* §8.1.5.2 · *Enforced* `common::pool`: shared participation, selector revalidation,
+*Argued* §8.1.5.2 · *Enforced* `pool`: shared participation, selector revalidation,
 exclusive draining, and holding the inactive lock through each selector switch · *Checked* deterministic stalled-reader
 and cross-group retirement tests, plus randomized ownership and quiescent-list audits
 for both link layouts, each requiring twelve observed coverage flags

@@ -1,0 +1,16 @@
+[package]
+name = "delawson-pool"
+description = "Indexed fixed-size pools for contiguous virtual arrays"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "pool"
+
+[dependencies]
+libc = "0.2.189"
+
+[dev-dependencies]
+delawson-common = { workspace = true, features = ["testing"] }

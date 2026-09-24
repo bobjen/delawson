@@ -7723,7 +7723,7 @@ much more than it does — and that is worth deciding rather than assuming (#46)
 after — the same stand-in bargain as DN's in-memory object index (§17.5g), and the same
 caution: nothing about the in-memory version is evidence about what the durable one costs.
 
-The shared `common::pool` interface owns fixed-size blocks in a contiguous virtual
+The shared `pool` interface owns fixed-size blocks in a contiguous virtual
 reservation. `Pool<ALIGN, BYTES, Links>` selects alignment, block size, and link layout
 at compile time, using static trait dispatch. Block size must be a positive multiple
 of the power-of-two alignment. Construction takes maximum and initial block counts;
@@ -7733,12 +7733,14 @@ ascending order. Physical pages are supplied on demand: initial blocks are made
 available on the free list, not necessarily prefaulted. Mappings stay until pool
 destruction; returning a block does not call `munmap` or discard its pages.
 
-The process-wide instance uses 4 KiB blocks aligned to 4 KiB. Process parameters
-`pool_max_blocks` and `pool_initial_blocks` default to 1,048,576 and 16 respectively
-(a 4 GiB payload address reservation, plus alignment slack). They are read before
-initialization and cannot change afterward. These replace the earlier runtime
-`block_bytes` parameter. `pool::global()` requires initialization; retaining its
-reference avoids subsequent initialization checks. `alloc()` returns a result
+The implementation is a standalone workspace crate in `pool/`, imported as `pool`.
+It is intended for indexed items in SN and DN virtual arrays. Each consumer creates
+its own pool with runtime maximum and initial counts; there is no process-global
+pool or automatic daemon initialization. Its only production dependency is libc;
+its tests and benchmark reuse common's RNG through a development dependency.
+Checkpoints and EN buffers can use system allocation directly; the malloc and
+aligned-allocation variants exist only in the comparison benchmark, not the pool
+API. `alloc()` returns a result
 containing an owning handle, and drop or `pool::free` returns the block. The handle
 borrows the pool, so its mappings cannot disappear while a block is live. Exhaustion
 is reported if neither a reusable nor a new index is available; delayed reclamation
@@ -7756,7 +7758,7 @@ implement the unsafe `Links` contract. Index `u32::MAX` is reserved as the empty
 sentinel, permitting at most `u32::MAX` blocks.
 
 Recycling uses one free list and two deleted lists, each deleted list protected by
-an `RwLock`. An atomic selector identifies the current group. Both allocation from
+an `AtomicI64` reader/writer counter. An atomic selector identifies the current group. Both allocation from
 the free list and return to a deleted list try its shared lock and recheck the
 selector before reading list state. Returns push onto the current deleted list;
 allocations pop from the free list. Empty-list allocation releases the shared lock,
@@ -7781,6 +7783,112 @@ in a single-threaded pool. Exclusive acquisition uses try-locks throughout, so a
 undrained inactive group does not prevent allocation from the free list, growth,
 or return to the current group. The initial implementation conservatively uses
 sequentially consistent atomics.
+
+An `AtomicI64` counter-lock prototype was compared with `RwLock`. Its readers
+incremented the count, rolling back if the old value was negative; writers CASed
+zero to `i64::MIN` and released with CAS back to zero, retrying until rejected
+readers had rolled back. It passed the concurrency tests, but their fixed 3 ms
+loops hid the performance difference: three 1000-round batches took about 5.9 s
+with either lock.
+
+The `pool/examples/pool_bench.rs` benchmark measures the production pool in a
+release build, with no histories, assertions, coverage probes or cancellation
+checks. Eight threads each make one million random alloc/free calls against a
+16-block pool. All workers are ready before timing starts; timing ends after
+cleanup, before joining. Only thread-local operation counts are collected, including
+allocation failures. Both variants were built from otherwise identical source,
+warmed up, and measured three times with alternating order and paired seeds.
+September 2026 results, seconds per eight million operations:
+
+| Links | Lock | Run 1 | Run 2 | Run 3 | Mean |
+|---|---|---:|---:|---:|---:|
+| External | `RwLock` | 1.695 | 2.509 | 2.867 | 2.357 |
+| External | `AtomicI64` | 4.825 | 7.603 | 7.654 | 6.694 |
+| Inline | `RwLock` | 2.470 | 2.871 | 2.574 | 2.638 |
+| Inline | `AtomicI64` | 8.903 | 5.211 | 5.475 | 6.530 |
+
+`RwLock` was retained after this first experiment: its slowest run beat the
+counter's fastest run in each layout.
+These are contention-heavy pool measurements, not end-to-end service timings.
+Run the retained benchmark with `cargo run --release -p delawson-pool --example
+pool_bench -- external 8 1000000 16 42`; substitute `inline` for the other layout.
+Arguments are layout, threads, operations per thread, maximum blocks and seed.
+The output is CSV: those first four settings, elapsed milliseconds, allocations,
+allocation failures and returns. The counter prototype used SeqCst
+ordering, as does the rest of the pool; this experiment did not tune memory ordering.
+
+The current counter implementation checks for a nonnegative reader count and
+increments with a conditional CAS, retrying with the newly observed value on
+failure. A separate load followed by fetch-add would not suffice: a writer could
+acquire between them. Rejected readers now leave the counter untouched, so writer
+release simply stores zero. Reader release still decrements; writer acquisition
+still CASes zero to `i64::MIN`. Outstanding readers are bounded by participating
+threads, so no overflow check is needed. All ordering remains SeqCst.
+
+Three paired runs of this revision with the same benchmark settings:
+
+| Links | Lock | Run 1 | Run 2 | Run 3 | Mean |
+|---|---|---:|---:|---:|---:|
+| External | `RwLock` | 2.840 | 2.500 | 2.595 | 2.645 |
+| External | CAS `AtomicI64` | 1.709 | 2.544 | 2.549 | 2.267 |
+| Inline | `RwLock` | 2.437 | 2.451 | 2.836 | 2.575 |
+| Inline | CAS `AtomicI64` | 2.400 | 2.414 | 2.489 | 2.434 |
+
+The revised counter removes the earlier large slowdown. Its means are lower, but
+the ranges overlap; these measurements do not establish a reliable advantage over
+`RwLock`. The requested counter revision is retained for review. A deterministic
+test covers a reader paused after its load while a writer acquires: its stale CAS
+fails without changing the exclusive count, and writer release restores zero.
+
+A third benchmark variant calls `libc::malloc(4096)` and `libc::free` per block,
+without requesting page alignment. A shared `AtomicU32` reserves a live slot by
+conditional CAS before malloc and releases it after free (also on malloc failure),
+with the same maximum of 16 blocks and SeqCst ordering. Capacity failures construct
+the same error as the pool. The worker loop is shared through static dispatch;
+there are no function-pointer calls. The final live count is checked after timing.
+Three interleaved, warmed runs with paired seeds, eight threads and eight million
+operations, in seconds:
+
+| Implementation | Run 1 | Run 2 | Run 3 | Mean |
+|---|---:|---:|---:|---:|
+| Capped malloc/free | 0.262 | 0.264 | 0.268 | 0.265 |
+| External CAS counter | 2.619 | 1.744 | 1.758 | 2.041 |
+| External RwLock | 1.680 | 2.584 | 1.698 | 1.988 |
+| Inline CAS counter | 1.669 | 2.893 | 1.677 | 2.080 |
+| Inline RwLock | 2.452 | 2.893 | 2.859 | 2.735 |
+
+Malloc/free is clearly faster in this workload, including its shared capacity
+counter: about 7.5–10.3 times faster by mean. It completed 3.07–3.09 million
+successful allocations per run versus 2.94–3.04 million for the pools; the remaining
+calls are returns and failed allocation attempts. All variants have the same
+capacity, but schedules and deferred pool reclamation affect their success mix.
+Each worker frees its own allocations, and payloads are untouched. This does not
+measure cross-thread frees, aligned allocation, or end-to-end I/O. Disassembly
+confirmed actual malloc/free calls in the optimized worker loop. The pool
+implementation is unchanged by this experiment. Run the baseline by selecting
+`malloc` in place of `external` in the benchmark command above.
+
+The `aligned` baseline substitutes `libc::aligned_alloc(4096, 4096)` for malloc,
+using the same free, capacity counter, and worker loop. Allocation selection is
+compile-time; an alignment check runs before timing. Three more interleaved runs
+with the same settings (seconds):
+
+| Implementation | Run 1 | Run 2 | Run 3 | Mean |
+|---|---:|---:|---:|---:|
+| 4KiB-aligned allocation/free | 0.257 | 0.224 | 0.254 | 0.245 |
+| Malloc/free | 0.203 | 0.269 | 0.271 | 0.248 |
+| External CAS counter | 2.470 | 1.728 | 1.724 | 1.974 |
+| External RwLock | 2.556 | 2.576 | 1.682 | 2.271 |
+| Inline CAS counter | 2.851 | 2.415 | 1.653 | 2.306 |
+| Inline RwLock | 2.565 | 2.866 | 2.896 | 2.776 |
+
+Alignment introduces no detectable slowdown in this benchmark: both system
+allocation variants average about 0.25 seconds, versus 1.97–2.78 seconds for the
+pools (8.1–11.3 times slower). Aligned allocation completed 3.10–3.13 million
+successful allocations per run. The same same-thread-free and untouched-payload
+limitations apply. Select `aligned` in the benchmark command to reproduce this
+mode. One-block and zero-capacity paths also passed; every run checks the final
+live count after timing. This experiment leaves the production pool unchanged.
 
 Two rules are essential. **POOL-REUSE-AFTER-GRACE:** a popped index cannot reappear
 on the free list until every pool operation that could hold its old head value

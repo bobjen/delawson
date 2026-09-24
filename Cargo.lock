@@ -288,6 +288,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "delawson-pool"
+version = "0.0.1"
+dependencies = [
+ "delawson-common",
+ "libc",
+]
+
+[[package]]
 name = "delawson-raft"
 version = "0.0.1"
 dependencies = [

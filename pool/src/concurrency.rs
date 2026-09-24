@@ -1,9 +1,10 @@
 //! Coverage-driven trials: https://burtleburtle.net/bob/testing/concurrencyflags.html
 use super::*;
-use crate::random::Rng;
+use common::random::Rng;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Barrier;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 

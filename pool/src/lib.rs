@@ -1,9 +1,7 @@
 //! Fixed-size pools with two retirement lists and statically selected link storage.
-use crate::{Error, Result};
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::SeqCst};
-use std::sync::{OnceLock, RwLock, TryLockError, TryLockResult};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering::SeqCst};
 
 #[cfg(test)]
 mod concurrency;
@@ -15,36 +13,26 @@ macro_rules! pool_hit {
     };
 }
 
-pub const DEFAULT_BYTES: usize = 4096;
-pub const DEFAULT_ALIGN: usize = 4096;
-pub const DEFAULT_MAX: u32 = 1 << 20;
-pub const DEFAULT_INITIAL: u32 = 16;
 const NONE: u32 = u32::MAX;
-pub type GlobalPool = Pool<DEFAULT_ALIGN, DEFAULT_BYTES, ExternalLinks>;
-static GLOBAL: OnceLock<GlobalPool> = OnceLock::new();
 
-pub(crate) fn default_max() -> u32 {
-    DEFAULT_MAX
-}
-pub(crate) fn default_initial() -> u32 {
-    DEFAULT_INITIAL
-}
+#[derive(Debug)]
+pub struct Error(String);
 
-/// Initialize from process parameters before allocating any blocks.
-pub fn initialize(max_blocks: u32, initial_blocks: u32) -> Result<()> {
-    if let Some(pool) = GLOBAL.get() {
-        return pool.same_limits(max_blocks, initial_blocks);
+impl Error {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
     }
-    let pool = GlobalPool::new(max_blocks, initial_blocks)?;
-    // A concurrent initializer may win; its parameters must agree.
-    let _ = GLOBAL.set(pool);
-    GLOBAL.get().unwrap().same_limits(max_blocks, initial_blocks)
 }
 
-/// Retain this reference to avoid checking initialization on every allocation.
-pub fn global() -> &'static GlobalPool {
-    GLOBAL.get().expect("initialize the block pool before use")
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
+
+impl std::error::Error for Error {}
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 struct Mapping {
     raw: NonNull<u8>,
@@ -190,23 +178,62 @@ unsafe impl<const O: usize> Links for InlineLinks<O> {
     }
 }
 
+struct ListLock(AtomicI64);
+
+impl ListLock {
+    fn new() -> Self {
+        Self(AtomicI64::new(0))
+    }
+
+    #[inline]
+    fn try_read(&self) -> Option<ReadGuard<'_>> {
+        // Check and increment atomically; outstanding readers are thread-bounded.
+        let mut count = self.0.load(SeqCst);
+        loop {
+            if count < 0 {
+                return None;
+            }
+            match self.0.compare_exchange_weak(count, count.wrapping_add(1), SeqCst, SeqCst) {
+                Ok(_) => return Some(ReadGuard(self)),
+                Err(actual) => count = actual,
+            }
+        }
+    }
+
+    #[inline]
+    fn try_write(&self) -> Option<WriteGuard<'_>> {
+        self.0.compare_exchange(0, i64::MIN, SeqCst, SeqCst).ok().map(|_| WriteGuard(self))
+    }
+}
+
+struct ReadGuard<'a>(&'a ListLock);
+
+impl Drop for ReadGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, SeqCst);
+    }
+}
+
+struct WriteGuard<'a>(&'a ListLock);
+
+impl Drop for WriteGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        // Rejected readers never modify the writer's counter.
+        self.0.0.store(0, SeqCst);
+    }
+}
+
 struct Deleted {
-    gate: RwLock<()>,
+    gate: ListLock,
     head: AtomicU32,
     tail: AtomicU32,
 }
 
 impl Deleted {
     fn new() -> Self {
-        Self { gate: RwLock::new(()), head: AtomicU32::new(NONE), tail: AtomicU32::new(NONE) }
-    }
-}
-
-fn try_guard<T>(result: TryLockResult<T>) -> Option<T> {
-    match result {
-        Ok(guard) => Some(guard),
-        Err(TryLockError::Poisoned(error)) => Some(error.into_inner()),
-        Err(TryLockError::WouldBlock) => None,
+        Self { gate: ListLock::new(), head: AtomicU32::new(NONE), tail: AtomicU32::new(NONE) }
     }
 }
 
@@ -215,7 +242,6 @@ pub struct Pool<const ALIGN: usize, const BYTES: usize, L: Links = ExternalLinks
     links: L,
     mapping: Mapping,
     max_blocks: u32,
-    initial_blocks: u32,
     next: AtomicU32,
     free: AtomicU32,
     deleted: [Deleted; 2],
@@ -251,7 +277,6 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
             links,
             mapping,
             max_blocks,
-            initial_blocks,
             next: AtomicU32::new(initial_blocks),
             free: AtomicU32::new(NONE),
             deleted: [Deleted::new(), Deleted::new()],
@@ -269,13 +294,6 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
             pool.free.store(0, SeqCst);
         }
         Ok(pool)
-    }
-
-    fn same_limits(&self, max_blocks: u32, initial_blocks: u32) -> Result<()> {
-        if self.max_blocks != max_blocks || self.initial_blocks != initial_blocks {
-            return Err(Error::new("block pool already initialized with different limits"));
-        }
-        Ok(())
     }
 
     #[inline]
@@ -300,7 +318,7 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
                 return None;
             }
             let current = self.current.load(SeqCst);
-            let Some(_guard) = try_guard(self.deleted[current].gate.try_read()) else {
+            let Some(_guard) = self.deleted[current].gate.try_read() else {
                 std::hint::spin_loop();
                 continue;
             };
@@ -370,7 +388,7 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
             }
             let current = self.current.load(SeqCst);
             let list = &self.deleted[current];
-            let Some(_guard) = try_guard(list.gate.try_read()) else {
+            let Some(_guard) = list.gate.try_read() else {
                 std::hint::spin_loop();
                 continue;
             };
@@ -411,7 +429,7 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
         let current = self.current.load(SeqCst);
         let inactive = 1 - current;
         let list = &self.deleted[inactive];
-        let Some(_guard) = try_guard(list.gate.try_write()) else {
+        let Some(_guard) = list.gate.try_write() else {
             pool_hit!(self, RecycleBusy);
             return;
         };
@@ -508,6 +526,44 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn shared_and_exclusive_counts() {
+        let gate = ListLock::new();
+        let first = gate.try_read().unwrap();
+        let second = gate.try_read().unwrap();
+        assert_eq!(gate.0.load(SeqCst), 2);
+        assert!(gate.try_write().is_none());
+        drop(first);
+        assert_eq!(gate.0.load(SeqCst), 1);
+        drop(second);
+        let writer = gate.try_write().unwrap();
+        assert_eq!(gate.0.load(SeqCst), i64::MIN);
+        assert!(gate.try_read().is_none());
+        assert_eq!(gate.0.load(SeqCst), i64::MIN);
+        assert!(gate.try_write().is_none());
+        drop(writer);
+        assert_eq!(gate.0.load(SeqCst), 0);
+        drop(gate.try_read().unwrap());
+        assert_eq!(gate.0.load(SeqCst), 0);
+    }
+
+    #[test]
+    fn stale_reader_cannot_increment_exclusive_lock() {
+        let gate = ListLock::new();
+        let observed = gate.0.load(SeqCst);
+        let writer = gate.try_write().unwrap();
+        // A writer arrived between the reader's load and conditional increment.
+        assert_eq!(
+            gate.0.compare_exchange(observed, observed.wrapping_add(1), SeqCst, SeqCst),
+            Err(i64::MIN)
+        );
+        assert_eq!(gate.0.load(SeqCst), i64::MIN);
+        drop(writer);
+        assert_eq!(gate.0.load(SeqCst), 0);
+        drop(gate.try_read().unwrap());
+        assert_eq!(gate.0.load(SeqCst), 0);
+    }
+
+    #[test]
     fn aligned_contiguous_and_reused() {
         let pool = Pool::<65536, 65536>::new(4, 2).unwrap();
         let mut blocks: Vec<_> = (0..4).map(|_| pool.alloc().unwrap()).collect();
@@ -557,7 +613,7 @@ mod tests {
     fn stalled_reader_delays_reuse_but_not_growth_or_retirement() {
         let pool = Pool::<4, 16, InlineLinks<4>>::new(3, 1).unwrap();
         let old = pool.current.load(SeqCst);
-        let guard = pool.deleted[old].gate.read().unwrap();
+        let guard = pool.deleted[old].gate.try_read().unwrap();
         let stale_head = pool.free.load(SeqCst);
         let first = pool.alloc().unwrap();
         first.link().store(0xdeadbeef, SeqCst);
@@ -582,7 +638,7 @@ mod tests {
     fn older_group_protects_items_retired_in_new_group() {
         let pool = Pool::<4, 16>::new(2, 1).unwrap();
         let old = pool.current.load(SeqCst);
-        let guard = pool.deleted[old].gate.read().unwrap();
+        let guard = pool.deleted[old].gate.try_read().unwrap();
         let stale_head = pool.free.load(SeqCst);
         pool.recycle();
         assert_eq!(pool.current.load(SeqCst), 1 - old);
@@ -610,14 +666,5 @@ mod tests {
         let pool = Pool::<4, 4>::new(1, 0).unwrap();
         assert_eq!(pool.alloc().unwrap().index(), 0);
         assert_eq!(pool.alloc().unwrap().index(), 0);
-    }
-
-    #[test]
-    fn global_limits_cannot_change() {
-        initialize(DEFAULT_MAX, DEFAULT_INITIAL).unwrap();
-        initialize(DEFAULT_MAX, DEFAULT_INITIAL).unwrap();
-        assert!(initialize(DEFAULT_MAX + 1, DEFAULT_INITIAL).is_err());
-        assert!(initialize(DEFAULT_MAX, DEFAULT_INITIAL + 1).is_err());
-        free(global().alloc().unwrap());
     }
 }

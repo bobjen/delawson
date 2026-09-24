@@ -1168,7 +1168,6 @@ pub fn main<S: Service>(build: impl FnOnce(&Process) -> Result<S>) -> Result<()>
         return Err(Error::new("usage: <daemon> <process-config.toml>"));
     }
     let process = Arc::new(Process::load(Path::new(&path))?);
-    crate::pool::initialize(process.config.pool_max_blocks, process.config.pool_initial_blocks)?;
     crate::scn::initialize(process.cluster.scn)?;
     let service = Arc::new(build(&process)?);
     service.start()?;
