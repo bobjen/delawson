@@ -374,6 +374,11 @@ impl StructWriter {
         StructWriter { bytes: MessageBytes::new(), depth: 1, maximum_depth: 1 }
     }
 
+    /// Reserve space for a payload whose serialized size is known or estimated.
+    pub fn with_capacity(capacity: usize) -> StructWriter {
+        StructWriter { bytes: MessageBytes::with_capacity(capacity), depth: 1, maximum_depth: 1 }
+    }
+
     pub fn number_u64(&mut self, value: u64) {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }

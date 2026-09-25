@@ -24,6 +24,11 @@ impl MessageBytes {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Reserve a small prefix without exceeding the promotion threshold.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let capacity = capacity.min(super::buffer::pool_config().small_message_bytes);
+        Self { storage: Storage::Small(Vec::with_capacity(capacity)), error: None }
+    }
     #[inline]
     pub fn len(&self) -> usize {
         match &self.storage {

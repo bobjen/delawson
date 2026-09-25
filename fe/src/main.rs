@@ -1650,11 +1650,16 @@ impl Spread {
                 Err(e) => return self.give_up(e.to_string()),
             },
         };
-        for (n, piece) in pieces.iter().enumerate() {
+        // Parsing borrows the response; retain only the piece lengths so ownership
+        // of its arguments can then move into the caller-ordered slots.
+        let header = answer.args.len() - rows.len();
+        let lengths: Vec<usize> = pieces.into_iter().map(<[Arg]>::len).collect();
+        let mut arguments = answer.args.into_iter().skip(header);
+        for (n, length) in lengths.into_iter().enumerate() {
             let Some(at) = ask.at.get(n) else {
                 return self.give_up("a DN described more names than it was asked about".into());
             };
-            let slot = match self.slot_of(piece, ask) {
+            let slot = match self.slot_of(arguments.by_ref().take(length).collect(), ask) {
                 Ok(slot) => slot,
                 Err(e) => return self.give_up(e.to_string()),
             };
@@ -1676,12 +1681,11 @@ impl Spread {
 
     /// One name's arguments, read only as far as is needed to know what it cost and
     /// whether it is finished. The rest is carried through untouched.
-    fn slot_of(&self, piece: &[Arg], ask: &Ask) -> Result<Slot> {
-        let args = piece.to_vec();
+    fn slot_of(&self, args: Vec<Arg>, ask: &Ask) -> Result<Slot> {
         if self.want.detail == 0 {
             return Ok(Slot { args, whole: true, full: 1, spent: 1 });
         }
-        let (shape, _) = Shape::of_args(piece)?;
+        let (shape, _) = Shape::of_args(&args)?;
         // Whether this ask covered everything the caller wanted. A summary did not — but a
         // summary of an object with no streams is still all there is to say about it, which
         // is why this is not simply `shape.more()`.
@@ -1766,13 +1770,13 @@ impl Spread {
         let mut given = 0;
         let mut entries = 0;
         let mut next = UNKNOWN;
-        for slot in &self.got {
+        for slot in &mut self.got {
             let Some(slot) = slot else { break };
             if entries == self.limit {
                 break;
             }
             let (piece, spent, whole) = if self.want.detail == 0 {
-                (slot.args.clone(), 1, slot.whole)
+                (std::mem::take(&mut slot.args), 1, slot.whole)
             } else {
                 let piece = match common::info::limit_object_info(&slot.args, self.limit - entries)
                 {

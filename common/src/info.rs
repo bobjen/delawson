@@ -57,7 +57,11 @@ impl Described {
     /// ⚠️ §9.1.3.7 will retire this: once an answer may be short, lining up by
     /// position stops working and the answer has to say how many names it covered.
     pub fn missing() -> Vec<Arg> {
-        let mut payload = StructWriter::new();
+        vec![Self::missing_arg()]
+    }
+
+    pub fn missing_arg() -> Arg {
+        let mut payload = StructWriter::with_capacity(7 * 8 + 3 * 4 + 2);
         payload.number_u64(0);
         payload.number_u32(ObjectId::NONE.get());
         payload.number_u64(0);
@@ -70,12 +74,16 @@ impl Described {
         payload.number_u8(0);
         payload.number_u32(0);
         payload.number_u64(0);
-        vec![payload.finish(Op::DescribedResp)]
+        payload.finish(Op::DescribedResp)
     }
 
     pub fn args(&self) -> Vec<Arg> {
+        vec![self.arg()]
+    }
+
+    pub fn arg(&self) -> Arg {
         let (kind, width) = self.framing.wire();
-        let mut payload = StructWriter::new();
+        let mut payload = StructWriter::with_capacity(7 * 8 + 3 * 4 + 2);
         payload.range_id(self.object.range);
         payload.object_id(self.object.object);
         payload.time_sec(self.object.created);
@@ -88,7 +96,7 @@ impl Described {
         payload.number_u8(kind);
         payload.number_u32(width);
         payload.oroff(self.first_record);
-        vec![payload.finish(Op::DescribedResp)]
+        payload.finish(Op::DescribedResp)
     }
 
     /// And back, returning whatever followed it. `None` for a row marked missing,
@@ -208,7 +216,11 @@ impl Shape {
     }
 
     pub fn args(&self) -> Vec<Arg> {
-        let mut payload = StructWriter::new();
+        vec![self.arg()]
+    }
+
+    pub fn arg(&self) -> Arg {
+        let mut payload = StructWriter::with_capacity(8 * 8);
         // Preserve the existing 64-bit wire fields and UNKNOWN spelling.
         payload.number_u64(if self.streams.is_none() { UNKNOWN } else { self.streams.number() });
         payload.number_u64(self.given.number());
@@ -218,7 +230,7 @@ impl Shape {
         payload.number_u64(self.records.number());
         payload.number_u64(self.logical.number());
         payload.number_u64(self.compressed.number());
-        vec![payload.finish(Op::ShapeResp)]
+        payload.finish(Op::ShapeResp)
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(Shape, &[Arg])> {
@@ -494,7 +506,11 @@ impl StreamRow {
     pub const ARGS: usize = 6 + Totals::ARGS;
 
     pub fn args(&self) -> Vec<Arg> {
-        let mut payload = StructWriter::new();
+        vec![self.arg()]
+    }
+
+    pub fn arg(&self) -> Arg {
+        let mut payload = StructWriter::with_capacity(7 * 8 + 2 * 4);
         payload.stream_id(self.stream);
         payload.sn_id(self.sn);
         payload.oroff(self.first_record);
@@ -504,7 +520,7 @@ impl StreamRow {
         payload.sloff(self.totals.logical);
         payload.scoff(self.totals.compressed);
         payload.number_u64(self.given.number());
-        vec![payload.finish(Op::StreamRowResp)]
+        payload.finish(Op::StreamRowResp)
     }
 
     pub fn of_args(args: &[Arg]) -> Result<(StreamRow, &[Arg])> {
@@ -659,7 +675,7 @@ pub fn limit_object_info(args: &[Arg], limit: u64) -> Result<Vec<Arg>> {
             stopped = true;
         }
         stream.given = ExtentId::of_number(take as u64)?;
-        body.extend(stream.args());
+        body.push(stream.arg());
         for extent in extents.iter().take(take) {
             body.extend(extent.args());
         }
@@ -671,7 +687,7 @@ pub fn limit_object_info(args: &[Arg], limit: u64) -> Result<Vec<Arg>> {
     shape.given = StreamId::of_number(streams)?;
     shape.entries = entries;
     let mut out = shape.args();
-    out.extend(described.map_or_else(Described::missing, |row| row.args()));
+    out.push(described.map_or_else(Described::missing_arg, |row| row.arg()));
     out.extend(body);
     Ok(out)
 }
@@ -701,7 +717,7 @@ pub struct Batch {
 
 impl Batch {
     pub fn args(&self) -> Vec<Arg> {
-        let mut payload = StructWriter::new();
+        let mut payload = StructWriter::with_capacity(4 * 8);
         payload.number_u64(self.asked);
         payload.number_u64(self.given);
         payload.number_u64(self.entries);

@@ -515,3 +515,34 @@ variation means that improvement should be treated as provisional. Boxing
 and inlining have not been measured separately. All lookups were answered
 and found, sample sizes/counts were unchanged, and cleanup finished with
 status 0. Logs: `/tmp/delawson-object-bench-dqoszrzs/` (temporary files).
+
+## Incremental row and merge allocation improvements, 2026-09-24
+
+Starting from `4799e92`, apply changes cumulatively and run the standard detached
+20M-object benchmark after each. Storage settings, rich flags 23, client count,
+and response sizes/counts are unchanged. Workspace tests passed at each step.
+
+| Change | ObjectInfo/s | BatchObjectInfo/s | Batch trials/s |
+| --- | ---: | ---: | --- |
+| Starting point (previous repeat) | 75,960 | 359,829 | 355,481 / 363,840 / 360,165 |
+| Single-row argument builders | 77,572 | 361,119 | 356,118 / 368,006 / 359,234 |
+| Move FE response arguments | 76,587 | 381,932 | 382,465 / 379,981 / 383,351 |
+
+Single-row builders return an `Arg` directly where callers previously appended
+a temporary one-element vector. Existing vector-returning entry points remain
+for callers that require a vector. No clear batch improvement (0.4%, within
+trial variation). Logs: `/tmp/delawson-object-bench-hk1co_sn/`.
+
+FE now records parsed piece lengths and moves owned DN response arguments into
+per-object slots instead of cloning payloads. Plain final answers also move
+arguments out of slots. Detailed final answers retain the existing limit
+validation and reconstruction. Batch throughput rose 5.8%, with a 0.9% trial
+spread. Logs: `/tmp/delawson-object-bench-s_q3wm2w/`. Both runners finished
+with status 0 after cleanup; all lookups were answered and found.
+
+The next implemented step reserves fixed-row payload sizes (70 bytes for an
+object, 64 for a shape or stream, 32 for a batch header), bounded by the small
+message threshold. DN rich batch capacity estimates include the shape, object,
+and usual one stream; per-object assembly reserves its known argument count.
+Workspace tests passed. Its benchmark is still running at this checkpoint:
+`/tmp/delawson-object-bench-8b8oi8jo/`. No writable-leaf cache changes yet.

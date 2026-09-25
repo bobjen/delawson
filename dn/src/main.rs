@@ -223,14 +223,16 @@ struct Levelled {
 impl Levelled {
     /// The DN-only answer, before any extent rows have been requested.
     fn args(self) -> Vec<Arg> {
-        let mut out = self.shape.args();
+        let rows = if self.hide_rows { 0 } else { self.rows.len() };
+        let mut out = Vec::with_capacity(1 + self.head.len() + rows);
+        out.push(self.shape.arg());
         out.extend(self.head);
         if self.hide_rows {
             return out;
         }
         for mut row in self.rows {
             row.given = ExtentId::FIRST;
-            out.extend(row.args());
+            out.push(row.arg());
         }
         out
     }
@@ -677,7 +679,7 @@ fn merge_object_info(mut held: Levelled, runs: &[Option<ExtentReply>], limit: u6
                         .expect("object position fits"),
                 );
             }
-            body.extend(row.args());
+            body.push(row.arg());
             for extent in rows {
                 let mut extent = extent.clone();
                 if let Some(framing) = framing.filter(|f| f.overhead() != 0) {
@@ -699,7 +701,7 @@ fn merge_object_info(mut held: Levelled, runs: &[Option<ExtentReply>], limit: u6
             given += rows.len() as u64;
         } else {
             row.given = ExtentId::FIRST;
-            body.extend(row.args());
+            body.push(row.arg());
         }
         // Counts come from the SN when available, never from the bounded row vector.
         extents = if extents.is_none() || row.totals.extents.is_none() {
@@ -2226,7 +2228,11 @@ impl DN {
             asked => asked.min(self.config.info_entries),
         };
 
-        let mut args = Vec::with_capacity(names.len() * Described::ARGS);
+        // A rich object normally contributes a shape, an object and one stream.
+        // This is only a capacity estimate; multi-stream objects still grow normally.
+        let per_name = 1 + usize::from(want.detail != 0) + usize::from(want.wants(Detail::Streams));
+        let names_in_limit = names.len().min(usize::try_from(limit).unwrap_or(usize::MAX));
+        let mut args = Vec::with_capacity(names_in_limit * per_name);
         let mut spent = 0;
         let mut given = 0;
         // Whether the last name given was described completely. Only the last one can be partial:
@@ -2256,9 +2262,9 @@ impl DN {
                     // all: every other name begins with a shape, so a reader counting arguments
                     // walks off by five and attributes rows to the wrong name (§17.24.1).
                     if want.detail != 0 {
-                        args.extend(Shape::plain().args());
+                        args.push(Shape::plain().arg());
                     }
-                    args.extend(Described::missing());
+                    args.push(Described::missing_arg());
                 }
             }
             given += 1;
