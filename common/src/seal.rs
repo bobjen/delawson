@@ -9,7 +9,7 @@
 //! does not compress.
 
 use crate::config::{Compress, Messaging};
-use crate::{Error, Result};
+use crate::{Context, Error, Result};
 use aegis::aegis128x2::Aegis128X2;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,6 +52,8 @@ pub struct Seal {
     compress_sample: usize,
     /// Reused by the sampler, so judging a batch allocates nothing.
     sample_buf: Vec<u8>,
+    /// LZ4 input only; encryption reads/writes the pool leaves directly.
+    compression_input: Vec<u8>,
     prefix: [u8; 8],
     dir: u8,
     counter: u64,
@@ -66,6 +68,7 @@ impl Seal {
             compress_min: config.compress_min,
             compress_sample: config.compress_sample,
             sample_buf: Vec::with_capacity(config.compress_sample),
+            compression_input: Vec::new(),
             prefix,
             dir,
             counter: 0,
@@ -120,13 +123,136 @@ impl Seal {
         match &self.key {
             Some(key) => {
                 let cipher = Aegis128X2::<TAG>::new(key, &self.nonce(counter));
-                let (sealed, tag) = cipher.encrypt(&body, &header);
-                out.write_all(&sealed)?;
+                let tag = cipher.encrypt_in_place(&mut body, &header);
+                out.write_all(&body)?;
                 out.write_all(&tag)?;
             }
             None => out.write_all(&body)?,
         }
         Ok(())
+    }
+
+    /// Seal a bounded range directly into pool leaves, preserving the wire format.
+    /// LZ4 borrows single-leaf input and writes directly when its output bound fits.
+    pub fn seal_segmented(
+        &mut self,
+        plain: &pool::SegmentedBuffer<'_>,
+        range: std::ops::Range<u64>,
+        out: &mut pool::SegmentedBuffer<'_>,
+        mut random: impl FnMut() -> u64,
+    ) -> Result<()> {
+        // Validate before arithmetic or examining chunks; batches can have a rolling start.
+        plain.reader_range(range.clone())?;
+        let size = usize::try_from(range.end - range.start)
+            .map_err(|_| Error::new("segment length does not fit"))?;
+        if size > crate::wire::MAX_SEGMENT_BYTES + 4 {
+            return Err(Error::new("plaintext segment exceeds maximum size"));
+        }
+        let attempt = self.compress == Compress::Lz4
+            && size >= self.compress_min
+            && self.worth_trying_segmented(plain, range.start, size)?;
+        let counter = self.counter;
+        self.counter += 1; // A failed write must not reuse this nonce.
+        let start = out.end();
+        let result = (|| -> Result<()> {
+            let mut header = [0; HEADER];
+            header[4..].copy_from_slice(&counter.to_le_bytes());
+            out.append(&header, &mut random).context("sealed segment append")?;
+            let body_start = out.end();
+            let mut compressed = false;
+            if attempt {
+                // Input and output contiguity are independent decisions.
+                let chunk = plain.chunk(range.start).unwrap_or(&[]);
+                let input = if chunk.len() >= size {
+                    &chunk[..size]
+                } else {
+                    self.compression_input.resize(size, 0);
+                    plain
+                        .read_at(range.start, &mut self.compression_input)
+                        .context("compression input")?;
+                    &self.compression_input
+                };
+                out.append(&[LZ4], &mut random).context("sealed segment append")?;
+                out.append(&(size as u32).to_le_bytes(), &mut random)
+                    .context("sealed segment append")?;
+                let compressed_start = out.end();
+                let bound = lz4_flex::block::get_maximum_output_size(size);
+                let written = if fits_tail(out, bound) {
+                    let dest = append_contiguous_space(out, bound, &mut random)?;
+                    let written = lz4_flex::block::compress_into(input, dest)
+                        .map_err(|e| Error::new(format!("segment did not compress: {e}")))?;
+                    out.truncate(compressed_start + written as u64)
+                        .context("compression output truncate")?;
+                    written
+                } else {
+                    let bytes = lz4_flex::compress(input);
+                    if bytes.len() < size {
+                        out.append(&bytes, &mut random).context("sealed segment append")?;
+                    }
+                    bytes.len()
+                };
+                compressed = written < size;
+                if !compressed {
+                    out.truncate(body_start).context("compression discarded")?;
+                }
+            }
+            if !compressed {
+                out.append(&[PLAIN], &mut random).context("sealed segment append")?;
+                let mut at = range.start;
+                while at < range.end {
+                    let chunk = plain.chunk(at).expect("validated plaintext range");
+                    let n = chunk.len().min((range.end - at) as usize);
+                    out.append(&chunk[..n], &mut random).context("sealed segment append")?;
+                    at += n as u64;
+                }
+            }
+            let length = out.end() - body_start + if self.key.is_some() { TAG as u64 } else { 0 };
+            header[..4].copy_from_slice(&(length as u32).to_le_bytes());
+            out.write_at(start, &header).context("sealed segment header")?;
+            if let Some(key) = &self.key {
+                let cipher = Aegis128X2::<TAG>::new(key, &self.nonce(counter));
+                let mut encryptor = cipher.encryptor(&header);
+                for chunk in out
+                    .chunks_mut_range(body_start..out.end())
+                    .context("encryption output leaves")?
+                {
+                    encryptor.update_in_place(chunk);
+                }
+                out.append(&encryptor.finalize(), &mut random).context("sealed segment append")?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            out.truncate(start).context("sealed segment rollback")?;
+        }
+        result?;
+        PLAIN_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+        WIRE_BYTES.fetch_add(out.end() - start, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn worth_trying_segmented(
+        &mut self,
+        plain: &pool::SegmentedBuffer<'_>,
+        start: u64,
+        size: usize,
+    ) -> Result<bool> {
+        let sample = self.compress_sample;
+        if sample == 0 || size < sample.saturating_mul(SAMPLE_SHARE) {
+            return Ok(true);
+        }
+        let piece = sample / SAMPLE_PIECES;
+        let stride = (size - piece) / (SAMPLE_PIECES - 1);
+        self.sample_buf.resize(piece * SAMPLE_PIECES, 0);
+        for n in 0..SAMPLE_PIECES {
+            plain
+                .read_at(
+                    start + (n * stride) as u64,
+                    &mut self.sample_buf[n * piece..(n + 1) * piece],
+                )
+                .context("compression sample")?;
+        }
+        Ok(lz4_flex::compress(&self.sample_buf).len() < self.sample_buf.len())
     }
 
     /// Whether to attempt the whole batch, judged by a few pieces of it taken
@@ -163,6 +289,56 @@ impl Seal {
         sealed: &[u8],
         out: &mut impl Write,
     ) -> Result<()> {
+        self.open_with(header, sealed, |input, expanded| {
+            if let Some(size) = expanded {
+                let loose = lz4_flex::decompress(input, size)
+                    .map_err(|e| Error::new(format!("segment did not expand: {e}")))?;
+                out.write_all(&loose)?;
+            } else {
+                out.write_all(input)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Authenticate first, then expand directly into a leaf when the result fits.
+    pub fn open_segmented(
+        &mut self,
+        header: &[u8; HEADER],
+        sealed: &[u8],
+        out: &mut pool::SegmentedBuffer<'_>,
+        mut random: impl FnMut() -> u64,
+    ) -> Result<()> {
+        let start = out.end();
+        let result = self.open_with(header, sealed, |input, expanded| {
+            match expanded {
+                Some(size) if size > 0 && fits_tail(out, size) => {
+                    let dest = append_contiguous_space(out, size, &mut random)?;
+                    let written = lz4_flex::block::decompress_into(input, dest)
+                        .map_err(|e| Error::new(format!("segment did not expand: {e}")))?;
+                    out.truncate(start + written as u64).context("expanded segment truncate")?;
+                }
+                Some(size) => {
+                    let loose = lz4_flex::decompress(input, size)
+                        .map_err(|e| Error::new(format!("segment did not expand: {e}")))?;
+                    out.append(&loose, &mut random).context("expanded segment append")?;
+                }
+                None => out.append(input, &mut random).context("opened segment append")?,
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            out.truncate(start).context("opened segment rollback")?;
+        }
+        result
+    }
+
+    fn open_with(
+        &mut self,
+        header: &[u8; HEADER],
+        sealed: &[u8],
+        output: impl FnOnce(&[u8], Option<usize>) -> Result<()>,
+    ) -> Result<()> {
         let counter = u64::from_le_bytes(header[4..12].try_into().expect("counter"));
         if counter != self.counter {
             return Err(Error::new(format!(
@@ -180,11 +356,13 @@ impl Seal {
                 let (cipher_text, tag) = sealed.split_at(sealed.len() - TAG);
                 let tag: [u8; TAG] = tag.try_into().expect("tag");
                 let cipher = Aegis128X2::<TAG>::new(key, &self.nonce(counter));
-                cipher
-                    .decrypt(cipher_text, &tag, header)
-                    .map_err(|e| Error::new(format!("segment {counter} did not open: {e}")))?
+                std::borrow::Cow::Owned(
+                    cipher
+                        .decrypt(cipher_text, &tag, header)
+                        .map_err(|e| Error::new(format!("segment {counter} did not open: {e}")))?,
+                )
             }
-            None => sealed.to_vec(),
+            None => std::borrow::Cow::Borrowed(sealed),
         };
 
         match body.split_first() {
@@ -192,7 +370,7 @@ impl Seal {
                 if messages.len() > crate::wire::MAX_SEGMENT_BYTES + 4 {
                     return Err(Error::new("opened segment exceeds maximum size"));
                 }
-                out.write_all(messages)?;
+                output(messages, None)?;
             }
             Some((&LZ4, rest)) => {
                 if rest.len() < 4 {
@@ -202,9 +380,7 @@ impl Seal {
                 if size > crate::wire::MAX_SEGMENT_BYTES + 4 {
                     return Err(Error::new("expanded segment exceeds maximum size"));
                 }
-                let loose = lz4_flex::decompress(&rest[4..], size)
-                    .map_err(|e| Error::new(format!("segment {counter} did not expand: {e}")))?;
-                out.write_all(&loose)?;
+                output(&rest[4..], Some(size))?;
             }
             Some((&other, _)) => {
                 return Err(Error::new(format!("segment {counter} has form {other}")));
@@ -213,6 +389,28 @@ impl Seal {
         }
         Ok(())
     }
+}
+
+// LZ4 requires initialized slices. Initialize only the bounded destination in the
+// current leaf; callers truncate its unused suffix after compression/expansion.
+fn fits_tail(out: &pool::SegmentedBuffer<'_>, size: usize) -> bool {
+    size <= pool::segmented::CHUNK_BYTES
+        - (out.end() % pool::segmented::CHUNK_BYTES as u64) as usize
+}
+
+fn append_contiguous_space<'a>(
+    out: &'a mut pool::SegmentedBuffer<'_>,
+    size: usize,
+    random: impl FnMut() -> u64,
+) -> Result<&'a mut [u8]> {
+    assert!(size > 0 && fits_tail(out, size));
+    let start = out.end();
+    out.append(&[0; pool::segmented::CHUNK_BYTES][..size], random).context("LZ4 output space")?;
+    Ok(out
+        .chunks_mut_range(start..out.end())
+        .context("LZ4 output leaf")?
+        .next()
+        .expect("nonempty single-leaf output"))
 }
 
 #[cfg(test)]
@@ -260,6 +458,196 @@ mod tests {
             at += HEADER + length;
         }
         assert_eq!(at, wire.len());
+    }
+
+    #[test]
+    fn segmented_encryption_matches_one_shot_at_leaf_boundaries() {
+        // This tests encryption compatibility, not pool capacity. Reserve ample
+        // virtual space; physical pages are supplied only as blocks are used.
+        let pool = pool::ChunkPool::new(1 << 20, 0).unwrap();
+        let mut allocation_rng = crate::random::Rng::from_seed(42);
+        for encrypted in [false, true] {
+            for compression in [Compress::None, Compress::Lz4] {
+                for repetitive in [false, true] {
+                    let config = messaging(encrypted, compression);
+                    let (mut reference, _) = pair(&config);
+                    let (mut sender, mut receiver) = pair(&config);
+                    for len in [0, 1, 31, 32, 33, 4095, 4096, 4097, 35000] {
+                        let mut rng = crate::random::Rng::from_seed(17);
+                        let mut data: Vec<u8> = (0..len)
+                            .map(|_| if repetitive { 7 } else { rng.next_u64() as u8 })
+                            .collect();
+                        let mut input = pool::SegmentedBuffer::with_start(&pool, 4093);
+                        input.append(b"skip", || allocation_rng.next_u64()).unwrap();
+                        let start = input.end();
+                        input.append(&data, || allocation_rng.next_u64()).unwrap();
+                        let end = input.end();
+                        input.append(b"ignore", || allocation_rng.next_u64()).unwrap();
+                        let mut output = pool::SegmentedBuffer::with_start(&pool, 4090);
+                        output.append(b"keep", || allocation_rng.next_u64()).unwrap();
+                        let output_start = output.end();
+                        sender
+                            .seal_segmented(&input, start..end, &mut output, || {
+                                allocation_rng.next_u64()
+                            })
+                            .unwrap();
+                        let mut actual = vec![0; (output.end() - output_start) as usize];
+                        output.read_at(output_start, &mut actual).unwrap();
+                        let mut expected = Vec::new();
+                        reference.seal(&mut data, &mut expected).unwrap();
+                        assert_eq!(actual, expected, "length {len}, encrypted {encrypted}");
+                        let mut opened = Vec::new();
+                        receiver
+                            .open(
+                                actual[..HEADER].try_into().unwrap(),
+                                &actual[HEADER..],
+                                &mut opened,
+                            )
+                            .unwrap();
+                        assert_eq!(opened, data);
+                        if compression == Compress::None {
+                            assert_eq!(sender.compression_input.capacity(), 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lz4_input_and_output_fast_paths_are_independent() {
+        let pool = pool::ChunkPool::new(1 << 20, 0).unwrap();
+        let mut rng = crate::random::Rng::from_seed(42);
+        for encrypted in [false, true] {
+            for repetitive in [false, true] {
+                for input_start in [0, 4090] {
+                    // The compression destination begins after the 12-byte header
+                    // and 5-byte LZ4 prefix. 4000 leaves too little room for its bound.
+                    for output_start in [0, 4000] {
+                        for opened_start in [0, 4000] {
+                            let config = messaging(encrypted, Compress::Lz4);
+                            let (mut sender, mut receiver) = pair(&config);
+                            let (mut reference, _) = pair(&config);
+                            let mut data = vec![7; 1024];
+                            if !repetitive {
+                                crate::random::Rng::from_seed(17).fill_bytes(&mut data);
+                            }
+                            let mut input = pool::SegmentedBuffer::with_start(&pool, input_start);
+                            input.append(&data, || rng.next_u64()).unwrap();
+                            let mut output = pool::SegmentedBuffer::with_start(&pool, output_start);
+                            output.append(b"keep", || rng.next_u64()).unwrap();
+                            let start = output.end();
+                            sender
+                                .seal_segmented(
+                                    &input,
+                                    input.start()..input.end(),
+                                    &mut output,
+                                    || rng.next_u64(),
+                                )
+                                .unwrap();
+                            assert_eq!(sender.compression_input.is_empty(), input_start == 0);
+                            let mut actual = vec![0; output.len() as usize];
+                            output.read_at(output_start, &mut actual).unwrap();
+                            assert_eq!(&actual[..4], b"keep");
+                            let mut expected = Vec::new();
+                            reference.seal(&mut data, &mut expected).unwrap();
+                            assert_eq!(&actual[4..], expected);
+                            assert_eq!(output.end() - start, expected.len() as u64);
+                            if !encrypted {
+                                assert_eq!(expected[HEADER], if repetitive { LZ4 } else { PLAIN });
+                            }
+                            let mut opened = pool::SegmentedBuffer::with_start(&pool, opened_start);
+                            opened.append(b"keep", || rng.next_u64()).unwrap();
+                            receiver
+                                .open_segmented(
+                                    expected[..HEADER].try_into().unwrap(),
+                                    &expected[HEADER..],
+                                    &mut opened,
+                                    || rng.next_u64(),
+                                )
+                                .unwrap();
+                            let mut actual = vec![0; opened.len() as usize];
+                            opened.read_at(opened_start, &mut actual).unwrap();
+                            assert_eq!(&actual[..4], b"keep");
+                            assert_eq!(&actual[4..], data);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn segmented_open_rolls_back_failed_expansion_and_authentication() {
+        let pool = pool::ChunkPool::new(1 << 20, 0).unwrap();
+        let mut rng = crate::random::Rng::from_seed(42);
+        for encrypted in [false, true] {
+            for output_start in [0, 4090] {
+                let config = messaging(encrypted, Compress::Lz4);
+                let (mut sender, mut receiver) = pair(&config);
+                let mut wire = Vec::new();
+                sender.seal(&mut vec![7; 1024], &mut wire).unwrap();
+                if encrypted {
+                    *wire.last_mut().unwrap() ^= 1; // Authentication must precede expansion.
+                } else {
+                    wire.truncate(HEADER + 5); // Missing raw LZ4 block.
+                    wire[..4].copy_from_slice(&5u32.to_le_bytes());
+                }
+                let mut opened = pool::SegmentedBuffer::with_start(&pool, output_start);
+                opened.append(b"keep", || rng.next_u64()).unwrap();
+                assert!(
+                    receiver
+                        .open_segmented(
+                            wire[..HEADER].try_into().unwrap(),
+                            &wire[HEADER..],
+                            &mut opened,
+                            || rng.next_u64()
+                        )
+                        .is_err()
+                );
+                assert_eq!(opened.len(), 4);
+                let mut actual = [0; 4];
+                opened.read_at(output_start, &mut actual).unwrap();
+                assert_eq!(&actual, b"keep");
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_compression_sample_never_flattens_input() {
+        let pool = pool::ChunkPool::new(128, 0).unwrap();
+        let mut allocation_rng = crate::random::Rng::from_seed(42);
+        let (mut sender, _) = pair(&messaging(true, Compress::Lz4));
+        let mut rng = crate::random::Rng::from_seed(29);
+        let bytes: Vec<u8> = (0..40000).map(|_| rng.next_u64() as u8).collect();
+        let mut input = pool::SegmentedBuffer::new(&pool);
+        input.append(&bytes, || allocation_rng.next_u64()).unwrap();
+        let mut out = pool::SegmentedBuffer::new(&pool);
+        sender
+            .seal_segmented(&input, 0..input.end(), &mut out, || allocation_rng.next_u64())
+            .unwrap();
+        assert_eq!(sender.compression_input.capacity(), 0);
+    }
+
+    #[test]
+    fn encryption_pool_exhaustion_rolls_back_output_without_reusing_counter() {
+        let source_pool = pool::ChunkPool::new(4, 0).unwrap();
+        let output_pool = pool::ChunkPool::new(1, 0).unwrap();
+        let mut input = pool::SegmentedBuffer::new(&source_pool);
+        input.append(&vec![1; 4096], || 0).unwrap();
+        let mut out = pool::SegmentedBuffer::new(&output_pool);
+        out.append(b"prefix", || 0).unwrap();
+        let (mut sender, _) = pair(&messaging(true, Compress::None));
+        assert!(sender.seal_segmented(&input, 0..4096, &mut out, || 0).is_err());
+        let mut prefix = [0; 6];
+        out.read_at(0, &mut prefix).unwrap();
+        assert_eq!(&prefix, b"prefix");
+        assert_eq!(out.end(), 6);
+        assert_eq!(sender.counter, 1);
+        sender.seal_segmented(&input, 0..10, &mut out, || 0).unwrap();
+        let mut header = [0; HEADER];
+        out.read_at(6, &mut header).unwrap();
+        assert_eq!(u64::from_le_bytes(header[4..].try_into().unwrap()), 1);
     }
 
     #[test]

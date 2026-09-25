@@ -1472,7 +1472,6 @@ pub struct Wire {
     stream: crate::machine::Stream,
     seal: Seal,
     sealed: MessageBuffer,
-    plain_scratch: Vec<u8>,
 }
 
 impl Wire {
@@ -1487,11 +1486,11 @@ impl Wire {
         let mut at = plain.bytes.start();
         while at < plain.bytes.end() {
             let end = segment_end(plain, at)?;
-            plain.copy_to(at..end, &mut self.plain_scratch)?;
             self.sealed.clear();
             buffer::with_random(|rng| {
-                self.seal
-                    .seal_to(&self.plain_scratch, &mut self.sealed.bytes.writer(|| rng.next_u64()))
+                self.seal.seal_segmented(&plain.bytes, at..end, &mut self.sealed.bytes, || {
+                    rng.next_u64()
+                })
             })?;
             self.sealed.write_to(&mut self.stream)?;
             self.sealed.clear();
@@ -1559,17 +1558,19 @@ impl Reader {
             return Err(Error::new(format!("peer announced a {length}-byte segment")));
         }
         self.sealed.receive(&mut self.stream, length)?;
-        self.sealed.copy_to(0..length as u64, &mut self.sealed_scratch)?;
-        self.sealed.clear();
+        let first = self.sealed.bytes.chunk(0).unwrap_or(&[]);
+        let sealed = if first.len() >= length {
+            &first[..length]
+        } else {
+            self.sealed.copy_to(0..length as u64, &mut self.sealed_scratch)?;
+            &self.sealed_scratch
+        };
         self.open.clear();
         self.at = 0;
         let result = buffer::with_random(|rng| {
-            self.seal.open_to(
-                &header,
-                &self.sealed_scratch,
-                &mut self.open.bytes.writer(|| rng.next_u64()),
-            )
+            self.seal.open_segmented(&header, sealed, &mut self.open.bytes, || rng.next_u64())
         });
+        self.sealed.clear();
         if result.is_err() {
             self.open.clear();
         }
@@ -1733,7 +1734,6 @@ pub fn connect(stream: TcpStream, config: &Messaging) -> Result<Link> {
             stream: writing,
             seal: Seal::new(config, prefix, 0)?,
             sealed: MessageBuffer::new(pool),
-            plain_scratch: Vec::new(),
         },
         plain: MessageBuffer::new(pool),
     })
@@ -1758,12 +1758,7 @@ pub fn accept(stream: TcpStream, config: &Messaging) -> Result<(Reader, Wire)> {
             at: 0,
             arrived: Instant::now(),
         },
-        Wire {
-            stream,
-            seal: Seal::new(config, prefix, 1)?,
-            sealed: MessageBuffer::new(pool),
-            plain_scratch: Vec::new(),
-        },
+        Wire { stream, seal: Seal::new(config, prefix, 1)?, sealed: MessageBuffer::new(pool) },
     ))
 }
 

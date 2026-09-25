@@ -150,3 +150,68 @@ Rates are names/sec; three-trial means. ObjectInfo trials: 71,557, 72,595,
 Logs: `/tmp/delawson-object-bench-_yf7nygn/`. The runner exited 0 after cleanup.
 The first startup hit the known Raft election race; the retry succeeded. The
 startup readiness gate was added afterward and did not affect these measurements.
+
+## Direct encryption of pool leaves, 2026-09-24
+
+Working tree based on `1333e46`, with sender encryption changed to incremental
+AEGIS in the outgoing pool leaves. Same standard 20M-object workload, flags 23,
+16 clients × depth 16, three trials, 32GiB pool cap and 2KiB message threshold.
+The sender's unconditional plaintext scratch copy and separate ciphertext
+allocation are removed. LZ4 attempts still use contiguous compression input;
+receive-side buffering is unchanged.
+
+| Workload | Previous hybrid run | Direct encryption | Change |
+| --- | ---: | ---: | ---: |
+| Create, batch 1,000 | 1,492,484 | 1,507,782 | +1.0% |
+| ObjectInfo | 72,367 | 73,974 | +2.2% |
+| BatchObjectInfo, batch 1,000 | 282,079 | 309,529 | +9.7% |
+
+Rates are objects/names per second. ObjectInfo trials: 73,655, 74,291, 73,977
+(0.9% spread). Batch trials: 307,901, 309,999, 310,688 (0.9% spread).
+All 20M objects were created in 13.26 seconds; every lookup was answered and
+found. Startup succeeded on the first attempt with the KS readiness gate.
+The detached runner exited 0 after cleanup. Logs:
+`/tmp/delawson-object-bench-_e3frsen/` (temporary files).
+These are sequential sessions, not interleaved before/after measurements.
+
+## Independent LZ4 leaf fast paths, 2026-09-24
+
+Working tree based on `1333e46`, including direct sender encryption and the new
+independent LZ4 input/output leaf fast paths. Same standard 20M-object workload,
+flags 23, 16 clients × depth 16, three lookup trials, 32GiB pool cap and 2KiB
+message threshold.
+
+| Workload | Previous direct-encryption run | LZ4 fast paths | Change |
+| --- | ---: | ---: | ---: |
+| Create, batch 1,000 | 1,507,782 | 1,549,170 | +2.7% |
+| ObjectInfo | 73,974 | 75,330 | +1.8% |
+| BatchObjectInfo, batch 1,000 | 309,529 | 271,163 | -12.4% |
+
+Rates are objects/names per second. ObjectInfo trials: 76,345, 74,488, 75,157
+(range 74,488–76,345; 2.5% spread). Batch trials: 240,184, 306,133, 267,173
+(range 240,184–306,133; 24.3% spread). The batch result is substantially more
+variable than the previous session; this single sequential comparison does not
+establish a stable regression or its cause.
+
+All 20M objects were created in 12.91 seconds; every lookup was answered and
+found. Startup succeeded, and the detached runner exited 0 after cleanup.
+Logs: `/tmp/delawson-object-bench-7l_3tys8/` (temporary files).
+
+### Repeat of the LZ4 fast-path run
+
+Repeated unchanged with a fresh cluster and the same standard workload.
+Create: 1,509,738 objects/sec (20M in 13.25 seconds).
+
+| Workload | Previous direct encryption | First LZ4 run | Repeat LZ4 run | Repeat vs direct encryption |
+| --- | ---: | ---: | ---: | ---: |
+| ObjectInfo | 73,974 | 75,330 | 75,686 | +2.3% |
+| BatchObjectInfo, batch 1,000 | 309,529 | 271,163 | 307,531 | -0.6% |
+
+Rates are names/sec, three-trial means. ObjectInfo trials: 74,903, 76,096,
+76,060 (range 74,903–76,096; 1.6% spread). Batch trials: 310,633, 305,003,
+306,958 (range 305,003–310,633; 1.8% spread). The first run's large batch
+slowdown did not reproduce; this repeat is close to the direct-encryption
+baseline, with no demonstrated material batch throughput change.
+
+Every lookup was answered and found. The detached runner exited 0 after
+cleanup. Logs: `/tmp/delawson-object-bench-mgv_l8je/` (temporary files).

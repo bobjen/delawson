@@ -8468,12 +8468,31 @@ logical end. This does not restore bytes already consumed from the socket.
 TLS retains its own record buffers; its vectored adapter preserves the existing
 send ordering and separate reader/writer locking.
 
-LZ4 and AEGIS still require contiguous codec inputs. The sender retains a plain
-scratch Vec and the receiver retains a sealed-input scratch Vec for this bridge.
-`Seal::seal_to` and `open_to` write their outputs directly into segmented buffers,
-so there is no additional whole-batch output Vec. This is not an end-to-end
-zero-copy codec pipeline. Compression/encryption still have their own temporary
-allocations. Expanded segment sizes are checked before decompression allocation.
+The sender uses incremental AEGIS encryption in place across the outgoing pool
+leaves. The authenticated header, compression marker, nonce sequence, and final
+tag are byte-identical to the one-shot format. There is no contiguous encryption
+input or ciphertext scratch buffer on this path. Uncompressed data is copied
+from input leaves to output leaves, then encrypted there; input batches remain
+unchanged. Allocation failure rolls output back without reusing the nonce.
+
+LZ4 input and output choose their contiguous fast paths independently. The
+compression sampler reads its small sample from input leaves. For an actual
+compression attempt, input wholly within one leaf is borrowed directly; input
+crossing leaves is copied into a retained Vec. Compression writes directly into
+the current output leaf when LZ4's worst-case output bound fits its remaining
+space; otherwise its contiguous result is copied into output leaves. Rejected
+compression is replaced with the original bytes, preserving the wire format.
+
+The receiver borrows a sealed segment wholly within one leaf and otherwise uses
+its retained sealed-input Vec. Authenticated decryption still produces a
+contiguous buffer. After authentication, LZ4 expands directly into the output
+leaf when the declared expanded size fits; crossing output uses a contiguous
+Vec and copy. Unencrypted single-leaf input needs no intermediate body copy.
+Direct output slices are initialized before passing them to LZ4, and unused
+suffixes are truncated. Expanded sizes are checked before allocation, and errors
+roll output back. Tests cover independent input/output boundary combinations,
+compression rejection, ciphertext/tag compatibility, failed authentication and
+expansion, and pool-exhaustion rollback without nonce reuse.
 
 Requests and responses are decoded directly from bounded segmented readers;
 scalar fields spanning leaves use stack storage, while owned argument payloads
