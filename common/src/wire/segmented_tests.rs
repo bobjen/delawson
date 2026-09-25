@@ -120,7 +120,7 @@ fn socket_round_trips_single_and_batched_messages_in_all_sealing_modes() {
                     }
                     writer.send(&mut out).unwrap();
                     assert!(out.is_empty());
-                    assert!(out.bytes.depth().is_none());
+                    assert!(out.bytes.chunk(0).is_none(), "retained capacity is not readable");
                 }
             });
             let stream = TcpStream::connect(address).unwrap();

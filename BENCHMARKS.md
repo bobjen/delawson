@@ -567,3 +567,141 @@ and found, sample sizes/counts were unchanged, and the runner exited 0 after
 cleanup. Logs: `/tmp/delawson-object-bench-lkf3non4/` (temporary files).
 These are sequential runs, not randomized alternating comparisons; small
 differences should still be interpreted with that limitation.
+
+## ObjectInfo perf comparison, 2026-09-24
+
+Compared current `73d1321` with the all-Vec `8729d5b` checkout using the same
+standard 20M-object workload, rich flags 23, 16 clients by depth 16. Recorded
+only the three batch-1 trials with `perf record -F 199 -e cpu-clock
+--call-graph dwarf,4096`, attached to all FE/DN/SN ready-file PIDs. The client,
+KS and EN are excluded. Each detached runner owned build, startup, population,
+both lookup workloads and cleanup. Baseline's only source-tree adjustment is
+the previously documented KS-leader readiness gate in `scripts/start-laws`;
+measured application code is unchanged.
+
+Current: 985,075 ObjectInfo lookups, 139.719 sampled server CPU seconds;
+Vec: 1,112,309 lookups, 138.754 CPU seconds. Approximate server CPU per
+lookup rose from 124.74us to 141.84us (13.7%). These are CPU sums across
+processes/threads, not request latencies. Perf perturbs scheduling and throughput;
+the profiled rates should not be compared directly with unprofiled benchmarks.
+No samples were reported lost. Kernel symbols are restricted, so kernel CPU
+cannot be attributed reliably to individual kernel functions. DWARF stacks
+are bounded; use the exclusive symbol samples, not incomplete inclusive
+call chains, for the table below.
+
+| Exclusive sampled CPU, us/ObjectInfo lookup | Vec | Current |
+| --- | ---: | ---: |
+| Kernel (unresolved symbols) | 63.82 | 69.09 |
+| libc I/O and syscall wrappers | 9.04 | 10.81 |
+| libc allocation/free methods | 13.87 | 8.61 |
+| libc copy/zero methods | 2.71 | 3.90 |
+| Pool allocation methods | 0 | 2.16 |
+| Segmented buffer/reader methods | 0 | 5.76 |
+| MessageBytes methods | 0 | 3.14 |
+| Named LZ4 methods | 1.48 | 2.02 |
+| Named crypto methods | 2.64 | 3.25 |
+| Other | 31.17 | 33.09 |
+
+Rows group non-overlapping exclusive samples by symbol, not all inclusive work
+for a subsystem; inlined work can be attributed elsewhere. Zero means no
+matching symbols in the old representation, not absence of equivalent work.
+Unlike BatchObjectInfo, ObjectInfo is dominated by kernel/I/O and per-message
+transport overhead. Allocator CPU is lower after the metadata improvements.
+
+Promising next experiments, not yet implemented or measured:
+
+- Retain a bounded number of leaves per connection across batch resets.
+  `Wire::send` clears sealed storage after each transport segment and clears
+  plaintext after sending; `Reader::fill` similarly clears sealed/open storage.
+  `MessageBuffer::clear` replaces the tree, returning its blocks to the pool.
+  Old Vec send buffers retained capacity. Reuse could avoid both pool operations
+  and some tree setup; retained memory must be bounded for idle connections.
+- Single-leaf receive/send paths could avoid constructing the 64-entry iovec
+  array and use scalar socket I/O. `machine::Stream::write` currently forwards
+  even scalar writes to `write_vectored`, so that layer also needs consideration.
+  The kernel difference is not proof of readv/writev being the cause.
+- Parsing a frame wholly within one leaf could use a contiguous reader, while
+  keeping segmented decoding for crossings. The profile shows reader setup
+  and wrapper costs, but does not yet quantify the benefit of this fast path.
+
+The subsequent unprofiled batch-1000 means in these runs were 462,930/s current
+and 511,106/s Vec. Every lookup in both workloads was answered and found; both
+runners exited 0 after cleanup. Current samples remained 232 serialized bytes
+for ObjectInfo and 219,052 for BatchObjectInfo with the same row counts. Logs,
+perf captures, exact-period reports and category summaries (temporary files):
+`/tmp/delawson-object-profile-current-53n9i7y_/` and
+`/tmp/delawson-object-profile-vec-h1dgde6r/`.
+
+## Bounded connection-buffer retention, 2026-09-24
+
+Working tree based on `73d1321`. Retain a lazily allocated prefix of 1, 2,
+or 4 leaves per reusable `MessageBuffer`, preserving required index nodes.
+Reset hides all old bytes; discarded live ranges outside the retained prefix
+are still reclaimed. Ordinary `SegmentedBuffer::new` keeps its release-on-clear
+behavior. A high-water leaf bound lets pruning recognize a wholly retained
+subtree without scanning unused index entries on every reset.
+
+This is per connection buffer, not a shared per-connection cache. A direct
+connection has four such buffers (send plaintext, send sealed, receive sealed,
+receive opened); batched sending has a fifth for the alternate plaintext batch.
+With 64KiB blocks, fully populated idle retention is:
+
+| Leaves per buffer | Blocks including index | KiB/buffer | KiB/direct connection | KiB/batched connection |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 1 | 64 | 256 | 320 |
+| 2 | 3 | 192 | 768 | 960 |
+| 4 | 5 | 320 | 1,280 | 1,600 |
+
+Retention is a maximum, not eager allocation. Workspace tests passed for the
+initial implementation; the pool test checks all three limits plus zero,
+unchanged leaf indexes on reuse, index-block counts, prefix discard, truncation,
+reset, inaccessible stale bytes, and return of every block on drop. Socket tests
+now check that reset leaves no readable data rather than assuming zero capacity.
+
+Same standard 20M-object workload and rich flags 23; scalar I/O is not included
+in the retention comparisons.
+
+| Retained leaves | ObjectInfo/s | BatchObjectInfo/s | Batch trial spread |
+| --- | ---: | ---: | ---: |
+| 0 (preceding unprofiled run) | 78,203 | 459,575 | 0.7% |
+| 1 | 78,468 | 398,242 | 18.1% |
+| 1, repeat | 79,347 | 468,261 | 2.5% |
+| 2 | 80,120 | 474,747 | 0.6% |
+| 4 | 78,781 | 437,738 | 13.7% |
+
+One leaf: ObjectInfo trials 77,990 / 78,654 / 78,760; batch trials
+368,205 / 386,179 / 440,341. The wide batch variation prevents a firm
+conclusion from this run alone. Logs: `/tmp/delawson-object-bench-pwvyidy9/`.
+Two leaves: batch trials 473,329 / 474,758 / 476,155. Logs:
+`/tmp/delawson-object-bench-xx6quric/`. Both runners completed with status 0
+after cleanup; every lookup was answered and found and response samples were
+unchanged. These sequential runs are not randomized alternating comparisons.
+
+Four leaves: ObjectInfo mean 78,781/s; batch trials 414,436 / 474,211 /
+424,566 (mean 437,738/s, 13.7% spread). Runner exited 0 after cleanup;
+all lookups succeeded and response samples were unchanged. Logs:
+`/tmp/delawson-object-bench-kh7cuyok/`. One leaf is being repeated before
+the scalar-I/O experiment because the first one-leaf and four-leaf runs
+had wide variation.
+
+Requested one-leaf repeat: ObjectInfo averaged 79,347/s and BatchObjectInfo
+468,261/s (trials 460,621 / 471,687 / 472,476, 2.5% spread). The original
+398K batch mean was not reproduced. One leaf is close to two leaves' 475K
+mean, and four showed no advantage, so retain one leaf for the next experiment.
+All lookups succeeded, samples were unchanged, and cleanup finished with status
+0. Logs: `/tmp/delawson-object-bench-f0s4lb5u/`.
+
+Next experiment adds scalar reads/writes whenever the remaining transfer fits
+in one leaf, avoiding iovec construction; multi-leaf transfers stay vectored.
+The plain socket `Stream::write` now calls scalar socket write rather than
+forwarding it to write_vectored. TLS keeps its existing serialization/locking.
+Workspace tests passed, including scalar short transfers, interruptions and
+EOF rollback, alongside existing multi-window vectored and socket tests.
+Completed scalar-I/O benchmark with one retained leaf: ObjectInfo 80,596/s
+(trials 80,130 / 80,899 / 80,760; 1.0% spread) and BatchObjectInfo 470,620/s
+(trials 467,558 / 470,610 / 473,693; 1.3% spread). Compared with the immediately
+preceding one-leaf repeat, this is +1.6% ObjectInfo and +0.5% BatchObjectInfo,
+small enough that these sequential trials do not establish a clear advantage.
+All lookups were answered and found, samples were unchanged, and cleanup
+finished with status 0. Logs: `/tmp/delawson-object-bench-ketj7a81/`.
+Leave one retained leaf per buffer and the scalar-I/O fast path enabled.

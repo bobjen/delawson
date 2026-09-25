@@ -286,21 +286,28 @@ impl<'p> SegmentedBuffer<'p> {
 const IO_SLICES: usize = 64;
 
 impl SegmentedBuffer<'_> {
-    /// Send initialized leaves directly, retrying interrupted and short writes.
+    /// Send initialized leaves directly, using scalar I/O for a single leaf.
+    /// Retry interrupted and short writes.
     pub fn write_to(&self, output: &mut impl Write) -> io::Result<()> {
         let mut at = self.start();
         while at < self.end() {
-            let mut slices: [io::IoSlice<'_>; IO_SLICES] =
-                std::array::from_fn(|_| io::IoSlice::new(&[]));
             let mut next = at;
-            let mut count = 0;
-            while count < IO_SLICES && next < self.end() {
-                let chunk = self.chunk(next).unwrap();
-                slices[count] = io::IoSlice::new(chunk);
-                next += chunk.len() as u64;
-                count += 1;
-            }
-            match output.write_vectored(&slices[..count]) {
+            let result = if self.end() - at <= (CHUNK_BYTES - at as usize % CHUNK_BYTES) as u64 {
+                next = self.end();
+                output.write(self.chunk(at).expect("live output leaf"))
+            } else {
+                let mut slices: [io::IoSlice<'_>; IO_SLICES] =
+                    std::array::from_fn(|_| io::IoSlice::new(&[]));
+                let mut count = 0;
+                while next < self.end() && count < IO_SLICES {
+                    let chunk = self.chunk(next).unwrap();
+                    slices[count] = io::IoSlice::new(chunk);
+                    next += chunk.len() as u64;
+                    count += 1;
+                }
+                output.write_vectored(&slices[..count])
+            };
+            match result {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -321,7 +328,7 @@ impl SegmentedBuffer<'_> {
         Ok(())
     }
 
-    /// Append exactly count bytes from vectored reads into the leaves. The safe
+    /// Append exactly count bytes, using scalar reads for a single leaf. The safe
     /// Read trait requires initialized destinations, so newly exposed bytes are
     /// zeroed before I/O. On EOF, I/O error, or allocation failure, roll back the
     /// logical append. Bytes already consumed from the input cannot be restored.
@@ -344,14 +351,24 @@ impl SegmentedBuffer<'_> {
                     self.append(&[0; CHUNK_BYTES][..n], &mut random).map_err(io::Error::other)?;
                 }
                 while at < window_end {
-                    let mut slices: [io::IoSliceMut<'_>; IO_SLICES] =
-                        std::array::from_fn(|_| io::IoSliceMut::new(&mut []));
-                    let mut count = 0;
-                    for chunk in self.chunks_mut_range(at..window_end).map_err(io::Error::other)? {
-                        slices[count] = io::IoSliceMut::new(chunk);
-                        count += 1;
-                    }
-                    match input.read_vectored(&mut slices[..count]) {
+                    let result =
+                        if window_end - at <= (CHUNK_BYTES - at as usize % CHUNK_BYTES) as u64 {
+                            let mut chunks =
+                                self.chunks_mut_range(at..window_end).map_err(io::Error::other)?;
+                            input.read(chunks.next().expect("live input leaf"))
+                        } else {
+                            let mut slices: [io::IoSliceMut<'_>; IO_SLICES] =
+                                std::array::from_fn(|_| io::IoSliceMut::new(&mut []));
+                            let mut count = 0;
+                            for chunk in
+                                self.chunks_mut_range(at..window_end).map_err(io::Error::other)?
+                            {
+                                slices[count] = io::IoSliceMut::new(chunk);
+                                count += 1;
+                            }
+                            input.read_vectored(&mut slices[..count])
+                        };
+                    match result {
                         Ok(0) => {
                             return Err(io::Error::new(
                                 io::ErrorKind::UnexpectedEof,
@@ -674,10 +691,12 @@ mod vectored_tests {
         at: usize,
         calls: usize,
         largest_vector: usize,
+        scalar_reads: usize,
+        scalar_writes: usize,
     }
     impl Transport {
         fn new(bytes: Vec<u8>) -> Self {
-            Self { bytes, at: 0, calls: 0, largest_vector: 0 }
+            Self { bytes, at: 0, calls: 0, largest_vector: 0, scalar_reads: 0, scalar_writes: 0 }
         }
         fn step(&mut self, vectors: usize) -> io::Result<()> {
             self.calls += 1;
@@ -689,8 +708,9 @@ mod vectored_tests {
         }
     }
     impl Write for Transport {
-        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-            panic!("expected vectored write")
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.scalar_writes += 1;
+            self.write_vectored(&[io::IoSlice::new(bytes)])
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
@@ -710,8 +730,9 @@ mod vectored_tests {
         }
     }
     impl Read for Transport {
-        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-            panic!("expected vectored read")
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.scalar_reads += 1;
+            self.read_vectored(&mut [io::IoSliceMut::new(bytes)])
         }
         fn read_vectored(&mut self, slices: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
             self.step(slices.len())?;
@@ -727,6 +748,30 @@ mod vectored_tests {
             }
             Ok(n)
         }
+    }
+
+    #[test]
+    fn single_leaf_io_uses_scalar_calls_with_interrupts_and_short_transfers() {
+        let pool = ChunkPool::with_buckets(8, 0, 1).unwrap();
+        let mut source = SegmentedBuffer::with_start(&pool, 17);
+        let bytes: Vec<_> = (0..16001).map(|n| (n % 251) as u8).collect();
+        source.append(&bytes, || 0).unwrap();
+        let mut transport = Transport::new(Vec::new());
+        source.write_to(&mut transport).unwrap();
+        assert_eq!(transport.bytes, bytes);
+        assert_eq!(transport.scalar_writes, transport.calls);
+        let writes = transport.calls;
+        let mut dest = SegmentedBuffer::with_start(&pool, 31);
+        dest.read_exact_from(&mut transport, bytes.len(), || 0).unwrap();
+        assert_eq!(transport.scalar_reads, transport.calls - writes);
+        assert!(transport.scalar_reads > 3);
+        assert_eq!(dest.chunk(31), Some(bytes.as_slice()));
+        let before = dest.len();
+        assert_eq!(
+            dest.read_exact_from(&mut transport, 1, || 0).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(dest.len(), before);
     }
 
     #[test]

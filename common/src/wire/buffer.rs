@@ -8,6 +8,9 @@ use std::cell::RefCell;
 use std::io::Write;
 use std::sync::OnceLock;
 
+// Per reusable connection buffer; index nodes are additional to these leaves.
+const RETAINED_LEAVES: u32 = 1;
+
 static POOL: OnceLock<Result<(BufferPoolConfig, ChunkPool)>> = OnceLock::new();
 pub(super) fn pool_config() -> BufferPoolConfig {
     POOL.get().and_then(|p| p.as_ref().ok()).map_or_else(BufferPoolConfig::default, |p| p.0)
@@ -36,13 +39,13 @@ pub(super) fn shared_pool(config: BufferPoolConfig) -> Result<&'static ChunkPool
     Ok(pool)
 }
 
-/// A batch borrows the one process-wide block pool; an empty batch owns no blocks.
+/// A batch borrows the process-wide pool, allocating lazily and retaining bounded capacity on reset.
 pub struct MessageBuffer {
     pub(super) bytes: SegmentedBuffer<'static>,
 }
 impl MessageBuffer {
     pub fn new(pool: &'static ChunkPool) -> Self {
-        Self { bytes: SegmentedBuffer::new(pool) }
+        Self { bytes: SegmentedBuffer::with_retained_leaves(pool, RETAINED_LEAVES) }
     }
     pub fn empty_like(&self) -> Self {
         Self::new(self.bytes.pool())
@@ -54,7 +57,7 @@ impl MessageBuffer {
         self.bytes.is_empty()
     }
     pub fn clear(&mut self) {
-        *self = self.empty_like();
+        self.bytes.reset();
     }
     pub fn append(&mut self, bytes: &[u8]) -> Result<()> {
         RANDOM

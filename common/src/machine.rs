@@ -507,6 +507,9 @@ impl Read for Stream {
 }
 impl Write for Stream {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        if self.tls.is_none() {
+            return self.socket.write(input);
+        }
         self.write_vectored(&[io::IoSlice::new(input)])
     }
     fn write_vectored(&mut self, input: &[io::IoSlice<'_>]) -> io::Result<usize> {

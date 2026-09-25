@@ -23,7 +23,9 @@ pub type ChunkPool = Pool<CHUNK_BYTES, CHUNK_BYTES>;
 ///
 /// Appending grows the tree; discarding a prefix returns whole unused leaves
 /// and index nodes to the pool. Offsets are absolute and do not change when a
-/// prefix is discarded. An empty buffer retains its end offset but no blocks.
+/// prefix is discarded. By default an empty buffer retains its end offset but
+/// no blocks. An optional bounded prefix of leaves can remain allocated for reuse;
+/// retained capacity is never exposed as initialized data.
 /// The exclusive end must fit in u64, so byte u64::MAX cannot be stored.
 ///
 /// Mutation requires exclusive access. Borrowed slices prevent mutation or
@@ -41,6 +43,10 @@ pub struct SegmentedBuffer<'a> {
     base: u64,
     start: u64,
     end: u64,
+    retain_leaves: u32,
+    retained: u32,
+    // Exclusive upper bound of allocated leaf numbers, including reusable capacity.
+    allocated_end: u64,
 }
 
 impl<'a> SegmentedBuffer<'a> {
@@ -50,7 +56,33 @@ impl<'a> SegmentedBuffer<'a> {
 
     /// Start an empty rolling buffer at an absolute stream offset.
     pub fn with_start(pool: &'a ChunkPool, offset: u64) -> Self {
-        Self { pool, root: NONE, tail: NONE, depth: 0, base: 0, start: offset, end: offset }
+        Self {
+            pool,
+            root: NONE,
+            tail: NONE,
+            depth: 0,
+            base: 0,
+            start: offset,
+            end: offset,
+            retain_leaves: 0,
+            retained: 0,
+            allocated_end: 0,
+        }
+    }
+
+    /// Retain at most this many zero-based prefix leaves across resets. Allocates
+    /// lazily; extra index nodes needed to address the retained leaves remain too.
+    pub fn with_retained_leaves(pool: &'a ChunkPool, leaves: u32) -> Self {
+        let mut buffer = Self::new(pool);
+        buffer.retain_leaves = leaves;
+        buffer
+    }
+
+    /// Start a new zero-based byte range, retaining only the configured capacity.
+    pub fn reset(&mut self) {
+        self.start = 0;
+        self.end = 0;
+        self.prune();
     }
 
     pub fn start(&self) -> u64 {
@@ -154,6 +186,10 @@ impl<'a> SegmentedBuffer<'a> {
             self.depth = depth;
         }
         self.root = self.insert(self.root, self.depth, (leaf - self.base) as u128, random)?;
+        self.allocated_end = self.allocated_end.max(leaf + 1);
+        if leaf < self.retain_leaves as u64 {
+            self.retained = self.retained.max(leaf as u32 + 1);
+        }
         Ok(self.leaf(leaf))
     }
 
@@ -319,7 +355,7 @@ impl<'a> SegmentedBuffer<'a> {
         Ok(ChunksMut { buffer: self, offset: range.start, end: range.end })
     }
 
-    /// Release all blocks, retaining the absolute end as the next append offset.
+    /// Clear the live range, retaining the absolute end and any configured prefix capacity.
     pub fn clear(&mut self) {
         self.start = self.end;
         self.prune();
@@ -341,12 +377,13 @@ impl<'a> SegmentedBuffer<'a> {
         if node == NONE {
             return NONE;
         }
-        let limit = base + Self::span(depth);
-        if limit <= first || base >= end {
+        let limit = (base + Self::span(depth)).min(self.allocated_end as u128);
+        let cached = self.retained as u128;
+        if (limit <= first || base >= end) && base >= cached {
             self.release_tree(node, depth);
             return NONE;
         }
-        if first <= base && limit <= end {
+        if (first <= base && limit <= end) || limit <= cached {
             return node;
         }
         debug_assert_ne!(depth, 0);
@@ -363,16 +400,20 @@ impl<'a> SegmentedBuffer<'a> {
 
     fn prune(&mut self) {
         self.tail = NONE;
-        if self.is_empty() {
+        if self.is_empty() && self.retained == 0 {
             self.release_tree(self.root, self.depth);
             self.root = NONE;
             self.depth = 0;
             self.base = 0;
+            self.allocated_end = 0;
             return;
         }
-        let first = self.start as u128 / CHUNK_BYTES as u128;
         let end = (self.end as u128).div_ceil(CHUNK_BYTES as u128);
+        let first = if self.is_empty() { end } else { self.start as u128 / CHUNK_BYTES as u128 };
         self.root = self.retain(self.root, self.depth, self.base as u128, first, end);
+        let first = if self.retained != 0 { 0 } else { first };
+        let end = if self.is_empty() { 0 } else { end }.max(self.retained as u128);
+        self.allocated_end = end as u64;
         // Collapse single-child roots; a rolling window need not retain the
         // ancestors of discarded portions of its address space.
         while self.depth > 0 {
@@ -459,8 +500,12 @@ mod tests {
             assert!(node < b.pool.issued_blocks());
             assert_eq!(b.ptr(node) as usize % CHUNK_BYTES, 0);
             if depth == 0 {
-                assert!(base >= b.start as u128 / CHUNK_BYTES as u128);
-                assert!(base < (b.end as u128).div_ceil(CHUNK_BYTES as u128));
+                assert!(
+                    base < b.retained as u128
+                        || (!b.is_empty()
+                            && base >= b.start as u128 / CHUNK_BYTES as u128
+                            && base < (b.end as u128).div_ceil(CHUNK_BYTES as u128))
+                );
             } else {
                 let span = SegmentedBuffer::span(depth - 1);
                 let mut children = 0;
@@ -489,6 +534,40 @@ mod tests {
         }
         assert_eq!(held.len(), max, "lost pool blocks");
         assert_eq!(held.iter().map(Block::index).collect::<HashSet<_>>().len(), max);
+    }
+
+    #[test]
+    fn bounded_retention_reuses_leaves_without_exposing_old_bytes() {
+        for keep in [0, 1, 2, 4] {
+            let pool = pool(32);
+            let mut b = SegmentedBuffer::with_retained_leaves(&pool, keep);
+            b.append(&vec![0xa5; CHUNK_BYTES * 6], || 0).unwrap();
+            let indexes: Vec<_> = (0..keep).map(|i| b.leaf(i as u64)).collect();
+            b.discard_before((CHUNK_BYTES * 4) as u64).unwrap();
+            assert_eq!(audit(&b), keep as usize + 2 + 1);
+            b.reset();
+            assert_eq!(b.len(), 0);
+            assert!(b.chunk(0).is_none());
+            assert_eq!(audit(&b), keep as usize + usize::from(keep > 1));
+            for i in 0..keep {
+                b.append(&vec![i as u8; CHUNK_BYTES], || panic!("retained leaf allocated"))
+                    .unwrap();
+                assert_eq!(b.leaf(i as u64), indexes[i as usize]);
+            }
+            b.discard_before(b.end()).unwrap();
+            b.reset();
+            assert_eq!(audit(&b), keep as usize + usize::from(keep > 1));
+            b.append(b"new", || 0).unwrap();
+            b.truncate(0).unwrap();
+            b.append(b"ok", || {
+                assert_eq!(keep, 0, "retained leaf allocated");
+                0
+            })
+            .unwrap();
+            assert_eq!(b.chunk(0), Some(b"ok".as_slice()));
+            drop(b);
+            all_returned(&pool, 32);
+        }
     }
 
     #[test]

@@ -1486,7 +1486,7 @@ impl Wire {
     }
 
     /// Seal and send a batch, splitting large batches at message boundaries.
-    /// Success releases all of the batch's blocks.
+    /// Success resets the batch, retaining only its bounded reusable capacity.
     pub fn send(&mut self, plain: &mut MessageBuffer) -> Result<()> {
         let mut at = plain.bytes.start();
         while at < plain.bytes.end() {
