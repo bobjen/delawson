@@ -528,6 +528,7 @@ and response sizes/counts are unchanged. Workspace tests passed at each step.
 | Single-row argument builders | 77,572 | 361,119 | 356,118 / 368,006 / 359,234 |
 | Move FE response arguments | 76,587 | 381,932 | 382,465 / 379,981 / 383,351 |
 | Reserve row and argument capacities | 78,260 | 447,924 | 444,727 / 446,272 / 452,774 |
+| Cache append leaf and defer RNG access | 78,203 | 459,575 | 457,527 / 460,717 / 460,483 |
 
 Single-row builders return an `Arg` directly where callers previously appended
 a temporary one-element vector. Existing vector-returning entry points remain
@@ -557,4 +558,12 @@ cache before recycling blocks; boundary-crossing writes retain allocation-error
 rollback. Message payloads now borrow the thread-local RNG only when the pool
 actually requests a random value. Workspace tests passed, including a rolling
 model mixing direct appends, writers, truncation, clearing and prefix discard.
-Benchmark running at this commit: `/tmp/delawson-object-bench-lkf3non4/`.
+Committed as `44209c2`. The completed benchmark averaged 78,203 ObjectInfo/s
+(trials 77,232 / 77,685 / 79,692) and 459,575 BatchObjectInfo/s (trials
+457,527 / 460,717 / 460,483, 0.7% spread). Batch throughput rose 2.6% over
+capacity reservations alone, and 27.7% over the starting repeat. ObjectInfo
+was effectively unchanged from the capacity step. All lookups were answered
+and found, sample sizes/counts were unchanged, and the runner exited 0 after
+cleanup. Logs: `/tmp/delawson-object-bench-lkf3non4/` (temporary files).
+These are sequential runs, not randomized alternating comparisons; small
+differences should still be interpreted with that limitation.
