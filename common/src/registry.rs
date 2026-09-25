@@ -93,7 +93,7 @@ pub fn response(peers: impl IntoIterator<Item = Peer>) -> Resp {
     for peer in peers {
         payload.text(&peer.line());
     }
-    Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::RegistryResp)] }
+    Resp::new(Status::Ok, payload.finish(Op::RegistryResp))
 }
 
 #[cfg(test)]
@@ -111,7 +111,7 @@ mod tests {
                 media_class: None,
                 ring_identity: Some(expected.clone()),
             };
-            let roundtrip = Peer::from_args(&peer.request().args).unwrap();
+            let roundtrip = Peer::from_args(peer.request().args()).unwrap();
             let accepted = roundtrip.check_ring(Some(&expected), false).is_ok();
             peer.ring_identity =
                 Some(crate::ring::RingIdentity::try_from("02".repeat(64)).unwrap());

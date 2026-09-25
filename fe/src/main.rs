@@ -277,7 +277,7 @@ impl Service for FE {
     }
 
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
-        match request.op {
+        match request.op() {
             Op::SoftDeleteObject | Op::DeleteObject => {
                 if let Err(error) = common::deletion::Delete::of_with_limit(
                     &request,
@@ -291,11 +291,11 @@ impl Service for FE {
             Op::SealObject => return self.seal_object(process, &request, reply),
             _ => {}
         }
-        if !FORWARDED.contains(&request.op) {
+        if !FORWARDED.contains(&request.op()) {
             reply.send(server::unbuilt(process, SERVES, &request));
             return;
         }
-        match request.op {
+        match request.op() {
             Op::BatchInfo => self.batch(process, &request, reply),
             Op::BatchCreate => self.create(process, &request, reply),
             _ => self.onward(process, &request, reply),
@@ -322,7 +322,7 @@ impl FE {
     /// filling: an object may be closed while its last extent is only partly full.
     fn seal_object(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Reply) {
         let (mut payload, rest) =
-            match structure(&request.args, Op::SealObject, "a seal-object request") {
+            match structure(&request.args(), Op::SealObject, "a seal-object request") {
                 Ok(value) => value,
                 Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
             };
@@ -364,7 +364,7 @@ impl FE {
                 let callback_process = Arc::clone(&onward);
                 if let Err(e) = onward.ask(&sn, &ask, move |answer| {
                     let Some(open) = (answer.status == Status::Ok)
-                        .then(|| Open::of(located.sn, located.framing, &answer.args))
+                        .then(|| Open::of(located.sn, located.framing, answer.args()))
                         .flatten()
                     else {
                         return reply.send(answer);
@@ -407,7 +407,7 @@ impl FE {
             let filled = if empty {
                 Filled::default()
             } else {
-                match Filled::of_args(&answer.args) {
+                match Filled::of_args(answer.args()) {
                     Ok((filled, [])) => filled,
                     _ => {
                         return reply
@@ -434,7 +434,7 @@ impl FE {
                     return reply.send(answer);
                 }
                 let (mut payload, rest) =
-                    match structure(&answer.args, Op::NumberResp, "a sealed-stream response") {
+                    match structure(answer.args(), Op::NumberResp, "a sealed-stream response") {
                         Ok(value) => value,
                         Err(e) => return reply.send(Resp::error(Status::Internal, e.to_string())),
                     };
@@ -551,7 +551,7 @@ impl FE {
             if answer.status != Status::Ok {
                 return reply.send(answer);
             }
-            let Some(located) = Located::of(&answer.args) else {
+            let Some(located) = Located::of(answer.args()) else {
                 return reply
                     .send(Resp::error(Status::Internal, "that answer did not describe an object"));
             };
@@ -686,7 +686,7 @@ impl FE {
         answer: Resp,
     ) {
         let extent = match answer.status {
-            Status::Ok => Open::of(wanting.located.sn, wanting.located.framing, &answer.args),
+            Status::Ok => Open::of(wanting.located.sn, wanting.located.framing, answer.args()),
             _ => None,
         };
         let waiting = {
@@ -770,7 +770,7 @@ impl FE {
         open: Open,
         answer: Resp,
     ) {
-        let Ok((came_to, [])) = Filled::of_args(&answer.args) else {
+        let Ok((came_to, [])) = Filled::of_args(answer.args()) else {
             return wanting
                 .reply
                 .send(Resp::error(Status::Internal, "a seal said nothing about the extent"));
@@ -796,16 +796,16 @@ impl FE {
     /// The stream is full. The DN gives the object another, carrying on from where
     /// this one stopped, and the append starts again there.
     fn after_stream(self: &Arc<Self>, process: &Arc<Process>, wanting: Wanting, answer: Resp) {
-        let (mut payload, rest) = match structure(&answer.args, Op::NumberResp, "a sealed response")
-        {
-            Ok(value) => value,
-            Err(_) => {
-                return wanting.reply.send(Resp::error(
-                    Status::Internal,
-                    "a full stream said nothing about itself",
-                ));
-            }
-        };
+        let (mut payload, rest) =
+            match structure(answer.args(), Op::NumberResp, "a sealed response") {
+                Ok(value) => value,
+                Err(_) => {
+                    return wanting.reply.send(Resp::error(
+                        Status::Internal,
+                        "a full stream said nothing about itself",
+                    ));
+                }
+            };
         let records =
             match payload.number_u64().and_then(|records| payload.done().map(|()| records)) {
                 Ok(records) if rest.is_empty() => records,
@@ -834,7 +834,7 @@ impl FE {
             if answer.status != Status::Ok {
                 return reply.send(answer);
             }
-            let Some(next) = Located::of(&answer.args) else {
+            let Some(next) = Located::of(answer.args()) else {
                 return reply.send(Resp::error(Status::Internal, "that extension named no stream"));
             };
             if next.stream == located.stream {
@@ -863,7 +863,7 @@ impl FE {
     fn read(self: &Arc<Self>, process: &Arc<Process>, request: &Req, mut reply: Reply) {
         let (path, expect, range, include) = {
             let (mut payload, rest) =
-                match structure(&request.args, Op::ReadRecord, "a read request") {
+                match structure(&request.args(), Op::ReadRecord, "a read request") {
                     Ok(value) => value,
                     Err(e) => {
                         return reply.send(Resp::error(Status::BadRequest, e.to_string()));
@@ -987,7 +987,7 @@ impl FE {
             if answer.status != Status::Ok {
                 return reply.send(answer);
             }
-            let Some(open) = Open::of(located.sn, located.framing, &answer.args) else {
+            let Some(open) = Open::of(located.sn, located.framing, answer.args()) else {
                 return reply.send(Resp::error(Status::Internal, "that answer named no extent"));
             };
             // A sealed extent the SN just named is one to remember: its record range
@@ -1030,7 +1030,7 @@ fn read_bytes(
     if initial.status != Status::Ok {
         return Ok(initial);
     }
-    let (described, _) = Described::of_args(&initial.args)?;
+    let (described, _) = Described::of_args(initial.args())?;
     let Some(described) = described else {
         return Ok(Resp::error(Status::NotFound, "no object"));
     };
@@ -1060,7 +1060,7 @@ fn read_bytes(
         if answer.status != Status::Ok {
             return Ok(answer);
         }
-        let located = Located::of(&answer.args)
+        let located = Located::of(answer.args())
             .ok_or_else(|| common::Error::new("byte lookup returned no stream"))?;
         let at = in_stream(wanted, located.first_record);
         let mut payload = StructWriter::new();
@@ -1078,7 +1078,7 @@ fn read_bytes(
         if answer.status != Status::Ok {
             return Ok(answer);
         }
-        let open = Open::of(located.sn, located.framing, &answer.args)
+        let open = Open::of(located.sn, located.framing, answer.args())
             .ok_or_else(|| common::Error::new("byte lookup returned no extent"))?;
         let mut payload = StructWriter::new();
         payload.en_id(open.disks[0].0);
@@ -1101,7 +1101,7 @@ fn read_bytes(
         if answer.status != Status::Ok {
             return Ok(answer);
         }
-        let (seek, rest) = common::range::ByteSeek::of_args(&answer.args)?;
+        let (seek, rest) = common::range::ByteSeek::of_args(answer.args())?;
         skip = skip
             .checked_sub(seek.skipped)
             .ok_or_else(|| common::Error::new("byte seek skipped beyond requested offset"))?;
@@ -1193,7 +1193,8 @@ impl ParsedAppend {
     }
 
     fn of(request: &Req) -> common::Result<Self> {
-        let (mut payload, rest) = structure(&request.args, Op::AppendRecord, "an append request")?;
+        let (mut payload, rest) =
+            structure(&request.args(), Op::AppendRecord, "an append request")?;
         let path = payload.text()?;
         let expect = Expecting::read(&mut payload)?;
         let kind = payload.number_u8()?;
@@ -1274,7 +1275,7 @@ fn wanting_extent(key: StreamName, sealed: Option<(ExtentId, Filled)>) -> Req {
         payload.time_sec(key.created);
         return Req::new(Op::OpenExtent).structure(payload);
     }
-    let mut request = Req::new(match sealed {
+    let request = Req::new(match sealed {
         None => Op::OpenExtent,
         Some(_) => Op::SealExtent,
     });
@@ -1289,7 +1290,6 @@ fn wanting_extent(key: StreamName, sealed: Option<(ExtentId, Filled)>) -> Req {
         payload.ecoff(came_to.compressed);
         return request.structure(payload);
     }
-    request.args.extend(key.args());
     request
 }
 
@@ -1340,7 +1340,7 @@ fn make_object(
         if answer.status != Status::Ok {
             return reply.send(answer);
         }
-        let Some(located) = Located::of(&answer.args) else {
+        let Some(located) = Located::of(answer.args()) else {
             return reply.send(Resp::error(Status::Internal, "that create made no object"));
         };
         if located.stream.stream.is_none() {
@@ -1456,7 +1456,7 @@ fn in_the_callers_numbering(answer: Resp, base: ORoff, sealed: bool) -> Resp {
     if answer.status != Status::Ok {
         return answer;
     }
-    let Ok((extent, rest)) = ExtentCovered::of_args(&answer.args) else {
+    let Ok((extent, rest)) = ExtentCovered::of_args(answer.args()) else {
         return Resp::error(Status::Internal, "that answer did not say what it covered");
     };
     let Ok(pieces) = Piece::all_of_args(rest) else {
@@ -1490,7 +1490,7 @@ fn in_the_callers_numbering(answer: Resp, base: ORoff, sealed: bool) -> Resp {
             .args(),
         );
     }
-    Resp { id: 0, status: Status::Ok, args }
+    Resp::from_args(Status::Ok, args).id(0)
 }
 
 /// What an append tells the writer. The durable reference comes first — a stream
@@ -1501,7 +1501,7 @@ fn receipt(located: &Located, open: &Open, answer: Resp) -> Resp {
     if answer.status != Status::Ok {
         return answer;
     }
-    let receipt = match EnReceipt::read(&answer.args) {
+    let receipt = match EnReceipt::read(answer.args()) {
         Ok(receipt) => receipt,
         Err(_) => return Resp::error(Status::Internal, "that append answered with no receipt"),
     };
@@ -1509,10 +1509,9 @@ fn receipt(located: &Located, open: &Open, answer: Resp) -> Resp {
     // address a reader gives back.
     let in_stream = SRoff::new(open.first_record.number() + receipt.first_record.number());
     let object_record = ORoff::new(located.first_record.number() + in_stream.number());
-    Resp {
-        id: 0,
-        status: Status::Ok,
-        args: vec![
+    Resp::from_args(
+        Status::Ok,
+        vec![
             Receipt {
                 stream: located.stream.stream,
                 record: in_stream,
@@ -1525,7 +1524,8 @@ fn receipt(located: &Located, open: &Open, answer: Resp) -> Resp {
             }
             .write(),
         ],
-    }
+    )
+    .id(0)
 }
 
 /// What a DN says an object is: which stream holds it, which SN holds that, and how
@@ -1636,7 +1636,7 @@ impl Spread {
             }
             return;
         }
-        let (covered, rows) = match Batch::of_args(&answer.args) {
+        let (covered, rows) = match Batch::of_args(answer.args()) {
             Ok(read) => read,
             Err(e) => return self.give_up(e.to_string()),
         };
@@ -1652,9 +1652,9 @@ impl Spread {
         };
         // Parsing borrows the response; retain only the piece lengths so ownership
         // of its arguments can then move into the caller-ordered slots.
-        let header = answer.args.len() - rows.len();
+        let header = answer.args().len() - rows.len();
         let lengths: Vec<usize> = pieces.into_iter().map(<[Arg]>::len).collect();
-        let mut arguments = answer.args.into_iter().skip(header);
+        let mut arguments = answer.into_args().into_iter().skip(header);
         for (n, length) in lengths.into_iter().enumerate() {
             let Some(at) = ask.at.get(n) else {
                 return self.give_up("a DN described more names than it was asked about".into());
@@ -1799,7 +1799,7 @@ impl Spread {
         let covered = Batch { asked: self.asked as u64, given, entries, next };
         let mut out = covered.args();
         out.append(&mut args);
-        Resp { id: 0, status: Status::Ok, args: out }
+        Resp::from_args(Status::Ok, out).id(0)
     }
 }
 
@@ -1818,7 +1818,7 @@ impl FE {
     fn batch(self: &Arc<Self>, process: &Arc<Process>, request: &Req, mut reply: Reply) {
         let (names, want) = {
             let (mut payload, rest) =
-                match structure(&request.args, Op::BatchInfo, "a batch-object-info request") {
+                match structure(&request.args(), Op::BatchInfo, "a batch-object-info request") {
                     Ok(value) => value,
                     Err(e) => {
                         return reply.send(Resp::error(Status::BadRequest, e.to_string()));
@@ -1916,7 +1916,7 @@ impl FE {
     fn create(self: &Arc<Self>, process: &Arc<Process>, request: &Req, mut reply: Reply) {
         let wanted = {
             let (mut payload, rest) =
-                match structure(&request.args, Op::BatchCreate, "a batch-create request") {
+                match structure(&request.args(), Op::BatchCreate, "a batch-create request") {
                     Ok(value) => value,
                     Err(e) => {
                         return reply.send(Resp::error(Status::BadRequest, e.to_string()));
@@ -2004,7 +2004,7 @@ impl FE {
     /// create lands on one machine and the lookup that follows it asks another — which with
     /// one DN is invisible and with two loses half the objects.
     fn destination(&self, process: &Process, request: &Req) -> Result<String> {
-        match request.op {
+        match request.op() {
             Op::SoftDeleteObject
             | Op::DeleteObject
             | Op::CreateObject
@@ -2035,7 +2035,7 @@ struct Making {
 /// One DN's count. The last one in answers.
 fn made(making: &Arc<Mutex<Making>>, answer: Resp) {
     let mut held = making.lock().expect("making");
-    let number = structure(&answer.args, Op::NumberResp, "a number response").and_then(
+    let number = structure(answer.args(), Op::NumberResp, "a number response").and_then(
         |(mut payload, rest)| {
             if !rest.is_empty() {
                 return Err(common::Error::new("a number response has trailing arguments"));
@@ -2186,46 +2186,21 @@ fn arrived(
 
 /// The request's first argument, which for anything about an object is the name.
 fn first(request: &Req) -> String {
-    match request.args.first() {
-        Some(Arg::Text(name)) => name.clone(),
-        Some(Arg::Struct(Op::SoftDeleteObject | Op::DeleteObject, _, _)) => {
+    match request.op() {
+        Op::SoftDeleteObject | Op::DeleteObject => {
             match common::deletion::Delete::of(request).map(|value| value.target) {
                 Ok(common::deletion::Target::Object(path)) => path,
                 _ => String::new(),
             }
         }
-        Some(Arg::Struct(Op::ObjectInfo, _bytes, _)) => {
-            structure(&request.args, Op::ObjectInfo, "an object-info request")
-                .and_then(|(mut payload, _)| payload.text())
-                .unwrap_or_default()
-        }
-        Some(Arg::Struct(Op::BatchInfo, _bytes, _)) => {
-            structure(&request.args, Op::BatchInfo, "a batch-object-info request")
-                .and_then(|(mut payload, _)| {
-                    let _ = payload.number_u64()?;
-                    payload.text()
-                })
-                .unwrap_or_default()
-        }
-        Some(Arg::Struct(Op::CreateObject, _bytes, _)) => {
-            structure(&request.args, Op::CreateObject, "a create-object request")
-                .and_then(|(mut payload, _)| payload.text())
-                .unwrap_or_default()
-        }
-        Some(Arg::Struct(Op::BatchCreate, _bytes, _)) => {
-            structure(&request.args, Op::BatchCreate, "a batch-create request")
-                .and_then(|(mut payload, _)| {
-                    let _ = payload.number_u64()?;
-                    payload.text()
-                })
-                .unwrap_or_default()
-        }
-        Some(Arg::Struct(Op::ConcatObjects, _bytes, _)) => {
-            structure(&request.args, Op::ConcatObjects, "a concat-objects request")
-                .and_then(|(mut payload, _)| payload.text())
-                .unwrap_or_default()
-        }
-        _ => String::new(),
+        op => structure(request.args(), op, "a request")
+            .and_then(|(mut payload, _)| {
+                if matches!(op, Op::BatchInfo | Op::BatchCreate) {
+                    payload.number_u64()?;
+                }
+                payload.text()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -2281,7 +2256,7 @@ mod tests {
             }
             .request()
             .unwrap();
-            assert!(FORWARDED.contains(&request.op));
+            assert!(FORWARDED.contains(&request.op()));
             assert_eq!(first(&request), "/not-the-empty-path");
         }
     }
@@ -2310,7 +2285,8 @@ mod tests {
             }),
         ] {
             let request = object_lookup("/x", Some(ORoff::new(7)), expected);
-            let (mut payload, rest) = structure(&request.args, Op::LocateStream, "locate").unwrap();
+            let (mut payload, rest) =
+                structure(&request.args(), Op::LocateStream, "locate").unwrap();
             assert!(rest.is_empty());
             assert_eq!(payload.text().unwrap(), "/x");
             assert_eq!(payload.oroff().unwrap(), ORoff::new(7));
@@ -2369,11 +2345,11 @@ mod tests {
         let mut args = covered.args();
         args.extend(piece.args());
         let response = in_the_callers_numbering(
-            Resp { id: 0, status: Status::Ok, args },
+            Resp::from_args(Status::Ok, args).id(0),
             ORoff::new(1 << 32),
             false,
         );
-        let (covered, rest) = ObjectCovered::of_args(&response.args).unwrap();
+        let (covered, rest) = ObjectCovered::of_args(response.args()).unwrap();
         let pieces = ObjectPiece::all_of_args(rest).unwrap();
         assert_eq!(pieces[0].first_record, ORoff::new((1 << 32) + 7));
         assert_eq!(covered.next, ORoff::new((1 << 32) + 8));
@@ -2534,7 +2510,7 @@ mod tests {
         for piece in pieces {
             args.extend(piece.iter().cloned());
         }
-        Resp { id: 0, status: Status::Ok, args }
+        Resp::from_args(Status::Ok, args).id(0)
     }
 
     #[test]
@@ -2546,7 +2522,7 @@ mod tests {
             spread.take(&ask, answer_of(&[described(2, 2, UNKNOWN)], 3));
         }
         let response = spread.answer();
-        let (batch, rest) = Batch::of_args(&response.args).unwrap();
+        let (batch, rest) = Batch::of_args(response.args()).unwrap();
         assert_eq!((batch.given, batch.entries, batch.next), (2, 4, 1));
         let pieces = Batch::pieces(rest, batch.given).unwrap();
         let (second, _) = Shape::of_args(pieces[1]).unwrap();
@@ -2570,7 +2546,7 @@ mod tests {
         spread.take(&other, answer_of(&[described(1, 0, 0)], 1));
         assert_eq!(spread.unfinished(), Some(1));
         let answer = spread.answer();
-        let (covered, _) = Batch::of_args(&answer.args).expect("a header");
+        let (covered, _) = Batch::of_args(answer.args()).expect("a header");
         assert_eq!((covered.given, covered.entries), (2, 3));
         assert_eq!(covered.next, 1, "come back for the one described only in counts");
     }
@@ -2610,7 +2586,7 @@ mod tests {
         let lead = Ask { dn: "DN0".into(), at: vec![0, 2], want };
         spread.take(&lead, answer_of(&[described(1, 1, UNKNOWN), described(1, 1, UNKNOWN)], 4));
         let answer = spread.answer();
-        let (covered, _) = Batch::of_args(&answer.args).expect("a header");
+        let (covered, _) = Batch::of_args(answer.args()).expect("a header");
         assert_eq!(covered.given, 1, "name 2 is held back rather than passed off as name 1");
         assert_eq!(covered.next, 1);
     }
@@ -2676,12 +2652,12 @@ mod tests {
             args.extend(piece(ERoff::new(first_record)).args());
         }
         let told = in_the_callers_numbering(
-            Resp { id: 0, status: Status::Ok, args },
+            Resp::from_args(Status::Ok, args).id(0),
             origin(stream_first, extent_first),
             true,
         );
 
-        let (back, rest) = ObjectCovered::of_args(&told.args).expect("what it covered");
+        let (back, rest) = ObjectCovered::of_args(told.args()).expect("what it covered");
         assert_eq!(back.next, ORoff::new(743), "the continuation, made the caller's");
         assert_eq!(
             (back.records, back.logical, back.compressed),
@@ -2707,15 +2683,15 @@ mod tests {
             next: ERoff::new(1),
             more: false,
         };
-        let answer = || Resp { id: 0, status: Status::Ok, args: covered.args() };
+        let answer = || Resp::from_args(Status::Ok, covered.args()).id(0);
 
         let tail = in_the_callers_numbering(answer(), ORoff::new(0), false);
         assert!(
-            !ObjectCovered::of_args(&tail.args).unwrap().0.more,
+            !ObjectCovered::of_args(tail.args()).unwrap().0.more,
             "the open extent ends the object"
         );
         let sealed = in_the_callers_numbering(answer(), ORoff::new(0), true);
-        assert!(ObjectCovered::of_args(&sealed.args).unwrap().0.more, "a sealed one does not");
+        assert!(ObjectCovered::of_args(sealed.args()).unwrap().0.more, "a sealed one does not");
     }
 
     /// A refusal is passed through untouched: there are no record numbers in it to
@@ -2741,9 +2717,8 @@ mod tests {
             payload.en_id(EnId::new(en));
             payload.disk_id(DiskId::new(disk));
         }
-        let response =
-            Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::ExtentResp)] };
-        let open = Open::of(SnId::new(0), Framing::Lf, &response.args).expect("an extent");
+        let response = Resp::new(Status::Ok, payload.finish(Op::ExtentResp));
+        let open = Open::of(SnId::new(0), Framing::Lf, response.args()).expect("an extent");
         assert_eq!(
             (open.sn, open.id, open.created, open.first_record),
             (SnId::new(0), ExtentId::new(7), TimeSec::new(1_000_000), SRoff::new(40))
@@ -2839,10 +2814,9 @@ mod tests {
             _framing: Framing::Lf,
             disks: vec![(EnId::new(2), DiskId::new(0)), (EnId::new(3), DiskId::new(0))],
         };
-        let from_en = Resp {
-            id: 0,
-            status: Status::Ok,
-            args: vec![
+        let from_en = Resp::from_args(
+            Status::Ok,
+            vec![
                 EnReceipt {
                     sn: SnId::new(0),
                     logical: common::offset::ELoff::new(512),
@@ -2854,11 +2828,12 @@ mod tests {
                 }
                 .write(),
             ],
-        };
+        )
+        .id(0);
         let receipt = receipt(&located, &open, from_en);
         assert_eq!(receipt.status, Status::Ok);
         assert_eq!(
-            Receipt::read(&receipt.args).unwrap(),
+            Receipt::read(receipt.args()).unwrap(),
             Receipt {
                 stream: StreamId::new(17),
                 record: SRoff::new(42),

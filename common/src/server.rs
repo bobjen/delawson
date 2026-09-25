@@ -47,8 +47,8 @@ use crate::random::Rng;
 use crate::registry::Peer;
 use crate::routing;
 use crate::wire::{
-    self, Arg, MAX_FRAME_BYTES, MessageBuffer, Op, Req, Resp, Status, StructWriter, Wire,
-    put_response, structure,
+    self, MAX_FRAME_BYTES, MessageBuffer, Op, Req, Resp, Status, StructWriter, Wire, put_response,
+    structure,
 };
 use crate::{Context, Error, Result};
 use crate::{logd, logi, logn, logsec, logw};
@@ -460,12 +460,16 @@ pub fn ask(
 /// The answer for an operation this machine type has not built, or should never
 /// have been sent.
 pub fn unbuilt(process: &Process, serves: &[Op], request: &Req) -> Resp {
-    if serves.contains(&request.op) {
-        Resp::error(Status::Unimplemented, format!("{} is not built yet", request.op))
+    if serves.contains(&request.op()) {
+        Resp::error(Status::Unimplemented, format!("{} is not built yet", request.op()))
     } else {
         Resp::error(
             Status::BadRequest,
-            format!("{} does not serve {}", process.entry.kind.as_str().to_uppercase(), request.op),
+            format!(
+                "{} does not serve {}",
+                process.entry.kind.as_str().to_uppercase(),
+                request.op()
+            ),
         )
     }
 }
@@ -590,18 +594,20 @@ fn read_loop<S: Service>(
             return Ok(());
         };
         if let Some(auth) = &process.cluster.messaging.authentication {
-            let allowed = match request.op {
-                Op::Raft => match request.args.first() {
-                    Some(Arg::Text(sender)) => {
+            let allowed = match request.op() {
+                Op::Raft => match structure(request.args(), Op::Raft, "a Raft request")
+                    .and_then(|(mut payload, _)| payload.text())
+                {
+                    Ok(sender) => {
                         process
                             .cluster
-                            .service(sender)
+                            .service(&sender)
                             .is_some_and(|entry| entry.kind == ServiceKind::Ks)
-                            && auth.permits(input.peer_key(), sender)
+                            && auth.permits(input.peer_key(), &sender)
                     }
                     _ => false,
                 },
-                Op::Register => Peer::from_args(&request.args)
+                Op::Register => Peer::from_args(&request.args())
                     .is_ok_and(|peer| auth.permits(input.peer_key(), &peer.identity)),
                 Op::SnMasterKey => process
                     .cluster
@@ -620,8 +626,8 @@ fn read_loop<S: Service>(
         // An answer that will come from another thread cannot be flushed by this
         // one, so the connection goes onto a sender first — the same reason a
         // pooled answer does.
-        let deferred = service.defers(request.op);
-        if (deferred || !service.inline(request.op))
+        let deferred = service.defers(request.op());
+        if (deferred || !service.inline(request.op()))
             && policy == SendMode::Adaptive
             && out.batch.get().is_none()
         {
@@ -633,7 +639,7 @@ fn read_loop<S: Service>(
         }
 
         let arrived = input.arrived();
-        if service.inline(request.op) {
+        if service.inline(request.op()) {
             // Nothing more in hand means the next read would block, so send. A
             // deferred answer is sent whenever it arrives, which is always a
             // moment this loop knows nothing about.
@@ -878,7 +884,7 @@ fn answer_here<S: Service>(
     arrived: Instant,
 ) {
     process.answered.fetch_add(1, Ordering::Relaxed);
-    let op = request.op;
+    let op = request.op();
     // The subject is only for the answer's line, so it is not paid when the level
     // is above info. The arrival time was read once for the whole batch.
     let logging = crate::log::enabled(crate::log::Level::Info);
@@ -890,7 +896,7 @@ fn answer_here<S: Service>(
         started: logging.then_some(arrived),
         about: String::new(),
     };
-    if logging && let Some(arg) = request.args.first() {
+    if logging && let Some(arg) = request.args().first() {
         reply.about(arg);
     }
     match op {
@@ -922,7 +928,7 @@ fn answer_here<S: Service>(
 
 fn assign_peers(process: &Process, request: &Req) -> Resp {
     let (mut payload, rest) =
-        match structure(&request.args, Op::AssignPeers, "an assign-peers request") {
+        match structure(&request.args(), Op::AssignPeers, "an assign-peers request") {
             Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
@@ -978,7 +984,7 @@ fn assign_peers(process: &Process, request: &Req) -> Resp {
 /// library, for when the process is not answering.
 fn read_logs(process: &Process, request: &Req) -> Resp {
     let (which, from, to, what, limit) = {
-        let (mut payload, rest) = match structure(&request.args, request.op, "a log request") {
+        let (mut payload, rest) = match structure(&request.args(), request.op(), "a log request") {
             Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
@@ -997,7 +1003,7 @@ fn read_logs(process: &Process, request: &Req) -> Resp {
             Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let (what, limit) = match request.op {
+        let (what, limit) = match request.op() {
             Op::LogHistogram => (None, 100),
             Op::LogGrep => {
                 let what = match payload.text() {
@@ -1044,7 +1050,7 @@ fn read_logs(process: &Process, request: &Req) -> Resp {
 
     // Each of the three takes the same window: a rare thing is looked for in the
     // minute it happened.
-    let read = match request.op {
+    let read = match request.op() {
         Op::LogHistogram => logs.histogram(&from, &to),
         Op::LogGrep => logs.grep(what.as_deref().unwrap_or_default(), &from, &to, limit),
         _ => logs.range(&from, &to, limit),
@@ -1057,7 +1063,7 @@ fn read_logs(process: &Process, request: &Req) -> Resp {
             let mut payload = StructWriter::new();
             payload.number_u64(seen);
             payload.text(&lines.join("\n"));
-            Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::LogResp)] }
+            Resp::new(Status::Ok, payload.finish(Op::LogResp))
         }
     }
 }
@@ -1065,12 +1071,19 @@ fn read_logs(process: &Process, request: &Req) -> Resp {
 /// A ping asks for a reply of a given size, so that message size is a knob and
 /// not a constant. Bare, it answers in words.
 fn ping(process: &Process, request: &Req) -> Resp {
-    let size = match request.args.first() {
-        None => 0,
-        Some(Arg::Number(size)) => *size as usize,
-        Some(other) => {
-            return Resp::error(Status::BadRequest, format!("ping takes a size, not {other}"));
+    let parsed = (|| -> Result<(usize, bool)> {
+        let (mut payload, rest) = structure(request.args(), Op::Ping, "a ping request")?;
+        if !rest.is_empty() {
+            return Err(Error::new("ping has trailing arguments"));
         }
+        let size = if payload.remaining() == 0 { 0 } else { payload.number_u64()? as usize };
+        let dull = if payload.remaining() == 0 { false } else { payload.flag()? };
+        payload.done()?;
+        Ok((size, dull))
+    })();
+    let (size, dull) = match parsed {
+        Ok(value) => value,
+        Err(error) => return Resp::error(Status::BadRequest, error.to_string()),
     };
     if size == 0 {
         // At debug, so it is off by default: a line per ping costs several times
@@ -1082,7 +1095,6 @@ fn ping(process: &Process, request: &Req) -> Resp {
     }
     // Random padding is the honest default; the repetitive kind exists to give
     // compression something to find.
-    let dull = matches!(request.args.get(1), Some(Arg::Flag(true)));
     match if dull { repetition(size) } else { noise(size) } {
         Some(bytes) => Resp::bytes(bytes),
         None => Resp::error(

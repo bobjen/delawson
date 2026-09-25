@@ -82,9 +82,8 @@ where
 /// connection cannot make the far side allocate without bound.
 pub const MAX_SEGMENT_BYTES: usize = 64 << 20;
 
-/// A request whose arguments are one self-contained command payload uses the
-/// request's Op as its tag, so it does not repeat that tag inside the payload.
-const COMMAND_PAYLOAD: u16 = u16::MAX;
+/// Every request has one payload. Its Op is the first field of that payload;
+/// the request header contains only the correlation ID and depth limit.
 
 macro_rules! ops {
     ($($name:ident = $code:expr, $text:expr;)*) => {
@@ -287,6 +286,10 @@ ops! {
 
     KsEnvelope = 131, "ks-encrypted-action";
     RaftMessageJournalTip = 132, "raft-journal-tip";
+    BatchInfoResp = 133, "batch-info-response";
+    ListExtentsResp = 134, "list-extents-response";
+    ObjectInfoResp = 135, "object-info-response";
+    CompoundResp = 136, "compound-response";
 }
 
 impl std::fmt::Display for Op {
@@ -357,6 +360,9 @@ pub enum Arg {
     /// message carries the maximum for all of its values.
     // Finished payloads embed Vec metadata, but never the writer's cache.
     Struct(Op, MessagePayload, u8),
+    /// A tagged compound value whose children can be spliced without copying
+    /// their serialized payloads.
+    Group(Op, Vec<Arg>),
     Text(String),
     Number(u64),
     Flag(bool),
@@ -839,6 +845,7 @@ impl std::fmt::Display for Arg {
             Arg::Flag(b) => write!(f, "{b}"),
             Arg::Bytes(bytes) => write!(f, "{} bytes", bytes.len()),
             Arg::Struct(op, bytes, _) => write!(f, "<{op}: {} bytes>", bytes.len()),
+            Arg::Group(op, args) => write!(f, "<{op}: {} arguments>", args.len()),
         }
     }
 }
@@ -848,20 +855,60 @@ pub struct Req {
     /// Chosen by the caller, echoed by the response. Unique among that caller's
     /// outstanding requests, and nothing more.
     pub id: u32,
-    pub op: Op,
-    pub args: Vec<Arg>,
+    pub payload: Arg,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resp {
     pub id: u32,
     pub status: Status,
-    pub args: Vec<Arg>,
+    pub payload: Arg,
 }
 
 impl Req {
     pub fn new(op: Op) -> Req {
-        Req { id: 0, op, args: Vec::new() }
+        Req { id: 0, payload: StructWriter::new().finish(op) }
+    }
+
+    pub fn op(&self) -> Op {
+        match &self.payload {
+            Arg::Struct(op, ..) | Arg::Group(op, ..) => *op,
+            _ => unreachable!("a request payload has a schema Op"),
+        }
+    }
+
+    pub fn args(&self) -> &[Arg] {
+        match &self.payload {
+            Arg::Group(_, args) => args,
+            payload => std::slice::from_ref(payload),
+        }
+    }
+
+    pub fn into_args(self) -> Vec<Arg> {
+        match self.payload {
+            Arg::Group(_, args) => args,
+            payload => vec![payload],
+        }
+    }
+
+    pub fn from_args(op: Op, args: Vec<Arg>) -> Req {
+        let payload = match args.as_slice() {
+            [Arg::Struct(tag, ..) | Arg::Group(tag, ..)] if *tag == op => {
+                args.into_iter().next().unwrap()
+            }
+            _ => Arg::Group(op, args),
+        };
+        Req { id: 0, payload }
+    }
+
+    fn write_field(mut self, write: impl FnOnce(&mut StructWriter)) -> Req {
+        let Arg::Struct(op, bytes, depth) = self.payload else {
+            panic!("positional fields need a structure payload")
+        };
+        let mut writer = StructWriter { bytes: bytes.into(), depth: 1, maximum_depth: depth };
+        write(&mut writer);
+        self.payload = writer.finish(op);
+        self
     }
 
     pub fn id(mut self, id: u32) -> Req {
@@ -869,31 +916,31 @@ impl Req {
         self
     }
 
-    pub fn text(mut self, text: impl Into<String>) -> Req {
-        self.args.push(Arg::Text(text.into()));
-        self
+    pub fn text(self, text: impl Into<String>) -> Req {
+        let text = text.into();
+        self.write_field(|writer| writer.text(&text))
     }
 
-    pub fn number(mut self, n: u64) -> Req {
-        self.args.push(Arg::Number(n));
-        self
+    pub fn number(self, n: u64) -> Req {
+        self.write_field(|writer| writer.number_u64(n))
     }
 
-    pub fn flag(mut self, b: bool) -> Req {
-        self.args.push(Arg::Flag(b));
-        self
+    pub fn flag(self, b: bool) -> Req {
+        self.write_field(|writer| writer.flag(b))
     }
 
-    pub fn bytes(mut self, bytes: impl Into<MessageBytes>) -> Req {
-        self.args.push(Arg::Bytes(bytes.into().into()));
-        self
+    pub fn bytes(self, bytes: impl Into<MessageBytes>) -> Req {
+        let bytes = bytes.into();
+        self.write_field(|writer| writer.message_bytes(&bytes))
     }
 
     /// Put this command's self-contained payload in the request. The request's
     /// `Op` is the command tag; the payload is positional and parsed by the
     /// command, not by generic wire code.
     pub fn structure(mut self, payload: StructWriter) -> Req {
-        self.args.push(payload.finish(self.op));
+        let op = self.op();
+        assert!(matches!(&self.payload, Arg::Struct(_, bytes, _) if bytes.len() == 0));
+        self.payload = payload.finish(op);
         self
     }
 
@@ -902,16 +949,9 @@ impl Req {
     }
 
     fn encode_to(&self, out: &mut impl Write) -> std::io::Result<()> {
-        encode_header(self.id, self.op.code(), &self.args, out)?;
-        if let [Arg::Struct(op, bytes, _)] = self.args.as_slice()
-            && *op == self.op
-        {
-            out.write_all(&COMMAND_PAYLOAD.to_le_bytes())?;
-            bytes.write_to(out)?;
-        } else {
-            encode_args(&self.args, out)?;
-        }
-        Ok(())
+        out.write_all(&self.id.to_le_bytes())?;
+        out.write_all(&[message_depth(std::slice::from_ref(&self.payload))])?;
+        encode_arg(&self.payload, out)
     }
 
     #[cfg(test)]
@@ -921,52 +961,105 @@ impl Req {
 
     fn decode_from(input: impl BufRead, length: usize) -> Result<Req> {
         let mut reader = Cursor::new(input, length);
-        let (id, op, maximum_depth) = reader.header(Op::from_code)?;
-        let count = reader.u16()?;
-        let args = if count == COMMAND_PAYLOAD {
-            vec![Arg::Struct(op, reader.take(reader.remaining)?, maximum_depth)]
-        } else {
-            reader.args_with_count_and_depth(count, maximum_depth)?
-        };
-        Ok(Req { id, op, args })
+        let id = reader.u32()?;
+        let maximum_depth = reader.depth()?;
+        let payload = reader.arg(maximum_depth)?;
+        if reader.remaining != 0 {
+            return Err(Error::new("trailing bytes in frame"));
+        }
+        if !matches!(payload, Arg::Struct(..) | Arg::Group(..)) {
+            return Err(Error::new("request payload has no schema Op"));
+        }
+        Ok(Req { id, payload })
     }
 }
 
 impl Resp {
+    pub fn new(status: Status, payload: Arg) -> Resp {
+        Resp { id: 0, status, payload }
+    }
+
+    pub fn id(mut self, id: u32) -> Resp {
+        self.id = id;
+        self
+    }
+
+    pub fn from_args(status: Status, args: Vec<Arg>) -> Resp {
+        let group_op = match args.first() {
+            Some(Arg::Struct(Op::BatchResp, ..)) => Some(Op::BatchInfoResp),
+            Some(Arg::Struct(Op::ExtentRunResp, ..)) => Some(Op::ListExtentsResp),
+            Some(Arg::Struct(Op::ShapeResp, ..)) => Some(Op::ObjectInfoResp),
+            _ => None,
+        };
+        let payload = match (group_op, args.len()) {
+            (Some(op), _) => Arg::Group(op, args),
+            (None, 0) => Arg::Group(Op::EmptyResp, args),
+            (None, 1) if matches!(args.first(), Some(Arg::Struct(..) | Arg::Group(..))) => {
+                args.into_iter().next().unwrap()
+            }
+            (None, _) => {
+                let op = match args.first() {
+                    Some(Arg::Struct(op, ..) | Arg::Group(op, ..)) => *op,
+                    _ => Op::CompoundResp,
+                };
+                Arg::Group(op, args)
+            }
+        };
+        Resp { id: 0, status, payload }
+    }
+
+    pub fn group(status: Status, op: Op, args: Vec<Arg>) -> Resp {
+        Resp { id: 0, status, payload: Arg::Group(op, args) }
+    }
+
+    pub fn args(&self) -> &[Arg] {
+        match &self.payload {
+            Arg::Group(_, args) => args,
+            payload => std::slice::from_ref(payload),
+        }
+    }
+
+    pub fn into_args(self) -> Vec<Arg> {
+        match self.payload {
+            Arg::Group(_, args) => args,
+            payload => vec![payload],
+        }
+    }
+
     pub fn ok() -> Resp {
-        Resp { id: 0, status: Status::Ok, args: vec![StructWriter::new().finish(Op::EmptyResp)] }
+        Resp { id: 0, status: Status::Ok, payload: StructWriter::new().finish(Op::EmptyResp) }
     }
 
     pub fn text(text: impl Into<String>) -> Resp {
         let text = text.into();
         let mut payload = StructWriter::new();
         payload.text(&text);
-        Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::TextResp)] }
+        Resp { id: 0, status: Status::Ok, payload: payload.finish(Op::TextResp) }
     }
 
     pub fn error(status: Status, message: impl Into<String>) -> Resp {
         let message = message.into();
         let mut payload = StructWriter::new();
         payload.text(&message);
-        Resp { id: 0, status, args: vec![payload.finish(Op::TextResp)] }
+        Resp { id: 0, status, payload: payload.finish(Op::TextResp) }
     }
 
     pub fn flag(b: bool) -> Resp {
         let mut payload = StructWriter::new();
         payload.flag(b);
-        Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::FlagResp)] }
+        Resp { id: 0, status: Status::Ok, payload: payload.finish(Op::FlagResp) }
     }
 
     pub fn bytes(bytes: impl Into<MessageBytes>) -> Resp {
         let mut payload = StructWriter::new();
         payload.message_bytes(&bytes.into());
-        Resp { id: 0, status: Status::Ok, args: vec![payload.finish(Op::BytesResp)] }
+        Resp { id: 0, status: Status::Ok, payload: payload.finish(Op::BytesResp) }
     }
 
     pub fn number(status: Status, number: u64) -> Resp {
         let mut payload = StructWriter::new();
         payload.number_u64(number);
-        Resp { id: 0, status, args: vec![payload.finish(Op::NumberResp)] }
+        Resp { id: 0, status, payload: payload.finish(Op::NumberResp) }
     }
 
     /// Answer this request, whenever the answer is ready.
@@ -977,7 +1070,7 @@ impl Resp {
 
     /// The single text argument, if the response is one message.
     pub fn message(&self) -> Option<String> {
-        let (mut payload, rest) = structure(&self.args, Op::TextResp, "text response").ok()?;
+        let (mut payload, rest) = structure(self.args(), Op::TextResp, "text response").ok()?;
         if !rest.is_empty() {
             return None;
         }
@@ -991,10 +1084,10 @@ impl Resp {
     }
 
     fn encode_to(&self, out: &mut impl Write) -> std::io::Result<()> {
-        encode_header(self.id, self.status as u16, &self.args, out)?;
+        encode_header(self.id, self.status as u16, std::slice::from_ref(&self.payload), out)?;
         // The status is not a schema tag: each response structure carries the
         // Op it was serialized with, independently of the request's Op.
-        encode_args(&self.args, out)
+        encode_arg(&self.payload, out)
     }
 
     #[cfg(test)]
@@ -1005,7 +1098,11 @@ impl Resp {
     fn decode_from(input: impl BufRead, length: usize) -> Result<Resp> {
         let mut reader = Cursor::new(input, length);
         let (id, status, maximum_depth) = reader.header(Status::from_code)?;
-        Ok(Resp { id, status, args: reader.args_with_depth(maximum_depth)? })
+        let payload = reader.arg(maximum_depth)?;
+        if reader.remaining != 0 {
+            return Err(Error::new("trailing bytes in frame"));
+        }
+        Ok(Resp { id, status, payload })
     }
 }
 
@@ -1192,7 +1289,7 @@ impl Receipt {
 
 impl AppendBlock {
     pub fn request(&self, en: EnId, disk: DiskId, op: Op) -> Req {
-        let mut request = Req::new(op);
+        let request = Req::new(op);
         let mut payload = StructWriter::new();
         let (kind, width) = self.framing.wire();
         payload.en_id(en);
@@ -1226,12 +1323,11 @@ impl AppendBlock {
             payload.number_u64(piece.crc);
             payload.bytes(&piece.bytes);
         }
-        request.args.push(payload.finish(op));
-        request
+        request.structure(payload)
     }
 
     pub fn of(request: &Req) -> Result<(EnId, DiskId, AppendBlock)> {
-        let (mut payload, rest) = structure(&request.args, request.op, "an append request")?;
+        let (mut payload, rest) = structure(&request.args(), request.op(), "an append request")?;
         if !rest.is_empty() {
             return Err(Error::new("an append block has arguments after its payload"));
         }
@@ -1308,31 +1404,45 @@ fn encode_header(id: u32, kind: u16, args: &[Arg], out: &mut impl Write) -> std:
 fn encode_args(args: &[Arg], out: &mut impl Write) -> std::io::Result<()> {
     out.write_all(&(args.len() as u16).to_le_bytes())?;
     for arg in args {
-        match arg {
-            Arg::Text(text) => {
-                out.write_all(&[0])?;
-                out.write_all(&(text.len() as u32).to_le_bytes())?;
-                out.write_all(text.as_bytes())?;
-            }
-            Arg::Number(n) => {
-                out.write_all(&[1])?;
-                out.write_all(&n.to_le_bytes())?;
-            }
-            Arg::Flag(b) => {
-                out.write_all(&[2])?;
-                out.write_all(&[*b as u8])?;
-            }
-            Arg::Bytes(bytes) => {
-                out.write_all(&[3])?;
-                out.write_all(&(bytes.len() as u32).to_le_bytes())?;
-                bytes.write_to(out)?;
-            }
-            Arg::Struct(op, bytes, _) => {
-                out.write_all(&[4])?;
-                out.write_all(&op.code().to_le_bytes())?;
-                out.write_all(&(bytes.len() as u32).to_le_bytes())?;
-                bytes.write_to(out)?;
-            }
+        encode_arg(arg, out)?;
+    }
+    Ok(())
+}
+
+fn encode_arg(arg: &Arg, out: &mut impl Write) -> std::io::Result<()> {
+    match arg {
+        Arg::Text(text) => {
+            out.write_all(&Op::TextResp.code().to_le_bytes())?;
+            out.write_all(&[0])?;
+            out.write_all(&(text.len() as u32).to_le_bytes())?;
+            out.write_all(text.as_bytes())?;
+        }
+        Arg::Number(n) => {
+            out.write_all(&Op::NumberResp.code().to_le_bytes())?;
+            out.write_all(&[1])?;
+            out.write_all(&n.to_le_bytes())?;
+        }
+        Arg::Flag(b) => {
+            out.write_all(&Op::FlagResp.code().to_le_bytes())?;
+            out.write_all(&[2])?;
+            out.write_all(&[*b as u8])?;
+        }
+        Arg::Bytes(bytes) => {
+            out.write_all(&Op::BytesResp.code().to_le_bytes())?;
+            out.write_all(&[3])?;
+            out.write_all(&(bytes.len() as u32).to_le_bytes())?;
+            bytes.write_to(out)?;
+        }
+        Arg::Struct(op, bytes, _) => {
+            out.write_all(&op.code().to_le_bytes())?;
+            out.write_all(&[4])?;
+            out.write_all(&(bytes.len() as u32).to_le_bytes())?;
+            bytes.write_to(out)?;
+        }
+        Arg::Group(op, args) => {
+            out.write_all(&op.code().to_le_bytes())?;
+            out.write_all(&[5])?;
+            encode_args(args, out)?;
         }
     }
     Ok(())
@@ -1341,6 +1451,7 @@ fn encode_args(args: &[Arg], out: &mut impl Write) -> std::io::Result<()> {
 fn message_depth(args: &[Arg]) -> u8 {
     args.iter().fold(1, |depth, arg| match arg {
         Arg::Struct(_, _, nested) => depth.max(*nested),
+        Arg::Group(_, args) => depth.max(message_depth(args).saturating_add(1)),
         _ => depth,
     })
 }
@@ -1357,6 +1468,11 @@ impl<R: BufRead> Cursor<R> {
     fn header<T>(&mut self, decode_kind: impl FnOnce(u16) -> Result<T>) -> Result<(u32, T, u8)> {
         let id = self.u32()?;
         let kind = decode_kind(self.u16()?)?;
+        let maximum_depth = self.depth()?;
+        Ok((id, kind, maximum_depth))
+    }
+
+    fn depth(&mut self) -> Result<u8> {
         let maximum_depth = self.u8()?;
         if maximum_depth == 0 {
             return Err(Error::new("message recursion depth is zero"));
@@ -1364,7 +1480,7 @@ impl<R: BufRead> Cursor<R> {
         if maximum_depth > MAX_RECURSION_DEPTH {
             return Err(Error::new("message recursion depth exceeds limit"));
         }
-        Ok((id, kind, maximum_depth))
+        Ok(maximum_depth)
     }
 
     fn take(&mut self, n: usize) -> Result<MessagePayload> {
@@ -1434,38 +1550,37 @@ impl<R: BufRead> Cursor<R> {
         Ok(u64::from_le_bytes(self.array()?))
     }
 
-    fn args_with_depth(&mut self, maximum_depth: u8) -> Result<Vec<Arg>> {
-        let count = self.u16()?;
-        self.args_with_count_and_depth(count, maximum_depth)
-    }
-
-    fn args_with_count_and_depth(&mut self, count: u16, maximum_depth: u8) -> Result<Vec<Arg>> {
-        let mut args = checked_vec(count, self.remaining)?;
-        for _ in 0..count {
-            args.push(match self.u8()? {
-                0 => {
-                    let len = self.u32()? as usize;
-                    let bytes = self.take(len)?;
-                    Arg::Text(String::from_utf8(bytes.to_vec()).context("text argument")?)
+    fn arg(&mut self, maximum_depth: u8) -> Result<Arg> {
+        let op = Op::from_code(self.u16()?)?;
+        Ok(match self.u8()? {
+            0 if op == Op::TextResp => {
+                let len = self.u32()? as usize;
+                let bytes = self.take(len)?;
+                Arg::Text(String::from_utf8(bytes.to_vec()).context("text argument")?)
+            }
+            1 if op == Op::NumberResp => Arg::Number(self.u64()?),
+            2 if op == Op::FlagResp => Arg::Flag(self.u8()? != 0),
+            3 if op == Op::BytesResp => {
+                let len = self.u32()? as usize;
+                Arg::Bytes(self.take(len)?)
+            }
+            4 => {
+                let len = self.u32()? as usize;
+                Arg::Struct(op, self.take(len)?, maximum_depth)
+            }
+            5 => {
+                if maximum_depth <= 1 {
+                    return Err(Error::new("message recursion depth exceeds limit"));
                 }
-                1 => Arg::Number(self.u64()?),
-                2 => Arg::Flag(self.u8()? != 0),
-                3 => {
-                    let len = self.u32()? as usize;
-                    Arg::Bytes(self.take(len)?)
+                let count = self.u16()?;
+                let mut args = checked_vec(count, self.remaining)?;
+                for _ in 0..count {
+                    args.push(self.arg(maximum_depth - 1)?);
                 }
-                4 => {
-                    let op = Op::from_code(self.u16()?)?;
-                    let len = self.u32()? as usize;
-                    Arg::Struct(op, self.take(len)?, maximum_depth)
-                }
-                tag => return Err(Error::new(format!("unknown argument tag {tag}"))),
-            });
-        }
-        if self.remaining != 0 {
-            return Err(Error::new("trailing bytes in frame"));
-        }
-        Ok(args)
+                Arg::Group(op, args)
+            }
+            tag => return Err(Error::new(format!("unknown argument tag {tag}"))),
+        })
     }
 }
 
@@ -1845,9 +1960,10 @@ mod tests {
         assert_eq!(round_trip_request(&request), request);
         let mut plain = Vec::new();
         put_request(&mut plain, &request).unwrap();
-        assert_eq!(u16::from_le_bytes(plain[11..13].try_into().unwrap()), COMMAND_PAYLOAD);
-        assert!(
-            encoded_len(&request) < encoded_len(&Req::new(Op::SnMasterKey).number(7).number(42))
+        assert_eq!(u16::from_le_bytes(plain[9..11].try_into().unwrap()), Op::SnMasterKey.code());
+        assert_eq!(
+            encoded_len(&request),
+            encoded_len(&Req::new(Op::SnMasterKey).number(7).number(42))
         );
     }
 
@@ -1856,15 +1972,16 @@ mod tests {
         let mut payload = StructWriter::new();
         payload.number_u64(42);
         let mut request = Req::new(Op::Ping).id(123).structure(payload);
-        request.op = Op::Status;
+        request = Req::from_args(Op::Status, request.into_args()).id(123);
 
         let mut plain = Vec::new();
         put_request(&mut plain, &request).unwrap();
         let body = &plain[4..];
-        assert_eq!(u16::from_le_bytes(body[4..6].try_into().unwrap()), Op::Status.code());
-        assert_eq!(u16::from_le_bytes(body[7..9].try_into().unwrap()), 1);
-        assert_eq!(body[9], 4); // Explicit structure argument.
+        assert_eq!(u16::from_le_bytes(body[5..7].try_into().unwrap()), Op::Status.code());
+        assert_eq!(body[7], 5); // The payload is one tagged group.
+        assert_eq!(u16::from_le_bytes(body[8..10].try_into().unwrap()), 1);
         assert_eq!(u16::from_le_bytes(body[10..12].try_into().unwrap()), Op::Ping.code());
+        assert_eq!(body[12], 4); // Its child is a tagged structure.
         assert_eq!(Req::decode(body).unwrap(), request);
 
         let response = Resp::ok().to(&request);
@@ -1872,10 +1989,36 @@ mod tests {
         put_response(&mut plain, &response).unwrap();
         let body = &plain[4..];
         assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), request.id);
-        assert_eq!(u16::from_le_bytes(body[7..9].try_into().unwrap()), 1);
+        assert_eq!(u16::from_le_bytes(body[7..9].try_into().unwrap()), Op::EmptyResp.code());
         assert_eq!(body[9], 4); // Response structure always has its own tag.
-        assert_eq!(u16::from_le_bytes(body[10..12].try_into().unwrap()), Op::EmptyResp.code());
         assert_eq!(Resp::decode(body).unwrap(), response);
+    }
+
+    #[test]
+    fn compound_responses_have_one_outer_schema_tag() {
+        let response = Resp::group(
+            Status::Ok,
+            Op::ListExtentsResp,
+            vec![StructWriter::new().finish(Op::ExtentRunResp), Arg::Number(7)],
+        )
+        .id(123);
+        let mut plain = Vec::new();
+        put_response(&mut plain, &response).unwrap();
+        let body = &plain[4..];
+        assert_eq!(u16::from_le_bytes(body[7..9].try_into().unwrap()), Op::ListExtentsResp.code());
+        assert_eq!(body[9], 5);
+        assert_eq!(u16::from_le_bytes(body[10..12].try_into().unwrap()), 2);
+        assert_eq!(Resp::decode(body).unwrap(), response);
+
+        // The wrapper is one additional parser level, even when its children
+        // are simple leaves.
+        let mut malformed = body.to_vec();
+        malformed[6] = 1;
+        assert!(Resp::decode(&malformed).is_err());
+
+        let batch_header = StructWriter::new().finish(Op::BatchResp);
+        let batch = Resp::from_args(Status::Ok, vec![batch_header]);
+        assert!(matches!(batch.payload, Arg::Group(Op::BatchInfoResp, _)));
     }
 
     #[test]
@@ -1885,7 +2028,7 @@ mod tests {
         let request = Req::new(Op::ReadRecord).structure(payload);
         let mut plain = Vec::new();
         put_request(&mut plain, &request).unwrap();
-        assert_eq!(plain[10], 2);
+        assert_eq!(plain[8], 2);
     }
 
     #[test]
@@ -1895,8 +2038,8 @@ mod tests {
         let Arg::Struct(op, bytes, _) = payload.finish(Op::ReadRecord) else {
             panic!("a self-contained payload")
         };
-        let request = Req { id: 0, op, args: vec![Arg::Struct(op, bytes, 1)] };
-        let (mut reader, rest) = structure(&request.args, op, "a request").unwrap();
+        let request = Req { id: 0, payload: Arg::Struct(op, bytes, 1) };
+        let (mut reader, rest) = structure(&request.args(), op, "a request").unwrap();
         assert!(rest.is_empty());
         assert!(crate::range::Range::read_nested(&mut reader).is_err());
     }
@@ -1906,7 +2049,7 @@ mod tests {
         for depth in [0, MAX_RECURSION_DEPTH + 1] {
             let mut request = Vec::new();
             put_request(&mut request, &Req::new(Op::Ping)).unwrap();
-            request[10] = depth;
+            request[8] = depth;
             assert!(Req::decode(&request[4..]).is_err());
 
             let mut response = Vec::new();
@@ -1974,9 +2117,9 @@ mod tests {
             logical: crate::offset::OLoff::NONE,
             compressed: crate::offset::OCoff::NONE,
         };
-        let compact = Req { id: 7, op: Op::BatchInfo, args: shape.args() };
-        assert_eq!(compact.args.len(), 1, "the shape is one self-contained value");
-        assert_eq!(round_trip_request(&compact).args, compact.args);
+        let compact = Req::from_args(Op::BatchInfo, shape.args()).id(7);
+        assert_eq!(compact.args().len(), 1, "the shape is one self-contained value");
+        assert_eq!(round_trip_request(&compact).args(), compact.args());
     }
 
     fn encoded_len(request: &Req) -> usize {
@@ -2155,5 +2298,13 @@ mod tests {
         })
         .unwrap();
         assert!(Req::decode(&plain[4..]).is_err());
+
+        let mut plain = Vec::new();
+        frame_into(&mut plain, |buf| {
+            Resp::ok().encode(buf);
+            buf.push(0xff);
+        })
+        .unwrap();
+        assert!(Resp::decode(&plain[4..]).is_err());
     }
 }

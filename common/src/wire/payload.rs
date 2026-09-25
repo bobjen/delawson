@@ -673,7 +673,7 @@ mod tests {
             writer.bytes(&vec![7; 9000]);
         });
         let request = Req::new(Op::ReadRecord).structure(writer);
-        let Arg::Struct(_, bytes, _) = &request.args[0] else { panic!() };
+        let Arg::Struct(_, bytes, _) = &request.args()[0] else { panic!() };
         assert!(bytes.is_segmented());
         let mut framed = MessageBytes::new();
         request.encode_to(&mut framed).unwrap();
@@ -681,7 +681,7 @@ mod tests {
         let mut decoded_input = PayloadInput { bytes: &framed, at: 0 };
         let decoded = Req::decode_from(&mut decoded_input, framed.len()).unwrap();
         assert_eq!(decoded, request);
-        let (mut reader, _) = structure(&decoded.args, Op::ReadRecord, "test").unwrap();
+        let (mut reader, _) = structure(decoded.args(), Op::ReadRecord, "test").unwrap();
         for _ in 0..pool::segmented::CHUNK_BYTES - 1 {
             assert_eq!(reader.number_u8().unwrap(), 0xa5);
         }

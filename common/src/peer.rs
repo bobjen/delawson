@@ -140,7 +140,7 @@ impl Peer {
             if answer.is_none() && timed_out.timed_out() {
                 self.waiting.lock().expect("peer").remove(&id);
                 self.disconnect();
-                return Err(Error::new(format!("no answer to {} in time", request.op)));
+                return Err(Error::new(format!("no answer to {} in time", request.op())));
             }
         }
         Ok(answer.take().expect("an answer"))

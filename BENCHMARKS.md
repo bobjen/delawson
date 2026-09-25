@@ -1540,3 +1540,41 @@ trials were 83,927–87,239/s (3.9% spread); BatchObjectInfo trials were
 other recent runs, without an evident throughput regression. Logs:
 `/tmp/delawson-object-bench-hiojz6la/` and
 `/tmp/delawson-object-bench-egjlxj0c/` (temporary files).
+
+## Inline response payloads, 2026-09-25
+
+Responses now hold one `Arg` inline. Responses with multiple pieces put those
+pieces inside a tagged group; `ListExtents` and `BatchObjectInfo` have explicit
+outer response tags. The response wire format changed, with no compatibility
+requirement for an earlier release. The standard 20M-object run created all
+objects and found every lookup; cleanup ended with status 0.
+
+| Workload | Three-trial mean | Trial range | Spread |
+| --- | ---: | ---: | ---: |
+| ObjectInfo | 84,430/s | 83,900–85,124/s | 1.4% |
+| BatchObjectInfo, batch 1,000 | 548,252/s | 544,666–551,088/s | 1.2% |
+
+Create, batch 1,000: 1,928,537 objects/s. ObjectInfo sampled response: 235
+serialized bytes; BatchObjectInfo sampled response: 219,055 bytes, both including
+the four-byte frame. These are three bytes larger than the preceding run because
+the outer group adds a tag and `Op` ahead of the argument-count prefix. The rates
+are close to the preceding repeated run (85,361/s and 554,024/s), but a single
+sequential pair does not establish a throughput difference. Logs:
+`/tmp/delawson-object-bench-iwmzf8eu/` (temporary files).
+
+## Single tagged request payload, 2026-09-25
+
+Requests now hold one tagged payload. The payload begins with its `Op`; the
+request header carries only the correlation ID and recursion-depth limit. The
+standard 20M-object run created every object, found every lookup, and exited
+with cleanup status 0.
+
+| Workload | Three-trial mean | Trial range | Spread |
+| --- | ---: | ---: | ---: |
+| ObjectInfo | 83,989/s | 83,451–84,586/s | 1.4% |
+| BatchObjectInfo, batch 1,000 | 543,410/s | 539,076–545,629/s | 1.2% |
+
+Create, batch 1,000: 1,888,953 objects/s. Sampled responses were 235 and
+219,055 serialized bytes, including the four-byte frame. The rates are close
+to the previous response-only run (84,430/s and 548,252/s). Log:
+`/tmp/delawson-object-bench-cvvhf_10/` (temporary files).

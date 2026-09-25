@@ -21,11 +21,15 @@ pub fn read_soft_deleted(args: &[crate::wire::Arg]) -> Result<bool> {
     Ok(include)
 }
 
-pub fn with_read_soft_deleted(mut request: Req, include: bool) -> Req {
+pub fn with_read_soft_deleted(request: Req, include: bool) -> Req {
     if include {
         let mut value = StructWriter::new();
         value.flag(true);
-        request.args.push(value.finish(Op::ReadSoftDeleted));
+        let id = request.id;
+        let op = request.op();
+        let mut args = request.into_args();
+        args.push(value.finish(Op::ReadSoftDeleted));
+        return Req::from_args(op, args).id(id);
     }
     request
 }
@@ -106,10 +110,10 @@ impl Delete {
     }
 
     pub fn of(request: &Req) -> Result<Self> {
-        let (mut payload, rest) = structure(&request.args, request.op, "a deletion request")?;
-        let (target, soft) = match request.op {
+        let (mut payload, rest) = structure(&request.args(), request.op(), "a deletion request")?;
+        let (target, soft) = match request.op() {
             Op::SoftDeleteObject | Op::DeleteObject => {
-                (Target::Object(payload.text()?), request.op == Op::SoftDeleteObject)
+                (Target::Object(payload.text()?), request.op() == Op::SoftDeleteObject)
             }
             Op::SoftDeleteStream | Op::DeleteStream => (
                 Target::Stream(StreamName {
@@ -117,7 +121,7 @@ impl Delete {
                     stream: payload.stream_id()?,
                     created: payload.time_sec()?,
                 }),
-                request.op == Op::SoftDeleteStream,
+                request.op() == Op::SoftDeleteStream,
             ),
             Op::SoftDeleteExtentInstance | Op::DeleteExtentInstance => (
                 Target::Instance {
@@ -127,7 +131,7 @@ impl Delete {
                     extent: payload.extent_id()?,
                     created: payload.time_sec()?,
                 },
-                request.op == Op::SoftDeleteExtentInstance,
+                request.op() == Op::SoftDeleteExtentInstance,
             ),
             _ => return Err(Error::new("not a deletion operation")),
         };
@@ -836,21 +840,21 @@ mod tests {
                 let request = delete.request().unwrap();
                 assert_eq!(Delete::of(&request).unwrap(), delete);
                 assert!(Delete::of_with_limit(&request, CAP).is_ok());
-                let mut extra = delete.request().unwrap();
-                extra.args.push(Arg::Flag(false));
+                let original = delete.request().unwrap();
+                let mut args = original.clone().into_args();
+                args.push(Arg::Flag(false));
+                let extra = Req::from_args(original.op(), args);
                 assert!(Delete::of(&extra).is_err());
-                let Arg::Struct(op, bytes, depth) = &request.args[0] else { panic!() };
+                let Arg::Struct(op, bytes, depth) = &request.args()[0] else { panic!() };
                 for len in 0..bytes.len() {
-                    let mut short = Req::new(*op);
-                    short.args.push(Arg::Struct(
-                        *op,
-                        bytes.to_vec()[..len].to_vec().into(),
-                        *depth,
-                    ));
+                    let short = Req {
+                        id: 0,
+                        payload: Arg::Struct(*op, bytes.to_vec()[..len].to_vec().into(), *depth),
+                    };
                     assert!(Delete::of(&short).is_err(), "accepted truncation at {len}");
                 }
                 let mut trailing = delete.request().unwrap();
-                let Arg::Struct(_, bytes, _) = &mut trailing.args[0] else { panic!() };
+                let Arg::Struct(_, bytes, _) = &mut trailing.payload else { panic!() };
                 let mut writer = crate::wire::MessageBytes::from(std::mem::take(bytes));
                 writer.push(0);
                 *bytes = writer.into();

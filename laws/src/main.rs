@@ -672,7 +672,7 @@ fn run(cli: Cli) -> Result<()> {
                 if answer.status != Status::Ok {
                     return report(&target, &answer);
                 }
-                let (mut payload, rest) = structure(&answer.args, Op::BytesResp, "byte range")?;
+                let (mut payload, rest) = structure(answer.args(), Op::BytesResp, "byte range")?;
                 let bytes = payload.bytes()?;
                 payload.done()?;
                 if !rest.is_empty() || bytes.len() as u64 > amount {
@@ -711,7 +711,7 @@ fn run(cli: Cli) -> Result<()> {
             let target = resolve(&cluster, &cli, ServiceKind::Ks)?;
             let response =
                 open(&target, timeout, &cluster.messaging)?.call(&Req::new(Op::Registry))?;
-            if response.args.is_empty() {
+            if response.args().is_empty() {
                 println!("{} nothing has registered", target.identity);
             }
             report(&target, &response)
@@ -902,7 +902,7 @@ fn run(cli: Cli) -> Result<()> {
             let request = build(cmd)?;
             let target = resolve(&cluster, &cli, serves(cmd))?;
             let answer = open(&target, timeout, &cluster.messaging)?.call(&request)?;
-            match (cmd, request.op) {
+            match (cmd, request.op()) {
                 (Cmd::Append { path, seal: true, .. }, Op::AppendRecord) => {
                     receipt(&target, &answer)?;
                     if answer.status == Status::Ok {
@@ -1206,7 +1206,7 @@ fn create_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result
                         Some(at) => tally.add(at.elapsed()),
                         None => return Err(Error::new("unasked answer")),
                     }
-                    made += match structure(&answer.args, Op::NumberResp, "a number response") {
+                    made += match structure(answer.args(), Op::NumberResp, "a number response") {
                         Ok((mut payload, [])) => payload.number_u64().unwrap_or(1),
                         _ => 1,
                     };
@@ -1332,7 +1332,7 @@ fn report_info_sample(target: &str, response: &Resp) -> Result<()> {
     let mut framed = Vec::new();
     common::wire::put_response(&mut framed, response)?;
     let serialized = framed.len();
-    let mut rows = response.args.as_slice();
+    let mut rows = response.args();
     let batch = matches!(rows.first(), Some(Arg::Struct(Op::BatchResp, _, _)));
     if batch {
         rows = Batch::of_args(rows)?.1;
@@ -1444,9 +1444,9 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging, flags: u64)
                     }
                     if answer.status == Status::Ok {
                         if batch == 1 {
-                            found += benchmark_info_found(&answer.args)?;
+                            found += benchmark_info_found(answer.args())?;
                         } else {
-                            let (covered, rows) = Batch::of_args(&answer.args)?;
+                            let (covered, rows) = Batch::of_args(answer.args())?;
                             given += covered.given;
                             if rich {
                                 let pieces = Batch::pieces(rows, covered.given)?;
@@ -1647,7 +1647,7 @@ fn estimated_logical_target(block: &[u8], compressed_target: usize) -> usize {
 /// What an append answers: where the bytes went, once a quorum of instances had
 /// them. Five numbers read as one line rather than five.
 fn receipt(target: &Target, response: &Resp) -> Result<()> {
-    if let Ok(receipt) = Receipt::read(&response.args) {
+    if let Ok(receipt) = Receipt::read(response.args()) {
         // The record number to read it back by comes first, then the durable
         // reference it is made of, then where the bytes went.
         match receipt.records.get() {
@@ -1689,10 +1689,10 @@ fn receipt(target: &Target, response: &Resp) -> Result<()> {
 fn object(target: &Target, response: &Resp, expansion: Expansion) -> Result<()> {
     // A plain answer is the row alone; a levelled one leads with its shape, so which
     // it is comes from whether the row parses at the front (§9.1.3.2).
-    if let Ok((Some(it), [])) = Described::of_args(&response.args) {
+    if let Ok((Some(it), [])) = Described::of_args(response.args()) {
         return say(target, &it, None, &[], expansion);
     }
-    let Ok((shape, rest)) = Shape::of_args(&response.args) else {
+    let Ok((shape, rest)) = Shape::of_args(response.args()) else {
         return report(target, response);
     };
     let Ok((Some(it), rest)) = Described::of_args(rest) else {
@@ -1746,7 +1746,7 @@ fn batch(
     response: &Resp,
     expansion: Expansion,
 ) -> Result<()> {
-    let (covered, rows) = match Batch::of_args(&response.args) {
+    let (covered, rows) = match Batch::of_args(response.args()) {
         Ok(read) => read,
         Err(_) => return report(target, response),
     };
@@ -1770,7 +1770,7 @@ fn batch(
             continue;
         }
         print!("{name}: ");
-        object(target, &Resp { id: 0, status: Status::Ok, args: piece.to_vec() }, expansion)?;
+        object(target, &Resp::from_args(Status::Ok, piece.to_vec()).id(0), expansion)?;
     }
     let e = if covered.entries == 1 { "y" } else { "ies" };
     match covered.next {
@@ -1959,7 +1959,7 @@ fn records_of(framing: Framing, pieces: &[Piece]) -> Result<Vec<(u64, Vec<u8>)>>
 
 /// One record out of a range answer, which is what a point read asks for.
 fn record(target: &Target, framing: Framing, want: u64, response: &Resp) -> Result<()> {
-    let Ok((_covered, rest)) = ObjectCovered::of_args(&response.args) else {
+    let Ok((_covered, rest)) = ObjectCovered::of_args(response.args()) else {
         return report(target, response);
     };
     let pieces = Piece::all_of_args(rest)?;
@@ -2059,7 +2059,7 @@ fn ranged(
     response: &Resp,
     before: Option<u64>,
 ) -> Result<(ObjectCovered, u64)> {
-    let Ok((covered, rest)) = ObjectCovered::of_args(&response.args) else {
+    let Ok((covered, rest)) = ObjectCovered::of_args(response.args()) else {
         report(target, response)?;
         return Err(Error::new("that answer did not say what it covered"));
     };
@@ -2085,11 +2085,11 @@ fn ranged(
 
 /// Print a response, and fail the process if the service refused.
 fn report(target: &Target, response: &Resp) -> Result<()> {
-    for arg in &response.args {
+    for arg in response.args() {
         match arg {
             Arg::Struct(Op::TextResp, _, _) => {
                 let (mut payload, rest) =
-                    structure(&response.args, Op::TextResp, "a text response")?;
+                    structure(response.args(), Op::TextResp, "a text response")?;
                 let text = payload.text()?;
                 payload.done()?;
                 if !rest.is_empty() {
@@ -2105,7 +2105,7 @@ fn report(target: &Target, response: &Resp) -> Result<()> {
                 break;
             }
             Arg::Struct(Op::SnKeyResp, _, _) => {
-                let key = common::wire::SnKey::read(&response.args)?;
+                let key = common::wire::SnKey::read(response.args())?;
                 println!("{} current {}", target.identity, common::shamir::hex(&key.current));
                 if let Some((since, key)) = key.next {
                     println!(
@@ -2118,7 +2118,8 @@ fn report(target: &Target, response: &Resp) -> Result<()> {
                 break;
             }
             Arg::Struct(Op::LogResp, _bytes, _) => {
-                let (mut payload, rest) = structure(&response.args, Op::LogResp, "a log response")?;
+                let (mut payload, rest) =
+                    structure(response.args(), Op::LogResp, "a log response")?;
                 if !rest.is_empty() {
                     return Err(Error::new("a log response has trailing arguments"));
                 }
@@ -2133,7 +2134,7 @@ fn report(target: &Target, response: &Resp) -> Result<()> {
             }
             Arg::Struct(Op::RegistryResp, _bytes, _) => {
                 let (mut payload, rest) =
-                    structure(&response.args, Op::RegistryResp, "a registry response")?;
+                    structure(response.args(), Op::RegistryResp, "a registry response")?;
                 if !rest.is_empty() {
                     return Err(Error::new("a registry response has trailing arguments"));
                 }
@@ -2625,7 +2626,7 @@ mod tests {
         let scan = Range { start: Start::Record(ORoff::new(7)), budget: Budget::Logical(1024) }
             .request("/x", Expecting::whatever());
         for request in [point, scan] {
-            let (mut payload, rest) = structure(&request.args, Op::ReadRecord, "read").unwrap();
+            let (mut payload, rest) = structure(&request.args(), Op::ReadRecord, "read").unwrap();
             assert!(rest.is_empty());
             assert_eq!(payload.text().unwrap(), "/x");
             assert!(!Expecting::read(&mut payload).unwrap().asked());
@@ -2669,7 +2670,7 @@ mod tests {
         let bare = Cmd::ObjectInfo { path: "/x".into(), want: Vec::new(), limit: 0, from: 0 };
         let request = build(&bare).expect("a request");
         let (mut payload, rest) =
-            structure(&request.args, Op::ObjectInfo, "an object-info request")
+            structure(&request.args(), Op::ObjectInfo, "an object-info request")
                 .expect("a self-contained request");
         assert!(rest.is_empty());
         assert_eq!(payload.text().unwrap(), "/x");
@@ -2684,7 +2685,7 @@ mod tests {
             Cmd::ObjectInfo { path: "/x".into(), want: vec![Want1::Instances], limit: 7, from: 3 };
         let request = build(&asked).expect("a request");
         let (mut payload, rest) =
-            structure(&request.args, Op::ObjectInfo, "an object-info request")
+            structure(&request.args(), Op::ObjectInfo, "an object-info request")
                 .expect("a self-contained request");
         assert!(rest.is_empty());
         assert_eq!(payload.text().unwrap(), "/x");

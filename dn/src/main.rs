@@ -558,7 +558,7 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, asked: &[ExtentAsk], answe
         if answer.status != Status::Ok {
             held.failed.get_or_insert(answer);
         } else {
-            if let Err(e) = receive_extents(&mut held.runs, asked, &answer.args) {
+            if let Err(e) = receive_extents(&mut held.runs, asked, answer.args()) {
                 held.failed.get_or_insert(Resp::error(Status::Internal, e.to_string()));
             }
         }
@@ -588,11 +588,7 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, asked: &[ExtentAsk], answe
         hide_rows: held.hide_rows,
         instances: held.instances,
     };
-    reply.send(Resp {
-        id: 0,
-        status: Status::Ok,
-        args: merge_object_info(levelled, &runs, held.limit),
-    });
+    reply.send(Resp::from_args(Status::Ok, merge_object_info(levelled, &runs, held.limit)).id(0));
 }
 
 /// Group by destination only. Keep every occurrence, its start, and its input order.
@@ -836,7 +832,7 @@ impl Service for DN {
     }
 
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
-        match request.op {
+        match request.op() {
             Op::SoftDeleteObject | Op::DeleteObject => {
                 reply.send(self.delete_object(process, &request))
             }
@@ -845,7 +841,7 @@ impl Service for DN {
             Op::ObjectInfo => self.info(process, &request, None, reply),
             Op::LocateStream => {
                 let (mut payload, rest) =
-                    match structure(&request.args, Op::LocateStream, "a locate-stream request") {
+                    match structure(&request.args(), Op::LocateStream, "a locate-stream request") {
                         Ok(value) => value,
                         Err(e) => {
                             return reply.send(Resp::error(Status::BadRequest, e.to_string()));
@@ -1040,7 +1036,7 @@ impl DN {
 
     fn seal_object(&self, request: &Req, reply: Reply) {
         let (mut payload, rest) =
-            match structure(&request.args, Op::SealObject, "a seal-object request") {
+            match structure(&request.args(), Op::SealObject, "a seal-object request") {
                 Ok(value) => value,
                 Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
             };
@@ -1083,7 +1079,7 @@ impl DN {
         }
         drop(table);
         match object.args(&self.stream_table.read().expect("streams"), self.mine, self.dn, None) {
-            Some(args) => reply.send(Resp { id: 0, status: Status::Ok, args }),
+            Some(args) => reply.send(Resp::from_args(Status::Ok, args).id(0)),
             None => reply.send(Resp::error(Status::Internal, "sealed object has no description")),
         }
     }
@@ -1094,7 +1090,7 @@ impl DN {
         let _serial = self.deleting.lock().expect("deletion");
         let retry = request.clone();
         let (mut payload, rest) =
-            match structure(&request.args, Op::ConcatObjects, "a concat-objects request") {
+            match structure(&request.args(), Op::ConcatObjects, "a concat-objects request") {
                 Ok(value) => value,
                 Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
             };
@@ -1431,7 +1427,7 @@ impl DN {
             if answer.status != Status::Ok {
                 return reply.send(answer);
             }
-            let runs = match ExtentRun::all_of_args(&answer.args) {
+            let runs = match ExtentRun::all_of_args(answer.args()) {
                 Ok(mut runs) if runs.len() == 1 && runs[0].0.stream == stream.stream => {
                     let (run, rows) = runs.pop().expect("one run");
                     vec![Some((run, rows))]
@@ -1512,7 +1508,7 @@ impl DN {
         // Only the first few arguments are the object; a create may carry more —
         // media class, an expiry — that nothing here reads yet.
         let (mut payload, rest) =
-            match structure(&request.args, Op::CreateObject, "a create-object request") {
+            match structure(&request.args(), Op::CreateObject, "a create-object request") {
                 Ok(value) => value,
                 Err(e) => {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
@@ -1554,7 +1550,7 @@ impl DN {
             // The object it just made, in the same shape object-info answers, so an
             // append that had to create one needs no second lookup to go on with.
             match dn.look(&name) {
-                Some(args) => Resp { id: 0, status: Status::Ok, args },
+                Some(args) => Resp::from_args(Status::Ok, args).id(0),
                 None => Resp::error(Status::Internal, format!("{name} went missing")),
             }
         });
@@ -1564,7 +1560,7 @@ impl DN {
     /// answer however many objects it holds.
     fn create_many(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Reply) {
         let (mut payload, rest) =
-            match structure(&request.args, Op::BatchCreate, "a batch-create request") {
+            match structure(&request.args(), Op::BatchCreate, "a batch-create request") {
                 Ok(value) => value,
                 Err(e) => {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
@@ -1761,7 +1757,7 @@ impl DN {
                             self.dn,
                             None,
                         ) {
-                            Some(args) => Next::Say(Resp { id: 0, status: Status::Ok, args }),
+                            Some(args) => Next::Say(Resp::from_args(Status::Ok, args).id(0)),
                             None => Next::Say(Resp::error(
                                 Status::Internal,
                                 format!("{name} has no stream"),
@@ -1831,7 +1827,7 @@ impl DN {
             }
             dn.streams.fetch_add(1, Ordering::Relaxed);
             let answer = match dn.describe(&name, None) {
-                Some(args) => Resp { id: 0, status: Status::Ok, args },
+                Some(args) => Resp::from_args(Status::Ok, args).id(0),
                 None => Resp::error(Status::Internal, format!("{name} has no stream")),
             };
             dn.wake(std::slice::from_ref(&name), None);
@@ -1870,9 +1866,9 @@ impl DN {
         record: Option<ORoff>,
         reply: Reply,
     ) {
-        let (name, want, include) = if matches!(request.args.first(), Some(Arg::Struct(..))) {
+        let (name, want, include) = if matches!(request.args().first(), Some(Arg::Struct(..))) {
             let (mut payload, rest) =
-                match structure(&request.args, Op::ObjectInfo, "an object-info request") {
+                match structure(&request.args(), Op::ObjectInfo, "an object-info request") {
                     Ok(value) => value,
                     Err(e) => {
                         return reply.send(Resp::error(Status::BadRequest, e.to_string()));
@@ -1965,7 +1961,7 @@ impl DN {
         let (Some(described), Some(reply)) = (described, carry) else { return };
         match described {
             Err(refused) => reply.send(refused),
-            Ok(Answering::Plain(args)) => reply.send(Resp { id: 0, status: Status::Ok, args }),
+            Ok(Answering::Plain(args)) => reply.send(Resp::from_args(Status::Ok, args).id(0)),
             // Extents were asked for, so the SNs holding those streams have to be asked.
             Ok(Answering::Levelled(levelled)) if want.wants(Detail::Extents) => self.spread(
                 process,
@@ -1977,7 +1973,7 @@ impl DN {
                 reply,
             ),
             Ok(Answering::Levelled(levelled)) => {
-                reply.send(Resp { id: 0, status: Status::Ok, args: levelled.args() })
+                reply.send(Resp::from_args(Status::Ok, levelled.args()).id(0))
             }
         }
     }
@@ -2005,7 +2001,7 @@ impl DN {
         // The DN's own range, which it already holds — see `DN::mine`.
         let by_sn = extent_asks(self.mine, &levelled.rows, from);
         if by_sn.is_empty() {
-            return reply.send(Resp { id: 0, status: Status::Ok, args: levelled.args() });
+            return reply.send(Resp::from_args(Status::Ok, levelled.args()).id(0));
         }
 
         // Each SN can use the allowance; final assembly trims the combined rows.
@@ -2087,7 +2083,7 @@ impl DN {
             self.parked.fetch_sub(waiters.len() as u64, Ordering::Relaxed);
             for reply in waiters {
                 reply.send(match (failed, &args) {
-                    (None, Some(args)) => Resp { id: 0, status: Status::Ok, args: args.clone() },
+                    (None, Some(args)) => Resp::from_args(Status::Ok, args.clone()).id(0),
                     (Some(failed), _) => failed.clone(),
                     (None, None) => {
                         Resp::error(Status::Internal, format!("{name} was made and then lost"))
@@ -2100,7 +2096,7 @@ impl DN {
     /// Parse one batch-info request.
     fn read_batch_info(request: &Req) -> Result<(Vec<String>, Want), Resp> {
         let (mut payload, rest) =
-            structure(&request.args, Op::BatchInfo, "a batch-object-info request")
+            structure(&request.args(), Op::BatchInfo, "a batch-object-info request")
                 .map_err(|e| Resp::error(Status::BadRequest, e.to_string()))?;
         let count =
             payload.number_u64().map_err(|e| Resp::error(Status::BadRequest, e.to_string()))?
@@ -2166,7 +2162,7 @@ impl DN {
         if base.status != Status::Ok {
             return reply.send(base);
         }
-        let rows = match batch_stream_rows(&base.args) {
+        let rows = match batch_stream_rows(base.args()) {
             Ok(rows) => rows,
             Err(e) => return reply.send(Resp::error(Status::Internal, e.to_string())),
         };
@@ -2177,7 +2173,7 @@ impl DN {
         let gather = Arc::new(Mutex::new(BatchCountGather {
             left: by_sn.len(),
             reply: Some(reply),
-            base: base.args,
+            base: base.into_args(),
             runs: vec![None; rows.len()],
             failed: None,
         }));
@@ -2281,7 +2277,7 @@ impl DN {
         let covered = Batch { asked: names.len() as u64, given, entries: spent, next };
         let mut out = covered.args();
         out.append(&mut args);
-        Resp { id: 0, status: Status::Ok, args: out }
+        Resp::from_args(Status::Ok, out).id(0)
     }
 
     /// One name's worth of a batch answer, and what it costs in entries.
@@ -2433,7 +2429,7 @@ fn batch_arrived(
     let mut held = gather.lock().expect("batch-info gather");
     if answer.status != Status::Ok {
         held.failed.get_or_insert(answer);
-    } else if let Err(e) = receive_extents(&mut held.runs, asked, &answer.args) {
+    } else if let Err(e) = receive_extents(&mut held.runs, asked, answer.args()) {
         held.failed.get_or_insert(Resp::error(Status::Internal, e.to_string()));
     }
     held.left -= 1;
@@ -2500,7 +2496,7 @@ fn merge_batch_info(args: Vec<Arg>, runs: &[Option<ExtentReply>], limit: u64) ->
         Ok(out)
     };
     match merge() {
-        Ok(args) => Resp { id: 0, status: Status::Ok, args },
+        Ok(args) => Resp::from_args(Status::Ok, args).id(0),
         Err(e) => Resp::error(Status::Internal, e.to_string()),
     }
 }
@@ -2516,7 +2512,7 @@ struct Piece {
 /// Decode the rollover request using the same ID and record widths as its writer.
 fn extension(request: &Req) -> common::Result<(String, StreamId, SRoff)> {
     let (mut payload, rest) =
-        structure(&request.args, Op::ExtendObject, "an extend-object request")?;
+        structure(&request.args(), Op::ExtendObject, "an extend-object request")?;
     if !rest.is_empty() {
         return Err(common::Error::new("an extend-object request has trailing arguments"));
     }
@@ -2615,7 +2611,7 @@ mod tests {
                         let request = reader.request().unwrap();
                         let n = count.fetch_add(1, Ordering::Relaxed);
                         assert_eq!(
-                            request.op,
+                            request.op(),
                             if n == 3 { Op::DeleteStream } else { Op::SoftDeleteStream }
                         );
                         let mut response = if n == 0 {
@@ -3141,7 +3137,7 @@ mod tests {
         assert_eq!(groups[&SnId::new(99)][0].row, 2);
         assert_eq!(stream_start(ORoff::ZERO, base), SRoff::ZERO);
         let request = ask_extents(asked, 3, true);
-        let (mut reader, _) = structure(&request.args, Op::ListExtents, "listing").unwrap();
+        let (mut reader, _) = structure(&request.args(), Op::ListExtents, "listing").unwrap();
         let listing = Listing::read_payload(&mut reader).unwrap();
         reader.done().unwrap();
         assert_eq!(listing.limit, 3);
@@ -3282,7 +3278,7 @@ mod tests {
         let runs = vec![runs[0].clone(), runs[0].clone()];
         let response = merge_batch_info(args.clone(), &runs, 6);
         assert_eq!(response.status, Status::Ok);
-        let (batch, rest) = Batch::of_args(&response.args).unwrap();
+        let (batch, rest) = Batch::of_args(response.args()).unwrap();
         assert_eq!((batch.given, batch.entries, batch.next), (2, 6, UNKNOWN));
         for piece in Batch::pieces(rest, batch.given).unwrap() {
             let (shape, rows) = summary_contents(piece);
@@ -3290,7 +3286,7 @@ mod tests {
             assert_eq!(rows[0].1, vec![visible_extent(&extent)]);
         }
         let response = merge_batch_info(args, &runs, 2);
-        let (batch, rest) = Batch::of_args(&response.args).unwrap();
+        let (batch, rest) = Batch::of_args(response.args()).unwrap();
         assert_eq!((batch.given, batch.entries, batch.next), (1, 2, 0));
         let (shape, rows) = summary_contents(rest);
         assert_eq!(shape.extents, OEoff::new(1));
@@ -3354,7 +3350,7 @@ mod tests {
         args.extend(body);
         let response = merge_batch_info(args, &runs, 100);
         assert_eq!(response.status, Status::Ok);
-        let (batch, rest) = Batch::of_args(&response.args).unwrap();
+        let (batch, rest) = Batch::of_args(response.args()).unwrap();
         let pieces = Batch::pieces(rest, batch.given).unwrap();
         assert_eq!(pieces.len(), expected.len());
         for (piece, (base, extent)) in pieces.iter().zip(expected) {
@@ -3575,7 +3571,7 @@ mod tests {
         let answer = batch_of(&dn, &borrowed, None);
         assert_eq!(answer.status, Status::Ok);
 
-        let (covered, rest) = Batch::of_args(&answer.args).expect("a batch header");
+        let (covered, rest) = Batch::of_args(answer.args()).expect("a batch header");
         assert_eq!(covered.asked, 10);
         assert_eq!(covered.given, 8, "the configured limit, spent one per object");
         assert_eq!(covered.entries, 8);
@@ -3591,7 +3587,7 @@ mod tests {
     fn a_batch_that_fits_says_there_is_no_more() {
         let dn = with_objects(3);
         let answer = batch_of(&dn, &["/n0", "/n1", "/n2"], None);
-        let (covered, rest) = Batch::of_args(&answer.args).expect("a batch header");
+        let (covered, rest) = Batch::of_args(answer.args()).expect("a batch header");
         assert_eq!((covered.asked, covered.given, covered.next), (3, 3, UNKNOWN));
         assert!(!covered.more());
         assert_eq!(Described::all_of_args(rest).expect("rows").len(), 3);
@@ -3603,7 +3599,7 @@ mod tests {
     fn a_missing_name_costs_a_row_and_an_entry() {
         let dn = with_objects(2);
         let answer = batch_of(&dn, &["/n0", "/nothing", "/n1"], None);
-        let (covered, rest) = Batch::of_args(&answer.args).expect("a batch header");
+        let (covered, rest) = Batch::of_args(answer.args()).expect("a batch header");
         assert_eq!((covered.given, covered.entries), (3, 3));
         let rows = Described::all_of_args(rest).expect("rows");
         assert_eq!(rows.len(), 3);
@@ -3620,7 +3616,7 @@ mod tests {
         let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
         let want = Want::plain().with(Detail::Streams).with(Detail::Counts);
         let answer = batch_of(&dn, &borrowed, Some(want));
-        let (covered, _) = Batch::of_args(&answer.args).expect("a batch header");
+        let (covered, _) = Batch::of_args(answer.args()).expect("a batch header");
         assert_eq!(covered.given, 4, "an object plus its one stream, so two entries each");
         assert_eq!(covered.entries, 8, "and the limit is what bounds it");
         assert!(covered.more());
@@ -3634,7 +3630,7 @@ mod tests {
         let dn = with_objects(3);
         let want = Want { limit: 1, ..Want::plain().with(Detail::Streams) };
         let answer = batch_of(&dn, &["/n0", "/n1", "/n2"], Some(want));
-        let (covered, _) = Batch::of_args(&answer.args).expect("a batch header");
+        let (covered, _) = Batch::of_args(answer.args()).expect("a batch header");
         assert_eq!(covered.given, 1, "one name, whatever it cost");
         // ⚠️ Not 1. That name got its object row and none of its streams, so the caller has to come
         // back to *it* — resuming at name 1 would drop the rest of name 0 without saying so.
@@ -3648,7 +3644,7 @@ mod tests {
         let dn = with_objects(2);
         let want = Want { limit: 100, ..Want::plain().with(Detail::Streams) };
         let answer = batch_of(&dn, &["/n0", "/gone", "/n1"], Some(want));
-        let (covered, rows) = Batch::of_args(&answer.args).expect("a batch header");
+        let (covered, rows) = Batch::of_args(answer.args()).expect("a batch header");
         assert_eq!(covered.given, 3, "a miss is answered, not skipped");
         let pieces = Batch::pieces(rows, covered.given).expect("one slice per name");
         assert_eq!(pieces.len(), 3);
@@ -3673,7 +3669,7 @@ mod tests {
         let dn = with_objects(2);
         let want = Want { limit: 100, ..Want::plain().with(Detail::Streams) };
         let answer = batch_of(&dn, &["/n0", "/n1"], Some(want));
-        let (covered, _) = Batch::of_args(&answer.args).expect("a batch header");
+        let (covered, _) = Batch::of_args(answer.args()).expect("a batch header");
         assert_eq!((covered.asked, covered.given), (2, 2));
         assert_eq!(covered.next, UNKNOWN, "every name, every stream");
     }
@@ -3700,7 +3696,7 @@ mod tests {
         let mut payload = StructWriter::new();
         wanted.write(&mut payload);
         let request = Req::new(Op::CreateObject).structure(payload);
-        let (mut reader, rest) = structure(&request.args, Op::CreateObject, "a create").unwrap();
+        let (mut reader, rest) = structure(&request.args(), Op::CreateObject, "a create").unwrap();
         assert!(rest.is_empty());
         let wanted = Wanted::read(&mut reader).expect("an object");
         assert_eq!((wanted.name.as_str(), wanted.keyed), ("/x", true));
@@ -3712,7 +3708,7 @@ mod tests {
         bad.number_u8(kind + 100);
         bad.number_u32(width);
         let request = Req::new(Op::CreateObject).structure(bad);
-        let (mut reader, rest) = structure(&request.args, Op::CreateObject, "a create").unwrap();
+        let (mut reader, rest) = structure(&request.args(), Op::CreateObject, "a create").unwrap();
         assert!(rest.is_empty());
         assert!(Wanted::read(&mut reader).is_err());
     }

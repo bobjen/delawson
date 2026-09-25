@@ -334,7 +334,7 @@ impl Service for SN {
     }
 
     fn answer(&self, process: &Process, request: &Req) -> Resp {
-        match request.op {
+        match request.op() {
             Op::SoftDeleteStream | Op::DeleteStream => self.delete_stream(process, request),
             Op::CreateStream => self.create(request),
             Op::ConcatStreams => self.concat_streams(request),
@@ -529,7 +529,7 @@ impl SN {
     fn create(&self, request: &Req) -> Resp {
         let _serial = self.deleting.lock().expect("deletion");
         let (mut payload, rest) =
-            match structure(&request.args, Op::CreateStream, "a create-stream request") {
+            match structure(&request.args(), Op::CreateStream, "a create-stream request") {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
@@ -604,7 +604,7 @@ impl SN {
     fn concat_streams(&self, request: &Req) -> Resp {
         let _serial = self.deleting.lock().expect("deletion");
         let (mut payload, rest) =
-            match structure(&request.args, Op::ConcatStreams, "a concat-streams request") {
+            match structure(&request.args(), Op::ConcatStreams, "a concat-streams request") {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
@@ -777,7 +777,7 @@ impl SN {
     /// roster, and the second from the clock.
     fn open_extent(&self, process: &Process, request: &Req) -> Resp {
         let (mut payload, rest) =
-            match structure(&request.args, Op::OpenExtent, "an open-extent request") {
+            match structure(&request.args(), Op::OpenExtent, "an open-extent request") {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
@@ -805,11 +805,9 @@ impl SN {
             }
         }
         match self.open(name, TimeSec::now(), process.cluster.extents.instances) {
-            Ok(placed) => Resp {
-                id: 0,
-                status: Status::Ok,
-                args: self.extent_args(&placed.extent, placed.first),
-            },
+            Ok(placed) => {
+                Resp::from_args(Status::Ok, self.extent_args(&placed.extent, placed.first)).id(0)
+            }
             Err(Full { records, why: None }) => Resp::number(Status::Sealed, records.number()),
             Err(Full { why: Some(why), .. }) => Resp::error(Status::Internal, why.to_string()),
         }
@@ -821,7 +819,7 @@ impl SN {
     /// routes a read and does not bound it.
     fn locate(&self, request: &Req) -> Resp {
         let (mut payload, rest) =
-            match structure(&request.args, Op::LocateRecord, "a locate-record request") {
+            match structure(&request.args(), Op::LocateRecord, "a locate-record request") {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
@@ -858,17 +856,17 @@ impl SN {
         if let Some((first, sealed)) =
             held.sealed_from(&extents).find(|(first, s)| s.holds(*first, record))
         {
-            return Resp { id: 0, status: Status::Ok, args: self.extent_args(sealed, first) };
+            return Resp::from_args(Status::Ok, self.extent_args(sealed, first)).id(0);
         }
         match &held.open {
             // How far the open extent reaches is not known here — an SN keeps its
             // record totals lazily — so anything at or past its first record is
             // routed to it and the EN says whether it is there.
-            Some(extent) if record >= held.sealed_records => Resp {
-                id: 0,
-                status: Status::Ok,
-                args: self.extent_args(&extents[extent.get() as usize].data, held.sealed_records),
-            },
+            Some(extent) if record >= held.sealed_records => Resp::from_args(
+                Status::Ok,
+                self.extent_args(&extents[extent.get() as usize].data, held.sealed_records),
+            )
+            .id(0),
             Some(_) | None => Resp::error(
                 Status::NotFound,
                 format!("{name} has no extent holding record {record}"),
@@ -891,7 +889,7 @@ impl SN {
     /// retains them alongside each stream's object-relative base.
     fn list(&self, request: &Req) -> Resp {
         let (mut payload, rest) =
-            match structure(&request.args, Op::ListExtents, "a list-extents request") {
+            match structure(&request.args(), Op::ListExtents, "a list-extents request") {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
@@ -923,7 +921,7 @@ impl SN {
                 args.extend(row.args());
             }
         }
-        Resp { id: 0, status: Status::Ok, args }
+        Resp::group(Status::Ok, Op::ListExtentsResp, args)
     }
 
     /// One stream's run, up to `room` rows.
@@ -1035,7 +1033,7 @@ impl SN {
     /// one, which is one round trip rather than two because whoever saw the seal wants both.
     fn seal(&self, process: &Process, request: &Req) -> Resp {
         let (mut payload, rest) =
-            match structure(&request.args, Op::SealExtent, "a seal-extent request") {
+            match structure(&request.args(), Op::SealExtent, "a seal-extent request") {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
@@ -1067,11 +1065,9 @@ impl SN {
             process.cluster.extents.instances,
             process.cluster.extents.per_stream,
         ) {
-            Ok(placed) => Resp {
-                id: 0,
-                status: Status::Ok,
-                args: self.extent_args(&placed.extent, placed.first),
-            },
+            Ok(placed) => {
+                Resp::from_args(Status::Ok, self.extent_args(&placed.extent, placed.first)).id(0)
+            }
             // The stream is full, which is the DN's business: it says what the
             // stream came to so the object's next stream can carry on from there.
             Err(Full { records, why: None }) => Resp::number(Status::Sealed, records.number()),
@@ -1081,7 +1077,7 @@ impl SN {
 
     fn seal_stream(&self, request: &Req) -> Resp {
         let (mut payload, rest) =
-            match structure(&request.args, Op::SealStream, "a seal-stream request") {
+            match structure(&request.args(), Op::SealStream, "a seal-stream request") {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
@@ -1883,7 +1879,7 @@ mod tests {
             let answer = sn.locate(&ask);
             assert_eq!(answer.status, Status::Ok, "record {record}");
             let (mut payload, rest) =
-                structure(&answer.args, Op::ExtentResp, "an extent").expect("an extent");
+                structure(answer.args(), Op::ExtentResp, "an extent").expect("an extent");
             assert!(rest.is_empty());
             payload.extent_id().expect("an extent id").number()
         };

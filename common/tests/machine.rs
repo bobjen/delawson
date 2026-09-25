@@ -196,7 +196,7 @@ fn segmented_message_batches_over_authenticated_tls() {
     for id in 0..4 {
         let response = link.reader.response().unwrap();
         assert_eq!(response.id, id);
-        let (mut payload, rest) = wire::structure(&response.args, Op::BytesResp, "bytes").unwrap();
+        let (mut payload, rest) = wire::structure(response.args(), Op::BytesResp, "bytes").unwrap();
         assert!(rest.is_empty());
         assert_eq!(payload.bytes().unwrap(), vec![id as u8; 70_000]);
         payload.done().unwrap();

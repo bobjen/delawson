@@ -129,7 +129,7 @@ impl Service for Ks {
     }
 
     fn answer(&self, process: &Process, request: &Req) -> Resp {
-        match request.op {
+        match request.op() {
             Op::Raft => self.raft_rpc(process, request),
             Op::Register => self.register_request(process, request, true),
             Op::Lookup => self.lookup(request),
@@ -172,23 +172,23 @@ impl Ks {
     /// Direct requests and forwarded client requests share this admission boundary.
     fn client_request(&self, process: &Process, request: &Req, allow_forward: bool) -> Resp {
         if allow_forward
-            && matches!(request.op, Op::SnMasterKey | Op::RotateMasterKey | Op::RaftMembers)
+            && matches!(request.op(), Op::SnMasterKey | Op::RotateMasterKey | Op::RaftMembers)
         {
             if let Some(answer) = self.forward(request) {
                 return answer;
             }
         }
         // Key generation is internal maintenance; proposals still require write authority.
-        if request.op == Op::SnMasterKey && self.ready.load(Ordering::SeqCst) {
+        if request.op() == Op::SnMasterKey && self.ready.load(Ordering::SeqCst) {
             if let Err(e) = self.prepare_key_read() {
                 return Resp::error(Status::Internal, e.to_string());
             }
         }
-        let admission = match self.admit_client(request.op == Op::SnMasterKey) {
+        let admission = match self.admit_client(request.op() == Op::SnMasterKey) {
             Ok(admission) => admission,
             Err(e) => return Resp::error(Status::Internal, e.to_string()),
         };
-        match request.op {
+        match request.op() {
             Op::RaftMembers => self.change_members(request),
             Op::Lookup => self.lookup(request),
             Op::AssignPeers => self.assign_peers(process, request),
@@ -362,7 +362,7 @@ impl Ks {
     }
 
     fn unlock(&self, request: &Req) -> Result<()> {
-        let (mut payload, rest) = structure(&request.args, Op::Unlock, "an unlock request")?;
+        let (mut payload, rest) = structure(&request.args(), Op::Unlock, "an unlock request")?;
         let bytes = payload.bytes()?;
         payload.done()?;
         if !rest.is_empty() {
@@ -385,7 +385,7 @@ impl Ks {
             return Resp::error(Status::Locked, "KS is locked");
         }
         let (mut payload, rest) =
-            match structure(&request.args, Op::SnMasterKey, "an SN master-key request") {
+            match structure(&request.args(), Op::SnMasterKey, "an SN master-key request") {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
@@ -404,7 +404,7 @@ impl Ks {
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         match Self::sn_key_for(history, sn, at) {
-            Ok(key) => Resp { id: 0, status: Status::Ok, args: vec![key.write()] },
+            Ok(key) => Resp::new(Status::Ok, key.write()),
             Err(e) => Resp::error(Status::Internal, e.to_string()),
         }
     }
@@ -455,7 +455,7 @@ impl Ks {
 
     fn rotate_master_key(&self, request: &Req) -> Result<()> {
         let (payload, rest) =
-            structure(&request.args, Op::RotateMasterKey, "a rotate-master-key request")?;
+            structure(&request.args(), Op::RotateMasterKey, "a rotate-master-key request")?;
         payload.done()?;
         if !rest.is_empty() {
             return Err(common::Error::new("trailing rotate arguments"));
@@ -480,7 +480,7 @@ impl Ks {
         self.enroll(process, request)
     }
     fn enroll(&self, process: &Process, request: &Req) -> Resp {
-        let peer = match Peer::from_args(&request.args) {
+        let peer = match Peer::from_args(&request.args()) {
             Ok(peer) => peer,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
@@ -510,7 +510,7 @@ impl Ks {
 
     fn assign_peers(&self, process: &Process, request: &Req) -> Resp {
         let (mut payload, rest) =
-            match structure(&request.args, Op::AssignPeers, "an assign-peers request") {
+            match structure(&request.args(), Op::AssignPeers, "an assign-peers request") {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
@@ -573,7 +573,7 @@ impl Ks {
     }
 
     fn lookup(&self, request: &Req) -> Resp {
-        let (mut payload, rest) = match structure(&request.args, Op::Lookup, "a lookup request") {
+        let (mut payload, rest) = match structure(&request.args(), Op::Lookup, "a lookup request") {
             Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };

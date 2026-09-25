@@ -7,7 +7,7 @@ use common::config::{Messaging, RaftConfig};
 use common::server::{self, Process};
 use common::time::TimeSec;
 use common::wire::Arg;
-use common::wire::{Op, Req, Resp, Status, structure};
+use common::wire::{MessagePayload, Op, Req, Resp, Status, structure};
 use common::{Context, logn};
 use common::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -353,22 +353,32 @@ struct ConsensusReply {
 /// Keep client setup, forwarding, and checkpoint waits off the shared RPC workers.
 /// This classifies scheduling, not whether an operation requires quorum.
 pub fn needs_request_worker(request: &Req) -> bool {
-    if matches!(request.op, Op::Register | Op::Lookup) {
+    if matches!(request.op(), Op::Register | Op::Lookup) {
         return false;
     }
-    if request.op != Op::Raft {
+    if request.op() != Op::Raft {
         return true;
     }
-    match request.args.as_slice() {
-        [Arg::Text(_), Arg::Bytes(bytes)] => crate::codec::decode_message::<Packet>(bytes)
-            .is_ok_and(|p| {
-                matches!(
-                    p.message,
-                    Message::Forward { .. } | Message::Checkpoint { .. } | Message::Client(_)
-                )
-            }),
-        _ => false,
+    raft_request_payload(request)
+        .and_then(|(_, bytes)| crate::codec::decode_message::<Packet>(&bytes))
+        .is_ok_and(|p| {
+            matches!(
+                p.message,
+                Message::Forward { .. } | Message::Checkpoint { .. } | Message::Client(_)
+            )
+        })
+}
+
+fn raft_request_payload(request: &Req) -> Result<(String, MessagePayload)> {
+    let (mut payload, rest) = structure(request.args(), Op::Raft, "a Raft RPC")?;
+    if !rest.is_empty() {
+        return Err(Error::new("Raft RPC has trailing arguments"));
     }
+    let sender = payload.text()?;
+    let length = payload.number_u32()? as usize;
+    let bytes = payload.raw_message_bytes(length)?;
+    payload.done()?;
+    Ok((sender, bytes.into()))
 }
 
 fn binary<T: crate::codec::Wire>(value: &T) -> Result<Vec<u8>> {
@@ -522,7 +532,7 @@ pub trait Host:
         if response.status != Status::Ok {
             return Err(Error::new("member identity query failed"));
         }
-        let (mut body, rest) = structure(&response.args, Op::BytesResp, "member identity")?;
+        let (mut body, rest) = structure(response.args(), Op::BytesResp, "member identity")?;
         let member: Member = parse(&body.bytes()?)?;
         body.done()?;
         if !rest.is_empty() || member.process != name {
@@ -682,7 +692,7 @@ pub trait Host:
         if response.status != Status::Ok {
             return Err(Error::new("primary history proof unavailable"));
         }
-        let (mut body, rest) = structure(&response.args, Op::BytesResp, "journal tip response")?;
+        let (mut body, rest) = structure(response.args(), Op::BytesResp, "journal tip response")?;
         let value = parse(&body.bytes()?)?;
         body.done()?;
         if !rest.is_empty() {
@@ -721,7 +731,7 @@ pub trait Host:
             }
             let decoded = (|| -> Result<Option<journal::CommittedJournal>> {
                 let (mut body, rest) =
-                    structure(&response.args, Op::BytesResp, "journal response")?;
+                    structure(response.args(), Op::BytesResp, "journal response")?;
                 let value = parse(&body.bytes()?)?;
                 body.done()?;
                 if !rest.is_empty() {
@@ -749,7 +759,7 @@ pub trait Host:
                 };
             let proof = (|| -> Result<Option<(u64, common::scn::Scn)>> {
                 let (mut body, rest) =
-                    structure(&response.args, Op::BytesResp, "journal tip response")?;
+                    structure(response.args(), Op::BytesResp, "journal tip response")?;
                 let value = parse(&body.bytes()?)?;
                 body.done()?;
                 if !rest.is_empty() {
@@ -956,7 +966,7 @@ pub trait Host:
                     }
                     let decoded = (|| -> Result<Option<raft::Snapshot>> {
                         let (mut body, rest) =
-                            structure(&response.args, Op::BytesResp, "checkpoint response")?;
+                            structure(response.args(), Op::BytesResp, "checkpoint response")?;
                         let bytes = body.bytes()?;
                         body.done()?;
                         if !rest.is_empty() {
@@ -1460,14 +1470,14 @@ pub trait Host:
         let Some(id) = target else {
             return Some(error("Raft has no known Raft leader"));
         };
-        let [Arg::Struct(_, payload, depth)] = request.args.as_slice() else {
+        let [Arg::Struct(_, payload, depth)] = request.args() else {
             return Some(error("expected structured Raft request"));
         };
         Some(
             self.send_raft(
                 &id,
                 Message::Forward {
-                    op: request.op.code(),
+                    op: request.op().code(),
                     payload: payload.clone().into(),
                     depth: *depth,
                 },
@@ -1477,11 +1487,8 @@ pub trait Host:
     }
     fn raft_rpc(&self, process: &Process, request: &Req) -> Resp {
         let result = (|| -> Result<Resp> {
-            let [Arg::Text(sender), Arg::Bytes(bytes)] = request.args.as_slice() else {
-                return Err(Error::new("invalid Raft RPC"));
-            };
-            let sender = sender.clone();
-            let packet: Packet = crate::codec::decode_message(bytes)?;
+            let (sender, bytes) = raft_request_payload(request)?;
+            let packet: Packet = crate::codec::decode_message(&bytes)?;
             let (response, deferred) = self.on_raft(move |host, node| {
                 let mut deferred = None;
                 let response = host.raft_packet(node, &sender, packet, &mut deferred)?;
@@ -1495,7 +1502,7 @@ pub trait Host:
                     let op = Op::from_code(op)?;
                     Ok(self.dispatch_forwarded(
                         process,
-                        &Req { id: 0, op, args: vec![Arg::Struct(op, payload.into(), depth)] },
+                        &Req { id: 0, payload: Arg::Struct(op, payload.into(), depth) },
                     ))
                 }
                 Some(Deferred::Read(read)) => Ok(Resp::bytes(read.wait()?)),
@@ -1503,10 +1510,7 @@ pub trait Host:
                 _ => Err(Error::new("invalid deferred Raft work")),
             }
         })();
-        let sender = match request.args.first() {
-            Some(Arg::Text(sender)) => sender.as_str(),
-            _ => "unparsed",
-        };
+        let sender = raft_request_payload(request).map(|(sender, _)| sender).unwrap_or_default();
         match result {
             Ok(response) => {
                 if response.status != Status::Ok {
@@ -1829,12 +1833,12 @@ pub trait Host:
                     return Err(Error::new("forward target is no longer Raft leader"));
                 }
                 let request =
-                    Req { id: 0, op, args: vec![Arg::Struct(op, payload.clone().into(), depth)] };
+                    Req { id: 0, payload: Arg::Struct(op, payload.clone().into(), depth) };
                 if !self.forwardable(op) {
                     return Err(Error::new("operation cannot be forwarded through Raft"));
                 }
                 *deferred = Some(Deferred::Message(Message::Forward {
-                    op: request.op.code(),
+                    op: request.op().code(),
                     payload,
                     depth,
                 }));
@@ -1845,7 +1849,7 @@ pub trait Host:
     fn change_members(&self, request: &Req) -> Resp {
         let result = (|| -> Result<()> {
             let (mut payload, rest) =
-                structure(&request.args, Op::RaftMembers, "a Raft membership request")?;
+                structure(&request.args(), Op::RaftMembers, "a Raft membership request")?;
             let count = usize::try_from(payload.number_u64()?)
                 .map_err(|_| Error::new("membership count overflow"))?;
             if count > payload.remaining() {
@@ -2145,7 +2149,7 @@ pub trait Host:
                                 )));
                             }
                             let (mut body, rest) =
-                                structure(&response.args, Op::BytesResp, "Raft response")?;
+                                structure(response.args(), Op::BytesResp, "Raft response")?;
                             let bytes = body.bytes()?;
                             body.done()?;
                             if !rest.is_empty() {

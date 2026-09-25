@@ -91,7 +91,7 @@ impl DailyKeyCache {
             .ask(&registrar, &ask, move |answer| {
                 let mut guard = cvar2.0.lock().expect("cvar");
                 if answer.status == Status::Ok {
-                    match common::wire::SnKey::read(&answer.args) {
+                    match common::wire::SnKey::read(answer.args()) {
                         Ok(response) => {
                             let mut key_guard = key_cell2.lock().expect("key_cell");
                             *key_guard = Some(response);
@@ -1101,7 +1101,7 @@ impl Disk {
                     came_to.logical,
                     came_to.compressed
                 ));
-                reply.send(Resp { id: 0, status: Status::Sealed, args: came_to.args() });
+                reply.send(Resp::from_args(Status::Sealed, came_to.args()).id(0));
                 return Ok(());
             }
         };
@@ -1316,7 +1316,7 @@ impl Disk {
                 skip,
                 amount.min(common::range::Range::DEFAULT_LOGICAL),
             ) {
-                Ok(args) => Resp { id: 0, status: Status::Ok, args },
+                Ok(args) => Resp::from_args(Status::Ok, args).id(0),
                 Err(e) => Resp::error(Status::Internal, e.to_string()),
             };
         }
@@ -1342,7 +1342,7 @@ impl Disk {
         for piece in ranged.pieces {
             args.extend(piece.args());
         }
-        Resp { id: 0, status: Status::Ok, args }
+        Resp::from_args(Status::Ok, args).id(0)
     }
 
     fn status(&self, _process: &Process, config: &ENConfig) -> Vec<String> {
@@ -1403,7 +1403,7 @@ impl Service for EN {
     }
 
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
-        match request.op {
+        match request.op() {
             Op::SoftDeleteExtentInstance | Op::DeleteExtentInstance => {
                 reply.send(self.delete_instance(process, &request))
             }
@@ -1504,7 +1504,7 @@ impl EN {
 
     fn force_seal(&self, process: &Process, request: &Req) -> Resp {
         let (mut payload, rest) =
-            match structure(&request.args, Op::ForceSealExtent, "a force-seal request") {
+            match structure(&request.args(), Op::ForceSealExtent, "a force-seal request") {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
@@ -1535,7 +1535,7 @@ impl EN {
             return Resp::error(Status::BadRequest, "force-seal request reached the wrong EN");
         }
         match self.disk(disk).and_then(|disk| disk.force_seal(sn, extent, created)) {
-            Ok(filled) => Resp { id: 0, status: Status::Ok, args: filled.args() },
+            Ok(filled) => Resp::from_args(Status::Ok, filled.args()).id(0),
             Err(e) => Resp::error(Status::BadRequest, e.to_string()),
         }
     }
@@ -1560,7 +1560,7 @@ impl EN {
 
     fn read(&self, process: &Process, request: &Req) -> Resp {
         let (mut payload, rest) =
-            match structure(&request.args, Op::ReadExtent, "a read-extent request") {
+            match structure(&request.args(), Op::ReadExtent, "a read-extent request") {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
@@ -1713,7 +1713,7 @@ impl Pending {
             return;
         }
         if let Some(reply) = gates.reply.take() {
-            reply.send(Resp { id: 0, status: Status::Ok, args: self.receipt.clone() });
+            reply.send(Resp::from_args(Status::Ok, self.receipt.clone()).id(0));
         }
     }
 
@@ -1864,7 +1864,7 @@ mod tests {
                 ExtentRange::from(ERoff::ZERO),
             );
             assert_eq!(answer.status, Status::Ok);
-            let (covered, rest) = ExtentCovered::of_args(&answer.args).unwrap();
+            let (covered, rest) = ExtentCovered::of_args(answer.args()).unwrap();
             assert_eq!(covered.records, ERoff::new(1));
             assert_eq!(Piece::all_of_args(rest).unwrap()[0].bytes, b"one\n");
             let answer = disk.read(
@@ -1899,7 +1899,7 @@ mod tests {
         .unwrap();
         let response = reader.response().unwrap();
         assert_eq!(response.status, Status::Sealed);
-        let (filled, rest) = Filled::of_args(&response.args).unwrap();
+        let (filled, rest) = Filled::of_args(response.args()).unwrap();
         assert!(rest.is_empty());
         assert_eq!(filled.records, ERoff::new(1));
         assert_eq!(filled.logical, ELoff::new(3));
@@ -2054,7 +2054,7 @@ mod tests {
         };
         let answer = read(0, 1, 1);
         assert_eq!(answer.status, Status::Ok);
-        let (seek, rest) = common::range::ByteSeek::of_args(&answer.args).unwrap();
+        let (seek, rest) = common::range::ByteSeek::of_args(answer.args()).unwrap();
         assert_eq!(seek.skipped, 1);
         assert_eq!(seek.next, ERoff::new(4));
         let pieces = Piece::all_of_args(rest).unwrap();
@@ -2067,7 +2067,7 @@ mod tests {
         // Beyond EOF needs no payload, even when every skipped ciphertext is broken.
         let answer = read(0, u64::MAX - 1, 1);
         assert_eq!(answer.status, Status::Ok);
-        let (seek, rest) = common::range::ByteSeek::of_args(&answer.args).unwrap();
+        let (seek, rest) = common::range::ByteSeek::of_args(answer.args()).unwrap();
         assert_eq!(seek.skipped, 7);
         assert_eq!(seek.next, ERoff::new(5));
         assert!(rest.is_empty());

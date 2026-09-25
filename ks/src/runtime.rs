@@ -6,7 +6,7 @@ pub use raft::runtime::Settings;
 use raft::{Command, Entry, Node, Role, State};
 use std::time::Duration;
 pub fn needs_request_worker(request: &Req) -> bool {
-    request.op == Op::Register || raft::runtime::needs_request_worker(request)
+    request.op() == Op::Register || raft::runtime::needs_request_worker(request)
 }
 /// Public routing projection, retained even when this member is locked/cold.
 #[derive(Default)]
@@ -23,9 +23,7 @@ impl raft::execution::Application for Registrations {
     }
 }
 fn registration_action(peer: &Peer) -> raft::Action {
-    let common::wire::Arg::Struct(_, bytes, depth) = peer.request().args.remove(0) else {
-        unreachable!()
-    };
+    let common::wire::Arg::Struct(_, bytes, depth) = peer.request().payload else { unreachable!() };
     let mut fields = vec![depth];
     bytes.write_to(&mut fields).expect("registration serialization");
     raft::Action::new(Op::Register, fields)
@@ -324,7 +322,7 @@ impl Host for Ks {
         }
     }
     fn dispatch_forwarded(&self, process: &Process, request: &Req) -> Resp {
-        if request.op == Op::Register {
+        if request.op() == Op::Register {
             self.register_request(process, request, false)
         } else {
             self.client_request(process, request, false)

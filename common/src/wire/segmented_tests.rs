@@ -35,7 +35,7 @@ fn segmented_frames_match_contiguous_encoding_at_every_boundary() {
             assert_eq!(actual, expected);
             let reader = b.bytes.reader_range(start + 4..b.bytes.end()).unwrap();
             assert_eq!(Req::decode_from(reader, expected.len() - 4).unwrap(), *req);
-            let resp = Resp { id: req.id, status: Status::Ok, args: req.args.clone() };
+            let resp = Resp::from_args(Status::Ok, req.args().to_vec()).id(req.id);
             b.clear();
             put_response(&mut b, &resp).unwrap();
             let reader = b.bytes.reader_range(4..b.bytes.end()).unwrap();
@@ -118,7 +118,7 @@ fn socket_round_trips_single_and_batched_messages_in_all_sealing_modes() {
                         arrived = Some(reader.arrived());
                         put_response(
                             &mut out,
-                            &Resp { id: req.id, status: Status::Ok, args: req.args },
+                            &Resp::from_args(Status::Ok, req.args().to_vec()).id(req.id),
                         )
                         .unwrap();
                     }
@@ -154,7 +154,7 @@ fn socket_round_trips_single_and_batched_messages_in_all_sealing_modes() {
                 for req in requests {
                     let resp = link.reader.response().unwrap();
                     assert_eq!(resp.id, req.id);
-                    assert_eq!(resp.args, req.args);
+                    assert_eq!(resp.args(), req.args());
                 }
                 assert_eq!(link.reader.at, 0);
                 assert_eq!(link.reader.open.bytes.end(), 0);
