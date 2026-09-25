@@ -557,6 +557,9 @@ impl<'a> StructReader<'a> {
     }
 
     pub fn from_payload(bytes: &'a MessagePayload, maximum_depth: u8) -> StructReader<'a> {
+        if let Some(bytes) = bytes.contiguous() {
+            return Self::new(bytes, maximum_depth);
+        }
         StructReader {
             bytes: StructureInput::Payload(bytes),
             current: bytes.chunk(0),
@@ -1364,9 +1367,25 @@ impl<R: BufRead> Cursor<R> {
         Self { input, remaining }
     }
 
-    fn take(&mut self, n: usize) -> Result<MessageBytes> {
+    fn take(&mut self, n: usize) -> Result<MessagePayload> {
         if n > self.remaining {
             return Err(Error::new("frame ends mid-value"));
+        }
+        if n <= buffer::pool_config().small_message_bytes {
+            let mut bytes = Vec::with_capacity(n);
+            let mut left = n;
+            while left != 0 {
+                let chunk = self.input.fill_buf()?;
+                if chunk.is_empty() {
+                    return Err(Error::new("frame ends mid-value"));
+                }
+                let count = chunk.len().min(left);
+                bytes.extend_from_slice(&chunk[..count]);
+                self.input.consume(count);
+                left -= count;
+            }
+            self.remaining -= n;
+            return Ok(MessagePayload::from_small(bytes));
         }
         let mut bytes = MessageBytes::new();
         let mut left = n;
@@ -1381,7 +1400,7 @@ impl<R: BufRead> Cursor<R> {
             left -= count;
         }
         self.remaining -= n;
-        Ok(bytes)
+        Ok(bytes.into())
     }
 
     #[inline]
@@ -1593,7 +1612,7 @@ impl Reader {
         let reader = self.next()?;
         let length = reader.remaining() as usize;
         let result = Req::decode_from(reader, length);
-        self.open.bytes.discard_before(self.at).context("discard consumed request")?;
+        self.discard_consumed("discard consumed request")?;
         result
     }
 
@@ -1601,8 +1620,20 @@ impl Reader {
         let reader = self.next()?;
         let length = reader.remaining() as usize;
         let result = Resp::decode_from(reader, length);
-        self.open.bytes.discard_before(self.at).context("discard consumed response")?;
+        self.discard_consumed("discard consumed response")?;
         result
+    }
+
+    fn discard_consumed(&mut self, what: &str) -> Result<()> {
+        if self.at == self.open.bytes.end() {
+            // The whole batch has been consumed. Reset to offset zero before
+            // pruning so its retained first leaf needs no tree walk.
+            self.open.clear();
+            self.at = 0;
+        } else {
+            self.open.bytes.discard_before(self.at).context(what)?;
+        }
+        Ok(())
     }
 }
 

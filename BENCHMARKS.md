@@ -1457,3 +1457,65 @@ Raw JSON, log, detached runner, status 0:
 `/tmp/delawson-pool-rng-6tlnlu4c/`. Deferred-access message code remains in place;
 the example now retains these optional RNG comparison modes. Release build and
 `git diff --check` passed. No production pool code was changed.
+
+## Small payload and segmented field CPU experiments, 2026-09-25
+
+Sequential standard detached runs: 20M objects, batch 1,000 creation, 16 clients
+with depth 16, detail flags 23, then three ObjectInfo and BatchObjectInfo trials.
+All creates completed, every lookup was answered and found, sample responses
+remained 232 and 219,052 serialized bytes, and every runner exited with status 0
+after cleanup. Rates are three-trial means in lookups/s.
+
+| Variant accumulated from previous row | ObjectInfo | BatchObjectInfo | Run directory |
+| --- | ---: | ---: | --- |
+| Small finished-payload direct write and direct slice reader | 84,162 | 538,292 | `/tmp/delawson-object-bench-du6gzot9/` |
+| Small decoded payload copied directly into Vec | 84,783 | 554,606 | `/tmp/delawson-object-bench-7sf6_lm_/` |
+| SegmentedWriter caches next pointer, first run | 86,632 | 554,116 | `/tmp/delawson-object-bench-sj8zzg8m/` |
+| Same, repeated | 84,247 | 553,593 | `/tmp/delawson-object-bench-4mnak4ld/` |
+| Direct SegmentedWriter::write_all | 84,607 | 546,703 | `/tmp/delawson-object-bench-dhqux1jo/` |
+| Fixed-slice StructReader with one offset update, first run | 84,735 | 496,918 | `/tmp/delawson-object-bench-hk33qdq_/` |
+| Same, repeated | 84,427 | 471,801 | `/tmp/delawson-object-bench-g5hbk0su/` |
+
+The direct small decode removes MessageBytes construction, slow first write,
+and finished-payload conversion for each small received field. Its batch rate
+rose about 3% from the preceding variant in this sequence; ObjectInfo varied
+within the normal range. The cached pointer and explicit `write_all` showed no
+reproducible benefit and were removed. The fixed-slice reader checked a proposed
+offset against the clipped leaf limit and updated only that offset per field,
+but its dynamic slice indexing was much slower on BatchObjectInfo; it was
+reverted. The first fixed-slice batch run spread 15.5%; the repeat spread 2.5%
+and confirmed the regression. The final source retains the two small-payload
+changes and the original segmented writer and StructReader field loop. Workspace
+tests passed for each implementation before benchmarking.
+
+After the measured runs, the small decode path was adjusted to skip a second
+`OnceLock` configuration lookup when wrapping the already size-checked Vec in a
+finished payload. Per-field serialization and parsing use no atomics; the
+configuration lookup happens at payload setup, while pool atomics are reached
+only on block allocation and release. This final lookup adjustment passed
+workspace tests but was not separately throughput measured.
+
+## Reset fully consumed message batches, 2026-09-25
+
+Earlier temporary counters found 5,516,018 prune calls and zero tree geometry
+changes during an ObjectInfo benchmark. One frequent source is the reader's
+`discard_before(end)` after its last message in a batch, while the absolute
+end still named the old offset. The reader now calls `MessageBuffer::clear`
+there, resetting start and end to zero. `SegmentedBuffer::reset` already skips
+pruning when only the retained first leaf remains. A partially consumed batch
+still uses `discard_before`, and generic pool pruning is unchanged. The socket
+test now checks the zero-based empty state after the final message, including
+large messages and each sealing mode.
+
+A general segmented-buffer shortcut was tried first, then removed in favor of
+the reader reset. That intermediate run measured 84,837 ObjectInfo/s and
+548,949 BatchObjectInfo/s (`/tmp/delawson-object-bench-m_87fnti/`); it is not
+the final implementation. The first run of the reader reset varied widely:
+77,817 and 533,984/s, with 14.9% and 9.6% trial spreads
+(`/tmp/delawson-object-bench-2_3z25v5/`). The repeated standard 20M-object run
+measured 84,808 ObjectInfo/s (84,215–85,277, 1.3% spread) and 540,257
+BatchObjectInfo/s (536,156–543,908, 1.4% spread). All creates completed,
+every lookup was answered and found, and cleanup finished with status 0.
+The reset removes a no-op prune on fully consumed single-leaf batches, but
+these rates do not show an end-to-end speedup. Repeated run directory:
+`/tmp/delawson-object-bench-k80pzt_o/`.

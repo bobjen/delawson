@@ -36,6 +36,16 @@ impl Default for MessagePayload {
     }
 }
 impl MessagePayload {
+    pub(crate) fn from_small(bytes: Vec<u8>) -> Self {
+        Self(FinishedStorage::Small(bytes))
+    }
+
+    pub(crate) fn contiguous(&self) -> Option<&[u8]> {
+        match &self.0 {
+            FinishedStorage::Small(v) => Some(v),
+            _ => None,
+        }
+    }
     pub fn len(&self) -> usize {
         match &self.0 {
             FinishedStorage::Small(v) => v.len(),
@@ -68,6 +78,9 @@ impl MessagePayload {
     }
     pub fn write_to(&self, out: &mut impl Write) -> io::Result<()> {
         self.check()?;
+        if let Some(bytes) = self.contiguous() {
+            return out.write_all(bytes);
+        }
         let mut at = 0;
         while at < self.len() {
             let bytes = self.chunk(at);
@@ -105,7 +118,11 @@ impl From<MessagePayload> for MessageBytes {
 }
 impl From<Vec<u8>> for MessagePayload {
     fn from(bytes: Vec<u8>) -> Self {
-        MessageBytes::from(bytes).into()
+        if bytes.len() <= super::buffer::pool_config().small_message_bytes {
+            Self::from_small(bytes)
+        } else {
+            MessageBytes::from(bytes).into()
+        }
     }
 }
 impl Clone for MessagePayload {

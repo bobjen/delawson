@@ -108,6 +108,10 @@ fn socket_round_trips_single_and_batched_messages_in_all_sealing_modes() {
                         let req = reader.request().unwrap();
                         assert_eq!(req.id, i);
                         assert_eq!(reader.more(), i + 1 < count);
+                        if i + 1 == count {
+                            assert_eq!(reader.at, 0);
+                            assert_eq!(reader.open.bytes.end(), 0);
+                        }
                         if let Some(time) = arrived {
                             assert_eq!(time, reader.arrived());
                         }
@@ -152,6 +156,8 @@ fn socket_round_trips_single_and_batched_messages_in_all_sealing_modes() {
                     assert_eq!(resp.id, req.id);
                     assert_eq!(resp.args, req.args);
                 }
+                assert_eq!(link.reader.at, 0);
+                assert_eq!(link.reader.open.bytes.end(), 0);
             }
             server.join().unwrap();
         }
