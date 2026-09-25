@@ -902,9 +902,7 @@ impl Req {
     }
 
     fn encode_to(&self, out: &mut impl Write) -> std::io::Result<()> {
-        out.write_all(&self.id.to_le_bytes())?;
-        out.write_all(&self.op.code().to_le_bytes())?;
-        out.write_all(&[message_depth(&self.args)])?;
+        encode_header(self.id, self.op.code(), &self.args, out)?;
         if let [Arg::Struct(op, bytes, _)] = self.args.as_slice()
             && *op == self.op
         {
@@ -923,18 +921,10 @@ impl Req {
 
     fn decode_from(input: impl BufRead, length: usize) -> Result<Req> {
         let mut reader = Cursor::new(input, length);
-        let id = reader.u32()?;
-        let op = Op::from_code(reader.u16()?)?;
-        let maximum_depth = reader.u8()?;
-        if maximum_depth == 0 {
-            return Err(Error::new("message recursion depth is zero"));
-        }
-        if maximum_depth > MAX_RECURSION_DEPTH {
-            return Err(Error::new("message recursion depth exceeds limit"));
-        }
+        let (id, op, maximum_depth) = reader.header(Op::from_code)?;
         let count = reader.u16()?;
         let args = if count == COMMAND_PAYLOAD {
-            vec![Arg::Struct(op, reader.take(reader.remaining)?.into(), maximum_depth)]
+            vec![Arg::Struct(op, reader.take(reader.remaining)?, maximum_depth)]
         } else {
             reader.args_with_count_and_depth(count, maximum_depth)?
         };
@@ -1001,11 +991,10 @@ impl Resp {
     }
 
     fn encode_to(&self, out: &mut impl Write) -> std::io::Result<()> {
-        out.write_all(&self.id.to_le_bytes())?;
-        out.write_all(&(self.status as u16).to_le_bytes())?;
-        out.write_all(&[message_depth(&self.args)])?;
-        encode_args(&self.args, out)?;
-        Ok(())
+        encode_header(self.id, self.status as u16, &self.args, out)?;
+        // The status is not a schema tag: each response structure carries the
+        // Op it was serialized with, independently of the request's Op.
+        encode_args(&self.args, out)
     }
 
     #[cfg(test)]
@@ -1015,15 +1004,7 @@ impl Resp {
 
     fn decode_from(input: impl BufRead, length: usize) -> Result<Resp> {
         let mut reader = Cursor::new(input, length);
-        let id = reader.u32()?;
-        let status = Status::from_code(reader.u16()?)?;
-        let maximum_depth = reader.u8()?;
-        if maximum_depth == 0 {
-            return Err(Error::new("message recursion depth is zero"));
-        }
-        if maximum_depth > MAX_RECURSION_DEPTH {
-            return Err(Error::new("message recursion depth exceeds limit"));
-        }
+        let (id, status, maximum_depth) = reader.header(Status::from_code)?;
         Ok(Resp { id, status, args: reader.args_with_depth(maximum_depth)? })
     }
 }
@@ -1318,6 +1299,12 @@ impl AppendBlock {
     }
 }
 
+fn encode_header(id: u32, kind: u16, args: &[Arg], out: &mut impl Write) -> std::io::Result<()> {
+    out.write_all(&id.to_le_bytes())?;
+    out.write_all(&kind.to_le_bytes())?;
+    out.write_all(&[message_depth(args)])
+}
+
 fn encode_args(args: &[Arg], out: &mut impl Write) -> std::io::Result<()> {
     out.write_all(&(args.len() as u16).to_le_bytes())?;
     for arg in args {
@@ -1365,6 +1352,19 @@ struct Cursor<R> {
 impl<R: BufRead> Cursor<R> {
     fn new(input: R, remaining: usize) -> Self {
         Self { input, remaining }
+    }
+
+    fn header<T>(&mut self, decode_kind: impl FnOnce(u16) -> Result<T>) -> Result<(u32, T, u8)> {
+        let id = self.u32()?;
+        let kind = decode_kind(self.u16()?)?;
+        let maximum_depth = self.u8()?;
+        if maximum_depth == 0 {
+            return Err(Error::new("message recursion depth is zero"));
+        }
+        if maximum_depth > MAX_RECURSION_DEPTH {
+            return Err(Error::new("message recursion depth exceeds limit"));
+        }
+        Ok((id, kind, maximum_depth))
     }
 
     fn take(&mut self, n: usize) -> Result<MessagePayload> {
@@ -1452,12 +1452,12 @@ impl<R: BufRead> Cursor<R> {
                 2 => Arg::Flag(self.u8()? != 0),
                 3 => {
                     let len = self.u32()? as usize;
-                    Arg::Bytes(self.take(len)?.into())
+                    Arg::Bytes(self.take(len)?)
                 }
                 4 => {
                     let op = Op::from_code(self.u16()?)?;
                     let len = self.u32()? as usize;
-                    Arg::Struct(op, self.take(len)?.into(), maximum_depth)
+                    Arg::Struct(op, self.take(len)?, maximum_depth)
                 }
                 tag => return Err(Error::new(format!("unknown argument tag {tag}"))),
             });
@@ -1609,18 +1609,26 @@ impl Reader {
     }
 
     pub fn request(&mut self) -> Result<Req> {
-        let reader = self.next()?;
-        let length = reader.remaining() as usize;
-        let result = Req::decode_from(reader, length);
-        self.discard_consumed("discard consumed request")?;
-        result
+        self.decode_next("discard consumed request", |reader, length| {
+            Req::decode_from(reader, length)
+        })
     }
 
     pub fn response(&mut self) -> Result<Resp> {
+        self.decode_next("discard consumed response", |reader, length| {
+            Resp::decode_from(reader, length)
+        })
+    }
+
+    fn decode_next<T>(
+        &mut self,
+        what: &str,
+        decode: impl FnOnce(pool::SegmentedReader<'_, 'static>, usize) -> Result<T>,
+    ) -> Result<T> {
         let reader = self.next()?;
         let length = reader.remaining() as usize;
-        let result = Resp::decode_from(reader, length);
-        self.discard_consumed("discard consumed response")?;
+        let result = decode(reader, length);
+        self.discard_consumed(what)?;
         result
     }
 
@@ -1835,9 +1843,39 @@ mod tests {
         payload.number_u64(42);
         let request = Req::new(Op::SnMasterKey).structure(payload);
         assert_eq!(round_trip_request(&request), request);
+        let mut plain = Vec::new();
+        put_request(&mut plain, &request).unwrap();
+        assert_eq!(u16::from_le_bytes(plain[11..13].try_into().unwrap()), COMMAND_PAYLOAD);
         assert!(
             encoded_len(&request) < encoded_len(&Req::new(Op::SnMasterKey).number(7).number(42))
         );
+    }
+
+    #[test]
+    fn structure_tags_survive_a_different_request_op() {
+        let mut payload = StructWriter::new();
+        payload.number_u64(42);
+        let mut request = Req::new(Op::Ping).id(123).structure(payload);
+        request.op = Op::Status;
+
+        let mut plain = Vec::new();
+        put_request(&mut plain, &request).unwrap();
+        let body = &plain[4..];
+        assert_eq!(u16::from_le_bytes(body[4..6].try_into().unwrap()), Op::Status.code());
+        assert_eq!(u16::from_le_bytes(body[7..9].try_into().unwrap()), 1);
+        assert_eq!(body[9], 4); // Explicit structure argument.
+        assert_eq!(u16::from_le_bytes(body[10..12].try_into().unwrap()), Op::Ping.code());
+        assert_eq!(Req::decode(body).unwrap(), request);
+
+        let response = Resp::ok().to(&request);
+        let mut plain = Vec::new();
+        put_response(&mut plain, &response).unwrap();
+        let body = &plain[4..];
+        assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), request.id);
+        assert_eq!(u16::from_le_bytes(body[7..9].try_into().unwrap()), 1);
+        assert_eq!(body[9], 4); // Response structure always has its own tag.
+        assert_eq!(u16::from_le_bytes(body[10..12].try_into().unwrap()), Op::EmptyResp.code());
+        assert_eq!(Resp::decode(body).unwrap(), response);
     }
 
     #[test]
@@ -1864,12 +1902,18 @@ mod tests {
     }
 
     #[test]
-    fn an_advertised_depth_above_the_limit_is_refused_before_dispatch() {
-        let request = Req::new(Op::Ping);
-        let mut plain = Vec::new();
-        put_request(&mut plain, &request).unwrap();
-        plain[10] = MAX_RECURSION_DEPTH + 1;
-        assert!(Req::decode(&plain[4..]).is_err());
+    fn requests_and_responses_enforce_the_same_advertised_depth_limits() {
+        for depth in [0, MAX_RECURSION_DEPTH + 1] {
+            let mut request = Vec::new();
+            put_request(&mut request, &Req::new(Op::Ping)).unwrap();
+            request[10] = depth;
+            assert!(Req::decode(&request[4..]).is_err());
+
+            let mut response = Vec::new();
+            put_response(&mut response, &Resp::ok()).unwrap();
+            response[10] = depth;
+            assert!(Resp::decode(&response[4..]).is_err());
+        }
     }
 
     #[test]

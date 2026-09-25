@@ -1519,3 +1519,24 @@ every lookup was answered and found, and cleanup finished with status 0.
 The reset removes a no-op prune on fully consumed single-leaf batches, but
 these rates do not show an end-to-end speedup. Repeated run directory:
 `/tmp/delawson-object-bench-k80pzt_o/`.
+
+## Shared request/response wire helpers, 2026-09-25
+
+The request and response paths now share header encoding/decoding and the
+framed reader's decode/discard lifecycle. Request payloads still use the
+header `Op` as their structure tag only when it matches the payload's `Op`;
+response structures always carry their own `Op`. The standard 20M-object run
+completed with every lookup answered and found, and cleanup status 0.
+
+| Run | Create, batch 1,000 | ObjectInfo | BatchObjectInfo, batch 1,000 |
+| --- | ---: | ---: | ---: |
+| First | 1,883,808 | 84,681 | 523,336 |
+| Repeat | 1,880,877 | 85,361 | 554,024 |
+
+Rates are objects or names per second. The first batch run included a low
+477,790/s trial (13.2% spread), so its mean is noisy. The repeat ObjectInfo
+trials were 83,927–87,239/s (3.9% spread); BatchObjectInfo trials were
+552,802–555,526/s (0.5% spread). The repeated rates are in the same range as
+other recent runs, without an evident throughput regression. Logs:
+`/tmp/delawson-object-bench-hiojz6la/` and
+`/tmp/delawson-object-bench-egjlxj0c/` (temporary files).
