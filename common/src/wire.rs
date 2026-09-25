@@ -1493,10 +1493,8 @@ impl Wire {
         while at < plain.bytes.end() {
             let end = segment_end(plain, at)?;
             self.sealed.clear();
-            buffer::with_random(|rng| {
-                self.seal.seal_segmented(&mut plain.bytes, at..end, &mut self.sealed.bytes, || {
-                    rng.next_u64()
-                })
+            self.seal.seal_segmented(&mut plain.bytes, at..end, &mut self.sealed.bytes, || {
+                buffer::with_random(|rng| rng.next_u64())
             })?;
             self.sealed.write_to(&mut self.stream)?;
             self.sealed.clear();
@@ -1568,8 +1566,8 @@ impl Reader {
         self.at = 0;
         let first = self.sealed.bytes.chunk(0).unwrap_or(&[]);
         let mut open = |sealed: &[u8]| {
-            buffer::with_random(|rng| {
-                self.seal.open_segmented(&header, sealed, &mut self.open.bytes, || rng.next_u64())
+            self.seal.open_segmented(&header, sealed, &mut self.open.bytes, || {
+                buffer::with_random(|rng| rng.next_u64())
             })
         };
         let result = if first.len() >= length {

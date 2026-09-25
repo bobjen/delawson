@@ -13,7 +13,19 @@
 //! now has no capacity limit or shared allocation counter.
 //! Earlier measurements above explicitly used 16 blocks.
 //! Compare fixed work, not the coverage tests' timed loops.
+//! RNG comparison: POOL_BENCH_RNG=local (default), held, or per-alloc.
+//! held borrows a thread-local RNG for the whole operation loop; per-alloc
+//! borrows it only to generate each allocation's bucket-selection value.
+//! All modes use the same per-thread seed and separate workload RNG. Setup and
+//! TLS initialization precede timing. The CSV format is unchanged; record the
+//! environment mode alongside each result when comparing modes.
 use common::random::Rng;
+use std::cell::RefCell;
+
+// POOL_BENCH_RNG=local (default), held, or per-alloc. The latter two isolate
+// TLS/RefCell access frequency using identical allocation bucket sequences.
+thread_local! { static BUCKET_RNG: RefCell<Rng> = RefCell::new(Rng::from_seed(0)); }
+
 use pool::{ExternalLinks, InlineLinks, Pool};
 use std::ptr::NonNull;
 use std::sync::Barrier;
@@ -47,22 +59,33 @@ impl Drop for MallocBlock {
 
 // Accounting is a separate monomorphization, absent from ordinary timing runs.
 fn run<T>(
-    alloc: impl Fn(&mut Rng) -> Option<T> + Sync,
+    alloc: impl Fn(&mut Rng, bool) -> Option<T> + Sync,
     threads: usize,
     blocks: u32,
     operations: usize,
     seed: u64,
     count_live: bool,
 ) -> (Duration, [u64; 3], usize) {
-    if count_live {
-        run_inner::<T, true>(alloc, threads, blocks, operations, seed)
-    } else {
-        run_inner::<T, false>(alloc, threads, blocks, operations, seed)
+    let mode = std::env::var("POOL_BENCH_RNG").unwrap_or_else(|_| "local".into());
+    macro_rules! run_mode {
+        ($mode:literal) => {
+            if count_live {
+                run_inner::<T, true, $mode>(alloc, threads, blocks, operations, seed)
+            } else {
+                run_inner::<T, false, $mode>(alloc, threads, blocks, operations, seed)
+            }
+        };
+    }
+    match mode.as_str() {
+        "local" => run_mode!(0),
+        "held" => run_mode!(1),
+        "per-alloc" => run_mode!(2),
+        _ => panic!("POOL_BENCH_RNG must be local, held, or per-alloc"),
     }
 }
 
-fn run_inner<T, const COUNT: bool>(
-    alloc: impl Fn(&mut Rng) -> Option<T> + Sync,
+fn run_inner<T, const COUNT: bool, const RNG_MODE: u8>(
+    alloc: impl Fn(&mut Rng, bool) -> Option<T> + Sync,
     threads: usize,
     blocks: u32,
     operations: usize,
@@ -86,32 +109,46 @@ fn run_inner<T, const COUNT: bool>(
                 let mut rng = Rng::from_seed(seed.wrapping_add(thread as u64));
                 let mut bucket_rng =
                     Rng::from_seed(seed.wrapping_add(thread as u64) ^ 0x76543210abcdef98);
+                if RNG_MODE != 0 {
+                    BUCKET_RNG.with(|rng| {
+                        *rng.borrow_mut() =
+                            Rng::from_seed(seed.wrapping_add(thread as u64) ^ 0x76543210abcdef98);
+                    });
+                }
                 let mut held = Vec::with_capacity(blocks as usize);
                 let mut counts = [0u64; 3];
                 ready.wait();
                 start.wait();
-                for _ in 0..operations {
-                    if held.is_empty() || rng.next_u32() & 1 == 0 {
-                        match alloc(&mut bucket_rng) {
-                            Some(block) => {
-                                if COUNT {
-                                    let n = live.fetch_add(1, SeqCst) + 1;
-                                    peak.fetch_max(n, SeqCst);
+                let mut work = |bucket_rng: &mut Rng| {
+                    for _ in 0..operations {
+                        if held.is_empty() || rng.next_u32() & 1 == 0 {
+                            let block = alloc(bucket_rng, RNG_MODE == 2);
+                            match block {
+                                Some(block) => {
+                                    if COUNT {
+                                        let n = live.fetch_add(1, SeqCst) + 1;
+                                        peak.fetch_max(n, SeqCst);
+                                    }
+                                    held.push(block);
+                                    counts[0] += 1;
                                 }
-                                held.push(block);
-                                counts[0] += 1;
+                                None => counts[1] += 1,
                             }
-                            None => counts[1] += 1,
+                        } else {
+                            let at = rng.next_u32() as usize % held.len();
+                            let block = held.swap_remove(at);
+                            if COUNT {
+                                live.fetch_sub(1, SeqCst);
+                            }
+                            drop(block);
+                            counts[2] += 1;
                         }
-                    } else {
-                        let at = rng.next_u32() as usize % held.len();
-                        let block = held.swap_remove(at);
-                        if COUNT {
-                            live.fetch_sub(1, SeqCst);
-                        }
-                        drop(block);
-                        counts[2] += 1;
                     }
+                };
+                if RNG_MODE == 1 {
+                    BUCKET_RNG.with(|rng| work(&mut rng.borrow_mut()));
+                } else {
+                    work(&mut bucket_rng);
                 }
                 counts[2] += held.len() as u64;
                 if COUNT {
@@ -142,6 +179,11 @@ fn run_inner<T, const COUNT: bool>(
         }
         (elapsed, totals, peak.load(SeqCst))
     })
+}
+
+#[inline]
+fn bucket_random(rng: &mut Rng, deferred: bool) -> u64 {
+    if deferred { BUCKET_RNG.with(|rng| rng.borrow_mut().next_u64()) } else { rng.next_u64() }
 }
 
 fn main() {
@@ -194,8 +236,8 @@ fn main() {
                     4
                 };
                 run(
-                    |rng| {
-                        let val = rng.next_u64() as usize;
+                    |rng, deferred| {
+                        let val = bucket_random(rng, deferred) as usize;
                         let first = (val ^ mask) & mask;
                         let delta = (((val >> shift) & (bucket_count / 2 - 1)) << 1) | 1;
                         let walk = (0..choices).map(|step| (first + step * delta) & mask);
@@ -218,7 +260,9 @@ fn main() {
                 )
             } else if layout == "external32" {
                 run(
-                    |rng| pool.alloc_from_bucket(rng.next_u64() as usize).ok(),
+                    |rng, deferred| {
+                        pool.alloc_from_bucket(bucket_random(rng, deferred) as usize).ok()
+                    },
                     threads,
                     blocks,
                     operations,
@@ -227,7 +271,7 @@ fn main() {
                 )
             } else {
                 run(
-                    |_| pool.alloc_from_bucket(0).ok(),
+                    |_, _| pool.alloc_from_bucket(0).ok(),
                     threads,
                     blocks,
                     operations,
@@ -265,8 +309,8 @@ fn main() {
                     4
                 };
                 run(
-                    |rng| {
-                        let val = rng.next_u64() as usize;
+                    |rng, deferred| {
+                        let val = bucket_random(rng, deferred) as usize;
                         let first = (val ^ mask) & mask;
                         let delta = (((val >> shift) & (bucket_count / 2 - 1)) << 1) | 1;
                         let walk = (0..choices).map(|step| (first + step * delta) & mask);
@@ -289,7 +333,9 @@ fn main() {
                 )
             } else if layout == "inline32" {
                 run(
-                    |rng| pool.alloc_from_bucket(rng.next_u64() as usize).ok(),
+                    |rng, deferred| {
+                        pool.alloc_from_bucket(bucket_random(rng, deferred) as usize).ok()
+                    },
                     threads,
                     blocks,
                     operations,
@@ -298,7 +344,7 @@ fn main() {
                 )
             } else {
                 run(
-                    |_| pool.alloc_from_bucket(0).ok(),
+                    |_, _| pool.alloc_from_bucket(0).ok(),
                     threads,
                     blocks,
                     operations,
@@ -317,7 +363,7 @@ fn main() {
                 assert_eq!(sample.ptr.as_ptr() as usize % 4096, 0);
                 drop(sample);
                 run(
-                    |_| MallocBlock::alloc::<true>().ok(),
+                    |_, _| MallocBlock::alloc::<true>().ok(),
                     threads,
                     blocks,
                     operations,
@@ -326,7 +372,7 @@ fn main() {
                 )
             } else {
                 run(
-                    |_| MallocBlock::alloc::<false>().ok(),
+                    |_, _| MallocBlock::alloc::<false>().ok(),
                     threads,
                     blocks,
                     operations,

@@ -1339,3 +1339,121 @@ phase snapshots, original and instrumented source, launcher, and `analysis.json`
 `/tmp/delawson-prune-counts-a1ewykz_/`. Temporary instrumentation was removed by
 exactly restoring the saved sources; retention remains one leaf. No production
 counter or logging changes remain.
+
+## Defer thread-local RNG access until allocation, 2026-09-24
+
+After committing buffer-owned aliases/reset changes as `f056807`, moved the
+thread-local RNG lookup and mutable borrow inside the allocation callback in
+six paths: MessageBuffer append, receive, append_message, append_payload, and
+Wire sealing / Reader opening. Previously number generation was lazy but these
+paths still accessed the thread-local RNG even when retained capacity sufficed.
+No buffer geometry, retention (one leaf), or codec policy changed.
+
+Clean standard detached run, 20M objects, flags 23, 16 clients x depth 16:
+
+| Workload | Previous one-leaf run | Deferred RNG access | Change |
+| --- | ---: | ---: | ---: |
+| ObjectInfo | 82,593 | 83,721 | +1.4% |
+| BatchObjectInfo | 470,486 | 538,628 | +14.5% |
+
+ObjectInfo trials: 82,964, 84,372, 83,827 (1.7% spread). Batch trials:
+536,160, 542,741, 536,982 (1.2%). The previous batch baseline had 15.1%
+spread, so its large apparent gain cannot confidently be attributed to RNG
+access; the ObjectInfo change is also modest relative to run variation.
+Create: 1,924,885 objects/sec. Every lookup was answered and found; status 0
+after cleanup. Logs: `/tmp/delawson-object-bench-nrj4sqgb/`.
+
+Validation: `cargo test --workspace` passed on a separate run before the clean
+benchmark; `git diff --check` passed. The initial standalone common test command
+lacked its `testing` feature and failed compiling Reply::new_test. A first
+workspace run overlapped `/tmp/delawson-object-bench-o5a60i27/` and stalled in
+EN tests; it was stopped, the affected test passed in isolation, and the full
+workspace rerun passed without a concurrent benchmark. The stall's cause was
+not established. That overlapping benchmark is excluded from this comparison.
+
+Deferred-RNG repeat, unchanged source and same standard workload, with no
+concurrent tests: ObjectInfo **83,818/sec**, trials 83,392 / 83,983 / 84,080
+(0.8% spread); BatchObjectInfo **541,042/sec**, trials 539,358 / 541,310 /
+542,456 (0.6%). These are +0.1% and +0.4% versus the preceding clean run,
+respectively. Creation: 1,938,044 objects/sec. All 20M creates completed and all
+lookups were answered and found. Status 0 after cleanup; logs:
+`/tmp/delawson-object-bench-ey9yk2yp/`. This confirms repeatability of the new
+rates, though the earlier noisy batch baseline still limits causal attribution.
+
+## Rerun the pre-RNG-change baseline, 2026-09-24
+
+The earlier 470,486/sec BatchObjectInfo baseline was suspicious, so restored
+exactly the two source files from `f056807` and ran the standard benchmark twice
+with eager thread-local RNG access. No concurrent tests or instrumentation.
+Both completed all 20M creates and every lookup was answered and found; status
+0 after cleanup. Deferred-access source was saved and restored after both runs.
+
+| Implementation | ObjectInfo run 1 | ObjectInfo run 2 | BatchObjectInfo run 1 | BatchObjectInfo run 2 |
+| --- | ---: | ---: | ---: | ---: |
+| Before: eager RNG access, fresh runs | 82,514 | 83,402 | 535,656 | 530,331 |
+| After: deferred RNG access, preceding clean runs | 83,721 | 83,818 | 538,628 | 541,042 |
+
+Means across the two sessions: before 82,958 ObjectInfo/sec and 532,994
+BatchObjectInfo/sec; after 83,770 and 539,835, respectively: approximately
+**+1.0% and +1.3%**. The original 470K batch baseline was unusually low; it
+should not be used to attribute a 14.5% improvement to deferred RNG access.
+These modest differences remain subject to run-to-run variation.
+
+Fresh baseline trial details:
+
+- `/tmp/delawson-object-bench-96d9n89s/`: ObjectInfo [81973, 83107, 82461]; BatchObjectInfo [533567, 532030, 541372].
+
+- `/tmp/delawson-object-bench-mqhki8i7/`: ObjectInfo [81919, 83481, 84807]; BatchObjectInfo [529338, 531172, 530483].
+
+## Allocation-heavy pool benchmark: RNG access frequency, 2026-09-24
+
+Extended the existing `pool/examples/pool_bench.rs`, retaining its 4KiB pool
+blocks, 256 buckets/four probes, initially empty pool capped at 1,000,000 blocks,
+eight threads x 1,000,000 allocation/free decisions, seed 42. Added environment
+selection `POOL_BENCH_RNG=local|held|per-alloc` (default local). Local passes the
+worker's RNG directly; held borrows TLS across the entire loop; per-alloc looks
+up/borrows TLS only while generating the allocation's random value, releasing
+that borrow before calling the pool. Workload-choice and bucket RNGs remain
+independent and identically seeded in all modes. Modes select const-generic
+loop variants before timing; TLS initialization is outside timing.
+
+Reproduce after `cargo build --release -p delawson-pool --example pool_bench`:
+
+```bash
+POOL_BENCH_RNG=per-alloc ./target/release/examples/pool_bench external256x4all 8 1000000 1000000 42
+```
+
+Substitute `local`/`held` and `inline256x4all`. Six trials per mode/layout;
+rotated mode order and alternated layout order. No history, probes, payload
+validation, or shared peak-live accounting in timed runs.
+
+| Links | Worker-local mean ms | Held TLS mean ms | Per-allocation TLS mean ms |
+| --- | ---: | ---: | ---: |
+| External | 85.764 | 86.916 | 85.756 |
+| Inline | 88.623 | 91.047 | 88.946 |
+
+Per-allocation versus held TLS was 1.3% faster externally and 2.3% faster
+inline in these samples, not a demonstrated regression. Versus worker-local,
+per-allocation was effectively equal externally and 0.4% slower inline.
+Do not interpret the small speedups as a general advantage: code generation,
+scheduling, and cache behavior can differ. Holding the borrow across the whole
+loop is an amortized eager-access comparison, not an exact recreation of message
+boundaries. The production pool implementation itself is unchanged.
+
+All 36 trials performed exactly 4,003,439 successful allocations and matching
+frees (including final held-block cleanup), with zero failures. Issued blocks
+vary with interleaving despite identical per-thread random sequences:
+
+| Links / RNG mode | Mean issued blocks | Range | Timing range, ms |
+| --- | ---: | ---: | ---: |
+| external / local | 8038 | 7217–8552 | 84.283–87.550 |
+| external / held | 7958 | 7096–8440 | 85.075–88.817 |
+| external / per-alloc | 7848 | 7219–8279 | 84.744–86.836 |
+| inline / local | 8012 | 7892–8211 | 87.220–90.431 |
+| inline / held | 8095 | 7505–8457 | 90.532–91.852 |
+| inline / per-alloc | 8032 | 7061–8535 | 86.261–90.726 |
+
+Raw JSON, log, detached runner, status 0:
+`/tmp/delawson-pool-rng-6tlnlu4c/`. Deferred-access message code remains in place;
+the example now retains these optional RNG comparison modes. Release build and
+`git diff --check` passed. No production pool code was changed.

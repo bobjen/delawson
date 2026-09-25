@@ -64,15 +64,13 @@ impl MessageBuffer {
         self.bytes.reset();
     }
     pub fn append(&mut self, bytes: &[u8]) -> Result<()> {
-        RANDOM
-            .with(|rng| self.bytes.append(bytes, || rng.borrow_mut().next_u64()))
+        self.bytes
+            .append(bytes, || with_random(|rng| rng.next_u64()))
             .context("message buffer append")
     }
     pub(super) fn receive(&mut self, source: &mut impl std::io::Read, length: usize) -> Result<()> {
         self.clear();
-        RANDOM.with(|rng| {
-            self.bytes.read_exact_from(source, length, || rng.borrow_mut().next_u64())
-        })?;
+        self.bytes.read_exact_from(source, length, || with_random(|rng| rng.next_u64()))?;
         Ok(())
     }
     pub(super) fn write_to(&self, output: &mut impl Write) -> Result<()> {
@@ -122,11 +120,11 @@ impl FrameBuffer for Vec<u8> {
 impl FrameBuffer for MessageBuffer {
     fn append_message(&mut self, message: &impl Message) -> Result<()> {
         let start = self.bytes.end();
-        let result = RANDOM.with(|rng| {
-            let mut writer = self.bytes.writer(|| rng.borrow_mut().next_u64());
+        let result = (|| {
+            let mut writer = self.bytes.writer(|| with_random(|rng| rng.next_u64()));
             writer.write_u32_le(0)?;
             message.encode_into(&mut writer)
-        });
+        })();
         if let Err(e) = result {
             self.bytes.truncate(start).context("frame rollback")?;
             return Err(e.into());
@@ -162,7 +160,7 @@ impl MessageBuffer {
     pub fn append_payload(&mut self, bytes: &super::MessageBytes) -> Result<()> {
         bytes.check()?;
         let start = self.bytes.end();
-        let result = with_random(|rng| bytes.write_to(&mut self.bytes.writer(|| rng.next_u64())));
+        let result = bytes.write_to(&mut self.bytes.writer(|| with_random(|rng| rng.next_u64())));
         if result.is_err() {
             self.bytes.truncate(start).context("batch rollback")?;
         }
