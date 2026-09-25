@@ -14,7 +14,7 @@ fn process_configuration_controls_payload_and_frame_promotion() {
     for _ in 0..1024 {
         writer.number_u8(1);
     }
-    let bytes = writer.finish(Op::Ping).bytes;
+    let bytes = writer.finish(Op::Ping).into_bytes();
     assert!(!bytes.is_segmented());
     let mut bytes = MessageBytes::from(bytes);
     bytes.write_all(&[2]).unwrap();

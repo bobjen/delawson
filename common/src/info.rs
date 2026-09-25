@@ -905,7 +905,7 @@ mod tests {
     #[test]
     fn an_impossible_framing_is_refused() {
         let mut args = one(1).args();
-        let payload = &mut args[0].bytes;
+        let payload = args[0].bytes_mut();
         let mut writer = crate::wire::MessageBytes::from(std::mem::take(payload));
         writer.write_at(57, &[99]).unwrap();
         *payload = writer.into();
@@ -1083,7 +1083,7 @@ mod tests {
     #[test]
     fn an_extent_lying_about_its_instances_is_refused() {
         let mut args = extent(1, 0, 40).args();
-        let payload = &mut args[0].bytes;
+        let payload = args[0].bytes_mut();
         let mut writer = crate::wire::MessageBytes::from(std::mem::take(payload));
         writer.write_at(40, &99u32.to_le_bytes()).unwrap();
         *payload = writer.into();

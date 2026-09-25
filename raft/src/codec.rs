@@ -10,7 +10,8 @@ pub fn encode<T: Wire>(value: &T) -> Result<Vec<u8>> {
     let mut w = StructWriter::new();
     value.write(&mut w);
     let arg = w.finish(Op::Raft);
-    let (bytes, depth) = (arg.bytes, arg.depth);
+    let depth = arg.depth;
+    let bytes = arg.into_bytes();
     if bytes.len() >= MAX_FRAME_BYTES || depth > MAX_RECURSION_DEPTH {
         return Err(Error::new("Raft encoding exceeds limits"));
     }
@@ -256,7 +257,8 @@ pub fn encode_message<T: Wire>(value: &T) -> Result<common::wire::MessageBytes> 
     let mut writer = StructWriter::new();
     value.write(&mut writer);
     let arg = writer.finish(Op::Raft);
-    let (bytes, depth) = (arg.bytes, arg.depth);
+    let depth = arg.depth;
+    let bytes = arg.into_bytes();
     if bytes.len() >= MAX_FRAME_BYTES || depth > MAX_RECURSION_DEPTH {
         return Err(Error::new("Raft encoding exceeds limits"));
     }

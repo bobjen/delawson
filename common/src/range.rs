@@ -934,8 +934,11 @@ mod tests {
         let mut writer = StructWriter::new();
         want.write(&mut writer);
         let encoded = writer.finish(Op::ObjectInfo);
-        let short =
-            [Arg::new(Op::ObjectInfo, encoded.bytes.to_vec()[..25].to_vec().into(), encoded.depth)];
+        let short = [Arg::new(
+            Op::ObjectInfo,
+            encoded.bytes().to_vec()[..25].to_vec().into(),
+            encoded.depth,
+        )];
         let (mut reader, _) = structure(&short, Op::ObjectInfo, "want").unwrap();
         assert!(Want::read(&mut reader).is_err());
     }
@@ -973,8 +976,11 @@ mod tests {
         let mut writer = StructWriter::new();
         want.write(&mut writer);
         let encoded = writer.finish(Op::ObjectInfo);
-        let short =
-            [Arg::new(Op::ObjectInfo, encoded.bytes.to_vec()[..3].to_vec().into(), encoded.depth)];
+        let short = [Arg::new(
+            Op::ObjectInfo,
+            encoded.bytes().to_vec()[..3].to_vec().into(),
+            encoded.depth,
+        )];
         let (mut reader, _) = structure(&short, Op::ObjectInfo, "want").unwrap();
         assert!(Want::read(&mut reader).is_err(), "and a short one is refused");
     }

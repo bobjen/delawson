@@ -26,7 +26,7 @@ fn registration_action(peer: &Peer) -> raft::Action {
     let arg = peer.request().payload;
     assert!(!arg.is_group());
     let mut fields = vec![arg.depth];
-    arg.bytes.write_to(&mut fields).expect("registration serialization");
+    arg.bytes().write_to(&mut fields).expect("registration serialization");
     raft::Action::new(Op::Register, fields)
 }
 fn registration_peer(action: &raft::Action) -> Result<Peer> {

@@ -359,30 +359,67 @@ impl std::fmt::Display for Status {
     }
 }
 
-/// A tagged wire value. Its Op selects the parser. For a compound Op, `parts`
-/// holds independently tagged children; otherwise `bytes` holds positional
-/// fields. Keeping both storage slots avoids a second discriminator.
+/// A tagged wire value. Its Op selects the parser and the payload layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arg {
     pub op: Op,
-    pub bytes: MessagePayload,
-    pub parts: Vec<Arg>,
+    payload: ArgPayload,
     pub depth: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArgPayload {
+    // This is only a storage union. The Op's GROUP trait selects the layout.
+    // A byte payload therefore does not carry a separate Vec header.
+    Bytes(MessagePayload),
+    Parts(Vec<Arg>),
 }
 
 impl Arg {
     pub fn new(op: Op, bytes: MessagePayload, depth: u8) -> Self {
         assert!(!op.is_group(), "a structure needs a structure Op");
-        Self { op, bytes, parts: Vec::new(), depth }
+        Self { op, payload: ArgPayload::Bytes(bytes), depth }
     }
 
     pub fn group(op: Op, parts: Vec<Arg>) -> Self {
         assert!(op.is_group(), "a group needs a group Op");
-        Self { op, bytes: MessagePayload::default(), parts, depth: 1 }
+        Self { op, payload: ArgPayload::Parts(parts), depth: 1 }
     }
 
     pub fn is_group(&self) -> bool {
         self.op.is_group()
+    }
+
+    pub fn bytes(&self) -> &MessagePayload {
+        assert!(!self.op.is_group());
+        let ArgPayload::Bytes(bytes) = &self.payload else { unreachable!("Op/storage mismatch") };
+        bytes
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut MessagePayload {
+        assert!(!self.op.is_group());
+        let ArgPayload::Bytes(bytes) = &mut self.payload else {
+            unreachable!("Op/storage mismatch")
+        };
+        bytes
+    }
+
+    pub fn into_bytes(self) -> MessagePayload {
+        assert!(!self.op.is_group());
+        let ArgPayload::Bytes(bytes) = self.payload else { unreachable!("Op/storage mismatch") };
+        bytes
+    }
+
+    pub fn parts(&self) -> &[Arg] {
+        assert!(self.op.is_group());
+        let ArgPayload::Parts(parts) = &self.payload else { unreachable!("Op/storage mismatch") };
+        parts
+    }
+
+    pub fn into_parts(self) -> Vec<Arg> {
+        assert!(self.op.is_group());
+        let ArgPayload::Parts(parts) = self.payload else { unreachable!("Op/storage mismatch") };
+        parts
     }
 }
 
@@ -853,16 +890,16 @@ pub fn structure<'a>(
     if arg.is_group() {
         return Err(Error::new(format!("{what} is not self-contained")));
     }
-    arg.bytes.check()?;
-    Ok((StructReader::from_payload(&arg.bytes, arg.depth), rest))
+    arg.bytes().check()?;
+    Ok((StructReader::from_payload(arg.bytes(), arg.depth), rest))
 }
 
 impl std::fmt::Display for Arg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_group() {
-            write!(f, "<{}: {} arguments>", self.op, self.parts.len())
+            write!(f, "<{}: {} arguments>", self.op, self.parts().len())
         } else {
-            write!(f, "<{}: {} bytes>", self.op, self.bytes.len())
+            write!(f, "<{}: {} bytes>", self.op, self.bytes().len())
         }
     }
 }
@@ -893,14 +930,14 @@ impl Req {
 
     pub fn args(&self) -> &[Arg] {
         if self.payload.is_group() {
-            &self.payload.parts
+            self.payload.parts()
         } else {
             std::slice::from_ref(&self.payload)
         }
     }
 
     pub fn into_args(self) -> Vec<Arg> {
-        if self.payload.is_group() { self.payload.parts } else { vec![self.payload] }
+        if self.payload.is_group() { self.payload.into_parts() } else { vec![self.payload] }
     }
 
     pub fn from_args(op: Op, args: Vec<Arg>) -> Req {
@@ -915,11 +952,9 @@ impl Req {
     fn write_field(mut self, write: impl FnOnce(&mut StructWriter)) -> Req {
         assert!(!self.payload.is_group(), "positional fields need a structure payload");
         let op = self.payload.op;
-        let mut writer = StructWriter {
-            bytes: self.payload.bytes.into(),
-            depth: 1,
-            maximum_depth: self.payload.depth,
-        };
+        let maximum_depth = self.payload.depth;
+        let mut writer =
+            StructWriter { bytes: self.payload.into_bytes().into(), depth: 1, maximum_depth };
         write(&mut writer);
         self.payload = writer.finish(op);
         self
@@ -953,7 +988,7 @@ impl Req {
     /// command, not by generic wire code.
     pub fn structure(mut self, payload: StructWriter) -> Req {
         let op = self.op();
-        assert!(!self.payload.is_group() && self.payload.bytes.len() == 0);
+        assert!(!self.payload.is_group() && self.payload.bytes().len() == 0);
         self.payload = payload.finish(op);
         self
     }
@@ -1017,14 +1052,14 @@ impl Resp {
 
     pub fn args(&self) -> &[Arg] {
         if self.payload.is_group() {
-            &self.payload.parts
+            self.payload.parts()
         } else {
             std::slice::from_ref(&self.payload)
         }
     }
 
     pub fn into_args(self) -> Vec<Arg> {
-        if self.payload.is_group() { self.payload.parts } else { vec![self.payload] }
+        if self.payload.is_group() { self.payload.into_parts() } else { vec![self.payload] }
     }
 
     pub fn ok() -> Resp {
@@ -1413,10 +1448,10 @@ fn encode_args(args: &[Arg], out: &mut impl Write) -> std::io::Result<()> {
 fn encode_arg(arg: &Arg, out: &mut impl Write) -> std::io::Result<()> {
     out.write_all(&arg.op.code().to_le_bytes())?;
     if arg.is_group() {
-        encode_args(&arg.parts, out)?;
+        encode_args(arg.parts(), out)?;
     } else {
-        out.write_all(&(arg.bytes.len() as u32).to_le_bytes())?;
-        arg.bytes.write_to(out)?;
+        out.write_all(&(arg.bytes().len() as u32).to_le_bytes())?;
+        arg.bytes().write_to(out)?;
     }
     Ok(())
 }
@@ -1424,7 +1459,7 @@ fn encode_arg(arg: &Arg, out: &mut impl Write) -> std::io::Result<()> {
 fn message_depth(args: &[Arg]) -> u8 {
     args.iter().fold(1, |depth, arg| {
         if arg.is_group() {
-            depth.max(message_depth(&arg.parts).saturating_add(1))
+            depth.max(message_depth(arg.parts()).saturating_add(1))
         } else {
             depth.max(arg.depth)
         }
@@ -1887,6 +1922,12 @@ pub fn accept(stream: TcpStream, config: &Messaging) -> Result<(Reader, Wire)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn ordinary_args_do_not_carry_a_separate_parts_vec() {
+        assert!(std::mem::size_of::<Arg>() <= 48);
+    }
 
     fn round_trip_request(request: &Req) -> Req {
         let mut plain = Vec::new();

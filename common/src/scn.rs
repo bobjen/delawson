@@ -453,7 +453,7 @@ mod tests {
         let mut writer = StructWriter::new();
         writer.scn(Scn(0x0102030405060708));
         let arg = writer.finish(Op::Raft);
-        let bytes = &arg.bytes;
+        let bytes = arg.bytes();
         let mut reader = StructReader::from_payload(bytes, arg.depth);
         let decoded = reader.scn().unwrap();
         reader.done().unwrap();

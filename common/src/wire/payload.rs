@@ -673,7 +673,7 @@ mod tests {
             writer.bytes(&vec![7; 9000]);
         });
         let request = Req::new(Op::ReadRecord).structure(writer);
-        let bytes = &request.args()[0].bytes;
+        let bytes = request.args()[0].bytes();
         assert!(bytes.is_segmented());
         let mut framed = MessageBytes::new();
         request.encode_to(&mut framed).unwrap();

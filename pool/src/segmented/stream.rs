@@ -665,7 +665,8 @@ mod tests {
             w.text("crossing a block");
         });
         let old = old.finish(Op::Range);
-        let (expected, depth) = (old.bytes, old.depth);
+        let depth = old.depth;
+        let expected = old.into_bytes();
         let pool = pool(8);
         for start in 4088..CHUNK_BYTES as u64 + 1 {
             let mut buffer = SegmentedBuffer::with_start(&pool, start);

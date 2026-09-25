@@ -1481,7 +1481,7 @@ pub trait Host:
                 &id,
                 Message::Forward {
                     op: request.op().code(),
-                    payload: arg.bytes.clone().into(),
+                    payload: arg.bytes().clone().into(),
                     depth: arg.depth,
                 },
             )

@@ -1596,3 +1596,21 @@ Create, batch 1,000: 1,896,121 objects/s. Sampled responses were 231 and
 216,053 serialized bytes, including the four-byte frame. Rates are close to
 the preceding run (83,989/s and 543,410/s). Log:
 `/tmp/delawson-object-bench-exz313s_/` (temporary files).
+
+## Compact Arg payload storage, 2026-09-25
+
+Group children now occupy the payload storage slot instead of a separate
+`parts: Vec<Arg>` field on every Arg. The Op trait still selects the layout,
+and groups still splice owned child payloads without copying their bytes.
+The standard 20M-object run created every object, found every lookup, and
+finished cleanup with status 0.
+
+| Workload | Three-trial mean | Trial range | Spread |
+| --- | ---: | ---: | ---: |
+| ObjectInfo | 84,471/s | 84,013–84,911/s | 1.1% |
+| BatchObjectInfo, batch 1,000 | 543,096/s | 541,090–545,367/s | 0.8% |
+
+Create, batch 1,000: 1,931,188 objects/s. Sampled responses remained 231
+and 216,053 serialized bytes, including the four-byte frame. Rates were in
+the same range as the previous run (84,770/s and 538,036/s). Log:
+`/tmp/delawson-object-bench-pu8dypd4/` (temporary files).

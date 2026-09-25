@@ -833,7 +833,7 @@ mod tests {
                 let extra = Req::from_args(Op::CompoundReq, args);
                 assert!(Delete::of(&extra).is_err());
                 let arg = &request.args()[0];
-                let (op, bytes, depth) = (arg.op, &arg.bytes, arg.depth);
+                let (op, bytes, depth) = (arg.op, arg.bytes(), arg.depth);
                 for len in 0..bytes.len() {
                     let short = Req {
                         id: 0,
@@ -842,7 +842,7 @@ mod tests {
                     assert!(Delete::of(&short).is_err(), "accepted truncation at {len}");
                 }
                 let mut trailing = delete.request().unwrap();
-                let bytes = &mut trailing.payload.bytes;
+                let bytes = trailing.payload.bytes_mut();
                 let mut writer = crate::wire::MessageBytes::from(std::mem::take(bytes));
                 writer.push(0);
                 *bytes = writer.into();
