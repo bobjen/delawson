@@ -601,7 +601,7 @@ pub struct StructReader<'a> {
     at: usize,
     depth: u8,
     maximum_depth: u8,
-    parse_count: usize,
+    parses_remaining: isize,
 }
 
 impl<'a> StructReader<'a> {
@@ -612,7 +612,7 @@ impl<'a> StructReader<'a> {
             at: 0,
             depth: 1,
             maximum_depth,
-            parse_count: 0,
+            parses_remaining: isize::try_from(bytes.len()).expect("slice length fits isize"),
         }
     }
 
@@ -626,15 +626,14 @@ impl<'a> StructReader<'a> {
             at: 0,
             depth: 1,
             maximum_depth,
-            parse_count: 0,
+            parses_remaining: isize::try_from(bytes.len()).expect("payload length fits isize"),
         }
     }
 
     // Charge structural attempts, including failures, without charging leaf reads.
     fn count_parse(&mut self) -> Result<()> {
-        self.parse_count =
-            self.parse_count.checked_add(1).ok_or_else(|| Error::new("parse count overflow"))?;
-        if self.parse_count > self.bytes.len() {
+        self.parses_remaining = self.parses_remaining.saturating_sub(1);
+        if self.parses_remaining < 0 {
             return Err(Error::new("too many parse routines for structure size"));
         }
         Ok(())
@@ -2059,10 +2058,10 @@ mod tests {
     #[test]
     fn leaf_reads_only_check_bounds() {
         let mut reader = StructReader::new(&[7], 1);
-        reader.parse_count = usize::MAX;
+        reader.parses_remaining = -1;
         assert_eq!(reader.number_u8().unwrap(), 7);
         assert_eq!(reader.number_u8().unwrap_err().to_string(), "structure payload ends mid-value");
-        assert_eq!(reader.parse_count, usize::MAX);
+        assert_eq!(reader.parses_remaining, -1);
         assert!(reader.read_array::<0>().unwrap().is_empty());
     }
 
