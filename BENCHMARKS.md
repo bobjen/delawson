@@ -527,6 +527,7 @@ and response sizes/counts are unchanged. Workspace tests passed at each step.
 | Starting point (previous repeat) | 75,960 | 359,829 | 355,481 / 363,840 / 360,165 |
 | Single-row argument builders | 77,572 | 361,119 | 356,118 / 368,006 / 359,234 |
 | Move FE response arguments | 76,587 | 381,932 | 382,465 / 379,981 / 383,351 |
+| Reserve row and argument capacities | 78,260 | 447,924 | 444,727 / 446,272 / 452,774 |
 
 Single-row builders return an `Arg` directly where callers previously appended
 a temporary one-element vector. Existing vector-returning entry points remain
@@ -544,5 +545,16 @@ The next implemented step reserves fixed-row payload sizes (70 bytes for an
 object, 64 for a shape or stream, 32 for a batch header), bounded by the small
 message threshold. DN rich batch capacity estimates include the shape, object,
 and usual one stream; per-object assembly reserves its known argument count.
-Workspace tests passed. Its benchmark is still running at this checkpoint:
-`/tmp/delawson-object-bench-8b8oi8jo/`. No writable-leaf cache changes yet.
+Workspace tests passed. Batch throughput rose another 17.3%, with a 1.8%
+trial spread; ObjectInfo trials were 77,580 / 79,358 / 77,841. All lookups
+were answered and found and sample sizes/counts were unchanged. Runner
+finished with status 0 after cleanup: `/tmp/delawson-object-bench-8b8oi8jo/`.
+These first three changes were committed together as `5f8008c`.
+
+Fourth step: cache the last initialized leaf in `SegmentedBuffer` so small
+appends can copy directly without traversing the tree. Pruning invalidates the
+cache before recycling blocks; boundary-crossing writes retain allocation-error
+rollback. Message payloads now borrow the thread-local RNG only when the pool
+actually requests a random value. Workspace tests passed, including a rolling
+model mixing direct appends, writers, truncation, clearing and prefix discard.
+Benchmark running at this commit: `/tmp/delawson-object-bench-lkf3non4/`.

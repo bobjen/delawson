@@ -33,6 +33,9 @@ pub type ChunkPool = Pool<CHUNK_BYTES, CHUNK_BYTES>;
 pub struct SegmentedBuffer<'a> {
     pool: &'a ChunkPool,
     root: u32,
+    // Last initialized leaf, or NONE. Pruning invalidates it before recycling.
+    // At a block boundary append must allocate/find the next leaf instead.
+    tail: u32,
     depth: u8,
     // Absolute leaf number of the beginning of the root's address range.
     base: u64,
@@ -47,7 +50,7 @@ impl<'a> SegmentedBuffer<'a> {
 
     /// Start an empty rolling buffer at an absolute stream offset.
     pub fn with_start(pool: &'a ChunkPool, offset: u64) -> Self {
-        Self { pool, root: NONE, depth: 0, base: 0, start: offset, end: offset }
+        Self { pool, root: NONE, tail: NONE, depth: 0, base: 0, start: offset, end: offset }
     }
 
     pub fn start(&self) -> u64 {
@@ -169,11 +172,35 @@ impl<'a> SegmentedBuffer<'a> {
     /// Append initialized bytes. Calls the caller's RNG once per pool allocation.
     /// On allocation failure the original byte range and contents are preserved.
     /// No leaf bytes outside the appended range are cleared or exposed.
-    pub fn append(&mut self, bytes: &[u8], mut random: impl FnMut() -> u64) -> Result<()> {
+    #[inline]
+    pub fn append(&mut self, bytes: &[u8], random: impl FnMut() -> u64) -> Result<()> {
         self.end
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| Error::new("segmented buffer offset overflow"))?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let within = self.end as usize % CHUNK_BYTES;
+        if self.tail != NONE && within != 0 && bytes.len() <= CHUNK_BYTES - within {
+            // SAFETY: tail is an owned leaf containing end - 1; pruning invalidates
+            // it before freeing anything. This write stays in that leaf, and the
+            // exclusive borrow prevents source aliasing. Overflow was checked above.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    self.ptr(self.tail).add(within),
+                    bytes.len(),
+                );
+            }
+            self.end += bytes.len() as u64;
+            return Ok(());
+        }
+        self.append_slow(bytes, random)
+    }
+
+    fn append_slow(&mut self, bytes: &[u8], mut random: impl FnMut() -> u64) -> Result<()> {
         let old_end = self.end;
+        self.tail = NONE;
         let mut remaining = bytes;
         while !remaining.is_empty() {
             let index = match self.ensure_leaf(self.end / CHUNK_BYTES as u64, &mut random) {
@@ -196,6 +223,7 @@ impl<'a> SegmentedBuffer<'a> {
                 )
             };
             self.end += count as u64;
+            self.tail = index;
             remaining = &remaining[count..];
         }
         Ok(())
@@ -334,6 +362,7 @@ impl<'a> SegmentedBuffer<'a> {
     }
 
     fn prune(&mut self) {
+        self.tail = NONE;
         if self.is_empty() {
             self.release_tree(self.root, self.depth);
             self.root = NONE;
@@ -442,6 +471,10 @@ mod tests {
                 }
                 assert_ne!(children, 0, "empty index node retained");
             }
+        }
+        if buffer.tail != NONE {
+            assert!(!buffer.is_empty());
+            assert_eq!(buffer.tail, buffer.leaf((buffer.end - 1) / CHUNK_BYTES as u64));
         }
         let mut seen = HashSet::new();
         walk(buffer, buffer.root, buffer.depth, buffer.base as u128, &mut seen);
@@ -612,8 +645,22 @@ mod tests {
         for iteration in 0..1500 {
             let count = (random() % 9000) as usize;
             let input = vec![iteration as u8; count];
-            b.append(&input, &mut random).unwrap();
+            if iteration % 3 == 0 {
+                use std::io::Write;
+                b.writer(&mut random).write_all(&input).unwrap();
+            } else {
+                b.append(&input, &mut random).unwrap();
+            }
             model.extend_from_slice(&input);
+            if iteration % 5 == 0 {
+                let keep = random() as usize % (model.len() + 1);
+                b.truncate(b.start() + keep as u64).unwrap();
+                model.truncate(keep);
+            }
+            if iteration % 17 == 0 {
+                b.clear();
+                model.clear();
+            }
             if !model.is_empty() {
                 let offset = random() as usize % model.len();
                 let count = (model.len() - offset).min(19);

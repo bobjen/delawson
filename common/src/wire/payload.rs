@@ -129,15 +129,15 @@ impl MessageBytes {
             }
             let pool = shared_pool(config).map_err(io::Error::other)?;
             let mut large = SegmentedBuffer::new(pool);
-            with_random(|rng| large.append(v, || rng.next_u64())).map_err(io::Error::other)?;
+            large.append(v, || with_random(|rng| rng.next_u64())).map_err(io::Error::other)?;
             // Do not discard the prefix until both appends succeed.
-            with_random(|rng| large.append(bytes, || rng.next_u64())).map_err(io::Error::other)?;
+            large.append(bytes, || with_random(|rng| rng.next_u64())).map_err(io::Error::other)?;
             self.storage = Storage::Large(Box::new(large));
             return Ok(());
         }
         if let Storage::Large(v) = &mut self.storage {
             let end = v.end();
-            if let Err(e) = with_random(|rng| v.append(bytes, || rng.next_u64())) {
+            if let Err(e) = v.append(bytes, || with_random(|rng| rng.next_u64())) {
                 v.truncate(end).map_err(io::Error::other)?;
                 return Err(io::Error::other(e));
             }
