@@ -8360,11 +8360,13 @@ selector tests were removed; the measurements above remain as experiment history
 The CPU-first mode names in that history are no longer supported by the benchmark.
 
 **Pool-backed segmented byte buffer.** `pool::SegmentedBuffer` uses
-`pool::ChunkPool` (`Pool<4096, 4096, ExternalLinks>`) for both data leaves and
-index nodes. Every node is 4KiB aligned and every index node holds 1,024 u32
+`pool::ChunkPool` (`Pool<CHUNK_BYTES, CHUNK_BYTES, ExternalLinks>`) for both data
+leaves and index nodes. `CHUNK_BYTES` is the single hardcoded block-size choice,
+currently 64KiB; alignment, index capacity, tree spans and maximum depth are
+derived from it. Every index node holds `CHUNK_BYTES / size_of::<u32>()` (16,384) u32
 pool indexes, with u32::MAX as the absent-child sentinel. These indexes describe
-an in-memory tree, not a disk serialization. Depth zero holds 2^12 bytes;
-depths one and two cover 2^22 and 2^32 bytes. Depth six covers all u64 offsets;
+an in-memory tree, not a disk serialization. Depth zero holds 2^16 bytes;
+depths one and two cover 2^30 and 2^44 bytes. Depth four covers all u64 offsets;
 internal span calculations use u128 to avoid overflow. Actual resident capacity
 is still bounded by the shared pool's configured maximum, including index nodes.
 
@@ -8416,10 +8418,12 @@ message storage described below.
 direct connection buffers, sealed network output, incoming sealed segments, and
 opened message batches now use `wire::MessageBuffer`, backed by the segmented
 tree. Empty batches allocate no blocks. A process-wide pool is initialized once
-from `messaging.buffer_pool = { max_blocks = 8388608, initial_blocks = 0,
-small_message_bytes = 2048 }` when loading the cluster configuration, before
-constructing messages. Omitted settings use those defaults. This reserves
-32GiB of block virtual address space plus 32MiB of packed external links, with
+from `messaging.buffer_pool` when loading the cluster configuration, before
+constructing messages. Omitted settings derive `max_blocks` from 32GiB divided
+by block size (currently 524,288), default `initial_blocks` to zero, and derive
+`small_message_bytes` from half a block (currently 32KiB). The sample configuration
+uses these defaults. This reserves 32GiB of block virtual address space plus
+2MiB of packed external links, with
 physical pages supplied on demand. Subsequent connections must use the same pool
 configuration. Thread-local RNGs choose allocation buckets. Pool exhaustion
 propagates as an error rather than publishing a partially framed message.
@@ -8434,7 +8438,7 @@ The existing wire byte format, compression selection, authentication tags, and
 nonce sequencing are preserved.
 
 **Hybrid individual messages.** `MessageBytes` begins with an empty Vec. Up to
-and including `small_message_bytes` (default 2KiB) it remains contiguous. A write
+and including `small_message_bytes` (default half a block, currently 32KiB) it remains contiguous. A write
 that exceeds that threshold allocates from the same process-wide pool, copies
 the small prefix once, and releases the Vec. Further growth adds leaves without
 moving the prefix. Clearing a large scratch buffer releases its blocks and
@@ -8476,23 +8480,39 @@ from input leaves to output leaves, then encrypted there; input batches remain
 unchanged. Allocation failure rolls output back without reusing the nonce.
 
 LZ4 input and output choose their contiguous fast paths independently. The
-compression sampler reads its small sample from input leaves. For an actual
-compression attempt, input wholly within one leaf is borrowed directly; input
-crossing leaves is copied into a retained Vec. Compression writes directly into
-the current output leaf when LZ4's worst-case output bound fits its remaining
-space; otherwise its contiguous result is copied into output leaves. Rejected
-compression is replaced with the original bytes, preserving the wire format.
+compression sampler reads its small sample from input leaves. Single-leaf input
+is borrowed directly, and compression writes directly into an output leaf when
+LZ4's worst-case capacity fits. Cross-leaf ranges use scoped contiguous virtual
+aliases of the actual pool blocks on Linux when block size is a multiple of the OS page size. Pool storage and
+external links use shared anonymous mappings. `mremap` with old size zero and
+`MREMAP_MAYMOVE | MREMAP_FIXED` duplicates the shared pages into the scratch
+reservation without moving the original pages or copying payload bytes. Adjacent
+pool slots are mapped in one call. The LZ4 slice starts at the original offset
+within the first leaf, so leading and trailing bytes outside the range are untouched.
 
-The receiver borrows a sealed segment wholly within one leaf and otherwise uses
-its retained sealed-input Vec. Authenticated decryption still produces a
-contiguous buffer. After authentication, LZ4 expands directly into the output
-leaf when the declared expanded size fits; crossing output uses a contiguous
-Vec and copy. Unencrypted single-leaf input needs no intermediate body copy.
-Direct output slices are initialized before passing them to LZ4, and unused
-suffixes are truncated. Expanded sizes are checked before allocation, and errors
-roll output back. Tests cover independent input/output boundary combinations,
-compression rejection, ciphertext/tag compatibility, failed authentication and
-expansion, and pool-exhaustion rollback without nonce reuse.
+Scratch windows are lazily reserved and retained per connection direction. The
+input window accommodates the maximum plaintext segment (64MiB plus four bytes);
+the compression-output window uses `lz4_flex::block::get_maximum_output_size`
+(currently 20 + floor(1.1 * input size)), about 70.4MiB. Reservations include page
+rounding and one block of slack for a mid-leaf start. Only actual pool leaves are
+mapped into these windows. Output leaves are allocated and initialized to the
+required capacity before LZ4 runs; unused suffixes are truncated afterward.
+This avoids result copies but can temporarily allocate substantially more output
+blocks than the compressed result needs.
+
+The receiver also aliases cross-leaf sealed input; authenticated decryption still
+produces a contiguous buffer. After authentication, decompression writes directly
+into a leaf or a virtual alias of its output leaves. Scoped callbacks retain the
+source buffer borrow; mutable output aliases require exclusive buffer access.
+A guard replaces aliases with inaccessible anonymous reservations before any
+blocks can be recycled, including on errors and unwinding. Unsupported platforms
+or page sizes retain the copying path; mapping failures are reported as errors.
+
+Wire format and compression rejection behavior are unchanged. Expanded sizes
+are checked before allocation, and errors roll output back. Tests cover scattered
+pool slots, mid-leaf offsets, alias write-through, reuse and panic cleanup,
+independent input/output boundaries, maximum-size segments, ciphertext/tag
+compatibility, and failed authentication, expansion, and pool allocation.
 
 Requests and responses are decoded directly from bounded segmented readers;
 scalar fields spanning leaves use stack storage, while owned argument payloads
@@ -8502,8 +8522,8 @@ Tests cover byte compatibility at leaf boundaries, framing rollback, malformed
 lengths, shared pool identity, partial vectored operations and interrupts, socket
 round trips with every compression/encryption combination, and authenticated TLS.
 
-Tests cover packed fields crossing leaves, all six depth transitions using small
-windows at large offsets, 4MiB growth, index-node reclamation, rolling windows
+Tests cover packed fields crossing leaves, all supported depth transitions using small
+windows at large offsets, growth beyond one index node, index-node reclamation, rolling windows
 against a contiguous reference model, range/offset overflow, allocation failure
 at every level, and unwinding through an RNG panic. Ownership audits and draining
 the pool after destruction check duplicate and lost blocks.

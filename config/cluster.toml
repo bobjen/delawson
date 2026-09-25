@@ -67,10 +67,12 @@ members = 1
 # from then on. Direct is fastest while every hot operation is answered on the
 # read loop, and useless for answers that are not.
 [messaging]
-# Shared process-wide 4KiB block pool: 32GiB virtual reservation, pages on demand.
+# Shared process-wide pool: 32GiB virtual reservation, pages on demand.
 # Counts include data leaves and index nodes; no blocks are pre-issued by default.
-# Individual messages promote from Vec storage only above small_message_bytes.
-buffer_pool = { max_blocks = 8388608, initial_blocks = 0, small_message_bytes = 2048 }
+# Defaults derive max_blocks from 32GiB / block size and small_message_bytes
+# from block size / 2 (currently 64KiB blocks and a 32KiB cutover).
+# Set either field here to override it.
+buffer_pool = {}
 send = "adaptive"
 
 # Everything sent is encrypted, in whole batches rather than per message, so the

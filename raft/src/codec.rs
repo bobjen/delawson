@@ -289,7 +289,8 @@ mod message_storage_tests {
     use super::*;
     #[test]
     fn segmented_network_encoding_matches_contiguous_byte_list() {
-        let bytes: Vec<u8> = (0..12000).map(|i| i as u8).collect();
+        let size = common::config::BufferPoolConfig::default().small_message_bytes * 3;
+        let bytes: Vec<u8> = (0..size).map(|i| i as u8).collect();
         let payload = common::wire::MessageBytes::from(bytes.clone());
         let encoded = encode_message(&payload).unwrap();
         assert!(encoded.is_segmented());

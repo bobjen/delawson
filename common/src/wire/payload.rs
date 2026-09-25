@@ -230,13 +230,13 @@ mod tests {
     #[test]
     fn segmented_payload_round_trip_with_straddling_tag_and_length() {
         let mut writer = StructWriter::new();
-        for _ in 0..4095 {
+        for _ in 0..pool::segmented::CHUNK_BYTES - 1 {
             writer.number_u8(0xa5);
         }
         writer.nested(Op::ReadRecord, |writer| {
             writer.number_u16(42);
-            // The next u32 length starts at byte 8191.
-            for _ in 0..4092 {
+            // The next u32 length starts at one byte before the second block boundary.
+            for _ in 0..pool::segmented::CHUNK_BYTES - 4 {
                 writer.number_u8(0x5a);
             }
             writer.bytes(&vec![7; 9000]);
@@ -251,13 +251,13 @@ mod tests {
         let decoded = Req::decode_from(&mut decoded_input, framed.len()).unwrap();
         assert_eq!(decoded, request);
         let (mut reader, _) = structure(&decoded.args, Op::ReadRecord, "test").unwrap();
-        for _ in 0..4095 {
+        for _ in 0..pool::segmented::CHUNK_BYTES - 1 {
             assert_eq!(reader.number_u8().unwrap(), 0xa5);
         }
         reader
             .nested(Op::ReadRecord, "nested", |reader| {
                 assert_eq!(reader.number_u16()?, 42);
-                for _ in 0..4092 {
+                for _ in 0..pool::segmented::CHUNK_BYTES - 4 {
                     assert_eq!(reader.number_u8()?, 0x5a);
                 }
                 assert_eq!(reader.bytes()?, vec![7; 9000]);
@@ -295,9 +295,9 @@ mod tests {
         let mut bytes =
             MessageBytes { storage: Storage::Large(SegmentedBuffer::new(pool)), error: None };
         bytes.write_all(b"prefix").unwrap();
-        assert!(bytes.write_all(&vec![0; 8192]).is_err());
+        assert!(bytes.write_all(&vec![0; pool::segmented::CHUNK_BYTES * 2]).is_err());
         assert_eq!(bytes.to_vec(), b"prefix");
-        bytes.extend_from_slice(&vec![0; 8192]);
+        bytes.extend_from_slice(&vec![0; pool::segmented::CHUNK_BYTES * 2]);
         bytes.push(1);
         let mut output = Vec::new();
         assert!(bytes.write_to(&mut output).is_err());

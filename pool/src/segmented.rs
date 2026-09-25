@@ -1,18 +1,22 @@
 //! A packed byte range backed by a radix tree of pool indexes.
 //!
-//! Leaves and index nodes are both 4KiB, aligned to 4KiB. An index node holds
-//! 1,024 native-endian u32 pool indexes; NONE marks an absent child. These are
+//! Leaves and index nodes use CHUNK_BYTES for size and alignment. Index nodes
+//! hold CHUNK_BYTES / size_of::<u32>() native-endian pool indexes; NONE marks an absent child. These are
 //! in-memory indexes, not a serialized disk format. Depth zero is a leaf.
-//! Depth six covers the entire u64 byte-offset space (using u128 internally
+//! The derived maximum depth covers the entire u64 byte-offset space (using u128 internally
 //! for tree spans). The pool's capacity independently limits resident storage.
+mod alias;
+pub use alias::VirtualScratch;
 mod stream;
 pub use stream::{SegmentedReader, SegmentedWriter};
 
 use crate::{Block, Error, NONE, Pool, Result};
 
-pub const CHUNK_BYTES: usize = 4096;
-pub const INDEX_ENTRIES: usize = 1024;
-pub const MAX_DEPTH: u8 = 6;
+pub const CHUNK_BYTES: usize = 64 * 1024;
+pub const INDEX_ENTRIES: usize = CHUNK_BYTES / size_of::<u32>();
+const CHUNK_BITS: u32 = CHUNK_BYTES.trailing_zeros();
+const INDEX_BITS: u32 = INDEX_ENTRIES.trailing_zeros();
+pub const MAX_DEPTH: u8 = (64 - CHUNK_BITS).div_ceil(INDEX_BITS) as u8;
 pub type ChunkPool = Pool<CHUNK_BYTES, CHUNK_BYTES>;
 
 /// One initialized byte range, `start()..end()`, with no holes.
@@ -62,9 +66,9 @@ impl<'a> SegmentedBuffer<'a> {
         (self.root != NONE).then_some(self.depth)
     }
 
-    // Spans are measured in leaves. The largest is 2^60, or 2^72 bytes.
+    // Spans are measured in leaves. The maximum depth covers all u64 byte offsets.
     fn span(depth: u8) -> u128 {
-        1u128 << (10 * depth as u32)
+        1u128 << (INDEX_BITS * depth as u32)
     }
 
     fn ptr(&self, index: u32) -> *mut u8 {
@@ -73,7 +77,7 @@ impl<'a> SegmentedBuffer<'a> {
     }
 
     fn child(&self, node: u32, slot: usize) -> u32 {
-        // SAFETY: node is an initialized, aligned index block; slot < 1024.
+        // SAFETY: node is an initialized, aligned index block; slot < INDEX_ENTRIES.
         unsafe { self.ptr(node).cast::<u32>().add(slot).read() }
     }
 
@@ -82,14 +86,17 @@ impl<'a> SegmentedBuffer<'a> {
         unsafe { self.ptr(node).cast::<u32>().add(slot).write(child) }
     }
 
-    fn index_block(&self, random: &mut impl FnMut() -> u64) -> Result<Block<'a, 4096, 4096>> {
+    fn index_block(
+        &self,
+        random: &mut impl FnMut() -> u64,
+    ) -> Result<Block<'a, CHUNK_BYTES, CHUNK_BYTES>> {
         let block = self.pool.alloc(random())?;
         // SAFETY: this new block is exclusively owned, and all bits set is NONE.
         unsafe { block.as_ptr().write_bytes(0xff, CHUNK_BYTES) };
         Ok(block)
     }
 
-    fn take(block: Block<'a, 4096, 4096>) -> u32 {
+    fn take(block: Block<'a, CHUNK_BYTES, CHUNK_BYTES>) -> u32 {
         let index = block.index();
         // Ownership moves into the tree; release() returns it exactly once.
         std::mem::forget(block);
@@ -466,8 +473,8 @@ mod tests {
         for chunk in b.chunks() {
             assert_eq!(chunk.as_ptr() as usize % CHUNK_BYTES, 0);
         }
-        b.write_at(4093, &[255; 19]).unwrap();
-        expected[4093..4112].fill(255);
+        b.write_at((CHUNK_BYTES - 3) as u64, &[255; 19]).unwrap();
+        expected[CHUNK_BYTES - 3..CHUNK_BYTES + 16].fill(255);
         let mut actual = vec![0; expected.len()];
         b.read_at(0, &mut actual).unwrap();
         assert_eq!(actual, expected);
@@ -478,9 +485,9 @@ mod tests {
         assert!(b.discard_before(b.end() + 1).is_err());
         assert!(b.chunk(b.end()).is_none());
         b.read_at(b.end(), &mut []).unwrap();
-        b.discard_before(4097).unwrap();
-        assert_eq!(b.chunks().flatten().copied().collect::<Vec<_>>(), expected[4097..]);
-        assert!(b.read_at(4096, &mut []).is_err());
+        b.discard_before((CHUNK_BYTES + 1) as u64).unwrap();
+        assert_eq!(b.chunks().flatten().copied().collect::<Vec<_>>(), expected[CHUNK_BYTES + 1..]);
+        assert!(b.read_at(CHUNK_BYTES as u64, &mut []).is_err());
         audit(&b);
         drop(b);
         all_returned(&pool, 16);
@@ -488,16 +495,16 @@ mod tests {
 
     #[test]
     fn grows_to_depth_two_and_reclaims_index_nodes() {
-        let pool = pool(1030);
+        let pool = pool((INDEX_ENTRIES + 6) as u32);
         let mut b = SegmentedBuffer::new(&pool);
-        let bytes = vec![73; CHUNK_BYTES * 1025];
+        let bytes = vec![73; CHUNK_BYTES * (INDEX_ENTRIES + 1)];
         b.append(&bytes, || 0).unwrap();
         assert_eq!(b.depth(), Some(2));
-        assert_eq!(audit(&b), 1028);
-        b.discard_before(1 << 22).unwrap();
+        assert_eq!(audit(&b), INDEX_ENTRIES + 4);
+        b.discard_before((CHUNK_BYTES * INDEX_ENTRIES) as u64).unwrap();
         assert_eq!(b.depth(), Some(0));
         assert_eq!(audit(&b), 1);
-        assert_eq!(b.chunk(1 << 22).unwrap(), &[73; CHUNK_BYTES]);
+        assert_eq!(b.chunk((CHUNK_BYTES * INDEX_ENTRIES) as u64).unwrap(), &[73; CHUNK_BYTES]);
         b.clear();
         assert!(b.is_empty());
         assert_eq!(audit(&b), 0);
@@ -505,14 +512,14 @@ mod tests {
         b.append(&[12], || 0).unwrap();
         assert_eq!(b.chunk(bytes.len() as u64), Some(&[12][..]));
         drop(b);
-        all_returned(&pool, 1030);
+        all_returned(&pool, INDEX_ENTRIES + 6);
     }
 
     #[test]
     fn crosses_every_tree_depth_without_allocating_the_address_space() {
         let pool = pool(32);
         for depth in 1..=MAX_DEPTH {
-            let boundary = 1u64 << (12 + 10 * (depth - 1) as u32);
+            let boundary = 1u64 << (CHUNK_BITS + INDEX_BITS * (depth - 1) as u32);
             let mut b = SegmentedBuffer::with_start(&pool, boundary - 1);
             b.append(&[23, 45], || 0).unwrap();
             assert_eq!(b.depth(), Some(depth));
@@ -537,13 +544,13 @@ mod tests {
 
     #[test]
     fn allocation_failure_rolls_back_and_returns_every_block() {
-        // Cross the depth-six boundary, failing at each intermediate allocation.
-        for max in 1..=13 {
+        // Cross the maximum-depth boundary, failing at each intermediate allocation.
+        for max in 1..=1 + 2 * MAX_DEPTH as u32 {
             let pool = pool(max);
             let mut b = SegmentedBuffer::with_start(&pool, (1u64 << 62) - 2);
             b.append(&[77], || 0).unwrap();
             let result = b.append(&[88, 99], || 0);
-            if max < 13 {
+            if max < 1 + 2 * MAX_DEPTH as u32 {
                 assert!(result.is_err());
                 assert_eq!(b.len(), 1);
                 assert_eq!(b.depth(), Some(0));
@@ -567,7 +574,7 @@ mod tests {
 
     #[test]
     fn rng_panic_does_not_lose_detached_nodes() {
-        for allowed in 0..13 {
+        for allowed in 0..1 + 2 * MAX_DEPTH as usize {
             let pool = pool(32);
             let mut b = SegmentedBuffer::with_start(&pool, (1u64 << 62) - 1);
             b.append(&[3], || 0).unwrap();
@@ -587,7 +594,8 @@ mod tests {
     #[test]
     fn rolling_buffer_matches_a_contiguous_model() {
         let pool = pool(128);
-        let mut b = SegmentedBuffer::with_start(&pool, (1 << 22) - 17000);
+        let mut b =
+            SegmentedBuffer::with_start(&pool, ((CHUNK_BYTES * INDEX_ENTRIES) as u64) - 17000);
         let mut model = Vec::new();
         let mut state = 0x123456789abcdefu64;
         let mut random = || {

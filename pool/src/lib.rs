@@ -57,7 +57,7 @@ impl Mapping {
                 std::ptr::null_mut(),
                 len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
                 -1,
                 0,
             )

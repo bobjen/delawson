@@ -1510,6 +1510,7 @@ pub struct Reader {
     open: MessageBuffer,
     sealed: MessageBuffer,
     sealed_scratch: Vec<u8>,
+    sealed_alias: pool::segmented::VirtualScratch,
     at: u64,
     /// When the segment now being read arrived. A batch arrives at one moment, so
     /// this is one clock read for however many messages it holds — and it is the
@@ -1558,18 +1559,25 @@ impl Reader {
             return Err(Error::new(format!("peer announced a {length}-byte segment")));
         }
         self.sealed.receive(&mut self.stream, length)?;
-        let first = self.sealed.bytes.chunk(0).unwrap_or(&[]);
-        let sealed = if first.len() >= length {
-            &first[..length]
-        } else {
-            self.sealed.copy_to(0..length as u64, &mut self.sealed_scratch)?;
-            &self.sealed_scratch
-        };
         self.open.clear();
         self.at = 0;
-        let result = buffer::with_random(|rng| {
-            self.seal.open_segmented(&header, sealed, &mut self.open.bytes, || rng.next_u64())
-        });
+        let first = self.sealed.bytes.chunk(0).unwrap_or(&[]);
+        let mut open = |sealed: &[u8]| {
+            buffer::with_random(|rng| {
+                self.seal.open_segmented(&header, sealed, &mut self.open.bytes, || rng.next_u64())
+            })
+        };
+        let result = if first.len() >= length {
+            open(&first[..length])
+        } else if pool::segmented::VirtualScratch::supported() {
+            self.sealed_alias
+                .with_read(&self.sealed.bytes, 0..length as u64, open)
+                .context("sealed input alias")
+                .and_then(|result| result)
+        } else {
+            self.sealed.copy_to(0..length as u64, &mut self.sealed_scratch)?;
+            open(&self.sealed_scratch)
+        };
         self.sealed.clear();
         if result.is_err() {
             self.open.clear();
@@ -1727,6 +1735,7 @@ pub fn connect(stream: TcpStream, config: &Messaging) -> Result<Link> {
             open: MessageBuffer::new(pool),
             sealed: MessageBuffer::new(pool),
             sealed_scratch: Vec::new(),
+            sealed_alias: pool::segmented::VirtualScratch::new(MAX_SEGMENT_BYTES + seal::OVERHEAD),
             at: 0,
             arrived: Instant::now(),
         },
@@ -1755,6 +1764,7 @@ pub fn accept(stream: TcpStream, config: &Messaging) -> Result<(Reader, Wire)> {
             open: MessageBuffer::new(pool),
             sealed: MessageBuffer::new(pool),
             sealed_scratch: Vec::new(),
+            sealed_alias: pool::segmented::VirtualScratch::new(MAX_SEGMENT_BYTES + seal::OVERHEAD),
             at: 0,
             arrived: Instant::now(),
         },
