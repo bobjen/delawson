@@ -1494,7 +1494,7 @@ impl Wire {
             let end = segment_end(plain, at)?;
             self.sealed.clear();
             buffer::with_random(|rng| {
-                self.seal.seal_segmented(&plain.bytes, at..end, &mut self.sealed.bytes, || {
+                self.seal.seal_segmented(&mut plain.bytes, at..end, &mut self.sealed.bytes, || {
                     rng.next_u64()
                 })
             })?;
@@ -1516,7 +1516,6 @@ pub struct Reader {
     open: MessageBuffer,
     sealed: MessageBuffer,
     sealed_scratch: Vec<u8>,
-    sealed_alias: pool::segmented::VirtualScratch,
     at: u64,
     /// When the segment now being read arrived. A batch arrives at one moment, so
     /// this is one clock read for however many messages it holds — and it is the
@@ -1575,9 +1574,10 @@ impl Reader {
         };
         let result = if first.len() >= length {
             open(&first[..length])
-        } else if pool::segmented::VirtualScratch::supported() {
-            self.sealed_alias
-                .with_read(&self.sealed.bytes, 0..length as u64, open)
+        } else if pool::SegmentedBuffer::alias_supported() {
+            self.sealed
+                .bytes
+                .with_contiguous_read(0..length as u64, open)
                 .context("sealed input alias")
                 .and_then(|result| result)
         } else {
@@ -1741,7 +1741,6 @@ pub fn connect(stream: TcpStream, config: &Messaging) -> Result<Link> {
             open: MessageBuffer::new(pool),
             sealed: MessageBuffer::new(pool),
             sealed_scratch: Vec::new(),
-            sealed_alias: pool::segmented::VirtualScratch::new(MAX_SEGMENT_BYTES + seal::OVERHEAD),
             at: 0,
             arrived: Instant::now(),
         },
@@ -1770,7 +1769,6 @@ pub fn accept(stream: TcpStream, config: &Messaging) -> Result<(Reader, Wire)> {
             open: MessageBuffer::new(pool),
             sealed: MessageBuffer::new(pool),
             sealed_scratch: Vec::new(),
-            sealed_alias: pool::segmented::VirtualScratch::new(MAX_SEGMENT_BYTES + seal::OVERHEAD),
             at: 0,
             arrived: Instant::now(),
         },

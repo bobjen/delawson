@@ -11,7 +11,6 @@
 use crate::config::{Compress, Messaging};
 use crate::{Context, Error, Result};
 use aegis::aegis128x2::Aegis128X2;
-use pool::segmented::VirtualScratch;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -55,8 +54,6 @@ pub struct Seal {
     sample_buf: Vec<u8>,
     /// Fallback for platforms without compatible shared-page aliases.
     compression_input: Vec<u8>,
-    input_alias: VirtualScratch,
-    output_alias: VirtualScratch,
     prefix: [u8; 8],
     dir: u8,
     counter: u64,
@@ -72,10 +69,6 @@ impl Seal {
             compress_sample: config.compress_sample,
             sample_buf: Vec::with_capacity(config.compress_sample),
             compression_input: Vec::new(),
-            input_alias: VirtualScratch::new(crate::wire::MAX_SEGMENT_BYTES + 4),
-            output_alias: VirtualScratch::new(lz4_flex::block::get_maximum_output_size(
-                crate::wire::MAX_SEGMENT_BYTES + 4,
-            )),
             prefix,
             dir,
             counter: 0,
@@ -143,7 +136,7 @@ impl Seal {
     /// LZ4 borrows single-leaf input and writes directly when its output bound fits.
     pub fn seal_segmented(
         &mut self,
-        plain: &pool::SegmentedBuffer<'_>,
+        plain: &mut pool::SegmentedBuffer<'_>,
         range: std::ops::Range<u64>,
         out: &mut pool::SegmentedBuffer<'_>,
         mut random: impl FnMut() -> u64,
@@ -172,15 +165,13 @@ impl Seal {
                 out.append(&(size as u32).to_le_bytes(), &mut random)
                     .context("sealed segment append")?;
                 // Input and output select direct-leaf or virtual alias independently.
-                let mut compress = |input: &[u8]| {
-                    compress_into_pool(input, out, &mut self.output_alias, &mut random)
-                };
+                let mut compress = |input: &[u8]| compress_into_pool(input, out, &mut random);
                 let chunk = plain.chunk(range.start).unwrap_or(&[]);
                 let written = if chunk.len() >= size {
                     compress(&chunk[..size])?
-                } else if VirtualScratch::supported() {
-                    self.input_alias
-                        .with_read(plain, range.clone(), compress)
+                } else if pool::SegmentedBuffer::alias_supported() {
+                    plain
+                        .with_contiguous_read(range.clone(), compress)
                         .context("compression input alias")??
                 } else {
                     self.compression_input.resize(size, 0);
@@ -218,14 +209,13 @@ impl Seal {
                         .chunks_mut_range(body_start..body_end)
                         .context("encryption output leaf")?;
                     cipher.encrypt_in_place(chunks.next().expect("nonempty sealed body"), &header)
-                } else if VirtualScratch::supported() {
-                    // Compression's output alias has already been released, so
-                    // reuse its reservation for a one-shot in-place encryption.
-                    self.output_alias
-                        .with_write(out, body_start..body_end, |body| {
-                            cipher.encrypt_in_place(body, &header)
-                        })
-                        .context("encryption output alias")?
+                } else if pool::SegmentedBuffer::alias_supported() {
+                    // Compression's callback borrow has ended. Reuse its cached
+                    // aliases where the encryption body occupies the same leaves.
+                    out.with_contiguous_write(body_start..body_end, |body| {
+                        cipher.encrypt_in_place(body, &header)
+                    })
+                    .context("encryption output alias")?
                 } else {
                     let mut encryptor = cipher.encryptor(&header);
                     for chunk in out
@@ -307,7 +297,7 @@ impl Seal {
         sealed: &[u8],
         out: &mut impl Write,
     ) -> Result<()> {
-        self.open_with(header, sealed, |input, expanded, _alias| {
+        self.open_with(header, sealed, |input, expanded| {
             if let Some(size) = expanded {
                 let loose = lz4_flex::decompress(input, size)
                     .map_err(|e| Error::new(format!("segment did not expand: {e}")))?;
@@ -328,7 +318,7 @@ impl Seal {
         mut random: impl FnMut() -> u64,
     ) -> Result<()> {
         let start = out.end();
-        let result = self.open_with(header, sealed, |input, expanded, alias| {
+        let result = self.open_with(header, sealed, |input, expanded| {
             match expanded {
                 Some(size) if size > 0 && fits_tail(out, size) => {
                     let dest = append_contiguous_space(out, size, &mut random)?;
@@ -336,10 +326,10 @@ impl Seal {
                         .map_err(|e| Error::new(format!("segment did not expand: {e}")))?;
                     out.truncate(start + written as u64).context("expanded segment truncate")?;
                 }
-                Some(size) if size > 0 && VirtualScratch::supported() => {
+                Some(size) if size > 0 && pool::SegmentedBuffer::alias_supported() => {
                     append_zeroes(out, size, &mut random)?;
-                    let written = alias
-                        .with_write(out, start..start + size as u64, |dest| {
+                    let written = out
+                        .with_contiguous_write(start..start + size as u64, |dest| {
                             lz4_flex::block::decompress_into(input, dest)
                         })
                         .context("expansion output alias")?
@@ -365,7 +355,7 @@ impl Seal {
         &mut self,
         header: &[u8; HEADER],
         sealed: &[u8],
-        output: impl FnOnce(&[u8], Option<usize>, &mut VirtualScratch) -> Result<()>,
+        output: impl FnOnce(&[u8], Option<usize>) -> Result<()>,
     ) -> Result<()> {
         let counter = u64::from_le_bytes(header[4..12].try_into().expect("counter"));
         if counter != self.counter {
@@ -398,7 +388,7 @@ impl Seal {
                 if messages.len() > crate::wire::MAX_SEGMENT_BYTES + 4 {
                     return Err(Error::new("opened segment exceeds maximum size"));
                 }
-                output(messages, None, &mut self.output_alias)?;
+                output(messages, None)?;
             }
             Some((&LZ4, rest)) => {
                 if rest.len() < 4 {
@@ -408,7 +398,7 @@ impl Seal {
                 if size > crate::wire::MAX_SEGMENT_BYTES + 4 {
                     return Err(Error::new("expanded segment exceeds maximum size"));
                 }
-                output(&rest[4..], Some(size), &mut self.output_alias)?;
+                output(&rest[4..], Some(size))?;
             }
             Some((&other, _)) => {
                 return Err(Error::new(format!("segment {counter} has form {other}")));
@@ -436,7 +426,6 @@ fn append_zeroes(
 fn compress_into_pool(
     input: &[u8],
     out: &mut pool::SegmentedBuffer<'_>,
-    alias: &mut VirtualScratch,
     mut random: impl FnMut() -> u64,
 ) -> Result<usize> {
     let start = out.end();
@@ -445,14 +434,13 @@ fn compress_into_pool(
         let dest = append_contiguous_space(out, bound, &mut random)?;
         lz4_flex::block::compress_into(input, dest)
             .map_err(|e| Error::new(format!("segment did not compress: {e}")))?
-    } else if VirtualScratch::supported() {
+    } else if pool::SegmentedBuffer::alias_supported() {
         append_zeroes(out, bound, &mut random)?;
-        alias
-            .with_write(out, start..start + bound as u64, |dest| {
-                lz4_flex::block::compress_into(input, dest)
-            })
-            .context("compression output alias")?
-            .map_err(|e| Error::new(format!("segment did not compress: {e}")))?
+        out.with_contiguous_write(start..start + bound as u64, |dest| {
+            lz4_flex::block::compress_into(input, dest)
+        })
+        .context("compression output alias")?
+        .map_err(|e| Error::new(format!("segment did not compress: {e}")))?
     } else {
         let bytes = lz4_flex::compress(input);
         out.append(&bytes, &mut random).context("compressed segment append")?;
@@ -577,7 +565,7 @@ mod tests {
                         output.append(b"keep", || allocation_rng.next_u64()).unwrap();
                         let output_start = output.end();
                         sender
-                            .seal_segmented(&input, start..end, &mut output, || {
+                            .seal_segmented(&mut input, start..end, &mut output, || {
                                 allocation_rng.next_u64()
                             })
                             .unwrap();
@@ -629,17 +617,15 @@ mod tests {
                             let mut output = pool::SegmentedBuffer::with_start(&pool, output_start);
                             output.append(b"keep", || rng.next_u64()).unwrap();
                             let start = output.end();
+                            let input_range = input.start()..input.end();
                             sender
-                                .seal_segmented(
-                                    &input,
-                                    input.start()..input.end(),
-                                    &mut output,
-                                    || rng.next_u64(),
-                                )
+                                .seal_segmented(&mut input, input_range, &mut output, || {
+                                    rng.next_u64()
+                                })
                                 .unwrap();
                             assert_eq!(
                                 sender.compression_input.is_empty(),
-                                input_start == 0 || VirtualScratch::supported()
+                                input_start == 0 || pool::SegmentedBuffer::alias_supported()
                             );
                             let mut actual = vec![0; output.len() as usize];
                             output.read_at(output_start, &mut actual).unwrap();
@@ -712,7 +698,7 @@ mod tests {
 
     #[test]
     fn virtual_scratch_handles_maximum_segment_with_unaligned_ends() {
-        if !VirtualScratch::supported() {
+        if !pool::SegmentedBuffer::alias_supported() {
             return;
         }
         let pool =
@@ -730,9 +716,8 @@ mod tests {
         let (mut sender, mut receiver) = pair(&messaging(false, Compress::Lz4));
         let mut output =
             pool::SegmentedBuffer::with_start(&pool, pool::segmented::CHUNK_BYTES as u64 - 2);
-        sender
-            .seal_segmented(&input, input.start()..input.end(), &mut output, || rng.next_u64())
-            .unwrap();
+        let input_range = input.start()..input.end();
+        sender.seal_segmented(&mut input, input_range, &mut output, || rng.next_u64()).unwrap();
         assert!(sender.compression_input.is_empty());
         let mut sealed = vec![0; output.len() as usize];
         output.read_at(output.start(), &mut sealed).unwrap();
@@ -766,8 +751,9 @@ mod tests {
         let mut input = pool::SegmentedBuffer::new(&pool);
         input.append(&bytes, || allocation_rng.next_u64()).unwrap();
         let mut out = pool::SegmentedBuffer::new(&pool);
+        let input_end = input.end();
         sender
-            .seal_segmented(&input, 0..input.end(), &mut out, || allocation_rng.next_u64())
+            .seal_segmented(&mut input, 0..input_end, &mut out, || allocation_rng.next_u64())
             .unwrap();
         assert_eq!(sender.compression_input.capacity(), 0);
     }
@@ -783,7 +769,7 @@ mod tests {
         let (mut sender, _) = pair(&messaging(true, Compress::None));
         assert!(
             sender
-                .seal_segmented(&input, 0..pool::segmented::CHUNK_BYTES as u64, &mut out, || 0)
+                .seal_segmented(&mut input, 0..pool::segmented::CHUNK_BYTES as u64, &mut out, || 0)
                 .is_err()
         );
         let mut prefix = [0; 6];
@@ -791,7 +777,7 @@ mod tests {
         assert_eq!(&prefix, b"prefix");
         assert_eq!(out.end(), 6);
         assert_eq!(sender.counter, 1);
-        sender.seal_segmented(&input, 0..10, &mut out, || 0).unwrap();
+        sender.seal_segmented(&mut input, 0..10, &mut out, || 0).unwrap();
         let mut header = [0; HEADER];
         out.read_at(6, &mut header).unwrap();
         assert_eq!(u64::from_le_bytes(header[4..].try_into().unwrap()), 1);

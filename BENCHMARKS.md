@@ -920,3 +920,422 @@ and failed serialization remains an error through finish/clone/reopen. Existing
 wire compatibility, promotion, exhaustion, forwarding and reader tests pass.
 The wire format is unchanged. Finished payload mutation sites explicitly reopen
 a writer rather than carrying a cursor in every argument.
+
+## ObjectInfo perf after cached writes and compact payloads, 2026-09-24
+
+Compared current cf96712 with a fresh all-Vec 8729d5b run. Reused the earlier
+lightweight detached perf runner: standard 20M objects, flags 23, 16 clients x
+depth 16, three five-second ObjectInfo trials recorded at 199Hz cpu-clock
+without stacks, concurrently collecting task-clock, context switches, migrations,
+and faults. Attach to all FE/DN/SN processes, excluding client/KS/EN. The
+standard BatchObjectInfo trials still run afterward, without profiling.
+Baseline application code is unchanged; only its existing startup KS-readiness
+gate patch is present. Both runs exited 0 after cleanup and all creates and
+lookups succeeded (all lookups answered/found).
+
+Current completed 992,118 profiled ObjectInfo lookups, Vec 1,072,871.
+Aggregate server task-clock per lookup: 171.21us current, 160.43us Vec,
++6.72%. This is consistent with the remaining unprofiled throughput gap.
+The profiled lookup rates themselves were 66,059/s and 71,329/s, with 8.9%
+and 10.2% spreads; instrumentation perturbs throughput. Do not compare these
+rates directly with the normal 82K/88K measurements.
+
+The sample-weighted CPU estimates are 138.51us current and 130.05us Vec
+(+6.51%). They are distinct from task-clock; the following exclusive symbol
+buckets sum to the sampled estimate, not the hardware/software counter total.
+
+| Exclusive sampled CPU, us/ObjectInfo lookup | Vec | Current |
+| --- | ---: | ---: |
+| Kernel, unresolved | 67.77 | 70.57 |
+| libc I/O/syscall wrappers | 11.74 | 12.83 |
+| libc allocation/free | 14.14 | 9.19 |
+| libc copy/zero | 2.90 | 2.91 |
+| Segmented storage/reader path symbols | 0 | 5.85 |
+| MessageBytes methods | 0 | 2.20 |
+| MessagePayload methods | 0 | 0.46 |
+| Named LZ4 methods/adapters | 1.62 | 2.51 |
+| Named crypto methods | 3.66 | 3.53 |
+| Other | 28.22 | 28.47 |
+
+No matching pool allocation-method samples. Segmented storage/reader grouping
+also includes wire Cursor instantiations on SegmentedReader. As with earlier
+profiles, inlining and generic-symbol attribution limit subsystem accounting:
+these are exclusive named-symbol buckets, not inclusive times. No samples were
+lost. Kernel symbols remain unavailable, so the additional kernel cost cannot
+be assigned to particular kernel functions. Approximate sampled per-process
+CPU/lookup: DN 57.66 vs 55.18us, FE 48.86 vs 45.17us, SN 31.99 vs 29.70us
+(current vs Vec). The difference is spread across services, largest in FE.
+
+The old standalone per-field MessageBytes::write/check hot symbols are absent.
+But the current MessageBytes + MessagePayload buckets still total 2.66us:
+work has shifted to slow/setup paths, not disappeared. Named write_slow is
+0.47us, synchronize 0.26us, write_at 0.20us, from_storage 0.16us, finished
+payload conversion 0.21us. The earlier corresponding message-only bucket was
+2.61us (different revision/run; not a precise before/after attribution).
+
+Concrete remaining candidates, no implementation changes in this investigation:
+
+- Retained single-leaf reset and first append: reset/prune/retain total 1.22us,
+  append_slow copying a framed payload 0.70us, plus named insert paths about
+  0.40us. reset always calls prune, which invalidates the tail; append's fast
+  path excludes offset zero. Thus a retained leaf still takes tree setup on
+  its first append. Reader::fill also clears sealed storage after processing,
+  then receive clears it again before the next read. A cheap retained-leaf
+  reset/append path is the strongest next focused experiment.
+- Receive/output initialization still appends zero-filled slices before receiving
+  or compressing. read_exact_from itself samples at 0.59us; direct initialized
+  reservation could avoid setup/copy work. However total copy/zero is equal to
+  Vec, so this profile does not support claiming extra copying is the main gap.
+- Thread-local RNG access remains visible (one named RANDOM closure 0.57us),
+  even though no pool allocation methods sampled. Making TLS lookup lazy as
+  well as number generation is another candidate, not an established saving.
+
+Context switches/lookup: 3.903 current, 3.840 Vec; migrations: 0.491 vs
+0.485; faults: 0.0073 vs 0.0093. Allocation/free is already cheaper than Vec;
+this is not evidence for tuning pool contention or returning to malloc.
+
+Artifacts: `/tmp/delawson-object-perf-cf96712-_o791he5/` and
+`/tmp/delawson-object-perf-vec-repeat-x1fx6v_o/`, each with runner, profile
+wrapper, captures, output, stat counters, symbol/process-period reports, and
+summary.json. Analysis helper: `/tmp/delawson-object-perf-analyze.py`.
+All are temporary files. No application code changed.
+
+## Cheap retained-leaf reset and first append, 2026-09-24
+
+Keep RETAINED_LEAVES at one. SegmentedBuffer::reset now sets start/end to zero
+and retains the root as the append tail without pruning when the sole allocation
+is retained leaf zero. General cleanup still handles larger trees, then primes
+the first retained leaf. Direct append accepts the empty zero-offset cached leaf;
+nonzero block boundaries still find the next leaf. SegmentedWriter also primes
+its writable cache from this retained leaf, avoiding its first-write slow path.
+No block bytes are cleared by reset, and no mappings change.
+
+cargo test --workspace passed, including counters compiled only for tests proving
+that repeated retained-leaf resets bypass prune and first fitting appends bypass
+append_slow. Tests also cover cleanup of a larger tree and verify that a full
+leaf is not overwritten by the next append, including reopening a stream writer
+at that boundary. Existing rolling-buffer, failure, retention and ownership
+audits pass. git diff --check passed.
+
+Standard detached workload, two runs of unchanged code:
+
+| Workload | Previous cf96712 repeat | First run | Repeat |
+| --- | ---: | ---: | ---: |
+| ObjectInfo | 82,012 | 74,566 | 83,601 |
+| BatchObjectInfo | 526,484 | 465,466 | 500,270 |
+
+First ObjectInfo trials: 74,568, 73,477, 75,652 (2.9% spread). First batches:
+443,770, 499,483, 453,144 (12.0%). Repeat ObjectInfo: 85,677, 82,813,
+82,313 (4.0%); repeat batches: 511,619, 486,707, 502,485 (5.0%).
+The repeat ObjectInfo mean is 1.9% above the previous repeat, but between-run
+variation is larger; these measurements do not establish a reliable speedup.
+The requested fast-path behavior is retained and independently tested.
+
+Both runs created all 20M objects, every lookup was answered/found, and cleanup
+completed with status 0. Sample response sizes/counts are unchanged. Logs:
+`/tmp/delawson-object-bench-emxpssub/` and
+`/tmp/delawson-object-bench-x0ui7k53/` (temporary files).
+
+## ObjectInfo perf after cheap reset: CPU versus stalls, 2026-09-24
+
+Profiled the current uncommitted retained-leaf reset/append changes against
+8729d5b twice with matched instrumentation. Standard detached 20M-object workload,
+flags 23, 16 clients x depth 16; only the three ObjectInfo trials are profiled,
+then ordinary BatchObjectInfo trials run. All four runs created all objects,
+answered/found every lookup, and exited 0 after cleanup. Baseline retains only
+its startup readiness patch. No additional application changes in this analysis.
+
+First pair added cycles, instructions, stalled-cycles-frontend and cache-misses
+to the usual task-clock/scheduling counters and 199Hz cpu-clock sampling.
+All counters report 100% runtime coverage. Backend-stall events are unsupported.
+On this Ryzen 7 5825U, perf identifies frontend stalls as stalled cycles during
+issue (idle-cycles-frontend alias, event 0xa9); cache-misses is its generic event
+0x64/umask 0x09. These event counts are clues, not a direct accounting of DRAM
+latency, blocked time, or all possible execution stalls.
+
+| Hardware-counter run, per lookup | Vec | Current | Change |
+| --- | ---: | ---: | ---: |
+| Instructions | 190,550 | 189,169 | -0.7% |
+| Cycles | 348,250 | 363,330 | +4.3% |
+| Frontend-stall events | 136,615 | 152,162 | +11.4% |
+| Cache-miss events | 5,448 | 6,337 | +16.3% |
+| IPC | 0.547 | 0.521 | -4.8% |
+| Server task-clock, us | 190.35 | 196.99 | +3.5% |
+| Context switches | 3.620 | 3.640 | +0.6% |
+
+Current completed 853,031 ObjectInfo lookups; Vec 888,717. Effective counted
+cycles/task-clock implies 1.84GHz current versus 1.83GHz Vec, so a 4GHz
+conversion would not describe these runs. Both use eight cores/16 SMT threads.
+Instruction counts are essentially equal while cycles and cache/stall events
+are higher, consistent with less efficient execution rather than just more
+instructions. CPU time includes stalls while a thread is running; blocked
+socket time and scheduler queue delay are distinct. These captures do not
+measure off-CPU waits directly or prove the cause of the extra cycles.
+
+Hardware counter collection materially perturbed both throughput and sample
+composition (kernel ~95us/lookup and LZ4 ~6us, compared with ~70us/~2us in
+lighter captures). Consequently a second matched pair used the previous
+lighter setup: task-clock/scheduling counters plus 199Hz CPU samples only.
+
+| Lighter run | Vec | Current |
+| --- | ---: | ---: |
+| Completed profiled ObjectInfo lookups | 1,065,978 | 1,012,189 |
+| Task-clock us/lookup | 160.86 | 168.42 |
+| Sample-weighted us/lookup | 127.54 | 137.39 |
+| Context switches/lookup | 3.855 | 3.893 |
+| Migrations/lookup | 0.486 | 0.494 |
+
+Task-clock remains 4.7% higher, so the gap is not purely off-CPU delay.
+The sample estimate is a different estimator (+7.7%); do not add sample buckets
+to the task-clock number. Current vs Vec exclusive samples: kernel 69.83 vs
+66.57us, libc I/O wrappers 12.76 vs 11.64us, allocator 9.70 vs 13.20us,
+copy/zero 2.85 vs 2.99us, segmented storage/reader symbols 4.66 vs zero,
+MessageBytes 1.99 and MessagePayload 0.53 vs zero, LZ4 2.45 vs 1.61,
+crypto 3.89 vs 3.63, other 28.73 vs 27.88us. Kernel symbols remain unresolved;
+socket internals cannot be distinguished from other kernel work. Both user and
+kernel sampled CPU are higher; no basis for attributing the whole gap to sockets.
+No pool allocation-method samples matched.
+
+Targeted symbols before reset change -> after, same lighter profiling setup:
+reset 0.309 -> 0.387us, prune 0.456 -> 0.154, retain 0.451 -> 0.243,
+append_slow 0.704 -> 0.174, insert 0.400 -> 0.065. Combined 2.32 -> 1.02us.
+These exclusive symbol samples confirm substantial removal of slow-path work,
+with residual calls expected for other pruning and multi-leaf operations.
+They are not a controlled estimate of the exact speedup.
+
+Hardware-pair artifacts:
+`/tmp/delawson-object-perf-reset-2or_2b0_/` and
+`/tmp/delawson-object-perf-reset-vec-ow2mliyn/`.
+Lighter-pair artifacts:
+`/tmp/delawson-object-perf-reset-light-8dohe5xe/` and
+`/tmp/delawson-object-perf-reset-light-vec-6vwcb1lt/`.
+Each includes output, status, runner, profile wrapper, perf capture, stat.csv,
+period report and summary.json. Analyzer scripts:
+`/tmp/delawson-object-perf-hardware-analyze.py` and
+`/tmp/delawson-object-perf-analyze.py`. These are temporary files.
+
+## Two retained leaves with the reset fast path, 2026-09-24
+
+Changed only common/src/wire/buffer.rs RETAINED_LEAVES from one to two,
+keeping the uncommitted cheap-reset and first-append changes. Retention remains
+lazy: a buffer that grows to two leaves keeps those leaves and their index
+block (three 64KiB blocks total); one-leaf buffers still keep just one block.
+The existing single-leaf cheap-reset branch still applies while only one leaf
+has been allocated; a retained two-leaf tree uses general reset/prune logic.
+
+Standard detached 20M-object workload, flags 23, 16 clients x depth 16,
+three five-second lookup trials:
+
+| Workload | One leaf, previous repeat | Two leaves | Change |
+| --- | ---: | ---: | ---: |
+| ObjectInfo | 83,601 | 82,498 | -1.3% |
+| BatchObjectInfo | 500,270 | 537,665 | +7.5% |
+
+ObjectInfo trials: 81,968, 82,794, 82,732 (1.0% spread). BatchObjectInfo:
+532,950, 537,197, 542,848 (1.8%). This run is reasonably consistent internally,
+but prior one-leaf sessions varied substantially; no convincing ObjectInfo
+improvement, and the batch result is promising rather than a controlled estimate
+of the gain. All creates completed, all lookups were answered/found, and sample
+response sizes/counts are unchanged. Runner exited 0 after cleanup. Logs:
+`/tmp/delawson-object-bench-v_s6hg5e/` (temporary files).
+
+The focused bounded-retention test passed (including one/two/four retained
+leaves and ownership reclamation), as did git diff --check. The preceding
+full workspace test run covered the unchanged reset/append implementation.
+Leave retention at two leaves for this experiment. No commit yet.
+
+## Four retained leaves, 2026-09-24
+
+Changed only RETAINED_LEAVES from two to four. Full retained capacity is four
+64KiB data leaves plus one index block (320KiB); allocation/retention remains
+lazy. The measured 219,052-byte BatchObjectInfo response fits in four data
+leaves, though a transport batch can contain multiple responses.
+
+Same standard detached workload and three trials:
+
+| Workload | Two leaves | Four leaves | Change |
+| --- | ---: | ---: | ---: |
+| ObjectInfo | 82,498 | 82,447 | -0.1% |
+| BatchObjectInfo | 537,665 | 543,781 | +1.1% |
+
+ObjectInfo trials: 82,253, 82,648, 82,439 (0.5% spread). BatchObjectInfo:
+541,932, 539,678, 549,732 (1.8%). Essentially unchanged ObjectInfo; the small
+batch increase is within the scale of run variability. All 20M creates and
+lookups succeeded, all lookups answered/found, response sizes/counts unchanged,
+runner exited 0 after cleanup. Logs:
+`/tmp/delawson-object-bench-wm9yc9p2/` (temporary files).
+Existing bounded-retention validation covers four leaves; git diff --check
+passed. Leave retention at four for this experiment, uncommitted.
+
+No-op behavior inspected, not changed in this measurement:
+- Reset bypasses prune only for a single retained leaf. A two/four-leaf retained
+  tree still invokes prune/retain, although retain can immediately return the
+  unchanged root without walking/releasing children.
+- VirtualScratch reserves its virtual range persistently but NOT its aliases.
+  Each multi-leaf callback rebuilds aliases using mremap; the callback guard
+  removes them with a fixed PROT_NONE anonymous mmap afterward. Identical leaves
+  on the next call therefore still cause real kernel mapping work. Single-leaf
+  crypto/compression fast paths bypass aliasing. Retention alone does not remove
+  this repeated mapping work; caching aliases requires a separate change.
+
+## Temporary per-segment compressed-size logging, 2026-09-24
+
+With four retained leaves, temporarily added opt-in DELAWSON_LOG_BATCH_SIZES
+logging after successful segmented sealing: plaintext bytes, stored payload
+bytes (LZ4 output or original bytes if uncompressed), final wire bytes, and a
+compression flag. Stored payload excludes the mode byte, optional four-byte
+original length, 12-byte header and 16-byte authentication tag. Wire bytes include
+all of those. A single line describes one sealed transport segment, not one
+object or one application message. Source instrumentation was removed after
+the capture; original and instrumented seal.rs copies are preserved in the run
+directory. Normal source contains no size logger.
+
+Used the standard detached 20M-object benchmark, adding byte-offset phase markers
+for process stderr logs before ObjectInfo, after ObjectInfo and after
+BatchObjectInfo. The statistics below aggregate FE/DN/SN sends in those windows,
+including both requests and responses; exclude client/KS/EN. A phase-boundary
+line may be omitted if only partially written at the marker. All creates and
+lookups succeeded, all lookups answered/found, and cleanup exited 0.
+
+| Phase | Transport segments | Plaintext p99 / max, bytes | Stored payload p99 / max, bytes | Final wire p99 / max, bytes |
+| --- | ---: | ---: | ---: | ---: |
+| ObjectInfo | 1,426,482 | 1,160 / 4,408 | 325 / 1,000 | 358 / 1,033 |
+| BatchObjectInfo | 271,198 | 219,052 / 986,762 | 34,278 / 142,707 | 34,311 / 142,740 |
+
+ObjectInfo: only 12.5% of segments used LZ4 (most fall below the 256-byte
+compression threshold). No plaintext or final wire segment exceeded 64KiB.
+BatchObjectInfo: all observed segments used LZ4. 4.04% of plaintext segments
+exceeded 64KiB, 3.09% exceeded 128KiB, and 0.06% exceeded 256KiB. Only 71
+final wire segments exceeded 64KiB (0.026%), two exceeded 128KiB, none exceeded
+256KiB. Mean final wire sizes: ObjectInfo 164 bytes, BatchObjectInfo 3,411 bytes.
+
+For FE segments containing exactly the known 219,052-byte plaintext response,
+7,577 observations compressed to 33,595–34,900 payload bytes (mean 34,199).
+Thus the usual single BatchObjectInfo response fits one leaf on the wire,
+while its plaintext uses four. FE's largest plaintext batch was 438,104 bytes;
+DN's largest was 986,762. The 219KB response size is not the maximum batch size.
+
+Compressed size alone does not determine mapping/retention requirements:
+compression reads plaintext, decompression writes plaintext, and the current
+compression-output path reserves LZ4's worst-case capacity before truncating to
+actual output size. These can span leaves even when compressed data fits one.
+The ObjectInfo observations suggest multi-leaf aliases are not a frequent path
+there, but this logging run does not prove their rate in normal uninstrumented
+runs or directly count mapping operations.
+
+Logging itself is significant for the small-message phase: ObjectInfo averaged
+26,532/s versus the preceding uninstrumented 82,447/s. BatchObjectInfo averaged
+470,010/s with 15.5% trial spread. Do not use these as performance results.
+Process stderr plus runner output totals about 140.5MiB including startup and
+population, and per-segment logging may alter batching itself. No logging was
+added to BatchObjectInfo's application response formatting.
+
+Artifacts: `/tmp/delawson-batch-size-3qz5i4qe/` contains raw logs, before/after
+phase offsets, original/instrumented source, runner, analyze.py, sizes.json
+(per-role/aggregate mean, p50/p95/p99/max and threshold rates), and analysis.txt.
+All temporary. Existing retention/reset changes remain uncommitted; this task
+adds only this measurement record to the final source diff.
+
+## Buffer-owned persistent aliases, 2026-09-24
+
+Each segmented buffer now owns its optional contiguous alias reservation and
+cached leaf indexes. Normal serialization continues to address pool leaves
+directly; the reservation is created only when a caller requests a contiguous
+alias (the codecs retain their single-leaf fast paths). It initially reserves
+64MiB of virtual address space, growing geometrically when required, without
+allocating extra payload blocks. Callback-scoped borrows prevent concurrent
+mutation/recycling. The mapping travels with its buffer, including sender swaps.
+
+Unchanged requested leaves incur no mmap/mremap/munmap calls. Newly requested or
+changed leaves are mapped, coalescing consecutive backing indexes. Reset retains
+cached aliases; before exposing a view, every requested slot is checked against
+the live tree. Dormant aliases never expose recycled blocks. Reservation growth,
+a changed rolling origin, mapping failure, or unwinding can require rebuilding
+mappings. Destruction releases the reservation before returning the tree's blocks.
+Codec-owned scratch windows were removed. Buffer counts and pipeline scheduling
+are unchanged; this does not implement receive prefetch. Retention remains four
+leaves per message buffer.
+
+Full `cargo test --workspace` passed. Alias tests cover independent buffers,
+swaps, retained reset without mapping calls, suffix growth/replacement, subranges,
+rolling offsets, virtual reservation growth, callback errors/panics, and recovery
+from an injected partial mapping failure. The final suffix-replacement test was
+also rerun separately. Existing wire compatibility and maximum-size tests pass.
+
+Same standard detached 20M-object benchmark, flags 23, 16 clients x depth 16,
+three five-second trials per lookup workload; no temporary batch-size logging.
+
+| Workload | Previous four-leaf retention | Buffer-owned aliases | Change |
+| --- | ---: | ---: | ---: |
+| ObjectInfo | 82,447 | 82,005 | -0.5% |
+| BatchObjectInfo | 543,781 | 558,981 | +2.8% |
+
+ObjectInfo trials: 81,252, 82,423, 82,341 (1.4% spread). Batch trials:
+557,045, 558,489, 561,409 (0.8%). Creation: 1,870,416 objects/sec.
+Every lookup was answered and found; runner status 0 after cleanup. Logs:
+`/tmp/delawson-object-bench-5gf6o4dp/`. This is a sequential-session comparison,
+not proof that the entire modest batch improvement comes from fewer mappings.
+
+## One retained leaf with persistent aliases, 2026-09-24
+
+Changed only `RETAINED_LEAVES` from four to one; buffer-owned alias caching
+remains enabled. Same standard detached 20M-object workload, flags 23,
+16 clients x depth 16, three five-second trials each.
+
+| Workload | Four retained leaves | One retained leaf | Change |
+| --- | ---: | ---: | ---: |
+| ObjectInfo | 82,005 | 82,593 | +0.7% |
+| BatchObjectInfo | 558,981 | 470,486 | -15.8% |
+
+ObjectInfo trials: 82,904, 82,498, 82,378 (0.6% spread), consistent with
+essentially unchanged throughput. Batch trials: 442,269, 455,868, 513,320
+(15.1% spread): materially lower in this session but noisy, so the precise
+regression needs replication. Large batches can again recycle leaves and change
+their cached alias slots; no syscall counts were collected in this run.
+Creation: 1,927,417 objects/sec. All 20M creates completed, every lookup was
+answered and found, and status was 0 after cleanup. Logs:
+`/tmp/delawson-object-bench-xec_zdeu/`. Code remains at one retained leaf.
+
+## ObjectInfo pruning and alias activity, 2026-09-24
+
+Temporary aggregate counters on the one-retained-leaf implementation, using the
+standard detached 20M-object workload. Daemon status snapshots bracketed each
+lookup phase; the benchmark client separately reported its lifetime totals.
+Snapshots include a small amount of status-connection/background activity.
+Counters measured resets, prune calls, prune changes to root/depth/base/allocated
+end, all tree block returns/takes, alias views, and actual alias mapping syscalls.
+No per-message logging. Counter overhead means these are activity measurements,
+not a new clean performance comparison.
+
+Across 1,239,585 successful ObjectInfo lookups (three trials):
+
+| Counter | All daemons | Benchmark client | Total |
+| --- | ---: | ---: | ---: |
+| Reset calls | 18,984,745 | 5,875,512 | 24,860,257 |
+| Prune calls | 4,519,623 | 996,395 | 5,516,018 |
+| Prune tree-geometry changes | 0 | 0 | 0 |
+| Blocks returned | 392 | 196 | 588 |
+| Blocks acquired | 392 | 196 | 588 |
+| Alias views | 0 | 0 | 0 |
+| Alias mmap / mremap / munmap calls | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+Thus ObjectInfo used no alias mapping at all, and its many prune calls made no
+root/depth/base/allocated-range changes. The 588 block returns are all returns,
+including buffer destruction, not 588 pruning events. The pattern is consistent
+with connection creation/destruction: ordinary daemons each acquired/returned
+four blocks for status traffic; FE0 acquired/returned 244; the client 196; KS0
+80 including background traffic. This counter did not separately label frees
+by caller. These data rule out repeated alias remapping as the remaining
+ObjectInfo throughput gap; they do not measure socket or other kernel activity.
+
+BatchObjectInfo exercised the counters heavily: daemons plus client made
+34,410 alias views, 84,353 mremap calls mapping 84,548 leaves, 451 mmap calls,
+and 408 munmap calls; 208,565 blocks were returned and 34,410 prune calls changed
+tree geometry. Its larger buffers therefore do recycle and remap with one leaf
+retained, unlike ObjectInfo.
+
+All creates/lookups succeeded and runner status was 0 after cleanup. Raw logs,
+phase snapshots, original and instrumented source, launcher, and `analysis.json`:
+`/tmp/delawson-prune-counts-a1ewykz_/`. Temporary instrumentation was removed by
+exactly restoring the saved sources; retention remains one leaf. No production
+counter or logging changes remain.

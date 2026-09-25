@@ -6,7 +6,6 @@
 //! The derived maximum depth covers the entire u64 byte-offset space (using u128 internally
 //! for tree spans). The pool's capacity independently limits resident storage.
 mod alias;
-pub use alias::VirtualScratch;
 mod stream;
 pub use stream::{SegmentedReader, SegmentedWriter};
 
@@ -34,9 +33,11 @@ pub type ChunkPool = Pool<CHUNK_BYTES, CHUNK_BYTES>;
 /// completion. This type does not submit I/O or initialize disk padding.
 pub struct SegmentedBuffer<'a> {
     pool: &'a ChunkPool,
+    alias: Option<Box<alias::AliasMapping>>,
     root: u32,
-    // Last initialized leaf, or NONE. Pruning invalidates it before recycling.
-    // At a block boundary append must allocate/find the next leaf instead.
+    // Last initialized leaf, or retained leaf zero after reset, or NONE.
+    // At nonzero block boundaries this still names the previous leaf; append
+    // must allocate/find the next one. Pruning invalidates it before recycling.
     tail: u32,
     depth: u8,
     // Absolute leaf number of the beginning of the root's address range.
@@ -58,6 +59,7 @@ impl<'a> SegmentedBuffer<'a> {
     pub fn with_start(pool: &'a ChunkPool, offset: u64) -> Self {
         Self {
             pool,
+            alias: None,
             root: NONE,
             tail: NONE,
             depth: 0,
@@ -82,7 +84,16 @@ impl<'a> SegmentedBuffer<'a> {
     pub fn reset(&mut self) {
         self.start = 0;
         self.end = 0;
+        if self.retained == 1 && self.depth == 0 && self.base == 0 {
+            // The only allocation is the retained first leaf: nothing to prune,
+            // and no index nodes or mappings to update. Old bytes stay invisible.
+            self.tail = self.root;
+            return;
+        }
         self.prune();
+        if self.retained != 0 {
+            self.tail = self.leaf(0);
+        }
     }
 
     pub fn start(&self) -> u64 {
@@ -217,9 +228,13 @@ impl<'a> SegmentedBuffer<'a> {
             return Ok(());
         }
         let within = self.end as usize % CHUNK_BYTES;
-        if self.tail != NONE && within != 0 && bytes.len() <= CHUNK_BYTES - within {
-            // SAFETY: tail is an owned leaf containing end - 1; pruning invalidates
-            // it before freeing anything. This write stays in that leaf, and the
+        if self.tail != NONE
+            && (within != 0 || self.end == 0)
+            && bytes.len() <= CHUNK_BYTES - within
+        {
+            // SAFETY: tail owns the leaf containing end - 1, or retained leaf zero
+            // after reset. Nonzero boundaries are excluded to avoid overwriting
+            // the previous leaf. This write stays in the cached leaf, and the
             // exclusive borrow prevents source aliasing. Overflow was checked above.
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -235,6 +250,8 @@ impl<'a> SegmentedBuffer<'a> {
     }
 
     fn append_slow(&mut self, bytes: &[u8], mut random: impl FnMut() -> u64) -> Result<()> {
+        #[cfg(test)]
+        tests::APPEND_SLOW_CALLS.with(|count| count.set(count.get() + 1));
         let old_end = self.end;
         self.tail = NONE;
         let mut remaining = bytes;
@@ -426,8 +443,11 @@ impl<'a> SegmentedBuffer<'a> {
     }
 
     fn prune(&mut self) {
+        #[cfg(test)]
+        tests::PRUNE_CALLS.with(|count| count.set(count.get() + 1));
         self.tail = NONE;
         if self.is_empty() && self.retained == 0 {
+            drop(self.alias.take());
             self.release_tree(self.root, self.depth);
             self.root = NONE;
             self.depth = 0;
@@ -461,6 +481,7 @@ impl<'a> SegmentedBuffer<'a> {
 
 impl Drop for SegmentedBuffer<'_> {
     fn drop(&mut self) {
+        drop(self.alias.take());
         self.release_tree(self.root, self.depth);
     }
 }
@@ -545,8 +566,12 @@ mod tests {
             }
         }
         if buffer.tail != NONE {
-            assert!(!buffer.is_empty());
-            assert_eq!(buffer.tail, buffer.leaf((buffer.end - 1) / CHUNK_BYTES as u64));
+            if buffer.end == 0 {
+                assert!(buffer.retained > 0);
+                assert_eq!(buffer.tail, buffer.leaf(0));
+            } else {
+                assert_eq!(buffer.tail, buffer.leaf((buffer.end - 1) / CHUNK_BYTES as u64));
+            }
         }
         let mut seen = HashSet::new();
         walk(buffer, buffer.root, buffer.depth, buffer.base as u128, &mut seen);
@@ -561,6 +586,42 @@ mod tests {
         }
         assert_eq!(held.len(), max, "lost pool blocks");
         assert_eq!(held.iter().map(Block::index).collect::<HashSet<_>>().len(), max);
+    }
+
+    thread_local! {
+        pub(super) static APPEND_SLOW_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        pub(super) static PRUNE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn retained_first_leaf_reset_and_append_skip_slow_paths() {
+        let pool = pool(8);
+        let mut b = SegmentedBuffer::with_retained_leaves(&pool, 1);
+        b.append(&vec![7; CHUNK_BYTES * 2], || 0).unwrap();
+        let first = b.leaf(0);
+        // A large buffer still needs its general cleanup, retaining only leaf zero.
+        b.reset();
+        assert_eq!(audit(&b), 1);
+        assert_eq!(b.tail, first);
+        let calls = APPEND_SLOW_CALLS.get();
+        let prunes = PRUNE_CALLS.get();
+        for _ in 0..3 {
+            b.reset();
+            b.reset(); // already empty
+            assert_eq!(PRUNE_CALLS.get(), prunes);
+            assert!(b.chunk(0).is_none());
+            b.append(&vec![3; CHUNK_BYTES], || panic!("retained allocation")).unwrap();
+            assert_eq!(APPEND_SLOW_CALLS.get(), calls);
+            assert_eq!(b.chunk(0), Some(vec![3; CHUNK_BYTES].as_slice()));
+            assert_eq!(b.tail, first);
+        }
+        // A full leaf's tail must never be mistaken for the NEXT leaf.
+        b.append(&[9], || 0).unwrap();
+        assert_eq!(b.chunk(0), Some(vec![3; CHUNK_BYTES].as_slice()));
+        assert_eq!(b.chunk(CHUNK_BYTES as u64), Some([9].as_slice()));
+        audit(&b);
+        drop(b);
+        all_returned(&pool, 8);
     }
 
     #[test]

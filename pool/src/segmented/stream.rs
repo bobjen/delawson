@@ -194,7 +194,11 @@ impl<'b, 'p, F: FnMut() -> u64> SegmentedWriter<'b, 'p, F> {
 
     fn refresh(&mut self) {
         let within = self.buffer.end() as usize % CHUNK_BYTES;
-        if self.buffer.is_empty() || within == 0 {
+        if self.buffer.end() == 0 && self.buffer.tail != NONE {
+            // reset leaves an owned first leaf ready even though no bytes are live.
+            self.tail = self.buffer.tail;
+            self.spare = CHUNK_BYTES;
+        } else if self.buffer.is_empty() || within == 0 {
             self.tail = NONE;
             self.spare = 0;
         } else {
@@ -515,6 +519,26 @@ mod tests {
         assert!(buffer.reader_range(CHUNK_BYTES as u64 - 4..CHUNK_BYTES as u64 + 1).is_err());
         assert!(buffer.reader_range(CHUNK_BYTES as u64 - 1..CHUNK_BYTES as u64 - 2).is_err());
         assert!(buffer.reader_range(CHUNK_BYTES as u64 - 3..CHUNK_BYTES as u64 + 6).is_err());
+    }
+
+    #[test]
+    fn writer_starts_directly_in_the_retained_leaf() {
+        let pool = pool(8);
+        let mut buffer = SegmentedBuffer::with_retained_leaves(&pool, 1);
+        buffer.append(b"old bytes", || 0).unwrap();
+        buffer.reset();
+        let first = buffer.tail;
+        {
+            let mut writer = buffer.writer(|| panic!("retained allocation"));
+            assert_eq!(writer.tail, first);
+            assert_eq!(writer.spare, CHUNK_BYTES);
+            writer.write_all(&vec![5; CHUNK_BYTES]).unwrap();
+            assert_eq!(writer.spare, 0);
+        }
+        // Reopening at a full-leaf boundary must not reuse the previous leaf.
+        buffer.writer(|| 0).write_u8(9).unwrap();
+        assert_eq!(buffer.chunk(0), Some(vec![5; CHUNK_BYTES].as_slice()));
+        assert_eq!(buffer.chunk(CHUNK_BYTES as u64), Some([9].as_slice()));
     }
 
     #[test]
