@@ -199,7 +199,10 @@ fn main() {
                         let first = (val ^ mask) & mask;
                         let delta = (((val >> shift) & (bucket_count / 2 - 1)) << 1) | 1;
                         let walk = (0..choices).map(|step| (first + step * delta) & mask);
-                        if layout.ends_with("all") && bucket_count == 256 && choices == 4 {
+                        if layout.ends_with("all")
+                            && bucket_count == 256
+                            && choices == pool::DEFAULT_CHOICES
+                        {
                             pool.alloc(val as u64).ok()
                         } else if layout.ends_with("all") {
                             pool.alloc_reclaiming_each(walk).ok()
@@ -267,7 +270,10 @@ fn main() {
                         let first = (val ^ mask) & mask;
                         let delta = (((val >> shift) & (bucket_count / 2 - 1)) << 1) | 1;
                         let walk = (0..choices).map(|step| (first + step * delta) & mask);
-                        if layout.ends_with("all") && bucket_count == 256 && choices == 4 {
+                        if layout.ends_with("all")
+                            && bucket_count == 256
+                            && choices == pool::DEFAULT_CHOICES
+                        {
                             pool.alloc(val as u64).ok()
                         } else if layout.ends_with("all") {
                             pool.alloc_reclaiming_each(walk).ok()

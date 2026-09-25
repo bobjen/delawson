@@ -636,7 +636,7 @@ mod tests {
         assert_eq!(pool.buckets.len(), 256);
         assert_eq!(DEFAULT_CHOICES, 4);
         // random=0 selects 255,0,1,2 with odd delta 1.
-        let held: Vec<_> = (0..4).map(|_| pool.alloc(0).unwrap()).collect();
+        let held: Vec<_> = (0..DEFAULT_CHOICES).map(|_| pool.alloc(0).unwrap()).collect();
         assert_eq!(held.iter().map(Block::index).collect::<Vec<_>>(), [255, 0, 1, 2]);
         assert!(pool.alloc(0).is_err());
         drop(held);

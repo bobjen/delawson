@@ -421,3 +421,60 @@ instance rows; samples are measured after timing, without a compression estimate
 All 20M objects were created in 12.56 seconds; every lookup was answered and
 found. The runner exited 0 after cleanup. Logs:
 `/tmp/delawson-object-bench-8nlzqro9/` (temporary files).
+
+## Two allocation bucket probes, 2026-09-24
+
+Working tree based on `99dc6cc`, reducing `DEFAULT_CHOICES` from four to two.
+Each probed bucket still attempts reclamation; the pool still has 256 buckets.
+64KiB blocks, 32KiB message cutover, 32GiB pool capacity, virtual LZ4 aliases,
+and direct/aliased encryption are unchanged. Same standard 20M-object workload,
+flags 23, 16 clients × depth 16, three lookup trials.
+
+| Workload | Four probes | Two probes | Change |
+| --- | ---: | ---: | ---: |
+| Create, batch 1,000 | 1,592,349 | 1,597,281 | +0.3% |
+| ObjectInfo | 74,858 | 74,844 | -0.02% |
+| BatchObjectInfo, batch 1,000 | 313,604 | 311,960 | -0.5% |
+
+Rates are objects/names per second; lookup rates are three-trial means.
+ObjectInfo trials: 74,519, 75,076, 74,935 (range 74,519–75,076; 0.7% spread).
+Batch trials: 306,780, 312,511, 316,590 (range 306,780–316,590; 3.1% spread).
+This run shows no clear throughput change from reducing the probe count.
+
+All 20M creates completed in 12.52 seconds; every lookup was answered and found.
+All sampled batch responses were 219,052 serialized bytes including the frame,
+with 1,000 objects, 1,000 streams, zero extents and zero instances. ObjectInfo
+samples were 232 bytes with one object and one stream. Pool tests passed, and
+the standalone benchmark compiles; its named probe-count modes were corrected
+to retain their explicit counts when the production default changes.
+The runner exited 0 after cleanup. Logs:
+`/tmp/delawson-object-bench-rnvm0sqi/` (temporary files).
+
+## Eight allocation bucket probes, 2026-09-24
+
+Changed only the allocation probe limit from two to eight, with reclamation at
+each choice. All other settings match the preceding two/four-probe comparison:
+256 buckets, 64KiB blocks, 32KiB cutover, 32GiB cap, and direct/aliased encryption.
+Same standard 20M-object workload, flags 23, 16 clients × depth 16, three trials.
+
+| Workload | Two probes | Four probes | Eight probes | Eight vs four |
+| --- | ---: | ---: | ---: | ---: |
+| Create, batch 1,000 | 1,597,281 | 1,592,349 | 1,594,997 | +0.2% |
+| ObjectInfo | 74,844 | 74,858 | 75,608 | +1.0% |
+| BatchObjectInfo, batch 1,000 | 311,960 | 313,604 | 316,214 | +0.8% |
+
+Rates are objects/names per second; lookup rates are three-trial means.
+ObjectInfo trials: 75,937, 75,488, 75,401 (range 75,401–75,937; 0.7% spread).
+Batch trials: 314,876, 312,025, 321,741 (range 312,025–321,741; 3.1% spread).
+The batch differences across probe counts remain smaller than the observed
+trial spread; these sequential sessions do not demonstrate a clear advantage.
+
+All 20M creates completed in 12.54 seconds; all lookups were answered and found.
+Batch samples remained 219,052 bytes with 1,000 objects, 1,000 streams, zero
+extents and zero instances; ObjectInfo samples were 232 bytes with one object
+and one stream. Pool tests passed. The runner exited 0 after cleanup. Logs:
+`/tmp/delawson-object-bench-s4kztclg/` (temporary files).
+
+After comparing two, four and eight probes, restored the four-probe default.
+The small throughput differences suggest probe count is not a significant
+bottleneck in this workload; they do not isolate every cost of pooled storage.

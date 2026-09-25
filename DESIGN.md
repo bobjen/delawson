@@ -8274,15 +8274,16 @@ those elapsed times are not used in throughput comparisons. All thirty runs had
 zero failures, matching allocation/return counts, and accounting ended at zero live
 handles. Tests also cover two-choice reclaim-each concurrency at 256 buckets.
 
-The selected production default is **256 buckets, up to four choices, reclamation
-at every choice**. Bob preferred fewer retained blocks over the two-choice speed
-advantage. `Pool::new(max, initial)` uses `DEFAULT_BUCKETS = 256`; `alloc(random)`
+The selected default is **256 buckets, up to four choices, reclamation at every
+choice**. End-to-end comparisons of two, four and eight probes showed little
+throughput sensitivity, so the four-choice default was restored. `Pool::new(max, initial)` uses `DEFAULT_BUCKETS = 256`; `alloc(random)`
 takes one u64 from the calling thread's RNG and walks up to `DEFAULT_CHOICES = 4`
 buckets with the odd-delta formula. No RNG is shared or hidden inside the pool.
 Explicit bucket counts and allocation policies remain available for experiments.
 Single-bucket coverage and grace-period tests construct one bucket explicitly.
-The benchmark's default mode is `external256x4all`; both external and inline
-256/four/reclaim-each benchmark modes exercise the selected public `alloc` API.
+The standalone benchmark's default mode remains `external256x4all`. Named modes
+retain their explicit probe counts; the external and inline modes matching
+`DEFAULT_CHOICES` exercise the selected public `alloc` API.
 
 A benchmark-only CPU-first experiment (`external256cpu` / `inline256cpu`) calls
 `sched_getcpu()` on each allocation and starts at that logical CPU number modulo
