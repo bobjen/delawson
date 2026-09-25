@@ -72,7 +72,12 @@ Never interpret failed startup or nonexistent-object lookups as a performance re
 
 Require all 20 million creates to complete and every lookup to be both answered
 and found. An entry limit can produce impressive asking rates with zero answers.
-Report the three-trial mean, range, and spread. The five seconds cover issuing
+Report the three-trial mean, range, and spread. `bench-info` also retains one
+response from client zero at the end of each trial and, after timing, reports its
+serialized byte size (including the four-byte message frame) and returned object,
+stream, extent, and instance counts. These are sampled response rows, not
+transport-batch sizes or aggregate metadata counts for omitted rows. It does
+not estimate compressed size. The five seconds cover issuing
 requests; draining outstanding requests can make elapsed time longer.
 
 Current `bench-info` defaults request detail flags 23 (streams, extents,
@@ -325,3 +330,94 @@ the effect of aliasing from block size and cutover.
 All 20M objects were created in 12.37 seconds; every lookup was answered and
 found. Workspace tests passed. The runner exited 0 after cleanup. Logs:
 `/tmp/delawson-object-bench-qqpsjlu2/` (temporary files).
+
+## 256KiB blocks with virtual scratch aliases, 2026-09-24
+
+Working tree based on `1af9c6c`, changing `CHUNK_BYTES` to 256KiB. Derived
+settings give a 128KiB cutover, 131,072 blocks for the same 32GiB pool cap,
+65,536 indexes per node and maximum tree depth three. Shared mappings and
+virtual scratch aliases remain enabled. Same standard 20M-object workload,
+flags 23, 16 clients × depth 16, three lookup trials.
+
+| Workload | 64KiB aliases, 32KiB cutover | 256KiB aliases, 128KiB cutover | Change |
+| --- | ---: | ---: | ---: |
+| Create, batch 1,000 | 1,617,054 | 1,611,260 | -0.4% |
+| ObjectInfo | 74,354 | 74,194 | -0.2% |
+| BatchObjectInfo, batch 1,000 | 317,932 | 332,502 | +4.6% |
+
+Rates are objects/names per second; lookup rates are three-trial means.
+ObjectInfo trials: 73,407, 74,537, 74,639 (range 73,407–74,639; 1.7% spread).
+Batch trials: 335,120, 330,411, 331,976 (range 330,411–335,120; 1.4% spread).
+Block size and promotion threshold change together, so the comparison does not
+isolate their individual effects.
+
+An index-growth test would allocate over 16GiB of payload plus its pool copy
+at this block size. It now crosses an index boundary using a small rolling
+range and still checks depth-two growth, node reclamation, and return of all
+blocks. Workspace tests passed with this bounded fixture; no additional
+functional failures were observed at 256KiB.
+
+All 20M objects were created in 12.41 seconds; every lookup was answered and
+found. The runner exited 0 after cleanup. Logs:
+`/tmp/delawson-object-bench-xdrvcq6a/` (temporary files).
+
+## BatchObjectInfo response sizes, 2026-09-24
+
+The saved FE logs from previous runs recorded operations, DN fan-out and latency,
+but not response size or metadata row counts. Added an untimed sampled-response
+report to `bench-info` and reran the standard 20M-object workload with 256KiB
+blocks and a 128KiB cutover. All three samples for each workload agreed:
+
+| Sample response | Serialized bytes, including 4-byte frame | Objects | Streams | Extents | Instances |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ObjectInfo | 232 | 1 | 1 | 0 | 0 |
+| BatchObjectInfo, batch 1,000 | 219,052 | 1,000 | 1,000 | 0 | 0 |
+
+The workload creates empty objects; flags 23 request extents/instances/counts,
+but there are no extent or instance rows to return. A single batch response is
+about 214KiB, so it fits in a 256KiB leaf if it starts at the beginning. Packed
+transport batches may still combine multiple responses or start a response
+partway through a leaf. These samples do not establish that all internal RPCs
+or transport compression segments fit one block.
+
+Run rates: create 1,562,928/s (20M in 12.80s), ObjectInfo mean 73,834/s
+(trials 73,076, 74,436, 73,990; 1.8% spread), BatchObjectInfo mean 325,315/s
+(trials 324,117, 322,091, 329,735; 2.3% spread). All lookups were answered
+and found; the runner exited 0 after cleanup. Logs:
+`/tmp/delawson-object-bench-kw92hi0i/` (temporary files). The running binary
+also performed an isolated sealing estimate after timing; that extra estimate
+was removed from the source at the user's request and is not reported here.
+
+## One-shot direct/aliased encryption at 64KiB, 2026-09-24
+
+Restored 64KiB blocks and the derived 32KiB message cutover. Sender encryption
+now calls one-shot in-place AEGIS directly on a single-leaf body, or on a virtual
+alias of a cross-leaf body. The output scratch reservation is reused after LZ4
+releases its alias. Incremental per-leaf encryption remains only as the fallback
+on platforms without compatible shared-page aliases. Receiver decryption was
+already one-shot with contiguous input. The workspace suite passed, including
+ciphertext/tag compatibility across multiple leaves.
+
+Same standard 20M-object workload, flags 23, 16 clients × depth 16, three lookup
+trials, and 32GiB pool cap. Baseline is the preceding 64KiB incremental-encryption
+run, not the intervening 256KiB experiment.
+
+| Workload | 64KiB incremental encryption | 64KiB direct/aliased encryption | Change |
+| --- | ---: | ---: | ---: |
+| Create, batch 1,000 | 1,617,054 | 1,592,349 | -1.5% |
+| ObjectInfo | 74,354 | 74,858 | +0.7% |
+| BatchObjectInfo, batch 1,000 | 317,932 | 313,604 | -1.4% |
+
+Rates are objects/names per second; lookup rates are three-trial means.
+ObjectInfo trials: 74,448, 74,916, 75,210 (range 74,448–75,210; 1.0% spread).
+Batch trials: 313,440, 315,243, 312,131 (range 312,131–315,243; 1.0% spread).
+This sequential comparison shows no throughput improvement from the new
+sender encryption paths.
+
+Every sampled ObjectInfo response was 232 serialized bytes including its frame,
+with one object and one stream. Every sampled BatchObjectInfo response was
+219,052 bytes with 1,000 objects and 1,000 streams. Both had zero extent and
+instance rows; samples are measured after timing, without a compression estimate.
+All 20M objects were created in 12.56 seconds; every lookup was answered and
+found. The runner exited 0 after cleanup. Logs:
+`/tmp/delawson-object-bench-8nlzqro9/` (temporary files).

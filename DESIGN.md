@@ -8472,12 +8472,18 @@ logical end. This does not restore bytes already consumed from the socket.
 TLS retains its own record buffers; its vectored adapter preserves the existing
 send ordering and separate reader/writer locking.
 
-The sender uses incremental AEGIS encryption in place across the outgoing pool
-leaves. The authenticated header, compression marker, nonce sequence, and final
-tag are byte-identical to the one-shot format. There is no contiguous encryption
-input or ciphertext scratch buffer on this path. Uncompressed data is copied
-from input leaves to output leaves, then encrypted there; input batches remain
-unchanged. Allocation failure rolls output back without reusing the nonce.
+The sender uses one-shot in-place AEGIS encryption. A body wholly within one
+outgoing leaf is passed directly to the cipher. A body crossing leaves uses a
+contiguous virtual alias of the same pool blocks, reusing the output scratch
+reservation after compression has released its alias. Only platforms without
+compatible shared-page aliases use the incremental per-leaf fallback. The tag
+is appended after encryption and alias cleanup. The authenticated header,
+compression marker, nonce sequence, and tag are byte-identical to the existing
+format. No encryption payload copy or ciphertext scratch allocation is needed.
+Uncompressed data is copied from input leaves to output leaves, then encrypted
+there; input batches remain unchanged. Allocation or mapping failure rolls
+output back without reusing the nonce. Receive-side authenticated decryption
+already consumes contiguous input from a leaf or a sealed-input virtual alias.
 
 LZ4 input and output choose their contiguous fast paths independently. The
 compression sampler reads its small sample from input leaves. Single-leaf input

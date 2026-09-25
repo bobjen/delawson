@@ -1327,6 +1327,50 @@ fn benchmark_info_found(args: &[Arg]) -> Result<u64> {
     Ok(object.is_some() as u64)
 }
 
+/// Count returned rows in one sampled response, outside the timed window.
+fn report_info_sample(target: &str, response: &Resp) -> Result<()> {
+    let mut framed = Vec::new();
+    common::wire::put_response(&mut framed, response)?;
+    let serialized = framed.len();
+    let mut rows = response.args.as_slice();
+    let batch = matches!(rows.first(), Some(Arg::Struct(Op::BatchResp, _, _)));
+    if batch {
+        rows = Batch::of_args(rows)?.1;
+    }
+    let (mut objects, mut streams, mut extents, mut instances) = (0u64, 0u64, 0u64, 0u64);
+    if response.status == Status::Ok {
+        while !rows.is_empty() {
+            let stream_count = if matches!(rows.first(), Some(Arg::Struct(Op::ShapeResp, _, _))) {
+                let (shape, rest) = Shape::of_args(rows)?;
+                rows = rest;
+                shape.given.number()
+            } else {
+                0
+            };
+            let (object, rest) = Described::of_args(rows)?;
+            objects += object.is_some() as u64;
+            rows = rest;
+            for _ in 0..stream_count {
+                let (stream, rest) = StreamRow::of_args(rows)?;
+                rows = rest;
+                streams += 1;
+                for _ in 0..stream.given.number() {
+                    let (extent, rest) = ExtentRow::of_args(rows)?;
+                    rows = rest;
+                    extents += 1;
+                    instances += extent.disks.len() as u64;
+                }
+            }
+        }
+    }
+    println!(
+        "{target} sample response: {serialized} serialized bytes (including 4-byte frame); \
+         returned {objects} objects, {streams} streams, {extents} extents, {instances} instances; \
+         sampled after timing"
+    );
+    Ok(())
+}
+
 fn info_once(target: &Target, plan: &Objects, messaging: &Messaging, flags: u64) -> Result<f64> {
     let rich = flags != 0;
     if plan.batch == 0 || plan.clients == 0 || plan.depth == 0 || plan.seconds == 0 {
@@ -1344,10 +1388,11 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging, flags: u64)
             let (messaging, prefix) = (Arc::clone(&shared), plan.prefix.clone());
             let (batch, depth, objects, timeout) =
                 (plan.batch, plan.depth, plan.objects, plan.timeout);
-            std::thread::spawn(move || -> Result<(u64, u64, u64, Tally)> {
+            std::thread::spawn(move || -> Result<(u64, u64, u64, Tally, Option<Resp>)> {
                 let mut rng = Rng::from_seed(client as u64 + 1);
                 let mut conn = Conn::open(addr, &identity, timeout, &messaging)?;
                 let mut tally = Tally::new();
+                let mut sample = None;
                 // Three counts, not two: names asked, names the server *looked at*, and objects
                 // that existed. A miss is not a truncation and the report must not confuse them.
                 let (mut asked, mut given, mut found) = (0u64, 0u64, 0u64);
@@ -1417,21 +1462,30 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging, flags: u64)
                             }
                         }
                     }
+                    // Move one existing answer out of the final drain. Parsing
+                    // and re-encoding the sample happen after timing.
+                    if client == 0 && sent.is_empty() && std::time::Instant::now() >= end {
+                        sample = Some(answer);
+                    }
                 }
-                Ok((asked, given, found, tally))
+                Ok((asked, given, found, tally, sample))
             })
         })
         .collect();
 
     let mut total = Tally::new();
+    let mut sample = None;
     let (mut asked, mut given, mut found) = (0, 0, 0);
     for thread in threads {
-        let (mine, seen, hit, tally) =
+        let (mine, seen, hit, tally, response) =
             thread.join().map_err(|_| Error::new("a client panicked"))??;
         asked += mine;
         given += seen;
         found += hit;
         total.merge(&tally);
+        if response.is_some() {
+            sample = response;
+        }
     }
     let seconds = start.elapsed().as_secs_f64();
     println!(
@@ -1462,6 +1516,9 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging, flags: u64)
         total.min.as_secs_f64() * 1e6,
         total.max.as_secs_f64() * 1e6
     );
+    if let Some(response) = sample {
+        report_info_sample(&target.identity, &response)?;
+    }
     Ok(asked as f64 / seconds)
 }
 

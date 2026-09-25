@@ -495,24 +495,29 @@ mod tests {
 
     #[test]
     fn grows_to_depth_two_and_reclaims_index_nodes() {
-        let pool = pool((INDEX_ENTRIES + 6) as u32);
-        let mut b = SegmentedBuffer::new(&pool);
-        let bytes = vec![73; CHUNK_BYTES * (INDEX_ENTRIES + 1)];
+        // Exercise both sides of an index boundary without allocating an
+        // entire index node's worth of data (quadratic in block size).
+        let pool = pool(16);
+        let boundary = (CHUNK_BYTES * INDEX_ENTRIES) as u64;
+        let start = boundary - 2 * CHUNK_BYTES as u64;
+        let mut b = SegmentedBuffer::with_start(&pool, start);
+        let bytes = vec![73; CHUNK_BYTES * 3];
         b.append(&bytes, || 0).unwrap();
         assert_eq!(b.depth(), Some(2));
-        assert_eq!(audit(&b), INDEX_ENTRIES + 4);
-        b.discard_before((CHUNK_BYTES * INDEX_ENTRIES) as u64).unwrap();
+        assert_eq!(audit(&b), 6); // three leaves, two lower indexes, one root
+        b.discard_before(boundary).unwrap();
         assert_eq!(b.depth(), Some(0));
         assert_eq!(audit(&b), 1);
-        assert_eq!(b.chunk((CHUNK_BYTES * INDEX_ENTRIES) as u64).unwrap(), &[73; CHUNK_BYTES]);
+        assert_eq!(b.chunk(boundary).unwrap(), &[73; CHUNK_BYTES]);
+        let end = start + bytes.len() as u64;
         b.clear();
         assert!(b.is_empty());
         assert_eq!(audit(&b), 0);
-        assert_eq!(b.start(), bytes.len() as u64);
+        assert_eq!(b.start(), end);
         b.append(&[12], || 0).unwrap();
-        assert_eq!(b.chunk(bytes.len() as u64), Some(&[12][..]));
+        assert_eq!(b.chunk(end), Some(&[12][..]));
         drop(b);
-        all_returned(&pool, INDEX_ENTRIES + 6);
+        all_returned(&pool, 16);
     }
 
     #[test]

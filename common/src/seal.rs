@@ -209,14 +209,34 @@ impl Seal {
             out.write_at(start, &header).context("sealed segment header")?;
             if let Some(key) = &self.key {
                 let cipher = Aegis128X2::<TAG>::new(key, &self.nonce(counter));
-                let mut encryptor = cipher.encryptor(&header);
-                for chunk in out
-                    .chunks_mut_range(body_start..out.end())
-                    .context("encryption output leaves")?
+                let body_end = out.end();
+                let body_len = (body_end - body_start) as usize;
+                let tag = if out.chunk(body_start).expect("nonempty sealed body").len() == body_len
                 {
-                    encryptor.update_in_place(chunk);
-                }
-                out.append(&encryptor.finalize(), &mut random).context("sealed segment append")?;
+                    // No mapping syscall for a body wholly within one leaf.
+                    let mut chunks = out
+                        .chunks_mut_range(body_start..body_end)
+                        .context("encryption output leaf")?;
+                    cipher.encrypt_in_place(chunks.next().expect("nonempty sealed body"), &header)
+                } else if VirtualScratch::supported() {
+                    // Compression's output alias has already been released, so
+                    // reuse its reservation for a one-shot in-place encryption.
+                    self.output_alias
+                        .with_write(out, body_start..body_end, |body| {
+                            cipher.encrypt_in_place(body, &header)
+                        })
+                        .context("encryption output alias")?
+                } else {
+                    let mut encryptor = cipher.encryptor(&header);
+                    for chunk in out
+                        .chunks_mut_range(body_start..body_end)
+                        .context("encryption output leaves")?
+                    {
+                        encryptor.update_in_place(chunk);
+                    }
+                    encryptor.finalize()
+                };
+                out.append(&tag, &mut random).context("sealed segment append")?;
             }
             Ok(())
         })();
@@ -534,6 +554,7 @@ mod tests {
                         pool::segmented::CHUNK_BYTES - 1,
                         pool::segmented::CHUNK_BYTES,
                         pool::segmented::CHUNK_BYTES + 1,
+                        pool::segmented::CHUNK_BYTES * 3 + 17,
                         35000,
                     ] {
                         let mut rng = crate::random::Rng::from_seed(17);
