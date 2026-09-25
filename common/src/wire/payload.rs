@@ -9,11 +9,11 @@ use std::io::{self, Write};
 /// Serialization errors are retained because StructWriter's field API is infallible.
 pub struct MessageBytes {
     storage: Storage,
-    error: Option<String>,
+    error: Option<Box<String>>,
 }
 enum Storage {
     Small(Vec<u8>),
-    Large(SegmentedBuffer<'static>),
+    Large(Box<SegmentedBuffer<'static>>),
 }
 impl Default for MessageBytes {
     fn default() -> Self {
@@ -24,12 +24,14 @@ impl MessageBytes {
     pub fn new() -> Self {
         Self::default()
     }
+    #[inline]
     pub fn len(&self) -> usize {
         match &self.storage {
             Storage::Small(v) => v.len(),
             Storage::Large(v) => v.len() as usize,
         }
     }
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -43,12 +45,14 @@ impl MessageBytes {
         }
         self.error = None;
     }
+    #[inline]
     pub fn check(&self) -> io::Result<()> {
         match &self.error {
-            Some(e) => Err(io::Error::other(e.clone())),
+            Some(e) => Err(io::Error::other(e.as_str().to_owned())),
             None => Ok(()),
         }
     }
+    #[inline]
     pub fn chunk(&self, offset: usize) -> &[u8] {
         match &self.storage {
             Storage::Small(v) => &v[offset..],
@@ -81,14 +85,16 @@ impl MessageBytes {
         }
         Ok(())
     }
+    #[inline]
     pub fn extend_from_slice(&mut self, bytes: &[u8]) {
         if let Err(e) = self.write_all(bytes) {
-            self.error = Some(e.to_string());
+            self.error = Some(Box::new(e.to_string()));
         }
     }
     pub(super) fn fail(&mut self, error: impl std::fmt::Display) {
-        self.error = Some(error.to_string());
+        self.error = Some(Box::new(error.to_string()));
     }
+    #[inline]
     pub fn push(&mut self, byte: u8) {
         self.extend_from_slice(&[byte]);
     }
@@ -100,6 +106,7 @@ impl MessageBytes {
             }
         }
     }
+    #[inline]
     pub(super) fn append_with_config(
         &mut self,
         bytes: &[u8],
@@ -120,7 +127,7 @@ impl MessageBytes {
             with_random(|rng| large.append(v, || rng.next_u64())).map_err(io::Error::other)?;
             // Do not discard the prefix until both appends succeed.
             with_random(|rng| large.append(bytes, || rng.next_u64())).map_err(io::Error::other)?;
-            self.storage = Storage::Large(large);
+            self.storage = Storage::Large(Box::new(large));
             return Ok(());
         }
         if let Storage::Large(v) = &mut self.storage {
@@ -134,10 +141,15 @@ impl MessageBytes {
     }
 }
 impl Write for MessageBytes {
+    #[inline]
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let config = super::buffer::pool_config();
         self.append_with_config(bytes, config)?;
         Ok(bytes.len())
+    }
+    #[inline]
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.write(bytes).map(|_| ())
     }
     fn flush(&mut self) -> io::Result<()> {
         self.check()
@@ -292,8 +304,10 @@ mod tests {
     #[test]
     fn exhausted_pool_preserves_prefix_and_failed_serialization_is_reported() {
         let pool = Box::leak(Box::new(pool::ChunkPool::new(1, 0).unwrap()));
-        let mut bytes =
-            MessageBytes { storage: Storage::Large(SegmentedBuffer::new(pool)), error: None };
+        let mut bytes = MessageBytes {
+            storage: Storage::Large(Box::new(SegmentedBuffer::new(pool))),
+            error: None,
+        };
         bytes.write_all(b"prefix").unwrap();
         assert!(bytes.write_all(&vec![0; pool::segmented::CHUNK_BYTES * 2]).is_err());
         assert_eq!(bytes.to_vec(), b"prefix");

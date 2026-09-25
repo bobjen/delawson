@@ -478,3 +478,40 @@ and one stream. Pool tests passed. The runner exited 0 after cleanup. Logs:
 After comparing two, four and eight probes, restored the four-probe default.
 The small throughput differences suggest probe count is not a significant
 bottleneck in this workload; they do not isolate every cost of pooled storage.
+
+## Compact message payload layout, 2026-09-24
+
+Working tree based on `7b03736`: keep the small `Vec<u8>` embedded, box the
+large `SegmentedBuffer`, and change the deferred serialization error from
+`Option<String>` to `Option<Box<String>>`. On this machine `MessageBytes`
+shrinks from 64 to 32 bytes, `Arg` from 72 to 40, and `StructWriter` from
+72 to 40; `StructReader` remains 56 bytes. A 3,001-argument batch response's
+argument elements occupy 120,040 rather than 216,072 bytes, excluding payloads
+and spare vector capacity. Small messages incur no new allocation; promotion
+adds one box allocation and recording an error adds one box allocation.
+
+This experiment also includes the pending inline hints on payload access/write
+methods and an explicit all-or-error `Write::write_all` implementation. Thus
+the throughput comparison does not isolate boxing from those changes.
+Workspace tests passed. The common crate alone lacks the workspace-enabled
+`Reply::new_test` test helper; use the workspace test configuration.
+
+Standard workload and storage settings are unchanged: 20M objects, flags 23,
+16 clients by depth 16, 64KiB blocks, 32KiB cutover, and four pool probes.
+First run: create 1,634,213/s; ObjectInfo trials 77,574, 77,737, 75,773
+(mean 77,028/s); BatchObjectInfo trials 271,684, 359,728, 291,625
+(mean 307,679/s, 28.6% spread). Previous four-probe means were 74,858/s
+and 313,604/s respectively. This noisy batch result establishes no speedup.
+Every lookup was answered and found; samples remained 232 bytes for ObjectInfo
+and 219,052 bytes for BatchObjectInfo, with 1,000 objects and streams and no
+extents or instances in the batch. Runner exited 0 after cleanup. Logs:
+`/tmp/delawson-object-bench-a3v70w7r/` (temporary files).
+
+Repeat with identical code: create 1,647,049/s; ObjectInfo trials 75,592,
+76,139, 76,149 (mean 75,960/s, 0.7% spread); BatchObjectInfo trials
+355,481, 363,840, 360,165 (mean 359,829/s, 2.3% spread). The repeat batch
+mean is 14.7% above the preceding four-probe baseline, but the first run's
+variation means that improvement should be treated as provisional. Boxing
+and inlining have not been measured separately. All lookups were answered
+and found, sample sizes/counts were unchanged, and cleanup finished with
+status 0. Logs: `/tmp/delawson-object-bench-dqoszrzs/` (temporary files).
