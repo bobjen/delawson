@@ -274,34 +274,6 @@ macro_rules! name {
             pub created: TimeSec,
         }
 
-        impl $name {
-            pub const ARGS: usize = 3;
-
-            pub fn args(&self) -> Vec<Arg> {
-                vec![
-                    Arg::Number(self.$minter.number()),
-                    Arg::Number(self.$what.number()),
-                    Arg::Number(self.created.number()),
-                ]
-            }
-
-            pub fn of_args(args: &[Arg]) -> Result<($name, &[Arg])> {
-                let [Arg::Number(minter), Arg::Number(id), Arg::Number(created), rest @ ..] = args
-                else {
-                    return Err(Error::new(concat!(
-                        $mints,
-                        " is named by a minter, an id and a second"
-                    )));
-                };
-                let name = $name {
-                    $minter: <$minted>::of_number(*minter)?,
-                    $what: <$what_ty>::of_number(*id)?,
-                    created: TimeSec::new(*created),
-                };
-                Ok((name, rest))
-            }
-        }
-
         impl std::fmt::Display for $name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 write!(
@@ -340,8 +312,6 @@ name!(StreamName, range, RangeId, stream, StreamId, "a stream");
 pub struct Expecting(pub ObjectName);
 
 impl Expecting {
-    pub const ARGS: usize = ObjectName::ARGS;
-
     /// No opinion: whatever the path points at now.
     pub fn whatever() -> Expecting {
         Expecting(ObjectName::default())
@@ -353,10 +323,6 @@ impl Expecting {
 
     pub fn asked(&self) -> bool {
         self.0.object.is_some()
-    }
-
-    pub fn args(&self) -> Vec<Arg> {
-        self.0.args()
     }
 
     pub fn write(&self, payload: &mut StructWriter) {
@@ -375,11 +341,6 @@ impl Expecting {
                 created: payload.time_sec()?,
             }))
         })
-    }
-
-    pub fn of_args(args: &[Arg]) -> Result<(Expecting, &[Arg])> {
-        let (name, rest) = ObjectName::of_args(args)?;
-        Ok((Expecting(name), rest))
     }
 
     /// Whether `found` is the object the caller meant. ⚠️ **True when nothing was asked**, so
@@ -441,34 +402,9 @@ pub struct Totals {
 }
 
 impl Totals {
-    pub const ARGS: usize = 3;
-
     /// Nothing known yet: a stream nobody has asked an SN about.
     pub fn unknown() -> Totals {
         Totals { extents: ExtentId::NONE, logical: SLoff::NONE, compressed: SCoff::NONE }
-    }
-
-    pub fn args(&self) -> Vec<Arg> {
-        vec![
-            Arg::Number(self.extents.number()),
-            Arg::Number(self.logical.number()),
-            Arg::Number(self.compressed.number()),
-        ]
-    }
-
-    pub fn of_args(args: &[Arg]) -> Result<(Totals, &[Arg])> {
-        let [Arg::Number(extents), Arg::Number(logical), Arg::Number(compressed), rest @ ..] = args
-        else {
-            return Err(Error::new("that answer's totals are not totals"));
-        };
-        Ok((
-            Totals {
-                extents: ExtentId::of_number(*extents)?,
-                logical: SLoff::of_number(*logical)?,
-                compressed: SCoff::of_number(*compressed)?,
-            },
-            rest,
-        ))
     }
 
     /// Bytes the user is charged for. ⚠️ See `Filled::physical`: `expansion` is the storage
@@ -503,8 +439,6 @@ pub struct StreamRow {
 }
 
 impl StreamRow {
-    pub const ARGS: usize = 6 + Totals::ARGS;
-
     pub fn args(&self) -> Vec<Arg> {
         vec![self.arg()]
     }
@@ -795,19 +729,6 @@ pub struct Listing {
 }
 
 impl Listing {
-    pub fn args(&self) -> Vec<Arg> {
-        let mut args = vec![
-            Arg::Number(self.limit),
-            Arg::Flag(self.instances),
-            Arg::Number(self.at.len() as u64),
-        ];
-        for (name, from) in &self.at {
-            args.extend(name.args());
-            args.push(Arg::Number(from.number()));
-        }
-        args
-    }
-
     pub fn write_payload(&self, payload: &mut StructWriter) {
         payload.number_u64(self.limit);
         payload.flag(self.instances);
@@ -836,31 +757,6 @@ impl Listing {
             ));
         }
         Ok(Listing { limit, instances, at })
-    }
-
-    pub fn of_args(args: &[Arg]) -> Result<Listing> {
-        let [Arg::Number(limit), Arg::Flag(instances), Arg::Number(count), rest @ ..] = args else {
-            return Err(Error::new("list-extents takes a limit and a run of streams"));
-        };
-        let count = usize::try_from(*count).map_err(|_| Error::new("stream count does not fit"))?;
-        let each = StreamName::ARGS + 1;
-        if rest.len() != count * each {
-            return Err(Error::new(format!(
-                "list-extents says it names {count} streams and carries {}",
-                rest.len() / each
-            )));
-        }
-        let mut at = checked_vec(count, rest.len())?;
-        let mut rest = rest;
-        for _ in 0..count {
-            let (name, after) = StreamName::of_args(rest)?;
-            let [Arg::Number(from), after @ ..] = after else {
-                return Err(Error::new("a stream is named, then the record to start from"));
-            };
-            at.push((name, SRoff::of_number(*from)?));
-            rest = after;
-        }
-        Ok(Listing { limit: *limit, instances: *instances, at })
     }
 }
 
@@ -1001,7 +897,7 @@ mod tests {
         let args = one(1).args();
         assert!(Described::of_args(&args[..0]).is_err());
         let mut ragged = args.clone();
-        ragged.push(Arg::Number(1));
+        ragged.push(StructWriter::new().finish(Op::NumberResp));
         assert!(Described::all_of_args(&ragged).is_err(), "a row and a fragment");
     }
 
@@ -1009,7 +905,7 @@ mod tests {
     #[test]
     fn an_impossible_framing_is_refused() {
         let mut args = one(1).args();
-        let Arg::Struct(_, payload, _) = &mut args[0] else { panic!("a self-contained row") };
+        let payload = &mut args[0].bytes;
         let mut writer = crate::wire::MessageBytes::from(std::mem::take(payload));
         writer.write_at(57, &[99]).unwrap();
         *payload = writer.into();
@@ -1187,7 +1083,7 @@ mod tests {
     #[test]
     fn an_extent_lying_about_its_instances_is_refused() {
         let mut args = extent(1, 0, 40).args();
-        let Arg::Struct(_, payload, _) = &mut args[0] else { panic!("a self-contained extent") };
+        let payload = &mut args[0].bytes;
         let mut writer = crate::wire::MessageBytes::from(std::mem::take(payload));
         writer.write_at(40, &99u32.to_le_bytes()).unwrap();
         *payload = writer.into();

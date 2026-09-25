@@ -1470,16 +1470,19 @@ pub trait Host:
         let Some(id) = target else {
             return Some(error("Raft has no known Raft leader"));
         };
-        let [Arg::Struct(_, payload, depth)] = request.args() else {
+        let [arg] = request.args() else {
             return Some(error("expected structured Raft request"));
         };
+        if arg.is_group() {
+            return Some(error("expected structured Raft request"));
+        }
         Some(
             self.send_raft(
                 &id,
                 Message::Forward {
                     op: request.op().code(),
-                    payload: payload.clone().into(),
-                    depth: *depth,
+                    payload: arg.bytes.clone().into(),
+                    depth: arg.depth,
                 },
             )
             .unwrap_or_else(error),
@@ -1502,7 +1505,7 @@ pub trait Host:
                     let op = Op::from_code(op)?;
                     Ok(self.dispatch_forwarded(
                         process,
-                        &Req { id: 0, payload: Arg::Struct(op, payload.into(), depth) },
+                        &Req { id: 0, payload: Arg::new(op, payload.into(), depth) },
                     ))
                 }
                 Some(Deferred::Read(read)) => Ok(Resp::bytes(read.wait()?)),
@@ -1832,8 +1835,7 @@ pub trait Host:
                 if node.role != Role::Leader {
                     return Err(Error::new("forward target is no longer Raft leader"));
                 }
-                let request =
-                    Req { id: 0, payload: Arg::Struct(op, payload.clone().into(), depth) };
+                let request = Req { id: 0, payload: Arg::new(op, payload.clone().into(), depth) };
                 if !self.forwardable(op) {
                     return Err(Error::new("operation cannot be forwarded through Raft"));
                 }

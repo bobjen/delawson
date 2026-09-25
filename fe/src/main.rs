@@ -903,10 +903,7 @@ impl FE {
                     return reply.send(Resp::error(Status::BadRequest, e.to_string()));
                 }
             };
-            if let Err(e) = payload.done() {
-                return reply.send(Resp::error(Status::BadRequest, e.to_string()));
-            }
-            let include = match read_soft_deleted(rest) {
+            let include = match read_soft_deleted(&mut payload, rest) {
                 Ok(value) => value,
                 Err(error) => {
                     return reply.send(Resp::error(Status::BadRequest, error.to_string()));
@@ -2744,13 +2741,25 @@ mod tests {
             Open::of(
                 SnId::new(0),
                 Framing::Lf,
-                &[Arg::Number(7), Arg::Number(1_000_000), Arg::Number(0), Arg::Number(0)]
+                &[
+                    Arg::new(Op::NumberResp, 7u64.to_le_bytes().to_vec().into(), 1),
+                    Arg::new(Op::NumberResp, 1_000_000u64.to_le_bytes().to_vec().into(), 1),
+                    Arg::new(Op::NumberResp, 0u64.to_le_bytes().to_vec().into(), 1),
+                    Arg::new(Op::NumberResp, 0u64.to_le_bytes().to_vec().into(), 1)
+                ]
             )
             .is_none()
         );
         assert!(
-            Open::of(SnId::new(0), Framing::Lf, &[Arg::Number(7), Arg::Number(1_000_000)])
-                .is_none()
+            Open::of(
+                SnId::new(0),
+                Framing::Lf,
+                &[
+                    Arg::new(Op::NumberResp, 7u64.to_le_bytes().to_vec().into(), 1),
+                    Arg::new(Op::NumberResp, 1_000_000u64.to_le_bytes().to_vec().into(), 1)
+                ]
+            )
+            .is_none()
         );
         assert!(Open::of(SnId::new(0), Framing::Lf, &[]).is_none());
     }

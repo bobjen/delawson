@@ -555,10 +555,6 @@ impl Want {
         }
     }
 
-    /// Minimum arguments a want takes on the wire (RecordThen adds its offset), so a caller sizing or slicing a request does not
-    /// count them itself (§17.13.3).
-    pub const ARGS: usize = 4 + Expecting::ARGS;
-
     /// Nothing beyond the object and its first stream: what every caller asked for before this
     /// field existed.
     pub fn plain() -> Want {
@@ -586,33 +582,6 @@ impl Want {
             .filter(|detail| self.wants(**detail) && built & detail.bit() == 0)
             .map(|detail| detail.as_str())
             .collect()
-    }
-
-    /// The flag field, the limit, the start as a kind and a number, and what object the
-    /// caller believes it is addressing.
-    ///
-    /// ⚠️ **The expectation rides here rather than as a group of its own** (§17.36.1). A
-    /// second optional group after the path would be told from the first only by counting
-    /// arguments, and this document is full of what happens then (§17.19, §17.12). One
-    /// optional group stays one optional group, and a caller with no want and no opinion
-    /// sends neither — so the plain lookup is byte-for-byte what §17.5g measured.
-    pub fn args(&self) -> Vec<Arg> {
-        let (kind, at) = match self.from {
-            Start::Record(record) => (0, record.number()),
-            Start::RecordThen(record, _) => (1, record.number()),
-            Start::Logical(offset) => (2, offset.number()),
-        };
-        let mut args = vec![
-            Arg::Number(self.detail),
-            Arg::Number(self.limit),
-            Arg::Number(kind),
-            Arg::Number(at),
-        ];
-        if let Start::RecordThen(_, offset) = self.from {
-            args.push(Arg::Number(offset.number()));
-        }
-        args.extend(self.expect.args());
-        args
     }
 
     /// Write the want fields into a command-owned payload without per-field wire tags.
@@ -659,47 +628,6 @@ impl Want {
             }
         }
         Ok(want)
-    }
-
-    /// And back. ⚠️ **A bit nothing here defines is not an error**, which is the forward
-    /// compatibility the bitfield exists for: a newer caller may ask for something this build has
-    /// never heard of, and `beyond` is what turns that into an honest refusal naming the rest.
-    pub fn of_args(args: &[Arg]) -> Result<(Want, &[Arg])> {
-        let [
-            Arg::Number(detail),
-            Arg::Number(limit),
-            Arg::Number(kind),
-            Arg::Number(at),
-            rest @ ..,
-        ] = args
-        else {
-            return Err(Error::new("a want takes a detail field, a limit and a start"));
-        };
-        let (offset, rest) = if *kind == 1 {
-            let [Arg::Number(offset), rest @ ..] = rest else {
-                return Err(Error::new("record-then start needs a logical offset"));
-            };
-            (OLoff::of_number(*offset)?, rest)
-        } else {
-            (OLoff::ZERO, rest)
-        };
-        let (expect, rest) = Expecting::of_args(rest)?;
-        let from = match kind {
-            0 => Start::Record(ORoff::new(*at)),
-            1 => Start::RecordThen(ORoff::new(*at), offset),
-            2 => Start::Logical(OLoff::new(*at)),
-            other => return Err(Error::new(format!("no range start of kind {other}"))),
-        };
-        Self::supported_start(from)?;
-        // Normalized on the way in, so nothing downstream has to remember the implications.
-        let mut want = Want { detail: 0, limit: *limit, from, expect };
-        want.detail = *detail;
-        for one in Detail::ALL {
-            if want.wants(*one) {
-                want.detail |= one.implies();
-            }
-        }
-        Ok((want, rest))
     }
 }
 
@@ -805,6 +733,17 @@ impl ObjectPiece {
 mod tests {
     use super::*;
 
+    fn round_trip_want(want: &Want) -> Result<Want> {
+        let mut writer = StructWriter::new();
+        want.write(&mut writer);
+        let args = [writer.finish(Op::ObjectInfo)];
+        let (mut reader, rest) = structure(&args, Op::ObjectInfo, "want")?;
+        assert!(rest.is_empty());
+        let decoded = Want::read(&mut reader)?;
+        reader.done()?;
+        Ok(decoded)
+    }
+
     #[test]
     fn extent_starts_round_trip_in_their_own_space() {
         for start in [
@@ -866,7 +805,7 @@ mod tests {
     fn a_range_is_the_same_width_whichever_kind_it_is() {
         let mut args =
             Range { start: Start::Logical(OLoff::new(9)), budget: Budget::Records(1) }.args();
-        args.push(Arg::Text("and something after it".into()));
+        args.push(StructWriter::new().finish(Op::TextResp));
         let (range, rest) = Range::of_args(&args).expect("a range");
         assert_eq!(range.start, Start::Logical(OLoff::new(9)));
         assert_eq!(rest.len(), 1, "and the rest is whoever's else");
@@ -948,10 +887,8 @@ mod tests {
             assert!(!plain.wants(*detail), "{}", detail.as_str());
         }
         // And it survives the wire as itself.
-        let args = plain.args();
-        let (back, rest) = Want::of_args(&args).expect("a want");
+        let back = round_trip_want(&plain).expect("a want");
         assert_eq!(back, plain);
-        assert!(rest.is_empty());
     }
 
     /// Asking for something that only makes sense with its container brings the container. A
@@ -974,8 +911,8 @@ mod tests {
     /// implications does not produce an answer nobody can interpret.
     #[test]
     fn implications_are_restored_off_the_wire() {
-        let raw = Want { detail: Detail::Instances.bit(), ..Want::plain() }.args();
-        let (want, _) = Want::of_args(&raw).expect("a want");
+        let raw = Want { detail: Detail::Instances.bit(), ..Want::plain() };
+        let want = round_trip_want(&raw).expect("a want");
         assert!(want.wants(Detail::Extents) && want.wants(Detail::Streams));
     }
 
@@ -986,11 +923,6 @@ mod tests {
             Start::Logical(OLoff::new(99)),
         ] {
             let want = Want { from: start, ..Want::plain() };
-            let args = want.args();
-            if let Start::RecordThen(_, offset) = start {
-                assert_eq!(args[4], Arg::Number(offset.number()));
-            }
-            assert!(Want::of_args(&args).unwrap_err().to_string().contains("not supported"));
             let mut writer = StructWriter::new();
             want.write(&mut writer);
             let args = vec![writer.finish(Op::ObjectInfo)];
@@ -998,10 +930,14 @@ mod tests {
             assert!(Want::read(&mut reader).unwrap_err().to_string().contains("not supported"));
             reader.done().unwrap();
         }
-        let mut args =
-            Want { from: Start::RecordThen(ORoff::new(7), OLoff::new(9)), ..Want::plain() }.args();
-        args.truncate(4);
-        assert!(Want::of_args(&args).unwrap_err().to_string().contains("needs a logical offset"));
+        let want = Want { from: Start::RecordThen(ORoff::new(7), OLoff::new(9)), ..Want::plain() };
+        let mut writer = StructWriter::new();
+        want.write(&mut writer);
+        let encoded = writer.finish(Op::ObjectInfo);
+        let short =
+            [Arg::new(Op::ObjectInfo, encoded.bytes.to_vec()[..25].to_vec().into(), encoded.depth)];
+        let (mut reader, _) = structure(&short, Op::ObjectInfo, "want").unwrap();
+        assert!(Want::read(&mut reader).is_err());
     }
 
     /// A bit this build does not know is not an error — that is the forward compatibility the
@@ -1010,8 +946,8 @@ mod tests {
     fn an_unknown_bit_is_reported_rather_than_refused() {
         // ⚠️ Built through the shape, so a field joining a want is a compile error here rather
         // than a raw list that silently stops parsing (§17.36.1 added the expectation).
-        let raw = Want { detail: 1 << 40, ..Want::plain() }.args();
-        let (want, _) = Want::of_args(&raw).expect("an unknown bit parses");
+        let raw = Want { detail: 1 << 40, ..Want::plain() };
+        let want = round_trip_want(&raw).expect("an unknown bit parses");
         assert_eq!(want.beyond(0), Vec::<&str>::new(), "nothing named, so nothing to report");
 
         // And what it does report is only what was asked for and is not built.
@@ -1031,11 +967,16 @@ mod tests {
             from: Start::Record(ORoff::new(9_000)),
             ..Want::plain()
         };
-        let args = want.args();
-        let (back, _) = Want::of_args(&args).expect("a want");
+        let back = round_trip_want(&want).expect("a want");
         assert_eq!(back.limit, 500);
         assert_eq!(back.from, Start::Record(ORoff::new(9_000)));
-        assert!(Want::of_args(&args[..3]).is_err(), "and a short one is refused");
+        let mut writer = StructWriter::new();
+        want.write(&mut writer);
+        let encoded = writer.finish(Op::ObjectInfo);
+        let short =
+            [Arg::new(Op::ObjectInfo, encoded.bytes.to_vec()[..3].to_vec().into(), encoded.depth)];
+        let (mut reader, _) = structure(&short, Op::ObjectInfo, "want").unwrap();
+        assert!(Want::read(&mut reader).is_err(), "and a short one is refused");
     }
 
     /// Blocks are counted in as they arrive, in all three spaces at once — the
@@ -1081,7 +1022,7 @@ mod tests {
         let args = whole.args();
         assert!(Piece::of_args(&args[..0]).is_err(), "no payload");
         let mut ragged = args.clone();
-        ragged.push(Arg::Number(1));
+        ragged.push(StructWriter::new().finish(Op::NumberResp));
         assert!(Piece::all_of_args(&ragged).is_err(), "one whole block and a fragment");
     }
 }

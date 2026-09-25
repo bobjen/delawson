@@ -45,34 +45,6 @@ pub struct Holds {
 }
 
 impl Holds {
-    /// On the wire, as three arguments. Written and read here so that no two
-    /// processes count positions independently — the mistake §17.13.3 records.
-    pub fn args(&self) -> Vec<crate::wire::Arg> {
-        use crate::wire::Arg;
-        vec![
-            Arg::Number(self.compressed.number()),
-            Arg::Number(self.logical.number()),
-            Arg::Number(self.records.number()),
-        ]
-    }
-
-    /// And back, returning whatever followed it.
-    pub fn of_args(args: &[crate::wire::Arg]) -> Result<(Holds, &[crate::wire::Arg])> {
-        use crate::wire::Arg;
-        let [Arg::Number(compressed), Arg::Number(logical), Arg::Number(records), rest @ ..] = args
-        else {
-            return Err(Error::new("a block does not say what it holds"));
-        };
-        Ok((
-            Holds {
-                compressed: ECoff::of_number(*compressed)?,
-                logical: ELoff::of_number(*logical)?,
-                records: ERoff::of_number(*records)?,
-            },
-            rest,
-        ))
-    }
-
     pub fn write(&self, payload: &mut StructWriter) {
         payload.nested(crate::wire::Op::AppendBlock, |payload| {
             payload.ecoff(self.compressed);

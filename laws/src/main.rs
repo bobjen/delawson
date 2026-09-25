@@ -579,16 +579,6 @@ impl Wants {
     }
 }
 
-impl At {
-    fn arg(&self) -> Arg {
-        match (self.record, &self.key) {
-            (Some(n), _) => Arg::Number(n),
-            (_, Some(key)) => Arg::Text(key.clone()),
-            _ => unreachable!("clap requires one of --record and --key"),
-        }
-    }
-}
-
 /// Record bytes: given inline, from a file, or from stdin.
 #[derive(clap::Args)]
 struct Body {
@@ -918,10 +908,7 @@ fn run(cli: Cli) -> Result<()> {
                 // The client asked for a record and gets the block holding it, so it
                 // needs its own question back to find the record in it.
                 (Cmd::Read { framing, at, .. }, Op::ReadRecord) => {
-                    let want = match at.arg() {
-                        Arg::Number(record) => record,
-                        _ => 0,
-                    };
+                    let want = at.record.unwrap_or(0);
                     record(&target, Framing::parse(framing)?, want, &answer)
                 }
                 (_, Op::ObjectInfo | Op::CreateObject) => {
@@ -1306,7 +1293,7 @@ fn benchmark_info_want(flags: u64) -> Want {
 }
 
 fn benchmark_info_found(args: &[Arg]) -> Result<u64> {
-    if matches!(args.first(), Some(Arg::Struct(Op::DescribedResp, _, _))) {
+    if args.first().is_some_and(|arg| arg.op == Op::DescribedResp) {
         let (object, rest) = Described::of_args(args)?;
         if !rest.is_empty() {
             return Err(Error::new("plain object-info answer has trailing arguments"));
@@ -1333,14 +1320,14 @@ fn report_info_sample(target: &str, response: &Resp) -> Result<()> {
     common::wire::put_response(&mut framed, response)?;
     let serialized = framed.len();
     let mut rows = response.args();
-    let batch = matches!(rows.first(), Some(Arg::Struct(Op::BatchResp, _, _)));
+    let batch = rows.first().is_some_and(|arg| arg.op == Op::BatchResp);
     if batch {
         rows = Batch::of_args(rows)?.1;
     }
     let (mut objects, mut streams, mut extents, mut instances) = (0u64, 0u64, 0u64, 0u64);
     if response.status == Status::Ok {
         while !rows.is_empty() {
-            let stream_count = if matches!(rows.first(), Some(Arg::Struct(Op::ShapeResp, _, _))) {
+            let stream_count = if rows.first().is_some_and(|arg| arg.op == Op::ShapeResp) {
                 let (shape, rest) = Shape::of_args(rows)?;
                 rows = rest;
                 shape.given.number()
@@ -2086,8 +2073,8 @@ fn ranged(
 /// Print a response, and fail the process if the service refused.
 fn report(target: &Target, response: &Resp) -> Result<()> {
     for arg in response.args() {
-        match arg {
-            Arg::Struct(Op::TextResp, _, _) => {
+        match arg.op {
+            Op::TextResp => {
                 let (mut payload, rest) =
                     structure(response.args(), Op::TextResp, "a text response")?;
                 let text = payload.text()?;
@@ -2104,7 +2091,7 @@ fn report(target: &Target, response: &Resp) -> Result<()> {
                 }
                 break;
             }
-            Arg::Struct(Op::SnKeyResp, _, _) => {
+            Op::SnKeyResp => {
                 let key = common::wire::SnKey::read(response.args())?;
                 println!("{} current {}", target.identity, common::shamir::hex(&key.current));
                 if let Some((since, key)) = key.next {
@@ -2117,7 +2104,7 @@ fn report(target: &Target, response: &Resp) -> Result<()> {
                 }
                 break;
             }
-            Arg::Struct(Op::LogResp, _bytes, _) => {
+            Op::LogResp => {
                 let (mut payload, rest) =
                     structure(response.args(), Op::LogResp, "a log response")?;
                 if !rest.is_empty() {
@@ -2132,7 +2119,7 @@ fn report(target: &Target, response: &Resp) -> Result<()> {
                 }
                 break;
             }
-            Arg::Struct(Op::RegistryResp, _bytes, _) => {
+            Op::RegistryResp => {
                 let (mut payload, rest) =
                     structure(response.args(), Op::RegistryResp, "a registry response")?;
                 if !rest.is_empty() {
@@ -2145,17 +2132,7 @@ fn report(target: &Target, response: &Resp) -> Result<()> {
                 payload.done()?;
                 break;
             }
-            // A reply that already names its sender does not get named twice.
-            Arg::Text(text) => {
-                for line in text.lines() {
-                    if line.starts_with(&target.identity) {
-                        println!("{line}");
-                    } else {
-                        println!("{} {line}", target.identity);
-                    }
-                }
-            }
-            other => println!("{} {other}", target.identity),
+            _ => println!("{} {arg}", target.identity),
         }
     }
     if response.status == Status::Ok {
@@ -2496,14 +2473,14 @@ fn build(cmd: &Cmd) -> Result<Req> {
         Cmd::Update { path, at, body } => {
             let mut payload = common::wire::StructWriter::new();
             payload.text(path);
-            match at.arg() {
-                Arg::Number(record) => {
+            match (at.record, at.key.as_ref()) {
+                (Some(record), _) => {
                     payload.number_u64(0);
                     payload.number_u64(record);
                 }
-                Arg::Text(key) => {
+                (_, Some(key)) => {
                     payload.number_u64(1);
-                    payload.text(&key);
+                    payload.text(key);
                 }
                 _ => unreachable!(),
             }
@@ -2513,40 +2490,36 @@ fn build(cmd: &Cmd) -> Result<Req> {
         Cmd::DeleteRecord { path, at } => {
             let mut payload = common::wire::StructWriter::new();
             payload.text(path);
-            match at.arg() {
-                Arg::Number(record) => {
+            match (at.record, at.key.as_ref()) {
+                (Some(record), _) => {
                     payload.number_u64(0);
                     payload.number_u64(record);
                 }
-                Arg::Text(key) => {
+                (_, Some(key)) => {
                     payload.number_u64(1);
-                    payload.text(&key);
+                    payload.text(key);
                 }
                 _ => unreachable!(),
             }
             Req::new(Op::DeleteRecord).structure(payload)
         }
         Cmd::Read { path, at, expect, read_soft_deleted, .. } => {
-            let request = match at.arg() {
+            let request = match at.record {
                 // A point read is a range of one record (§9.1.3.6): the block
                 // holding it comes back whole either way, and asking this way means
                 // there is one shape on the read path rather than two.
-                Arg::Number(record) => {
+                Some(record) => {
                     Range { start: Start::Record(ORoff::new(record)), budget: Budget::Records(1) }
                         .request(path, expecting(expect)?)
                 }
                 // A key, which is a keyed read and unbuilt. Sent as it stands so the
                 // answer says so rather than the client guessing.
-                key => {
+                None => {
                     let mut payload = common::wire::StructWriter::new();
                     payload.text(path);
                     expecting(expect)?.write(&mut payload);
                     payload.number_u64(1);
-                    if let Arg::Text(key) = key {
-                        payload.text(&key);
-                    } else {
-                        unreachable!();
-                    }
+                    payload.text(at.key.as_ref().expect("clap requires --record or --key"));
                     Req::new(Op::ReadRecord).structure(payload)
                 }
             };

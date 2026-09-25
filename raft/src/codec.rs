@@ -1,5 +1,5 @@
 //! Tagged binary schema, built with the same readers/writers as service messages.
-use common::wire::{Arg, MAX_FRAME_BYTES, MAX_RECURSION_DEPTH, Op, StructReader, StructWriter};
+use common::wire::{MAX_FRAME_BYTES, MAX_RECURSION_DEPTH, Op, StructReader, StructWriter};
 use common::{Error, Result};
 use std::collections::{BTreeMap, BTreeSet};
 pub trait Wire: Sized {
@@ -9,7 +9,8 @@ pub trait Wire: Sized {
 pub fn encode<T: Wire>(value: &T) -> Result<Vec<u8>> {
     let mut w = StructWriter::new();
     value.write(&mut w);
-    let Arg::Struct(_, bytes, depth) = w.finish(Op::Raft) else { unreachable!() };
+    let arg = w.finish(Op::Raft);
+    let (bytes, depth) = (arg.bytes, arg.depth);
     if bytes.len() >= MAX_FRAME_BYTES || depth > MAX_RECURSION_DEPTH {
         return Err(Error::new("Raft encoding exceeds limits"));
     }
@@ -254,7 +255,8 @@ pub fn decode_message<T: Wire>(bytes: &common::wire::MessagePayload) -> Result<T
 pub fn encode_message<T: Wire>(value: &T) -> Result<common::wire::MessageBytes> {
     let mut writer = StructWriter::new();
     value.write(&mut writer);
-    let Arg::Struct(_, bytes, depth) = writer.finish(Op::Raft) else { unreachable!() };
+    let arg = writer.finish(Op::Raft);
+    let (bytes, depth) = (arg.bytes, arg.depth);
     if bytes.len() >= MAX_FRAME_BYTES || depth > MAX_RECURSION_DEPTH {
         return Err(Error::new("Raft encoding exceeds limits"));
     }

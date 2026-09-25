@@ -449,11 +449,12 @@ mod tests {
     }
     #[test]
     fn wire_scn_is_exactly_eight_bytes() {
-        use crate::wire::{Arg, Op, StructReader, StructWriter};
+        use crate::wire::{Op, StructReader, StructWriter};
         let mut writer = StructWriter::new();
         writer.scn(Scn(0x0102030405060708));
-        let Arg::Struct(_, bytes, depth) = writer.finish(Op::Raft) else { panic!("structure") };
-        let mut reader = StructReader::from_payload(&bytes, depth);
+        let arg = writer.finish(Op::Raft);
+        let bytes = &arg.bytes;
+        let mut reader = StructReader::from_payload(bytes, arg.depth);
         let decoded = reader.scn().unwrap();
         reader.done().unwrap();
         assert_eq!(bytes.to_vec(), [8, 7, 6, 5, 4, 3, 2, 1]);

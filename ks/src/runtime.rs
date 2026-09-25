@@ -23,9 +23,10 @@ impl raft::execution::Application for Registrations {
     }
 }
 fn registration_action(peer: &Peer) -> raft::Action {
-    let common::wire::Arg::Struct(_, bytes, depth) = peer.request().payload else { unreachable!() };
-    let mut fields = vec![depth];
-    bytes.write_to(&mut fields).expect("registration serialization");
+    let arg = peer.request().payload;
+    assert!(!arg.is_group());
+    let mut fields = vec![arg.depth];
+    arg.bytes.write_to(&mut fields).expect("registration serialization");
     raft::Action::new(Op::Register, fields)
 }
 fn registration_peer(action: &raft::Action) -> Result<Peer> {
@@ -37,7 +38,7 @@ fn registration_peer(action: &raft::Action) -> Result<Peer> {
     {
         return Err(Error::new("invalid registration action limits"));
     }
-    Peer::from_args(&[common::wire::Arg::Struct(Op::Register, bytes.to_vec().into(), depth)])
+    Peer::from_args(&[common::wire::Arg::new(Op::Register, bytes.to_vec().into(), depth)])
 }
 fn apply_registration(
     state: &mut Registrations,

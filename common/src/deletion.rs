@@ -2,36 +2,23 @@
 use crate::ids::{DiskId, EnId, ExtentId, SnId};
 use crate::info::StreamName;
 use crate::time::{TimeIntSec32, TimeIntSec64, TimeSec};
-use crate::wire::{Op, Req, Resp, Status, StructWriter, structure};
+use crate::wire::{Arg, Op, Req, Resp, Status, StructReader, StructWriter, structure};
 use crate::{Error, Result};
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-pub fn read_soft_deleted(args: &[crate::wire::Arg]) -> Result<bool> {
-    if args.is_empty() {
-        return Ok(false);
-    }
-    let (mut value, rest) = structure(args, Op::ReadSoftDeleted, "read options")?;
-    let include = value.flag()?;
-    value.done()?;
+pub fn read_soft_deleted(payload: &mut StructReader<'_>, rest: &[Arg]) -> Result<bool> {
     if !rest.is_empty() {
         return Err(Error::new("trailing read options"));
     }
+    let include = if payload.remaining() == 0 { false } else { payload.flag()? };
+    payload.done()?;
     Ok(include)
 }
 
 pub fn with_read_soft_deleted(request: Req, include: bool) -> Req {
-    if include {
-        let mut value = StructWriter::new();
-        value.flag(true);
-        let id = request.id;
-        let op = request.op();
-        let mut args = request.into_args();
-        args.push(value.finish(Op::ReadSoftDeleted));
-        return Req::from_args(op, args).id(id);
-    }
-    request
+    if include { request.flag(true) } else { request }
 }
 
 pub fn bad(error: impl std::fmt::Display) -> Resp {
@@ -842,19 +829,20 @@ mod tests {
                 assert!(Delete::of_with_limit(&request, CAP).is_ok());
                 let original = delete.request().unwrap();
                 let mut args = original.clone().into_args();
-                args.push(Arg::Flag(false));
-                let extra = Req::from_args(original.op(), args);
+                args.push(StructWriter::new().finish(Op::FlagResp));
+                let extra = Req::from_args(Op::CompoundReq, args);
                 assert!(Delete::of(&extra).is_err());
-                let Arg::Struct(op, bytes, depth) = &request.args()[0] else { panic!() };
+                let arg = &request.args()[0];
+                let (op, bytes, depth) = (arg.op, &arg.bytes, arg.depth);
                 for len in 0..bytes.len() {
                     let short = Req {
                         id: 0,
-                        payload: Arg::Struct(*op, bytes.to_vec()[..len].to_vec().into(), *depth),
+                        payload: Arg::new(op, bytes.to_vec()[..len].to_vec().into(), depth),
                     };
                     assert!(Delete::of(&short).is_err(), "accepted truncation at {len}");
                 }
                 let mut trailing = delete.request().unwrap();
-                let Arg::Struct(_, bytes, _) = &mut trailing.payload else { panic!() };
+                let bytes = &mut trailing.payload.bytes;
                 let mut writer = crate::wire::MessageBytes::from(std::mem::take(bytes));
                 writer.push(0);
                 *bytes = writer.into();

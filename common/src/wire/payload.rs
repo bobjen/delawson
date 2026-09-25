@@ -510,7 +510,7 @@ impl Eq for MessageBytes {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{Arg, Op, Req, StructWriter, structure};
+    use crate::wire::{Op, Req, StructWriter, structure};
 
     #[test]
     fn finished_payload_moves_storage_and_commits_cached_writes() {
@@ -673,7 +673,7 @@ mod tests {
             writer.bytes(&vec![7; 9000]);
         });
         let request = Req::new(Op::ReadRecord).structure(writer);
-        let Arg::Struct(_, bytes, _) = &request.args()[0] else { panic!() };
+        let bytes = &request.args()[0].bytes;
         assert!(bytes.is_segmented());
         let mut framed = MessageBytes::new();
         request.encode_to(&mut framed).unwrap();

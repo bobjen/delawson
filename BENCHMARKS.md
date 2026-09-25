@@ -1578,3 +1578,21 @@ Create, batch 1,000: 1,888,953 objects/s. Sampled responses were 235 and
 219,055 serialized bytes, including the four-byte frame. The rates are close
 to the previous response-only run (84,430/s and 548,252/s). Log:
 `/tmp/delawson-object-bench-cvvhf_10/` (temporary files).
+
+## Op-driven payloads, 2026-09-25
+
+`Arg` is a struct with an `Op`; the Op's group trait selects the wire layout,
+so individual values no longer carry a separate kind byte. Optional
+soft-deleted reads put their flag inside the request's positional payload.
+The standard run created all 20M objects, every lookup was answered and found,
+and detached cleanup exited 0.
+
+| Workload | Three-trial mean | Trial range | Spread |
+| --- | ---: | ---: | ---: |
+| ObjectInfo | 84,770/s | 83,991–85,332/s | 1.6% |
+| BatchObjectInfo, batch 1,000 | 538,036/s | 534,014–541,087/s | 1.3% |
+
+Create, batch 1,000: 1,896,121 objects/s. Sampled responses were 231 and
+216,053 serialized bytes, including the four-byte frame. Rates are close to
+the preceding run (83,989/s and 543,410/s). Log:
+`/tmp/delawson-object-bench-exz313s_/` (temporary files).

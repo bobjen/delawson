@@ -1,5 +1,5 @@
 use common::config::BufferPoolConfig;
-use common::wire::{Arg, MessageBytes, Op, Req, StructWriter, configure_message_pool};
+use common::wire::{MessageBytes, Op, Req, StructWriter, configure_message_pool};
 use std::io::Write;
 
 #[test]
@@ -14,7 +14,7 @@ fn process_configuration_controls_payload_and_frame_promotion() {
     for _ in 0..1024 {
         writer.number_u8(1);
     }
-    let Arg::Struct(_, bytes, _) = writer.finish(Op::Ping) else { panic!() };
+    let bytes = writer.finish(Op::Ping).bytes;
     assert!(!bytes.is_segmented());
     let mut bytes = MessageBytes::from(bytes);
     bytes.write_all(&[2]).unwrap();

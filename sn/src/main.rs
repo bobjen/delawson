@@ -823,17 +823,17 @@ impl SN {
                 Ok(value) => value,
                 Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             };
-        let include = match read_soft_deleted(rest) {
-            Ok(value) => value,
-            Err(error) => return bad(error),
-        };
         let name = match stream_name(&mut payload) {
             Ok(name) => name,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let record = match payload.sroff().and_then(|record| payload.done().map(|()| record)) {
+        let record = match payload.sroff() {
             Ok(record) => record,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        let include = match read_soft_deleted(&mut payload, rest) {
+            Ok(value) => value,
+            Err(error) => return bad(error),
         };
         let shard = self.shards[shard_of(name)].lock().expect("streams");
         let Some(held) = shard.get(&name) else {
@@ -897,10 +897,7 @@ impl SN {
             Ok(asked) => asked,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        if let Err(e) = payload.done() {
-            return Resp::error(Status::BadRequest, e.to_string());
-        }
-        let include = match read_soft_deleted(rest) {
+        let include = match read_soft_deleted(&mut payload, rest) {
             Ok(value) => value,
             Err(error) => return bad(error),
         };

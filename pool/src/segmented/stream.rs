@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn scalar_encoding_matches_existing_structure_format() {
-        use common::wire::{Arg, Op, StructReader, StructWriter};
+        use common::wire::{Op, StructReader, StructWriter};
         let mut old = StructWriter::new();
         old.number_u8(7);
         old.nested(Op::Range, |w| {
@@ -664,7 +664,8 @@ mod tests {
             w.number_u64(0x0123456789abcdef);
             w.text("crossing a block");
         });
-        let Arg::Struct(_, expected, depth) = old.finish(Op::Range) else { unreachable!() };
+        let old = old.finish(Op::Range);
+        let (expected, depth) = (old.bytes, old.depth);
         let pool = pool(8);
         for start in 4088..CHUNK_BYTES as u64 + 1 {
             let mut buffer = SegmentedBuffer::with_start(&pool, start);

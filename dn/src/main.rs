@@ -863,10 +863,7 @@ impl Service for DN {
                     Ok(expect) => expect,
                     Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
                 };
-                if let Err(e) = payload.done() {
-                    return reply.send(Resp::error(Status::BadRequest, e.to_string()));
-                }
-                let include = match read_soft_deleted(rest) {
+                let include = match read_soft_deleted(&mut payload, rest) {
                     Ok(value) => value,
                     Err(error) => return reply.send(bad(error)),
                 };
@@ -1866,7 +1863,7 @@ impl DN {
         record: Option<ORoff>,
         reply: Reply,
     ) {
-        let (name, want, include) = if matches!(request.args().first(), Some(Arg::Struct(..))) {
+        let (name, want, include) = if request.args().first().is_some_and(|arg| !arg.is_group()) {
             let (mut payload, rest) =
                 match structure(&request.args(), Op::ObjectInfo, "an object-info request") {
                     Ok(value) => value,
@@ -1892,10 +1889,7 @@ impl DN {
             } else {
                 Want::plain()
             };
-            if let Err(e) = payload.done() {
-                return reply.send(Resp::error(Status::BadRequest, e.to_string()));
-            }
-            let include = match read_soft_deleted(rest) {
+            let include = match read_soft_deleted(&mut payload, rest) {
                 Ok(value) => value,
                 Err(error) => return reply.send(bad(error)),
             };
@@ -3144,7 +3138,12 @@ mod tests {
         assert!(listing.instances);
         assert_eq!(listing.at.len(), 3, "identical requests are not combined");
         assert_eq!(listing.at[0], listing.at[2]);
-        assert_eq!(Listing::of_args(&listing.args()).unwrap(), listing);
+        let mut encoded = common::wire::StructWriter::new();
+        listing.write_payload(&mut encoded);
+        let args = [encoded.finish(Op::ListExtents)];
+        let (mut reader, _) = structure(&args, Op::ListExtents, "listing").unwrap();
+        assert_eq!(Listing::read_payload(&mut reader).unwrap(), listing);
+        reader.done().unwrap();
     }
 
     fn summary_contents(args: &[Arg]) -> (Shape, Vec<(StreamRow, Vec<ExtentRow>)>) {

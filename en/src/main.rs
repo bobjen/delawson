@@ -1588,10 +1588,7 @@ impl EN {
             Ok(range) => range,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        if let Err(e) = payload.done() {
-            return Resp::error(Status::BadRequest, e.to_string());
-        }
-        let include = match read_soft_deleted(rest) {
+        let include = match read_soft_deleted(&mut payload, rest) {
             Ok(value) => value,
             Err(error) => return bad(error),
         };
