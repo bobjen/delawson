@@ -265,6 +265,33 @@ impl<'a> SegmentedBuffer<'a> {
         Ok(())
     }
 
+    /// Raw spare space in the currently initialized tail leaf. Does not allocate.
+    /// The pointer retains the provenance of the whole owned leaf. It remains
+    /// valid until a buffer mutation that can release that leaf. Bytes written
+    /// here are not readable through this buffer until committed below.
+    pub fn spare_tail_ptr(&mut self) -> (*mut u8, usize) {
+        let within = self.end as usize % CHUNK_BYTES;
+        if self.is_empty() || within == 0 {
+            return (std::ptr::NonNull::<u8>::dangling().as_ptr(), 0);
+        }
+        let index = self.leaf(self.end / CHUNK_BYTES as u64);
+        let spare = ((CHUNK_BYTES - within) as u64).min(u64::MAX - self.end) as usize;
+        // SAFETY: within is inside this owned leaf. No reference to spare bytes
+        // is constructed, since they may still be uninitialized.
+        (unsafe { self.ptr(index).add(within) }, spare)
+    }
+
+    /// Make bytes written into the current spare tail part of the live range.
+    ///
+    /// # Safety
+    /// The caller must have initialized the next `count` bytes of the spare tail.
+    /// No borrowed view of those bytes may remain live across this mutation.
+    pub unsafe fn advance_initialized_tail(&mut self, count: usize) {
+        let (_, spare) = self.spare_tail_ptr();
+        assert!(count <= spare, "initialized bytes exceed spare tail");
+        self.end += count as u64;
+    }
+
     /// Borrow the initialized suffix of the leaf containing offset, clipped to
     /// the live range. Returns None for an offset outside start..end.
     pub fn chunk(&self, offset: u64) -> Option<&[u8]> {

@@ -29,7 +29,7 @@ mod buffer;
 mod payload;
 #[cfg(test)]
 mod segmented_tests;
-pub use payload::MessageBytes;
+pub use payload::{MessageBytes, MessagePayload};
 pub fn configure_message_pool(config: crate::config::BufferPoolConfig) -> Result<()> {
     buffer::shared_pool(config).map(|_| ())
 }
@@ -355,11 +355,12 @@ pub enum Arg {
     /// The third value is the maximum tagged-structure depth observed while
     /// constructing this value. It is not serialized separately; the enclosing
     /// message carries the maximum for all of its values.
-    Struct(Op, MessageBytes, u8),
+    // Finished payloads embed Vec metadata, but never the writer's cache.
+    Struct(Op, MessagePayload, u8),
     Text(String),
     Number(u64),
     Flag(bool),
-    Bytes(MessageBytes),
+    Bytes(MessagePayload),
 }
 
 /// Build the self-contained payload of one tagged structure.
@@ -511,26 +512,26 @@ impl StructWriter {
     }
 
     pub fn finish(self, op: Op) -> Arg {
-        Arg::Struct(op, self.bytes, self.maximum_depth)
+        Arg::Struct(op, self.bytes.into(), self.maximum_depth)
     }
 }
 
 /// Read the self-contained payload of one tagged structure.
 enum StructureInput<'a> {
     Slice(&'a [u8]),
-    Message(&'a MessageBytes),
+    Payload(&'a MessagePayload),
 }
 impl<'a> StructureInput<'a> {
     fn len(&self) -> usize {
         match self {
             Self::Slice(b) => b.len(),
-            Self::Message(b) => b.len(),
+            Self::Payload(b) => b.len(),
         }
     }
     fn chunk(&self, at: usize) -> &'a [u8] {
         match self {
             Self::Slice(b) => &b[at..],
-            Self::Message(b) => b.chunk(at),
+            Self::Payload(b) => b.chunk(at),
         }
     }
 }
@@ -555,9 +556,9 @@ impl<'a> StructReader<'a> {
         }
     }
 
-    pub fn from_message(bytes: &'a MessageBytes, maximum_depth: u8) -> StructReader<'a> {
+    pub fn from_payload(bytes: &'a MessagePayload, maximum_depth: u8) -> StructReader<'a> {
         StructReader {
-            bytes: StructureInput::Message(bytes),
+            bytes: StructureInput::Payload(bytes),
             current: bytes.chunk(0),
             at: 0,
             depth: 1,
@@ -590,7 +591,7 @@ impl<'a> StructReader<'a> {
     }
 
     fn read_into(&mut self, mut out: &mut [u8]) -> Result<()> {
-        if let StructureInput::Message(bytes) = &self.bytes {
+        if let StructureInput::Payload(bytes) = &self.bytes {
             bytes.check()?;
         }
         if out.len() > self.remaining() {
@@ -729,7 +730,7 @@ impl<'a> StructReader<'a> {
 
     /// Read an owned serialized field without flattening large fields.
     pub fn raw_message_bytes(&mut self, length: usize) -> Result<MessageBytes> {
-        if let StructureInput::Message(bytes) = &self.bytes {
+        if let StructureInput::Payload(bytes) = &self.bytes {
             bytes.check()?;
         }
         if length > self.remaining() {
@@ -801,7 +802,7 @@ impl<'a> StructReader<'a> {
     }
 
     pub fn done(&self) -> Result<()> {
-        if let StructureInput::Message(bytes) = &self.bytes {
+        if let StructureInput::Payload(bytes) = &self.bytes {
             bytes.check()?;
         }
         if self.at == self.bytes.len() {
@@ -824,7 +825,7 @@ pub fn structure<'a>(
         return Err(Error::new(format!("expected {expected}, got {actual}")));
     }
     bytes.check()?;
-    Ok((StructReader::from_message(bytes, *maximum_depth), rest))
+    Ok((StructReader::from_payload(bytes, *maximum_depth), rest))
 }
 
 impl std::fmt::Display for Arg {
@@ -881,7 +882,7 @@ impl Req {
     }
 
     pub fn bytes(mut self, bytes: impl Into<MessageBytes>) -> Req {
-        self.args.push(Arg::Bytes(bytes.into()));
+        self.args.push(Arg::Bytes(bytes.into().into()));
         self
     }
 
@@ -930,7 +931,7 @@ impl Req {
         }
         let count = reader.u16()?;
         let args = if count == COMMAND_PAYLOAD {
-            vec![Arg::Struct(op, reader.take(reader.remaining)?, maximum_depth)]
+            vec![Arg::Struct(op, reader.take(reader.remaining)?.into(), maximum_depth)]
         } else {
             reader.args_with_count_and_depth(count, maximum_depth)?
         };
@@ -1432,12 +1433,12 @@ impl<R: BufRead> Cursor<R> {
                 2 => Arg::Flag(self.u8()? != 0),
                 3 => {
                     let len = self.u32()? as usize;
-                    Arg::Bytes(self.take(len)?)
+                    Arg::Bytes(self.take(len)?.into())
                 }
                 4 => {
                     let op = Op::from_code(self.u16()?)?;
                     let len = self.u32()? as usize;
-                    Arg::Struct(op, self.take(len)?, maximum_depth)
+                    Arg::Struct(op, self.take(len)?.into(), maximum_depth)
                 }
                 tag => return Err(Error::new(format!("unknown argument tag {tag}"))),
             });

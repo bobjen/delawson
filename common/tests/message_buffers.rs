@@ -16,7 +16,7 @@ fn process_configuration_controls_payload_and_frame_promotion() {
     }
     let Arg::Struct(_, bytes, _) = writer.finish(Op::Ping) else { panic!() };
     assert!(!bytes.is_segmented());
-    let mut bytes = bytes;
+    let mut bytes = MessageBytes::from(bytes);
     bytes.write_all(&[2]).unwrap();
     assert!(bytes.is_segmented());
     let mut framed = MessageBytes::new();

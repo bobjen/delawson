@@ -12,6 +12,10 @@ use std::sync::OnceLock;
 const RETAINED_LEAVES: u32 = 1;
 
 static POOL: OnceLock<Result<(BufferPoolConfig, ChunkPool)>> = OnceLock::new();
+// A cached small-write limit is safe only after the process configuration is fixed.
+pub(super) fn configured_pool() -> Option<BufferPoolConfig> {
+    POOL.get().and_then(|p| p.as_ref().ok()).map(|p| p.0)
+}
 pub(super) fn pool_config() -> BufferPoolConfig {
     POOL.get().and_then(|p| p.as_ref().ok()).map_or_else(BufferPoolConfig::default, |p| p.0)
 }

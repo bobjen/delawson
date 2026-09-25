@@ -237,13 +237,13 @@ mod tests {
 }
 
 /// Decode a message payload directly across its pool leaves.
-pub fn decode_message<T: Wire>(bytes: &common::wire::MessageBytes) -> Result<T> {
+pub fn decode_message<T: Wire>(bytes: &common::wire::MessagePayload) -> Result<T> {
     bytes.check()?;
     let depth = *bytes.chunk(0).first().ok_or_else(|| Error::new("empty Raft encoding"))?;
     if depth == 0 || depth > MAX_RECURSION_DEPTH || bytes.len() > MAX_FRAME_BYTES {
         return Err(Error::new("invalid Raft encoding limits"));
     }
-    let mut r = StructReader::from_message(bytes, depth);
+    let mut r = StructReader::from_payload(bytes, depth);
     r.number_u8()?;
     let value = T::read(&mut r)?;
     r.done()?;
@@ -292,7 +292,7 @@ mod message_storage_tests {
         let size = common::config::BufferPoolConfig::default().small_message_bytes * 3;
         let bytes: Vec<u8> = (0..size).map(|i| i as u8).collect();
         let payload = common::wire::MessageBytes::from(bytes.clone());
-        let encoded = encode_message(&payload).unwrap();
+        let encoded: common::wire::MessagePayload = encode_message(&payload).unwrap().into();
         assert!(encoded.is_segmented());
         assert_eq!(encoded.to_vec(), encode(&bytes).unwrap());
         let decoded: common::wire::MessageBytes = decode_message(&encoded).unwrap();

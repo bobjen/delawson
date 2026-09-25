@@ -705,3 +705,218 @@ small enough that these sequential trials do not establish a clear advantage.
 All lookups were answered and found, samples were unchanged, and cleanup
 finished with status 0. Logs: `/tmp/delawson-object-bench-ketj7a81/`.
 Leave one retained leaf per buffer and the scalar-I/O fast path enabled.
+
+## ObjectInfo perf after retention and scalar I/O, 2026-09-24
+
+Compared `a2f4327` with all-Vec `8729d5b`, using the same standard detached
+20M-object workload and profiling only the three ObjectInfo trials. Both runs
+attach to FE/DN/SN processes, excluding the client, KS and EN. Record 199Hz
+cpu-clock instruction-pointer samples without stack dumps; concurrently collect
+perf stat task-clock, context-switches, CPU migrations and page faults. The
+baseline still has only the startup KS-readiness gate adjustment.
+
+Current completed 982,481 profiled lookups; Vec completed 1,072,689. Despite
+omitting stacks, counter collection still perturbed throughput, so compare the
+matched instrumented runs, not their rates against normal benchmarks. Perf stat
+measured 173.45us aggregate server task-clock per current lookup versus 159.94us
+for Vec (+8.4%). Sample-weighted CPU estimates are lower (139.71us versus
+128.66us, +8.6%); these are distinct estimators, and the rows below sum to the
+sampled estimate, not task-clock. Kernel symbols remain unavailable.
+
+| Exclusive sampled CPU, us/ObjectInfo lookup | Vec | Current |
+| --- | ---: | ---: |
+| Kernel, unresolved | 66.73 | 70.13 |
+| libc I/O/syscall wrappers | 11.13 | 12.38 |
+| libc allocation/free | 13.72 | 9.46 |
+| libc copy/zero | 2.98 | 3.31 |
+| Pool allocation methods | 0 | 0 |
+| Segmented buffer/reader methods | 0 | 5.09 |
+| MessageBytes methods | 0 | 2.61 |
+| Named LZ4 methods | 1.57 | 2.38 |
+| Named crypto methods | 3.72 | 3.57 |
+| Other | 28.82 | 30.76 |
+
+As before, symbol buckets are exclusive, not inclusive subsystem timings;
+inlined work can be charged elsewhere. Zero means no matching samples. There
+were no pool allocation-method samples in the current capture: retaining one
+leaf has removed that previous visible cost for this workload.
+
+Specific remaining candidates, not changed during this investigation:
+
+- `MessageBytes::write` and `check` account for 1.22us and 0.78us per lookup
+  respectively; the whole named MessageBytes group is 2.61us. Tightening the
+  small-Vec write path and keeping promotion/error machinery cold is a more
+  targeted next experiment than another pool change.
+- `SegmentedBuffer::{reset,prune,retain}` together account for 1.27us per
+  lookup; append_slow when copying a framed response into the batch accounts
+  for another 0.73us. A reset invalidates the tail cache even when keeping
+  leaf zero, so the first append still calls ensure_leaf/insert. Wire sending
+  and receiving also reset buffers that are commonly already reset. Avoiding
+  redundant reset/pruning and cheaply reusing the first retained leaf may help.
+- The buffer receive and compression-output paths still initialize zero slices
+  and append-copy them into leaves. A direct zero-fill/reservation operation
+  could avoid a pass, though sampled copy/zero is only 0.34us higher than Vec.
+
+The existing scalar field parser already checks the minimum of current chunk
+and message remainder. Decryption and LZ4 already have single-leaf paths. These
+profiles do not justify adding a second deserializer merely to avoid boundaries.
+
+Context switches per lookup were 3.939 current versus 3.833 Vec; migrations
+0.498 versus 0.472; faults 0.0076 versus 0.0086. Scheduling/socket overhead is
+large in both, with only modest differences in these counters. This does not
+identify which kernel functions account for the additional sampled time.
+Logging/ZSTD/formatting named self samples were about 4.81us current and 5.06us
+Vec, another common cost rather than an explanation of the regression.
+
+All lookup results in both workloads were answered and found, and both runners
+completed cleanup with status 0. No application code changed. Captures, exact
+period reports, stat counters and JSON summaries (temporary files):
+`/tmp/delawson-object-perf-light-current-fjo1pdad/` and
+`/tmp/delawson-object-perf-light-vec-_xdno6m9/`.
+
+## Small-Vec append fast path, 2026-09-24
+
+Working tree based on `a2f4327`. Isolate a short inline successful Small(Vec)
+append path in MessageBytes: check the stored-error flag, dispatch to the Vec,
+check addition and the unchanged promotion threshold, then extend. Promotion
+and already-segmented writes move into a non-inlined helper; constructing a
+stored I/O error moves into a cold helper. Bounds checks, promotion, storage
+representation and wire format are unchanged. Both before and after already
+use Vec for small payloads; this tests wrapper/code-generation overhead, not
+an intrinsic advantage of Vec storage over a contiguous pool leaf.
+
+Workspace tests passed, including threshold promotion, cross-block round trips
+and failure/rollback coverage. Same standard detached benchmark, one retained
+leaf per connection buffer and scalar I/O enabled:
+
+| Workload | Preceding baseline | Small-Vec fast path | Change |
+| --- | ---: | ---: | ---: |
+| ObjectInfo/s | 80,596 | 82,507 | +2.4% |
+| BatchObjectInfo/s | 470,620 | 501,688 | +6.6% |
+
+ObjectInfo trials: 81,588 / 82,478 / 83,455 (2.3% spread). Batch trials:
+499,734 / 500,682 / 504,649 (1.0% spread). These are sequential sessions,
+so the modest ObjectInfo improvement especially should not be treated as a
+precise causal estimate. Every lookup was answered and found, sample sizes and
+row counts were unchanged, and cleanup completed with status 0. Logs:
+`/tmp/delawson-object-bench-wna0ttdp/` (temporary files).
+
+Generated-code evidence: the cached pre-change DN binary from the last perf
+run (build ID ab8f23ee7f462fe09f4600affdfb8bb71a58d0d4) contains separate
+MessageBytes::write functions of 1,599/1,648 bytes and check functions of
+235 bytes. The experimental DN binary has no separate write/check symbols;
+its remaining write_all instances are 172/225 bytes, versus 1,741 bytes for
+the previous write_all instance. Function sizes are not executed-instruction
+counts, but support the explanation that outlining the uncommon work allowed
+a substantially smaller hot path. The underlying byte copy is unchanged.
+
+## Cached writable span for MessageBytes, 2026-09-24
+
+On top of the preceding small-Vec experiment, ordinary writes now compare
+against a cached allowance, copy to a cached pointer, and advance the pointer,
+logical length, and allowance. Growth, promotion, leaf transitions, and stored
+errors use a separate slow routine. Backing lengths synchronize on slow
+mutations; reads also expose initialized bytes written through the cache.
+
+Same standard detached workload, 20M objects, flags 23, 16 clients x depth 16.
+
+| Workload | Preceding small-Vec path | Cached span | Change |
+| --- | ---: | ---: | ---: |
+| ObjectInfo | 82,507 | 80,750 | -2.1% |
+| BatchObjectInfo | 501,688 | 513,041 | +2.3% |
+
+ObjectInfo trials: 80,571, 80,845, 80,833 (0.3% spread). BatchObjectInfo:
+511,407, 515,759, 511,958 (0.8%). Create: 1,927,875 objects/sec.
+All creates completed and every lookup was answered and found. Sample
+responses remain 232 bytes (one object/stream) and 219,052 bytes (1,000
+objects/streams), including framing, with no extent or instance rows.
+The runner exited 0 after cleanup. Logs:
+`/tmp/delawson-object-bench-pn_4cv2u/` (temporary files).
+These sequential sessions show a mixed result, not a universal improvement.
+
+Layout matters: MessageBytes grew from 32 to 56 bytes, Arg from 40 to 64,
+and StructWriter from 40 to 64. The existing Arg variants embed MessageBytes;
+the earlier boxing change boxed its SegmentedBuffer and error internally,
+not MessageBytes itself. Thus the new cache also enlarges every Arg. This
+must not be mistaken for a comparison holding argument size constant.
+
+Validation: cargo test --workspace passed. New tests cover cached writes read
+before backing-length synchronization, clone/move across threads, leaf
+crossings against a contiguous model, truncation, patching, clearing, and
+stored errors (including empty writes). Existing exhaustion and round-trip
+tests also pass. No wire-format change.
+
+## Move payload indirection to Arg, 2026-09-24
+
+Keep the cached writable span, but change Arg::Struct/Bytes to own
+Box<MessageBytes>, and keep SegmentedBuffer inline in MessageBytes's Large
+variant. Small payloads still use the Vec variant. Arg is now 24 bytes,
+MessageBytes 96, StructWriter 104, and StructReader remains 56. In particular,
+adding metadata to MessageBytes no longer increases the size of every Arg.
+
+Two standard detached runs, with no code change between them:
+
+| Workload | Cached span, inline payload | Boxed payload | Boxed payload repeat |
+| --- | ---: | ---: | ---: |
+| ObjectInfo | 80,750 | 81,727 | 81,457 |
+| BatchObjectInfo | 513,041 | 351,797 | 408,751 |
+
+First ObjectInfo trials: 81,823, 81,610, 81,747 (0.3% spread); batches:
+317,479, 328,476, 409,436 (26.1%). Repeat ObjectInfo: 80,709, 81,950,
+81,712 (1.5%); batches: 395,469, 409,444, 421,340 (6.3%).
+The batch slowdown repeats, although its magnitude is noisy. Described-object
+and stream rows are themselves Arg::Struct values, so boxing adds one heap
+allocation per such small payload; this is a plausible explanation, not a
+profiled attribution. No automatic reversion: the requested layout is retained.
+
+Both runs created all 20M objects, every lookup was answered/found, and both
+runners exited 0 after cleanup. Sample response sizes and row counts are
+unchanged. Logs: `/tmp/delawson-object-bench-ivs4miiq/` and
+`/tmp/delawson-object-bench-zqm0a8bz/` (temporary files).
+Workspace tests passed after updating constructors and forwarding ownership;
+wire encoding is unchanged.
+
+## Inline small finished payloads, 2026-09-24
+
+Separate mutable MessageBytes (including its cached writable span) from finished
+MessagePayload. Arg embeds the latter: a compact enum holding inline Vec metadata,
+a boxed SegmentedBuffer, or a boxed failed writer on the error path. The helper
+enum keeps the existing Struct/Bytes argument variants without another heap
+allocation. Finishing moves the Vec or tree and commits cached writes without
+copying payload bytes; reopening a finished payload moves the same storage back
+into a writer. Successful finished payloads carry no write cursor or error slot.
+
+Measured sizes: MessagePayload 24 bytes, Arg 32, MessageBytes 96,
+StructWriter 104, StructReader 56. Compared with boxing every MessageBytes,
+Arg grows from 24 to 32 bytes but small rows no longer allocate a payload box.
+Compared with embedding the cached MessageBytes, Arg shrinks from 64 to 32.
+
+Same standard detached 20M-object workload, flags 23, 16 clients x depth 16,
+three five-second trials of each lookup batch size:
+
+| Workload | Box every payload (repeat) | Inline small, first | Inline small, repeat |
+| --- | ---: | ---: | ---: |
+| ObjectInfo | 81,457 | 81,764 | 82,012 |
+| BatchObjectInfo | 408,751 | 457,868 | 526,484 |
+
+First ObjectInfo trials: 80,834, 82,857, 81,601 (2.5% spread). First batches:
+418,902, 510,312, 444,389 (20.0%); this spread motivated repeating unchanged
+code. Repeat ObjectInfo: 81,440, 82,416, 82,179 (1.2%). Repeat batches:
+527,487, 525,899, 526,066 (0.3%). The repeat recovers the batch slowdown;
+it is also 2.6% above the earlier 513,041 cached-span/inline-writer result,
+but session variability prevents a strong claim about that smaller difference.
+
+Both runs created all 20M objects and every lookup was answered and found.
+Sample responses remain 232 bytes with one object/stream and 219,052 bytes
+with 1,000 objects/streams, including framing and with zero extent/instance
+rows. Both detached runners exited 0 after cleanup. Logs:
+`/tmp/delawson-object-bench-d5jayp6e/` and
+`/tmp/delawson-object-bench-_nph0pk6/` (temporary files).
+
+Validation: cargo test --workspace and git diff --check passed. New tests
+verify storage pointers remain unchanged when finishing/reopening small and
+segmented payloads, cached tail bytes become visible, cloning preserves bytes,
+and failed serialization remains an error through finish/clone/reopen. Existing
+wire compatibility, promotion, exhaustion, forwarding and reader tests pass.
+The wire format is unchanged. Finished payload mutation sites explicitly reopen
+a writer rather than carrying a cursor in every argument.

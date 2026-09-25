@@ -851,7 +851,9 @@ mod tests {
                 }
                 let mut trailing = delete.request().unwrap();
                 let Arg::Struct(_, bytes, _) = &mut trailing.args[0] else { panic!() };
-                bytes.push(0);
+                let mut writer = crate::wire::MessageBytes::from(std::mem::take(bytes));
+                writer.push(0);
+                *bytes = writer.into();
                 assert!(Delete::of(&trailing).is_err());
             }
         }

@@ -453,7 +453,7 @@ mod tests {
         let mut writer = StructWriter::new();
         writer.scn(Scn(0x0102030405060708));
         let Arg::Struct(_, bytes, depth) = writer.finish(Op::Raft) else { panic!("structure") };
-        let mut reader = StructReader::from_message(&bytes, depth);
+        let mut reader = StructReader::from_payload(&bytes, depth);
         let decoded = reader.scn().unwrap();
         reader.done().unwrap();
         assert_eq!(bytes.to_vec(), [8, 7, 6, 5, 4, 3, 2, 1]);

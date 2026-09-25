@@ -1466,7 +1466,11 @@ pub trait Host:
         Some(
             self.send_raft(
                 &id,
-                Message::Forward { op: request.op.code(), payload: payload.clone(), depth: *depth },
+                Message::Forward {
+                    op: request.op.code(),
+                    payload: payload.clone().into(),
+                    depth: *depth,
+                },
             )
             .unwrap_or_else(error),
         )
@@ -1491,7 +1495,7 @@ pub trait Host:
                     let op = Op::from_code(op)?;
                     Ok(self.dispatch_forwarded(
                         process,
-                        &Req { id: 0, op, args: vec![Arg::Struct(op, payload, depth)] },
+                        &Req { id: 0, op, args: vec![Arg::Struct(op, payload.into(), depth)] },
                     ))
                 }
                 Some(Deferred::Read(read)) => Ok(Resp::bytes(read.wait()?)),
@@ -1825,7 +1829,7 @@ pub trait Host:
                     return Err(Error::new("forward target is no longer Raft leader"));
                 }
                 let request =
-                    Req { id: 0, op, args: vec![Arg::Struct(op, payload.clone(), depth)] };
+                    Req { id: 0, op, args: vec![Arg::Struct(op, payload.clone().into(), depth)] };
                 if !self.forwardable(op) {
                     return Err(Error::new("operation cannot be forwarded through Raft"));
                 }
