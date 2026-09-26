@@ -302,8 +302,7 @@ impl MessageBytes {
                     return &[];
                 }
                 let committed = v.end() as usize;
-                let tail_start =
-                    committed / pool::segmented::CHUNK_BYTES * pool::segmented::CHUNK_BYTES;
+                let tail_start = committed / pool::CHUNK_BYTES * pool::CHUNK_BYTES;
                 if self.len > committed && offset >= tail_start {
                     // SAFETY: unsynchronized bytes lie within the last owned
                     // leaf. next retains whole-leaf provenance; the requested
@@ -527,7 +526,7 @@ mod tests {
         writer.write_all(b" more").unwrap();
         assert_eq!(writer.to_vec(), b"cached small payload more");
 
-        let data = vec![9; pool::segmented::CHUNK_BYTES + 17];
+        let data = vec![9; pool::CHUNK_BYTES + 17];
         let mut writer = MessageBytes::from(data.clone());
         writer.write_all(b"cached tail").unwrap();
         let pointer = writer.chunk(0).as_ptr();
@@ -599,7 +598,7 @@ mod tests {
     fn cached_leaf_writes_match_a_contiguous_model_through_boundaries() {
         let pool = Box::leak(Box::new(pool::ChunkPool::with_buckets(32, 0, 1).unwrap()));
         let mut bytes = MessageBytes::from_storage(Storage::Large(SegmentedBuffer::new(pool)));
-        let mut model = vec![17; pool::segmented::CHUNK_BYTES - 11];
+        let mut model = vec![17; pool::CHUNK_BYTES - 11];
         bytes.write_all(&model).unwrap();
         bytes.write_all(b"pending").unwrap();
         model.extend_from_slice(b"pending");
@@ -661,13 +660,13 @@ mod tests {
     #[test]
     fn segmented_payload_round_trip_with_straddling_tag_and_length() {
         let mut writer = StructWriter::new();
-        for _ in 0..pool::segmented::CHUNK_BYTES - 1 {
+        for _ in 0..pool::CHUNK_BYTES - 1 {
             writer.number_u8(0xa5);
         }
         writer.nested(Op::ReadRecord, |writer| {
             writer.number_u16(42);
             // The next u32 length starts at one byte before the second block boundary.
-            for _ in 0..pool::segmented::CHUNK_BYTES - 4 {
+            for _ in 0..pool::CHUNK_BYTES - 4 {
                 writer.number_u8(0x5a);
             }
             writer.bytes(&vec![7; 9000]);
@@ -682,13 +681,13 @@ mod tests {
         let decoded = Req::decode_from(&mut decoded_input, framed.len()).unwrap();
         assert_eq!(decoded, request);
         let (mut reader, _) = structure(decoded.args(), Op::ReadRecord, "test").unwrap();
-        for _ in 0..pool::segmented::CHUNK_BYTES - 1 {
+        for _ in 0..pool::CHUNK_BYTES - 1 {
             assert_eq!(reader.number_u8().unwrap(), 0xa5);
         }
         reader
             .nested(Op::ReadRecord, "nested", |reader| {
                 assert_eq!(reader.number_u16()?, 42);
-                for _ in 0..pool::segmented::CHUNK_BYTES - 4 {
+                for _ in 0..pool::CHUNK_BYTES - 4 {
                     assert_eq!(reader.number_u8()?, 0x5a);
                 }
                 assert_eq!(reader.bytes()?, vec![7; 9000]);
@@ -725,9 +724,9 @@ mod tests {
         let pool = Box::leak(Box::new(pool::ChunkPool::new(1, 0).unwrap()));
         let mut bytes = MessageBytes::from_storage(Storage::Large(SegmentedBuffer::new(pool)));
         bytes.write_all(b"prefix").unwrap();
-        assert!(bytes.write_all(&vec![0; pool::segmented::CHUNK_BYTES * 2]).is_err());
+        assert!(bytes.write_all(&vec![0; pool::CHUNK_BYTES * 2]).is_err());
         assert_eq!(bytes.to_vec(), b"prefix");
-        bytes.extend_from_slice(&vec![0; pool::segmented::CHUNK_BYTES * 2]);
+        bytes.extend_from_slice(&vec![0; pool::CHUNK_BYTES * 2]);
         bytes.push(1);
         let mut output = Vec::new();
         assert!(bytes.write_to(&mut output).is_err());

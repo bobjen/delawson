@@ -23,7 +23,7 @@ fn segmented_frames_match_contiguous_encoding_at_every_boundary() {
             s
         }),
     ];
-    for start in pool::segmented::CHUNK_BYTES as u64 - 16..pool::segmented::CHUNK_BYTES as u64 + 1 {
+    for start in pool::CHUNK_BYTES as u64 - 16..pool::CHUNK_BYTES as u64 + 1 {
         for req in &requests {
             let mut b = batch();
             b.bytes = pool::SegmentedBuffer::with_start(b.bytes.pool(), start);
@@ -136,11 +136,7 @@ fn socket_round_trips_single_and_batched_messages_in_all_sealing_modes() {
                     .map(|i| {
                         // First frame ends three bytes before a block boundary, splitting the next frame's length.
                         match i {
-                            0 => Req::new(Op::Ping).id(i).bytes(vec![
-                                7;
-                                pool::segmented::CHUNK_BYTES
-                                    - 21
-                            ]),
+                            0 => Req::new(Op::Ping).id(i).bytes(vec![7; pool::CHUNK_BYTES - 21]),
                             1 => Req::new(Op::Ping).id(i),
                             2 => Req::new(Op::Status).id(i).bytes(vec![19; 300_000]),
                             _ => Req::new(Op::Status).id(i).number(i as u64).text("hello"),

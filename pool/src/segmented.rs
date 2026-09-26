@@ -5,7 +5,9 @@
 //! in-memory indexes, not a serialized disk format. Depth zero is a leaf.
 //! The derived maximum depth covers the entire u64 byte-offset space (using u128 internally
 //! for tree spans). The pool's capacity independently limits resident storage.
+#[path = "alias.rs"]
 mod alias;
+#[path = "stream.rs"]
 mod stream;
 pub use stream::{SegmentedReader, SegmentedWriter};
 

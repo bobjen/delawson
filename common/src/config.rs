@@ -179,9 +179,9 @@ pub struct BufferPoolConfig {
 impl Default for BufferPoolConfig {
     fn default() -> Self {
         Self {
-            max_blocks: ((32u64 << 30) / pool::segmented::CHUNK_BYTES as u64) as u32,
+            max_blocks: ((32u64 << 30) / pool::CHUNK_BYTES as u64) as u32,
             initial_blocks: 0,
-            small_message_bytes: pool::segmented::CHUNK_BYTES / 2,
+            small_message_bytes: pool::CHUNK_BYTES / 2,
         }
     }
 }

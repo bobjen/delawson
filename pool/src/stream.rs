@@ -6,7 +6,7 @@
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let pool = ChunkPool::new(32, 0)?;
-//! let start = pool::segmented::CHUNK_BYTES as u64 - 3;
+//! let start = pool::CHUNK_BYTES as u64 - 3;
 //! let mut buffer = SegmentedBuffer::with_start(&pool, start);
 //! {
 //!     // Supply the calling thread's RNG in production.

@@ -3,8 +3,8 @@ use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering::SeqCst};
 
-pub mod segmented;
-pub use segmented::{ChunkPool, SegmentedBuffer, SegmentedReader, SegmentedWriter};
+mod segmented;
+pub use segmented::*;
 
 #[cfg(test)]
 mod concurrency;

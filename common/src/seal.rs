@@ -414,7 +414,7 @@ fn append_zeroes(
     mut size: usize,
     mut random: impl FnMut() -> u64,
 ) -> Result<()> {
-    let zeros = [0; pool::segmented::CHUNK_BYTES];
+    let zeros = [0; pool::CHUNK_BYTES];
     while size != 0 {
         let n = size.min(zeros.len());
         out.append(&zeros[..n], &mut random).context("LZ4 output space")?;
@@ -453,8 +453,7 @@ fn compress_into_pool(
 // LZ4 requires initialized slices. Initialize only the bounded destination in the
 // current leaf; callers truncate its unused suffix after compression/expansion.
 fn fits_tail(out: &pool::SegmentedBuffer<'_>, size: usize) -> bool {
-    size <= pool::segmented::CHUNK_BYTES
-        - (out.end() % pool::segmented::CHUNK_BYTES as u64) as usize
+    size <= pool::CHUNK_BYTES - (out.end() % pool::CHUNK_BYTES as u64) as usize
 }
 
 fn append_contiguous_space<'a>(
@@ -464,7 +463,7 @@ fn append_contiguous_space<'a>(
 ) -> Result<&'a mut [u8]> {
     assert!(size > 0 && fits_tail(out, size));
     let start = out.end();
-    out.append(&[0; pool::segmented::CHUNK_BYTES][..size], random).context("LZ4 output space")?;
+    out.append(&[0; pool::CHUNK_BYTES][..size], random).context("LZ4 output space")?;
     Ok(out
         .chunks_mut_range(start..out.end())
         .context("LZ4 output leaf")?
@@ -524,8 +523,7 @@ mod tests {
         // This tests encryption compatibility, not pool capacity. Reserve ample
         // virtual space; physical pages are supplied only as blocks are used.
         let pool =
-            pool::ChunkPool::new(((4u64 << 30) / pool::segmented::CHUNK_BYTES as u64) as u32, 0)
-                .unwrap();
+            pool::ChunkPool::new(((4u64 << 30) / pool::CHUNK_BYTES as u64) as u32, 0).unwrap();
         let mut allocation_rng = crate::random::Rng::from_seed(42);
         for encrypted in [false, true] {
             for compression in [Compress::None, Compress::Lz4] {
@@ -539,29 +537,25 @@ mod tests {
                         31,
                         32,
                         33,
-                        pool::segmented::CHUNK_BYTES - 1,
-                        pool::segmented::CHUNK_BYTES,
-                        pool::segmented::CHUNK_BYTES + 1,
-                        pool::segmented::CHUNK_BYTES * 3 + 17,
+                        pool::CHUNK_BYTES - 1,
+                        pool::CHUNK_BYTES,
+                        pool::CHUNK_BYTES + 1,
+                        pool::CHUNK_BYTES * 3 + 17,
                         35000,
                     ] {
                         let mut rng = crate::random::Rng::from_seed(17);
                         let mut data: Vec<u8> = (0..len)
                             .map(|_| if repetitive { 7 } else { rng.next_u64() as u8 })
                             .collect();
-                        let mut input = pool::SegmentedBuffer::with_start(
-                            &pool,
-                            pool::segmented::CHUNK_BYTES as u64 - 3,
-                        );
+                        let mut input =
+                            pool::SegmentedBuffer::with_start(&pool, pool::CHUNK_BYTES as u64 - 3);
                         input.append(b"skip", || allocation_rng.next_u64()).unwrap();
                         let start = input.end();
                         input.append(&data, || allocation_rng.next_u64()).unwrap();
                         let end = input.end();
                         input.append(b"ignore", || allocation_rng.next_u64()).unwrap();
-                        let mut output = pool::SegmentedBuffer::with_start(
-                            &pool,
-                            pool::segmented::CHUNK_BYTES as u64 - 6,
-                        );
+                        let mut output =
+                            pool::SegmentedBuffer::with_start(&pool, pool::CHUNK_BYTES as u64 - 6);
                         output.append(b"keep", || allocation_rng.next_u64()).unwrap();
                         let output_start = output.end();
                         sender
@@ -595,16 +589,15 @@ mod tests {
     #[test]
     fn lz4_input_and_output_fast_paths_are_independent() {
         let pool =
-            pool::ChunkPool::new(((4u64 << 30) / pool::segmented::CHUNK_BYTES as u64) as u32, 0)
-                .unwrap();
+            pool::ChunkPool::new(((4u64 << 30) / pool::CHUNK_BYTES as u64) as u32, 0).unwrap();
         let mut rng = crate::random::Rng::from_seed(42);
         for encrypted in [false, true] {
             for repetitive in [false, true] {
-                for input_start in [0, pool::segmented::CHUNK_BYTES as u64 - 6] {
+                for input_start in [0, pool::CHUNK_BYTES as u64 - 6] {
                     // The compression destination begins after the 12-byte header
                     // and 5-byte LZ4 prefix. A 96-byte tail cannot hold its bound.
-                    for output_start in [0, pool::segmented::CHUNK_BYTES as u64 - 96] {
-                        for opened_start in [0, pool::segmented::CHUNK_BYTES as u64 - 96] {
+                    for output_start in [0, pool::CHUNK_BYTES as u64 - 96] {
+                        for opened_start in [0, pool::CHUNK_BYTES as u64 - 96] {
                             let config = messaging(encrypted, Compress::Lz4);
                             let (mut sender, mut receiver) = pair(&config);
                             let (mut reference, _) = pair(&config);
@@ -661,11 +654,10 @@ mod tests {
     #[test]
     fn segmented_open_rolls_back_failed_expansion_and_authentication() {
         let pool =
-            pool::ChunkPool::new(((4u64 << 30) / pool::segmented::CHUNK_BYTES as u64) as u32, 0)
-                .unwrap();
+            pool::ChunkPool::new(((4u64 << 30) / pool::CHUNK_BYTES as u64) as u32, 0).unwrap();
         let mut rng = crate::random::Rng::from_seed(42);
         for encrypted in [false, true] {
-            for output_start in [0, pool::segmented::CHUNK_BYTES as u64 - 6] {
+            for output_start in [0, pool::CHUNK_BYTES as u64 - 6] {
                 let config = messaging(encrypted, Compress::Lz4);
                 let (mut sender, mut receiver) = pair(&config);
                 let mut wire = Vec::new();
@@ -702,28 +694,24 @@ mod tests {
             return;
         }
         let pool =
-            pool::ChunkPool::new(((4u64 << 30) / pool::segmented::CHUNK_BYTES as u64) as u32, 0)
-                .unwrap();
+            pool::ChunkPool::new(((4u64 << 30) / pool::CHUNK_BYTES as u64) as u32, 0).unwrap();
         let mut rng = crate::random::Rng::from_seed(42);
         let size = crate::wire::MAX_SEGMENT_BYTES + 4;
-        let mut input =
-            pool::SegmentedBuffer::with_start(&pool, pool::segmented::CHUNK_BYTES as u64 - 1);
-        let chunk = [7; pool::segmented::CHUNK_BYTES];
+        let mut input = pool::SegmentedBuffer::with_start(&pool, pool::CHUNK_BYTES as u64 - 1);
+        let chunk = [7; pool::CHUNK_BYTES];
         for _ in 0..size / chunk.len() {
             input.append(&chunk, || rng.next_u64()).unwrap();
         }
         input.append(&chunk[..size % chunk.len()], || rng.next_u64()).unwrap();
         let (mut sender, mut receiver) = pair(&messaging(false, Compress::Lz4));
-        let mut output =
-            pool::SegmentedBuffer::with_start(&pool, pool::segmented::CHUNK_BYTES as u64 - 2);
+        let mut output = pool::SegmentedBuffer::with_start(&pool, pool::CHUNK_BYTES as u64 - 2);
         let input_range = input.start()..input.end();
         sender.seal_segmented(&mut input, input_range, &mut output, || rng.next_u64()).unwrap();
         assert!(sender.compression_input.is_empty());
         let mut sealed = vec![0; output.len() as usize];
         output.read_at(output.start(), &mut sealed).unwrap();
         assert_eq!(sealed[HEADER], LZ4);
-        let mut opened =
-            pool::SegmentedBuffer::with_start(&pool, pool::segmented::CHUNK_BYTES as u64 - 3);
+        let mut opened = pool::SegmentedBuffer::with_start(&pool, pool::CHUNK_BYTES as u64 - 3);
         receiver
             .open_segmented(
                 sealed[..HEADER].try_into().unwrap(),
@@ -763,14 +751,12 @@ mod tests {
         let source_pool = pool::ChunkPool::new(4, 0).unwrap();
         let output_pool = pool::ChunkPool::new(1, 0).unwrap();
         let mut input = pool::SegmentedBuffer::new(&source_pool);
-        input.append(&vec![1; pool::segmented::CHUNK_BYTES], || 0).unwrap();
+        input.append(&vec![1; pool::CHUNK_BYTES], || 0).unwrap();
         let mut out = pool::SegmentedBuffer::new(&output_pool);
         out.append(b"prefix", || 0).unwrap();
         let (mut sender, _) = pair(&messaging(true, Compress::None));
         assert!(
-            sender
-                .seal_segmented(&mut input, 0..pool::segmented::CHUNK_BYTES as u64, &mut out, || 0)
-                .is_err()
+            sender.seal_segmented(&mut input, 0..pool::CHUNK_BYTES as u64, &mut out, || 0).is_err()
         );
         let mut prefix = [0; 6];
         out.read_at(0, &mut prefix).unwrap();
