@@ -1,5 +1,6 @@
 //! Fixed-size pools with two retirement lists and statically selected link storage.
-use std::mem::MaybeUninit;
+use std::marker::PhantomData;
+use std::mem::{MaybeUninit, align_of, size_of};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering::SeqCst};
 
@@ -39,6 +40,21 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Initialization hook for fresh slots. Byte arrays intentionally do nothing.
+/// The pool calls this once when it first assigns raw storage to a slot; it does
+/// not reset items when their blocks are returned or reused.
+///
+/// # Safety
+/// `init` must be safe to call once on a fresh slot and must prepare any typed
+/// state that callers expect to read. It must not panic.
+pub unsafe trait PoolItem: Sized {
+    /// # Safety
+    /// `slot` is aligned writable storage for one fresh `Self` value.
+    unsafe fn init(_slot: *mut Self) {}
+}
+
+unsafe impl<const N: usize> PoolItem for [u8; N] {}
+
 struct Mapping {
     raw: NonNull<u8>,
     base: NonNull<u8>,
@@ -51,13 +67,13 @@ impl Mapping {
             .checked_add(align - 1)
             .filter(|&n| n <= isize::MAX as usize)
             .ok_or_else(|| Error::new("block pool mapping is too large"))?;
-        // Anonymous pages are supplied on demand, not allocated for the whole range.
+        // Reserve address space now, while leaving physical backing to first touch.
         let raw = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
                 -1,
                 0,
             )
@@ -260,60 +276,73 @@ impl Bucket {
     }
 }
 
-pub struct Pool<const ALIGN: usize, const BYTES: usize, L: Links = ExternalLinks> {
+/// Fixed-size slots laid out as `T`, aligned to at least `ALIGN`.
+///
+/// `T` supplies the slot size, alignment, and fresh-slot initializer. The pool
+/// never resets or destroys slots; callers must reset item state before return
+/// and drop every initialized `T` before the pool does. `L` supplies the atomic
+/// free-list link.
+pub struct Pool<T: PoolItem, const ALIGN: usize, L: Links = ExternalLinks> {
     // Links must be dropped before the mapping they may refer to.
     links: L,
     mapping: Mapping,
     max_blocks: u32,
     next: AtomicU32,
     buckets: Box<[Bucket]>,
+    _slot: PhantomData<fn() -> T>,
     #[cfg(test)]
     probe: concurrency::Probe,
 }
 
 // SAFETY: pool metadata is synchronized; each live block has one owner. Mapping
 // addresses stay fixed when the pool moves. L provides its own Send/Sync contract.
-unsafe impl<const A: usize, const B: usize, L: Links> Send for Pool<A, B, L> {}
-unsafe impl<const A: usize, const B: usize, L: Links> Sync for Pool<A, B, L> {}
+unsafe impl<T: PoolItem + Send, const A: usize, L: Links> Send for Pool<T, A, L> {}
+unsafe impl<T: PoolItem + Send + Sync, const A: usize, L: Links> Sync for Pool<T, A, L> {}
 
-impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
+impl<T: PoolItem, const A: usize, L: Links> Pool<T, A, L> {
     pub fn new(max_blocks: u32, initial_blocks: u32) -> Result<Self> {
-        Self::with_buckets(max_blocks, initial_blocks, DEFAULT_BUCKETS)
+        Self::with_params(max_blocks, initial_blocks, DEFAULT_BUCKETS)
     }
 
     /// Each index permanently belongs to index & (bucket_count - 1).
     /// Call alloc_from_bucket with a caller-generated random value to spread work.
     pub fn with_buckets(max_blocks: u32, initial_blocks: u32, bucket_count: usize) -> Result<Self> {
+        Self::with_params(max_blocks, initial_blocks, bucket_count)
+    }
+
+    fn with_params(max_blocks: u32, initial_blocks: u32, bucket_count: usize) -> Result<Self> {
         if !bucket_count.is_power_of_two() || bucket_count > u32::MAX as usize {
             return Err(Error::new("bucket count must be a representable power of two"));
         }
-        if !A.is_power_of_two() || B == 0 || B % A != 0 {
+        let bytes = size_of::<T>();
+        if !A.is_power_of_two() || bytes == 0 || bytes % A != 0 || align_of::<T>() > A {
             return Err(Error::new(
-                "block size must be a positive multiple of power-of-two alignment",
+                "slot size must be a positive multiple of power-of-two alignment at least as large as the slot alignment",
             ));
         }
         if max_blocks == 0 || initial_blocks > max_blocks {
-            return Err(Error::new(
-                "pool needs 0 <= initial_blocks <= max_blocks and max_blocks > 0",
-            ));
+            return Err(Error::new("pool needs 0 <= initial_blocks <= max_blocks"));
         }
-        let bytes = B
+        let total_bytes = bytes
             .checked_mul(max_blocks as usize)
             .ok_or_else(|| Error::new("block pool is too large"))?;
-        let mapping = Mapping::new(bytes, A)?;
+        let mapping = Mapping::new(total_bytes, A)?;
         // SAFETY: mapping remains alive until after links, including on drop.
-        let links = unsafe { L::new(mapping.base, B, max_blocks)? };
+        let links = unsafe { L::new(mapping.base, bytes, max_blocks)? };
         let pool = Self {
             links,
             mapping,
             max_blocks,
             next: AtomicU32::new(initial_blocks),
             buckets: (0..bucket_count).map(|_| Bucket::new()).collect(),
+            _slot: PhantomData,
             #[cfg(test)]
             probe: concurrency::Probe::default(),
         };
         for index in 0..initial_blocks {
-            // SAFETY: initialization is single-threaded and each index is new.
+            // SAFETY: each index is new writable storage, initialized before publication.
+            unsafe { T::init(pool.slot(index)) };
+            // SAFETY: each index is initialized once before publication.
             unsafe { pool.links.init(index) };
             let next = index as u64 + bucket_count as u64;
             pool.link(index)
@@ -336,14 +365,20 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
         unsafe { self.links.link(index) }
     }
 
-    /// Number of indexes issued from the shared virtual array, including initial blocks.
-    /// During concurrent allocation, some issued indexes may still be initializing.
+    #[inline]
+    fn slot(&self, index: u32) -> *mut T {
+        // SAFETY: index is in the reserved mapping and slots are aligned by stride.
+        unsafe { self.mapping.base.as_ptr().add(index as usize * size_of::<T>()).cast::<T>() }
+    }
+
+    /// Number of initialized indexes, including staged free slots and initial blocks.
+    /// During concurrent growth, some indexes may still be initializing.
     pub fn issued_blocks(&self) -> u32 {
         self.next.load(SeqCst)
     }
 
     pub const fn block_bytes(&self) -> usize {
-        B
+        size_of::<T>()
     }
 
     fn pop(&self, bucket: &Bucket) -> Option<u32> {
@@ -392,7 +427,7 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
     /// Tries up to four buckets, reclaiming at each before issuing a fresh index.
     /// Supply one value from the calling thread's RNG; no shared RNG is used.
     /// Returns can remain temporarily unavailable while protected by readers.
-    pub fn alloc(&self, random: u64) -> Result<Block<'_, A, B, L>> {
+    pub fn alloc(&self, random: u64) -> Result<Block<'_, T, A, L>> {
         let count = self.buckets.len();
         let mask = count - 1;
         let first = ((random as usize) ^ mask) & mask;
@@ -406,10 +441,18 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
         )
     }
 
+    /// Grows by one fresh index without reclaiming retired slots.
+    ///
+    /// Use this for arenas whose indexes remain stable and are never retired.
+    #[inline]
+    pub fn alloc_fresh(&self) -> Result<Block<'_, T, A, L>> {
+        self.issue_fresh()
+    }
+
     /// Tries one bucket, selected by the low bits, then issues a fresh index.
     /// A fresh index may belong to a different bucket; returns always use its index.
     /// Other buckets are not searched, even at capacity.
-    pub fn alloc_from_bucket(&self, choice: usize) -> Result<Block<'_, A, B, L>> {
+    pub fn alloc_from_bucket(&self, choice: usize) -> Result<Block<'_, T, A, L>> {
         self.alloc_from_buckets(std::iter::once(choice))
     }
 
@@ -419,7 +462,7 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
     pub fn alloc_from_buckets(
         &self,
         choices: impl IntoIterator<Item = usize>,
-    ) -> Result<Block<'_, A, B, L>> {
+    ) -> Result<Block<'_, T, A, L>> {
         self.alloc_choices::<false>(choices)
     }
 
@@ -427,7 +470,7 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
     pub fn alloc_reclaiming_each(
         &self,
         choices: impl IntoIterator<Item = usize>,
-    ) -> Result<Block<'_, A, B, L>> {
+    ) -> Result<Block<'_, T, A, L>> {
         self.alloc_choices::<true>(choices)
     }
 
@@ -446,7 +489,7 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
     fn alloc_choices<const EACH: bool>(
         &self,
         choices: impl IntoIterator<Item = usize>,
-    ) -> Result<Block<'_, A, B, L>> {
+    ) -> Result<Block<'_, T, A, L>> {
         let mut last = None;
         for choice in choices {
             let bucket = &self.buckets[choice & (self.buckets.len() - 1)];
@@ -467,6 +510,10 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
                 }
             }
         }
+        self.issue_fresh()
+    }
+
+    fn issue_fresh(&self) -> Result<Block<'_, T, A, L>> {
         #[cfg(test)]
         if self.probe.cancelled() {
             return Err(Error::new("pool test cancelled"));
@@ -478,7 +525,9 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
                 pool_hit!(self, Exhausted);
                 Error::new("block pool exhausted; some blocks may await reclamation")
             })?;
-        // SAFETY: fetch_update granted this caller a unique new index.
+        // SAFETY: fetch_update granted this caller one new writable index.
+        unsafe { T::init(self.slot(index)) };
+        // SAFETY: each fresh index has its atomic link initialized before use.
         unsafe { self.links.init(index) };
         pool_hit!(self, Fresh);
         Ok(Block { pool: self, index })
@@ -582,19 +631,19 @@ impl<const A: usize, const B: usize, L: Links> Pool<A, B, L> {
 /// Ownership of one index; the borrow keeps its pool and mappings alive.
 /// Inline-link callers must not overwrite the atomic link with non-atomic writes,
 /// or create an exclusive reference spanning it while stale pool readers exist.
-pub struct Block<'a, const ALIGN: usize, const BYTES: usize, L: Links = ExternalLinks> {
-    pool: &'a Pool<ALIGN, BYTES, L>,
+pub struct Block<'a, T: PoolItem, const ALIGN: usize, L: Links = ExternalLinks> {
+    pool: &'a Pool<T, ALIGN, L>,
     index: u32,
 }
 
-impl<const A: usize, const B: usize, L: Links> Block<'_, A, B, L> {
+impl<T: PoolItem, const A: usize, L: Links> Block<'_, T, A, L> {
     pub fn index(&self) -> u32 {
         self.index
     }
 
     pub fn as_ptr(&self) -> *mut u8 {
         // SAFETY: index identifies a block in the reserved mapping.
-        unsafe { self.pool.mapping.base.as_ptr().add(self.index as usize * B) }
+        unsafe { self.pool.mapping.base.as_ptr().add(self.index as usize * size_of::<T>()) }
     }
 
     /// May be reused as an application value until this block is returned.
@@ -603,25 +652,25 @@ impl<const A: usize, const B: usize, L: Links> Block<'_, A, B, L> {
     }
 }
 
-impl<const A: usize, const B: usize> Block<'_, A, B, ExternalLinks> {
+impl<T: PoolItem, const A: usize> Block<'_, T, A, ExternalLinks> {
     pub fn as_slice(&self) -> &[MaybeUninit<u8>] {
         // SAFETY: the external link never overlaps these exclusively owned bytes.
-        unsafe { std::slice::from_raw_parts(self.as_ptr().cast(), B) }
+        unsafe { std::slice::from_raw_parts(self.as_ptr().cast(), size_of::<T>()) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [MaybeUninit<u8>] {
         // SAFETY: the handle uniquely owns the payload; pool readers only use links.
-        unsafe { std::slice::from_raw_parts_mut(self.as_ptr().cast(), B) }
+        unsafe { std::slice::from_raw_parts_mut(self.as_ptr().cast(), size_of::<T>()) }
     }
 }
 
-impl<const A: usize, const B: usize, L: Links> Drop for Block<'_, A, B, L> {
+impl<T: PoolItem, const A: usize, L: Links> Drop for Block<'_, T, A, L> {
     fn drop(&mut self) {
         self.pool.retire(self.index);
     }
 }
 
-pub fn free<const A: usize, const B: usize, L: Links>(block: Block<'_, A, B, L>) {
+pub fn free<T: PoolItem, const A: usize, L: Links>(block: Block<'_, T, A, L>) {
     drop(block);
 }
 
@@ -630,9 +679,13 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    type Pool16 = Pool<[u8; 16], 4, ExternalLinks>;
+    type Pool4 = Pool<[u8; 4], 4, ExternalLinks>;
+    type InlinePool16 = Pool<[u8; 16], 4, InlineLinks<4>>;
+
     #[test]
     fn default_configuration_uses_four_reclaiming_choices() {
-        let pool = Pool::<4, 16>::new(256, 256).unwrap();
+        let pool = Pool16::new(256, 256).unwrap();
         assert_eq!(pool.buckets.len(), 256);
         assert_eq!(DEFAULT_CHOICES, 4);
         // random=0 selects 255,0,1,2 with odd delta 1.
@@ -642,6 +695,39 @@ mod tests {
         drop(held);
         assert!(pool.alloc(0).is_ok());
         assert_eq!(pool.issued_blocks(), 256);
+    }
+
+    #[test]
+    fn fresh_only() {
+        let pool = Pool16::with_buckets(2, 1, 1).unwrap();
+        drop(pool.alloc_from_bucket(0).unwrap());
+        assert_eq!(pool.alloc_fresh().unwrap().index(), 1);
+        assert!(pool.alloc_fresh().is_err());
+        assert_eq!(pool.issued_blocks(), 2);
+
+        let pool = Pool16::new(2, 0).unwrap();
+        drop(pool.alloc_fresh().unwrap());
+        assert_eq!(pool.issued_blocks(), 1);
+    }
+
+    #[test]
+    fn growth_issues_one_slot() {
+        let pool = Pool16::with_buckets(6, 0, 4).unwrap();
+        let mut blocks = Vec::new();
+        for index in 0..6 {
+            let block = pool.alloc_from_bucket(index).unwrap();
+            assert_eq!(block.index(), index as u32);
+            assert_eq!(pool.issued_blocks(), index as u32 + 1);
+            blocks.push(block);
+        }
+        assert!(pool.alloc_from_bucket(0).is_err());
+        drop(blocks);
+
+        let pool = Pool16::new(4, 0).unwrap();
+        let blocks: Vec<_> = (0..4).map(|_| pool.alloc_fresh().unwrap()).collect();
+        assert_eq!(blocks.iter().map(Block::index).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!(pool.issued_blocks(), 4);
+        assert!(pool.alloc_fresh().is_err());
     }
 
     #[test]
@@ -684,7 +770,7 @@ mod tests {
 
     #[test]
     fn aligned_contiguous_and_reused() {
-        let pool = Pool::<65536, 65536>::with_buckets(4, 2, 1).unwrap();
+        let pool = Pool::<[u8; 65536], 65536>::with_buckets(4, 2, 1).unwrap();
         let mut blocks: Vec<_> = (0..4).map(|_| pool.alloc_from_bucket(0).unwrap()).collect();
         let base = blocks[0].as_ptr() as usize;
         for (index, block) in blocks.iter_mut().enumerate() {
@@ -710,7 +796,7 @@ mod tests {
 
     #[test]
     fn retired_tail_preserves_existing_free_chain() {
-        let pool = Pool::<4, 16>::with_buckets(4, 4, 1).unwrap();
+        let pool = Pool16::with_buckets(4, 4, 1).unwrap();
         let first = pool.alloc_from_bucket(0).unwrap();
         let second = pool.alloc_from_bucket(0).unwrap();
         drop(first);
@@ -730,7 +816,7 @@ mod tests {
 
     #[test]
     fn stalled_reader_delays_reuse_but_not_growth_or_retirement() {
-        let pool = Pool::<4, 16, InlineLinks<4>>::with_buckets(3, 1, 1).unwrap();
+        let pool = InlinePool16::with_buckets(3, 1, 1).unwrap();
         let old = pool.buckets[0].current.load(SeqCst);
         let guard = pool.buckets[0].deleted[old].gate.try_read().unwrap();
         let stale_head = pool.buckets[0].free.load(SeqCst);
@@ -757,7 +843,7 @@ mod tests {
 
     #[test]
     fn older_group_protects_items_retired_in_new_group() {
-        let pool = Pool::<4, 16>::with_buckets(2, 1, 1).unwrap();
+        let pool = Pool16::with_buckets(2, 1, 1).unwrap();
         let old = pool.buckets[0].current.load(SeqCst);
         let guard = pool.buckets[0].deleted[old].gate.try_read().unwrap();
         let stale_head = pool.buckets[0].free.load(SeqCst);
@@ -775,7 +861,7 @@ mod tests {
 
     #[test]
     fn bucket_returns_preserve_identity_and_grace() {
-        let pool = Pool::<4, 16>::with_buckets(64, 64, 32).unwrap();
+        let pool = Pool16::with_buckets(64, 64, 32).unwrap();
         let bucket = &pool.buckets[7];
         let guard = bucket.deleted[0].gate.try_read().unwrap();
         let block = pool.alloc_from_bucket(7).unwrap();
@@ -797,7 +883,7 @@ mod tests {
 
     #[test]
     fn second_bucket_avoids_growth_and_choices_are_lazy() {
-        let pool = Pool::<4, 16>::with_buckets(64, 1, 32).unwrap();
+        let pool = Pool16::with_buckets(64, 1, 32).unwrap();
         let mut draws = 0;
         let choices = [31, 0, 1].into_iter().inspect(|_| draws += 1);
         let block = pool.alloc_from_buckets(choices).unwrap();
@@ -811,7 +897,7 @@ mod tests {
 
     #[test]
     fn first_empty_bucket_is_not_reclaimed() {
-        let pool = Pool::<4, 16>::with_buckets(64, 2, 32).unwrap();
+        let pool = Pool16::with_buckets(64, 2, 32).unwrap();
         drop(pool.alloc_from_bucket(0).unwrap());
         let first = &pool.buckets[0];
         let current = first.current.load(SeqCst);
@@ -832,7 +918,7 @@ mod tests {
 
     #[test]
     fn reclaim_each_reuses_first_retiree_before_next_choice() {
-        let pool = Pool::<4, 16>::with_buckets(32, 1, 32).unwrap();
+        let pool = Pool16::with_buckets(32, 1, 32).unwrap();
         drop(pool.alloc_from_bucket(0).unwrap());
         let mut tried = 0;
         let block =
@@ -844,7 +930,7 @@ mod tests {
 
     #[test]
     fn empty_pop_does_not_take_shared_lock() {
-        let pool = Pool::<4, 16>::with_buckets(1, 0, 1).unwrap();
+        let pool = Pool16::with_buckets(1, 0, 1).unwrap();
         let bucket = &pool.buckets[0];
         let _writer = bucket.deleted[0].gate.try_write().unwrap();
         assert_eq!(pool.pop(bucket), None);
@@ -852,29 +938,35 @@ mod tests {
 
     #[test]
     fn fresh_index_returns_to_its_own_bucket() {
-        let pool = Pool::<4, 16>::with_buckets(1, 0, 32).unwrap();
+        let pool = Pool16::with_buckets(1, 0, 32).unwrap();
         let block = pool.alloc_from_bucket(31).unwrap();
         assert_eq!(block.index(), 0);
         drop(block);
         assert!(pool.alloc_from_bucket(31).is_err());
         assert_eq!(pool.alloc_from_bucket(0).unwrap().index(), 0);
         assert_eq!(pool.issued_blocks(), 1);
-        assert!(Pool::<4, 16>::with_buckets(1, 0, 0).is_err());
-        assert!(Pool::<4, 16>::with_buckets(1, 0, 3).is_err());
+        assert!(Pool16::with_buckets(1, 0, 0).is_err());
+        assert!(Pool16::with_buckets(1, 0, 3).is_err());
     }
 
     #[test]
     fn validates_geometry_and_limits() {
-        assert!(Pool::<0, 4>::with_buckets(1, 0, 1).is_err());
-        assert!(Pool::<3, 12>::with_buckets(1, 0, 1).is_err());
-        assert!(Pool::<4, 6>::with_buckets(1, 0, 1).is_err());
-        assert!(Pool::<4, 0>::with_buckets(1, 0, 1).is_err());
-        assert!(Pool::<4, 4>::with_buckets(0, 0, 1).is_err());
-        assert!(Pool::<4, 4>::with_buckets(1, 2, 1).is_err());
-        assert!(Pool::<1, { usize::MAX }>::with_buckets(2, 0, 1).is_err());
-        assert!(Pool::<4, 4, InlineLinks<4>>::with_buckets(1, 0, 1).is_err());
-        assert!(Pool::<4, 8, InlineLinks<1>>::with_buckets(1, 0, 1).is_err());
-        let pool = Pool::<4, 4>::with_buckets(1, 0, 1).unwrap();
+        assert!(Pool::<[u8; 4], 0>::with_buckets(1, 0, 1).is_err());
+        assert!(Pool::<[u8; 12], 3>::with_buckets(1, 0, 1).is_err());
+        assert!(Pool::<[u8; 6], 4>::with_buckets(1, 0, 1).is_err());
+        assert!(Pool::<[u8; 0], 4>::with_buckets(1, 0, 1).is_err());
+        assert!(Pool4::with_buckets(0, 0, 1).is_err());
+        assert!(Pool4::with_buckets(1, 2, 1).is_err());
+        assert!(Pool::<[u8; 1usize << 40], 1>::with_buckets(u32::MAX, 0, 1).is_err());
+        assert!(Pool::<[u8; 4], 4, InlineLinks<4>>::with_buckets(1, 0, 1).is_err());
+        assert!(Pool::<[u8; 8], 4, InlineLinks<1>>::with_buckets(1, 0, 1).is_err());
+        #[allow(dead_code)]
+        #[repr(align(8))]
+        struct Aligned([u8; 8]);
+        // SAFETY: this test only checks the alignment rejection path.
+        unsafe impl PoolItem for Aligned {}
+        assert!(Pool::<Aligned, 4>::with_buckets(1, 0, 1).is_err());
+        let pool = Pool4::with_buckets(1, 0, 1).unwrap();
         assert_eq!(pool.alloc_from_bucket(0).unwrap().index(), 0);
         assert_eq!(pool.alloc_from_bucket(0).unwrap().index(), 0);
     }

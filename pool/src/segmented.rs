@@ -18,7 +18,7 @@ pub const INDEX_ENTRIES: usize = CHUNK_BYTES / size_of::<u32>();
 const CHUNK_BITS: u32 = CHUNK_BYTES.trailing_zeros();
 const INDEX_BITS: u32 = INDEX_ENTRIES.trailing_zeros();
 pub const MAX_DEPTH: u8 = (64 - CHUNK_BITS).div_ceil(INDEX_BITS) as u8;
-pub type ChunkPool = Pool<CHUNK_BYTES, CHUNK_BYTES>;
+pub type ChunkPool = Pool<[u8; CHUNK_BYTES], CHUNK_BYTES>;
 
 /// One initialized byte range, `start()..end()`, with no holes.
 ///
@@ -137,14 +137,14 @@ impl<'a> SegmentedBuffer<'a> {
     fn index_block(
         &self,
         random: &mut impl FnMut() -> u64,
-    ) -> Result<Block<'a, CHUNK_BYTES, CHUNK_BYTES>> {
+    ) -> Result<Block<'a, [u8; CHUNK_BYTES], CHUNK_BYTES>> {
         let block = self.pool.alloc(random())?;
         // SAFETY: this new block is exclusively owned, and all bits set is NONE.
         unsafe { block.as_ptr().write_bytes(0xff, CHUNK_BYTES) };
         Ok(block)
     }
 
-    fn take(block: Block<'a, CHUNK_BYTES, CHUNK_BYTES>) -> u32 {
+    fn take(block: Block<'a, [u8; CHUNK_BYTES], CHUNK_BYTES>) -> u32 {
         let index = block.index();
         // Ownership moves into the tree; release() returns it exactly once.
         std::mem::forget(block);

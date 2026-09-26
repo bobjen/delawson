@@ -6,6 +6,10 @@
 # machine's mix drifts.
 stream_share = 0.333
 
+# Maximum extents this SN can name.
+# The limit should be at least the machine RAM size divided by the SN Extent size.
+max_extents = 1073741824
+
 # Threads answering requests off the read loop. Zero means one per core.
 [knobs]
 # Opt in to primary reads after quorum lease expiry (may return stale data).

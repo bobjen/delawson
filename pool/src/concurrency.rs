@@ -51,8 +51,8 @@ const TRIALS: u32 = 40;
 // Separate watchdog: allow all forty full trials plus setup/teardown overhead.
 const BUDGET: Duration = Duration::from_secs(1);
 
-type TestPool<L> = Pool<4096, 4096, L>;
-type TestBlock<'a, L> = Block<'a, 4096, 4096, L>;
+type TestPool<L> = Pool<[u8; 4096], 4096, L>;
+type TestBlock<'a, L> = Block<'a, [u8; 4096], 4096, L>;
 
 thread_local! {
     static HITS: [Cell<u64>; CASES] = const { [const { Cell::new(0) }; CASES] };
@@ -598,6 +598,57 @@ fn bucketed_ownership<L: Links>(choices: usize, reclaim_each: bool, buckets: usi
         }
     });
     audit(&pool, &owners).unwrap();
+}
+
+fn growth_owners<L: Links>() {
+    const CAP: usize = 256;
+    let pool = TestPool::<L>::with_buckets(CAP as u32, 0, DEFAULT_BUCKETS).unwrap();
+    let owners = std::array::from_fn::<_, CAP, _>(|_| AtomicU32::new(0));
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let pool = &pool;
+            let owners = &owners;
+            scope.spawn(move || {
+                let id = thread as u32 + 1;
+                let mut rng = Rng::from_seed(id as u64);
+                let mut held: Vec<TestBlock<'_, L>> = Vec::new();
+                for _ in 0..2048 {
+                    if held.is_empty() || rng.next_u32() & 1 == 0 {
+                        if let Ok(block) = pool.alloc(rng.next_u64()) {
+                            assert_eq!(
+                                owners[block.index() as usize]
+                                    .compare_exchange(0, id, SeqCst, SeqCst),
+                                Ok(0)
+                            );
+                            block.link().store(id, SeqCst);
+                            held.push(block);
+                        }
+                    } else {
+                        let block = held.swap_remove(rng.next_u32() as usize % held.len());
+                        assert_eq!(block.link().load(SeqCst), id);
+                        assert_eq!(owners[block.index() as usize].swap(0, SeqCst), id);
+                        drop(block);
+                    }
+                }
+                for block in held {
+                    assert_eq!(block.link().load(SeqCst), id);
+                    assert_eq!(owners[block.index() as usize].swap(0, SeqCst), id);
+                    drop(block);
+                }
+            });
+        }
+    });
+    audit(&pool, &owners).unwrap();
+}
+
+#[test]
+fn growth_external() {
+    growth_owners::<ExternalLinks>();
+}
+
+#[test]
+fn growth_inline() {
+    growth_owners::<InlineLinks<8>>();
 }
 
 #[test]

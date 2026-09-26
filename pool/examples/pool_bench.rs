@@ -212,7 +212,7 @@ fn main() {
         "external" | "external32" | "external32x2" | "external32x4" | "external32x4all"
         | "external64x4all" | "external128x4all" | "external256x4all" | "external512x4all"
         | "external256x8all" | "external256x2all" => {
-            let pool = Pool::<4096, 4096, ExternalLinks>::with_buckets(
+            let pool = Pool::<[u8; 4096], 4096, ExternalLinks>::with_buckets(
                 blocks,
                 0,
                 if layout == "external" { 1 } else { bucket_count },
@@ -285,7 +285,7 @@ fn main() {
         "inline" | "inline32" | "inline32x2" | "inline32x4" | "inline32x4all" | "inline64x4all"
         | "inline128x4all" | "inline256x4all" | "inline512x4all" | "inline256x8all"
         | "inline256x2all" => {
-            let pool = Pool::<4096, 4096, InlineLinks<8>>::with_buckets(
+            let pool = Pool::<[u8; 4096], 4096, InlineLinks<8>>::with_buckets(
                 blocks,
                 0,
                 if layout == "inline" { 1 } else { bucket_count },

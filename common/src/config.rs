@@ -851,6 +851,9 @@ fn default_max_concat_sources() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct SNConfig {
     pub knobs: Knobs,
+    /// Maximum number of extents this SN can name and hold in its extent table.
+    /// The extent pool reserves virtual address space for this many entries.
+    pub max_extents: u32,
     /// A machine's extent budget is split between streams and extents, and the
     /// split encodes an assumed workload mix.
     pub stream_share: f64,

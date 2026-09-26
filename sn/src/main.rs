@@ -25,10 +25,12 @@ use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::{Arg, Op, Req, Resp, Status, StructReader, StructWriter, structure};
 use common::{Error, Result};
+use pool::{InlineLinks, Pool};
 use std::collections::HashMap;
-#[cfg(test)]
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::mem::{align_of, offset_of};
+use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 const SERVES: &[Op] = &[
@@ -126,10 +128,119 @@ impl Stream {
 /// has **as many first-records as there are streams referencing it**, so the field had no
 /// single correct value to hold — it recorded whichever stream happened to create it and
 /// was wrong for every other (§17.29.1).
+#[repr(C)]
 #[derive(Debug)]
 struct Extent {
+    /// Pool free-list link, placed in space already present in the extent layout.
+    #[allow(dead_code)]
+    pool_link: AtomicU32,
     deletion: Flags,
     data: ExtentData,
+}
+
+impl Extent {
+    fn blank() -> Self {
+        Self {
+            pool_link: AtomicU32::new(u32::MAX),
+            deletion: Flags::default(),
+            data: ExtentData {
+                logical: ELoff::ZERO,
+                compressed: ECoff::ZERO,
+                id: ExtentId::NONE,
+                records: ERoff::ZERO,
+                created: TimeSec::EPOCH,
+                disks: Vec::new(),
+            },
+        }
+    }
+
+    fn init(&mut self) {
+        self.deletion.clear_valid();
+    }
+}
+
+// SAFETY: init writes a complete Extent into fresh slot storage before it is used.
+unsafe impl pool::PoolItem for Extent {
+    unsafe fn init(slot: *mut Self) {
+        // SAFETY: the pool provides aligned, fresh storage for one Extent.
+        unsafe {
+            slot.write(Self::blank());
+            (*slot).init();
+        }
+    }
+}
+
+type ExtentPool =
+    Pool<Extent, { align_of::<Extent>() }, InlineLinks<{ offset_of!(Extent, pool_link) }>>;
+
+/// A dense, stable-index table backed by typed pool slots.
+struct ExtentTable {
+    pool: ExtentPool,
+    base: NonNull<Extent>,
+    len: usize,
+}
+
+// SAFETY: base points into the owned pool's stable mapping; table access is
+// serialized by SN's RwLock, and Extents are Send + Sync.
+unsafe impl Send for ExtentTable {}
+unsafe impl Sync for ExtentTable {}
+
+impl ExtentTable {
+    fn new(max_extents: u32) -> pool::Result<Self> {
+        Ok(Self { pool: ExtentPool::new(max_extents, 0)?, base: NonNull::dangling(), len: 0 })
+    }
+
+    fn push(&mut self, mut extent: Extent) {
+        let index = self.len;
+        assert_eq!(extent.data.id.get() as usize, index, "extent IDs are table indexes");
+        let block = self.pool.alloc_fresh().expect("configured extent table capacity");
+        assert_eq!(block.index() as usize, index, "extent pool issues dense indexes");
+        let pointer = block.as_ptr().cast::<Extent>();
+        // The pool has already initialized a complete invalid Extent here.
+        unsafe {
+            let slot = &mut *pointer;
+            debug_assert!(!slot.deletion.is_valid());
+            slot.pool_link.store(u32::MAX, Ordering::Relaxed);
+            extent.deletion.set_valid();
+            slot.deletion = extent.deletion;
+            slot.data = extent.data;
+        }
+        if index == 0 {
+            self.base = NonNull::new(pointer).expect("extent pool mapping is non-null");
+        }
+        self.len += 1;
+        // Extents are stable tombstones, so the table owns these pool indexes for
+        // its lifetime instead of returning them to the reusable free lists.
+        std::mem::forget(block);
+    }
+}
+
+impl Deref for ExtentTable {
+    type Target = [Extent];
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: push initializes one contiguous slot before increasing len;
+        // slots remain initialized and stationary until this table is dropped.
+        unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.len) }
+    }
+}
+
+impl DerefMut for ExtentTable {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: the enclosing RwLock serializes mutation and slots are stable.
+        unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for ExtentTable {
+    fn drop(&mut self) {
+        for index in 0..self.pool.issued_blocks() as usize {
+            // PoolItem::init initialized every issued slot.
+            // Use raw pointers so the slice does not retain references to values
+            // after their individual lifetimes end.
+            unsafe { std::ptr::drop_in_place(self.base.as_ptr().add(index)) };
+        }
+    }
 }
 /// A snapshot for an answer, never an owning reference.
 #[derive(Clone, Debug)]
@@ -295,7 +406,7 @@ struct SN {
     /// (`A-NAME-IS-NEVER-REMINTED-IN-ITS-OWN-SECOND`).
     shards: Vec<Mutex<HashMap<StreamName, Stream>>>,
     /// Lock stream shards before this table. IDs are stable vector indexes.
-    extent_table: RwLock<Vec<Extent>>,
+    extent_table: RwLock<ExtentTable>,
     // Lock owner before its sparse extras.
     stream_extras: Mutex<Extras<StreamName>>,
     extent_extras: Mutex<SharedExtras<(ExtentId, TimeSec)>>,
@@ -503,8 +614,15 @@ impl SN {
         extent.args(first, &disks)
     }
 
-    fn new(config: SNConfig, per_stream: usize, mine: SnId, disks: Vec<(EnId, DiskId)>) -> SN {
-        SN {
+    fn new(
+        config: SNConfig,
+        per_stream: usize,
+        mine: SnId,
+        disks: Vec<(EnId, DiskId)>,
+    ) -> Result<SN> {
+        let extent_table = ExtentTable::new(config.max_extents)
+            .map_err(|error| Error::new(format!("reserve SN extent table: {error}")))?;
+        Ok(SN {
             config,
             deleting: Mutex::new(()),
             retired_streams: Mutex::new(std::collections::HashSet::new()),
@@ -512,7 +630,7 @@ impl SN {
             mine,
             disks: Mutex::new(disks),
             shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
-            extent_table: RwLock::new(Vec::new()),
+            extent_table: RwLock::new(extent_table),
             stream_extras: Mutex::new(Extras::default()),
             extent_extras: Mutex::new(Extras::default()),
             naming: Naming::new(),
@@ -520,7 +638,7 @@ impl SN {
             extents: AtomicU64::new(0),
             sealed: AtomicU64::new(0),
             sealed_streams: AtomicU64::new(0),
-        }
+        })
     }
 
     /// `(RangeId, first StreamId, count, creation second)`. A DN creating many
@@ -1217,10 +1335,13 @@ impl SN {
             return Ok(Placed { extent: extents[id.get() as usize].data.clone(), first });
         }
         let mut extents = self.extent_table.write().expect("extents");
-        let disks = self.naming.disks(self.disks.lock().expect("disks").len(), instances)?;
+        if extents.len() >= self.config.max_extents as usize {
+            return Err(Error::new("extent table reached its configured maximum"));
+        }
         if extents.len() as u64 > ExtentId::MAX.number() {
             return Err(Error::new("extent table is full"));
         }
+        let disks = self.naming.disks(self.disks.lock().expect("disks").len(), instances)?;
         let (id, created) = self.naming.name(second)?;
         assert_eq!(id.get() as usize, extents.len());
         let extent = ExtentData {
@@ -1231,7 +1352,11 @@ impl SN {
             compressed: ECoff::ZERO,
             disks,
         };
-        extents.push(Extent { deletion: Flags::default(), data: extent.clone() });
+        extents.push(Extent {
+            pool_link: AtomicU32::new(u32::MAX),
+            deletion: Flags::default(),
+            data: extent.clone(),
+        });
         held.open = Some(id);
         self.extents.fetch_add(1, Ordering::Relaxed);
         Ok(Placed { extent, first })
@@ -1240,12 +1365,12 @@ impl SN {
 
 fn main() {
     let result = server::main(|process| {
-        Ok(SN::new(
+        SN::new(
             SNConfig::load(&process.config.service_config)?,
             process.cluster.extents.per_stream,
             SnId::new(process.entry.number()),
             Vec::new(),
-        ))
+        )
     });
     if let Err(e) = result {
         eprintln!("sn: {e}");
@@ -1356,10 +1481,64 @@ mod tests {
         });
         assert_eq!(extent.hard.load(Ordering::Relaxed), 1);
     }
+
+    #[test]
+    fn link_layout() {
+        assert_eq!(std::mem::size_of::<Extent>(), 56);
+        assert_eq!(align_of::<Extent>(), 8);
+        assert_eq!(offset_of!(Extent, pool_link), 0);
+        assert!(!Flags::default().is_valid());
+    }
+
+    #[test]
+    fn spare_invalid() {
+        let mut config = testing::sn_config();
+        config.max_extents = 2;
+        let sn = SN::new(config, 10, SnId::FIRST, default_disks()).unwrap();
+        let mut stream = Stream {
+            deletion: Flags::default(),
+            created: TimeSec::new(100),
+            creator: SnId::FIRST,
+            sealed: Vec::new(),
+            open: None,
+            sealed_records: SRoff::ZERO,
+            sealed_stream: false,
+        };
+        sn.appendable(&mut stream, TimeSec::new(100), 4).unwrap();
+
+        let table = sn.extent_table.read().unwrap();
+        assert!(table[0].deletion.is_valid());
+        assert_eq!(table.pool.issued_blocks(), 1);
+        let spare = table.pool.alloc_fresh().unwrap();
+        assert_eq!(spare.index(), 1);
+        assert_eq!(table.pool.issued_blocks(), 2);
+        let pointer = spare.as_ptr().cast::<Extent>();
+        assert!(!unsafe { (*pointer).deletion.is_valid() });
+        // Model the extent's own delete routine clearing Valid before the pool
+        // sees the block. Pool retirement and reuse must leave it alone.
+        unsafe {
+            (*pointer).deletion.set_valid();
+            (*pointer).deletion.clear_valid();
+        }
+        assert!(!unsafe { (*pointer).deletion.is_valid() });
+        drop(spare);
+        let reused = table.pool.alloc_from_bucket(1).unwrap();
+        assert_eq!(reused.index(), 1);
+        assert!(!unsafe { (*reused.as_ptr().cast::<Extent>()).deletion.is_valid() });
+    }
+
+    #[test]
+    fn big_map() {
+        let table = ExtentTable::new(1_073_741_824).unwrap();
+        assert_eq!(table.pool.block_bytes(), std::mem::size_of::<Extent>());
+        assert_eq!(table.pool.issued_blocks(), 0);
+    }
+
     #[test]
     fn extent_rows_keep_extent_measures_while_stream_totals_widen() {
-        let sn = SN::new(testing::sn_config(), 10, SnId::FIRST, Vec::new());
+        let sn = SN::new(testing::sn_config(), 10, SnId::FIRST, Vec::new()).unwrap();
         sn.extent_table.write().unwrap().push(Extent {
+            pool_link: AtomicU32::new(u32::MAX),
             deletion: Flags::default(),
             data: ExtentData {
                 id: ExtentId::FIRST,
@@ -1395,9 +1574,10 @@ mod tests {
 
     #[test]
     fn listing_continuation_advances_through_sealed_extents_and_into_the_open_one() {
-        let sn = SN::new(testing::sn_config(), 10, SnId::FIRST, Vec::new());
+        let sn = SN::new(testing::sn_config(), 10, SnId::FIRST, Vec::new()).unwrap();
         for id in 0..4 {
             sn.extent_table.write().unwrap().push(Extent {
+                pool_link: AtomicU32::new(u32::MAX),
                 deletion: Flags::default(),
                 data: ExtentData {
                     id: ExtentId::new(id),
@@ -1488,7 +1668,8 @@ mod tests {
             testing::extents().per_stream,
             SnId::new(0),
             default_disks(),
-        );
+        )
+        .unwrap();
         let made = sn.create(&Req::new(Op::CreateStream).structure({
             let mut payload = StructWriter::new();
             payload.range_id(RangeId::new(range));
@@ -1669,13 +1850,37 @@ mod tests {
     }
 
     #[test]
+    fn extent_cap() {
+        let mut config = testing::sn_config();
+        config.max_extents = 1;
+        let sn = SN::new(config, 10, SnId::FIRST, default_disks()).unwrap();
+        let mut stream = Stream {
+            deletion: Flags::default(),
+            created: TimeSec::new(100),
+            creator: SnId::FIRST,
+            sealed: Vec::new(),
+            open: None,
+            sealed_records: SRoff::ZERO,
+            sealed_stream: false,
+        };
+        let first = sn.appendable(&mut stream, TimeSec::new(100), 4).unwrap();
+        assert_eq!(first.extent.id, ExtentId::FIRST);
+        assert_eq!(sn.config.max_extents, 1);
+        assert_eq!(sn.extent_table.read().unwrap().len(), 1);
+        stream.open = None;
+        assert!(sn.appendable(&mut stream, TimeSec::new(101), 4).is_err());
+        assert_eq!(sn.extent_table.read().unwrap().len(), 1);
+    }
+
+    #[test]
     fn an_extent_on_a_stream_that_does_not_exist_is_refused() {
         let sn = SN::new(
             testing::sn_config(),
             testing::extents().per_stream,
             SnId::new(0),
             default_disks(),
-        );
+        )
+        .unwrap();
         assert!(sn.open(named(0, 7), TimeSec::new(1_000_000), 4).is_err());
     }
 

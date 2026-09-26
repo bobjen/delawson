@@ -153,8 +153,18 @@ impl Flags {
     const EXTRA: u8 = 1;
     const SOFT_DELETED: u8 = 2;
     const DELETED: u8 = 4;
+    const VALID: u8 = 8;
     pub fn vacant() -> Self {
         Self(Self::SOFT_DELETED | Self::DELETED)
+    }
+    pub fn is_valid(self) -> bool {
+        self.0 & Self::VALID != 0
+    }
+    pub fn set_valid(&mut self) {
+        self.0 |= Self::VALID;
+    }
+    pub fn clear_valid(&mut self) {
+        self.0 &= !Self::VALID;
     }
     pub fn extra(self) -> bool {
         self.0 & Self::EXTRA != 0
