@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn what_does_not_compress_is_left_alone() {
         let mut noise = vec![0u8; 4096];
-        crate::random::Rng::new().fill_bytes(&mut noise);
+        random::Rng::new().fill_bytes(&mut noise);
         assert!(squeeze(Compress::Lz4, &noise).is_none());
         // And a block stored uncompressed reads back without a codec.
         assert_eq!(expand(Compress::Lz4, &noise, noise.len()).unwrap(), noise);

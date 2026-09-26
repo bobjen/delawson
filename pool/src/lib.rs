@@ -425,9 +425,10 @@ impl<T: PoolItem, const A: usize, L: Links> Pool<T, A, L> {
     }
 
     /// Tries up to four buckets, reclaiming at each before issuing a fresh index.
-    /// Supply one value from the calling thread's RNG; no shared RNG is used.
+    /// Bucket selection uses this thread's RNG; no shared RNG is used.
     /// Returns can remain temporarily unavailable while protected by readers.
-    pub fn alloc(&self, random: u64) -> Result<Block<'_, T, A, L>> {
+    pub fn alloc(&self) -> Result<Block<'_, T, A, L>> {
+        let random = random::thread_u64();
         let count = self.buckets.len();
         let mask = count - 1;
         let first = ((random as usize) ^ mask) & mask;
@@ -684,17 +685,15 @@ mod tests {
     type InlinePool16 = Pool<[u8; 16], 4, InlineLinks<4>>;
 
     #[test]
-    fn default_configuration_uses_four_reclaiming_choices() {
-        let pool = Pool16::new(256, 256).unwrap();
+    fn default_allocator_uses_four_choices_and_grows() {
+        let pool = Pool16::new(8, 0).unwrap();
         assert_eq!(pool.buckets.len(), 256);
         assert_eq!(DEFAULT_CHOICES, 4);
-        // random=0 selects 255,0,1,2 with odd delta 1.
-        let held: Vec<_> = (0..DEFAULT_CHOICES).map(|_| pool.alloc(0).unwrap()).collect();
-        assert_eq!(held.iter().map(Block::index).collect::<Vec<_>>(), [255, 0, 1, 2]);
-        assert!(pool.alloc(0).is_err());
+        let held: Vec<_> = (0..DEFAULT_CHOICES).map(|_| pool.alloc().unwrap()).collect();
+        assert_eq!(held.iter().map(Block::index).collect::<Vec<_>>(), [0, 1, 2, 3]);
         drop(held);
-        assert!(pool.alloc(0).is_ok());
-        assert_eq!(pool.issued_blocks(), 256);
+        assert!(pool.alloc().is_ok());
+        assert!(pool.issued_blocks() >= 4);
     }
 
     #[test]

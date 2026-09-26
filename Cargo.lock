@@ -228,10 +228,10 @@ dependencies = [
  "aes-gcm",
  "crc64-nvme",
  "delawson-pool",
+ "delawson-random",
  "hkdf",
  "libc",
  "lz4_flex",
- "rand_core",
  "rustls",
  "serde",
  "sha2",
@@ -277,6 +277,7 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "delawson-common",
+ "delawson-random",
  "serde_json",
 ]
 
@@ -293,6 +294,7 @@ name = "delawson-pool"
 version = "0.0.1"
 dependencies = [
  "delawson-common",
+ "delawson-random",
  "libc",
 ]
 
@@ -307,11 +309,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "delawson-random"
+version = "0.0.1"
+dependencies = [
+ "rand_core",
+]
+
+[[package]]
 name = "delawson-sn"
 version = "0.0.1"
 dependencies = [
  "delawson-common",
  "delawson-pool",
+ "delawson-random",
 ]
 
 [[package]]

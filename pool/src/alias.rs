@@ -250,7 +250,6 @@ impl SegmentedBuffer<'_> {
 mod tests {
     use super::*;
     use crate::ChunkPool;
-    use common::random::Rng;
 
     #[test]
     fn mappings_follow_buffers_and_reuse_retained_leaves() {
@@ -258,12 +257,11 @@ mod tests {
             return;
         }
         let pool = ChunkPool::new(((4u64 << 30) / CHUNK_BYTES as u64) as u32, 0).unwrap();
-        let mut rng = Rng::from_seed(42);
         let mut a = SegmentedBuffer::with_retained_leaves(&pool, 4);
         let mut b = SegmentedBuffer::with_retained_leaves(&pool, 4);
         for _ in 0..4 {
-            a.append(&[7; CHUNK_BYTES], || rng.next_u64()).unwrap();
-            b.append(&[9; CHUNK_BYTES], || rng.next_u64()).unwrap();
+            a.append(&[7; CHUNK_BYTES]).unwrap();
+            b.append(&[9; CHUNK_BYTES]).unwrap();
         }
         let end = a.end();
         a.with_contiguous_read(3..end, |s| assert!(s.iter().all(|&x| x == 7))).unwrap();
@@ -275,19 +273,19 @@ mod tests {
         b.with_contiguous_write(CHUNK_BYTES as u64 + 3..end, |s| s.fill(11)).unwrap();
         assert_eq!(b.chunk(CHUNK_BYTES as u64 + 3).unwrap()[0], 11);
         b.reset();
-        b.append(&vec![13; end as usize], || rng.next_u64()).unwrap();
+        b.append(&vec![13; end as usize]).unwrap();
         b.with_contiguous_read(0..end, |s| assert!(s.iter().all(|&x| x == 13))).unwrap();
         assert_eq!(b.alias.as_ref().unwrap().base, base);
         assert_eq!(b.alias.as_ref().unwrap().map_calls, calls);
         // Growing maps only the new suffix; the prefix keeps its virtual address.
-        b.append(&[15; CHUNK_BYTES], || rng.next_u64()).unwrap();
+        b.append(&[15; CHUNK_BYTES]).unwrap();
         b.with_contiguous_read(0..b.end(), |_| ()).unwrap();
         assert_eq!(b.alias.as_ref().unwrap().map_calls, calls + 1);
         assert_eq!(b.alias.as_ref().unwrap().base, base);
         // Replace a non-retained suffix while its old alias is still cached.
         b.reset();
-        b.append(&vec![17; end as usize], || rng.next_u64()).unwrap();
-        b.append(&[19; CHUNK_BYTES], || rng.next_u64()).unwrap();
+        b.append(&vec![17; end as usize]).unwrap();
+        b.append(&[19; CHUNK_BYTES]).unwrap();
         b.with_contiguous_read(0..b.end(), |s| {
             assert!(s[..end as usize].iter().all(|&x| x == 17));
             assert!(s[end as usize..].iter().all(|&x| x == 19));
@@ -301,13 +299,12 @@ mod tests {
             return;
         }
         let pool = ChunkPool::new(((4u64 << 30) / CHUNK_BYTES as u64) as u32, 0).unwrap();
-        let mut rng = Rng::from_seed(42);
         let start = CHUNK_BYTES as u64 - 3;
         let mut b = SegmentedBuffer::with_start(&pool, start);
         let mut other = SegmentedBuffer::new(&pool);
         for n in 1..=4 {
-            b.append(&[n; CHUNK_BYTES], || rng.next_u64()).unwrap();
-            other.append(&[99; CHUNK_BYTES], || rng.next_u64()).unwrap();
+            b.append(&[n; CHUNK_BYTES]).unwrap();
+            other.append(&[99; CHUNK_BYTES]).unwrap();
         }
         let end = b.end();
         let mut expected = vec![0; b.len() as usize];

@@ -341,7 +341,7 @@ mod tests {
     /// stream's extent list is the largest structure the store keeps (§4.7.1). This measures it.
     #[test]
     fn a_list_of_triples_compresses_and_a_list_of_guids_does_not() {
-        let mut rng = crate::random::Rng::new();
+        let mut rng = random::Rng::new();
         let (mut triples, mut guids, mut beside) = (Vec::new(), Vec::new(), Vec::new());
         // Ten thousand extents of one stream: one SN, consecutive ids, seconds creeping up.
         let mut second = 1_787_000_000u64;

@@ -1,10 +1,8 @@
 //! Process-shared storage for queued, sealed, and opened message batches.
 use super::{MAX_FRAME_BYTES, Req, Resp};
 use crate::config::BufferPoolConfig;
-use crate::random::Rng;
 use crate::{Context, Error, Result};
 use pool::{ChunkPool, SegmentedBuffer};
-use std::cell::RefCell;
 use std::io::Write;
 use std::sync::OnceLock;
 
@@ -18,12 +16,6 @@ pub(super) fn configured_pool() -> Option<BufferPoolConfig> {
 }
 pub(super) fn pool_config() -> BufferPoolConfig {
     POOL.get().and_then(|p| p.as_ref().ok()).map_or_else(BufferPoolConfig::default, |p| p.0)
-}
-
-thread_local! { static RANDOM: RefCell<Rng> = RefCell::new(Rng::new()); }
-
-pub(super) fn with_random<T>(f: impl FnOnce(&mut Rng) -> T) -> T {
-    RANDOM.with(|rng| f(&mut rng.borrow_mut()))
 }
 
 pub(super) fn shared_pool(config: BufferPoolConfig) -> Result<&'static ChunkPool> {
@@ -64,13 +56,11 @@ impl MessageBuffer {
         self.bytes.reset();
     }
     pub fn append(&mut self, bytes: &[u8]) -> Result<()> {
-        self.bytes
-            .append(bytes, || with_random(|rng| rng.next_u64()))
-            .context("message buffer append")
+        self.bytes.append(bytes).context("message buffer append")
     }
     pub(super) fn receive(&mut self, source: &mut impl std::io::Read, length: usize) -> Result<()> {
         self.clear();
-        self.bytes.read_exact_from(source, length, || with_random(|rng| rng.next_u64()))?;
+        self.bytes.read_exact_from(source, length)?;
         Ok(())
     }
     pub(super) fn write_to(&self, output: &mut impl Write) -> Result<()> {
@@ -121,7 +111,7 @@ impl FrameBuffer for MessageBuffer {
     fn append_message(&mut self, message: &impl Message) -> Result<()> {
         let start = self.bytes.end();
         let result = (|| {
-            let mut writer = self.bytes.writer(|| with_random(|rng| rng.next_u64()));
+            let mut writer = self.bytes.writer();
             writer.write_u32_le(0)?;
             message.encode_into(&mut writer)
         })();
@@ -160,7 +150,7 @@ impl MessageBuffer {
     pub fn append_payload(&mut self, bytes: &super::MessageBytes) -> Result<()> {
         bytes.check()?;
         let start = self.bytes.end();
-        let result = bytes.write_to(&mut self.bytes.writer(|| with_random(|rng| rng.next_u64())));
+        let result = bytes.write_to(&mut self.bytes.writer());
         if result.is_err() {
             self.bytes.truncate(start).context("batch rollback")?;
         }

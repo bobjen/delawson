@@ -139,7 +139,6 @@ impl Seal {
         plain: &mut pool::SegmentedBuffer<'_>,
         range: std::ops::Range<u64>,
         out: &mut pool::SegmentedBuffer<'_>,
-        mut random: impl FnMut() -> u64,
     ) -> Result<()> {
         // Validate before arithmetic or examining chunks; batches can have a rolling start.
         plain.reader_range(range.clone())?;
@@ -157,15 +156,14 @@ impl Seal {
         let result = (|| -> Result<()> {
             let mut header = [0; HEADER];
             header[4..].copy_from_slice(&counter.to_le_bytes());
-            out.append(&header, &mut random).context("sealed segment append")?;
+            out.append(&header).context("sealed segment append")?;
             let body_start = out.end();
             let mut compressed = false;
             if attempt {
-                out.append(&[LZ4], &mut random).context("sealed segment append")?;
-                out.append(&(size as u32).to_le_bytes(), &mut random)
-                    .context("sealed segment append")?;
+                out.append(&[LZ4]).context("sealed segment append")?;
+                out.append(&(size as u32).to_le_bytes()).context("sealed segment append")?;
                 // Input and output select direct-leaf or virtual alias independently.
-                let mut compress = |input: &[u8]| compress_into_pool(input, out, &mut random);
+                let mut compress = |input: &[u8]| compress_into_pool(input, out);
                 let chunk = plain.chunk(range.start).unwrap_or(&[]);
                 let written = if chunk.len() >= size {
                     compress(&chunk[..size])?
@@ -186,12 +184,12 @@ impl Seal {
                 }
             }
             if !compressed {
-                out.append(&[PLAIN], &mut random).context("sealed segment append")?;
+                out.append(&[PLAIN]).context("sealed segment append")?;
                 let mut at = range.start;
                 while at < range.end {
                     let chunk = plain.chunk(at).expect("validated plaintext range");
                     let n = chunk.len().min((range.end - at) as usize);
-                    out.append(&chunk[..n], &mut random).context("sealed segment append")?;
+                    out.append(&chunk[..n]).context("sealed segment append")?;
                     at += n as u64;
                 }
             }
@@ -226,7 +224,7 @@ impl Seal {
                     }
                     encryptor.finalize()
                 };
-                out.append(&tag, &mut random).context("sealed segment append")?;
+                out.append(&tag).context("sealed segment append")?;
             }
             Ok(())
         })();
@@ -315,19 +313,18 @@ impl Seal {
         header: &[u8; HEADER],
         sealed: &[u8],
         out: &mut pool::SegmentedBuffer<'_>,
-        mut random: impl FnMut() -> u64,
     ) -> Result<()> {
         let start = out.end();
         let result = self.open_with(header, sealed, |input, expanded| {
             match expanded {
                 Some(size) if size > 0 && fits_tail(out, size) => {
-                    let dest = append_contiguous_space(out, size, &mut random)?;
+                    let dest = append_contiguous_space(out, size)?;
                     let written = lz4_flex::block::decompress_into(input, dest)
                         .map_err(|e| Error::new(format!("segment did not expand: {e}")))?;
                     out.truncate(start + written as u64).context("expanded segment truncate")?;
                 }
                 Some(size) if size > 0 && pool::SegmentedBuffer::alias_supported() => {
-                    append_zeroes(out, size, &mut random)?;
+                    append_zeroes(out, size)?;
                     let written = out
                         .with_contiguous_write(start..start + size as u64, |dest| {
                             lz4_flex::block::decompress_into(input, dest)
@@ -339,9 +336,9 @@ impl Seal {
                 Some(size) => {
                     let loose = lz4_flex::decompress(input, size)
                         .map_err(|e| Error::new(format!("segment did not expand: {e}")))?;
-                    out.append(&loose, &mut random).context("expanded segment append")?;
+                    out.append(&loose).context("expanded segment append")?;
                 }
-                None => out.append(input, &mut random).context("opened segment append")?,
+                None => out.append(input).context("opened segment append")?,
             }
             Ok(())
         });
@@ -409,33 +406,25 @@ impl Seal {
     }
 }
 
-fn append_zeroes(
-    out: &mut pool::SegmentedBuffer<'_>,
-    mut size: usize,
-    mut random: impl FnMut() -> u64,
-) -> Result<()> {
+fn append_zeroes(out: &mut pool::SegmentedBuffer<'_>, mut size: usize) -> Result<()> {
     let zeros = [0; pool::CHUNK_BYTES];
     while size != 0 {
         let n = size.min(zeros.len());
-        out.append(&zeros[..n], &mut random).context("LZ4 output space")?;
+        out.append(&zeros[..n]).context("LZ4 output space")?;
         size -= n;
     }
     Ok(())
 }
 
-fn compress_into_pool(
-    input: &[u8],
-    out: &mut pool::SegmentedBuffer<'_>,
-    mut random: impl FnMut() -> u64,
-) -> Result<usize> {
+fn compress_into_pool(input: &[u8], out: &mut pool::SegmentedBuffer<'_>) -> Result<usize> {
     let start = out.end();
     let bound = lz4_flex::block::get_maximum_output_size(input.len());
     let written = if fits_tail(out, bound) {
-        let dest = append_contiguous_space(out, bound, &mut random)?;
+        let dest = append_contiguous_space(out, bound)?;
         lz4_flex::block::compress_into(input, dest)
             .map_err(|e| Error::new(format!("segment did not compress: {e}")))?
     } else if pool::SegmentedBuffer::alias_supported() {
-        append_zeroes(out, bound, &mut random)?;
+        append_zeroes(out, bound)?;
         out.with_contiguous_write(start..start + bound as u64, |dest| {
             lz4_flex::block::compress_into(input, dest)
         })
@@ -443,7 +432,7 @@ fn compress_into_pool(
         .map_err(|e| Error::new(format!("segment did not compress: {e}")))?
     } else {
         let bytes = lz4_flex::compress(input);
-        out.append(&bytes, &mut random).context("compressed segment append")?;
+        out.append(&bytes).context("compressed segment append")?;
         bytes.len()
     };
     out.truncate(start + written as u64).context("compression output truncate")?;
@@ -459,11 +448,10 @@ fn fits_tail(out: &pool::SegmentedBuffer<'_>, size: usize) -> bool {
 fn append_contiguous_space<'a>(
     out: &'a mut pool::SegmentedBuffer<'_>,
     size: usize,
-    random: impl FnMut() -> u64,
 ) -> Result<&'a mut [u8]> {
     assert!(size > 0 && fits_tail(out, size));
     let start = out.end();
-    out.append(&[0; pool::CHUNK_BYTES][..size], random).context("LZ4 output space")?;
+    out.append(&[0; pool::CHUNK_BYTES][..size]).context("LZ4 output space")?;
     Ok(out
         .chunks_mut_range(start..out.end())
         .context("LZ4 output leaf")?
@@ -524,7 +512,6 @@ mod tests {
         // virtual space; physical pages are supplied only as blocks are used.
         let pool =
             pool::ChunkPool::new(((4u64 << 30) / pool::CHUNK_BYTES as u64) as u32, 0).unwrap();
-        let mut allocation_rng = crate::random::Rng::from_seed(42);
         for encrypted in [false, true] {
             for compression in [Compress::None, Compress::Lz4] {
                 for repetitive in [false, true] {
@@ -543,26 +530,22 @@ mod tests {
                         pool::CHUNK_BYTES * 3 + 17,
                         35000,
                     ] {
-                        let mut rng = crate::random::Rng::from_seed(17);
+                        let mut rng = random::Rng::from_seed(17);
                         let mut data: Vec<u8> = (0..len)
                             .map(|_| if repetitive { 7 } else { rng.next_u64() as u8 })
                             .collect();
                         let mut input =
                             pool::SegmentedBuffer::with_start(&pool, pool::CHUNK_BYTES as u64 - 3);
-                        input.append(b"skip", || allocation_rng.next_u64()).unwrap();
+                        input.append(b"skip").unwrap();
                         let start = input.end();
-                        input.append(&data, || allocation_rng.next_u64()).unwrap();
+                        input.append(&data).unwrap();
                         let end = input.end();
-                        input.append(b"ignore", || allocation_rng.next_u64()).unwrap();
+                        input.append(b"ignore").unwrap();
                         let mut output =
                             pool::SegmentedBuffer::with_start(&pool, pool::CHUNK_BYTES as u64 - 6);
-                        output.append(b"keep", || allocation_rng.next_u64()).unwrap();
+                        output.append(b"keep").unwrap();
                         let output_start = output.end();
-                        sender
-                            .seal_segmented(&mut input, start..end, &mut output, || {
-                                allocation_rng.next_u64()
-                            })
-                            .unwrap();
+                        sender.seal_segmented(&mut input, start..end, &mut output).unwrap();
                         let mut actual = vec![0; (output.end() - output_start) as usize];
                         output.read_at(output_start, &mut actual).unwrap();
                         let mut expected = Vec::new();
@@ -590,7 +573,6 @@ mod tests {
     fn lz4_input_and_output_fast_paths_are_independent() {
         let pool =
             pool::ChunkPool::new(((4u64 << 30) / pool::CHUNK_BYTES as u64) as u32, 0).unwrap();
-        let mut rng = crate::random::Rng::from_seed(42);
         for encrypted in [false, true] {
             for repetitive in [false, true] {
                 for input_start in [0, pool::CHUNK_BYTES as u64 - 6] {
@@ -603,19 +585,15 @@ mod tests {
                             let (mut reference, _) = pair(&config);
                             let mut data = vec![7; 1024];
                             if !repetitive {
-                                crate::random::Rng::from_seed(17).fill_bytes(&mut data);
+                                random::Rng::from_seed(17).fill_bytes(&mut data);
                             }
                             let mut input = pool::SegmentedBuffer::with_start(&pool, input_start);
-                            input.append(&data, || rng.next_u64()).unwrap();
+                            input.append(&data).unwrap();
                             let mut output = pool::SegmentedBuffer::with_start(&pool, output_start);
-                            output.append(b"keep", || rng.next_u64()).unwrap();
+                            output.append(b"keep").unwrap();
                             let start = output.end();
                             let input_range = input.start()..input.end();
-                            sender
-                                .seal_segmented(&mut input, input_range, &mut output, || {
-                                    rng.next_u64()
-                                })
-                                .unwrap();
+                            sender.seal_segmented(&mut input, input_range, &mut output).unwrap();
                             assert_eq!(
                                 sender.compression_input.is_empty(),
                                 input_start == 0 || pool::SegmentedBuffer::alias_supported()
@@ -631,13 +609,12 @@ mod tests {
                                 assert_eq!(expected[HEADER], if repetitive { LZ4 } else { PLAIN });
                             }
                             let mut opened = pool::SegmentedBuffer::with_start(&pool, opened_start);
-                            opened.append(b"keep", || rng.next_u64()).unwrap();
+                            opened.append(b"keep").unwrap();
                             receiver
                                 .open_segmented(
                                     expected[..HEADER].try_into().unwrap(),
                                     &expected[HEADER..],
                                     &mut opened,
-                                    || rng.next_u64(),
                                 )
                                 .unwrap();
                             let mut actual = vec![0; opened.len() as usize];
@@ -655,7 +632,6 @@ mod tests {
     fn segmented_open_rolls_back_failed_expansion_and_authentication() {
         let pool =
             pool::ChunkPool::new(((4u64 << 30) / pool::CHUNK_BYTES as u64) as u32, 0).unwrap();
-        let mut rng = crate::random::Rng::from_seed(42);
         for encrypted in [false, true] {
             for output_start in [0, pool::CHUNK_BYTES as u64 - 6] {
                 let config = messaging(encrypted, Compress::Lz4);
@@ -669,14 +645,13 @@ mod tests {
                     wire[..4].copy_from_slice(&5u32.to_le_bytes());
                 }
                 let mut opened = pool::SegmentedBuffer::with_start(&pool, output_start);
-                opened.append(b"keep", || rng.next_u64()).unwrap();
+                opened.append(b"keep").unwrap();
                 assert!(
                     receiver
                         .open_segmented(
                             wire[..HEADER].try_into().unwrap(),
                             &wire[HEADER..],
                             &mut opened,
-                            || rng.next_u64()
                         )
                         .is_err()
                 );
@@ -695,30 +670,24 @@ mod tests {
         }
         let pool =
             pool::ChunkPool::new(((4u64 << 30) / pool::CHUNK_BYTES as u64) as u32, 0).unwrap();
-        let mut rng = crate::random::Rng::from_seed(42);
         let size = crate::wire::MAX_SEGMENT_BYTES + 4;
         let mut input = pool::SegmentedBuffer::with_start(&pool, pool::CHUNK_BYTES as u64 - 1);
         let chunk = [7; pool::CHUNK_BYTES];
         for _ in 0..size / chunk.len() {
-            input.append(&chunk, || rng.next_u64()).unwrap();
+            input.append(&chunk).unwrap();
         }
-        input.append(&chunk[..size % chunk.len()], || rng.next_u64()).unwrap();
+        input.append(&chunk[..size % chunk.len()]).unwrap();
         let (mut sender, mut receiver) = pair(&messaging(false, Compress::Lz4));
         let mut output = pool::SegmentedBuffer::with_start(&pool, pool::CHUNK_BYTES as u64 - 2);
         let input_range = input.start()..input.end();
-        sender.seal_segmented(&mut input, input_range, &mut output, || rng.next_u64()).unwrap();
+        sender.seal_segmented(&mut input, input_range, &mut output).unwrap();
         assert!(sender.compression_input.is_empty());
         let mut sealed = vec![0; output.len() as usize];
         output.read_at(output.start(), &mut sealed).unwrap();
         assert_eq!(sealed[HEADER], LZ4);
         let mut opened = pool::SegmentedBuffer::with_start(&pool, pool::CHUNK_BYTES as u64 - 3);
         receiver
-            .open_segmented(
-                sealed[..HEADER].try_into().unwrap(),
-                &sealed[HEADER..],
-                &mut opened,
-                || rng.next_u64(),
-            )
+            .open_segmented(sealed[..HEADER].try_into().unwrap(), &sealed[HEADER..], &mut opened)
             .unwrap();
         assert_eq!(opened.len(), size as u64);
         let mut at = opened.start();
@@ -732,17 +701,14 @@ mod tests {
     #[test]
     fn rejected_compression_sample_never_flattens_input() {
         let pool = pool::ChunkPool::new(128, 0).unwrap();
-        let mut allocation_rng = crate::random::Rng::from_seed(42);
         let (mut sender, _) = pair(&messaging(true, Compress::Lz4));
-        let mut rng = crate::random::Rng::from_seed(29);
+        let mut rng = random::Rng::from_seed(29);
         let bytes: Vec<u8> = (0..40000).map(|_| rng.next_u64() as u8).collect();
         let mut input = pool::SegmentedBuffer::new(&pool);
-        input.append(&bytes, || allocation_rng.next_u64()).unwrap();
+        input.append(&bytes).unwrap();
         let mut out = pool::SegmentedBuffer::new(&pool);
         let input_end = input.end();
-        sender
-            .seal_segmented(&mut input, 0..input_end, &mut out, || allocation_rng.next_u64())
-            .unwrap();
+        sender.seal_segmented(&mut input, 0..input_end, &mut out).unwrap();
         assert_eq!(sender.compression_input.capacity(), 0);
     }
 
@@ -751,19 +717,17 @@ mod tests {
         let source_pool = pool::ChunkPool::new(4, 0).unwrap();
         let output_pool = pool::ChunkPool::new(1, 0).unwrap();
         let mut input = pool::SegmentedBuffer::new(&source_pool);
-        input.append(&vec![1; pool::CHUNK_BYTES], || 0).unwrap();
+        input.append(&vec![1; pool::CHUNK_BYTES]).unwrap();
         let mut out = pool::SegmentedBuffer::new(&output_pool);
-        out.append(b"prefix", || 0).unwrap();
+        out.append(b"prefix").unwrap();
         let (mut sender, _) = pair(&messaging(true, Compress::None));
-        assert!(
-            sender.seal_segmented(&mut input, 0..pool::CHUNK_BYTES as u64, &mut out, || 0).is_err()
-        );
+        assert!(sender.seal_segmented(&mut input, 0..pool::CHUNK_BYTES as u64, &mut out).is_err());
         let mut prefix = [0; 6];
         out.read_at(0, &mut prefix).unwrap();
         assert_eq!(&prefix, b"prefix");
         assert_eq!(out.end(), 6);
         assert_eq!(sender.counter, 1);
-        sender.seal_segmented(&mut input, 0..10, &mut out, || 0).unwrap();
+        sender.seal_segmented(&mut input, 0..10, &mut out).unwrap();
         let mut header = [0; HEADER];
         out.read_at(6, &mut header).unwrap();
         assert_eq!(u64::from_le_bytes(header[4..].try_into().unwrap()), 1);
@@ -806,7 +770,7 @@ mod tests {
     fn incompressible_stays_plain() {
         let config = messaging(false, Compress::Lz4);
         let mut noise = vec![0u8; 4096];
-        crate::random::Rng::from_seed(1).fill_bytes(&mut noise);
+        random::Rng::from_seed(1).fill_bytes(&mut noise);
         let (mut sender, _) = pair(&config);
         let mut wire = Vec::new();
         sender.seal(&mut noise.clone(), &mut wire).unwrap();
@@ -840,7 +804,7 @@ mod tests {
 
 #[cfg(test)]
 mod ratio {
-    use crate::random::Rng;
+    use random::Rng;
 
     /// A batch of replies with random bodies must not compress. If it does, a
     /// measurement of compression is measuring the padding instead of the wire.
@@ -870,7 +834,7 @@ mod ratio {
 mod sampling {
     use super::*;
     use crate::config::{Compress, SendMode};
-    use crate::random::Rng;
+    use random::Rng;
 
     fn config(sample: usize) -> Messaging {
         Messaging {

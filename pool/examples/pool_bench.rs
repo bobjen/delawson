@@ -13,13 +13,14 @@
 //! now has no capacity limit or shared allocation counter.
 //! Earlier measurements above explicitly used 16 blocks.
 //! Compare fixed work, not the coverage tests' timed loops.
-//! RNG comparison: POOL_BENCH_RNG=local (default), held, or per-alloc.
+//! RNG comparison: POOL_BENCH_RNG=local (default), held, or per-alloc for
+//! caller-selected bucket APIs. Pool::alloc owns its thread-local RNG in all modes.
 //! held borrows a thread-local RNG for the whole operation loop; per-alloc
-//! borrows it only to generate each allocation's bucket-selection value.
+//! borrows it only to generate each selected bucket's choices.
 //! All modes use the same per-thread seed and separate workload RNG. Setup and
 //! TLS initialization precede timing. The CSV format is unchanged; record the
 //! environment mode alongside each result when comparing modes.
-use common::random::Rng;
+use random::Rng;
 use std::cell::RefCell;
 
 // POOL_BENCH_RNG=local (default), held, or per-alloc. The latter two isolate
@@ -237,19 +238,21 @@ fn main() {
                 };
                 run(
                     |rng, deferred| {
-                        let val = bucket_random(rng, deferred) as usize;
-                        let first = (val ^ mask) & mask;
-                        let delta = (((val >> shift) & (bucket_count / 2 - 1)) << 1) | 1;
-                        let walk = (0..choices).map(|step| (first + step * delta) & mask);
                         if layout.ends_with("all")
                             && bucket_count == 256
                             && choices == pool::DEFAULT_CHOICES
                         {
-                            pool.alloc(val as u64).ok()
-                        } else if layout.ends_with("all") {
-                            pool.alloc_reclaiming_each(walk).ok()
+                            pool.alloc().ok()
                         } else {
-                            pool.alloc_from_buckets(walk).ok()
+                            let val = bucket_random(rng, deferred) as usize;
+                            let first = (val ^ mask) & mask;
+                            let delta = (((val >> shift) & (bucket_count / 2 - 1)) << 1) | 1;
+                            let walk = (0..choices).map(|step| (first + step * delta) & mask);
+                            if layout.ends_with("all") {
+                                pool.alloc_reclaiming_each(walk).ok()
+                            } else {
+                                pool.alloc_from_buckets(walk).ok()
+                            }
                         }
                     },
                     threads,
@@ -310,19 +313,21 @@ fn main() {
                 };
                 run(
                     |rng, deferred| {
-                        let val = bucket_random(rng, deferred) as usize;
-                        let first = (val ^ mask) & mask;
-                        let delta = (((val >> shift) & (bucket_count / 2 - 1)) << 1) | 1;
-                        let walk = (0..choices).map(|step| (first + step * delta) & mask);
                         if layout.ends_with("all")
                             && bucket_count == 256
                             && choices == pool::DEFAULT_CHOICES
                         {
-                            pool.alloc(val as u64).ok()
-                        } else if layout.ends_with("all") {
-                            pool.alloc_reclaiming_each(walk).ok()
+                            pool.alloc().ok()
                         } else {
-                            pool.alloc_from_buckets(walk).ok()
+                            let val = bucket_random(rng, deferred) as usize;
+                            let first = (val ^ mask) & mask;
+                            let delta = (((val >> shift) & (bucket_count / 2 - 1)) << 1) | 1;
+                            let walk = (0..choices).map(|step| (first + step * delta) & mask);
+                            if layout.ends_with("all") {
+                                pool.alloc_reclaiming_each(walk).ok()
+                            } else {
+                                pool.alloc_from_buckets(walk).ok()
+                            }
                         }
                     },
                     threads,

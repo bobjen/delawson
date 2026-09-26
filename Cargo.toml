@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["common", "dn", "en", "fe", "ks", "laws", "logs", "pool", "raft", "sn"]
+members = ["common", "dn", "en", "fe", "ks", "laws", "logs", "pool", "raft", "random", "sn"]
 
 [workspace.package]
 version = "0.0.1"
@@ -10,6 +10,7 @@ publish = false
 
 [workspace.dependencies]
 delawson-pool = { path = "pool" }
+delawson-random = { path = "random" }
 delawson-raft = { path = "raft" }
 delawson-common = { path = "common" }
 clap = { version = "4.6", features = ["derive", "env"] }

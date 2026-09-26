@@ -134,11 +134,8 @@ impl<'a> SegmentedBuffer<'a> {
         unsafe { self.ptr(node).cast::<u32>().add(slot).write(child) }
     }
 
-    fn index_block(
-        &self,
-        random: &mut impl FnMut() -> u64,
-    ) -> Result<Block<'a, [u8; CHUNK_BYTES], CHUNK_BYTES>> {
-        let block = self.pool.alloc(random())?;
+    fn index_block(&self) -> Result<Block<'a, [u8; CHUNK_BYTES], CHUNK_BYTES>> {
+        let block = self.pool.alloc()?;
         // SAFETY: this new block is exclusively owned, and all bits set is NONE.
         unsafe { block.as_ptr().write_bytes(0xff, CHUNK_BYTES) };
         Ok(block)
@@ -156,32 +153,22 @@ impl<'a> SegmentedBuffer<'a> {
     }
 
     // Add a missing path. New nodes remain RAII-owned until their child is
-    // successfully installed, so allocation errors or a panicking RNG cannot
-    // leak a detached subtree. Existing nodes change only after child success.
-    fn insert(
-        &mut self,
-        node: u32,
-        depth: u8,
-        relative: u128,
-        random: &mut impl FnMut() -> u64,
-    ) -> Result<u32> {
+    // successfully installed, so allocation errors cannot leak a detached
+    // subtree. Existing nodes change only after child success.
+    fn insert(&mut self, node: u32, depth: u8, relative: u128) -> Result<u32> {
         if depth == 0 {
-            return if node == NONE {
-                Ok(Self::take(self.pool.alloc(random())?))
-            } else {
-                Ok(node)
-            };
+            return if node == NONE { Ok(Self::take(self.pool.alloc()?)) } else { Ok(node) };
         }
-        let owned = if node == NONE { Some(self.index_block(random)?) } else { None };
+        let owned = if node == NONE { Some(self.index_block()?) } else { None };
         let node = owned.as_ref().map_or(node, Block::index);
         let span = Self::span(depth - 1);
         let slot = (relative / span) as usize;
-        let child = self.insert(self.child(node, slot), depth - 1, relative % span, random)?;
+        let child = self.insert(self.child(node, slot), depth - 1, relative % span)?;
         self.set_child(node, slot, child);
         Ok(owned.map_or(node, Self::take))
     }
 
-    fn ensure_leaf(&mut self, leaf: u64, random: &mut impl FnMut() -> u64) -> Result<u32> {
+    fn ensure_leaf(&mut self, leaf: u64) -> Result<u32> {
         if self.root == NONE {
             self.base = leaf;
             self.depth = 0;
@@ -191,14 +178,14 @@ impl<'a> SegmentedBuffer<'a> {
             debug_assert!(depth <= MAX_DEPTH);
             let span = Self::span(depth);
             let base = (self.base as u128 / span * span) as u64;
-            let parent = self.index_block(random)?;
+            let parent = self.index_block()?;
             let slot = ((self.base - base) as u128 / Self::span(self.depth)) as usize;
             self.set_child(parent.index(), slot, self.root);
             self.root = Self::take(parent);
             self.base = base;
             self.depth = depth;
         }
-        self.root = self.insert(self.root, self.depth, (leaf - self.base) as u128, random)?;
+        self.root = self.insert(self.root, self.depth, (leaf - self.base) as u128)?;
         self.allocated_end = self.allocated_end.max(leaf + 1);
         if leaf < self.retain_leaves as u64 {
             self.retained = self.retained.max(leaf as u32 + 1);
@@ -218,11 +205,11 @@ impl<'a> SegmentedBuffer<'a> {
         node
     }
 
-    /// Append initialized bytes. Calls the caller's RNG once per pool allocation.
+    /// Append initialized bytes. Pool allocation uses this thread's RNG as needed.
     /// On allocation failure the original byte range and contents are preserved.
     /// No leaf bytes outside the appended range are cleared or exposed.
     #[inline]
-    pub fn append(&mut self, bytes: &[u8], random: impl FnMut() -> u64) -> Result<()> {
+    pub fn append(&mut self, bytes: &[u8]) -> Result<()> {
         self.end
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| Error::new("segmented buffer offset overflow"))?;
@@ -248,17 +235,17 @@ impl<'a> SegmentedBuffer<'a> {
             self.end += bytes.len() as u64;
             return Ok(());
         }
-        self.append_slow(bytes, random)
+        self.append_slow(bytes)
     }
 
-    fn append_slow(&mut self, bytes: &[u8], mut random: impl FnMut() -> u64) -> Result<()> {
+    fn append_slow(&mut self, bytes: &[u8]) -> Result<()> {
         #[cfg(test)]
         tests::APPEND_SLOW_CALLS.with(|count| count.set(count.get() + 1));
         let old_end = self.end;
         self.tail = NONE;
         let mut remaining = bytes;
         while !remaining.is_empty() {
-            let index = match self.ensure_leaf(self.end / CHUNK_BYTES as u64, &mut random) {
+            let index = match self.ensure_leaf(self.end / CHUNK_BYTES as u64) {
                 Ok(index) => index,
                 Err(error) => {
                     self.end = old_end;
@@ -583,7 +570,7 @@ mod tests {
 
     fn all_returned(pool: &ChunkPool, max: usize) {
         let mut held = Vec::new();
-        while let Ok(block) = pool.alloc(0) {
+        while let Ok(block) = pool.alloc() {
             held.push(block);
         }
         assert_eq!(held.len(), max, "lost pool blocks");
@@ -599,7 +586,7 @@ mod tests {
     fn retained_first_leaf_reset_and_append_skip_slow_paths() {
         let pool = pool(8);
         let mut b = SegmentedBuffer::with_retained_leaves(&pool, 1);
-        b.append(&vec![7; CHUNK_BYTES * 2], || 0).unwrap();
+        b.append(&vec![7; CHUNK_BYTES * 2]).unwrap();
         let first = b.leaf(0);
         // A large buffer still needs its general cleanup, retaining only leaf zero.
         b.reset();
@@ -612,13 +599,13 @@ mod tests {
             b.reset(); // already empty
             assert_eq!(PRUNE_CALLS.get(), prunes);
             assert!(b.chunk(0).is_none());
-            b.append(&vec![3; CHUNK_BYTES], || panic!("retained allocation")).unwrap();
+            b.append(&vec![3; CHUNK_BYTES]).unwrap();
             assert_eq!(APPEND_SLOW_CALLS.get(), calls);
             assert_eq!(b.chunk(0), Some(vec![3; CHUNK_BYTES].as_slice()));
             assert_eq!(b.tail, first);
         }
         // A full leaf's tail must never be mistaken for the NEXT leaf.
-        b.append(&[9], || 0).unwrap();
+        b.append(&[9]).unwrap();
         assert_eq!(b.chunk(0), Some(vec![3; CHUNK_BYTES].as_slice()));
         assert_eq!(b.chunk(CHUNK_BYTES as u64), Some([9].as_slice()));
         audit(&b);
@@ -631,7 +618,7 @@ mod tests {
         for keep in [0, 1, 2, 4] {
             let pool = pool(32);
             let mut b = SegmentedBuffer::with_retained_leaves(&pool, keep);
-            b.append(&vec![0xa5; CHUNK_BYTES * 6], || 0).unwrap();
+            b.append(&vec![0xa5; CHUNK_BYTES * 6]).unwrap();
             let indexes: Vec<_> = (0..keep).map(|i| b.leaf(i as u64)).collect();
             b.discard_before((CHUNK_BYTES * 4) as u64).unwrap();
             assert_eq!(audit(&b), keep as usize + 2 + 1);
@@ -640,20 +627,15 @@ mod tests {
             assert!(b.chunk(0).is_none());
             assert_eq!(audit(&b), keep as usize + usize::from(keep > 1));
             for i in 0..keep {
-                b.append(&vec![i as u8; CHUNK_BYTES], || panic!("retained leaf allocated"))
-                    .unwrap();
+                b.append(&vec![i as u8; CHUNK_BYTES]).unwrap();
                 assert_eq!(b.leaf(i as u64), indexes[i as usize]);
             }
             b.discard_before(b.end()).unwrap();
             b.reset();
             assert_eq!(audit(&b), keep as usize + usize::from(keep > 1));
-            b.append(b"new", || 0).unwrap();
+            b.append(b"new").unwrap();
             b.truncate(0).unwrap();
-            b.append(b"ok", || {
-                assert_eq!(keep, 0, "retained leaf allocated");
-                0
-            })
-            .unwrap();
+            b.append(b"ok").unwrap();
             assert_eq!(b.chunk(0), Some(b"ok".as_slice()));
             drop(b);
             all_returned(&pool, 32);
@@ -664,11 +646,11 @@ mod tests {
     fn packed_append_read_overwrite_and_bounds() {
         let pool = pool(16);
         let mut b = SegmentedBuffer::new(&pool);
-        b.append(&[], || panic!("empty append allocated")).unwrap();
+        b.append(&[]).unwrap();
         assert_eq!(b.depth(), None);
         let mut expected: Vec<u8> = (0..CHUNK_BYTES * 3 + 17).map(|i| (i % 251) as u8).collect();
         for part in expected.chunks(37) {
-            b.append(part, || 0).unwrap();
+            b.append(part).unwrap();
         }
         assert_eq!(audit(&b), 5); // four leaves and one index
         assert_eq!(b.depth(), Some(1));
@@ -704,7 +686,7 @@ mod tests {
         let start = boundary - 2 * CHUNK_BYTES as u64;
         let mut b = SegmentedBuffer::with_start(&pool, start);
         let bytes = vec![73; CHUNK_BYTES * 3];
-        b.append(&bytes, || 0).unwrap();
+        b.append(&bytes).unwrap();
         assert_eq!(b.depth(), Some(2));
         assert_eq!(audit(&b), 6); // three leaves, two lower indexes, one root
         b.discard_before(boundary).unwrap();
@@ -716,7 +698,7 @@ mod tests {
         assert!(b.is_empty());
         assert_eq!(audit(&b), 0);
         assert_eq!(b.start(), end);
-        b.append(&[12], || 0).unwrap();
+        b.append(&[12]).unwrap();
         assert_eq!(b.chunk(end), Some(&[12][..]));
         drop(b);
         all_returned(&pool, 16);
@@ -728,7 +710,7 @@ mod tests {
         for depth in 1..=MAX_DEPTH {
             let boundary = 1u64 << (CHUNK_BITS + INDEX_BITS * (depth - 1) as u32);
             let mut b = SegmentedBuffer::with_start(&pool, boundary - 1);
-            b.append(&[23, 45], || 0).unwrap();
+            b.append(&[23, 45]).unwrap();
             assert_eq!(b.depth(), Some(depth));
             assert_eq!(b.chunks().flatten().copied().collect::<Vec<_>>(), [23, 45]);
             assert_eq!(audit(&b), 1 + 2 * depth as usize);
@@ -738,13 +720,13 @@ mod tests {
             assert_eq!(b.chunk(boundary), Some(&[45][..]));
         }
         let mut b = SegmentedBuffer::with_start(&pool, u64::MAX - 3);
-        b.append(&[1, 2, 3], || 0).unwrap();
-        assert!(b.append(&[4], || panic!("overflow allocated")).is_err());
+        b.append(&[1, 2, 3]).unwrap();
+        assert!(b.append(&[4]).is_err());
         assert_eq!(b.end(), u64::MAX);
         assert_eq!(b.chunks().flatten().copied().collect::<Vec<_>>(), [1, 2, 3]);
         b.clear();
-        b.append(&[], || 0).unwrap();
-        assert!(b.append(&[4], || 0).is_err());
+        b.append(&[]).unwrap();
+        assert!(b.append(&[4]).is_err());
         drop(b);
         all_returned(&pool, 32);
     }
@@ -755,8 +737,8 @@ mod tests {
         for max in 1..=1 + 2 * MAX_DEPTH as u32 {
             let pool = pool(max);
             let mut b = SegmentedBuffer::with_start(&pool, (1u64 << 62) - 2);
-            b.append(&[77], || 0).unwrap();
-            let result = b.append(&[88, 99], || 0);
+            b.append(&[77]).unwrap();
+            let result = b.append(&[88, 99]);
             if max < 1 + 2 * MAX_DEPTH as u32 {
                 assert!(result.is_err());
                 assert_eq!(b.len(), 1);
@@ -772,30 +754,11 @@ mod tests {
         }
         let pool = pool(2);
         let mut b = SegmentedBuffer::new(&pool);
-        assert!(b.append(&[5; CHUNK_BYTES * 2], || 0).is_err());
+        assert!(b.append(&[5; CHUNK_BYTES * 2]).is_err());
         assert!(b.is_empty());
         assert_eq!(audit(&b), 0);
         drop(b);
         all_returned(&pool, 2);
-    }
-
-    #[test]
-    fn rng_panic_does_not_lose_detached_nodes() {
-        for allowed in 0..1 + 2 * MAX_DEPTH as usize {
-            let pool = pool(32);
-            let mut b = SegmentedBuffer::with_start(&pool, (1u64 << 62) - 1);
-            b.append(&[3], || 0).unwrap();
-            let mut calls = 0;
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = b.append(&[7], || {
-                    assert!(calls < allowed, "injected RNG panic");
-                    calls += 1;
-                    0
-                });
-            }));
-            drop(b);
-            all_returned(&pool, 32);
-        }
     }
 
     #[test]
@@ -816,9 +779,9 @@ mod tests {
             let input = vec![iteration as u8; count];
             if iteration % 3 == 0 {
                 use std::io::Write;
-                b.writer(&mut random).write_all(&input).unwrap();
+                b.writer().write_all(&input).unwrap();
             } else {
-                b.append(&input, &mut random).unwrap();
+                b.append(&input).unwrap();
             }
             model.extend_from_slice(&input);
             if iteration % 5 == 0 {

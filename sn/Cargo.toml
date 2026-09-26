@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 delawson-common.workspace = true
 delawson-pool.workspace = true
+delawson-random.workspace = true
 
 [dev-dependencies]
 delawson-common = { workspace = true, features = ["testing"] }

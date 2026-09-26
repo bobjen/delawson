@@ -9,8 +9,7 @@
 //! let start = pool::CHUNK_BYTES as u64 - 3;
 //! let mut buffer = SegmentedBuffer::with_start(&pool, start);
 //! {
-//!     // Supply the calling thread's RNG in production.
-//!     let mut writer = buffer.writer(|| 0);
+//!     let mut writer = buffer.writer();
 //!     writer.write_u32_le(5)?; // crosses a leaf boundary
 //!     writer.write_all(b"hello")?;
 //! }
@@ -161,24 +160,23 @@ impl Read for SegmentedReader<'_, '_> {
     }
 }
 
-/// An append-only writer, borrowing its buffer and a caller-provided RNG.
+/// An append-only writer, borrowing its buffer.
 ///
 /// Small writes use a cached tail index without walking the tree or calling the
-/// RNG. Boundary-crossing writes use SegmentedBuffer::append and its rollback
+/// Pool RNG. Boundary-crossing writes use SegmentedBuffer::append and its rollback
 /// on allocation failure. Each write either appends all its bytes or returns an
 /// error without extending the logical range; a sequence of writes is not a
 /// transaction. Unused leaf bytes remain uninitialized. flush() is a no-op: all
 /// bytes are already in memory, and this writer provides no disk durability.
-pub struct SegmentedWriter<'b, 'p, F> {
+pub struct SegmentedWriter<'b, 'p> {
     buffer: &'b mut SegmentedBuffer<'p>,
-    random: F,
     tail: u32,
     spare: usize,
 }
 
-impl<'b, 'p, F: FnMut() -> u64> SegmentedWriter<'b, 'p, F> {
-    pub fn new(buffer: &'b mut SegmentedBuffer<'p>, random: F) -> Self {
-        let mut writer = Self { buffer, random, tail: NONE, spare: 0 };
+impl<'b, 'p> SegmentedWriter<'b, 'p> {
+    pub fn new(buffer: &'b mut SegmentedBuffer<'p>) -> Self {
+        let mut writer = Self { buffer, tail: NONE, spare: 0 };
         writer.refresh();
         writer
     }
@@ -215,11 +213,11 @@ impl<'b, 'p, F: FnMut() -> u64> SegmentedWriter<'b, 'p, F> {
                 "segmented output offset overflow",
             ));
         }
-        // Invalidate the cache before invoking user code, including the RNG.
-        // If that unwinds after a partial append, no stale tail can be reused.
+        // Invalidate the cache before a potentially allocating append. If that
+        // fails or unwinds after a partial append, no stale tail can be reused.
         self.tail = NONE;
         self.spare = 0;
-        let result = self.buffer.append(bytes, &mut self.random);
+        let result = self.buffer.append(bytes);
         self.refresh();
         result.map_err(io::Error::other)?;
         Ok(bytes.len())
@@ -243,7 +241,7 @@ impl<'b, 'p, F: FnMut() -> u64> SegmentedWriter<'b, 'p, F> {
     }
 }
 
-impl<F: FnMut() -> u64> Write for SegmentedWriter<'_, '_, F> {
+impl Write for SegmentedWriter<'_, '_> {
     #[inline]
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.is_empty() {
@@ -281,8 +279,8 @@ impl<'p> SegmentedBuffer<'p> {
     pub fn reader_range(&self, range: Range<u64>) -> io::Result<SegmentedReader<'_, 'p>> {
         SegmentedReader::with_range(self, range)
     }
-    pub fn writer<F: FnMut() -> u64>(&mut self, random: F) -> SegmentedWriter<'_, 'p, F> {
-        SegmentedWriter::new(self, random)
+    pub fn writer(&mut self) -> SegmentedWriter<'_, 'p> {
+        SegmentedWriter::new(self)
     }
 }
 
@@ -336,12 +334,7 @@ impl SegmentedBuffer<'_> {
     /// Read trait requires initialized destinations, so newly exposed bytes are
     /// zeroed before I/O. On EOF, I/O error, or allocation failure, roll back the
     /// logical append. Bytes already consumed from the input cannot be restored.
-    pub fn read_exact_from(
-        &mut self,
-        input: &mut impl Read,
-        count: usize,
-        mut random: impl FnMut() -> u64,
-    ) -> io::Result<()> {
+    pub fn read_exact_from(&mut self, input: &mut impl Read, count: usize) -> io::Result<()> {
         let start = self.end();
         let end = start.checked_add(count as u64).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "receive offset overflow")
@@ -352,7 +345,7 @@ impl SegmentedBuffer<'_> {
                 let window_end = end.min(at.saturating_add(((IO_SLICES - 1) * CHUNK_BYTES) as u64));
                 while self.end() < window_end {
                     let n = (window_end - self.end()).min(CHUNK_BYTES as u64) as usize;
-                    self.append(&[0; CHUNK_BYTES][..n], &mut random).map_err(io::Error::other)?;
+                    self.append(&[0; CHUNK_BYTES][..n]).map_err(io::Error::other)?;
                 }
                 while at < window_end {
                     let result =
@@ -404,7 +397,6 @@ impl SegmentedBuffer<'_> {
 mod tests {
     use super::*;
     use crate::ChunkPool;
-    use std::cell::Cell;
 
     fn pool(count: u32) -> ChunkPool {
         ChunkPool::with_buckets(count, 0, 1).unwrap()
@@ -417,7 +409,7 @@ mod tests {
             let start = CHUNK_BYTES as u64 - tail;
             let mut buffer = SegmentedBuffer::with_start(&pool, start);
             {
-                let mut writer = buffer.writer(|| 0);
+                let mut writer = buffer.writer();
                 writer.write_u64_le(0x0123456789abcdef).unwrap();
                 writer.write_u32_le(0x89abcdef).unwrap();
                 writer.write_u16_le(0x1234).unwrap();
@@ -439,7 +431,7 @@ mod tests {
         for width in [2, 4] {
             for tail in 1..width {
                 let mut buffer = SegmentedBuffer::with_start(&pool, CHUNK_BYTES as u64 - tail);
-                let mut writer = buffer.writer(|| 0);
+                let mut writer = buffer.writer();
                 if width == 2 {
                     writer.write_u16_le(0xabcd).unwrap();
                 } else {
@@ -459,7 +451,7 @@ mod tests {
     fn fill_and_consume_borrow_one_leaf_at_a_time() {
         let pool = pool(8);
         let mut buffer = SegmentedBuffer::with_start(&pool, CHUNK_BYTES as u64 - 3);
-        buffer.append(&[1, 2, 3, 4, 5], || 0).unwrap();
+        buffer.append(&[1, 2, 3, 4, 5]).unwrap();
         let first_ptr = buffer.chunk(CHUNK_BYTES as u64 - 3).unwrap().as_ptr();
         let next_ptr = buffer.chunk(CHUNK_BYTES as u64).unwrap().as_ptr();
         let mut reader = buffer.reader();
@@ -483,7 +475,7 @@ mod tests {
     fn consume_cannot_cross_the_exposed_slice() {
         let pool = pool(8);
         let mut buffer = SegmentedBuffer::with_start(&pool, CHUNK_BYTES as u64 - 3);
-        buffer.append(&[1; 8], || 0).unwrap();
+        buffer.append(&[1; 8]).unwrap();
         let mut reader = buffer.reader();
         assert_eq!(reader.fill_buf().unwrap().len(), 3);
         reader.consume(4);
@@ -493,7 +485,7 @@ mod tests {
     fn logical_end_is_enforced_before_the_physical_end() {
         let pool = pool(8);
         let mut buffer = SegmentedBuffer::with_start(&pool, CHUNK_BYTES as u64 - 3);
-        buffer.append(&[1, 2, 3, 4, 5, 6, 7, 8], || 0).unwrap();
+        buffer.append(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
         for length in 0..4 {
             let mut reader = buffer
                 .reader_range(CHUNK_BYTES as u64 - 3..CHUNK_BYTES as u64 - 3 + length)
@@ -525,18 +517,18 @@ mod tests {
     fn writer_starts_directly_in_the_retained_leaf() {
         let pool = pool(8);
         let mut buffer = SegmentedBuffer::with_retained_leaves(&pool, 1);
-        buffer.append(b"old bytes", || 0).unwrap();
+        buffer.append(b"old bytes").unwrap();
         buffer.reset();
         let first = buffer.tail;
         {
-            let mut writer = buffer.writer(|| panic!("retained allocation"));
+            let mut writer = buffer.writer();
             assert_eq!(writer.tail, first);
             assert_eq!(writer.spare, CHUNK_BYTES);
             writer.write_all(&vec![5; CHUNK_BYTES]).unwrap();
             assert_eq!(writer.spare, 0);
         }
         // Reopening at a full-leaf boundary must not reuse the previous leaf.
-        buffer.writer(|| 0).write_u8(9).unwrap();
+        buffer.writer().write_u8(9).unwrap();
         assert_eq!(buffer.chunk(0), Some(vec![5; CHUNK_BYTES].as_slice()));
         assert_eq!(buffer.chunk(CHUNK_BYTES as u64), Some([9].as_slice()));
     }
@@ -544,20 +536,16 @@ mod tests {
     #[test]
     fn small_writes_reuse_the_tail_without_allocating() {
         let pool = pool(8);
-        let calls = Cell::new(0);
         let mut buffer = SegmentedBuffer::new(&pool);
-        let mut writer = buffer.writer(|| {
-            calls.set(calls.get() + 1);
-            0
-        });
+        let mut writer = buffer.writer();
         writer.write_all(&[]).unwrap();
-        assert_eq!(calls.get(), 0);
+        assert_eq!(pool.issued_blocks(), 0);
         for _ in 0..CHUNK_BYTES / 4 {
             writer.write_u32_le(0x12345678).unwrap();
         }
-        assert_eq!(calls.get(), 1);
+        assert_eq!(pool.issued_blocks(), 1);
         writer.write_u8(9).unwrap();
-        assert_eq!(calls.get(), 3); // one index node and a second leaf
+        assert_eq!(pool.issued_blocks(), 3); // one index node and a second leaf
         let buffer = writer.into_inner();
         let mut reader = buffer.reader();
         for _ in 0..CHUNK_BYTES / 4 {
@@ -570,7 +558,7 @@ mod tests {
     fn write_error_restores_the_cached_tail() {
         let pool = pool(2); // can't own two leaves plus an index node
         let mut buffer = SegmentedBuffer::with_start(&pool, CHUNK_BYTES as u64 - 3);
-        let mut writer = buffer.writer(|| 0);
+        let mut writer = buffer.writer();
         writer.write_u8(11).unwrap();
         assert!(writer.write_u32_le(0x12345678).is_err());
         assert_eq!(writer.position(), CHUNK_BYTES as u64 - 2);
@@ -580,7 +568,7 @@ mod tests {
         let buffer = writer.into_inner();
         assert_eq!(buffer.chunks().flatten().copied().collect::<Vec<_>>(), [11, 0x33, 0x22]);
         buffer.clear();
-        let mut writer = buffer.writer(|| 0);
+        let mut writer = buffer.writer();
         writer.write_u32_le(0xabcdef01).unwrap();
         assert_eq!(writer.into_inner().reader().read_u32_le().unwrap(), 0xabcdef01);
     }
@@ -589,7 +577,7 @@ mod tests {
     fn reader_writer_handle_the_end_of_u64_offsets() {
         let pool = pool(4);
         let mut buffer = SegmentedBuffer::with_start(&pool, u64::MAX - 4);
-        let mut writer = buffer.writer(|| 0);
+        let mut writer = buffer.writer();
         writer.write_u16_le(0x1234).unwrap();
         writer.write_u16_le(0xabcd).unwrap(); // cached path ends at u64::MAX
         assert_eq!(writer.position(), u64::MAX);
@@ -608,49 +596,20 @@ mod tests {
         let pool = pool(32);
         let mut source = SegmentedBuffer::with_start(&pool, CHUNK_BYTES as u64 - 5);
         let bytes: Vec<_> = (0..17000).map(|n| (n % 251) as u8).collect();
-        source.writer(|| 0).write_all(&bytes).unwrap();
+        source.writer().write_all(&bytes).unwrap();
         let mut destination = SegmentedBuffer::new(&pool);
-        let count = io::copy(&mut source.reader(), &mut destination.writer(|| 0)).unwrap();
+        let count = io::copy(&mut source.reader(), &mut destination.writer()).unwrap();
         assert_eq!(count, bytes.len() as u64);
         let mut output = Vec::new();
         destination.reader().read_to_end(&mut output).unwrap();
         assert_eq!(output, bytes);
         source.discard_before(CHUNK_BYTES as u64 - 5 + 9000).unwrap();
-        source.writer(|| 0).write_all(&[99; 7]).unwrap();
+        source.writer().write_all(&[99; 7]).unwrap();
         let mut output = Vec::new();
         source.reader().read_to_end(&mut output).unwrap();
         let mut expected = bytes[9000..].to_vec();
         expected.extend([99; 7]);
         assert_eq!(output, expected);
-    }
-
-    #[test]
-    fn writer_cache_survives_caught_rng_panic() {
-        let pool = pool(16);
-        let mut buffer = SegmentedBuffer::with_start(&pool, CHUNK_BYTES as u64 - 3);
-        let fail = Cell::new(false);
-        let mut writer = buffer.writer(|| {
-            assert!(!fail.get(), "injected RNG failure");
-            0
-        });
-        writer.write_u8(11).unwrap();
-        fail.set(true);
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = writer.write_all(&[22; 8]);
-            }))
-            .is_err()
-        );
-        // The resident append copied the first two bytes before requesting
-        // another node. Panics (unlike returned errors) need not roll back.
-        assert_eq!(writer.position(), CHUNK_BYTES as u64);
-        fail.set(false);
-        writer.write_u16_le(0x4433).unwrap();
-        let buffer = writer.into_inner();
-        assert_eq!(
-            buffer.chunks().flatten().copied().collect::<Vec<_>>(),
-            [11, 22, 22, 0x33, 0x44]
-        );
     }
 
     #[test]
@@ -670,7 +629,7 @@ mod tests {
         let pool = pool(8);
         for start in 4088..CHUNK_BYTES as u64 + 1 {
             let mut buffer = SegmentedBuffer::with_start(&pool, start);
-            let mut writer = buffer.writer(|| 0);
+            let mut writer = buffer.writer();
             writer.write_u8(7).unwrap();
             writer.write_u16_le(Op::Range.code()).unwrap();
             writer.write_u16_le(0x1234).unwrap();
@@ -781,20 +740,20 @@ mod vectored_tests {
         let pool = ChunkPool::with_buckets(8, 0, 1).unwrap();
         let mut source = SegmentedBuffer::with_start(&pool, 17);
         let bytes: Vec<_> = (0..16001).map(|n| (n % 251) as u8).collect();
-        source.append(&bytes, || 0).unwrap();
+        source.append(&bytes).unwrap();
         let mut transport = Transport::new(Vec::new());
         source.write_to(&mut transport).unwrap();
         assert_eq!(transport.bytes, bytes);
         assert_eq!(transport.scalar_writes, transport.calls);
         let writes = transport.calls;
         let mut dest = SegmentedBuffer::with_start(&pool, 31);
-        dest.read_exact_from(&mut transport, bytes.len(), || 0).unwrap();
+        dest.read_exact_from(&mut transport, bytes.len()).unwrap();
         assert_eq!(transport.scalar_reads, transport.calls - writes);
         assert!(transport.scalar_reads > 3);
         assert_eq!(dest.chunk(31), Some(bytes.as_slice()));
         let before = dest.len();
         assert_eq!(
-            dest.read_exact_from(&mut transport, 1, || 0).unwrap_err().kind(),
+            dest.read_exact_from(&mut transport, 1).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
         assert_eq!(dest.len(), before);
@@ -805,14 +764,14 @@ mod vectored_tests {
         let pool = ChunkPool::with_buckets(200, 0, 1).unwrap();
         let mut source = SegmentedBuffer::with_start(&pool, CHUNK_BYTES as u64 - 3);
         let bytes: Vec<u8> = (0..CHUNK_BYTES * (IO_SLICES + 9)).map(|n| (n % 251) as u8).collect();
-        source.append(&bytes, || 0).unwrap();
+        source.append(&bytes).unwrap();
         let mut transport = Transport::new(Vec::new());
         source.write_to(&mut transport).unwrap();
         assert_eq!(transport.bytes, bytes);
         assert_eq!(transport.largest_vector, IO_SLICES);
         let mut dest = SegmentedBuffer::with_start(&pool, 17);
-        dest.append(&[9; 5], || 0).unwrap();
-        dest.read_exact_from(&mut transport, bytes.len(), || 0).unwrap();
+        dest.append(&[9; 5]).unwrap();
+        dest.read_exact_from(&mut transport, bytes.len()).unwrap();
         let mut actual = vec![0; bytes.len()];
         dest.read_at(22, &mut actual).unwrap();
         assert_eq!(actual, bytes);
@@ -824,10 +783,10 @@ mod vectored_tests {
     fn failed_receive_rolls_back_and_mutable_slices_stay_within_the_range() {
         let pool = ChunkPool::with_buckets(8, 0, 1).unwrap();
         let mut dest = SegmentedBuffer::new(&pool);
-        dest.append(&[7; CHUNK_BYTES + 904], || 0).unwrap();
+        dest.append(&[7; CHUNK_BYTES + 904]).unwrap();
         let mut input = Transport::new(vec![8; 100]);
         assert_eq!(
-            dest.read_exact_from(&mut input, CHUNK_BYTES * 2, || 0).unwrap_err().kind(),
+            dest.read_exact_from(&mut input, CHUNK_BYTES * 2).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
         assert_eq!(dest.len(), (CHUNK_BYTES + 904) as u64);
@@ -853,9 +812,9 @@ mod vectored_tests {
     fn receive_allocation_failure_preserves_existing_bytes() {
         let pool = ChunkPool::with_buckets(1, 0, 1).unwrap();
         let mut dest = SegmentedBuffer::new(&pool);
-        dest.append(&[7; 3], || 0).unwrap();
+        dest.append(&[7; 3]).unwrap();
         let mut input = Transport::new(vec![8; CHUNK_BYTES * 2]);
-        assert!(dest.read_exact_from(&mut input, CHUNK_BYTES * 2, || 0).is_err());
+        assert!(dest.read_exact_from(&mut input, CHUNK_BYTES * 2).is_err());
         assert_eq!(dest.len(), 3);
         assert_eq!(dest.reader().read_array::<3>().unwrap(), [7; 3]);
         assert_eq!(dest.depth(), Some(0));

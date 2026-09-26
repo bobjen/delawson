@@ -43,7 +43,6 @@
 
 use crate::config::{ClusterConfig, Messaging, ProcessConfig, SendMode, ServiceEntry, ServiceKind};
 use crate::peer::Peers;
-use crate::random::Rng;
 use crate::registry::Peer;
 use crate::routing;
 use crate::wire::{
@@ -52,6 +51,7 @@ use crate::wire::{
 };
 use crate::{Context, Error, Result};
 use crate::{logd, logi, logn, logsec, logw};
+use random::Rng;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener, TcpStream};

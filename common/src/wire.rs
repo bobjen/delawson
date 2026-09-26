@@ -42,10 +42,10 @@ pub use buffer::{FrameBuffer, Message, MessageBuffer};
 use crate::config::Messaging;
 use crate::ids::{DiskId, DnId, EnId, ExtentId, ObjectId, RangeId, SnId, StreamId};
 use crate::offset::{ECoff, ELoff, ERoff, OCoff, OEoff, OLoff, ORoff, SCoff, SLoff, SRoff};
-use crate::random::Rng;
 use crate::seal::{self, Seal};
 use crate::time::TimeSec;
 use crate::{Context, Error, Result};
+use random::Rng;
 use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1620,9 +1620,7 @@ impl Wire {
         while at < plain.bytes.end() {
             let end = segment_end(plain, at)?;
             self.sealed.clear();
-            self.seal.seal_segmented(&mut plain.bytes, at..end, &mut self.sealed.bytes, || {
-                buffer::with_random(|rng| rng.next_u64())
-            })?;
+            self.seal.seal_segmented(&mut plain.bytes, at..end, &mut self.sealed.bytes)?;
             self.sealed.write_to(&mut self.stream)?;
             self.sealed.clear();
             at = end;
@@ -1692,11 +1690,8 @@ impl Reader {
         self.open.clear();
         self.at = 0;
         let first = self.sealed.bytes.chunk(0).unwrap_or(&[]);
-        let mut open = |sealed: &[u8]| {
-            self.seal.open_segmented(&header, sealed, &mut self.open.bytes, || {
-                buffer::with_random(|rng| rng.next_u64())
-            })
-        };
+        let mut open =
+            |sealed: &[u8]| self.seal.open_segmented(&header, sealed, &mut self.open.bytes);
         let result = if first.len() >= length {
             open(&first[..length])
         } else if pool::SegmentedBuffer::alias_supported() {

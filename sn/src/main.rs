@@ -9,9 +9,9 @@
 //! way.** An append goes from the FE to the primary EN and is not seen here, so
 //! this is asked once per extent rather than once per write.
 //!
-//! State is in memory and sharded by stream id, so creating streams from every
-//! core does not queue on one lock. Deleted extent slots remain tombstones;
-//! recycling them safely is a later step.
+//! State is in memory and stream lookup is sharded by id. Stream and extent state
+//! share one SN-wide lock so request handling and Raft apply can synchronize.
+//! Deleted extent slots remain tombstones; recycling them safely is a later step.
 
 use common::config::{SNConfig, ServiceKind};
 use common::deletion::{
@@ -173,15 +173,16 @@ unsafe impl pool::PoolItem for Extent {
 type ExtentPool =
     Pool<Extent, { align_of::<Extent>() }, InlineLinks<{ offset_of!(Extent, pool_link) }>>;
 
-/// A dense, stable-index table backed by typed pool slots.
+/// A stable-index table backed by typed pool slots.
 struct ExtentTable {
     pool: ExtentPool,
     base: NonNull<Extent>,
+    /// One past the highest initialized pool index, not the number of live extents.
     len: usize,
 }
 
-// SAFETY: base points into the owned pool's stable mapping; table access is
-// serialized by SN's RwLock, and Extents are Send + Sync.
+// SAFETY: base points into the owned pool's stable mapping; SN accesses the
+// table under its shared state RwLock, and Extents are Send + Sync.
 unsafe impl Send for ExtentTable {}
 unsafe impl Sync for ExtentTable {}
 
@@ -190,28 +191,32 @@ impl ExtentTable {
         Ok(Self { pool: ExtentPool::new(max_extents, 0)?, base: NonNull::dangling(), len: 0 })
     }
 
-    fn push(&mut self, mut extent: Extent) {
-        let index = self.len;
-        assert_eq!(extent.data.id.get() as usize, index, "extent IDs are table indexes");
-        let block = self.pool.alloc_fresh().expect("configured extent table capacity");
-        assert_eq!(block.index() as usize, index, "extent pool issues dense indexes");
+    fn insert(&mut self, mut extent: Extent) -> pool::Result<ExtentId> {
+        let block = self.pool.alloc()?;
+        let index = block.index() as usize;
+        assert!(index <= self.len, "extent pool returned an unissued table index");
+        let id = ExtentId::new(block.index());
         let pointer = block.as_ptr().cast::<Extent>();
-        // The pool has already initialized a complete invalid Extent here.
+        // New slots are initialized by the pool; reused slots were invalidated before release.
         unsafe {
             let slot = &mut *pointer;
             debug_assert!(!slot.deletion.is_valid());
             slot.pool_link.store(u32::MAX, Ordering::Relaxed);
             extent.deletion.set_valid();
+            extent.data.id = id;
             slot.deletion = extent.deletion;
             slot.data = extent.data;
         }
-        if index == 0 {
-            self.base = NonNull::new(pointer).expect("extent pool mapping is non-null");
+        if index == self.len {
+            if index == 0 {
+                self.base = NonNull::new(pointer).expect("extent pool mapping is non-null");
+            }
+            self.len += 1;
         }
-        self.len += 1;
-        // Extents are stable tombstones, so the table owns these pool indexes for
-        // its lifetime instead of returning them to the reusable free lists.
+        // Keep the allocated slot owned by the table; dropping this handle would
+        // return the slot to the pool before extent retirement is implemented.
         std::mem::forget(block);
+        Ok(id)
     }
 }
 
@@ -219,7 +224,7 @@ impl Deref for ExtentTable {
     type Target = [Extent];
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: push initializes one contiguous slot before increasing len;
+        // SAFETY: insert initializes one contiguous slot before increasing len;
         // slots remain initialized and stationary until this table is dropped.
         unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.len) }
     }
@@ -227,7 +232,7 @@ impl Deref for ExtentTable {
 
 impl DerefMut for ExtentTable {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: the enclosing RwLock serializes mutation and slots are stable.
+        // SAFETY: SN's shared state RwLock serializes mutation and slots are stable.
         unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr(), self.len) }
     }
 }
@@ -335,58 +340,46 @@ use std::cell::RefCell;
 
 thread_local! {
     /// One generator per worker thread, so choosing disks needs no lock.
-    static RNG: RefCell<common::random::Rng> = RefCell::new(common::random::Rng::new());
+    static RNG: RefCell<random::Rng> = RefCell::new(random::Rng::new());
 }
 
-/// Hands out extent names and chooses instances for them.
-struct Naming {
-    next: AtomicU64,
-    /// The latest second used in a name, so one cannot go backwards.
-    latest: AtomicU64,
-}
-
-impl Naming {
-    fn new() -> Naming {
-        Naming { next: AtomicU64::new(0), latest: AtomicU64::new(0) }
+/// Instances for one extent, taken randomly from the available disks.
+fn pick_disks(total_disks: usize, want: usize) -> Result<Vec<SnDiskId>> {
+    if total_disks < want {
+        return Err(Error::new(format!(
+            "an extent wants {want} instances, and there are only {total_disks} disks",
+        )));
     }
-
-    /// An id and the second to name an extent with. A second earlier than one
-    /// already used is refused rather than quietly moved forward: the second is
-    /// what selects the key, so reaching back for an earlier one asks for a key
-    /// that may since have been retired.
-    fn name(&self, second: TimeSec) -> Result<(ExtentId, TimeSec)> {
-        // The atomic holds seconds; the check that they only move forward is `TimeSec`'s,
-        // so the message is the same wherever a creation second is taken (§17.32).
-        let latest = TimeSec::new(self.latest.fetch_max(second.number(), Ordering::Relaxed));
-        let second = second.not_before(latest)?;
-        Ok((ExtentId::new(self.next.fetch_add(1, Ordering::Relaxed) as u32), second))
-    }
-
-    /// Instances for one extent, taken randomly from the disks there are.
-    fn disks(&self, total_disks: usize, want: usize) -> Result<Vec<SnDiskId>> {
-        if total_disks < want {
-            return Err(Error::new(format!(
-                "an extent wants {want} instances, and there are only {total_disks} disks",
-            )));
-        }
-        let mut picked = Vec::with_capacity(want);
-        RNG.with(|rng| {
-            let mut rng = rng.borrow_mut();
-            while picked.len() < want {
-                let id = SnDiskId::new((rng.next_u64() % total_disks as u64) as u32);
-                if !picked.contains(&id) {
-                    picked.push(id);
-                }
+    let mut picked = Vec::with_capacity(want);
+    RNG.with(|rng| {
+        let mut rng = rng.borrow_mut();
+        while picked.len() < want {
+            let id = SnDiskId::new((rng.next_u64() % total_disks as u64) as u32);
+            if !picked.contains(&id) {
+                picked.push(id);
             }
-        });
-        Ok(picked)
-    }
+        }
+    });
+    Ok(picked)
+}
+
+struct SNState {
+    /// Keyed by the whole name, `(RangeId, StreamId, CreateSec)`, not just the id (#109).
+    /// A re-minted id in a later second is a different key, so stale references cannot
+    /// silently find the new stream (`A-NAME-IS-NEVER-REMINTED-IN-ITS-OWN-SECOND`).
+    /// Shards keep lookup maps small; IDs remain stable indexes in the extent table.
+    shards: Vec<HashMap<StreamName, Stream>>,
+    /// Stable extent indexes, protected by the same lock as the stream table.
+    extent_table: ExtentTable,
+    /// Side metadata whose lifetime follows its owning stream or extent.
+    retired_streams: std::collections::HashSet<StreamName>,
+    stream_extras: Extras<StreamName>,
+    extent_extras: SharedExtras<(ExtentId, TimeSec)>,
 }
 
 struct SN {
     config: SNConfig,
     deleting: Mutex<()>,
-    retired_streams: Mutex<std::collections::HashSet<StreamName>>,
     /// Maximum sealed extents one stream may hold, including extent references made by
     /// concatenation rather than by appending.
     per_stream: usize,
@@ -399,18 +392,8 @@ struct SN {
     mine: SnId,
     /// All disks across all ENs that this SN can see.
     disks: Mutex<Vec<(EnId, DiskId)>>,
-    /// ⚠️ **Keyed by the whole name**, `(RangeId, StreamId, CreateSec)`, and not by the id
-    /// alone (#109). That is what makes the id safe at 32 bits and what makes recycling one
-    /// safe at all: a re-minted id in a later second is a different key, so the old stream is
-    /// not overwritten and a stale reference to it does not silently find the new one
-    /// (`A-NAME-IS-NEVER-REMINTED-IN-ITS-OWN-SECOND`).
-    shards: Vec<Mutex<HashMap<StreamName, Stream>>>,
-    /// Lock stream shards before this table. IDs are stable vector indexes.
-    extent_table: RwLock<ExtentTable>,
-    // Lock owner before its sparse extras.
-    stream_extras: Mutex<Extras<StreamName>>,
-    extent_extras: Mutex<SharedExtras<(ExtentId, TimeSec)>>,
-    naming: Naming,
+    /// One lock for stream and extent state. Raft apply will use this same lock.
+    state: RwLock<SNState>,
     streams: AtomicU64,
     extents: AtomicU64,
     sealed: AtomicU64,
@@ -488,17 +471,18 @@ impl SN {
         let now = TimeSec::now();
         let maximum = process.cluster.max_soft_delete_retention_secs;
         let ids = {
-            let mut shard = self.shards[shard_of(name)].lock().expect("streams");
-            let Some(stream) = shard.get_mut(&name) else {
-                return if self.retired_streams.lock().unwrap().contains(&name) {
+            let mut state = self.state.write().expect("SN state");
+            let SNState { shards, extent_table, retired_streams, stream_extras, extent_extras } =
+                &mut *state;
+            let Some(stream) = shards[shard_of(name)].get_mut(&name) else {
+                return if retired_streams.contains(&name) {
                     Ok(())
                 } else {
                     Err(Resp::error(Status::NotFound, "no stream"))
                 };
             };
-            let mut extras = self.stream_extras.lock().expect("stream extras");
             let first_hard = deletion.hard && !stream.deletion.deleted();
-            let first = extras
+            let first = stream_extras
                 .transition(
                     name,
                     &mut stream.deletion,
@@ -508,13 +492,10 @@ impl SN {
                     maximum,
                 )
                 .map_err(bad)?;
-            let interval = extras.remaining(&name, now).map_err(bad)?;
-            drop(extras);
+            let interval = stream_extras.remaining(&name, now).map_err(bad)?;
             let ids: Vec<_> = stream.sealed.iter().copied().chain(stream.open).collect();
-            let mut table = self.extent_table.write().expect("extents");
-            let mut extent_extras = self.extent_extras.lock().expect("extent extras");
             for id in &ids {
-                let extent = &mut table[id.get() as usize];
+                let extent = &mut extent_table[id.get() as usize];
                 let key = (extent.data.id, extent.data.created);
                 if first {
                     extent_extras
@@ -544,21 +525,23 @@ impl SN {
                 continue;
             }
             let (created, disks, interval, hard) = {
-                let mut table = self.extent_table.write().unwrap();
-                let extent = &mut table[id.get() as usize];
+                let mut state = self.state.write().unwrap();
+                let SNState { extent_table, extent_extras, .. } = &mut *state;
+                let extent = &mut extent_table[id.get() as usize];
                 if !extent.deletion.soft_deleted() || extent.deletion.retired() {
                     continue;
                 }
-                let extras = self.extent_extras.lock().unwrap();
                 let key = (extent.data.id, extent.data.created);
                 let hard = deletion.hard && extent.deletion.deleted();
                 if hard {
-                    extras.delete(&key, &mut extent.deletion, TimeSec::now()).map_err(bad)?;
+                    extent_extras
+                        .delete(&key, &mut extent.deletion, TimeSec::now())
+                        .map_err(bad)?;
                 }
                 (
                     extent.data.created,
                     extent.data.disks.clone(),
-                    extras.remaining(&key, TimeSec::now()).map_err(bad)?,
+                    extent_extras.remaining(&key, TimeSec::now()).map_err(bad)?,
                     hard,
                 )
             };
@@ -579,9 +562,10 @@ impl SN {
                 }
             }
             if hard {
-                let mut table = self.extent_table.write().unwrap();
-                let extent = &mut table[id.get() as usize];
-                assert!(self.extent_extras.lock().unwrap().reclaim(
+                let mut state = self.state.write().unwrap();
+                let SNState { extent_table, extent_extras, .. } = &mut *state;
+                let extent = &mut extent_table[id.get() as usize];
+                assert!(extent_extras.reclaim(
                     &(id, created),
                     &mut extent.deletion,
                     TimeSec::now()
@@ -591,15 +575,13 @@ impl SN {
             }
         }
         if deletion.hard {
-            let mut shard = self.shards[shard_of(name)].lock().unwrap();
+            let mut state = self.state.write().unwrap();
+            let SNState { shards, stream_extras, retired_streams, .. } = &mut *state;
+            let shard = &mut shards[shard_of(name)];
             let stream = shard.get_mut(&name).unwrap();
-            assert!(self.stream_extras.lock().unwrap().reclaim(
-                &name,
-                &mut stream.deletion,
-                TimeSec::now()
-            ));
+            assert!(stream_extras.reclaim(&name, &mut stream.deletion, TimeSec::now()));
             shard.remove(&name);
-            self.retired_streams.lock().unwrap().insert(name);
+            retired_streams.insert(name);
             self.streams.fetch_sub(1, Ordering::Relaxed);
         }
         Ok(())
@@ -625,15 +607,16 @@ impl SN {
         Ok(SN {
             config,
             deleting: Mutex::new(()),
-            retired_streams: Mutex::new(std::collections::HashSet::new()),
             per_stream,
             mine,
             disks: Mutex::new(disks),
-            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
-            extent_table: RwLock::new(extent_table),
-            stream_extras: Mutex::new(Extras::default()),
-            extent_extras: Mutex::new(Extras::default()),
-            naming: Naming::new(),
+            state: RwLock::new(SNState {
+                shards: (0..SHARDS).map(|_| HashMap::new()).collect(),
+                extent_table,
+                retired_streams: std::collections::HashSet::new(),
+                stream_extras: Extras::default(),
+                extent_extras: Extras::default(),
+            }),
             streams: AtomicU64::new(0),
             extents: AtomicU64::new(0),
             sealed: AtomicU64::new(0),
@@ -688,10 +671,11 @@ impl SN {
                 );
             };
             let name = StreamName { range, stream, created };
-            if self.retired_streams.lock().unwrap().contains(&name) {
+            let mut state = self.state.write().expect("SN state");
+            if state.retired_streams.contains(&name) {
                 return bad("stream identity has been retired");
             }
-            let mut shard = self.shards[shard_of(name)].lock().expect("streams");
+            let shard = &mut state.shards[shard_of(name)];
             if let Some(stream) = shard.get(&name) {
                 if !stream.deletion.readable(false) {
                     return bad("stream is deleted");
@@ -736,7 +720,7 @@ impl SN {
             Ok(name) => name,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        if self.retired_streams.lock().unwrap().contains(&destination) {
+        if self.state.read().expect("SN state").retired_streams.contains(&destination) {
             return bad("destination stream identity has been retired");
         }
         let left = match stream_name(&mut payload) {
@@ -772,7 +756,8 @@ impl SN {
         }
 
         {
-            let shard = self.shards[shard_of(destination)].lock().expect("streams");
+            let state = self.state.read().expect("SN state");
+            let shard = &state.shards[shard_of(destination)];
             if let Some(destination_stream) = shard.get(&destination) {
                 if !destination_stream.deletion.readable(false)
                     || destination_stream.sealed_stream
@@ -790,16 +775,17 @@ impl SN {
                 // The destination is absent, which is exactly what this flag requires.
             }
         }
-        // Different streams normally hash to different table shards, so copy the
-        // source state out before taking the destination shard for mutation.
-        let left_stream = match self.shards[shard_of(left)].lock().expect("streams").get(&left) {
-            Some(stream) => stream.clone(),
-            None => return Resp::error(Status::NotFound, format!("no {left}")),
-        };
-        let right_stream = match self.shards[shard_of(right)].lock().expect("streams").get(&right) {
-            Some(stream) => stream.clone(),
-            None => return Resp::error(Status::NotFound, format!("no {right}")),
-        };
+        // Copy source state before taking the global write lock for the destination.
+        let left_stream =
+            match self.state.read().expect("SN state").shards[shard_of(left)].get(&left) {
+                Some(stream) => stream.clone(),
+                None => return Resp::error(Status::NotFound, format!("no {left}")),
+            };
+        let right_stream =
+            match self.state.read().expect("SN state").shards[shard_of(right)].get(&right) {
+                Some(stream) => stream.clone(),
+                None => return Resp::error(Status::NotFound, format!("no {right}")),
+            };
         if !left_stream.deletion.readable(false) || !right_stream.deletion.readable(false) {
             return bad("cannot concatenate deleted streams");
         }
@@ -842,7 +828,12 @@ impl SN {
         let mut copied = Vec::with_capacity(extent_count);
         copied.extend(left_stream.sealed.iter().cloned());
         copied.extend(right_stream.sealed.iter().cloned());
-        let mut shard = self.shards[shard_of(destination)].lock().expect("streams");
+        let mut state = self.state.write().expect("SN state");
+        let SNState { shards, extent_table, extent_extras, retired_streams, .. } = &mut *state;
+        if retired_streams.contains(&destination) {
+            return bad("destination stream identity has been retired");
+        }
+        let shard = &mut shards[shard_of(destination)];
         if require_absent && shard.contains_key(&destination) {
             return Resp::error(
                 Status::BadRequest,
@@ -867,8 +858,8 @@ impl SN {
         {
             return Resp::error(Status::BadRequest, "destination stream is not empty and open");
         }
-        let mut extents = self.extent_table.write().expect("extents");
-        let mut extras = self.extent_extras.lock().expect("extent extras");
+        let extents = extent_table;
+        let extras = extent_extras;
         let mut retained: Vec<ExtentId> = Vec::new();
         for &id in &copied {
             let extent = &mut extents[id.get() as usize];
@@ -953,14 +944,15 @@ impl SN {
             Ok(value) => value,
             Err(error) => return bad(error),
         };
-        let shard = self.shards[shard_of(name)].lock().expect("streams");
+        let state = self.state.read().expect("SN state");
+        let shard = &state.shards[shard_of(name)];
         let Some(held) = shard.get(&name) else {
             return Resp::error(Status::NotFound, format!("no {name}"));
         };
         if !held.deletion.readable(include) {
             return Resp::error(Status::NotFound, "stream is deleted");
         }
-        let extents = self.extent_table.read().expect("extents");
+        let extents = &state.extent_table;
         if held
             .sealed
             .iter()
@@ -1021,15 +1013,17 @@ impl SN {
         };
         let mut args = Vec::new();
         let mut room = asked.limit;
+        let state = self.state.read().expect("SN state");
         for (name, from) in &asked.at {
-            let shard = self.shards[shard_of(*name)].lock().expect("streams");
+            let shard = &state.shards[shard_of(*name)];
             let Some(held) = shard.get(name) else {
                 return Resp::error(Status::NotFound, format!("no {name}"));
             };
             if !held.deletion.readable(include) {
                 return Resp::error(Status::NotFound, "stream is deleted");
             }
-            let (run, rows) = self.run_of(held, name.stream, *from, room, asked.instances);
+            let (run, rows) =
+                self.run_of(&state.extent_table, held, name.stream, *from, room, asked.instances);
             room = room.saturating_sub(rows.len() as u64);
             args.extend(run.args());
             for row in rows {
@@ -1042,13 +1036,13 @@ impl SN {
     /// One stream's run, up to `room` rows.
     fn run_of(
         &self,
+        extents: &ExtentTable,
         held: &Stream,
         stream: StreamId,
         from: SRoff,
         room: u64,
         instances: bool,
     ) -> (ExtentRun, Vec<ExtentRow>) {
-        let extents = self.extent_table.read().expect("extents");
         // The sealed extents are in record order, so the first to describe is the last
         // one starting at or before `from` — the same rule locate uses to pick one.
         let first = if held.open.is_some() && from >= held.sealed_records {
@@ -1211,7 +1205,9 @@ impl SN {
         if !rest.is_empty() || payload.done().is_err() {
             return Resp::error(Status::BadRequest, "seal-stream has trailing arguments");
         }
-        let mut shard = self.shards[shard_of(name)].lock().expect("streams");
+        let mut state = self.state.write().expect("SN state");
+        let SNState { shards, extent_table, .. } = &mut *state;
+        let shard = &mut shards[shard_of(name)];
         let Some(stream) = shard.get_mut(&name) else {
             return Resp::error(Status::NotFound, format!("no {name}"));
         };
@@ -1231,7 +1227,7 @@ impl SN {
             .sealed_records
             .plus(SRoff::from_extent(came_to.records))
             .expect("stream record position fits");
-        let mut extents = self.extent_table.write().expect("extents");
+        let extents = extent_table;
         let extent = &mut extents[open.get() as usize].data;
         extent.records = came_to.records;
         extent.logical = came_to.logical;
@@ -1244,7 +1240,7 @@ impl SN {
         Resp::number(Status::Ok, stream.sealed_records.number())
     }
 
-    /// Seal the stream's open extent and name the next one, both under the stream's
+    /// Seal the stream's open extent and name the next one, both under the shared
     /// lock, so a request that finds the extent already sealed gets the extent that
     /// replaced it rather than an error.
     #[allow(clippy::too_many_arguments)]
@@ -1257,7 +1253,9 @@ impl SN {
         instances: usize,
         per_stream: usize,
     ) -> std::result::Result<Placed, Full> {
-        let mut shard = self.shards[shard_of(name)].lock().expect("streams");
+        let mut state = self.state.write().expect("SN state");
+        let SNState { shards, extent_table, .. } = &mut *state;
+        let shard = &mut shards[shard_of(name)];
         let Some(held) = shard.get_mut(&name) else {
             return Err(Full::from(Error::new(format!("no {name}"))));
         };
@@ -1275,8 +1273,7 @@ impl SN {
                 .plus(SRoff::from_extent(came_to.records))
                 .expect("stream record position fits");
             {
-                let mut extents = self.extent_table.write().expect("extents");
-                let data = &mut extents[extent.get() as usize].data;
+                let data = &mut extent_table[extent.get() as usize].data;
                 data.records = came_to.records;
                 data.logical = came_to.logical;
                 data.compressed = came_to.compressed;
@@ -1291,39 +1288,46 @@ impl SN {
         if held.sealed_stream {
             return Err(Full::records(held.sealed_records));
         }
-        self.appendable(held, second, instances).map_err(Full::from)
+        self.appendable(extent_table, held, second, instances).map_err(Full::from)
     }
 
-    /// The stream's open extent, naming one if it has none.
+    /// The stream's open extent, allocating one if it has none.
     fn open(
         &self,
         name: StreamName,
         second: TimeSec,
         instances: usize,
     ) -> std::result::Result<Placed, Full> {
-        let mut shard = self.shards[shard_of(name)].lock().expect("streams");
+        let mut state = self.state.write().expect("SN state");
+        let SNState { shards, extent_table, .. } = &mut *state;
+        let shard = &mut shards[shard_of(name)];
         let Some(held) = shard.get_mut(&name) else {
             return Err(Full::from(Error::new(format!("no {name}"))));
         };
         if held.sealed_stream {
             return Err(Full::records(held.sealed_records));
         }
-        self.appendable(held, second, instances).map_err(Full::from)
+        self.appendable(extent_table, held, second, instances).map_err(Full::from)
     }
 
     /// The extent this stream can be appended to, named here if there is not one.
     ///
-    /// **The stream's lock is held across the naming, so several requests for a new
+    /// **The shared state write lock is held across allocation, so requests for one new
     /// extent produce one extent**: whoever gets the lock does the work and the rest
-    /// queue behind it and are handed the same answer. That is what stops a burst of
+    /// wait and are handed the same answer. That is what stops a burst of
     /// appends to a fresh stream — or to one that has just sealed — from opening an
     /// extent apiece.
     ///
-    /// ⚠️ The queue is the mutex only because the work is a counter and an instance
-    /// list. When opening an extent has to be recorded durably, this becomes a wait
-    /// on somebody else's round trip, and blocking a worker per waiter would be the
-    /// wrong shape — the waiters must attach to the one in flight instead.
-    fn appendable(&self, held: &mut Stream, second: TimeSec, instances: usize) -> Result<Placed> {
+    /// ⚠️ When opening an extent has to be recorded durably, this becomes a wait on
+    /// somebody else's round trip, and blocking a worker per waiter would be the wrong
+    /// shape — the waiters must attach to the one in flight instead.
+    fn appendable(
+        &self,
+        extents: &mut ExtentTable,
+        held: &mut Stream,
+        second: TimeSec,
+        instances: usize,
+    ) -> Result<Placed> {
         if !held.deletion.readable(false) {
             return Err(Error::new("stream is deleted"));
         }
@@ -1331,32 +1335,25 @@ impl SN {
         // was already there or is being made now.
         let first = held.sealed_records;
         if let Some(id) = held.open {
-            let extents = self.extent_table.read().expect("extents");
             return Ok(Placed { extent: extents[id.get() as usize].data.clone(), first });
         }
-        let mut extents = self.extent_table.write().expect("extents");
-        if extents.len() >= self.config.max_extents as usize {
-            return Err(Error::new("extent table reached its configured maximum"));
-        }
-        if extents.len() as u64 > ExtentId::MAX.number() {
-            return Err(Error::new("extent table is full"));
-        }
-        let disks = self.naming.disks(self.disks.lock().expect("disks").len(), instances)?;
-        let (id, created) = self.naming.name(second)?;
-        assert_eq!(id.get() as usize, extents.len());
+        let disks = pick_disks(self.disks.lock().expect("disks").len(), instances)?;
         let extent = ExtentData {
-            id,
-            created,
+            id: ExtentId::NONE,
+            created: second,
             records: ERoff::ZERO,
             logical: ELoff::ZERO,
             compressed: ECoff::ZERO,
             disks,
         };
-        extents.push(Extent {
-            pool_link: AtomicU32::new(u32::MAX),
-            deletion: Flags::default(),
-            data: extent.clone(),
-        });
+        let id = extents
+            .insert(Extent {
+                pool_link: AtomicU32::new(u32::MAX),
+                deletion: Flags::default(),
+                data: extent,
+            })
+            .map_err(|error| Error::new(format!("allocate SN extent slot: {error}")))?;
+        let extent = extents[id.get() as usize].data.clone();
         held.open = Some(id);
         self.extents.fetch_add(1, Ordering::Relaxed);
         Ok(Placed { extent, first })
@@ -1380,19 +1377,12 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    fn counts(sn: &SN, extent: &Extent) -> (u32, u32) {
-        sn.extent_extras
-            .lock()
-            .unwrap()
-            .counts(&(extent.data.id, extent.data.created), extent.deletion)
+    fn counts(extras: &SharedExtras<(ExtentId, TimeSec)>, extent: &Extent) -> (u32, u32) {
+        extras.counts(&(extent.data.id, extent.data.created), extent.deletion)
     }
 
-    fn retain(sn: &SN, extent: &mut Extent) {
-        sn.extent_extras
-            .lock()
-            .unwrap()
-            .retain((extent.data.id, extent.data.created), &mut extent.deletion)
-            .unwrap();
+    fn retain(extras: &mut SharedExtras<(ExtentId, TimeSec)>, extent: &mut Extent) {
+        extras.retain((extent.data.id, extent.data.created), &mut extent.deletion).unwrap();
     }
 
     #[test]
@@ -1403,14 +1393,18 @@ mod tests {
         let other = named(0, 9);
         let placed = sn.open(source, TimeSec::new(1_000_000), 4).unwrap();
         let id = placed.extent.id;
-        let snapshot = sn.shards[shard_of(source)].lock().unwrap()[&source].clone();
-        sn.shards[shard_of(other)].lock().unwrap().insert(other, snapshot);
+        {
+            let mut state = sn.state.write().unwrap();
+            let snapshot = state.shards[shard_of(source)][&source].clone();
+            state.shards[shard_of(other)].insert(other, snapshot);
+        }
         sn.streams.fetch_add(1, Ordering::Relaxed);
         {
-            let mut table = sn.extent_table.write().unwrap();
-            retain(&sn, &mut table[id.get() as usize]);
+            let mut state = sn.state.write().unwrap();
+            let SNState { extent_table, extent_extras, .. } = &mut *state;
+            retain(extent_extras, &mut extent_table[id.get() as usize]);
             // No network in this unit test; the live test verifies instance fanout.
-            table[id.get() as usize].data.disks.clear();
+            extent_table[id.get() as usize].data.disks.clear();
         }
         let process = testing::process();
         let request = |name, retention, hard| {
@@ -1429,30 +1423,33 @@ mod tests {
             Status::Ok
         );
         {
-            let table = sn.extent_table.read().unwrap();
+            let state = sn.state.read().unwrap();
+            let SNState { extent_table, extent_extras, .. } = &*state;
+            let table = extent_table;
             let extent = &table[id.get() as usize];
-            assert_eq!(counts(&sn, extent).0, 0);
-            assert_eq!(counts(&sn, extent).1, 1);
+            assert_eq!(counts(extent_extras, extent).0, 0);
+            assert_eq!(counts(extent_extras, extent).1, 1);
             assert!(extent.deletion.soft_deleted());
             assert!(!extent.deletion.deleted());
         }
         assert_eq!(sn.delete_stream(&process, &request(source, None, true)).status, Status::Ok);
         assert_eq!(sn.delete_stream(&process, &request(source, None, true)).status, Status::Ok);
-        let table = sn.extent_table.read().unwrap();
+        let state = sn.state.read().unwrap();
+        let SNState { extent_table, extent_extras, .. } = &*state;
+        let table = extent_table;
         assert!(table[id.get() as usize].deletion.retired());
-        assert_eq!(counts(&sn, &table[id.get() as usize]).1, 0);
+        assert_eq!(counts(extent_extras, &table[id.get() as usize]).1, 0);
     }
     #[test]
     fn concat_rolls_back_reference_increments_on_overflow() {
         let sn = sn_with_stream(0, 7);
         seal_for_concat(&sn, named(0, 7));
         {
-            let mut table = sn.extent_table.write().unwrap();
-            retain(&sn, &mut table[0]);
-            sn.extent_extras
-                .lock()
-                .unwrap()
-                .get(&(table[0].data.id, table[0].data.created))
+            let mut state = sn.state.write().unwrap();
+            let SNState { extent_table, extent_extras, .. } = &mut *state;
+            retain(extent_extras, &mut extent_table[0]);
+            extent_extras
+                .get(&(extent_table[0].data.id, extent_table[0].data.created))
                 .unwrap()
                 .references
                 .hard
@@ -1460,9 +1457,11 @@ mod tests {
         }
         let response = sn.concat_streams(&concat_request(named(0, 9), named(0, 7), named(0, 7)));
         assert_eq!(response.status, Status::BadRequest);
-        let table = sn.extent_table.read().unwrap();
+        let state = sn.state.read().unwrap();
+        let SNState { extent_table, extent_extras, .. } = &*state;
+        let table = extent_table;
         assert_eq!(table.len(), 1);
-        assert_eq!(counts(&sn, &table[0]).1, u32::MAX - 1);
+        assert_eq!(counts(extent_extras, &table[0]).1, u32::MAX - 1);
         assert_eq!(table[0].data.records, ERoff::new(12));
     }
 
@@ -1504,9 +1503,14 @@ mod tests {
             sealed_records: SRoff::ZERO,
             sealed_stream: false,
         };
-        sn.appendable(&mut stream, TimeSec::new(100), 4).unwrap();
+        {
+            let mut state = sn.state.write().unwrap();
+            let SNState { extent_table, .. } = &mut *state;
+            sn.appendable(extent_table, &mut stream, TimeSec::new(100), 4).unwrap();
+        }
 
-        let table = sn.extent_table.read().unwrap();
+        let state = sn.state.read().unwrap();
+        let table = &state.extent_table;
         assert!(table[0].deletion.is_valid());
         assert_eq!(table.pool.issued_blocks(), 1);
         let spare = table.pool.alloc_fresh().unwrap();
@@ -1537,18 +1541,23 @@ mod tests {
     #[test]
     fn extent_rows_keep_extent_measures_while_stream_totals_widen() {
         let sn = SN::new(testing::sn_config(), 10, SnId::FIRST, Vec::new()).unwrap();
-        sn.extent_table.write().unwrap().push(Extent {
-            pool_link: AtomicU32::new(u32::MAX),
-            deletion: Flags::default(),
-            data: ExtentData {
-                id: ExtentId::FIRST,
-                records: ERoff::new(7),
-                created: TimeSec::new(100),
-                disks: Vec::new(),
-                logical: ELoff::MAX,
-                compressed: ECoff::new(123),
-            },
-        });
+        sn.state
+            .write()
+            .unwrap()
+            .extent_table
+            .insert(Extent {
+                pool_link: AtomicU32::new(u32::MAX),
+                deletion: Flags::default(),
+                data: ExtentData {
+                    id: ExtentId::FIRST,
+                    records: ERoff::new(7),
+                    created: TimeSec::new(100),
+                    disks: Vec::new(),
+                    logical: ELoff::MAX,
+                    compressed: ECoff::new(123),
+                },
+            })
+            .unwrap();
         let extent = ExtentId::FIRST;
         let stream = Stream {
             deletion: Flags::default(),
@@ -1559,7 +1568,9 @@ mod tests {
             sealed_records: SRoff::new(14),
             sealed_stream: true,
         };
-        let (run, rows) = sn.run_of(&stream, StreamId::FIRST, SRoff::ZERO, 10, false);
+        let state = sn.state.read().unwrap();
+        let (run, rows) =
+            sn.run_of(&state.extent_table, &stream, StreamId::FIRST, SRoff::ZERO, 10, false);
         assert_eq!(run.totals.extents, ExtentId::new(2));
         assert_eq!(run.given, ExtentId::new(2));
         assert_eq!(run.totals.logical, SLoff::new(2 * ELoff::MAX.number()));
@@ -1576,18 +1587,23 @@ mod tests {
     fn listing_continuation_advances_through_sealed_extents_and_into_the_open_one() {
         let sn = SN::new(testing::sn_config(), 10, SnId::FIRST, Vec::new()).unwrap();
         for id in 0..4 {
-            sn.extent_table.write().unwrap().push(Extent {
-                pool_link: AtomicU32::new(u32::MAX),
-                deletion: Flags::default(),
-                data: ExtentData {
-                    id: ExtentId::new(id),
-                    records: ERoff::new(7),
-                    created: TimeSec::new(100),
-                    disks: Vec::new(),
-                    logical: ELoff::new(100),
-                    compressed: ECoff::new(80),
-                },
-            });
+            sn.state
+                .write()
+                .unwrap()
+                .extent_table
+                .insert(Extent {
+                    pool_link: AtomicU32::new(u32::MAX),
+                    deletion: Flags::default(),
+                    data: ExtentData {
+                        id: ExtentId::new(id),
+                        records: ERoff::new(7),
+                        created: TimeSec::new(100),
+                        disks: Vec::new(),
+                        logical: ELoff::new(100),
+                        compressed: ECoff::new(80),
+                    },
+                })
+                .unwrap();
         }
         let stream = Stream {
             deletion: Flags::default(),
@@ -1604,14 +1620,18 @@ mod tests {
             (2, SRoff::new(7), SRoff::new(14)),
             (3, SRoff::new(14), SRoff::NONE),
         ] {
-            let (run, rows) = sn.run_of(&stream, StreamId::FIRST, from, 1, false);
+            let state = sn.state.read().unwrap();
+            let (run, rows) =
+                sn.run_of(&state.extent_table, &stream, StreamId::FIRST, from, 1, false);
             assert_eq!(run.totals.extents, ExtentId::new(3));
             assert_eq!(rows.len(), 1);
             assert_eq!((rows[0].id, rows[0].first_record), (ExtentId::new(id), first));
             assert_eq!(run.next, next);
             from = run.next;
         }
-        let (run, rows) = sn.run_of(&stream, StreamId::FIRST, SRoff::new(7), 0, false);
+        let state = sn.state.read().unwrap();
+        let (run, rows) =
+            sn.run_of(&state.extent_table, &stream, StreamId::FIRST, SRoff::new(7), 0, false);
         assert!(rows.is_empty());
         assert_eq!(run.totals.extents, ExtentId::new(3));
         assert_eq!(run.next, SRoff::new(7));
@@ -1733,21 +1753,26 @@ mod tests {
         let answer = sn.concat_streams(&concat_request(named(0, 9), named(0, 7), named(0, 7)));
         assert_eq!(answer.status, Status::Ok, "{}", answer.message().unwrap_or_default());
 
-        let shard = sn.shards[shard_of(named(0, 9))].lock().unwrap();
-        let destination = &shard[&named(0, 9)];
-        assert_eq!(destination.sealed.len(), 2, "A || A has two extent references");
-        assert_eq!(destination.sealed_records, SRoff::new(24));
-        assert!(destination.open.is_none(), "concatenation does not open an extent");
-        assert!(!destination.sealed_stream, "the result remains appendable");
-        assert_eq!(
-            destination.sealed[0], destination.sealed[1],
-            "self-concat shares the same immutable extent"
-        );
-        let mut extents = sn.extent_table.write().unwrap();
+        let id = {
+            let state = sn.state.read().unwrap();
+            let destination = &state.shards[shard_of(named(0, 9))][&named(0, 9)];
+            assert_eq!(destination.sealed.len(), 2, "A || A has two extent references");
+            assert_eq!(destination.sealed_records, SRoff::new(24));
+            assert!(destination.open.is_none(), "concatenation does not open an extent");
+            assert!(!destination.sealed_stream, "the result remains appendable");
+            assert_eq!(
+                destination.sealed[0], destination.sealed[1],
+                "self-concat shares the same immutable extent"
+            );
+            destination.sealed[0]
+        };
+        let mut state = sn.state.write().unwrap();
+        let SNState { extent_table, extent_extras, .. } = &mut *state;
+        let extents = extent_table;
         assert_eq!(extents.len(), 1);
-        let extent = &mut extents[destination.sealed[0].get() as usize];
-        assert_eq!(counts(&sn, extent).1, 3);
-        let mut extras = sn.extent_extras.lock().unwrap();
+        let extent = &mut extents[id.get() as usize];
+        assert_eq!(counts(extent_extras, extent).1, 3);
+        let extras = extent_extras;
         let key = (extent.data.id, extent.data.created);
         assert!(!extras.release(&key, &mut extent.deletion).unwrap());
         assert!(!extras.release(&key, &mut extent.deletion).unwrap());
@@ -1863,13 +1888,22 @@ mod tests {
             sealed_records: SRoff::ZERO,
             sealed_stream: false,
         };
-        let first = sn.appendable(&mut stream, TimeSec::new(100), 4).unwrap();
+        let first = {
+            let mut state = sn.state.write().unwrap();
+            let SNState { extent_table, .. } = &mut *state;
+            sn.appendable(extent_table, &mut stream, TimeSec::new(100), 4).unwrap()
+        };
         assert_eq!(first.extent.id, ExtentId::FIRST);
         assert_eq!(sn.config.max_extents, 1);
-        assert_eq!(sn.extent_table.read().unwrap().len(), 1);
+        assert_eq!(sn.state.read().unwrap().extent_table.len(), 1);
         stream.open = None;
-        assert!(sn.appendable(&mut stream, TimeSec::new(101), 4).is_err());
-        assert_eq!(sn.extent_table.read().unwrap().len(), 1);
+        let result = {
+            let mut state = sn.state.write().unwrap();
+            let SNState { extent_table, .. } = &mut *state;
+            sn.appendable(extent_table, &mut stream, TimeSec::new(101), 4)
+        };
+        assert!(result.is_err());
+        assert_eq!(sn.state.read().unwrap().extent_table.len(), 1);
     }
 
     #[test]
@@ -1924,14 +1958,15 @@ mod tests {
     /// Where the open extent starts, for a test.
     impl SN {
         fn starts_at(&self, range: u64, stream: u32) -> SRoff {
-            self.shards[shard_of(named(range, stream))].lock().unwrap()[&named(range, stream)]
+            self.state.read().unwrap().shards[shard_of(named(range, stream))][&named(range, stream)]
                 .sealed_records
         }
 
         /// The stream-local first record of every sealed extent, recomputed by summing.
         fn firsts(&self, range: u64, stream: u32) -> Vec<SRoff> {
-            self.shards[shard_of(named(range, stream))].lock().unwrap()[&named(range, stream)]
-                .sealed_from(&self.extent_table.read().unwrap())
+            let state = self.state.read().unwrap();
+            state.shards[shard_of(named(range, stream))][&named(range, stream)]
+                .sealed_from(&state.extent_table)
                 .map(|(at, _)| at)
                 .collect()
         }
@@ -1968,8 +2003,8 @@ mod tests {
     }
 
     /// An extent already sealed by somebody else does not fail: the caller wanted
-    /// somewhere to append, and the extent that replaced it is the answer. This is
-    /// the race the stream's lock exists to make harmless.
+    /// somewhere to append, and the extent that replaced it is the answer. The shared
+    /// state write lock makes concurrent seal requests serialize on that stream.
     #[test]
     fn sealing_an_extent_that_is_already_gone_gives_the_one_that_replaced_it() {
         let sn = sn_with_stream(0, 7);
@@ -2110,31 +2145,10 @@ mod tests {
         assert_eq!(answer.status, Status::NotFound);
     }
 
-    /// The second names the key, so an id must never carry one that has already
-    /// been passed.
-    #[test]
-    fn a_second_may_not_go_backwards() {
-        let naming = Naming::new();
-        assert!(naming.name(TimeSec::new(1_000_000)).is_ok());
-        assert!(naming.name(TimeSec::new(1_000_005)).is_ok());
-        assert!(naming.name(TimeSec::new(999_999)).is_err());
-        // And the refusal did not lose the position it had reached.
-        assert!(naming.name(TimeSec::new(1_000_005)).is_ok());
-    }
-
-    #[test]
-    fn every_extent_gets_a_name_of_its_own() {
-        let naming = Naming::new();
-        let (first, _) = naming.name(TimeSec::new(1_000_000)).unwrap();
-        let (second, _) = naming.name(TimeSec::new(1_000_000)).unwrap();
-        assert_ne!(first, second);
-    }
-
     #[test]
     fn instances_are_four_distinct_disks_chosen_randomly() {
-        let naming = Naming::new();
         for _ in 0..20 {
-            let picked = naming.disks(7, testing::extents().instances).unwrap();
+            let picked = pick_disks(7, testing::extents().instances).unwrap();
             assert_eq!(picked.len(), testing::extents().instances);
             let mut sorted = picked.clone();
             sorted.sort();
@@ -2147,15 +2161,13 @@ mod tests {
     /// one: four instances on three machines is three failure domains.
     #[test]
     fn too_few_ens_is_an_error_not_a_repeat() {
-        let naming = Naming::new();
-        assert!(naming.disks(3, testing::extents().instances).is_err());
+        assert!(pick_disks(3, testing::extents().instances).is_err());
     }
 
     #[test]
     fn disks_are_chosen_from_all_available_nodes_and_disks() {
-        let naming = Naming::new();
         // 10 disks total (e.g., 2 ENs with 5 disks each)
-        let picked = naming.disks(10, 4).unwrap();
+        let picked = pick_disks(10, 4).unwrap();
         assert_eq!(picked.len(), 4);
         let mut sorted = picked.clone();
         sorted.sort();
@@ -2179,6 +2191,6 @@ mod tests {
             }
         }
         assert!(disks.len() >= testing::extents().instances);
-        assert!(Naming::new().disks(disks.len(), testing::extents().instances).is_ok());
+        assert!(pick_disks(disks.len(), testing::extents().instances).is_ok());
     }
 }

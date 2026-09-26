@@ -1,5 +1,5 @@
 //! Small contiguous message payloads that promote once to process-shared pool storage.
-use super::buffer::{shared_pool, with_random};
+use super::buffer::shared_pool;
 use crate::config::BufferPoolConfig;
 use pool::SegmentedBuffer;
 use std::io::{self, Write};
@@ -399,17 +399,12 @@ impl MessageBytes {
                 Storage::Small(v) => {
                     let pool = shared_pool(config).map_err(io::Error::other)?;
                     let mut large = SegmentedBuffer::new(pool);
-                    large
-                        .append(v, || with_random(|rng| rng.next_u64()))
-                        .map_err(io::Error::other)?;
-                    large
-                        .append(bytes, || with_random(|rng| rng.next_u64()))
-                        .map_err(io::Error::other)?;
+                    large.append(v).map_err(io::Error::other)?;
+                    large.append(bytes).map_err(io::Error::other)?;
                     self.storage = Storage::Large(large);
                 }
                 Storage::Large(v) => {
-                    v.append(bytes, || with_random(|rng| rng.next_u64()))
-                        .map_err(io::Error::other)?;
+                    v.append(bytes).map_err(io::Error::other)?;
                 }
             }
             Ok(())

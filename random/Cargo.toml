@@ -1,0 +1,14 @@
+[package]
+name = "delawson-random"
+description = "Fast thread-local and seeded random number generation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "random"
+path = "src/lib.rs"
+
+[dependencies]
+rand_core = { version = "0.6", default-features = false }

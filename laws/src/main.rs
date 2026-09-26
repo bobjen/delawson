@@ -21,11 +21,11 @@ use common::info::{Batch, Described, Expecting, ExtentRow, ObjectName, Shape, St
 use common::offset::{ELoff, ERoff, OLoff, ORoff, SCoff, SLoff, SRoff};
 use common::placement::{self, Expansion};
 
-use common::random::Rng;
 use common::range::{Budget, Detail, ObjectCovered, ObjectPiece as Piece, Range, Start, Want};
 use common::time::TimeSec;
 use common::{Arg, Op, Receipt, Req, Resp, Status, structure};
 use common::{Error, Result};
+use random::Rng;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;

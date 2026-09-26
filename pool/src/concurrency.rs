@@ -1,6 +1,6 @@
 //! Coverage-driven trials: https://burtleburtle.net/bob/testing/concurrencyflags.html
 use super::*;
-use common::random::Rng;
+use random::Rng;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Barrier;
@@ -614,7 +614,7 @@ fn growth_owners<L: Links>() {
                 let mut held: Vec<TestBlock<'_, L>> = Vec::new();
                 for _ in 0..2048 {
                     if held.is_empty() || rng.next_u32() & 1 == 0 {
-                        if let Ok(block) = pool.alloc(rng.next_u64()) {
+                        if let Ok(block) = pool.alloc() {
                             assert_eq!(
                                 owners[block.index() as usize]
                                     .compare_exchange(0, id, SeqCst, SeqCst),

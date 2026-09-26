@@ -1,12 +1,8 @@
-//! Enough randomness to fill a buffer with values nothing downstream can
-//! shortcut — not zeros, which compress and which a page-sharing kernel can
-//! cheat on. Not for keys.
-//!
-//! Bob's small fast generator, 64-bit variant: four words of state, three
-//! rotates, no multiplies, and no dependence on whatever the platform's
-//! generator happens to be this year.
+//! Fast non-cryptographic random values. Do not use these for keys.
 
 use rand_core::RngCore;
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Rng {
@@ -17,6 +13,7 @@ pub struct Rng {
 }
 
 impl Rng {
+    /// Seed a generator from the current clock.
     pub fn new() -> Rng {
         let nanos =
             SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
@@ -25,7 +22,6 @@ impl Rng {
 
     pub fn from_seed(seed: u64) -> Rng {
         let mut rng = Rng { a: 0xf1ea_5eed, b: seed, c: seed, d: seed };
-        // Twenty rounds to bury the seed before anything is handed out.
         for _ in 0..20 {
             rng.next_u64();
         }
@@ -46,8 +42,6 @@ impl Rng {
     }
 
     pub fn fill_bytes(&mut self, buf: &mut [u8]) {
-        // chunks_exact_mut, not chunks_mut: the bulk loop then has no per-word
-        // length check, which was costing more than generating the word.
         let mut chunks = buf.chunks_exact_mut(8);
         for chunk in &mut chunks {
             chunk.copy_from_slice(&self.next_u64().to_le_bytes());
@@ -62,19 +56,19 @@ impl Rng {
 
 impl RngCore for Rng {
     fn next_u32(&mut self) -> u32 {
-        self.next_u32()
+        Rng::next_u32(self)
     }
 
     fn next_u64(&mut self) -> u64 {
-        self.next_u64()
+        Rng::next_u64(self)
     }
 
     fn fill_bytes(&mut self, dest: &mut [u8]) {
-        self.fill_bytes(dest);
+        Rng::fill_bytes(self, dest);
     }
 
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> std::result::Result<(), rand_core::Error> {
-        self.fill_bytes(dest);
+        Rng::fill_bytes(self, dest);
         Ok(())
     }
 }
@@ -83,6 +77,24 @@ impl Default for Rng {
     fn default() -> Rng {
         Rng::new()
     }
+}
+
+static THREAD_SEED: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static THREAD_RNG: RefCell<Rng> = RefCell::new(new_thread_rng());
+}
+
+fn new_thread_rng() -> Rng {
+    let nanos =
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
+    let sequence = THREAD_SEED.fetch_add(0x9e37_79b9_7f4a_7c15, Relaxed);
+    Rng::from_seed(nanos ^ sequence)
+}
+
+/// Draw from a generator owned by the calling thread.
+pub fn thread_u64() -> u64 {
+    THREAD_RNG.with(|rng| rng.borrow_mut().next_u64())
 }
 
 #[cfg(test)]
@@ -110,8 +122,6 @@ mod tests {
         assert_ne!(a.next_u64(), Rng::from_seed(43).next_u64());
     }
 
-    /// Not a test of randomness, just of not being obviously broken: no short
-    /// cycle, and every byte value shows up.
     #[test]
     fn no_early_repeat() {
         let mut rng = Rng::from_seed(1);
@@ -119,9 +129,18 @@ mod tests {
         for _ in 0..10_000 {
             assert!(seen.insert(rng.next_u64()), "repeated inside 10,000 draws");
         }
-        let mut buf = [0u8; 4096];
+        let mut buf = [0; 4096];
         rng.fill_bytes(&mut buf);
-        let bytes: BTreeSet<u8> = buf.iter().copied().collect();
+        let bytes: BTreeSet<u8> = buf.into_iter().collect();
         assert_eq!(bytes.len(), 256);
+    }
+
+    #[test]
+    fn thread_rngs_are_independent() {
+        let local = [thread_u64(), thread_u64()];
+        let remote = std::thread::spawn(|| [thread_u64(), thread_u64()]).join().unwrap();
+        assert_ne!(local[0], local[1]);
+        assert_ne!(remote[0], remote[1]);
+        assert_ne!(local, remote);
     }
 }
