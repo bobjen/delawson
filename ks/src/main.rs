@@ -9,8 +9,8 @@ use common::logn;
 use common::registry::{self, Peer};
 use common::server::{self, Process, Service};
 use common::time::TimeSec;
-use common::wire::{Op, Req, Resp, SnKey, Status, structure};
 use common::{Context, Result};
+use common::{Op, Req, Resp, SnKey, Status, structure};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
@@ -526,7 +526,7 @@ impl Ks {
             Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let mut forwarded = common::wire::StructWriter::new();
+        let mut forwarded = common::StructWriter::new();
         forwarded.text(&source);
         forwarded.number_u64(count);
         for n in 0..count {
@@ -624,7 +624,7 @@ mod persistence_tests {
         }
     }
     fn unlock(key: &[u8]) -> Req {
-        let mut payload = common::wire::StructWriter::new();
+        let mut payload = common::StructWriter::new();
         payload.bytes(key);
         Req::new(Op::Unlock).structure(payload)
     }

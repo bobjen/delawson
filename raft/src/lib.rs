@@ -7,8 +7,8 @@ pub mod lease;
 pub mod owner;
 pub mod raft;
 pub mod runtime;
+use common::Op;
 use common::Result;
-use common::wire::Op;
 pub use raft::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

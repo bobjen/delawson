@@ -23,7 +23,7 @@ use common::offset::{ECoff, ELoff, ERoff, SCoff, SLoff, SRoff};
 use common::range::Filled;
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
-use common::wire::{Arg, Op, Req, Resp, Status, StructReader, StructWriter, structure};
+use common::{Arg, Op, Req, Resp, Status, StructReader, StructWriter, structure};
 use common::{Error, Result};
 use std::collections::HashMap;
 #[cfg(test)]

@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn scalar_encoding_matches_existing_structure_format() {
-        use common::wire::{Op, StructReader, StructWriter};
+        use common::{Op, StructReader, StructWriter};
         let mut old = StructWriter::new();
         old.number_u8(7);
         old.nested(Op::Range, |w| {

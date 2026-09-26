@@ -1,5 +1,5 @@
 use common::config::BufferPoolConfig;
-use common::wire::{MessageBytes, Op, Req, StructWriter, configure_message_pool};
+use common::{MessageBytes, Op, Req, StructWriter, configure_message_pool};
 use std::io::Write;
 
 #[test]
@@ -20,7 +20,7 @@ fn process_configuration_controls_payload_and_frame_promotion() {
     bytes.write_all(&[2]).unwrap();
     assert!(bytes.is_segmented());
     let mut framed = MessageBytes::new();
-    common::wire::put_request(&mut framed, &Req::new(Op::Ping).bytes(bytes.clone())).unwrap();
+    common::put_request(&mut framed, &Req::new(Op::Ping).bytes(bytes.clone())).unwrap();
     assert!(framed.is_segmented());
     assert_eq!(bytes.len(), 1025);
     assert!(

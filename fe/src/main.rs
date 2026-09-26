@@ -36,7 +36,7 @@ use common::range::{
 use common::routing;
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
-use common::wire::{
+use common::{
     AppendBlock, AppendPiece, Arg, EnReceipt, Op, Receipt, Req, Resp, Status, StructWriter,
     structure,
 };
@@ -2609,7 +2609,7 @@ mod tests {
     #[test]
     fn a_record_number_survives_the_trip_through_three_spaces() {
         use super::{in_extent, in_stream, in_the_callers_numbering, origin};
-        use common::wire::{Resp, Status};
+        use common::{Resp, Status};
 
         // ⚠️ Each step names the space it lands in, which is what stops the two
         // conversions being the same helper called twice (§17.32.1).

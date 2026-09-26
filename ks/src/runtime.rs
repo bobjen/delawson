@@ -32,13 +32,10 @@ fn registration_action(peer: &Peer) -> raft::Action {
 fn registration_peer(action: &raft::Action) -> Result<Peer> {
     let (&depth, bytes) =
         action.fields.split_first().ok_or_else(|| Error::new("empty registration action"))?;
-    if depth == 0
-        || depth > common::wire::MAX_RECURSION_DEPTH
-        || bytes.len() >= common::wire::MAX_FRAME_BYTES
-    {
+    if depth == 0 || depth > common::MAX_RECURSION_DEPTH || bytes.len() >= common::MAX_FRAME_BYTES {
         return Err(Error::new("invalid registration action limits"));
     }
-    Peer::from_args(&[common::wire::Arg::new(Op::Register, bytes.to_vec().into(), depth)])
+    Peer::from_args(&[common::Arg::new(Op::Register, bytes.to_vec().into(), depth)])
 }
 fn apply_registration(
     state: &mut Registrations,

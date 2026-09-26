@@ -3,13 +3,13 @@ use crate::execution::Application;
 use crate::{Answer, Command, Entry, Members, Membership, Node, Role, Rpc, State};
 use crate::{Member, MemberId, MemberNames, Retirement, Storage, UNASSIGNED};
 use crate::{application, journal, lease, raft, random_bytes};
+use common::Arg;
 use common::config::{Messaging, RaftConfig};
 use common::server::{self, Process};
 use common::time::TimeSec;
-use common::wire::Arg;
-use common::wire::{MessagePayload, Op, Req, Resp, Status, structure};
 use common::{Context, logn};
 use common::{Error, Result};
+use common::{MessagePayload, Op, Req, Resp, Status, structure};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -327,7 +327,7 @@ pub enum Message {
     JournalTip { index: u64, term: u64 },
     CheckpointStart,
     Client(crate::Action),
-    Forward { op: u16, payload: common::wire::MessageBytes, depth: u8 },
+    Forward { op: u16, payload: common::MessageBytes, depth: u8 },
 }
 pub struct Packet {
     member: Sender,
@@ -1365,7 +1365,7 @@ pub trait Host:
                 return Ok(*address);
             }
             if registrar != &self.runtime.name {
-                let mut payload = common::wire::StructWriter::new();
+                let mut payload = common::StructWriter::new();
                 payload.text(peer);
                 let response = server::ask(
                     *address,
@@ -2229,26 +2229,26 @@ crate::wire_struct!(Packet, RaftPacket, {member,target,retirement,ready,applying
 crate::wire_struct!(ConsensusReply, RaftConsensusReply, {member,retirement,answer,ready});
 
 impl crate::codec::Wire for Message {
-    fn write(&self, w: &mut common::wire::StructWriter) {
+    fn write(&self, w: &mut common::StructWriter) {
         match self {
-            Self::Identity => w.nested(common::wire::Op::RaftMessageIdentity, |_| {}),
+            Self::Identity => w.nested(common::Op::RaftMessageIdentity, |_| {}),
             Self::Bootstrap { founders, membership } => {
-                w.nested(common::wire::Op::RaftMessageBootstrap, |w| {
+                w.nested(common::Op::RaftMessageBootstrap, |w| {
                     founders.write(w);
                     membership.write(w);
                 })
             }
-            Self::Consensus(value) => w.nested(common::wire::Op::RaftMessageConsensus, |w| {
+            Self::Consensus(value) => w.nested(common::Op::RaftMessageConsensus, |w| {
                 value.write(w);
             }),
             Self::Checkpoint { after, primary_fallback } => {
-                w.nested(common::wire::Op::RaftMessageCheckpoint, |w| {
+                w.nested(common::Op::RaftMessageCheckpoint, |w| {
                     after.write(w);
                     primary_fallback.write(w);
                 })
             }
             Self::Journal { after, through, primary_fallback } => {
-                w.nested(common::wire::Op::RaftMessageJournal, |w| {
+                w.nested(common::Op::RaftMessageJournal, |w| {
                     after.write(w);
                     through.write(w);
                     primary_fallback.write(w);
@@ -2258,31 +2258,29 @@ impl crate::codec::Wire for Message {
                 index.write(w);
                 term.write(w);
             }),
-            Self::CheckpointStart => w.nested(common::wire::Op::RaftMessageCheckpointStart, |_| {}),
-            Self::Client(value) => w.nested(common::wire::Op::RaftMessageClient, |w| {
+            Self::CheckpointStart => w.nested(common::Op::RaftMessageCheckpointStart, |_| {}),
+            Self::Client(value) => w.nested(common::Op::RaftMessageClient, |w| {
                 value.write(w);
             }),
-            Self::Forward { op, payload, depth } => {
-                w.nested(common::wire::Op::RaftMessageForward, |w| {
-                    op.write(w);
-                    payload.write(w);
-                    depth.write(w);
-                })
-            }
+            Self::Forward { op, payload, depth } => w.nested(common::Op::RaftMessageForward, |w| {
+                op.write(w);
+                payload.write(w);
+                depth.write(w);
+            }),
         }
     }
-    fn read(r: &mut common::wire::StructReader<'_>) -> common::Result<Self> {
+    fn read(r: &mut common::StructReader<'_>) -> common::Result<Self> {
         use crate::codec::Wire;
         r.nested_any(|op, r| match op {
-            common::wire::Op::RaftMessageIdentity => Ok(Self::Identity),
-            common::wire::Op::RaftMessageBootstrap => {
+            common::Op::RaftMessageIdentity => Ok(Self::Identity),
+            common::Op::RaftMessageBootstrap => {
                 Ok(Self::Bootstrap { founders: Wire::read(r)?, membership: Wire::read(r)? })
             }
-            common::wire::Op::RaftMessageConsensus => Ok(Self::Consensus(Wire::read(r)?)),
-            common::wire::Op::RaftMessageCheckpoint => {
+            common::Op::RaftMessageConsensus => Ok(Self::Consensus(Wire::read(r)?)),
+            common::Op::RaftMessageCheckpoint => {
                 Ok(Self::Checkpoint { after: Wire::read(r)?, primary_fallback: Wire::read(r)? })
             }
-            common::wire::Op::RaftMessageJournal => Ok(Self::Journal {
+            common::Op::RaftMessageJournal => Ok(Self::Journal {
                 after: Wire::read(r)?,
                 through: Wire::read(r)?,
                 primary_fallback: Wire::read(r)?,
@@ -2290,9 +2288,9 @@ impl crate::codec::Wire for Message {
             Op::RaftMessageJournalTip => {
                 Ok(Self::JournalTip { index: Wire::read(r)?, term: Wire::read(r)? })
             }
-            common::wire::Op::RaftMessageCheckpointStart => Ok(Self::CheckpointStart),
-            common::wire::Op::RaftMessageClient => Ok(Self::Client(Wire::read(r)?)),
-            common::wire::Op::RaftMessageForward => Ok(Self::Forward {
+            common::Op::RaftMessageCheckpointStart => Ok(Self::CheckpointStart),
+            common::Op::RaftMessageClient => Ok(Self::Client(Wire::read(r)?)),
+            common::Op::RaftMessageForward => Ok(Self::Forward {
                 op: Wire::read(r)?,
                 payload: Wire::read(r)?,
                 depth: Wire::read(r)?,
@@ -2303,21 +2301,21 @@ impl crate::codec::Wire for Message {
 }
 
 impl crate::codec::Wire for Sender {
-    fn write(&self, w: &mut common::wire::StructWriter) {
+    fn write(&self, w: &mut common::StructWriter) {
         match self {
-            Self::Slot(value) => w.nested(common::wire::Op::RaftSenderSlot, |w| {
+            Self::Slot(value) => w.nested(common::Op::RaftSenderSlot, |w| {
                 value.write(w);
             }),
-            Self::Applicant(value) => w.nested(common::wire::Op::RaftSenderApplicant, |w| {
+            Self::Applicant(value) => w.nested(common::Op::RaftSenderApplicant, |w| {
                 value.write(w);
             }),
         }
     }
-    fn read(r: &mut common::wire::StructReader<'_>) -> common::Result<Self> {
+    fn read(r: &mut common::StructReader<'_>) -> common::Result<Self> {
         use crate::codec::Wire;
         r.nested_any(|op, r| match op {
-            common::wire::Op::RaftSenderSlot => Ok(Self::Slot(Wire::read(r)?)),
-            common::wire::Op::RaftSenderApplicant => Ok(Self::Applicant(Wire::read(r)?)),
+            common::Op::RaftSenderSlot => Ok(Self::Slot(Wire::read(r)?)),
+            common::Op::RaftSenderApplicant => Ok(Self::Applicant(Wire::read(r)?)),
             _ => Err(common::Error::new("unexpected Sender tag")),
         })
     }
@@ -2416,7 +2414,7 @@ mod tests {
         ))));
         let forwarded = needs_request_worker(&packet(Message::Forward {
             op: Op::SnMasterKey.code(),
-            payload: common::wire::MessageBytes::new(),
+            payload: common::MessageBytes::new(),
             depth: 0,
         }));
         assert!(all_clients);

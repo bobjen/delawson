@@ -9,8 +9,8 @@
 //! request is separate and independently answerable; only the transport coalesces.
 
 use common::config::Messaging;
-use common::wire::{self, Link, Req, Resp, Status, put_request};
 use common::{Context, Error, Result};
+use common::{Link, Req, Resp, Status, connect, put_request};
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
@@ -33,7 +33,7 @@ impl Conn {
         stream.set_write_timeout(Some(timeout))?;
         let mut config = config.clone();
         config.expected_peer = Some(identity.into());
-        Ok(Conn { link: wire::connect(stream, &config)?, next_id: 0 })
+        Ok(Conn { link: connect(stream, &config)?, next_id: 0 })
     }
 
     /// Buffer a request without waiting for it, and return the id to expect back.

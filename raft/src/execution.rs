@@ -180,7 +180,7 @@ fn execute_with_lock<S: Application>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::wire::Op;
+    use common::Op;
     #[derive(Default)]
     struct Values {
         applied: u64,

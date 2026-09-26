@@ -26,7 +26,8 @@ pub mod server;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod time;
-pub mod wire;
+mod wire;
+pub use wire::*;
 
 #[derive(Debug)]
 pub struct Error(String);

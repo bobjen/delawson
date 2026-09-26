@@ -30,7 +30,7 @@ use common::offset::{ECoff, ELoff, ERoff};
 use common::range::{Budget, ExtentCovered, ExtentRange, ExtentStart, Filled, Piece};
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
-use common::wire::{
+use common::{
     AppendBlock, AppendPiece, Arg, EnReceipt, Op, Req, Resp, SnKey, Status, StructWriter, structure,
 };
 use common::{Error, Result, logw};
@@ -91,7 +91,7 @@ impl DailyKeyCache {
             .ask(&registrar, &ask, move |answer| {
                 let mut guard = cvar2.0.lock().expect("cvar");
                 if answer.status == Status::Ok {
-                    match common::wire::SnKey::read(answer.args()) {
+                    match common::SnKey::read(answer.args()) {
                         Ok(response) => {
                             let mut key_guard = key_cell2.lock().expect("key_cell");
                             *key_guard = Some(response);
@@ -2088,8 +2088,8 @@ mod tests {
         let mut batch = block(0, 1, first);
         batch.holds = total;
         batch.pieces = vec![
-            common::wire::AppendPiece { holds: first_holds, crc: 0, bytes: first.to_vec() },
-            common::wire::AppendPiece { holds: second_holds, crc: 0, bytes: second.to_vec() },
+            common::AppendPiece { holds: first_holds, crc: 0, bytes: first.to_vec() },
+            common::AppendPiece { holds: second_holds, crc: 0, bytes: second.to_vec() },
         ];
         assert!(matches!(disk.take(&testing::process(), &batch, ROOM), Ok(Took::Landed(_))));
         let held = disk.held.lock().unwrap();
@@ -2112,8 +2112,8 @@ mod tests {
                 records: first_holds.records.plus(second_holds.records).unwrap(),
             },
             pieces: vec![
-                common::wire::AppendPiece { holds: first_holds, crc: 0, bytes: first.to_vec() },
-                common::wire::AppendPiece { holds: second_holds, crc: 0, bytes: second.to_vec() },
+                common::AppendPiece { holds: first_holds, crc: 0, bytes: first.to_vec() },
+                common::AppendPiece { holds: second_holds, crc: 0, bytes: second.to_vec() },
             ],
             ..block(0, 2, first)
         };

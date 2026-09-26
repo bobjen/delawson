@@ -1,6 +1,6 @@
 //! Tagged binary schema, built with the same readers/writers as service messages.
-use common::wire::{MAX_FRAME_BYTES, MAX_RECURSION_DEPTH, Op, StructReader, StructWriter};
 use common::{Error, Result};
+use common::{MAX_FRAME_BYTES, MAX_RECURSION_DEPTH, Op, StructReader, StructWriter};
 use std::collections::{BTreeMap, BTreeSet};
 pub trait Wire: Sized {
     fn write(&self, w: &mut StructWriter);
@@ -87,7 +87,7 @@ impl<T: Wire> Wire for Vec<T> {
     fn read(r: &mut StructReader<'_>) -> Result<Self> {
         r.nested(Op::RaftList, "list", |r| {
             let n = r.number_u64()?;
-            let mut values = common::wire::checked_vec(n, r.remaining())?;
+            let mut values = common::checked_vec(n, r.remaining())?;
             for _ in 0..n {
                 values.push(T::read(r)?);
             }
@@ -187,11 +187,11 @@ impl Wire for crate::Action {
 macro_rules! wire_struct {
     ($type:ty, $tag:ident, {$($field:ident),* $(,)?}) => {
         impl $crate::codec::Wire for $type {
-            fn write(&self,w:&mut common::wire::StructWriter) {
-                w.nested(common::wire::Op::$tag, |w| { $( $crate::codec::Wire::write(&self.$field,w); )* });
+            fn write(&self,w:&mut common::StructWriter) {
+                w.nested(common::Op::$tag, |w| { $( $crate::codec::Wire::write(&self.$field,w); )* });
             }
-            fn read(r:&mut common::wire::StructReader<'_>)->common::Result<Self> {
-                r.nested(common::wire::Op::$tag,stringify!($type), |r| Ok(Self { $( $field:$crate::codec::Wire::read(r)?, )* }))
+            fn read(r:&mut common::StructReader<'_>)->common::Result<Self> {
+                r.nested(common::Op::$tag,stringify!($type), |r| Ok(Self { $( $field:$crate::codec::Wire::read(r)?, )* }))
             }
         }
     };
@@ -239,7 +239,7 @@ mod tests {
 }
 
 /// Decode a message payload directly across its pool leaves.
-pub fn decode_message<T: Wire>(bytes: &common::wire::MessagePayload) -> Result<T> {
+pub fn decode_message<T: Wire>(bytes: &common::MessagePayload) -> Result<T> {
     bytes.check()?;
     let depth = *bytes.chunk(0).first().ok_or_else(|| Error::new("empty Raft encoding"))?;
     if depth == 0 || depth > MAX_RECURSION_DEPTH || bytes.len() > MAX_FRAME_BYTES {
@@ -253,7 +253,7 @@ pub fn decode_message<T: Wire>(bytes: &common::wire::MessagePayload) -> Result<T
 }
 
 /// Network encoding retains pool leaves instead of flattening for the caller.
-pub fn encode_message<T: Wire>(value: &T) -> Result<common::wire::MessageBytes> {
+pub fn encode_message<T: Wire>(value: &T) -> Result<common::MessageBytes> {
     let mut writer = StructWriter::new();
     value.write(&mut writer);
     let arg = writer.finish(Op::Raft);
@@ -262,7 +262,7 @@ pub fn encode_message<T: Wire>(value: &T) -> Result<common::wire::MessageBytes> 
     if bytes.len() >= MAX_FRAME_BYTES || depth > MAX_RECURSION_DEPTH {
         return Err(Error::new("Raft encoding exceeds limits"));
     }
-    let mut out = common::wire::MessageBytes::new();
+    let mut out = common::MessageBytes::new();
     out.push(depth);
     bytes.write_to(&mut out)?;
     out.check()?;
@@ -270,7 +270,7 @@ pub fn encode_message<T: Wire>(value: &T) -> Result<common::wire::MessageBytes> 
 }
 
 // Preserve Vec<u8>'s existing tagged-list representation for forwarded payloads.
-impl Wire for common::wire::MessageBytes {
+impl Wire for common::MessageBytes {
     fn write(&self, writer: &mut StructWriter) {
         writer.nested(Op::RaftList, |writer| {
             writer.number_u64(self.len() as u64);
@@ -295,11 +295,11 @@ mod message_storage_tests {
     fn segmented_network_encoding_matches_contiguous_byte_list() {
         let size = common::config::BufferPoolConfig::default().small_message_bytes * 3;
         let bytes: Vec<u8> = (0..size).map(|i| i as u8).collect();
-        let payload = common::wire::MessageBytes::from(bytes.clone());
-        let encoded: common::wire::MessagePayload = encode_message(&payload).unwrap().into();
+        let payload = common::MessageBytes::from(bytes.clone());
+        let encoded: common::MessagePayload = encode_message(&payload).unwrap().into();
         assert!(encoded.is_segmented());
         assert_eq!(encoded.to_vec(), encode(&bytes).unwrap());
-        let decoded: common::wire::MessageBytes = decode_message(&encoded).unwrap();
+        let decoded: common::MessageBytes = decode_message(&encoded).unwrap();
         assert_eq!(decoded, payload);
         assert_eq!(decode_message::<Vec<u8>>(&encoded).unwrap(), bytes);
     }

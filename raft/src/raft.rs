@@ -2336,10 +2336,7 @@ pub mod tests {
         pair(&mut nodes, 0, 1);
         let committed = nodes[0].state().commit;
         let abandoned = nodes[0]
-            .propose(Command::Client(vec![crate::Action::new(
-                common::wire::Op::BytesResp,
-                vec![1; 104],
-            )]))
+            .propose(Command::Client(vec![crate::Action::new(common::Op::BytesResp, vec![1; 104])]))
             .unwrap();
         assert!(abandoned > committed);
         assert_eq!(nodes[0].state().commit, committed);
@@ -2362,10 +2359,7 @@ pub mod tests {
         pair(&mut nodes, 0, 1);
         pair(&mut nodes, 0, 1);
         let index = nodes[0]
-            .propose(Command::Client(vec![crate::Action::new(
-                common::wire::Op::BytesResp,
-                vec![7; 104],
-            )]))
+            .propose(Command::Client(vec![crate::Action::new(common::Op::BytesResp, vec![7; 104])]))
             .unwrap();
         // The follower journals the entry, but the leader loses the acknowledgment.
         let request = nodes[0].request(&1).unwrap();
@@ -2387,10 +2381,7 @@ pub mod tests {
         pair(&mut nodes, 0, 1);
         pair(&mut nodes, 0, 1);
         nodes[0]
-            .propose(Command::Client(vec![crate::Action::new(
-                common::wire::Op::BytesResp,
-                vec![2; 104],
-            )]))
+            .propose(Command::Client(vec![crate::Action::new(common::Op::BytesResp, vec![2; 104])]))
             .unwrap();
         pair(&mut nodes, 0, 1);
         let last = nodes[1].state().last();
@@ -2450,10 +2441,7 @@ pub mod tests {
         pair(&mut nodes, 0, 1);
         pair(&mut nodes, 0, 1);
         nodes[0]
-            .propose(Command::Client(vec![crate::Action::new(
-                common::wire::Op::BytesResp,
-                vec![9; 104],
-            )]))
+            .propose(Command::Client(vec![crate::Action::new(common::Op::BytesResp, vec![9; 104])]))
             .unwrap();
         pair(&mut nodes, 0, 1);
         pair(&mut nodes, 0, 1);
@@ -2486,16 +2474,13 @@ pub mod tests {
         pair(&mut nodes, 0, 1);
         pair(&mut nodes, 0, 1);
         nodes[0]
-            .propose(Command::Client(vec![crate::Action::new(
-                common::wire::Op::BytesResp,
-                vec![9; 104],
-            )]))
+            .propose(Command::Client(vec![crate::Action::new(common::Op::BytesResp, vec![9; 104])]))
             .unwrap();
         pair(&mut nodes, 0, 1);
         nodes[0].journal.snapshot(100).unwrap();
         nodes[0]
             .propose(Command::Client(vec![crate::Action::new(
-                common::wire::Op::BytesResp,
+                common::Op::BytesResp,
                 vec![10; 104],
             )]))
             .unwrap();
@@ -2574,7 +2559,7 @@ pub mod tests {
                             .as_mut()
                             .unwrap()
                             .propose(Command::Client(vec![crate::Action::new(
-                                common::wire::Op::BytesResp,
+                                common::Op::BytesResp,
                                 vec![(step % 251) as u8; 104],
                             )]))
                             .unwrap();
@@ -2675,7 +2660,7 @@ pub mod tests {
                         .as_mut()
                         .unwrap()
                         .propose(Command::Client(vec![crate::Action::new(
-                            common::wire::Op::BytesResp,
+                            common::Op::BytesResp,
                             vec![77; 104],
                         )]))
                         .unwrap();
@@ -2729,95 +2714,91 @@ crate::wire_struct!(Snapshot, RaftSnapshot, {ring,index,term,scn,membership,appl
 crate::wire_struct!(Answer, RaftAnswer, {term,success,matched});
 
 impl crate::codec::Wire for Command {
-    fn write(&self, w: &mut common::wire::StructWriter) {
+    fn write(&self, w: &mut common::StructWriter) {
         match self {
-            Self::Noop => w.nested(common::wire::Op::RaftCommandNoop, |_| {}),
-            Self::Client(value) => w.nested(common::wire::Op::RaftCommandClient, |w| {
+            Self::Noop => w.nested(common::Op::RaftCommandNoop, |_| {}),
+            Self::Client(value) => w.nested(common::Op::RaftCommandClient, |w| {
                 value.write(w);
             }),
-            Self::Members(value) => w.nested(common::wire::Op::RaftCommandMembers, |w| {
+            Self::Members(value) => w.nested(common::Op::RaftCommandMembers, |w| {
                 value.write(w);
             }),
-            Self::CheckpointStart(value) => {
-                w.nested(common::wire::Op::RaftCommandCheckpointStart, |w| {
-                    value.write(w);
-                })
-            }
+            Self::CheckpointStart(value) => w.nested(common::Op::RaftCommandCheckpointStart, |w| {
+                value.write(w);
+            }),
         }
     }
-    fn read(r: &mut common::wire::StructReader<'_>) -> common::Result<Self> {
+    fn read(r: &mut common::StructReader<'_>) -> common::Result<Self> {
         use crate::codec::Wire;
         r.nested_any(|op, r| match op {
-            common::wire::Op::RaftCommandNoop => Ok(Self::Noop),
-            common::wire::Op::RaftCommandClient => Ok(Self::Client(Wire::read(r)?)),
-            common::wire::Op::RaftCommandMembers => Ok(Self::Members(Wire::read(r)?)),
-            common::wire::Op::RaftCommandCheckpointStart => {
-                Ok(Self::CheckpointStart(Wire::read(r)?))
-            }
+            common::Op::RaftCommandNoop => Ok(Self::Noop),
+            common::Op::RaftCommandClient => Ok(Self::Client(Wire::read(r)?)),
+            common::Op::RaftCommandMembers => Ok(Self::Members(Wire::read(r)?)),
+            common::Op::RaftCommandCheckpointStart => Ok(Self::CheckpointStart(Wire::read(r)?)),
             _ => Err(common::Error::new("unexpected Command tag")),
         })
     }
 }
 
 impl crate::codec::Wire for Record {
-    fn write(&self, w: &mut common::wire::StructWriter) {
+    fn write(&self, w: &mut common::StructWriter) {
         match self {
-            Self::Contacts(value) => w.nested(common::wire::Op::RaftRecordContacts, |w| {
+            Self::Contacts(value) => w.nested(common::Op::RaftRecordContacts, |w| {
                 value.write(w);
             }),
-            Self::Retired(value) => w.nested(common::wire::Op::RaftRecordRetired, |w| {
+            Self::Retired(value) => w.nested(common::Op::RaftRecordRetired, |w| {
                 value.write(w);
             }),
-            Self::Bootstrap(value) => w.nested(common::wire::Op::RaftRecordBootstrap, |w| {
+            Self::Bootstrap(value) => w.nested(common::Op::RaftRecordBootstrap, |w| {
                 value.write(w);
             }),
-            Self::Carry { entries, commit } => w.nested(common::wire::Op::RaftRecordCarry, |w| {
+            Self::Carry { entries, commit } => w.nested(common::Op::RaftRecordCarry, |w| {
                 entries.write(w);
                 commit.write(w);
             }),
-            Self::Hard { term, vote } => w.nested(common::wire::Op::RaftRecordHard, |w| {
+            Self::Hard { term, vote } => w.nested(common::Op::RaftRecordHard, |w| {
                 term.write(w);
                 vote.write(w);
             }),
-            Self::Entries { from, entries } => w.nested(common::wire::Op::RaftRecordEntries, |w| {
+            Self::Entries { from, entries } => w.nested(common::Op::RaftRecordEntries, |w| {
                 from.write(w);
                 entries.write(w);
             }),
-            Self::Commit(value) => w.nested(common::wire::Op::RaftRecordCommit, |w| {
+            Self::Commit(value) => w.nested(common::Op::RaftRecordCommit, |w| {
                 value.write(w);
             }),
-            Self::Install(value) => w.nested(common::wire::Op::RaftRecordInstall, |w| {
+            Self::Install(value) => w.nested(common::Op::RaftRecordInstall, |w| {
                 value.write(w);
             }),
         }
     }
-    fn read(r: &mut common::wire::StructReader<'_>) -> common::Result<Self> {
+    fn read(r: &mut common::StructReader<'_>) -> common::Result<Self> {
         use crate::codec::Wire;
         r.nested_any(|op, r| match op {
-            common::wire::Op::RaftRecordContacts => Ok(Self::Contacts(Wire::read(r)?)),
-            common::wire::Op::RaftRecordRetired => Ok(Self::Retired(Wire::read(r)?)),
-            common::wire::Op::RaftRecordBootstrap => Ok(Self::Bootstrap(Wire::read(r)?)),
-            common::wire::Op::RaftRecordCarry => {
+            common::Op::RaftRecordContacts => Ok(Self::Contacts(Wire::read(r)?)),
+            common::Op::RaftRecordRetired => Ok(Self::Retired(Wire::read(r)?)),
+            common::Op::RaftRecordBootstrap => Ok(Self::Bootstrap(Wire::read(r)?)),
+            common::Op::RaftRecordCarry => {
                 Ok(Self::Carry { entries: Wire::read(r)?, commit: Wire::read(r)? })
             }
-            common::wire::Op::RaftRecordHard => {
+            common::Op::RaftRecordHard => {
                 Ok(Self::Hard { term: Wire::read(r)?, vote: Wire::read(r)? })
             }
-            common::wire::Op::RaftRecordEntries => {
+            common::Op::RaftRecordEntries => {
                 Ok(Self::Entries { from: Wire::read(r)?, entries: Wire::read(r)? })
             }
-            common::wire::Op::RaftRecordCommit => Ok(Self::Commit(Wire::read(r)?)),
-            common::wire::Op::RaftRecordInstall => Ok(Self::Install(Wire::read(r)?)),
+            common::Op::RaftRecordCommit => Ok(Self::Commit(Wire::read(r)?)),
+            common::Op::RaftRecordInstall => Ok(Self::Install(Wire::read(r)?)),
             _ => Err(common::Error::new("unexpected Record tag")),
         })
     }
 }
 
 impl crate::codec::Wire for Rpc {
-    fn write(&self, w: &mut common::wire::StructWriter) {
+    fn write(&self, w: &mut common::StructWriter) {
         match self {
             Self::Vote { term, last, last_term, last_scn } => {
-                w.nested(common::wire::Op::RaftRpcVote, |w| {
+                w.nested(common::Op::RaftRpcVote, |w| {
                     term.write(w);
                     last.write(w);
                     last_term.write(w);
@@ -2825,7 +2806,7 @@ impl crate::codec::Wire for Rpc {
                 })
             }
             Self::Append { term, previous, previous_term, previous_scn, entries, commit } => w
-                .nested(common::wire::Op::RaftRpcAppend, |w| {
+                .nested(common::Op::RaftRpcAppend, |w| {
                     term.write(w);
                     previous.write(w);
                     previous_term.write(w);
@@ -2833,12 +2814,12 @@ impl crate::codec::Wire for Rpc {
                     entries.write(w);
                     commit.write(w);
                 }),
-            Self::Install { term, snapshot } => w.nested(common::wire::Op::RaftRpcInstall, |w| {
+            Self::Install { term, snapshot } => w.nested(common::Op::RaftRpcInstall, |w| {
                 term.write(w);
                 snapshot.write(w);
             }),
             Self::Checkpoint { term, index, snapshot_term, snapshot_scn } => {
-                w.nested(common::wire::Op::RaftRpcCheckpoint, |w| {
+                w.nested(common::Op::RaftRpcCheckpoint, |w| {
                     term.write(w);
                     index.write(w);
                     snapshot_term.write(w);
@@ -2847,16 +2828,16 @@ impl crate::codec::Wire for Rpc {
             }
         }
     }
-    fn read(r: &mut common::wire::StructReader<'_>) -> common::Result<Self> {
+    fn read(r: &mut common::StructReader<'_>) -> common::Result<Self> {
         use crate::codec::Wire;
         r.nested_any(|op, r| match op {
-            common::wire::Op::RaftRpcVote => Ok(Self::Vote {
+            common::Op::RaftRpcVote => Ok(Self::Vote {
                 term: Wire::read(r)?,
                 last: Wire::read(r)?,
                 last_term: Wire::read(r)?,
                 last_scn: Wire::read(r)?,
             }),
-            common::wire::Op::RaftRpcAppend => Ok(Self::Append {
+            common::Op::RaftRpcAppend => Ok(Self::Append {
                 term: Wire::read(r)?,
                 previous: Wire::read(r)?,
                 previous_term: Wire::read(r)?,
@@ -2864,10 +2845,10 @@ impl crate::codec::Wire for Rpc {
                 entries: Wire::read(r)?,
                 commit: Wire::read(r)?,
             }),
-            common::wire::Op::RaftRpcInstall => {
+            common::Op::RaftRpcInstall => {
                 Ok(Self::Install { term: Wire::read(r)?, snapshot: Wire::read(r)? })
             }
-            common::wire::Op::RaftRpcCheckpoint => Ok(Self::Checkpoint {
+            common::Op::RaftRpcCheckpoint => Ok(Self::Checkpoint {
                 term: Wire::read(r)?,
                 index: Wire::read(r)?,
                 snapshot_term: Wire::read(r)?,
@@ -2879,8 +2860,8 @@ impl crate::codec::Wire for Rpc {
 }
 
 impl crate::codec::Wire for State {
-    fn write(&self, w: &mut common::wire::StructWriter) {
-        w.nested(common::wire::Op::RaftState, |w| {
+    fn write(&self, w: &mut common::StructWriter) {
+        w.nested(common::Op::RaftState, |w| {
             self.ring.write(w);
             self.founders.write(w);
             self.contacts.write(w);
@@ -2894,9 +2875,9 @@ impl crate::codec::Wire for State {
             self.generation.write(w);
         });
     }
-    fn read(r: &mut common::wire::StructReader<'_>) -> common::Result<Self> {
+    fn read(r: &mut common::StructReader<'_>) -> common::Result<Self> {
         use crate::codec::Wire;
-        r.nested(common::wire::Op::RaftState, "state", |r| {
+        r.nested(common::Op::RaftState, "state", |r| {
             Ok(Self {
                 ignore_ring_identity: false,
                 ring: Wire::read(r)?,

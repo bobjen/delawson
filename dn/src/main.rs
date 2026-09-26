@@ -31,7 +31,7 @@ use common::range::{Detail, Want};
 use common::routing;
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
-use common::wire::{Arg, Op, Req, Resp, Status, StructWriter, structure};
+use common::{Arg, Op, Req, Resp, Status, StructWriter, structure};
 use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::AtomicU32;
@@ -2600,7 +2600,7 @@ mod tests {
                 let count = Arc::clone(&count);
                 workers.push(std::thread::spawn(move || {
                     let (mut reader, mut writer) =
-                        common::wire::accept(socket, &testing::messaging()).unwrap();
+                        common::accept(socket, &testing::messaging()).unwrap();
                     for _ in 0..2 {
                         let request = reader.request().unwrap();
                         let n = count.fetch_add(1, Ordering::Relaxed);
@@ -2615,7 +2615,7 @@ mod tests {
                         };
                         response.id = request.id;
                         let mut bytes = writer.new_buffer();
-                        common::wire::put_response(&mut bytes, &response).unwrap();
+                        common::put_response(&mut bytes, &response).unwrap();
                         writer.send(&mut bytes).unwrap();
                     }
                 }));
@@ -3138,7 +3138,7 @@ mod tests {
         assert!(listing.instances);
         assert_eq!(listing.at.len(), 3, "identical requests are not combined");
         assert_eq!(listing.at[0], listing.at[2]);
-        let mut encoded = common::wire::StructWriter::new();
+        let mut encoded = common::StructWriter::new();
         listing.write_payload(&mut encoded);
         let args = [encoded.finish(Op::ListExtents)];
         let (mut reader, _) = structure(&args, Op::ListExtents, "listing").unwrap();

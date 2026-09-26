@@ -24,7 +24,7 @@ use common::placement::{self, Expansion};
 use common::random::Rng;
 use common::range::{Budget, Detail, ObjectCovered, ObjectPiece as Piece, Range, Start, Want};
 use common::time::TimeSec;
-use common::wire::{Arg, Op, Receipt, Req, Resp, Status, structure};
+use common::{Arg, Op, Receipt, Req, Resp, Status, structure};
 use common::{Error, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -708,7 +708,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::AssignPeers { source, destinations } => {
             let target = resolve(&cluster, &cli, ServiceKind::Ks)?;
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(source);
             payload.number_u64(destinations.len() as u64);
             for identity in destinations {
@@ -896,7 +896,7 @@ fn run(cli: Cli) -> Result<()> {
                 (Cmd::Append { path, seal: true, .. }, Op::AppendRecord) => {
                     receipt(&target, &answer)?;
                     if answer.status == Status::Ok {
-                        let mut payload = common::wire::StructWriter::new();
+                        let mut payload = common::StructWriter::new();
                         payload.text(path);
                         let closed = Req::new(Op::SealObject).structure(payload);
                         let answer = open(&target, timeout, &cluster.messaging)?.call(&closed)?;
@@ -1160,7 +1160,7 @@ fn create_once(target: &Target, plan: &Objects, messaging: &Messaging) -> Result
                     while sent.len() < depth && at < mine.len() {
                         let first = mine[at] * batch as u64;
                         at += 1;
-                        let mut payload = common::wire::StructWriter::new();
+                        let mut payload = common::StructWriter::new();
                         if batch != 1 {
                             payload.number_u64(batch as u64);
                         }
@@ -1317,7 +1317,7 @@ fn benchmark_info_found(args: &[Arg]) -> Result<u64> {
 /// Count returned rows in one sampled response, outside the timed window.
 fn report_info_sample(target: &str, response: &Resp) -> Result<()> {
     let mut framed = Vec::new();
-    common::wire::put_response(&mut framed, response)?;
+    common::put_response(&mut framed, response)?;
     let serialized = framed.len();
     let mut rows = response.args();
     let batch = rows.first().is_some_and(|arg| arg.op == Op::BatchResp);
@@ -1387,13 +1387,13 @@ fn info_once(target: &Target, plan: &Objects, messaging: &Messaging, flags: u64)
                 loop {
                     while sent.len() < depth && std::time::Instant::now() < end {
                         let request = if batch == 1 {
-                            let mut payload = common::wire::StructWriter::new();
+                            let mut payload = common::StructWriter::new();
                             payload.text(&format!("{prefix}{}", rng.next_u64() % objects));
                             payload.flag(true);
                             benchmark_info_want(flags).write(&mut payload);
                             Req::new(Op::ObjectInfo).structure(payload)
                         } else {
-                            let mut payload = common::wire::StructWriter::new();
+                            let mut payload = common::StructWriter::new();
                             payload.number_u64(batch as u64);
                             for _ in 0..batch {
                                 payload.text(&format!("{prefix}{}", rng.next_u64() % objects));
@@ -2092,7 +2092,7 @@ fn report(target: &Target, response: &Resp) -> Result<()> {
                 break;
             }
             Op::SnKeyResp => {
-                let key = common::wire::SnKey::read(response.args())?;
+                let key = common::SnKey::read(response.args())?;
                 println!("{} current {}", target.identity, common::shamir::hex(&key.current));
                 if let Some((since, key)) = key.next {
                     println!(
@@ -2213,7 +2213,7 @@ fn lookup(cluster: &ClusterConfig, identity: &str) -> Result<SocketAddr> {
         timeout,
         &cluster.messaging,
     )?;
-    let mut payload = common::wire::StructWriter::new();
+    let mut payload = common::StructWriter::new();
     payload.text(identity);
     let response = ks.call(&Req::new(Op::Lookup).structure(payload))?;
     match response.status {
@@ -2258,18 +2258,18 @@ fn build(cmd: &Cmd) -> Result<Req> {
     Ok(match cmd {
         Cmd::Unlock { key_file, share } => {
             let key = operator::key(key_file, share)?;
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.bytes(&key);
             Req::new(Op::Unlock).structure(payload)
         }
         Cmd::SnMasterKey { sn, creation_second } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.number_u64(*sn);
             payload.number_u64(TimeSec::new(*creation_second).number());
             Req::new(Op::SnMasterKey).structure(payload)
         }
         Cmd::RaftMembers { members_file } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             let members: Vec<String> = serde_json::from_slice(&std::fs::read(members_file)?)
                 .map_err(|e| common::Error::new(e.to_string()))?;
             payload.number_u64(members.len() as u64);
@@ -2279,18 +2279,18 @@ fn build(cmd: &Cmd) -> Result<Req> {
             Req::new(Op::RaftMembers).structure(payload)
         }
         Cmd::RotateMasterKey => {
-            Req::new(Op::RotateMasterKey).structure(common::wire::StructWriter::new())
+            Req::new(Op::RotateMasterKey).structure(common::StructWriter::new())
         }
 
         Cmd::LogHistogram { from, to, which, .. } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(which);
             payload.text(from);
             payload.text(to);
             Req::new(Op::LogHistogram).structure(payload)
         }
         Cmd::LogGrep { what, from, to, limit, which, .. } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(which);
             payload.text(what);
             payload.text(from);
@@ -2299,7 +2299,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
             Req::new(Op::LogGrep).structure(payload)
         }
         Cmd::LogLines { from, to, limit, which, .. } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(which);
             payload.text(from);
             payload.text(to);
@@ -2308,7 +2308,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
         }
         Cmd::ObjectInfo { path, want, limit, from } => {
             let asked = asking(want, *limit, *from);
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             payload.flag(asked != Want::plain());
             if asked != Want::plain() {
@@ -2318,7 +2318,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
         }
         Cmd::BatchObjectInfo { paths, want, limit, from } => {
             let asked = asking(want, *limit, *from);
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.number_u64(paths.len() as u64);
             for path in paths {
                 payload.text(path);
@@ -2330,29 +2330,29 @@ fn build(cmd: &Cmd) -> Result<Req> {
             Req::new(Op::BatchInfo).structure(payload)
         }
         Cmd::Mkdir { path } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             Req::new(Op::MakeDirectory).structure(payload)
         }
         Cmd::Rmdir { path } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             Req::new(Op::RemoveDirectory).structure(payload)
         }
         Cmd::Ls { path } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             Req::new(Op::List).structure(payload)
         }
         Cmd::Stat { path } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             Req::new(Op::Stat).structure(payload)
         }
 
         Cmd::Create { path, flavor, framing, media_class, expiry } => {
             let (kind, width) = Framing::parse(framing)?.wire();
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             payload.flag(*flavor == Flavor::Keyed);
             payload.number_u8(kind);
@@ -2372,17 +2372,17 @@ fn build(cmd: &Cmd) -> Result<Req> {
         }
         .request()?,
         Cmd::Delete { path } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             Req::new(Op::DeleteObject).structure(payload)
         }
         Cmd::Undelete { path } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             Req::new(Op::UndeleteObject).structure(payload)
         }
         Cmd::SetExpiry { path, seconds } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             match seconds {
                 Some(seconds) => {
@@ -2394,13 +2394,13 @@ fn build(cmd: &Cmd) -> Result<Req> {
             Req::new(Op::SetExpiry).structure(payload)
         }
         Cmd::Clone { src, dst } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(src);
             payload.text(dst);
             Req::new(Op::CloneObject).structure(payload)
         }
         Cmd::Concat { dst, src } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(dst);
             payload.number_u64(src.len() as u64);
             for one in src {
@@ -2423,7 +2423,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
             // tier in the middle spends CPU on them.
             let parts = append_parts(framing, &block)?;
 
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             expecting(expect)?.write(&mut payload);
             payload.number_u8(kind);
@@ -2438,7 +2438,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
             Req::new(Op::AppendRecord).structure(payload)
         }
         Cmd::Seal { path } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             Req::new(Op::SealObject).structure(payload)
         }
@@ -2449,7 +2449,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
             framing.whole(&block)?;
             let (kind, width) = framing.wire();
             let parts = append_parts(framing, &block)?;
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             expecting(&None)?.write(&mut payload);
             payload.number_u8(kind);
@@ -2464,14 +2464,14 @@ fn build(cmd: &Cmd) -> Result<Req> {
             Req::new(Op::AppendRecord).structure(payload)
         }
         Cmd::Insert { path, key, body } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             payload.text(key);
             payload.bytes(&body.bytes()?);
             Req::new(Op::InsertRecord).structure(payload)
         }
         Cmd::Update { path, at, body } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             match (at.record, at.key.as_ref()) {
                 (Some(record), _) => {
@@ -2488,7 +2488,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
             Req::new(Op::UpdateRecord).structure(payload)
         }
         Cmd::DeleteRecord { path, at } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             match (at.record, at.key.as_ref()) {
                 (Some(record), _) => {
@@ -2515,7 +2515,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
                 // A key, which is a keyed read and unbuilt. Sent as it stands so the
                 // answer says so rather than the client guessing.
                 None => {
-                    let mut payload = common::wire::StructWriter::new();
+                    let mut payload = common::StructWriter::new();
                     payload.text(path);
                     expecting(expect)?.write(&mut payload);
                     payload.number_u64(1);
@@ -2530,12 +2530,12 @@ fn build(cmd: &Cmd) -> Result<Req> {
         // in `scan` and never reaches here.
         Cmd::Scan { .. } => return Err(Error::new("a scan is many requests")),
         Cmd::Count { path } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             Req::new(Op::Count).structure(payload)
         }
         Cmd::TimeRange { path, from, to } => {
-            let mut payload = common::wire::StructWriter::new();
+            let mut payload = common::StructWriter::new();
             payload.text(path);
             payload.number_u64(*from);
             payload.number_u64(*to);

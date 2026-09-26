@@ -2218,7 +2218,7 @@ mod tests {
         node.campaign().unwrap();
         for n in 0..5 {
             node.propose(Command::Client(vec![crate::Action::new(
-                common::wire::Op::BytesResp,
+                common::Op::BytesResp,
                 vec![n; 104],
             )]))
             .unwrap();
@@ -2301,7 +2301,7 @@ mod tests {
                         index: 1,
                         term: 1,
                         command: Command::Client(vec![crate::Action::new(
-                            common::wire::Op::BytesResp,
+                            common::Op::BytesResp,
                             vec![8; 104],
                         )]),
                     }],
@@ -2320,7 +2320,7 @@ mod tests {
                         index: 2,
                         term: 1,
                         command: Command::Client(vec![crate::Action::new(
-                            common::wire::Op::BytesResp,
+                            common::Op::BytesResp,
                             vec![9; 104],
                         )]),
                     }],

@@ -164,7 +164,7 @@ fn simultaneous_large_writes_do_not_block_readers() {
 
 #[test]
 fn segmented_message_batches_over_authenticated_tls() {
-    use common::wire::{self, Op, Req, Resp};
+    use common::{Op, Req, Resp, accept, connect, put_request, put_response, structure};
     let members = vec![member(A, &["KS0"]), member(B, &["EN0"])];
     let (_server_dir, server_config) = config(Some(A), members.clone());
     let (_client_dir, client_config) = config(Some(B), members);
@@ -174,29 +174,25 @@ fn segmented_message_batches_over_authenticated_tls() {
         let socket = listener.accept().unwrap().0;
         socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         socket.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
-        let (mut reader, mut writer) = wire::accept(socket, &server_config).unwrap();
+        let (mut reader, mut writer) = accept(socket, &server_config).unwrap();
         let mut batch = writer.new_buffer();
         for id in 0..4 {
             let request = reader.request().unwrap();
             assert_eq!(request.id, id);
-            wire::put_response(&mut batch, &Resp::bytes(vec![id as u8; 70_000]).to(&request))
-                .unwrap();
+            put_response(&mut batch, &Resp::bytes(vec![id as u8; 70_000]).to(&request)).unwrap();
         }
         writer.send(&mut batch).unwrap();
     });
-    let mut link = wire::connect(socket(address), &client_config).unwrap();
+    let mut link = connect(socket(address), &client_config).unwrap();
     for id in 0..4 {
-        wire::put_request(
-            &mut link.plain,
-            &Req::new(Op::Ping).id(id).bytes(vec![id as u8; 70_000]),
-        )
-        .unwrap();
+        put_request(&mut link.plain, &Req::new(Op::Ping).id(id).bytes(vec![id as u8; 70_000]))
+            .unwrap();
     }
     link.wire.send(&mut link.plain).unwrap();
     for id in 0..4 {
         let response = link.reader.response().unwrap();
         assert_eq!(response.id, id);
-        let (mut payload, rest) = wire::structure(response.args(), Op::BytesResp, "bytes").unwrap();
+        let (mut payload, rest) = structure(response.args(), Op::BytesResp, "bytes").unwrap();
         assert!(rest.is_empty());
         assert_eq!(payload.bytes().unwrap(), vec![id as u8; 70_000]);
         payload.done().unwrap();

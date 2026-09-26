@@ -25,9 +25,12 @@
 //! nonce, a tag and a compression attempt are paid per write. Inside the segment
 //! the messages are just length-prefixed.
 
+#[path = "buffer.rs"]
 mod buffer;
+#[path = "payload.rs"]
 mod payload;
 #[cfg(test)]
+#[path = "segmented_tests.rs"]
 mod segmented_tests;
 pub use payload::{MessageBytes, MessagePayload};
 pub fn configure_message_pool(config: crate::config::BufferPoolConfig) -> Result<()> {

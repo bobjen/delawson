@@ -16419,7 +16419,7 @@ The implementation is the dependency, not a copy: `crc64-nvme` from
 
 **And the shared append shape came out of §17.13.3's lesson.** Adding the CRC meant adding a field to a
 message two processes each parse by counting positions — the exact contract that had already gone wrong
-once. So `common::wire::AppendBlock` is now built and read in one place and used by both the FE and the
+once. So `common::AppendBlock` is now built and read in one place and used by both the FE and the
 EN, which turns that class of mistake into a compile error. Its round trip is a unit test; the positions
 are nobody's business.
 
