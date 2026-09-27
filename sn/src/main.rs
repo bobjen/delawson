@@ -177,7 +177,7 @@ type ExtentPool =
 struct ExtentTable {
     pool: ExtentPool,
     base: NonNull<Extent>,
-    /// One past the highest initialized pool index, not the number of live extents.
+    /// One past the highest extent index assigned to a live table entry.
     len: usize,
 }
 
@@ -194,7 +194,6 @@ impl ExtentTable {
     fn insert(&mut self, mut extent: Extent) -> pool::Result<ExtentId> {
         let block = self.pool.alloc()?;
         let index = block.index() as usize;
-        assert!(index <= self.len, "extent pool returned an unissued table index");
         let id = ExtentId::new(block.index());
         let pointer = block.as_ptr().cast::<Extent>();
         // New slots are initialized by the pool; reused slots were invalidated before release.
@@ -207,11 +206,14 @@ impl ExtentTable {
             slot.deletion = extent.deletion;
             slot.data = extent.data;
         }
-        if index == self.len {
-            if index == 0 {
-                self.base = NonNull::new(pointer).expect("extent pool mapping is non-null");
-            }
-            self.len += 1;
+        if self.len == 0 {
+            assert_eq!(index, 0, "the first extent must use the first pool slot");
+            self.base = NonNull::new(pointer).expect("extent pool mapping is non-null");
+        }
+        if index >= self.len {
+            // Pool slots can be assigned out of order; unused gaps stay
+            // initialized and invalid until an extent receives that index.
+            self.len = index + 1;
         }
         // Keep the allocated slot owned by the table; dropping this handle would
         // return the slot to the pool before extent retirement is implemented.
@@ -1586,46 +1588,49 @@ mod tests {
     #[test]
     fn listing_continuation_advances_through_sealed_extents_and_into_the_open_one() {
         let sn = SN::new(testing::sn_config(), 10, SnId::FIRST, Vec::new()).unwrap();
-        for id in 0..4 {
-            sn.state
-                .write()
-                .unwrap()
-                .extent_table
-                .insert(Extent {
-                    pool_link: AtomicU32::new(u32::MAX),
-                    deletion: Flags::default(),
-                    data: ExtentData {
-                        id: ExtentId::new(id),
-                        records: ERoff::new(7),
-                        created: TimeSec::new(100),
-                        disks: Vec::new(),
-                        logical: ELoff::new(100),
-                        compressed: ECoff::new(80),
-                    },
-                })
-                .unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            ids.push(
+                sn.state
+                    .write()
+                    .unwrap()
+                    .extent_table
+                    .insert(Extent {
+                        pool_link: AtomicU32::new(u32::MAX),
+                        deletion: Flags::default(),
+                        data: ExtentData {
+                            id: ExtentId::FIRST,
+                            records: ERoff::new(7),
+                            created: TimeSec::new(100),
+                            disks: Vec::new(),
+                            logical: ELoff::new(100),
+                            compressed: ECoff::new(80),
+                        },
+                    })
+                    .unwrap(),
+            );
         }
         let stream = Stream {
             deletion: Flags::default(),
             created: TimeSec::new(100),
             creator: SnId::FIRST,
-            sealed: vec![ExtentId::new(1), ExtentId::new(2)],
-            open: Some(ExtentId::new(3)),
+            sealed: vec![ids[1], ids[2]],
+            open: Some(ids[3]),
             sealed_records: SRoff::new(14),
             sealed_stream: false,
         };
         let mut from = SRoff::ZERO;
         for (id, first, next) in [
-            (1, SRoff::ZERO, SRoff::new(7)),
-            (2, SRoff::new(7), SRoff::new(14)),
-            (3, SRoff::new(14), SRoff::NONE),
+            (ids[1], SRoff::ZERO, SRoff::new(7)),
+            (ids[2], SRoff::new(7), SRoff::new(14)),
+            (ids[3], SRoff::new(14), SRoff::NONE),
         ] {
             let state = sn.state.read().unwrap();
             let (run, rows) =
                 sn.run_of(&state.extent_table, &stream, StreamId::FIRST, from, 1, false);
             assert_eq!(run.totals.extents, ExtentId::new(3));
             assert_eq!(rows.len(), 1);
-            assert_eq!((rows[0].id, rows[0].first_record), (ExtentId::new(id), first));
+            assert_eq!((rows[0].id, rows[0].first_record), (id, first));
             assert_eq!(run.next, next);
             from = run.next;
         }
