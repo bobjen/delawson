@@ -1614,3 +1614,87 @@ Create, batch 1,000: 1,931,188 objects/s. Sampled responses remained 231
 and 216,053 serialized bytes, including the four-byte frame. Rates were in
 the same range as the previous run (84,770/s and 538,036/s). Log:
 `/tmp/delawson-object-bench-pu8dypd4/` (temporary files).
+
+## Hadoop HDFS ObjectInfo comparison, 2026-09-27
+
+To compare single-object metadata lookups, a one-machine Hadoop 3.5.0 HDFS run
+used `FileSystem.getFileStatus(path)` (HDFS `getFileInfo`), the closest analogue
+to DeLawson `ObjectInfo`. `BatchObjectInfo` was not tested. Hadoop was run with
+Java 17, replication 1, and 64 NameNode RPC handlers.
+
+The saved client source is
+`/home/bob-jenkins/hadoop-objectinfo-bench-20m/results/HadoopObjectInfoBench.java`;
+the compiled jar is next to it. It creates 20,000,000 completed zero-byte files
+under `hdfs://localhost:9000/objectinfo-bench-3pxfek1b`, arranged as 1,000
+numeric shard directories of 20,000 files each. Creation opens and closes each
+file without writing data, using 16 FileSystem clients and 16 workers per client
+(256 workers total). For measurement, the same 16-by-16 concurrency chooses
+random object IDs, calls `getFileStatus`, and verifies each result is a file of
+length zero. It runs one warmup followed by three 5-second trials.
+
+| Phase | Result |
+| --- | ---: |
+| Create 20M empty files | 2,549.399 s; 7,845 files/s |
+| Random `getFileStatus` warmup | 35,337 lookups/s |
+| Trial 1 | 42,958 lookups/s |
+| Trial 2 | 42,271 lookups/s |
+| Trial 3 | 42,978 lookups/s |
+| Three-trial mean | 42,736 lookups/s; range 42,271–42,978; 1.7% spread |
+
+Every measured lookup returned an existing file with length zero. The run did
+not record RPC byte counters or packet captures. The previously discussed
+rough estimate of 110–120 bytes per request-plus-response protobuf excludes
+Hadoop IPC framing/headers and TCP/IP, so it is not a measured on-wire size.
+
+### Retained namespace and cleanup
+
+The Hadoop cluster is stopped. Preserve the completed namespace; do not format
+its storage directories or rerun the client's `create` mode. The saved data and
+run files are at `/home/bob-jenkins/hadoop-objectinfo-bench-20m`:
+
+- HDFS namespace: `/objectinfo-bench-3pxfek1b`.
+- NameNode metadata and edit logs: `storage/name` (about 6.0 GB at capture).
+- DataNode storage: `storage/data` (44 KB; the objects are empty).
+- Configuration, start/stop scripts, client source/jar, and results: `conf/`,
+  `start.sh`, `stop.sh`, and `results/`.
+- Total saved directory size was about 6.5 GB.
+
+The NameNode console log was compressed losslessly to
+`results/namenode.out.gz`: 10,758,371,249 bytes expanded and 548,687,186 bytes
+compressed (about 19.6:1, or 94.9% smaller). The raw uncompressed log is not
+retained separately. HDFS edit logs in `storage/name` are required to recover
+the namespace. No SecondaryNameNode or CheckpointNode was run; plan a checkpoint
+before continued metadata-writing use.
+
+For a same-input codec comparison, streamed the retained gzip log through its
+decompressor and recompressed the expanded text with each codec, counting output
+bytes to `wc` rather than writing another large file. These are single-threaded,
+level-1 CLI runs; elapsed time includes reading/decompressing the source gzip,
+compressing the text, and counting bytes. The retained gzip file is 52 bytes
+larger than the timed gzip recompression, due to gzip metadata.
+
+| Codec | Elapsed | Compressed bytes | Expanded/compressed ratio |
+| --- | ---: | ---: | ---: |
+| gzip -1 | 35.63 s | 548,687,134 | 19.61:1 |
+| Zstandard -1 | 28.55 s | 442,072,114 | 24.34:1 |
+
+On this log, Zstandard's output was 19.4% smaller and its end-to-end pass took
+19.9% less time than gzip. This compares whole-stream CLI output; DeLawson's
+logger uses Zstandard level 1 in independent blocks with its own 8-byte block
+headers, so its on-disk log ratio can differ.
+
+To restart the saved namespace and remeasure without recreating objects:
+
+```bash
+cd /home/bob-jenkins/hadoop-objectinfo-bench-20m
+set -e
+trap './stop.sh' EXIT
+./start.sh
+JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 HADOOP_CONF_DIR=$PWD/conf \
+  /opt/hadoop/bin/hadoop jar results/hadoop-objectinfo-bench.jar \
+  HadoopObjectInfoBench measure /objectinfo-bench-3pxfek1b
+```
+
+The `measure` mode only performs lookups. The existing root check in `create`
+mode refuses to populate over this namespace; retain that guard so the 40-minute
+creation is not repeated.
