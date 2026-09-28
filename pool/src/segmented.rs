@@ -569,6 +569,7 @@ mod tests {
     }
 
     fn all_returned(pool: &ChunkPool, max: usize) {
+        pool.drain_retired();
         let mut held = Vec::new();
         while let Ok(block) = pool.alloc() {
             held.push(block);

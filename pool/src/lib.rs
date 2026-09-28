@@ -17,8 +17,9 @@ macro_rules! pool_hit {
     };
 }
 
-pub const DEFAULT_BUCKETS: usize = 256;
-pub const DEFAULT_CHOICES: usize = 4;
+pub const DEFAULT_BUCKETS: usize = 128;
+pub const DEFAULT_CHOICES: usize = 128;
+const DEL_MASK: u64 = 0x3; // Reclaim on one in four eligible deletes.
 const NONE: u32 = u32::MAX;
 
 #[derive(Debug)]
@@ -424,9 +425,8 @@ impl<T: PoolItem, const A: usize, L: Links> Pool<T, A, L> {
         }
     }
 
-    /// Tries up to DEFAULT_CHOICES buckets, reclaiming at each before issuing a fresh index.
-    /// Bucket selection uses this thread's RNG; no shared RNG is used.
-    /// Returns can remain temporarily unavailable while protected by readers.
+    /// Probes up to DEFAULT_CHOICES free lists before issuing a fresh index.
+    /// Bucket selection uses this thread's RNG; deletes rotate and reclaim lists.
     pub fn alloc(&self) -> Result<Block<'_, T, A, L>> {
         let random = random::thread_u64();
         let count = self.buckets.len();
@@ -437,9 +437,18 @@ impl<T: PoolItem, const A: usize, L: Links> Pool<T, A, L> {
         } else {
             ((((random >> count.trailing_zeros()) as usize) & (count / 2 - 1)) << 1) | 1
         };
-        self.alloc_reclaiming_each(
-            (0..DEFAULT_CHOICES.min(count)).map(|step| (first + step * delta) & mask),
-        )
+        self.alloc_probe((0..DEFAULT_CHOICES.min(count)).map(|step| (first + step * delta) & mask))
+    }
+
+    #[inline]
+    fn alloc_probe(&self, choices: impl IntoIterator<Item = usize>) -> Result<Block<'_, T, A, L>> {
+        for choice in choices {
+            let bucket = &self.buckets[choice & (self.buckets.len() - 1)];
+            if let Some(index) = self.pop(bucket) {
+                return Ok(Block { pool: self, index });
+            }
+        }
+        self.issue_fresh()
     }
 
     /// Grows by one fresh index without reclaiming retired slots.
@@ -565,6 +574,8 @@ impl<T: PoolItem, const A: usize, L: Links> Pool<T, A, L> {
                         } else {
                             pool_hit!(self, RetiredNonempty);
                         }
+                        drop(_guard);
+                        self.try_reclaim(bucket);
                         return;
                     }
                     Err(actual) => {
@@ -573,6 +584,22 @@ impl<T: PoolItem, const A: usize, L: Links> Pool<T, A, L> {
                     }
                 }
             }
+        }
+    }
+
+    fn try_reclaim(&self, bucket: &Bucket) {
+        if random::thread_u64() & DEL_MASK == 0 {
+            // Rotate even when the inactive list is empty, so the current list
+            // can become eligible for reclamation by a later delete.
+            self.recycle(bucket);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drain_retired(&self) {
+        for bucket in self.buckets.iter() {
+            self.recycle(bucket);
+            self.recycle(bucket);
         }
     }
 
@@ -623,6 +650,8 @@ impl<T: PoolItem, const A: usize, L: Links> Pool<T, A, L> {
         if head == NONE {
             pool_hit!(self, RecycleEmpty);
         }
+        // Even an empty transfer rotates the lists and makes the old current
+        // list inactive for the next delete-side reclaim attempt.
         // Keep the exclusive lock through the switch; releasing it first would
         // allow a delayed recycler to switch after an intervening full rotation.
         bucket.current.store(inactive, SeqCst);
@@ -800,12 +829,21 @@ mod tests {
         let pool = Pool16::with_buckets(4, 4, 1).unwrap();
         let first = pool.alloc_from_bucket(0).unwrap();
         let second = pool.alloc_from_bucket(0).unwrap();
-        drop(first);
-        drop(second);
+        std::mem::forget(first);
+        std::mem::forget(second);
+        pool.link(0).store(NONE, SeqCst);
+        pool.link(1).store(0, SeqCst);
+        pool.buckets[0].deleted[0].head.store(1, SeqCst);
+        pool.buckets[0].deleted[0].tail.store(0, SeqCst);
         assert_eq!(pool.buckets[0].deleted[0].head.load(SeqCst), 1);
         assert_eq!(pool.buckets[0].deleted[0].tail.load(SeqCst), 0);
+        assert_eq!(pool.buckets[0].current.load(SeqCst), 0);
+        let free = pool.buckets[0].free.load(SeqCst);
         pool.recycle(&pool.buckets[0]);
+        assert_eq!(pool.buckets[0].current.load(SeqCst), 1);
+        assert_eq!(pool.buckets[0].free.load(SeqCst), free);
         pool.recycle(&pool.buckets[0]);
+        assert_eq!(pool.buckets[0].current.load(SeqCst), 0);
         assert_eq!(pool.buckets[0].free.load(SeqCst), 1);
         assert_eq!(pool.link(1).load(SeqCst), 0);
         assert_eq!(pool.link(0).load(SeqCst), 2);
@@ -899,9 +937,14 @@ mod tests {
     #[test]
     fn first_empty_bucket_is_not_reclaimed() {
         let pool = Pool16::with_buckets(64, 2, 32).unwrap();
-        drop(pool.alloc_from_bucket(0).unwrap());
+        let block = pool.alloc_from_bucket(0).unwrap();
+        assert_eq!(block.index(), 0);
+        std::mem::forget(block);
+        pool.link(0).store(NONE, SeqCst);
         let first = &pool.buckets[0];
         let current = first.current.load(SeqCst);
+        first.deleted[current].head.store(0, SeqCst);
+        first.deleted[current].tail.store(0, SeqCst);
         let head = first.deleted[current].head.load(SeqCst);
         assert_eq!(head, 0);
         let _writer = first.deleted[current].gate.try_write().unwrap();

@@ -426,6 +426,9 @@ mod tests {
             assert_eq!(reader.remaining(), 0);
             assert!(reader.fill_buf().unwrap().is_empty());
             assert_eq!(reader.read_u8().unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+            drop(reader);
+            drop(buffer);
+            pool.drain_retired();
         }
         // Explicitly exercise every internal split for the shorter fields too.
         for width in [2, 4] {
@@ -443,6 +446,9 @@ mod tests {
                 } else {
                     assert_eq!(reader.read_u32_le().unwrap(), 0xabcdef01);
                 }
+                drop(reader);
+                drop(buffer);
+                pool.drain_retired();
             }
         }
     }
@@ -568,6 +574,7 @@ mod tests {
         let buffer = writer.into_inner();
         assert_eq!(buffer.chunks().flatten().copied().collect::<Vec<_>>(), [11, 0x33, 0x22]);
         buffer.clear();
+        pool.drain_retired();
         let mut writer = buffer.writer();
         writer.write_u32_le(0xabcdef01).unwrap();
         assert_eq!(writer.into_inner().reader().read_u32_le().unwrap(), 0xabcdef01);
@@ -628,8 +635,8 @@ mod tests {
         let expected = old.into_bytes();
         let pool = pool(8);
         for start in 4088..CHUNK_BYTES as u64 + 1 {
-            let mut buffer = SegmentedBuffer::with_start(&pool, start);
-            let mut writer = buffer.writer();
+            let mut storage = SegmentedBuffer::with_start(&pool, start);
+            let mut writer = storage.writer();
             writer.write_u8(7).unwrap();
             writer.write_u16_le(Op::Range.code()).unwrap();
             writer.write_u16_le(0x1234).unwrap();
@@ -662,6 +669,10 @@ mod tests {
             assert_eq!(length, 16);
             assert_eq!(&reader.read_array::<16>().unwrap(), b"crossing a block");
             assert_eq!(reader.remaining(), 0);
+            drop(reader);
+            let _ = buffer;
+            drop(storage);
+            pool.drain_retired();
         }
     }
 }
