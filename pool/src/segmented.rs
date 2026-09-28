@@ -519,7 +519,7 @@ mod tests {
     use std::collections::HashSet;
 
     fn pool(max: u32) -> ChunkPool {
-        ChunkPool::with_buckets(max, 0, 1).unwrap()
+        ChunkPool::new(max, 0).unwrap()
     }
 
     fn audit(buffer: &SegmentedBuffer<'_>) -> usize {
@@ -569,7 +569,6 @@ mod tests {
     }
 
     fn all_returned(pool: &ChunkPool, max: usize) {
-        pool.drain_retired();
         let mut held = Vec::new();
         while let Ok(block) = pool.alloc() {
             held.push(block);

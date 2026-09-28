@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn cached_leaf_writes_match_a_contiguous_model_through_boundaries() {
-        let pool = Box::leak(Box::new(pool::ChunkPool::with_buckets(32, 0, 1).unwrap()));
+        let pool = Box::leak(Box::new(pool::ChunkPool::new(32, 0).unwrap()));
         let mut bytes = MessageBytes::from_storage(Storage::Large(SegmentedBuffer::new(pool)));
         let mut model = vec![17; pool::CHUNK_BYTES - 11];
         bytes.write_all(&model).unwrap();

@@ -399,7 +399,7 @@ mod tests {
     use crate::ChunkPool;
 
     fn pool(count: u32) -> ChunkPool {
-        ChunkPool::with_buckets(count, 0, 1).unwrap()
+        ChunkPool::new(count, 0).unwrap()
     }
 
     #[test]
@@ -428,7 +428,6 @@ mod tests {
             assert_eq!(reader.read_u8().unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
             drop(reader);
             drop(buffer);
-            pool.drain_retired();
         }
         // Explicitly exercise every internal split for the shorter fields too.
         for width in [2, 4] {
@@ -448,7 +447,6 @@ mod tests {
                 }
                 drop(reader);
                 drop(buffer);
-                pool.drain_retired();
             }
         }
     }
@@ -574,7 +572,6 @@ mod tests {
         let buffer = writer.into_inner();
         assert_eq!(buffer.chunks().flatten().copied().collect::<Vec<_>>(), [11, 0x33, 0x22]);
         buffer.clear();
-        pool.drain_retired();
         let mut writer = buffer.writer();
         writer.write_u32_le(0xabcdef01).unwrap();
         assert_eq!(writer.into_inner().reader().read_u32_le().unwrap(), 0xabcdef01);
@@ -672,7 +669,6 @@ mod tests {
             drop(reader);
             let _ = buffer;
             drop(storage);
-            pool.drain_retired();
         }
     }
 }
@@ -748,7 +744,7 @@ mod vectored_tests {
 
     #[test]
     fn single_leaf_io_uses_scalar_calls_with_interrupts_and_short_transfers() {
-        let pool = ChunkPool::with_buckets(8, 0, 1).unwrap();
+        let pool = ChunkPool::new(8, 0).unwrap();
         let mut source = SegmentedBuffer::with_start(&pool, 17);
         let bytes: Vec<_> = (0..16001).map(|n| (n % 251) as u8).collect();
         source.append(&bytes).unwrap();
@@ -772,7 +768,7 @@ mod vectored_tests {
 
     #[test]
     fn vectored_io_handles_short_calls_interrupts_and_multiple_windows() {
-        let pool = ChunkPool::with_buckets(200, 0, 1).unwrap();
+        let pool = ChunkPool::new(200, 0).unwrap();
         let mut source = SegmentedBuffer::with_start(&pool, CHUNK_BYTES as u64 - 3);
         let bytes: Vec<u8> = (0..CHUNK_BYTES * (IO_SLICES + 9)).map(|n| (n % 251) as u8).collect();
         source.append(&bytes).unwrap();
@@ -792,7 +788,7 @@ mod vectored_tests {
 
     #[test]
     fn failed_receive_rolls_back_and_mutable_slices_stay_within_the_range() {
-        let pool = ChunkPool::with_buckets(8, 0, 1).unwrap();
+        let pool = ChunkPool::new(8, 0).unwrap();
         let mut dest = SegmentedBuffer::new(&pool);
         dest.append(&[7; CHUNK_BYTES + 904]).unwrap();
         let mut input = Transport::new(vec![8; 100]);
@@ -821,7 +817,7 @@ mod vectored_tests {
 
     #[test]
     fn receive_allocation_failure_preserves_existing_bytes() {
-        let pool = ChunkPool::with_buckets(1, 0, 1).unwrap();
+        let pool = ChunkPool::new(1, 0).unwrap();
         let mut dest = SegmentedBuffer::new(&pool);
         dest.append(&[7; 3]).unwrap();
         let mut input = Transport::new(vec![8; CHUNK_BYTES * 2]);

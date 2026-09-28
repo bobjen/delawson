@@ -25,12 +25,12 @@ use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::{Arg, Op, Req, Resp, Status, StructReader, StructWriter, structure};
 use common::{Error, Result};
-use pool::{InlineLinks, Pool};
+use pool::Pool;
 use std::collections::HashMap;
-use std::mem::{align_of, offset_of};
+use std::mem::align_of;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 const SERVES: &[Op] = &[
@@ -131,9 +131,6 @@ impl Stream {
 #[repr(C)]
 #[derive(Debug)]
 struct Extent {
-    /// Pool free-list link, placed in space already present in the extent layout.
-    #[allow(dead_code)]
-    pool_link: AtomicU32,
     deletion: Flags,
     data: ExtentData,
 }
@@ -141,7 +138,6 @@ struct Extent {
 impl Extent {
     fn blank() -> Self {
         Self {
-            pool_link: AtomicU32::new(u32::MAX),
             deletion: Flags::default(),
             data: ExtentData {
                 logical: ELoff::ZERO,
@@ -170,8 +166,7 @@ unsafe impl pool::PoolItem for Extent {
     }
 }
 
-type ExtentPool =
-    Pool<Extent, { align_of::<Extent>() }, InlineLinks<{ offset_of!(Extent, pool_link) }>>;
+type ExtentPool = Pool<Extent, { align_of::<Extent>() }>;
 
 /// A stable-index table backed by typed pool slots.
 struct ExtentTable {
@@ -200,7 +195,6 @@ impl ExtentTable {
         unsafe {
             let slot = &mut *pointer;
             debug_assert!(!slot.deletion.is_valid());
-            slot.pool_link.store(u32::MAX, Ordering::Relaxed);
             extent.deletion.set_valid();
             extent.data.id = id;
             slot.deletion = extent.deletion;
@@ -1349,11 +1343,7 @@ impl SN {
             disks,
         };
         let id = extents
-            .insert(Extent {
-                pool_link: AtomicU32::new(u32::MAX),
-                deletion: Flags::default(),
-                data: extent,
-            })
+            .insert(Extent { deletion: Flags::default(), data: extent })
             .map_err(|error| Error::new(format!("allocate SN extent slot: {error}")))?;
         let extent = extents[id.get() as usize].data.clone();
         held.open = Some(id);
@@ -1484,10 +1474,9 @@ mod tests {
     }
 
     #[test]
-    fn link_layout() {
+    fn extent_layout() {
         assert_eq!(std::mem::size_of::<Extent>(), 56);
         assert_eq!(align_of::<Extent>(), 8);
-        assert_eq!(offset_of!(Extent, pool_link), 0);
         assert!(!Flags::default().is_valid());
     }
 
@@ -1520,15 +1509,15 @@ mod tests {
         assert_eq!(table.pool.issued_blocks(), 2);
         let pointer = spare.as_ptr().cast::<Extent>();
         assert!(!unsafe { (*pointer).deletion.is_valid() });
-        // Model the extent's own delete routine clearing Valid before the pool
-        // sees the block. Pool retirement and reuse must leave it alone.
+        // Model the extent's delete routine clearing Valid before the pool
+        // sees the block. Pool reuse must leave it alone.
         unsafe {
             (*pointer).deletion.set_valid();
             (*pointer).deletion.clear_valid();
         }
         assert!(!unsafe { (*pointer).deletion.is_valid() });
         drop(spare);
-        let reused = table.pool.alloc_from_bucket(1).unwrap();
+        let reused = table.pool.alloc().unwrap();
         assert_eq!(reused.index(), 1);
         assert!(!unsafe { (*reused.as_ptr().cast::<Extent>()).deletion.is_valid() });
     }
@@ -1548,7 +1537,6 @@ mod tests {
             .unwrap()
             .extent_table
             .insert(Extent {
-                pool_link: AtomicU32::new(u32::MAX),
                 deletion: Flags::default(),
                 data: ExtentData {
                     id: ExtentId::FIRST,
@@ -1596,7 +1584,6 @@ mod tests {
                     .unwrap()
                     .extent_table
                     .insert(Extent {
-                        pool_link: AtomicU32::new(u32::MAX),
                         deletion: Flags::default(),
                         data: ExtentData {
                             id: ExtentId::FIRST,
@@ -1658,7 +1645,6 @@ mod tests {
     fn extent_references_are_four_bytes() {
         assert_eq!(size_of::<ExtentId>(), 4);
         assert_eq!(size_of::<Extent>(), 56);
-        assert_eq!(size_of::<AtomicU32>(), 4);
     }
 
     use super::*;
