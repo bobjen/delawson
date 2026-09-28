@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 const THREADS: usize = 8;
 const OPS_PER_THREAD: usize = 16_000_000;
 const MAX_BLOCKS: u32 = 1_000_000;
+const STRIDE_LIMIT: usize = 100;
+const RANDOM_PROBES: usize = 6000;
 const SEED: u64 = 42;
 
 macro_rules! run_test {
@@ -72,10 +74,12 @@ macro_rules! run_test {
 run_test!(run_pool, Pool<[u8; 4096], 4096>, alloc);
 
 fn main() {
-    let pool = Pool::<[u8; 4096], 4096>::new(MAX_BLOCKS, 0).unwrap();
+    let pool =
+        Pool::<[u8; 4096], 4096>::with_probe_limits(MAX_BLOCKS, 0, STRIDE_LIMIT, RANDOM_PROBES)
+            .unwrap();
     let (elapsed, counts) = run_pool(&pool);
     println!(
-        "pool=bitmap interleave=4096 second_probe=first-popcnt-1 threads={THREADS} ops_per_thread={OPS_PER_THREAD} max_blocks={MAX_BLOCKS} elapsed_ms={:.3} allocs={} failed={} frees={} issued={}",
+        "pool=bitmap interleave=4096 second_probe=first-popcnt-1 threads={THREADS} ops_per_thread={OPS_PER_THREAD} max_blocks={MAX_BLOCKS} stride_limit={STRIDE_LIMIT} random_probes={RANDOM_PROBES} elapsed_ms={:.3} allocs={} failed={} frees={} issued={}",
         elapsed.as_secs_f64() * 1000.0,
         counts[0],
         counts[1],

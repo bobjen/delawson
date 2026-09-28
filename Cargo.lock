@@ -290,6 +290,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "delawson-permute"
+version = "0.0.1"
+
+[[package]]
 name = "delawson-pool"
 version = "0.0.1"
 dependencies = [

@@ -8,6 +8,8 @@ const BITS: usize = 64;
 const INTERLEAVE_BITS: usize = 4096;
 const INTERLEAVE_WORDS: usize = INTERLEAVE_BITS / BITS;
 const PROBE_LIMIT: usize = 4;
+const DEFAULT_STRIDE_LIMIT: usize = 6000;
+const DEFAULT_RANDOM_PROBES: usize = 6000;
 const REFILL_BATCH: u32 = 64;
 const REFILL_BUSY: u32 = 1 << 31;
 const REFILL_MASK: u32 = !REFILL_BUSY;
@@ -27,6 +29,78 @@ fn word_count(slots: usize) -> usize {
     groups * INTERLEAVE_WORDS + rem.min(INTERLEAVE_WORDS)
 }
 
+#[inline]
+fn random_word(words: usize, random: u64) -> usize {
+    ((random as u128 * words as u128) >> 64) as usize
+}
+
+struct ProbeSeq {
+    words: usize,
+    random_probes: usize,
+    used: usize,
+    scan: usize,
+    mask: usize,
+    base: usize,
+    delta: usize,
+    step: usize,
+    strided: bool,
+}
+
+impl ProbeSeq {
+    fn new(
+        words: usize,
+        stride_limit: usize,
+        random_probes: usize,
+        random: &mut impl FnMut() -> u64,
+    ) -> Self {
+        let strided = words <= stride_limit;
+        if strided {
+            let scan = words.next_power_of_two();
+            let mask = scan - 1;
+            let value = random();
+            let base = value as usize & mask;
+            // An odd delta visits every padded word before repeating.
+            let delta = (((value >> (usize::BITS / 2)) as usize) & mask) | 1;
+            Self { words, random_probes, used: 0, scan, mask, base, delta, step: 0, strided }
+        } else {
+            Self {
+                words,
+                random_probes,
+                used: 0,
+                scan: 0,
+                mask: 0,
+                base: 0,
+                delta: 0,
+                step: 0,
+                strided,
+            }
+        }
+    }
+
+    fn next(&mut self, random: &mut impl FnMut() -> u64) -> Option<usize> {
+        if self.strided {
+            if self.used == self.words {
+                return None;
+            }
+            while self.step < self.scan {
+                let at = self.base.wrapping_add(self.step.wrapping_mul(self.delta)) & self.mask;
+                self.step += 1;
+                if at < self.words {
+                    self.used += 1;
+                    return Some(at);
+                }
+            }
+            None
+        } else {
+            if self.used == self.random_probes {
+                return None;
+            }
+            self.used += 1;
+            Some(random_word(self.words, random()))
+        }
+    }
+}
+
 /// A fixed-size pool whose free slots are represented by one bit per index.
 /// Bit 1 means free; zero means allocated or not yet issued. Each 4096-index
 /// group is transposed across 64 bitmap words.
@@ -37,6 +111,8 @@ pub struct Pool<T: PoolItem, const ALIGN: usize> {
     next: AtomicU32,
     refill: AtomicU32,
     refill_gen: AtomicU32,
+    stride_limit: usize,
+    random_probes: usize,
     _slot: PhantomData<fn() -> T>,
 }
 
@@ -46,6 +122,24 @@ unsafe impl<T: PoolItem + Send + Sync, const A: usize> Sync for Pool<T, A> {}
 
 impl<T: PoolItem, const A: usize> Pool<T, A> {
     pub fn new(max_blocks: u32, initial_blocks: u32) -> Result<Self> {
+        Self::with_probe_limits(
+            max_blocks,
+            initial_blocks,
+            DEFAULT_STRIDE_LIMIT,
+            DEFAULT_RANDOM_PROBES,
+        )
+    }
+
+    /// Create a pool with custom limits for stride and random probing.
+    /// Pools with at most `stride_limit` bitmap words are exhaustively scanned
+    /// with a stride. Larger pools draw up to `random_probes` independent random
+    /// words, allowing repeats.
+    pub fn with_probe_limits(
+        max_blocks: u32,
+        initial_blocks: u32,
+        stride_limit: usize,
+        random_probes: usize,
+    ) -> Result<Self> {
         if !A.is_power_of_two()
             || size_of::<T>() == 0
             || size_of::<T>() % A != 0
@@ -57,6 +151,9 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
         }
         if max_blocks == 0 || initial_blocks > max_blocks {
             return Err(Error::new("pool needs 0 <= initial_blocks <= max_blocks"));
+        }
+        if random_probes == 0 {
+            return Err(Error::new("pool needs at least one random bitmap probe"));
         }
         let total_bytes = size_of::<T>()
             .checked_mul(max_blocks as usize)
@@ -76,6 +173,8 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
             next: AtomicU32::new(initial_blocks),
             refill: AtomicU32::new(0),
             refill_gen: AtomicU32::new(0),
+            stride_limit,
+            random_probes,
             _slot: PhantomData,
         };
         for index in 0..initial_blocks {
@@ -197,74 +296,48 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
         size_of::<T>()
     }
 
-    /// Samples a second word when the first has one free bit, then scans/grows.
+    /// Searches the bitmap with the configured probe policy, then grows if needed.
     #[inline]
     pub fn alloc(&self) -> Result<Block<'_, T, A>> {
         let issued = self.next.load(SeqCst) as usize;
         let words = word_count(issued);
         let refill_gen = (words > PROBE_LIMIT).then(|| self.refill_gen.load(SeqCst));
         if words != 0 {
-            let scan = words.next_power_of_two();
-            let mask = scan - 1;
-            let random = random::thread_u64();
-            let first = random as usize & mask;
-            let delta = (((random >> usize::BITS / 2) as usize) & mask) | 1;
-            let mut probes = 0usize;
-            let mut step = 0usize;
-            let first_at = loop {
-                let at = first.wrapping_add(step.wrapping_mul(delta)) & mask;
-                step += 1;
-                if at < words {
-                    break at;
-                }
-            };
-            probes += 1;
-            let first_free = self.word(first_at).load(SeqCst);
+            let mut random = || random::thread_u64();
+            let mut probes =
+                ProbeSeq::new(words, self.stride_limit, self.random_probes, &mut random);
+            if let Some(first_at) = probes.next(&mut random) {
+                let first_free = self.word(first_at).load(SeqCst);
 
-            if first_free != 0 {
-                let mut second_at = 0;
-                let mut second_free = 0;
-                let mut have_second = false;
-                if first_free.count_ones() == 1 {
-                    while step < scan {
-                        let at = first.wrapping_add(step.wrapping_mul(delta)) & mask;
-                        step += 1;
-                        if at < words {
-                            probes += 1;
-                            second_at = at;
-                            second_free = self.word(at).load(SeqCst);
-                            have_second = true;
-                            break;
+                if first_free != 0 {
+                    let second = if first_free.count_ones() == 1 {
+                        probes.next(&mut random).map(|at| (at, self.word(at).load(SeqCst)))
+                    } else {
+                        None
+                    };
+                    let found = if let Some((second_at, second_free)) = second {
+                        let (fuller_at, fuller_free, other_at, other_free) =
+                            if first_free.count_ones() >= second_free.count_ones() {
+                                (first_at, first_free, second_at, second_free)
+                            } else {
+                                (second_at, second_free, first_at, first_free)
+                            };
+                        self.take_word_from(fuller_at, fuller_free)
+                            .or_else(|| self.take_word_from(other_at, other_free))
+                    } else {
+                        self.take_word_from(first_at, first_free)
+                    };
+                    if let Some(index) = found {
+                        if probes.used > PROBE_LIMIT {
+                            self.refill();
                         }
+                        return Ok(Block { pool: self, index });
                     }
                 }
-                let found = if have_second {
-                    let (fuller_at, fuller_free, other_at, other_free) =
-                        if first_free.count_ones() >= second_free.count_ones() {
-                            (first_at, first_free, second_at, second_free)
-                        } else {
-                            (second_at, second_free, first_at, first_free)
-                        };
-                    self.take_word_from(fuller_at, fuller_free)
-                        .or_else(|| self.take_word_from(other_at, other_free))
-                } else {
-                    self.take_word_from(first_at, first_free)
-                };
-                if let Some(index) = found {
-                    if probes > PROBE_LIMIT {
-                        self.refill();
-                    }
-                    return Ok(Block { pool: self, index });
-                }
-            }
 
-            while step < scan {
-                let at = first.wrapping_add(step.wrapping_mul(delta)) & mask;
-                step += 1;
-                if at < words {
-                    probes += 1;
+                while let Some(at) = probes.next(&mut random) {
                     if let Some(index) = self.take_word(at) {
-                        if probes > PROBE_LIMIT {
+                        if probes.used > PROBE_LIMIT {
                             self.refill();
                         }
                         return Ok(Block { pool: self, index });
@@ -360,6 +433,68 @@ mod tests {
     }
 
     #[test]
+    fn short_probe_sequence_visits_every_word_once() {
+        let calls = std::cell::Cell::new(0);
+        let mut random = || {
+            calls.set(calls.get() + 1);
+            17
+        };
+        let mut probes = ProbeSeq::new(37, 37, 6000, &mut random);
+        let mut seen = vec![false; 37];
+        while let Some(word) = probes.next(&mut random) {
+            assert!(!seen[word]);
+            seen[word] = true;
+        }
+        assert!(seen.into_iter().all(|hit| hit));
+        assert_eq!(calls.get(), 1, "only the base is random for a stride scan");
+    }
+
+    #[test]
+    fn long_probe_sequence_draws_independent_samples_with_repeats() {
+        let samples = [u64::MAX, u64::MAX];
+        let mut calls = 0;
+        let mut random = || {
+            let sample = samples[calls];
+            calls += 1;
+            sample
+        };
+        let mut probes = ProbeSeq::new(8, 0, 2, &mut random);
+        assert_eq!(probes.next(&mut random), Some(7));
+        assert_eq!(probes.next(&mut random), Some(7));
+        assert_eq!(probes.next(&mut random), None);
+        assert_eq!(calls, 2, "each random probe draws a fresh value");
+    }
+
+    #[test]
+    fn failed_probe_scan_schedules_one_over_64_spare() {
+        let pool = Pool::<[u8; 64], 64>::with_probe_limits(256, 0, 64, 6000).unwrap();
+        let held: Vec<_> = (0..128).map(|_| pool.alloc_fresh().unwrap()).collect();
+
+        let first = pool.alloc().unwrap();
+        assert_eq!(first.index(), 128);
+        assert_eq!(pool.issued_blocks(), 129);
+
+        let second = pool.alloc().unwrap();
+        assert_eq!(second.index(), 129);
+        assert_eq!(pool.issued_blocks(), 132);
+
+        let a = pool.alloc().unwrap();
+        let b = pool.alloc().unwrap();
+        let mut indexes = [a.index(), b.index()];
+        indexes.sort_unstable();
+        assert_eq!(indexes, [130, 131]);
+        drop((held, first, second, a, b));
+    }
+
+    #[test]
+    fn custom_probe_limit_selects_random_mode_above_threshold() {
+        let pool = Pool::<[u8; 64], 64>::with_probe_limits(256, 128, 1, 1).unwrap();
+        let block = pool.alloc().unwrap();
+        assert!(block.index() < 128);
+        assert_eq!(pool.issued_blocks(), 128);
+    }
+
+    #[test]
     fn reuse_all() {
         let pool = Pool::<[u8; 64], 64>::new(130, 0).unwrap();
         let first: Vec<_> = (0..130).map(|_| pool.alloc_fresh().unwrap()).collect();
@@ -382,10 +517,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_random_probes() {
+        assert!(Pool::<[u8; 64], 64>::with_probe_limits(1, 0, 0, 0).is_err());
+    }
+
+    #[test]
     fn slow_scans_do_not_schedule_unbounded_growth() {
         const INITIAL: u32 = 4096;
-        let pool = Pool::<[u8; 64], 64>::new(8192, INITIAL).unwrap();
-        let mut held: Vec<_> = (0..INITIAL).map(|_| pool.alloc().unwrap()).collect();
+        let pool = Pool::<[u8; 64], 64>::new(8192, 0).unwrap();
+        let mut held: Vec<_> = (0..INITIAL).map(|_| pool.alloc_fresh().unwrap()).collect();
 
         // An empty scan gives its caller one fresh block and schedules reserve.
         held.push(pool.alloc().unwrap());
@@ -409,8 +549,8 @@ mod tests {
     fn concurrent_exhaustion_schedules_one_reserve() {
         const INITIAL: u32 = 4096;
         const THREADS: usize = 8;
-        let pool = Pool::<[u8; 64], 64>::new(8192, INITIAL).unwrap();
-        let mut held: Vec<_> = (0..INITIAL).map(|_| pool.alloc().unwrap()).collect();
+        let pool = Pool::<[u8; 64], 64>::new(8192, 0).unwrap();
+        let mut held: Vec<_> = (0..INITIAL).map(|_| pool.alloc_fresh().unwrap()).collect();
         let start = std::sync::Barrier::new(THREADS + 1);
 
         std::thread::scope(|scope| {

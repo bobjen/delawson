@@ -1,0 +1,11 @@
+[package]
+name = "delawson-permute"
+description = "Pseudorandom permutations over integer ranges"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "permute"
+path = "src/lib.rs"
