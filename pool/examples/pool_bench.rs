@@ -1,165 +1,50 @@
-//! Production-path timing: no unit-test probes, histories, or invariant checks.
-//! Optional --count-live after the seed enables separate peak-live accounting;
-//! its shared counters perturb scheduling, so do not use those elapsed times.
-//! Sep 2026, 8 threads * 1M operations, 16 blocks, three runs (seconds):
-//! external RwLock 2.840/2.500/2.595; CAS AtomicI64 1.709/2.544/2.549.
-//! inline RwLock 2.437/2.451/2.836; CAS AtomicI64 2.400/2.414/2.489.
-//! Ranges overlap; see DESIGN.md for the earlier fetch-add/rollback comparison.
-//! Capped malloc/free: 0.262/0.264/0.268 seconds in a subsequent paired comparison.
-//! Aligned allocation/free: 0.257/0.224/0.254 seconds; concurrent comparison malloc
-//! 0.203/0.269/0.271. Those historical measurements used a shared capacity counter.
-//! The aligned mode requests 4KiB alignment; malloc does not.
-//! Pool capacity defaults to 1,000,000 blocks, starting empty. System allocation
-//! now has no capacity limit or shared allocation counter.
-//! Earlier measurements above explicitly used 16 blocks.
-//! Compare fixed work, not the coverage tests' timed loops.
-//! RNG comparison: POOL_BENCH_RNG=local (default), held, or per-alloc for
-//! caller-selected bucket APIs. Pool::alloc owns its thread-local RNG in all modes.
-//! held borrows a thread-local RNG for the whole operation loop; per-alloc
-//! borrows it only to generate each selected bucket's choices.
-//! All modes use the same per-thread seed and separate workload RNG. Setup and
-//! TLS initialization precede timing. The CSV format is unchanged; record the
-//! environment mode alongside each result when comparing modes.
+//! Production-path timing: the workload is set by constants below, while the
+//! bucket count and probe count come directly from pool/src/lib.rs. Change those
+//! pool constants, rebuild in release mode, and run this example for a new test.
+//! This benchmark intentionally has no command-line selectors.
+use pool::{DEFAULT_BUCKETS, DEFAULT_CHOICES, ExternalLinks, Pool};
 use random::Rng;
-use std::cell::RefCell;
-
-// POOL_BENCH_RNG=local (default), held, or per-alloc. The latter two isolate
-// TLS/RefCell access frequency using identical allocation bucket sequences.
-thread_local! { static BUCKET_RNG: RefCell<Rng> = RefCell::new(Rng::from_seed(0)); }
-
-use pool::{ExternalLinks, InlineLinks, Pool};
-use std::ptr::NonNull;
 use std::sync::Barrier;
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
-impl MallocBlock {
-    fn alloc<const ALIGNED: bool>() -> common::Result<Self> {
-        // SAFETY: 4096 is a valid alignment and size is a multiple of alignment.
-        // Both allocation functions return storage releasable with free.
-        let raw =
-            unsafe { if ALIGNED { libc::aligned_alloc(4096, 4096) } else { libc::malloc(4096) } };
-        let Some(ptr) = NonNull::new(raw) else {
-            return Err(common::Error::new("system allocation failed"));
-        };
-        Ok(MallocBlock { ptr })
-    }
-}
+const THREADS: usize = 8;
+const OPS_PER_THREAD: usize = 16_000_000;
+const MAX_BLOCKS: u32 = 1_000_000;
+const SEED: u64 = 42;
 
-// Ownership pairs each system allocation with exactly one free.
-struct MallocBlock {
-    ptr: NonNull<libc::c_void>,
-}
-
-impl Drop for MallocBlock {
-    fn drop(&mut self) {
-        // SAFETY: this pointer came from malloc/aligned_alloc and has not been freed.
-        unsafe { libc::free(self.ptr.as_ptr()) };
-    }
-}
-
-// Accounting is a separate monomorphization, absent from ordinary timing runs.
-fn run<T>(
-    alloc: impl Fn(&mut Rng, bool) -> Option<T> + Sync,
-    threads: usize,
-    blocks: u32,
-    operations: usize,
-    seed: u64,
-    count_live: bool,
-) -> (Duration, [u64; 3], usize) {
-    let mode = std::env::var("POOL_BENCH_RNG").unwrap_or_else(|_| "local".into());
-    macro_rules! run_mode {
-        ($mode:literal) => {
-            if count_live {
-                run_inner::<T, true, $mode>(alloc, threads, blocks, operations, seed)
-            } else {
-                run_inner::<T, false, $mode>(alloc, threads, blocks, operations, seed)
-            }
-        };
-    }
-    match mode.as_str() {
-        "local" => run_mode!(0),
-        "held" => run_mode!(1),
-        "per-alloc" => run_mode!(2),
-        _ => panic!("POOL_BENCH_RNG must be local, held, or per-alloc"),
-    }
-}
-
-fn run_inner<T, const COUNT: bool, const RNG_MODE: u8>(
-    alloc: impl Fn(&mut Rng, bool) -> Option<T> + Sync,
-    threads: usize,
-    blocks: u32,
-    operations: usize,
-    seed: u64,
-) -> (Duration, [u64; 3], usize) {
-    let live = AtomicUsize::new(0);
-    let peak = AtomicUsize::new(0);
-    let ready = Barrier::new(threads + 1);
-    let start = Barrier::new(threads + 1);
-    let done = Barrier::new(threads + 1);
+fn run(pool: &Pool<[u8; 4096], 4096, ExternalLinks>) -> (Duration, [u64; 3]) {
+    let ready = Barrier::new(THREADS + 1);
+    let start = Barrier::new(THREADS + 1);
+    let done = Barrier::new(THREADS + 1);
     std::thread::scope(|scope| {
-        let mut workers = Vec::with_capacity(threads);
-        for thread in 0..threads {
-            let alloc = &alloc;
-            let live = &live;
-            let peak = &peak;
+        let mut workers = Vec::with_capacity(THREADS);
+        for thread in 0..THREADS {
             let ready = &ready;
             let start = &start;
             let done = &done;
             workers.push(scope.spawn(move || {
-                let mut rng = Rng::from_seed(seed.wrapping_add(thread as u64));
-                let mut bucket_rng =
-                    Rng::from_seed(seed.wrapping_add(thread as u64) ^ 0x76543210abcdef98);
-                if RNG_MODE != 0 {
-                    BUCKET_RNG.with(|rng| {
-                        *rng.borrow_mut() =
-                            Rng::from_seed(seed.wrapping_add(thread as u64) ^ 0x76543210abcdef98);
-                    });
-                }
-                let mut held = Vec::with_capacity(blocks as usize);
+                let mut rng = Rng::from_seed(SEED.wrapping_add(thread as u64));
+                let mut held = Vec::with_capacity(MAX_BLOCKS as usize);
                 let mut counts = [0u64; 3];
                 ready.wait();
                 start.wait();
-                let mut work = |bucket_rng: &mut Rng| {
-                    for _ in 0..operations {
-                        if held.is_empty() || rng.next_u32() & 1 == 0 {
-                            let block = alloc(bucket_rng, RNG_MODE == 2);
-                            match block {
-                                Some(block) => {
-                                    if COUNT {
-                                        let n = live.fetch_add(1, SeqCst) + 1;
-                                        peak.fetch_max(n, SeqCst);
-                                    }
-                                    held.push(block);
-                                    counts[0] += 1;
-                                }
-                                None => counts[1] += 1,
+                for _ in 0..OPS_PER_THREAD {
+                    if held.is_empty() || rng.next_u32() & 1 == 0 {
+                        match pool.alloc() {
+                            Ok(block) => {
+                                held.push(block);
+                                counts[0] += 1;
                             }
-                        } else {
-                            let at = rng.next_u32() as usize % held.len();
-                            let block = held.swap_remove(at);
-                            if COUNT {
-                                live.fetch_sub(1, SeqCst);
-                            }
-                            drop(block);
-                            counts[2] += 1;
+                            Err(_) => counts[1] += 1,
                         }
+                    } else {
+                        let at = rng.next_u32() as usize % held.len();
+                        drop(held.swap_remove(at));
+                        counts[2] += 1;
                     }
-                };
-                if RNG_MODE == 1 {
-                    BUCKET_RNG.with(|rng| work(&mut rng.borrow_mut()));
-                } else {
-                    work(&mut bucket_rng);
                 }
                 counts[2] += held.len() as u64;
-                if COUNT {
-                    for block in held {
-                        live.fetch_sub(1, SeqCst);
-                        drop(block);
-                    }
-                } else {
-                    drop(held);
-                }
+                drop(held);
                 done.wait();
                 counts
             }));
@@ -175,228 +60,21 @@ fn run_inner<T, const COUNT: bool, const RNG_MODE: u8>(
                 *total += count;
             }
         }
-        if COUNT {
-            assert_eq!(live.load(SeqCst), 0);
-        }
-        (elapsed, totals, peak.load(SeqCst))
+        (elapsed, totals)
     })
 }
 
-#[inline]
-fn bucket_random(rng: &mut Rng, deferred: bool) -> u64 {
-    if deferred { BUCKET_RNG.with(|rng| rng.borrow_mut().next_u64()) } else { rng.next_u64() }
-}
-
 fn main() {
-    let args: Vec<_> = std::env::args().collect();
-    let layout = args.get(1).map(String::as_str).unwrap_or("external256x4all");
-    let threads = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(8);
-    let operations = args.get(3).map(|s| s.parse().unwrap()).unwrap_or(1_000_000);
-    let blocks = args.get(4).map(|s| s.parse().unwrap()).unwrap_or(1_000_000);
-    let seed = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(42);
-    let count_live = args.get(6).is_some_and(|s| s == "--count-live");
-    let bucket_count: usize = if layout.contains("512") {
-        512
-    } else if layout.contains("256") {
-        256
-    } else if layout.contains("128") {
-        128
-    } else if layout.contains("64") {
-        64
-    } else {
-        32
-    };
-    let mask = bucket_count - 1;
-    let shift = bucket_count.trailing_zeros();
-    let mut issued = None;
-    let (elapsed, counts, peak) = match layout {
-        "external" | "external32" | "external32x2" | "external32x4" | "external32x4all"
-        | "external64x4all" | "external128x4all" | "external256x4all" | "external512x4all"
-        | "external256x8all" | "external256x2all" => {
-            let pool = Pool::<[u8; 4096], 4096, ExternalLinks>::with_buckets(
-                blocks,
-                0,
-                if layout == "external" { 1 } else { bucket_count },
-            )
-            .unwrap();
-            let result = if layout == "external32x2"
-                || layout == "external32x4"
-                || layout == "external32x4all"
-                || layout == "external64x4all"
-                || layout == "external128x4all"
-                || layout == "external256x4all"
-                || layout == "external512x4all"
-                || layout == "external256x8all"
-                || layout == "external256x2all"
-            {
-                let choices = if layout.ends_with("x8all") {
-                    8
-                } else if layout.ends_with("x2") || layout.ends_with("x2all") {
-                    2
-                } else {
-                    4
-                };
-                run(
-                    |rng, deferred| {
-                        if layout.ends_with("all")
-                            && bucket_count == 256
-                            && choices == pool::DEFAULT_CHOICES
-                        {
-                            pool.alloc().ok()
-                        } else {
-                            let val = bucket_random(rng, deferred) as usize;
-                            let first = (val ^ mask) & mask;
-                            let delta = (((val >> shift) & (bucket_count / 2 - 1)) << 1) | 1;
-                            let walk = (0..choices).map(|step| (first + step * delta) & mask);
-                            if layout.ends_with("all") {
-                                pool.alloc_reclaiming_each(walk).ok()
-                            } else {
-                                pool.alloc_from_buckets(walk).ok()
-                            }
-                        }
-                    },
-                    threads,
-                    blocks,
-                    operations,
-                    seed,
-                    count_live,
-                )
-            } else if layout == "external32" {
-                run(
-                    |rng, deferred| {
-                        pool.alloc_from_bucket(bucket_random(rng, deferred) as usize).ok()
-                    },
-                    threads,
-                    blocks,
-                    operations,
-                    seed,
-                    count_live,
-                )
-            } else {
-                run(
-                    |_, _| pool.alloc_from_bucket(0).ok(),
-                    threads,
-                    blocks,
-                    operations,
-                    seed,
-                    count_live,
-                )
-            };
-            issued = Some(pool.issued_blocks());
-            result
-        }
-        "inline" | "inline32" | "inline32x2" | "inline32x4" | "inline32x4all" | "inline64x4all"
-        | "inline128x4all" | "inline256x4all" | "inline512x4all" | "inline256x8all"
-        | "inline256x2all" => {
-            let pool = Pool::<[u8; 4096], 4096, InlineLinks<8>>::with_buckets(
-                blocks,
-                0,
-                if layout == "inline" { 1 } else { bucket_count },
-            )
-            .unwrap();
-            let result = if layout == "inline32x2"
-                || layout == "inline32x4"
-                || layout == "inline32x4all"
-                || layout == "inline64x4all"
-                || layout == "inline128x4all"
-                || layout == "inline256x4all"
-                || layout == "inline512x4all"
-                || layout == "inline256x8all"
-                || layout == "inline256x2all"
-            {
-                let choices = if layout.ends_with("x8all") {
-                    8
-                } else if layout.ends_with("x2") || layout.ends_with("x2all") {
-                    2
-                } else {
-                    4
-                };
-                run(
-                    |rng, deferred| {
-                        if layout.ends_with("all")
-                            && bucket_count == 256
-                            && choices == pool::DEFAULT_CHOICES
-                        {
-                            pool.alloc().ok()
-                        } else {
-                            let val = bucket_random(rng, deferred) as usize;
-                            let first = (val ^ mask) & mask;
-                            let delta = (((val >> shift) & (bucket_count / 2 - 1)) << 1) | 1;
-                            let walk = (0..choices).map(|step| (first + step * delta) & mask);
-                            if layout.ends_with("all") {
-                                pool.alloc_reclaiming_each(walk).ok()
-                            } else {
-                                pool.alloc_from_buckets(walk).ok()
-                            }
-                        }
-                    },
-                    threads,
-                    blocks,
-                    operations,
-                    seed,
-                    count_live,
-                )
-            } else if layout == "inline32" {
-                run(
-                    |rng, deferred| {
-                        pool.alloc_from_bucket(bucket_random(rng, deferred) as usize).ok()
-                    },
-                    threads,
-                    blocks,
-                    operations,
-                    seed,
-                    count_live,
-                )
-            } else {
-                run(
-                    |_, _| pool.alloc_from_bucket(0).ok(),
-                    threads,
-                    blocks,
-                    operations,
-                    seed,
-                    count_live,
-                )
-            };
-            issued = Some(pool.issued_blocks());
-            result
-        }
-        "malloc" | "aligned" => {
-            // No shared counter or capacity limit for system allocation. The
-            // blocks argument only reserves worker Vec capacity in these modes.
-            if layout == "aligned" {
-                let sample = MallocBlock::alloc::<true>().unwrap();
-                assert_eq!(sample.ptr.as_ptr() as usize % 4096, 0);
-                drop(sample);
-                run(
-                    |_, _| MallocBlock::alloc::<true>().ok(),
-                    threads,
-                    blocks,
-                    operations,
-                    seed,
-                    count_live,
-                )
-            } else {
-                run(
-                    |_, _| MallocBlock::alloc::<false>().ok(),
-                    threads,
-                    blocks,
-                    operations,
-                    seed,
-                    count_live,
-                )
-            }
-        }
-        _ => panic!(
-            "layout must be external, external32, external32x2, external32x4, external32x4all, external64x4all, external128x4all, external256x4all, external512x4all, external256x8all, external256x2all, inline, inline32, inline32x2, inline32x4, inline32x4all, inline64x4all, inline128x4all, inline256x4all, inline512x4all, inline256x8all, inline256x2all, malloc or aligned"
-        ),
-    };
+    assert!(DEFAULT_BUCKETS.is_power_of_two());
+    assert!(DEFAULT_CHOICES > 0 && DEFAULT_CHOICES <= DEFAULT_BUCKETS);
+    let pool = Pool::<[u8; 4096], 4096, ExternalLinks>::new(MAX_BLOCKS, 0).unwrap();
+    let (elapsed, counts) = run(&pool);
     println!(
-        "{layout},{threads},{blocks},{operations},{:.6},{},{},{},{},{}",
+        "buckets={DEFAULT_BUCKETS} probes={DEFAULT_CHOICES} threads={THREADS} ops_per_thread={OPS_PER_THREAD} max_blocks={MAX_BLOCKS} elapsed_ms={:.3} allocs={} failed={} frees={} issued={}",
         elapsed.as_secs_f64() * 1000.0,
         counts[0],
         counts[1],
         counts[2],
-        issued.map(|n| n.to_string()).unwrap_or_default(),
-        if count_live { peak.to_string() } else { String::new() }
+        pool.issued_blocks(),
     );
 }

@@ -424,7 +424,7 @@ impl<T: PoolItem, const A: usize, L: Links> Pool<T, A, L> {
         }
     }
 
-    /// Tries up to four buckets, reclaiming at each before issuing a fresh index.
+    /// Tries up to DEFAULT_CHOICES buckets, reclaiming at each before issuing a fresh index.
     /// Bucket selection uses this thread's RNG; no shared RNG is used.
     /// Returns can remain temporarily unavailable while protected by readers.
     pub fn alloc(&self) -> Result<Block<'_, T, A, L>> {
@@ -685,15 +685,17 @@ mod tests {
     type InlinePool16 = Pool<[u8; 16], 4, InlineLinks<4>>;
 
     #[test]
-    fn default_allocator_uses_four_choices_and_grows() {
-        let pool = Pool16::new(8, 0).unwrap();
-        assert_eq!(pool.buckets.len(), 256);
-        assert_eq!(DEFAULT_CHOICES, 4);
+    fn default_allocator_uses_configured_choices_and_grows() {
+        let pool = Pool16::new(DEFAULT_CHOICES as u32 + 4, 0).unwrap();
+        assert_eq!(pool.buckets.len(), DEFAULT_BUCKETS);
         let held: Vec<_> = (0..DEFAULT_CHOICES).map(|_| pool.alloc().unwrap()).collect();
-        assert_eq!(held.iter().map(Block::index).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!(
+            held.iter().map(Block::index).collect::<Vec<_>>(),
+            (0..DEFAULT_CHOICES as u32).collect::<Vec<_>>()
+        );
         drop(held);
         assert!(pool.alloc().is_ok());
-        assert!(pool.issued_blocks() >= 4);
+        assert!(pool.issued_blocks() >= DEFAULT_CHOICES as u32);
     }
 
     #[test]
