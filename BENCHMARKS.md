@@ -1698,3 +1698,30 @@ JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 HADOOP_CONF_DIR=$PWD/conf \
 The `measure` mode only performs lookups. The existing root check in `create`
 mode refuses to populate over this namespace; retain that guard so the 40-minute
 creation is not repeated.
+
+## Block-pool allocation tuning, 2026-09-28
+
+The pool can issue more blocks than are simultaneously in use because its
+bucket-local free lists leave some blocks temporarily unavailable to a given
+allocation. This is a space leak in the sense that unused blocks accumulate as
+slack, but it has not grown in proportion to total pool operations: extra issued
+blocks were nearly proportional to peak block use and nearly independent of
+operation count. As unused slack builds up, allocations are faster and fresh
+block issuance falls sharply, so the growth slows rather than accumulating at a
+constant rate per operation.
+
+The current tradeoff is 256 buckets, 4 probes per allocation, reclaiming each
+probed bucket's inactive deleted list whenever its free list is empty, and
+growing by only the one block needed. Delete-side reclaim is disabled. Having
+far more buckets than logical CPUs reduces atomic contention. Eight probes
+were slower but produced fewer unused blocks; the difference in unused-block
+percentage between 8 and 4 probes narrowed slowly over longer runs.
+
+The 512-million-operation mixed test (8 threads, 64 million operations each)
+showed batch growth's tradeoff: starting empty, growth by 1 issued slightly
+fewer blocks but ran about 7% slower than growth by 4. With 70,000 blocks
+prepopulated, the two growth settings had indistinguishable throughput, while
+growth by 1 issued fewer additional blocks. This points to the amount of slack
+left by fresh growth as the main difference, rather than the cost of probing
+four buckets before growing. The benchmark was restored to start with zero
+blocks afterward.
