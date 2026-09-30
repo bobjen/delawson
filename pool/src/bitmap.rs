@@ -263,8 +263,7 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
 
         let block = self.alloc_fresh()?;
         let issued_after = self.next.load(SeqCst);
-        let scheduled = issued_after == issued + 1
-            && self.schedule_refill(issued_after.saturating_sub(1) / BITS as u32);
+        let scheduled = issued_after == issued + 1 && self.schedule_refill(issued / BITS as u32);
         if !scheduled {
             // A failed probe search allocates one fresh block for its caller. If
             // another call already scheduled reserve work, help pay it here.
