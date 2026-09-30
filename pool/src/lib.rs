@@ -1,12 +1,8 @@
 //! Fixed-size pools with two retirement lists and statically selected link storage.
-#[cfg(test)]
 use std::marker::PhantomData;
-#[cfg(test)]
 use std::mem::MaybeUninit;
-#[cfg(test)]
 use std::mem::{align_of, size_of};
 use std::ptr::NonNull;
-#[cfg(test)]
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering::SeqCst};
 
 mod segmented;
@@ -17,7 +13,6 @@ pub use bitmap::*;
 #[cfg(test)]
 mod concurrency;
 
-#[cfg(test)]
 macro_rules! pool_hit {
     ($pool:ident, $case:ident) => {
         #[cfg(test)]
@@ -25,11 +20,8 @@ macro_rules! pool_hit {
     };
 }
 
-#[cfg(test)]
 const LIST_BUCKETS: usize = 128;
-#[cfg(test)]
 const LIST_CHOICES: usize = 128;
-#[cfg(test)]
 const DEL_MASK: u64 = 0x3; // Reclaim on one in four eligible deletes.
 const NONE: u32 = u32::MAX;
 
@@ -122,7 +114,6 @@ impl Drop for Mapping {
 /// for the pool's lifetime. `link` must always return that same AtomicU32. Links
 /// must not overlap other mutable storage exposed through safe APIs. Neither
 /// initialization nor lookup may panic for valid arguments.
-#[cfg(test)]
 pub unsafe trait Links: Send + Sync + Sized {
     /// # Safety
     /// `base` describes max_blocks * block_bytes writable bytes, kept mapped
@@ -138,17 +129,13 @@ pub unsafe trait Links: Send + Sync + Sized {
     unsafe fn link(&self, index: u32) -> &AtomicU32;
 }
 
-#[cfg(test)]
 pub struct ExternalLinks {
     mapping: Mapping,
 }
 
 // SAFETY: only atomic accesses are made to the mapping after initialization.
-#[cfg(test)]
 unsafe impl Send for ExternalLinks {}
-#[cfg(test)]
 unsafe impl Sync for ExternalLinks {}
-#[cfg(test)]
 unsafe impl Links for ExternalLinks {
     unsafe fn new(_: NonNull<u8>, _: usize, max_blocks: u32) -> Result<Self> {
         let bytes = (max_blocks as usize)
@@ -178,18 +165,14 @@ unsafe impl Links for ExternalLinks {
 
 /// OFFSET can be supplied with offset_of!(Item, field). The field remains atomic
 /// while allocated, but its value may then have an application-specific meaning.
-#[cfg(test)]
 pub struct InlineLinks<const OFFSET: usize> {
     base: NonNull<u8>,
     stride: usize,
 }
 
 // SAFETY: this exposes only atomic references to the live pool mapping.
-#[cfg(test)]
 unsafe impl<const O: usize> Send for InlineLinks<O> {}
-#[cfg(test)]
 unsafe impl<const O: usize> Sync for InlineLinks<O> {}
-#[cfg(test)]
 unsafe impl<const O: usize> Links for InlineLinks<O> {
     unsafe fn new(base: NonNull<u8>, block_bytes: usize, _: u32) -> Result<Self> {
         if O.checked_add(4).is_none_or(|end| end > block_bytes)
@@ -220,10 +203,8 @@ unsafe impl<const O: usize> Links for InlineLinks<O> {
     }
 }
 
-#[cfg(test)]
 struct ListLock(AtomicI64);
 
-#[cfg(test)]
 impl ListLock {
     fn new() -> Self {
         Self(AtomicI64::new(0))
@@ -250,10 +231,8 @@ impl ListLock {
     }
 }
 
-#[cfg(test)]
 struct ReadGuard<'a>(&'a ListLock);
 
-#[cfg(test)]
 impl Drop for ReadGuard<'_> {
     #[inline]
     fn drop(&mut self) {
@@ -261,10 +240,8 @@ impl Drop for ReadGuard<'_> {
     }
 }
 
-#[cfg(test)]
 struct WriteGuard<'a>(&'a ListLock);
 
-#[cfg(test)]
 impl Drop for WriteGuard<'_> {
     #[inline]
     fn drop(&mut self) {
@@ -273,14 +250,12 @@ impl Drop for WriteGuard<'_> {
     }
 }
 
-#[cfg(test)]
 struct Deleted {
     gate: ListLock,
     head: AtomicU32,
     tail: AtomicU32,
 }
 
-#[cfg(test)]
 impl Deleted {
     fn new() -> Self {
         Self { gate: ListLock::new(), head: AtomicU32::new(NONE), tail: AtomicU32::new(NONE) }
@@ -289,14 +264,12 @@ impl Deleted {
 
 // Keep independent buckets off each other's cache lines.
 #[repr(align(64))]
-#[cfg(test)]
 struct Bucket {
     free: AtomicU32,
     deleted: [Deleted; 2],
     current: AtomicUsize,
 }
 
-#[cfg(test)]
 impl Bucket {
     fn new() -> Self {
         Self {
@@ -313,8 +286,7 @@ impl Bucket {
 /// never resets or destroys slots; callers must reset item state before return
 /// and drop every initialized `T` before the pool does. `L` supplies the atomic
 /// free-list link.
-#[cfg(test)]
-pub(crate) struct ListPool<T: PoolItem, const ALIGN: usize, L: Links = ExternalLinks> {
+pub struct ListPool<T: PoolItem, const ALIGN: usize, L: Links = ExternalLinks> {
     // Links must be dropped before the mapping they may refer to.
     links: L,
     mapping: Mapping,
@@ -328,12 +300,9 @@ pub(crate) struct ListPool<T: PoolItem, const ALIGN: usize, L: Links = ExternalL
 
 // SAFETY: pool metadata is synchronized; each live block has one owner. Mapping
 // addresses stay fixed when the pool moves. L provides its own Send/Sync contract.
-#[cfg(test)]
 unsafe impl<T: PoolItem + Send, const A: usize, L: Links> Send for ListPool<T, A, L> {}
-#[cfg(test)]
 unsafe impl<T: PoolItem + Send + Sync, const A: usize, L: Links> Sync for ListPool<T, A, L> {}
 
-#[cfg(test)]
 impl<T: PoolItem, const A: usize, L: Links> ListPool<T, A, L> {
     pub fn new(max_blocks: u32, initial_blocks: u32) -> Result<Self> {
         Self::with_params(max_blocks, initial_blocks, LIST_BUCKETS)
@@ -355,9 +324,13 @@ impl<T: PoolItem, const A: usize, L: Links> ListPool<T, A, L> {
                 "slot size must be a positive multiple of power-of-two alignment at least as large as the slot alignment",
             ));
         }
-        if max_blocks == 0 || initial_blocks > max_blocks {
-            return Err(Error::new("pool needs 0 <= initial_blocks <= max_blocks"));
+        if max_blocks == 0 {
+            return Err(Error::new("pool needs max_blocks >= 1"));
         }
+        if initial_blocks > max_blocks {
+            return Err(Error::new("pool needs initial_blocks <= max_blocks"));
+        }
+        let initial_blocks = initial_blocks.max(1);
         let total_bytes = bytes
             .checked_mul(max_blocks as usize)
             .ok_or_else(|| Error::new("block pool is too large"))?;
@@ -410,6 +383,16 @@ impl<T: PoolItem, const A: usize, L: Links> ListPool<T, A, L> {
     /// During concurrent growth, some indexes may still be initializing.
     pub fn issued_blocks(&self) -> u32 {
         self.next.load(SeqCst)
+    }
+
+    pub const fn block_bytes(&self) -> usize {
+        size_of::<T>()
+    }
+
+    /// Stable pointer to slot zero, initialized during pool construction.
+    pub fn base_ptr(&self) -> NonNull<T> {
+        // The constructor guarantees that at least one slot is initialized.
+        NonNull::new(self.slot(0)).expect("pool mapping is non-null")
     }
 
     fn pop(&self, bucket: &Bucket) -> Option<u32> {
@@ -686,13 +669,11 @@ impl<T: PoolItem, const A: usize, L: Links> ListPool<T, A, L> {
 /// Ownership of one index; the borrow keeps its pool and mappings alive.
 /// Inline-link callers must not overwrite the atomic link with non-atomic writes,
 /// or create an exclusive reference spanning it while stale pool readers exist.
-#[cfg(test)]
-pub(crate) struct ListBlock<'a, T: PoolItem, const ALIGN: usize, L: Links = ExternalLinks> {
+pub struct ListBlock<'a, T: PoolItem, const ALIGN: usize, L: Links = ExternalLinks> {
     pool: &'a ListPool<T, ALIGN, L>,
     index: u32,
 }
 
-#[cfg(test)]
 impl<T: PoolItem, const A: usize, L: Links> ListBlock<'_, T, A, L> {
     pub fn index(&self) -> u32 {
         self.index
@@ -709,7 +690,6 @@ impl<T: PoolItem, const A: usize, L: Links> ListBlock<'_, T, A, L> {
     }
 }
 
-#[cfg(test)]
 impl<T: PoolItem, const A: usize> ListBlock<'_, T, A, ExternalLinks> {
     pub fn as_slice(&self) -> &[MaybeUninit<u8>] {
         // SAFETY: the external link never overlaps these exclusively owned bytes.
@@ -722,7 +702,6 @@ impl<T: PoolItem, const A: usize> ListBlock<'_, T, A, ExternalLinks> {
     }
 }
 
-#[cfg(test)]
 impl<T: PoolItem, const A: usize, L: Links> Drop for ListBlock<'_, T, A, L> {
     fn drop(&mut self) {
         self.pool.retire(self.index);
@@ -761,8 +740,10 @@ mod tests {
         assert_eq!(pool.issued_blocks(), 2);
 
         let pool = Pool16::new(2, 0).unwrap();
-        drop(pool.alloc_fresh().unwrap());
         assert_eq!(pool.issued_blocks(), 1);
+        assert_eq!(pool.alloc().unwrap().index(), 0);
+        assert_eq!(pool.alloc_fresh().unwrap().index(), 1);
+        assert_eq!(pool.issued_blocks(), 2);
     }
 
     #[test]
@@ -779,7 +760,8 @@ mod tests {
         drop(blocks);
 
         let pool = Pool16::new(4, 0).unwrap();
-        let blocks: Vec<_> = (0..4).map(|_| pool.alloc_fresh().unwrap()).collect();
+        let mut blocks = vec![pool.alloc_from_bucket(0).unwrap()];
+        blocks.extend((0..3).map(|_| pool.alloc_fresh().unwrap()));
         assert_eq!(blocks.iter().map(ListBlock::index).collect::<Vec<_>>(), [0, 1, 2, 3]);
         assert_eq!(pool.issued_blocks(), 4);
         assert!(pool.alloc_fresh().is_err());
@@ -1004,17 +986,18 @@ mod tests {
     fn empty_pop_does_not_take_shared_lock() {
         let pool = Pool16::with_buckets(1, 0, 1).unwrap();
         let bucket = &pool.buckets[0];
+        assert_eq!(pool.pop(bucket), Some(0));
         let _writer = bucket.deleted[0].gate.try_write().unwrap();
         assert_eq!(pool.pop(bucket), None);
     }
 
     #[test]
-    fn fresh_index_returns_to_its_own_bucket() {
+    fn zero_initial_slot_is_available_and_reused() {
         let pool = Pool16::with_buckets(1, 0, 32).unwrap();
-        let block = pool.alloc_from_bucket(31).unwrap();
+        assert_eq!(pool.issued_blocks(), 1);
+        let block = pool.alloc_from_bucket(0).unwrap();
         assert_eq!(block.index(), 0);
         drop(block);
-        assert!(pool.alloc_from_bucket(31).is_err());
         assert_eq!(pool.alloc_from_bucket(0).unwrap().index(), 0);
         assert_eq!(pool.issued_blocks(), 1);
         assert!(Pool16::with_buckets(1, 0, 0).is_err());

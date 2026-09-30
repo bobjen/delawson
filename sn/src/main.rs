@@ -25,9 +25,9 @@ use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::{Arg, Op, Req, Resp, Status, StructReader, StructWriter, structure};
 use common::{Error, Result};
-use pool::Pool;
+use pool::{InlineLinks, ListPool};
 use std::collections::HashMap;
-use std::mem::align_of;
+use std::mem::{MaybeUninit, align_of, offset_of};
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -131,6 +131,7 @@ impl Stream {
 #[repr(C)]
 #[derive(Debug)]
 struct Extent {
+    link: MaybeUninit<std::sync::atomic::AtomicU32>,
     deletion: Flags,
     data: ExtentData,
 }
@@ -138,6 +139,7 @@ struct Extent {
 impl Extent {
     fn blank() -> Self {
         Self {
+            link: MaybeUninit::uninit(),
             deletion: Flags::default(),
             data: ExtentData {
                 logical: ELoff::ZERO,
@@ -166,7 +168,8 @@ unsafe impl pool::PoolItem for Extent {
     }
 }
 
-type ExtentPool = Pool<Extent, { align_of::<Extent>() }>;
+type ExtentPool =
+    ListPool<Extent, { align_of::<Extent>() }, InlineLinks<{ offset_of!(Extent, link) }>>;
 
 /// A stable-index table backed by typed pool slots.
 struct ExtentTable {
@@ -183,7 +186,9 @@ unsafe impl Sync for ExtentTable {}
 
 impl ExtentTable {
     fn new(max_extents: u32) -> pool::Result<Self> {
-        Ok(Self { pool: ExtentPool::new(max_extents, 0)?, base: NonNull::dangling(), len: 0 })
+        let pool = ExtentPool::new(max_extents, 0)?;
+        let base = pool.base_ptr();
+        Ok(Self { pool, base, len: 0 })
     }
 
     fn insert(&mut self, mut extent: Extent) -> pool::Result<ExtentId> {
@@ -1343,7 +1348,11 @@ impl SN {
             disks,
         };
         let id = extents
-            .insert(Extent { deletion: Flags::default(), data: extent })
+            .insert(Extent {
+                link: MaybeUninit::uninit(),
+                deletion: Flags::default(),
+                data: extent,
+            })
             .map_err(|error| Error::new(format!("allocate SN extent slot: {error}")))?;
         let extent = extents[id.get() as usize].data.clone();
         held.open = Some(id);
@@ -1517,7 +1526,7 @@ mod tests {
         }
         assert!(!unsafe { (*pointer).deletion.is_valid() });
         drop(spare);
-        let reused = table.pool.alloc().unwrap();
+        let reused = table.pool.alloc_reclaiming_each([1]).unwrap();
         assert_eq!(reused.index(), 1);
         assert!(!unsafe { (*reused.as_ptr().cast::<Extent>()).deletion.is_valid() });
     }
@@ -1526,7 +1535,8 @@ mod tests {
     fn big_map() {
         let table = ExtentTable::new(1_073_741_824).unwrap();
         assert_eq!(table.pool.block_bytes(), std::mem::size_of::<Extent>());
-        assert_eq!(table.pool.issued_blocks(), 0);
+        assert_eq!(table.pool.issued_blocks(), 1);
+        assert!(!unsafe { (*table.base.as_ptr()).deletion.is_valid() });
     }
 
     #[test]
@@ -1537,6 +1547,7 @@ mod tests {
             .unwrap()
             .extent_table
             .insert(Extent {
+                link: MaybeUninit::uninit(),
                 deletion: Flags::default(),
                 data: ExtentData {
                     id: ExtentId::FIRST,
@@ -1584,6 +1595,7 @@ mod tests {
                     .unwrap()
                     .extent_table
                     .insert(Extent {
+                        link: MaybeUninit::uninit(),
                         deletion: Flags::default(),
                         data: ExtentData {
                             id: ExtentId::FIRST,

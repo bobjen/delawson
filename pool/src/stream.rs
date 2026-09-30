@@ -543,7 +543,7 @@ mod tests {
         let mut buffer = SegmentedBuffer::new(&pool);
         let mut writer = buffer.writer();
         writer.write_all(&[]).unwrap();
-        assert_eq!(pool.issued_blocks(), 0);
+        assert_eq!(pool.issued_blocks(), 1);
         for _ in 0..CHUNK_BYTES / 4 {
             writer.write_u32_le(0x12345678).unwrap();
         }

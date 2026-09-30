@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 const THREADS: usize = 8;
 const OPS_PER_THREAD: usize = 16_000_000;
 const MAX_BLOCKS: u32 = 1_000_000;
-const STRIDE_LIMIT: usize = 100;
+const STRIDE_LIMIT: usize = 6000;
 const RANDOM_PROBES: usize = 6000;
 const SEED: u64 = 42;
 
