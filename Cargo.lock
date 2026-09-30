@@ -302,6 +302,7 @@ dependencies = [
  "delawson-common",
  "delawson-random",
  "libc",
+ "parking_lot",
 ]
 
 [[package]]

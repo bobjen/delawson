@@ -11,6 +11,7 @@ name = "pool"
 
 [dependencies]
 delawson-random.workspace = true
+parking_lot.workspace = true
 libc = "0.2.189"
 
 [dev-dependencies]

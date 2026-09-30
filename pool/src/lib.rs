@@ -9,6 +9,8 @@ mod segmented;
 pub use segmented::*;
 mod bitmap;
 pub use bitmap::*;
+mod locked;
+pub use locked::*;
 
 #[cfg(test)]
 mod concurrency;
