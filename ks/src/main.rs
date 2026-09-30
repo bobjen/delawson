@@ -15,7 +15,9 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 #[derive(Clone)]
 struct MasterEpoch {
@@ -70,6 +72,8 @@ struct Ks {
     unlock_verifier: Option<[u8; 32]>,
     unlock_key: Mutex<Option<[u8; 32]>>,
     metadata_cursor: Mutex<raft::execution::Cursor>,
+    gc_stop: AtomicBool,
+    gc_thread: Mutex<Option<JoinHandle<()>>>,
 }
 impl std::ops::Deref for Ks {
     type Target = raft::runtime::Runtime<KsState>;
@@ -92,10 +96,16 @@ const SERVES: &[Op] = &[
 
 impl Service for Ks {
     fn start(self: &std::sync::Arc<Self>) -> Result<()> {
-        self.start_raft()
+        self.start_gc()?;
+        if let Err(error) = self.start_raft() {
+            let _ = self.stop_gc();
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn stop(&self, _process: &Process) -> Result<()> {
+        self.stop_gc()?;
         self.stop_snapshot_worker()
     }
 
@@ -185,6 +195,45 @@ impl Service for Ks {
 }
 
 impl Ks {
+    fn start_gc(self: &std::sync::Arc<Self>) -> Result<()> {
+        let mut slot = self.gc_thread.lock().expect("GC thread");
+        if slot.is_some() {
+            return Err(common::Error::new("KS GC thread is already running"));
+        }
+        self.gc_stop.store(false, Ordering::Release);
+        let ks = std::sync::Arc::downgrade(self);
+        let worker = thread::Builder::new()
+            .name("ks-gc".into())
+            .spawn(move || {
+                loop {
+                    let Some(ks) = ks.upgrade() else { break };
+                    if ks.gc_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let guard = ks.global_lock.read();
+                    thread::sleep(Duration::from_millis(10));
+                    drop(guard);
+                    if ks.gc_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            })
+            .map_err(|error| common::Error::new(format!("starting KS GC thread: {error}")))?;
+        *slot = Some(worker);
+        Ok(())
+    }
+
+    fn stop_gc(&self) -> Result<()> {
+        self.gc_stop.store(true, Ordering::Release);
+        let worker = self.gc_thread.lock().expect("GC thread").take();
+        if let Some(worker) = worker {
+            worker.thread().unpark();
+            worker.join().map_err(|_| common::Error::new("KS GC thread panicked"))?;
+        }
+        Ok(())
+    }
+
     /// Direct requests and forwarded client requests share this admission boundary.
     fn client_request(&self, process: &Process, request: &Req, allow_forward: bool) -> Resp {
         if allow_forward
@@ -314,6 +363,8 @@ impl Ks {
             unlock_verifier,
             unlock_key: Mutex::new(None),
             metadata_cursor: Mutex::new(raft::execution::Cursor::default()),
+            gc_stop: AtomicBool::new(true),
+            gc_thread: Mutex::new(None),
             common: raft::runtime::Runtime::new(runtime, node, options),
         };
         // Routing must be recovered before transport starts, even while locked.

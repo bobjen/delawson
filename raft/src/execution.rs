@@ -58,6 +58,8 @@ impl Committed for Work {
 pub trait Application: Default + Send + Sync {
     fn applied(&self) -> u64;
     fn set_applied(&mut self, index: u64);
+    /// Reclaim application-owned state while the global lock is still exclusive.
+    fn reclaim(&mut self) {}
     fn reset(&mut self) {
         *self = Self::default();
     }
@@ -118,7 +120,7 @@ pub fn execute_blocking<S: Application>(
         apply,
     )
 }
-pub fn execute_state<S>(
+pub fn execute_state<S: Application>(
     global: &RwLock<S>,
     progress: &Mutex<Cursor>,
     state: &impl Committed,
@@ -131,7 +133,7 @@ pub fn execute_state<S>(
 ) -> Result<bool> {
     execute_with_lock(global, progress, state, budget, blocking, applied, set_applied, reset, apply)
 }
-fn execute_with_lock<S>(
+fn execute_with_lock<S: Application>(
     global: &RwLock<S>,
     progress: &Mutex<Cursor>,
     state: &impl Committed,
@@ -150,22 +152,28 @@ fn execute_with_lock<S>(
     } else {
         return Ok(false);
     };
-    if cursor.generation != state.generation() {
-        reset(&mut *data);
-        *cursor = Cursor { generation: state.generation(), ..Cursor::default() };
-    }
-    if applied(&data) == state.commit() && cursor.restoring.is_none() {
-        return Ok(true);
-    }
-    if applied(&data) < state.snapshot().index && cursor.restoring != Some(state.snapshot().index) {
-        reset(&mut *data);
-        cursor.restoring = Some(state.snapshot().index);
-        cursor.entry = 0;
-        cursor.action = 0;
-    }
-    let began = Instant::now();
-    let mut run =
-        |entry: &Entry, restoring: bool, data: &mut S, cursor: &mut Cursor| -> Result<bool> {
+    let result = (|| -> Result<bool> {
+        if cursor.generation != state.generation() {
+            reset(&mut *data);
+            *cursor = Cursor { generation: state.generation(), ..Cursor::default() };
+        }
+        if applied(&data) == state.commit() && cursor.restoring.is_none() {
+            return Ok(true);
+        }
+        if applied(&data) < state.snapshot().index
+            && cursor.restoring != Some(state.snapshot().index)
+        {
+            reset(&mut *data);
+            cursor.restoring = Some(state.snapshot().index);
+            cursor.entry = 0;
+            cursor.action = 0;
+        }
+        let began = Instant::now();
+        let mut run = |entry: &Entry,
+                       restoring: bool,
+                       data: &mut S,
+                       cursor: &mut Cursor|
+         -> Result<bool> {
             if restoring && entry.index < cursor.entry {
                 return Ok(true);
             }
@@ -195,24 +203,27 @@ fn execute_with_lock<S>(
             }
             Ok(true)
         };
-    if cursor.restoring.is_some() {
-        for entry in &state.snapshot().application {
-            if !run(entry, true, &mut *data, &mut cursor)? {
+        if cursor.restoring.is_some() {
+            for entry in &state.snapshot().application {
+                if !run(entry, true, &mut *data, &mut cursor)? {
+                    return Ok(false);
+                }
+            }
+            set_applied(&mut *data, state.snapshot().index);
+            cursor.restoring = None;
+            cursor.entry = 0;
+            cursor.action = 0;
+        }
+        for entry in state.entries().iter().filter(|entry| entry.index <= state.commit()) {
+            if entry.index > applied(&data) && !run(entry, false, &mut *data, &mut cursor)? {
                 return Ok(false);
             }
         }
-        set_applied(&mut *data, state.snapshot().index);
-        cursor.restoring = None;
-        cursor.entry = 0;
-        cursor.action = 0;
-    }
-    for entry in state.entries().iter().filter(|entry| entry.index <= state.commit()) {
-        if entry.index > applied(&data) && !run(entry, false, &mut *data, &mut cursor)? {
-            return Ok(false);
-        }
-    }
-    set_applied(&mut *data, state.commit());
-    Ok(true)
+        set_applied(&mut *data, state.commit());
+        Ok(true)
+    })();
+    (&mut *data).reclaim();
+    result
 }
 
 #[cfg(test)]

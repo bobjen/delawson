@@ -36,8 +36,10 @@ use parking_lot::RwLock as GlobalRwLock;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 const SERVES: &[Op] = &[
     Op::CreateObject,
@@ -758,6 +760,8 @@ struct DN {
     config: DNConfig,
     /// Shared by request and reply processing; future Raft applies take it exclusively.
     global_lock: GlobalRwLock<()>,
+    gc_stop: AtomicBool,
+    gc_thread: Mutex<Option<JoinHandle<()>>>,
     deleting: Mutex<()>,
     retired_objects: Mutex<std::collections::HashSet<String>>,
     /// This DN's own identity.
@@ -792,6 +796,14 @@ fn shard_of(name: &str) -> usize {
 }
 
 impl Service for DN {
+    fn start(self: &Arc<Self>) -> common::Result<()> {
+        self.start_gc()
+    }
+
+    fn stop(&self, _process: &Process) -> common::Result<()> {
+        self.stop_gc()
+    }
+
     fn serves(&self) -> &'static [Op] {
         SERVES
     }
@@ -900,6 +912,45 @@ impl Service for DN {
 }
 
 impl DN {
+    fn start_gc(self: &Arc<Self>) -> common::Result<()> {
+        let mut slot = self.gc_thread.lock().expect("GC thread");
+        if slot.is_some() {
+            return Err(common::Error::new("DN GC thread is already running"));
+        }
+        self.gc_stop.store(false, Ordering::Release);
+        let dn = Arc::downgrade(self);
+        let worker = thread::Builder::new()
+            .name("dn-gc".into())
+            .spawn(move || {
+                loop {
+                    let Some(dn) = dn.upgrade() else { break };
+                    if dn.gc_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let guard = dn.global_lock.read();
+                    thread::sleep(Duration::from_millis(10));
+                    drop(guard);
+                    if dn.gc_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            })
+            .map_err(|error| common::Error::new(format!("starting DN GC thread: {error}")))?;
+        *slot = Some(worker);
+        Ok(())
+    }
+
+    fn stop_gc(&self) -> common::Result<()> {
+        self.gc_stop.store(true, Ordering::Release);
+        let worker = self.gc_thread.lock().expect("GC thread").take();
+        if let Some(worker) = worker {
+            worker.thread().unpark();
+            worker.join().map_err(|_| common::Error::new("DN GC thread panicked"))?;
+        }
+        Ok(())
+    }
+
     fn delete_object(&self, process: &Process, request: &Req) -> Resp {
         match self.deleting_object(process, request) {
             Ok(()) => Resp::ok(),
@@ -2391,6 +2442,8 @@ impl DN {
         DN {
             config,
             global_lock: GlobalRwLock::new(()),
+            gc_stop: AtomicBool::new(true),
+            gc_thread: Mutex::new(None),
             deleting: Mutex::new(()),
             retired_objects: Mutex::new(std::collections::HashSet::new()),
             dn,

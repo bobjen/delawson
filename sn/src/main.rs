@@ -31,8 +31,10 @@ use std::collections::HashMap;
 use std::mem::{MaybeUninit, align_of, offset_of};
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 const SERVES: &[Op] = &[
     Op::SoftDeleteStream,
@@ -396,6 +398,8 @@ struct SN {
     disks: Mutex<Vec<(EnId, DiskId)>>,
     /// One lock for stream and extent state. Raft apply will use this same lock.
     state: RwLock<SNState>,
+    gc_stop: AtomicBool,
+    gc_thread: Mutex<Option<JoinHandle<()>>>,
     streams: AtomicU64,
     extents: AtomicU64,
     sealed: AtomicU64,
@@ -413,6 +417,14 @@ fn shard_of(name: StreamName) -> usize {
 }
 
 impl Service for SN {
+    fn start(self: &Arc<Self>) -> Result<()> {
+        self.start_gc()
+    }
+
+    fn stop(&self, _process: &Process) -> Result<()> {
+        self.stop_gc()
+    }
+
     fn serves(&self) -> &'static [Op] {
         SERVES
     }
@@ -455,6 +467,45 @@ impl Service for SN {
 }
 
 impl SN {
+    fn start_gc(self: &Arc<Self>) -> Result<()> {
+        let mut slot = self.gc_thread.lock().expect("GC thread");
+        if slot.is_some() {
+            return Err(Error::new("SN GC thread is already running"));
+        }
+        self.gc_stop.store(false, Ordering::Release);
+        let sn = Arc::downgrade(self);
+        let worker = thread::Builder::new()
+            .name("sn-gc".into())
+            .spawn(move || {
+                loop {
+                    let Some(sn) = sn.upgrade() else { break };
+                    if sn.gc_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let guard = sn.state.read();
+                    thread::sleep(Duration::from_millis(10));
+                    drop(guard);
+                    if sn.gc_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            })
+            .map_err(|error| Error::new(format!("starting SN GC thread: {error}")))?;
+        *slot = Some(worker);
+        Ok(())
+    }
+
+    fn stop_gc(&self) -> Result<()> {
+        self.gc_stop.store(true, Ordering::Release);
+        let worker = self.gc_thread.lock().expect("GC thread").take();
+        if let Some(worker) = worker {
+            worker.thread().unpark();
+            worker.join().map_err(|_| Error::new("SN GC thread panicked"))?;
+        }
+        Ok(())
+    }
+
     fn delete_stream(&self, process: &Process, request: &Req) -> Resp {
         match self.deleting_stream(process, request) {
             Ok(()) => Resp::ok(),
@@ -619,6 +670,8 @@ impl SN {
                 stream_extras: Extras::default(),
                 extent_extras: Extras::default(),
             }),
+            gc_stop: AtomicBool::new(true),
+            gc_thread: Mutex::new(None),
             streams: AtomicU64::new(0),
             extents: AtomicU64::new(0),
             sealed: AtomicU64::new(0),
