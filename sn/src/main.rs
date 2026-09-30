@@ -26,7 +26,7 @@ use common::time::TimeSec;
 use common::{Arg, Op, Req, Resp, Status, StructReader, StructWriter, structure};
 use common::{Error, Result};
 use parking_lot::RwLock;
-use pool::{InlineLinks, ListPool};
+use pool::{InlineLinks, LockedPool};
 use std::collections::HashMap;
 use std::mem::{MaybeUninit, align_of, offset_of};
 use std::ops::{Deref, DerefMut};
@@ -172,7 +172,7 @@ unsafe impl pool::PoolItem for Extent {
 }
 
 type ExtentPool =
-    ListPool<Extent, { align_of::<Extent>() }, InlineLinks<{ offset_of!(Extent, link) }>>;
+    LockedPool<Extent, { align_of::<Extent>() }, InlineLinks<{ offset_of!(Extent, link) }>>;
 
 /// A stable-index table backed by typed pool slots.
 struct ExtentTable {
@@ -1565,7 +1565,7 @@ mod tests {
         let table = &state.extent_table;
         assert!(table[0].deletion.is_valid());
         assert_eq!(table.pool.issued_blocks(), 1);
-        let spare = table.pool.alloc_fresh().unwrap();
+        let spare = table.pool.alloc().unwrap();
         assert_eq!(spare.index(), 1);
         assert_eq!(table.pool.issued_blocks(), 2);
         let pointer = spare.as_ptr().cast::<Extent>();
@@ -1578,7 +1578,13 @@ mod tests {
         }
         assert!(!unsafe { (*pointer).deletion.is_valid() });
         drop(spare);
-        let reused = table.pool.alloc_reclaiming_each([1]).unwrap();
+        drop(state);
+        {
+            let state = sn.state.write();
+            state.extent_table.pool.reclaim();
+        }
+        let state = sn.state.read();
+        let reused = state.extent_table.pool.alloc().unwrap();
         assert_eq!(reused.index(), 1);
         assert!(!unsafe { (*reused.as_ptr().cast::<Extent>()).deletion.is_valid() });
     }
