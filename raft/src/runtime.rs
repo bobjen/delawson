@@ -10,10 +10,11 @@ use common::time::TimeSec;
 use common::{Context, logn};
 use common::{Error, Result};
 use common::{MessagePayload, Op, Req, Resp, Status, structure};
+use parking_lot::{RwLock, RwLockReadGuard};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 pub struct Options {
@@ -191,7 +192,7 @@ impl Drop for SnapshotProduction<'_> {
 }
 
 pub struct Admission<'a, S> {
-    pub history: Option<std::sync::RwLockReadGuard<'a, S>>,
+    pub history: Option<RwLockReadGuard<'a, S>>,
 }
 
 pub struct Settings {
@@ -858,7 +859,7 @@ pub trait Host:
         let _production = SnapshotProduction(&self.producing_snapshot);
         let now = TimeSec::now().number();
         // The application lock is obtained only by this checkpoint helper, never raft-main.
-        let history = self.global_lock.read().map_err(|_| Error::new("global lock poisoned"))?;
+        let history = self.global_lock.read();
         let applied = history.applied();
         let plan = self.on_raft(move |host, node| {
             if node.journal.failed || matches!(node.role, Role::Stopped | Role::Candidate) {
@@ -1174,19 +1175,13 @@ pub trait Host:
                         .execution
                         .lock()
                         .map_err(|_| Error::new("execution cursor poisoned"))?;
-                    *self.global_lock.write().map_err(|_| Error::new("global lock poisoned"))? =
-                        Self::Application::default();
+                    self.global_lock.write().reset();
                     *cursor = crate::execution::Cursor::default();
                     Ok(true)
                 }
                 PendingWork::Apply(work) => {
                     self.apply_client(work)?;
-                    let complete = self
-                        .global_lock
-                        .read()
-                        .map_err(|_| Error::new("global lock poisoned"))?
-                        .applied()
-                        >= work.commit;
+                    let complete = self.global_lock.read().applied() >= work.commit;
                     if complete {
                         self.application_generation.store(work.generation, Ordering::SeqCst);
                     }
@@ -1270,7 +1265,7 @@ pub trait Host:
                     .then_some(node.state().commit))
             })?;
             if let Some(commit) = commit {
-                let guard = self.global_lock.try_read().ok();
+                let guard = self.global_lock.try_read();
                 if guard.as_ref().is_some_and(|data| data.applied() >= commit) {
                     let valid = self.on_raft(move |host, node| {
                         Ok(node.can_admit_with_policy(
@@ -1311,7 +1306,8 @@ pub trait Host:
                     && host.application_generation.load(Ordering::SeqCst)
                         == node.state().generation)
             })?;
-            if committed && self.global_lock.try_read().is_ok_and(|data| data.applied() >= index) {
+            if committed && self.global_lock.try_read().is_some_and(|data| data.applied() >= index)
+            {
                 return Ok(());
             }
             if !self.execution_started.load(Ordering::SeqCst) {

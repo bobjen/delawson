@@ -14,8 +14,8 @@ use common::{Op, Req, Resp, SnKey, Status, structure};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
-use std::sync::{Mutex, RwLock};
 
 #[derive(Clone)]
 struct MasterEpoch {
@@ -47,16 +47,32 @@ impl raft::execution::Application for KeyHistory {
     }
 }
 
+#[derive(Default)]
+struct KsState {
+    keys: KeyHistory,
+    registrations: runtime::Registrations,
+}
+impl raft::execution::Application for KsState {
+    fn applied(&self) -> u64 {
+        self.keys.applied
+    }
+    fn set_applied(&mut self, index: u64) {
+        self.keys.applied = index;
+    }
+    fn reset(&mut self) {
+        self.keys = KeyHistory::default();
+    }
+}
+
 struct Ks {
-    common: raft::runtime::Runtime<KeyHistory>,
+    common: raft::runtime::Runtime<KsState>,
     config: KsConfig,
     unlock_verifier: Option<[u8; 32]>,
     unlock_key: Mutex<Option<[u8; 32]>>,
-    peers: RwLock<runtime::Registrations>,
-    peer_cursor: Mutex<raft::execution::Cursor>,
+    metadata_cursor: Mutex<raft::execution::Cursor>,
 }
 impl std::ops::Deref for Ks {
-    type Target = raft::runtime::Runtime<KeyHistory>;
+    type Target = raft::runtime::Runtime<KsState>;
     fn deref(&self) -> &Self::Target {
         &self.common
     }
@@ -151,16 +167,16 @@ impl Service for Ks {
     }
 
     fn status(&self, _process: &Process) -> Vec<String> {
-        let (key_count, applied) = {
-            let history = self.global_lock.read().expect("global_lock");
-            (history.epochs.len(), history.applied)
+        let (key_count, applied, registered) = {
+            let state = self.global_lock.read();
+            (state.keys.epochs.len(), state.keys.applied, state.registrations.peers.len())
         };
         vec![
             format!("lazy_day_keys {}", self.config.lazy_day_keys),
             format!("require_unlock {}", self.config.require_unlock),
             format!("inline_ping {}", self.config.inline_ping),
             format!("unlocked {}", self.ready.load(Ordering::SeqCst)),
-            format!("registered {}", self.peers.read().expect("peers").peers.len()),
+            format!("registered {registered}"),
             format!("master_keys {key_count}"),
             format!("applied_commit {applied}"),
             self.raft_status(),
@@ -193,10 +209,10 @@ impl Ks {
             Op::Lookup => self.lookup(request),
             Op::AssignPeers => self.assign_peers(process, request),
             Op::Registry => {
-                registry::response(self.peers.read().expect("peers").peers.values().cloned())
+                registry::response(self.global_lock.read().registrations.peers.values().cloned())
             }
             Op::SnMasterKey => match admission.history.as_deref() {
-                Some(history) => self.sn_key(request, history),
+                Some(history) => self.sn_key(request, &history.keys),
                 None => Resp::error(Status::Internal, "missing admitted key history"),
             },
             Op::RotateMasterKey => {
@@ -297,8 +313,7 @@ impl Ks {
             config,
             unlock_verifier,
             unlock_key: Mutex::new(None),
-            peers: RwLock::new(runtime::Registrations::default()),
-            peer_cursor: Mutex::new(raft::execution::Cursor::default()),
+            metadata_cursor: Mutex::new(raft::execution::Cursor::default()),
             common: raft::runtime::Runtime::new(runtime, node, options),
         };
         // Routing must be recovered before transport starts, even while locked.
@@ -306,9 +321,7 @@ impl Ks {
             host.refresh_application(node)?;
             Ok(node.state().commit)
         })?;
-        while ks.peers.read().map_err(|_| common::Error::new("registrations poisoned"))?.applied
-            < commit
-        {
+        while ks.global_lock.read().registrations.applied < commit {
             ks.execute_pending()?;
         }
         if test_mode {
@@ -334,8 +347,7 @@ impl Ks {
             if apply { runtime::decode_history(&state, &key)? } else { KeyHistory::default() };
         *self.unlock_key.lock().map_err(|_| common::Error::new("unlock lock poisoned"))? =
             Some(key);
-        *self.global_lock.write().map_err(|_| common::Error::new("key history lock poisoned"))? =
-            history;
+        self.global_lock.write().keys = history;
         *self.execution.lock().map_err(|_| common::Error::new("execution cursor poisoned"))? =
             raft::execution::Cursor::default();
         self.ready.store(true, Ordering::SeqCst);
@@ -438,7 +450,7 @@ impl Ks {
         if self
             .global_lock
             .read()
-            .map_err(|_| common::Error::new("key history lock poisoned"))?
+            .keys
             .epochs
             .last()
             .is_some_and(|last| last.since.day() >= horizon.day())
@@ -518,7 +530,7 @@ impl Ks {
             Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let Some(source_peer) = self.peers.read().expect("peers").peers.get(&source).cloned()
+        let Some(source_peer) = self.global_lock.read().registrations.peers.get(&source).cloned()
         else {
             return Resp::error(Status::NotFound, format!("{source} has not registered"));
         };
@@ -548,7 +560,7 @@ impl Ks {
                     );
                 }
             };
-            if self.peers.read().expect("peers").peers.get(&identity).is_none() {
+            if self.global_lock.read().registrations.peers.get(&identity).is_none() {
                 return Resp::error(Status::NotFound, format!("{identity} has not registered"));
             }
             if address.parse::<std::net::SocketAddr>().is_err() {
@@ -584,7 +596,7 @@ impl Ks {
             Ok(identity) => identity,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        match self.peers.read().expect("peers").peers.get(&identity) {
+        match self.global_lock.read().registrations.peers.get(&identity) {
             Some(peer) => Resp::text(peer.address.to_string()),
             None => Resp::error(Status::NotFound, format!("{identity} has not registered")),
         }
@@ -640,7 +652,7 @@ mod persistence_tests {
         let locked = ks.ready.load(Ordering::SeqCst);
         assert!(!locked);
         ks.unlock(&unlock(&[42; 32])).unwrap();
-        let initial = ks.global_lock.read().unwrap().epochs[0].clone();
+        let initial = ks.global_lock.read().keys.epochs[0].clone();
         assert!(initial.since <= TimeSec::now());
         let epoch = ks.choose_key().unwrap();
         assert!(epoch.since > initial.since);
@@ -652,10 +664,10 @@ mod persistence_tests {
         let locked = ks.ready.load(Ordering::SeqCst);
         assert!(!locked);
         ks.unlock(&unlock(&[42; 32])).unwrap();
-        let history = ks.global_lock.read().unwrap();
-        assert_eq!(history.epochs.len(), 2);
-        assert_eq!(history.epochs[0].key, initial.key);
-        assert_eq!(history.epochs[1].key, epoch.key);
+        let history = ks.global_lock.read();
+        assert_eq!(history.keys.epochs.len(), 2);
+        assert_eq!(history.keys.epochs[0].key, initial.key);
+        assert_eq!(history.keys.epochs[1].key, epoch.key);
     }
     #[test]
     #[ignore = "filesystem integration; run explicitly with --ignored"]
@@ -677,7 +689,7 @@ mod persistence_tests {
         assert_eq!(before, after);
         drop(ks);
         let ks = Ks::new(config(), dir.path()).unwrap();
-        let restored = ks.peers.read().unwrap().peers["EN0"].clone();
+        let restored = ks.global_lock.read().registrations.peers["EN0"].clone();
         let unlocked = ks.ready.load(Ordering::SeqCst);
         assert_eq!(restored, peer);
         assert!(!unlocked);
@@ -688,7 +700,7 @@ mod persistence_tests {
         .unwrap();
         peer.address.set_port(9002);
         let failed = ks.propose_registration(peer).is_err();
-        let retained = ks.peers.read().unwrap().peers["EN0"].address.port();
+        let retained = ks.global_lock.read().registrations.peers["EN0"].address.port();
         assert!(failed);
         assert_eq!(retained, 9001);
     }
@@ -706,7 +718,7 @@ mod persistence_tests {
         let epoch = ks.choose_key().unwrap();
         let result = ks.propose_key(epoch);
         assert!(result.is_err());
-        assert_eq!(ks.global_lock.read().unwrap().epochs.len(), 1);
+        assert_eq!(ks.global_lock.read().keys.epochs.len(), 1);
     }
     #[test]
     fn locked_members_journal_commit_and_snapshot_without_the_unlock_key() {

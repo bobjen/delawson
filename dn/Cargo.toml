@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 delawson-common.workspace = true
+parking_lot.workspace = true
 
 [dev-dependencies]
 delawson-common = { workspace = true, features = ["testing"] }

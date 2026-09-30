@@ -1,6 +1,7 @@
 //! KS action encryption and application; consensus and transport live in raft.
 use super::*;
 use common::{Error, Result};
+use parking_lot::RwLock;
 use raft::runtime::Host;
 pub use raft::runtime::Settings;
 use raft::{Command, Entry, Node, Role, State};
@@ -13,14 +14,6 @@ pub fn needs_request_worker(request: &Req) -> bool {
 pub struct Registrations {
     pub peers: BTreeMap<String, Peer>,
     pub(super) applied: u64,
-}
-impl raft::execution::Application for Registrations {
-    fn applied(&self) -> u64 {
-        self.applied
-    }
-    fn set_applied(&mut self, index: u64) {
-        self.applied = index;
-    }
 }
 fn registration_action(peer: &Peer) -> raft::Action {
     let arg = peer.request().payload;
@@ -37,7 +30,7 @@ fn registration_peer(action: &raft::Action) -> Result<Peer> {
     }
     Peer::from_args(&[common::Arg::new(Op::Register, bytes.to_vec().into(), depth)])
 }
-fn apply_registration(
+pub(super) fn apply_registration(
     state: &mut Registrations,
     _context: raft::execution::Context<'_>,
     action: &raft::Action,
@@ -51,6 +44,14 @@ fn apply_registration(
         Op::KsKey => Ok(()), // Opaque ciphertext is not needed for routing.
         _ => Err(Error::new("unknown KS action tag")),
     }
+}
+pub(super) fn apply_state(
+    state: &mut KsState,
+    key: &[u8; 32],
+    context: raft::execution::Context<'_>,
+    action: &raft::Action,
+) -> Result<()> {
+    apply_action(&mut state.keys, key, context, action)
 }
 fn has_keys(state: &State) -> bool {
     state.snapshot.application.iter().chain(state.log.iter().filter(|e| e.index <= state.commit))
@@ -119,7 +120,7 @@ pub fn decode_history(state: &State, key: &[u8; 32]) -> Result<KeyHistory> {
     Ok(history)
 }
 fn apply_history(state: &State, key: &[u8; 32], history: &mut KeyHistory) -> Result<()> {
-    let global = RwLock::new(std::mem::take(history));
+    let global = parking_lot::RwLock::new(std::mem::take(history));
     let progress = Mutex::new(raft::execution::Cursor::default());
     let result = raft::execution::execute(
         &global,
@@ -128,7 +129,7 @@ fn apply_history(state: &State, key: &[u8; 32], history: &mut KeyHistory) -> Res
         Duration::MAX,
         |history, ctx, action| apply_action(history, key, ctx, action),
     );
-    *history = global.into_inner().map_err(|_| Error::new("global lock poisoned"))?;
+    *history = global.into_inner();
     result.map(|_| ())
 }
 
@@ -149,7 +150,7 @@ impl Ks {
                     && host.metadata_generation.load(Ordering::SeqCst) == node.state().generation)
                     .then_some(node.state().commit))
             })?;
-            if commit.is_some_and(|index| self.peers.read().is_ok_and(|p| p.applied >= index)) {
+            if commit.is_some_and(|index| self.global_lock.read().registrations.applied >= index) {
                 break;
             }
             if !self.execution_started.load(Ordering::SeqCst) {
@@ -161,8 +162,11 @@ impl Ks {
             std::thread::sleep(Duration::from_millis(5));
         }
         let (identical, applied) = {
-            let routes = self.peers.read().map_err(|_| Error::new("registrations poisoned"))?;
-            (routes.peers.get(&peer.identity) == Some(&peer), routes.applied)
+            let state = self.global_lock.read();
+            (
+                state.registrations.peers.get(&peer.identity) == Some(&peer),
+                state.registrations.applied,
+            )
         };
         if identical
             && self.on_raft(move |_, node| {
@@ -191,8 +195,7 @@ impl Ks {
                 }
                 host.refresh_application(node)
             })?;
-            if self.peers.read().map_err(|_| Error::new("registrations poisoned"))?.applied >= index
-            {
+            if self.global_lock.read().registrations.applied >= index {
                 break;
             }
             if !self.execution_started.load(Ordering::SeqCst) {
@@ -266,17 +269,21 @@ impl Ks {
     }
 }
 impl Host for Ks {
-    type Application = KeyHistory;
+    type Application = KsState;
     fn has_metadata(&self) -> bool {
         true
     }
     fn apply_metadata(&self, state: &raft::execution::Work) -> Result<bool> {
-        raft::execution::execute_blocking(
-            &self.peers,
-            &self.peer_cursor,
+        raft::execution::execute_state(
+            &self.global_lock,
+            &self.metadata_cursor,
             state,
             Duration::from_millis(self.config.raft.execution_lock_ms),
-            apply_registration,
+            true,
+            |state| state.registrations.applied,
+            |state, index| state.registrations.applied = index,
+            |state| state.registrations = Registrations::default(),
+            |state, context, action| apply_registration(&mut state.registrations, context, action),
         )
     }
     fn apply_client(&self, state: &raft::execution::Work) -> Result<()> {
@@ -290,11 +297,11 @@ impl Host for Ks {
             &self.execution,
             state,
             Duration::from_millis(self.config.raft.execution_lock_ms),
-            |history, ctx, action| apply_action(history, &key, ctx, action),
+            |state, ctx, action| apply_state(state, &key, ctx, action),
         )
         .map(|_| ())
     }
-    fn checkpoint_actions(&self, state: &State, _history: &KeyHistory) -> Result<Vec<Entry>> {
+    fn checkpoint_actions(&self, state: &State, _history: &KsState) -> Result<Vec<Entry>> {
         Ok(state.capture().application)
     }
     fn prepare_primary(&self, node: &mut Node) -> Result<()> {
@@ -330,7 +337,7 @@ impl Host for Ks {
         matches!(op, Op::Register | Op::SnMasterKey | Op::RotateMasterKey | Op::RaftMembers)
     }
     fn registered_endpoint(&self, name: &str) -> Option<std::net::SocketAddr> {
-        self.peers.read().ok()?.peers.get(name).map(|peer| peer.address)
+        self.global_lock.read().registrations.peers.get(name).map(|peer| peer.address)
     }
 }
 #[cfg(test)]
@@ -347,12 +354,22 @@ mod tests {
             ring_identity: Some(common::ring::RingIdentity::try_from("01".repeat(64)).unwrap()),
         }
     }
-    fn routes(state: &State) -> Registrations {
-        let routes = RwLock::new(Registrations::default());
+    fn routes(state: &State) -> KsState {
+        let global = RwLock::new(KsState::default());
         let cursor = Mutex::new(raft::execution::Cursor::default());
-        raft::execution::execute(&routes, &cursor, state, Duration::MAX, apply_registration)
-            .unwrap();
-        routes.into_inner().unwrap()
+        raft::execution::execute_state(
+            &global,
+            &cursor,
+            state,
+            Duration::MAX,
+            true,
+            |state| state.registrations.applied,
+            |state, index| state.registrations.applied = index,
+            |state| state.registrations = Registrations::default(),
+            |state, context, action| apply_registration(&mut state.registrations, context, action),
+        )
+        .unwrap();
+        global.into_inner()
     }
     #[test]
     fn registrations_replay_only_committed_changes_without_unlock_material() {
@@ -374,7 +391,7 @@ mod tests {
         state.commit = 1;
         let before_commit = routes(&state);
         let key_present = has_keys(&state);
-        assert_eq!(before_commit.peers["KS0-member1"], peer(9001));
+        assert_eq!(before_commit.registrations.peers["KS0-member1"], peer(9001));
         assert!(!key_present); // A registration must not suppress initial-key creation.
         let snapshot = state.capture();
         state.apply(&raft::Record::Install(snapshot)).unwrap();
@@ -383,8 +400,8 @@ mod tests {
         let saved = raft::codec::encode(&state).unwrap();
         let recovered: State = raft::codec::decode(&saved).unwrap();
         let after_commit = routes(&recovered);
-        assert_eq!(after_commit.peers["KS0-member1"], peer(9002));
-        assert_eq!(after_commit.applied, 2);
+        assert_eq!(after_commit.registrations.peers["KS0-member1"], peer(9002));
+        assert_eq!(after_commit.registrations.applied, 2);
         // Routing and key application can replay the same mixed checkpoint independently.
         let key = [55; 32];
         let epoch = MasterEpoch { key: [89; 32], since: TimeSec::new(100) };
@@ -400,7 +417,7 @@ mod tests {
         state.apply(&raft::Record::Install(snapshot)).unwrap();
         let locked = routes(&state);
         let unlocked = decode_history(&state, &key).unwrap();
-        assert_eq!(locked.peers["KS0-member1"], peer(9002));
+        assert_eq!(locked.registrations.peers["KS0-member1"], peer(9002));
         assert_eq!(unlocked.epochs[0].key, epoch.key);
         assert!(has_keys(&state));
     }

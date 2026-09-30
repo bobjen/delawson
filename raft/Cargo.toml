@@ -13,6 +13,7 @@ testing = ["dep:tempfile"]
 
 [dependencies]
 delawson-common.workspace = true
+parking_lot.workspace = true
 sha2 = "0.10.8"
 libc = "0.2.189"
 tempfile = { version = "3", optional = true }

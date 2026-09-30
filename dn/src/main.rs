@@ -32,6 +32,7 @@ use common::routing;
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::{Arg, Op, Req, Resp, Status, StructWriter, structure};
+use parking_lot::RwLock as GlobalRwLock;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::AtomicU32;
@@ -755,6 +756,8 @@ struct BatchCountGather {
 
 struct DN {
     config: DNConfig,
+    /// Shared by request and reply processing; future Raft applies take it exclusively.
+    global_lock: GlobalRwLock<()>,
     deleting: Mutex<()>,
     retired_objects: Mutex<std::collections::HashSet<String>>,
     /// This DN's own identity.
@@ -832,6 +835,7 @@ impl Service for DN {
     }
 
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
+        let _state = self.global_lock.read();
         match request.op() {
             Op::SoftDeleteObject | Op::DeleteObject => {
                 reply.send(self.delete_object(process, &request))
@@ -1318,6 +1322,7 @@ impl DN {
             let destination_name = destination.clone();
             let named = sn.clone();
             if let Err(e) = process.ask(&sn, &ask, move |answer| {
+                let _state = dn.global_lock.read();
                 if answer.status != Status::Ok {
                     return dn.fail_concat(
                         &destination_name,
@@ -1386,6 +1391,7 @@ impl DN {
         let named = sn.clone();
         let destination_name = destination.clone();
         if let Err(e) = process.ask(&sn, &ask, move |answer| {
+            let _state = dn.global_lock.read();
             if answer.status != Status::Ok {
                 return dn.fail_concat(
                     &destination_name,
@@ -1421,6 +1427,7 @@ impl DN {
         let next = Arc::clone(&onward);
         let named = identity.clone();
         let asked = onward.ask(&identity, &ask, move |answer| {
+            let _state = dn.global_lock.read();
             if answer.status != Status::Ok {
                 return reply.send(answer);
             }
@@ -1664,6 +1671,7 @@ impl DN {
             SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
         let named = sn.clone();
         let asked = process.ask(&sn, &ask, move |answer| {
+            let _state = dn.global_lock.read();
             if answer.status != Status::Ok {
                 let why = format!("{named} would not make {count} streams");
                 let failed = dn.give_back(&mine, answer.status, why);
@@ -1805,6 +1813,7 @@ impl DN {
         let named = sn.clone();
         reply.about(format_args!("{name} stream {stream} on {named} from record {first_record}"));
         let asked = process.ask(&sn, &ask, move |answer| {
+            let _state = dn.global_lock.read();
             if answer.status != Status::Ok {
                 let why = format!("{named} would not make a stream");
                 let failed = dn.gave_up(&name, answer.status, why);
@@ -2021,9 +2030,10 @@ impl DN {
             let waiting = Arc::clone(&gather);
             let named = identity.clone();
             let mine = Arc::clone(&dn);
-            if let Err(e) =
-                process.ask(&identity, &ask, move |answer| arrived(&mine, &waiting, &at, answer))
-            {
+            if let Err(e) = process.ask(&identity, &ask, move |answer| {
+                let _state = mine.global_lock.read();
+                arrived(&mine, &waiting, &at, answer)
+            }) {
                 logw!("could not reach an SN", "sn {named},{e}");
                 arrived(
                     self,
@@ -2380,6 +2390,7 @@ impl DN {
     fn new(config: DNConfig, dn: DnId, mine: RangeId) -> DN {
         DN {
             config,
+            global_lock: GlobalRwLock::new(()),
             deleting: Mutex::new(()),
             retired_objects: Mutex::new(std::collections::HashSet::new()),
             dn,

@@ -25,13 +25,14 @@ use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::{Arg, Op, Req, Resp, Status, StructReader, StructWriter, structure};
 use common::{Error, Result};
+use parking_lot::RwLock;
 use pool::{InlineLinks, ListPool};
 use std::collections::HashMap;
 use std::mem::{MaybeUninit, align_of, offset_of};
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 const SERVES: &[Op] = &[
     Op::SoftDeleteStream,
@@ -472,7 +473,7 @@ impl SN {
         let now = TimeSec::now();
         let maximum = process.cluster.max_soft_delete_retention_secs;
         let ids = {
-            let mut state = self.state.write().expect("SN state");
+            let mut state = self.state.write();
             let SNState { shards, extent_table, retired_streams, stream_extras, extent_extras } =
                 &mut *state;
             let Some(stream) = shards[shard_of(name)].get_mut(&name) else {
@@ -526,7 +527,7 @@ impl SN {
                 continue;
             }
             let (created, disks, interval, hard) = {
-                let mut state = self.state.write().unwrap();
+                let mut state = self.state.write();
                 let SNState { extent_table, extent_extras, .. } = &mut *state;
                 let extent = &mut extent_table[id.get() as usize];
                 if !extent.deletion.soft_deleted() || extent.deletion.retired() {
@@ -563,7 +564,7 @@ impl SN {
                 }
             }
             if hard {
-                let mut state = self.state.write().unwrap();
+                let mut state = self.state.write();
                 let SNState { extent_table, extent_extras, .. } = &mut *state;
                 let extent = &mut extent_table[id.get() as usize];
                 assert!(extent_extras.reclaim(
@@ -576,7 +577,7 @@ impl SN {
             }
         }
         if deletion.hard {
-            let mut state = self.state.write().unwrap();
+            let mut state = self.state.write();
             let SNState { shards, stream_extras, retired_streams, .. } = &mut *state;
             let shard = &mut shards[shard_of(name)];
             let stream = shard.get_mut(&name).unwrap();
@@ -672,7 +673,7 @@ impl SN {
                 );
             };
             let name = StreamName { range, stream, created };
-            let mut state = self.state.write().expect("SN state");
+            let mut state = self.state.write();
             if state.retired_streams.contains(&name) {
                 return bad("stream identity has been retired");
             }
@@ -721,7 +722,7 @@ impl SN {
             Ok(name) => name,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        if self.state.read().expect("SN state").retired_streams.contains(&destination) {
+        if self.state.read().retired_streams.contains(&destination) {
             return bad("destination stream identity has been retired");
         }
         let left = match stream_name(&mut payload) {
@@ -757,7 +758,7 @@ impl SN {
         }
 
         {
-            let state = self.state.read().expect("SN state");
+            let state = self.state.read();
             let shard = &state.shards[shard_of(destination)];
             if let Some(destination_stream) = shard.get(&destination) {
                 if !destination_stream.deletion.readable(false)
@@ -777,16 +778,14 @@ impl SN {
             }
         }
         // Copy source state before taking the global write lock for the destination.
-        let left_stream =
-            match self.state.read().expect("SN state").shards[shard_of(left)].get(&left) {
-                Some(stream) => stream.clone(),
-                None => return Resp::error(Status::NotFound, format!("no {left}")),
-            };
-        let right_stream =
-            match self.state.read().expect("SN state").shards[shard_of(right)].get(&right) {
-                Some(stream) => stream.clone(),
-                None => return Resp::error(Status::NotFound, format!("no {right}")),
-            };
+        let left_stream = match self.state.read().shards[shard_of(left)].get(&left) {
+            Some(stream) => stream.clone(),
+            None => return Resp::error(Status::NotFound, format!("no {left}")),
+        };
+        let right_stream = match self.state.read().shards[shard_of(right)].get(&right) {
+            Some(stream) => stream.clone(),
+            None => return Resp::error(Status::NotFound, format!("no {right}")),
+        };
         if !left_stream.deletion.readable(false) || !right_stream.deletion.readable(false) {
             return bad("cannot concatenate deleted streams");
         }
@@ -829,7 +828,7 @@ impl SN {
         let mut copied = Vec::with_capacity(extent_count);
         copied.extend(left_stream.sealed.iter().cloned());
         copied.extend(right_stream.sealed.iter().cloned());
-        let mut state = self.state.write().expect("SN state");
+        let mut state = self.state.write();
         let SNState { shards, extent_table, extent_extras, retired_streams, .. } = &mut *state;
         if retired_streams.contains(&destination) {
             return bad("destination stream identity has been retired");
@@ -945,7 +944,7 @@ impl SN {
             Ok(value) => value,
             Err(error) => return bad(error),
         };
-        let state = self.state.read().expect("SN state");
+        let state = self.state.read();
         let shard = &state.shards[shard_of(name)];
         let Some(held) = shard.get(&name) else {
             return Resp::error(Status::NotFound, format!("no {name}"));
@@ -1014,7 +1013,7 @@ impl SN {
         };
         let mut args = Vec::new();
         let mut room = asked.limit;
-        let state = self.state.read().expect("SN state");
+        let state = self.state.read();
         for (name, from) in &asked.at {
             let shard = &state.shards[shard_of(*name)];
             let Some(held) = shard.get(name) else {
@@ -1206,7 +1205,7 @@ impl SN {
         if !rest.is_empty() || payload.done().is_err() {
             return Resp::error(Status::BadRequest, "seal-stream has trailing arguments");
         }
-        let mut state = self.state.write().expect("SN state");
+        let mut state = self.state.write();
         let SNState { shards, extent_table, .. } = &mut *state;
         let shard = &mut shards[shard_of(name)];
         let Some(stream) = shard.get_mut(&name) else {
@@ -1254,7 +1253,7 @@ impl SN {
         instances: usize,
         per_stream: usize,
     ) -> std::result::Result<Placed, Full> {
-        let mut state = self.state.write().expect("SN state");
+        let mut state = self.state.write();
         let SNState { shards, extent_table, .. } = &mut *state;
         let shard = &mut shards[shard_of(name)];
         let Some(held) = shard.get_mut(&name) else {
@@ -1299,7 +1298,7 @@ impl SN {
         second: TimeSec,
         instances: usize,
     ) -> std::result::Result<Placed, Full> {
-        let mut state = self.state.write().expect("SN state");
+        let mut state = self.state.write();
         let SNState { shards, extent_table, .. } = &mut *state;
         let shard = &mut shards[shard_of(name)];
         let Some(held) = shard.get_mut(&name) else {
@@ -1395,13 +1394,13 @@ mod tests {
         let placed = sn.open(source, TimeSec::new(1_000_000), 4).unwrap();
         let id = placed.extent.id;
         {
-            let mut state = sn.state.write().unwrap();
+            let mut state = sn.state.write();
             let snapshot = state.shards[shard_of(source)][&source].clone();
             state.shards[shard_of(other)].insert(other, snapshot);
         }
         sn.streams.fetch_add(1, Ordering::Relaxed);
         {
-            let mut state = sn.state.write().unwrap();
+            let mut state = sn.state.write();
             let SNState { extent_table, extent_extras, .. } = &mut *state;
             retain(extent_extras, &mut extent_table[id.get() as usize]);
             // No network in this unit test; the live test verifies instance fanout.
@@ -1424,7 +1423,7 @@ mod tests {
             Status::Ok
         );
         {
-            let state = sn.state.read().unwrap();
+            let state = sn.state.read();
             let SNState { extent_table, extent_extras, .. } = &*state;
             let table = extent_table;
             let extent = &table[id.get() as usize];
@@ -1435,7 +1434,7 @@ mod tests {
         }
         assert_eq!(sn.delete_stream(&process, &request(source, None, true)).status, Status::Ok);
         assert_eq!(sn.delete_stream(&process, &request(source, None, true)).status, Status::Ok);
-        let state = sn.state.read().unwrap();
+        let state = sn.state.read();
         let SNState { extent_table, extent_extras, .. } = &*state;
         let table = extent_table;
         assert!(table[id.get() as usize].deletion.retired());
@@ -1446,7 +1445,7 @@ mod tests {
         let sn = sn_with_stream(0, 7);
         seal_for_concat(&sn, named(0, 7));
         {
-            let mut state = sn.state.write().unwrap();
+            let mut state = sn.state.write();
             let SNState { extent_table, extent_extras, .. } = &mut *state;
             retain(extent_extras, &mut extent_table[0]);
             extent_extras
@@ -1458,7 +1457,7 @@ mod tests {
         }
         let response = sn.concat_streams(&concat_request(named(0, 9), named(0, 7), named(0, 7)));
         assert_eq!(response.status, Status::BadRequest);
-        let state = sn.state.read().unwrap();
+        let state = sn.state.read();
         let SNState { extent_table, extent_extras, .. } = &*state;
         let table = extent_table;
         assert_eq!(table.len(), 1);
@@ -1504,12 +1503,12 @@ mod tests {
             sealed_stream: false,
         };
         {
-            let mut state = sn.state.write().unwrap();
+            let mut state = sn.state.write();
             let SNState { extent_table, .. } = &mut *state;
             sn.appendable(extent_table, &mut stream, TimeSec::new(100), 4).unwrap();
         }
 
-        let state = sn.state.read().unwrap();
+        let state = sn.state.read();
         let table = &state.extent_table;
         assert!(table[0].deletion.is_valid());
         assert_eq!(table.pool.issued_blocks(), 1);
@@ -1544,7 +1543,6 @@ mod tests {
         let sn = SN::new(testing::sn_config(), 10, SnId::FIRST, Vec::new()).unwrap();
         sn.state
             .write()
-            .unwrap()
             .extent_table
             .insert(Extent {
                 link: MaybeUninit::uninit(),
@@ -1569,7 +1567,7 @@ mod tests {
             sealed_records: SRoff::new(14),
             sealed_stream: true,
         };
-        let state = sn.state.read().unwrap();
+        let state = sn.state.read();
         let (run, rows) =
             sn.run_of(&state.extent_table, &stream, StreamId::FIRST, SRoff::ZERO, 10, false);
         assert_eq!(run.totals.extents, ExtentId::new(2));
@@ -1592,7 +1590,6 @@ mod tests {
             ids.push(
                 sn.state
                     .write()
-                    .unwrap()
                     .extent_table
                     .insert(Extent {
                         link: MaybeUninit::uninit(),
@@ -1624,7 +1621,7 @@ mod tests {
             (ids[2], SRoff::new(7), SRoff::new(14)),
             (ids[3], SRoff::new(14), SRoff::NONE),
         ] {
-            let state = sn.state.read().unwrap();
+            let state = sn.state.read();
             let (run, rows) =
                 sn.run_of(&state.extent_table, &stream, StreamId::FIRST, from, 1, false);
             assert_eq!(run.totals.extents, ExtentId::new(3));
@@ -1633,7 +1630,7 @@ mod tests {
             assert_eq!(run.next, next);
             from = run.next;
         }
-        let state = sn.state.read().unwrap();
+        let state = sn.state.read();
         let (run, rows) =
             sn.run_of(&state.extent_table, &stream, StreamId::FIRST, SRoff::new(7), 0, false);
         assert!(rows.is_empty());
@@ -1757,7 +1754,7 @@ mod tests {
         assert_eq!(answer.status, Status::Ok, "{}", answer.message().unwrap_or_default());
 
         let id = {
-            let state = sn.state.read().unwrap();
+            let state = sn.state.read();
             let destination = &state.shards[shard_of(named(0, 9))][&named(0, 9)];
             assert_eq!(destination.sealed.len(), 2, "A || A has two extent references");
             assert_eq!(destination.sealed_records, SRoff::new(24));
@@ -1769,7 +1766,7 @@ mod tests {
             );
             destination.sealed[0]
         };
-        let mut state = sn.state.write().unwrap();
+        let mut state = sn.state.write();
         let SNState { extent_table, extent_extras, .. } = &mut *state;
         let extents = extent_table;
         assert_eq!(extents.len(), 1);
@@ -1892,21 +1889,21 @@ mod tests {
             sealed_stream: false,
         };
         let first = {
-            let mut state = sn.state.write().unwrap();
+            let mut state = sn.state.write();
             let SNState { extent_table, .. } = &mut *state;
             sn.appendable(extent_table, &mut stream, TimeSec::new(100), 4).unwrap()
         };
         assert_eq!(first.extent.id, ExtentId::FIRST);
         assert_eq!(sn.config.max_extents, 1);
-        assert_eq!(sn.state.read().unwrap().extent_table.len(), 1);
+        assert_eq!(sn.state.read().extent_table.len(), 1);
         stream.open = None;
         let result = {
-            let mut state = sn.state.write().unwrap();
+            let mut state = sn.state.write();
             let SNState { extent_table, .. } = &mut *state;
             sn.appendable(extent_table, &mut stream, TimeSec::new(101), 4)
         };
         assert!(result.is_err());
-        assert_eq!(sn.state.read().unwrap().extent_table.len(), 1);
+        assert_eq!(sn.state.read().extent_table.len(), 1);
     }
 
     #[test]
@@ -1961,13 +1958,13 @@ mod tests {
     /// Where the open extent starts, for a test.
     impl SN {
         fn starts_at(&self, range: u64, stream: u32) -> SRoff {
-            self.state.read().unwrap().shards[shard_of(named(range, stream))][&named(range, stream)]
+            self.state.read().shards[shard_of(named(range, stream))][&named(range, stream)]
                 .sealed_records
         }
 
         /// The stream-local first record of every sealed extent, recomputed by summing.
         fn firsts(&self, range: u64, stream: u32) -> Vec<SRoff> {
-            let state = self.state.read().unwrap();
+            let state = self.state.read();
             state.shards[shard_of(named(range, stream))][&named(range, stream)]
                 .sealed_from(&state.extent_table)
                 .map(|(at, _)| at)

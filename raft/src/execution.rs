@@ -1,8 +1,9 @@
 //! Shared action iteration and global-lock budgeting. Clients dispatch action tags.
 use crate::{Action, Command, Entry, Snapshot, State};
 use common::{Error, Result};
+use parking_lot::RwLock;
 use std::sync::Arc;
-use std::sync::{Mutex, RwLock, TryLockError};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// A detached, immutable view of committed work. No consensus lock is retained.
@@ -57,6 +58,9 @@ impl Committed for Work {
 pub trait Application: Default + Send + Sync {
     fn applied(&self) -> u64;
     fn set_applied(&mut self, index: u64);
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 #[derive(Default)]
 pub struct Cursor {
@@ -82,7 +86,17 @@ pub fn execute<S: Application>(
     budget: Duration,
     apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
 ) -> Result<bool> {
-    execute_with_lock(global, progress, state, budget, false, apply)
+    execute_state(
+        global,
+        progress,
+        state,
+        budget,
+        false,
+        |data| data.applied(),
+        |data, index| data.set_applied(index),
+        |data| data.reset(),
+        apply,
+    )
 }
 /// The application worker can sleep on the global lock without delaying consensus.
 pub fn execute_blocking<S: Application>(
@@ -92,35 +106,59 @@ pub fn execute_blocking<S: Application>(
     budget: Duration,
     apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
 ) -> Result<bool> {
-    execute_with_lock(global, progress, state, budget, true, apply)
+    execute_state(
+        global,
+        progress,
+        state,
+        budget,
+        true,
+        |data| data.applied(),
+        |data, index| data.set_applied(index),
+        |data| data.reset(),
+        apply,
+    )
 }
-fn execute_with_lock<S: Application>(
+pub fn execute_state<S>(
     global: &RwLock<S>,
     progress: &Mutex<Cursor>,
     state: &impl Committed,
     budget: Duration,
     blocking: bool,
+    applied: impl Fn(&S) -> u64,
+    set_applied: impl Fn(&mut S, u64),
+    reset: impl Fn(&mut S),
+    apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
+) -> Result<bool> {
+    execute_with_lock(global, progress, state, budget, blocking, applied, set_applied, reset, apply)
+}
+fn execute_with_lock<S>(
+    global: &RwLock<S>,
+    progress: &Mutex<Cursor>,
+    state: &impl Committed,
+    budget: Duration,
+    blocking: bool,
+    applied: impl Fn(&S) -> u64,
+    set_applied: impl Fn(&mut S, u64),
+    reset: impl Fn(&mut S),
     mut apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
 ) -> Result<bool> {
     let mut cursor = progress.lock().map_err(|_| Error::new("execution cursor poisoned"))?;
-    let mut data = match if blocking {
-        global.write().map_err(TryLockError::Poisoned)
+    let mut data = if blocking {
+        global.write()
+    } else if let Some(data) = global.try_write() {
+        data
     } else {
-        global.try_write()
-    } {
-        Ok(guard) => guard,
-        Err(TryLockError::WouldBlock) => return Ok(false),
-        Err(TryLockError::Poisoned(_)) => return Err(Error::new("global lock poisoned")),
+        return Ok(false);
     };
     if cursor.generation != state.generation() {
-        *data = S::default();
+        reset(&mut *data);
         *cursor = Cursor { generation: state.generation(), ..Cursor::default() };
     }
-    if data.applied() == state.commit() && cursor.restoring.is_none() {
+    if applied(&data) == state.commit() && cursor.restoring.is_none() {
         return Ok(true);
     }
-    if data.applied() < state.snapshot().index && cursor.restoring != Some(state.snapshot().index) {
-        *data = S::default();
+    if applied(&data) < state.snapshot().index && cursor.restoring != Some(state.snapshot().index) {
+        reset(&mut *data);
         cursor.restoring = Some(state.snapshot().index);
         cursor.entry = 0;
         cursor.action = 0;
@@ -152,7 +190,7 @@ fn execute_with_lock<S: Application>(
                 Command::Noop | Command::Members(_) | Command::CheckpointStart(_) => {}
             }
             if !restoring {
-                data.set_applied(entry.index);
+                set_applied(data, entry.index);
                 common::logn!("Raft entry applied", "index {},term {}", entry.index, entry.term);
             }
             Ok(true)
@@ -163,17 +201,17 @@ fn execute_with_lock<S: Application>(
                 return Ok(false);
             }
         }
-        data.set_applied(state.snapshot().index);
+        set_applied(&mut *data, state.snapshot().index);
         cursor.restoring = None;
         cursor.entry = 0;
         cursor.action = 0;
     }
     for entry in state.entries().iter().filter(|entry| entry.index <= state.commit()) {
-        if entry.index > data.applied() && !run(entry, false, &mut *data, &mut cursor)? {
+        if entry.index > applied(&data) && !run(entry, false, &mut *data, &mut cursor)? {
             return Ok(false);
         }
     }
-    data.set_applied(state.commit());
+    set_applied(&mut *data, state.commit());
     Ok(true)
 }
 
@@ -230,7 +268,7 @@ mod tests {
         replacement.generation = 1;
         replacement.log[0].command = Command::Client(vec![Action::new(Op::BytesResp, vec![9])]);
         execute_blocking(&global, &cursor, &replacement, Duration::MAX, apply).unwrap();
-        let data = global.read().unwrap();
+        let data = global.read();
         assert_eq!(data.applied, 1);
         assert_eq!(data.values, vec![9]);
     }
@@ -313,13 +351,13 @@ mod tests {
         for expected in 1..=3 {
             let finished = execute(&global, &cursor, &state, Duration::ZERO, apply).unwrap();
             assert!(!finished);
-            let checkpoint_read = global.read().unwrap();
+            let checkpoint_read = global.read();
             assert_eq!(checkpoint_read.values.len(), expected);
             let blocked = execute(&global, &cursor, &state, Duration::MAX, apply).unwrap();
             assert!(!blocked);
         }
         let finished = execute(&global, &cursor, &state, Duration::MAX, apply).unwrap();
-        let data = global.read().unwrap();
+        let data = global.read();
         assert!(finished);
         assert_eq!(data.values, vec![1, 2, 3]);
         assert_eq!(data.applied, 1);
@@ -336,7 +374,7 @@ mod tests {
         }
         let finished = execute(&global, &cursor, &state, Duration::MAX, apply).unwrap();
         assert!(finished);
-        assert_eq!(global.read().unwrap().values, vec![1, 2, 3]);
+        assert_eq!(global.read().values, vec![1, 2, 3]);
     }
     #[test]
     fn failed_action_does_not_repeat_successful_predecessors() {
@@ -352,6 +390,6 @@ mod tests {
         assert!(failed.is_err());
         let finished = execute(&global, &cursor, &state, Duration::MAX, apply).unwrap();
         assert!(finished);
-        assert_eq!(global.read().unwrap().values, vec![1, 2, 3]);
+        assert_eq!(global.read().values, vec![1, 2, 3]);
     }
 }
