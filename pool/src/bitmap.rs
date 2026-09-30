@@ -8,8 +8,9 @@ const BITS: usize = 64;
 const INTERLEAVE_BITS: usize = 4096;
 const INTERLEAVE_WORDS: usize = INTERLEAVE_BITS / BITS;
 const PROBE_LIMIT: usize = 2;
-// 128 * ln(2^64) ≈ 5679 probes: at 1/128 free words, miss chance is ≈ 2^-64.
-const DEFAULT_RANDOM_PROBES: usize = 5679;
+// 64 * ln(2^64) ≈ 2839.1, rounded up to 2840 probes.
+// At 1/64 free words, the miss chance is < 2^-64; at 1/128, about 2^-32.
+const DEFAULT_RANDOM_PROBES: usize = 2840;
 const REFILL_BATCH: u32 = 64;
 const REFILL_BUSY: u32 = 1 << 31;
 const REFILL_MASK: u32 = !REFILL_BUSY;
@@ -263,7 +264,8 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
 
         let block = self.alloc_fresh()?;
         let issued_after = self.next.load(SeqCst);
-        let scheduled = issued_after == issued + 1 && self.schedule_refill(issued / BITS as u32);
+        let scheduled =
+            issued_after == issued + 1 && self.schedule_refill(issued / (2 * BITS as u32));
         if !scheduled {
             // A failed probe search allocates one fresh block for its caller. If
             // another call already scheduled reserve work, help pay it here.
@@ -356,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_random_probes_schedule_one_over_64_spare() {
+    fn failed_random_probes_schedule_one_over_128_spare() {
         let pool = Pool::<[u8; 64], 64>::with_random_probes(256, 0, 6000).unwrap();
         let mut held = vec![pool.alloc().unwrap()];
         held.extend((1..128).map(|_| pool.alloc_fresh().unwrap()));
@@ -367,7 +369,7 @@ mod tests {
 
         let second = pool.alloc().unwrap();
         assert_eq!(second.index(), 129);
-        assert_eq!(pool.issued_blocks(), 132);
+        assert_eq!(pool.issued_blocks(), 131);
 
         let a = pool.alloc().unwrap();
         let b = pool.alloc().unwrap();
@@ -440,7 +442,7 @@ mod tests {
         // A later empty probe search gets its own block and helps pay that reserve.
         held.push(pool.alloc().unwrap());
         let issued = pool.issued_blocks();
-        assert_eq!(issued, INITIAL + 2 + INITIAL / BITS as u32);
+        assert_eq!(issued, INITIAL + 2 + INITIAL / (2 * BITS as u32));
 
         // The reserve is now paid. Repeated sparse probes may be long, but
         // cannot create more capacity unless the available blocks are used up.
@@ -477,7 +479,7 @@ mod tests {
         // One reserve is scheduled for this exhaustion. Concurrent demand can
         // add user-owned slots, but cannot each schedule another full reserve.
         assert!(
-            pool.issued_blocks() <= INITIAL + THREADS as u32 + INITIAL / BITS as u32,
+            pool.issued_blocks() <= INITIAL + THREADS as u32 + INITIAL / (2 * BITS as u32),
             "issued {} blocks",
             pool.issued_blocks()
         );
