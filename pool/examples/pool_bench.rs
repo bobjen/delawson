@@ -10,6 +10,9 @@ const OPS_PER_THREAD: usize = 16_000_000;
 const MAX_BLOCKS: u32 = 1_000_000;
 const RANDOM_PROBES: usize = 2840;
 const SEED: u64 = 42;
+const INDEX_ITEMS: usize = 65_536;
+const INDEX_ROUNDS: usize = 32;
+const INDEX_TRIALS: usize = 3;
 
 macro_rules! run_test {
     ($name:ident, $pool:ty, $method:ident) => {
@@ -72,8 +75,72 @@ macro_rules! run_test {
 
 run_test!(run_pool, Pool<[u8; 4096], 4096>, alloc);
 
+fn sum_indexes(indexes: &[u32]) -> u64 {
+    indexes.iter().fold(0, |sum, &index| sum.wrapping_add(index as u64))
+}
+
+fn sum_pointers(pool: &Pool<[u8; 4096], 4096>, pointers: &[*const u8]) -> u64 {
+    pointers.iter().fold(0, |sum, &ptr| sum.wrapping_add(pool.index_of(ptr).unwrap() as u64))
+}
+
+fn time_indexes(indexes: &[u32]) -> (Duration, u64) {
+    let start = Instant::now();
+    let mut sum = 0u64;
+    for _ in 0..INDEX_ROUNDS {
+        sum = sum.wrapping_add(sum_indexes(std::hint::black_box(indexes)));
+    }
+    (start.elapsed(), std::hint::black_box(sum))
+}
+
+fn time_pointers(pool: &Pool<[u8; 4096], 4096>, pointers: &[*const u8]) -> (Duration, u64) {
+    let start = Instant::now();
+    let mut sum = 0u64;
+    for _ in 0..INDEX_ROUNDS {
+        sum = sum.wrapping_add(sum_pointers(pool, std::hint::black_box(pointers)));
+    }
+    (start.elapsed(), std::hint::black_box(sum))
+}
+
+fn benchmark_indexes() {
+    let pool = Pool::<[u8; 4096], 4096>::new(INDEX_ITEMS as u32, 1).unwrap();
+    let mut blocks = Vec::with_capacity(INDEX_ITEMS);
+    blocks.push(pool.alloc().unwrap());
+    blocks.extend((1..INDEX_ITEMS).map(|_| pool.alloc_fresh().unwrap()));
+    let indexes: Vec<_> = blocks.iter().map(|block| block.index()).collect();
+    let pointers: Vec<_> = blocks.iter().map(|block| block.as_ptr() as *const u8).collect();
+    let mut stored_ns = [0.0; INDEX_TRIALS];
+    let mut derived_ns = [0.0; INDEX_TRIALS];
+    let operations = (INDEX_ITEMS * INDEX_ROUNDS) as f64;
+
+    for trial in 0..INDEX_TRIALS {
+        let (stored, stored_sum, derived, derived_sum) = if trial % 2 == 0 {
+            let (elapsed, sum) = time_indexes(&indexes);
+            let (derived, derived_sum) = time_pointers(&pool, &pointers);
+            (elapsed, sum, derived, derived_sum)
+        } else {
+            let (elapsed, sum) = time_pointers(&pool, &pointers);
+            let (stored, stored_sum) = time_indexes(&indexes);
+            (stored, stored_sum, elapsed, sum)
+        };
+        assert_eq!(stored_sum, derived_sum);
+        stored_ns[trial] = stored.as_secs_f64() * 1e9 / operations;
+        derived_ns[trial] = derived.as_secs_f64() * 1e9 / operations;
+    }
+
+    let mean = |samples: &[f64; INDEX_TRIALS]| samples.iter().sum::<f64>() / INDEX_TRIALS as f64;
+    println!(
+        "index_lookup blocks={INDEX_ITEMS} rounds={INDEX_ROUNDS} trials={INDEX_TRIALS} stored_ns={stored_ns:?} stored_mean_ns={:.2} rederived_ns={derived_ns:?} rederived_mean_ns={:.2}",
+        mean(&stored_ns),
+        mean(&derived_ns),
+    );
+}
+
 fn main() {
+    benchmark_indexes();
     let pool = Pool::<[u8; 4096], 4096>::with_random_probes(MAX_BLOCKS, 0, RANDOM_PROBES).unwrap();
+    let block = pool.alloc().unwrap();
+    assert_eq!(pool.index_of(block.as_ptr()).unwrap(), 0);
+    drop(block);
     let (elapsed, counts) = run_pool(&pool);
     println!(
         "pool=bitmap interleave=4096 second_probe=first-popcnt-1 threads={THREADS} ops_per_thread={OPS_PER_THREAD} max_blocks={MAX_BLOCKS} random_probes={RANDOM_PROBES} elapsed_ms={:.3} allocs={} failed={} frees={} issued={}",

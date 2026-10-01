@@ -220,6 +220,28 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
         size_of::<T>()
     }
 
+    /// Find the index of an issued block from its starting address.
+    ///
+    /// The pointer must point to the first byte of a block in this pool. This
+    /// checks the pool's mapping, block alignment, and issued range; it does not
+    /// establish ownership or prove that the block is currently allocated.
+    pub fn index_of(&self, ptr: *const u8) -> Result<u32> {
+        let base = self.mapping.base.as_ptr() as usize;
+        let address = ptr as usize;
+        let offset = address
+            .checked_sub(base)
+            .ok_or_else(|| Error::new("pointer is below the block pool mapping"))?;
+        let block_bytes = size_of::<T>();
+        if offset % block_bytes != 0 {
+            return Err(Error::new("pointer is not at a block boundary"));
+        }
+        let index = offset / block_bytes;
+        if index >= self.max_blocks as usize || index >= self.issued_blocks() as usize {
+            return Err(Error::new("pointer is outside the issued block pool"));
+        }
+        Ok(index as u32)
+    }
+
     /// Searches the bitmap with the configured probe policy, then grows if needed.
     #[inline]
     pub fn alloc(&self) -> Result<Block<'_, T, A>> {
@@ -364,16 +386,16 @@ mod tests {
         held.extend((1..128).map(|_| pool.alloc_fresh().unwrap()));
 
         let first = pool.alloc().unwrap();
-        assert_eq!(first.index(), 128);
+        assert_eq!(pool.index_of(first.as_ptr()).unwrap(), 128);
         assert_eq!(pool.issued_blocks(), 129);
 
         let second = pool.alloc().unwrap();
-        assert_eq!(second.index(), 129);
+        assert_eq!(pool.index_of(second.as_ptr()).unwrap(), 129);
         assert_eq!(pool.issued_blocks(), 131);
 
         let a = pool.alloc().unwrap();
         let b = pool.alloc().unwrap();
-        let mut indexes = [a.index(), b.index()];
+        let mut indexes = [pool.index_of(a.as_ptr()).unwrap(), pool.index_of(b.as_ptr()).unwrap()];
         indexes.sort_unstable();
         assert_eq!(indexes, [130, 131]);
         drop((held, first, second, a, b));
@@ -383,7 +405,7 @@ mod tests {
     fn random_probe_reuses_a_free_block_without_growth() {
         let pool = Pool::<[u8; 64], 64>::with_random_probes(256, 128, 1).unwrap();
         let block = pool.alloc().unwrap();
-        assert!(block.index() < 128);
+        assert!(pool.index_of(block.as_ptr()).unwrap() < 128);
         assert_eq!(pool.issued_blocks(), 128);
     }
 
@@ -398,7 +420,7 @@ mod tests {
         let held: Vec<_> = (0..130)
             .map(|_| {
                 let block = pool.alloc().unwrap();
-                let index = block.index() as usize;
+                let index = pool.index_of(block.as_ptr()).unwrap() as usize;
                 assert!(!seen[index]);
                 seen[index] = true;
                 block
@@ -419,8 +441,23 @@ mod tests {
     fn zero_initial_blocks_means_one() {
         let pool = Pool::<[u8; 64], 64>::new(3, 0).unwrap();
         assert_eq!(pool.issued_blocks(), 1);
-        assert_eq!(pool.alloc().unwrap().index(), 0);
+        let block = pool.alloc().unwrap();
+        assert_eq!(pool.index_of(block.as_ptr()).unwrap(), 0);
         assert_eq!(pool.issued_blocks(), 1);
+    }
+
+    #[test]
+    fn index_of_checks_pool_and_slot_boundaries() {
+        let pool = Pool::<[u8; 64], 64>::new(4, 0).unwrap();
+        let base = pool.mapping.base.as_ptr();
+        assert_eq!(pool.index_of(base).unwrap(), 0);
+        assert!(pool.index_of(base.wrapping_add(1)).is_err());
+        assert!(pool.index_of(base.wrapping_add(64)).is_err());
+        assert!(pool.index_of(base.wrapping_add(4 * 64)).is_err());
+        assert!(pool.index_of((base as usize - 1) as *const u8).is_err());
+        let other = Pool::<[u8; 64], 64>::new(4, 0).unwrap();
+        let other_block = other.alloc().unwrap();
+        assert!(pool.index_of(other_block.as_ptr()).is_err());
     }
 
     #[test]
@@ -499,7 +536,8 @@ mod tests {
                     for _ in 0..20_000 {
                         match pool.alloc() {
                             Ok(block) => {
-                                let owner = &owners[block.index() as usize];
+                                let owner =
+                                    &owners[pool.index_of(block.as_ptr()).unwrap() as usize];
                                 assert_eq!(
                                     owner.compare_exchange(
                                         0,
