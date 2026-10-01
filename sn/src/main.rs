@@ -17,12 +17,12 @@ use common::config::{SNConfig, ServiceKind};
 use common::deletion::{
     Delete, Extras, Flags, SharedExtras, Target, bad, forward, read_soft_deleted,
 };
-use common::ids::{DiskId, EnId, ExtentId, SnDiskId, SnId, StreamId};
+use common::ids::{DiskId, EnId, ExtentId, RangeId, SnDiskId, SnId, StreamId};
 use common::info::{ExtentRow, ExtentRun, Listing, StreamName, Totals};
 use common::offset::{ECoff, ELoff, ERoff, SCoff, SLoff, SRoff};
 use common::range::Filled;
 use common::server::{self, Process, Reply, Service};
-use common::time::TimeSec;
+use common::time::{TimeIntSec64, TimeSec};
 use common::{Arg, Op, Req, Resp, Status, StructReader, StructWriter, structure};
 use common::{Error, Result};
 use pool::{InlineLinks, LockedPool};
@@ -31,7 +31,8 @@ use std::collections::HashMap;
 use std::mem::{MaybeUninit, align_of, offset_of};
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -181,6 +182,7 @@ struct ExtentTable {
     base: NonNull<Extent>,
     /// One past the highest extent index assigned to a live table entry.
     len: usize,
+    max: u32,
 }
 
 // SAFETY: base points into the owned pool's stable mapping; SN accesses the
@@ -192,13 +194,14 @@ impl ExtentTable {
     fn new(max_extents: u32) -> pool::Result<Self> {
         let pool = ExtentPool::new(max_extents, 0)?;
         let base = pool.base_ptr();
-        Ok(Self { pool, base, len: 0 })
+        Ok(Self { pool, base, len: 0, max: max_extents })
     }
 
-    fn insert(&mut self, mut extent: Extent) -> pool::Result<ExtentId> {
+    fn insert_at(&mut self, wanted: ExtentId, mut extent: Extent) -> pool::Result<ExtentId> {
         let block = self.pool.alloc()?;
         let index = block.index() as usize;
         let id = ExtentId::new(block.index());
+        assert_eq!(id, wanted, "extent pool index differs from committed Raft action");
         let pointer = block.as_ptr().cast::<Extent>();
         // New slots are initialized by the pool; reused slots were invalidated before release.
         unsafe {
@@ -222,6 +225,16 @@ impl ExtentTable {
         // return the slot to the pool before extent retirement is implemented.
         std::mem::forget(block);
         Ok(id)
+    }
+
+    #[cfg(test)]
+    fn insert(&mut self, extent: Extent) -> pool::Result<ExtentId> {
+        let id = ExtentId::new(self.len as u32);
+        self.insert_at(id, extent)
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new(self.max).expect("rebuilding SN extent table");
     }
 }
 
@@ -272,6 +285,278 @@ struct ExtentData {
     disks: Vec<SnDiskId>,
 }
 
+struct CreateCmd {
+    range: RangeId,
+    first: StreamId,
+    count: u64,
+    created: TimeSec,
+    creator: SnId,
+}
+
+struct ConcatCmd {
+    destination: StreamName,
+    creator: SnId,
+    extents: Vec<ExtentId>,
+    records: SRoff,
+    require_exists: bool,
+    require_absent: bool,
+}
+
+struct OpenCmd {
+    name: StreamName,
+    extent: ExtentData,
+}
+
+struct SealCmd {
+    name: StreamName,
+    id: ExtentId,
+    came_to: Filled,
+    per_stream: u64,
+    next: Option<ExtentData>,
+}
+
+struct SealStreamCmd {
+    name: StreamName,
+    id: ExtentId,
+    came_to: Filled,
+}
+
+struct DeleteCmd {
+    name: StreamName,
+    retention: Option<i64>,
+    hard: bool,
+    now: TimeSec,
+    maximum: i64,
+}
+
+struct DeleteDoneCmd {
+    entry: u64,
+    now: TimeSec,
+}
+
+#[derive(Clone)]
+struct DeleteTask {
+    id: ExtentId,
+    created: TimeSec,
+    disks: Vec<SnDiskId>,
+    interval: TimeIntSec64,
+    hard: bool,
+}
+
+#[derive(Clone)]
+struct PendingDelete {
+    name: StreamName,
+    hard: bool,
+    tasks: Vec<DeleteTask>,
+}
+
+fn write_name(w: &mut StructWriter, name: StreamName) {
+    w.range_id(name.range);
+    w.stream_id(name.stream);
+    w.time_sec(name.created);
+}
+
+fn read_name(r: &mut StructReader<'_>) -> Result<StreamName> {
+    Ok(StreamName { range: r.range_id()?, stream: r.stream_id()?, created: r.time_sec()? })
+}
+
+fn write_extent(w: &mut StructWriter, extent: &ExtentData) {
+    w.extent_id(extent.id);
+    w.eloff(extent.logical);
+    w.ecoff(extent.compressed);
+    w.eroff(extent.records);
+    w.time_sec(extent.created);
+    w.number_u64(extent.disks.len() as u64);
+    for disk in &extent.disks {
+        w.number_u32(disk.get());
+    }
+}
+
+fn read_extent(r: &mut StructReader<'_>) -> Result<ExtentData> {
+    let id = r.extent_id()?;
+    let logical = r.eloff()?;
+    let compressed = r.ecoff()?;
+    let records = r.eroff()?;
+    let created = r.time_sec()?;
+    let count =
+        usize::try_from(r.number_u64()?).map_err(|_| Error::new("extent disk count overflow"))?;
+    if count > r.remaining() / 4 {
+        return Err(Error::new("extent disk count exceeds action"));
+    }
+    let mut disks = Vec::with_capacity(count);
+    for _ in 0..count {
+        disks.push(SnDiskId::new(r.number_u32()?));
+    }
+    Ok(ExtentData { logical, compressed, id, records, created, disks })
+}
+
+fn write_filled(w: &mut StructWriter, filled: Filled) {
+    w.eroff(filled.records);
+    w.eloff(filled.logical);
+    w.ecoff(filled.compressed);
+}
+
+fn read_filled(r: &mut StructReader<'_>) -> Result<Filled> {
+    Ok(Filled { records: r.eroff()?, logical: r.eloff()?, compressed: r.ecoff()? })
+}
+
+macro_rules! sn_wire {
+    ($type:ty, $tag:ident, $write:expr, $read:expr) => {
+        impl raft::codec::Wire for $type {
+            fn write(&self, w: &mut StructWriter) {
+                w.nested(Op::$tag, |w| ($write)(self, w));
+            }
+            fn read(r: &mut StructReader<'_>) -> Result<Self> {
+                r.nested(Op::$tag, stringify!($type), |r| ($read)(r))
+            }
+        }
+    };
+}
+
+sn_wire!(
+    CreateCmd,
+    SnCreate,
+    |v: &CreateCmd, w: &mut StructWriter| {
+        w.range_id(v.range);
+        w.stream_id(v.first);
+        w.number_u64(v.count);
+        w.time_sec(v.created);
+        w.sn_id(v.creator);
+    },
+    |r: &mut StructReader<'_>| Ok(CreateCmd {
+        range: r.range_id()?,
+        first: r.stream_id()?,
+        count: r.number_u64()?,
+        created: r.time_sec()?,
+        creator: r.sn_id()?,
+    })
+);
+
+sn_wire!(
+    ConcatCmd,
+    SnConcat,
+    |v: &ConcatCmd, w: &mut StructWriter| {
+        write_name(w, v.destination);
+        w.sn_id(v.creator);
+        w.number_u64(v.extents.len() as u64);
+        for id in &v.extents {
+            w.extent_id(*id);
+        }
+        w.number_u64(v.records.number());
+        w.flag(v.require_exists);
+        w.flag(v.require_absent);
+    },
+    |r: &mut StructReader<'_>| {
+        let destination = read_name(r)?;
+        let creator = r.sn_id()?;
+        let count = usize::try_from(r.number_u64()?)
+            .map_err(|_| Error::new("concat extent count overflow"))?;
+        if count > r.remaining() / 4 {
+            return Err(Error::new("concat extent count exceeds action"));
+        }
+        let mut extents = Vec::with_capacity(count);
+        for _ in 0..count {
+            extents.push(r.extent_id()?);
+        }
+        Ok(ConcatCmd {
+            destination,
+            creator,
+            extents,
+            records: SRoff::of_number(r.number_u64()?)?,
+            require_exists: r.flag()?,
+            require_absent: r.flag()?,
+        })
+    }
+);
+
+sn_wire!(
+    OpenCmd,
+    SnOpen,
+    |v: &OpenCmd, w: &mut StructWriter| {
+        write_name(w, v.name);
+        write_extent(w, &v.extent);
+    },
+    |r: &mut StructReader<'_>| Ok(OpenCmd { name: read_name(r)?, extent: read_extent(r)? })
+);
+
+sn_wire!(
+    SealCmd,
+    SnSeal,
+    |v: &SealCmd, w: &mut StructWriter| {
+        write_name(w, v.name);
+        w.extent_id(v.id);
+        write_filled(w, v.came_to);
+        w.number_u64(v.per_stream);
+        w.flag(v.next.is_some());
+        if let Some(next) = &v.next {
+            write_extent(w, next);
+        }
+    },
+    |r: &mut StructReader<'_>| {
+        let name = read_name(r)?;
+        let id = r.extent_id()?;
+        let came_to = read_filled(r)?;
+        let per_stream = r.number_u64()?;
+        let next = if r.flag()? { Some(read_extent(r)?) } else { None };
+        Ok(SealCmd { name, id, came_to, per_stream, next })
+    }
+);
+
+sn_wire!(
+    SealStreamCmd,
+    SnSealStream,
+    |v: &SealStreamCmd, w: &mut StructWriter| {
+        write_name(w, v.name);
+        w.extent_id(v.id);
+        write_filled(w, v.came_to);
+    },
+    |r: &mut StructReader<'_>| Ok(SealStreamCmd {
+        name: read_name(r)?,
+        id: r.extent_id()?,
+        came_to: read_filled(r)?,
+    })
+);
+
+sn_wire!(
+    DeleteCmd,
+    SnDelete,
+    |v: &DeleteCmd, w: &mut StructWriter| {
+        write_name(w, v.name);
+        w.flag(v.retention.is_some());
+        if let Some(retention) = v.retention {
+            w.number_u64(retention as u64);
+        }
+        w.flag(v.hard);
+        w.time_sec(v.now);
+        w.number_u64(v.maximum as u64);
+    },
+    |r: &mut StructReader<'_>| {
+        let name = read_name(r)?;
+        let retention = if r.flag()? { Some(r.number_u64()? as i64) } else { None };
+        Ok(DeleteCmd {
+            name,
+            retention,
+            hard: r.flag()?,
+            now: r.time_sec()?,
+            maximum: r.number_u64()? as i64,
+        })
+    }
+);
+
+sn_wire!(
+    DeleteDoneCmd,
+    SnDeleteDone,
+    |v: &DeleteDoneCmd, w: &mut StructWriter| {
+        w.number_u64(v.entry);
+        w.time_sec(v.now);
+    },
+    |r: &mut StructReader<'_>| Ok(DeleteDoneCmd { entry: r.number_u64()?, now: r.time_sec()? })
+);
+
+fn sn_action<T: raft::codec::Wire>(op: Op, value: &T) -> Result<raft::Action> {
+    Ok(raft::Action::new(op, raft::codec::encode(value)?))
+}
+
 /// An extent **as one stream holds it**: the extent, and where its records start in that
 /// stream.
 ///
@@ -281,6 +566,7 @@ struct ExtentData {
 /// own (§17.29.1). Anything answering a question about an extent *in a stream* answers with
 /// this; anything about the extent itself answers with `Extent`.
 #[derive(Clone, Debug)]
+#[cfg(test)]
 struct Placed {
     extent: ExtentData,
     first: SRoff,
@@ -323,18 +609,21 @@ impl ExtentData {
 /// A stream that will hold no more extents, and how many records it came to. Not a
 /// failure: whoever asked needs another stream, and the DN is what makes those.
 #[derive(Debug)]
+#[cfg(test)]
 struct Full {
     records: SRoff,
     /// Set when the stream could not be extended for an ordinary reason instead.
     why: Option<Error>,
 }
 
+#[cfg(test)]
 impl Full {
     fn records(records: SRoff) -> Full {
         Full { records, why: None }
     }
 }
 
+#[cfg(test)]
 impl From<Error> for Full {
     fn from(why: Error) -> Full {
         Full { records: SRoff::ZERO, why: Some(why) }
@@ -380,7 +669,17 @@ struct SNState {
     retired_streams: std::collections::HashSet<StreamName>,
     stream_extras: Extras<StreamName>,
     extent_extras: SharedExtras<(ExtentId, TimeSec)>,
-    /// Highest Raft entry applied to this state. SN actions are not applied yet.
+    /// In-flight EN deletion work; the entry key makes completion durable and retryable.
+    pending_deletes: HashMap<u64, PendingDelete>,
+    /// Primary-only waiters for an extent that is being created by Raft.
+    /// The global lock protects the map; each value has a lock-free waiter stack.
+    pending_opens: HashMap<StreamName, PendingOpen>,
+    streams: u64,
+    extents: u64,
+    sealed: u64,
+    sealed_streams: u64,
+    max_extents: u32,
+    /// Highest Raft entry applied to this state.
     applied: u64,
 }
 
@@ -394,8 +693,530 @@ impl SNState {
             retired_streams: std::collections::HashSet::new(),
             stream_extras: Extras::default(),
             extent_extras: Extras::default(),
+            pending_deletes: HashMap::new(),
+            pending_opens: HashMap::new(),
+            streams: 0,
+            extents: 0,
+            sealed: 0,
+            sealed_streams: 0,
+            max_extents,
             applied: 0,
         })
+    }
+}
+
+enum OpenWaiter {
+    Reply(Reply),
+    Forward(SyncSender<Resp>),
+}
+
+impl OpenWaiter {
+    fn send(self, response: Resp) {
+        match self {
+            Self::Reply(reply) => reply.send(response),
+            Self::Forward(sender) => {
+                let _ = sender.send(response);
+            }
+        }
+    }
+}
+
+struct OpenNode {
+    next: *mut OpenNode,
+    waiter: OpenWaiter,
+}
+
+// The pointer is published only after the node is initialized. The global write
+// lock drains it only after all readers that can push have left.
+unsafe impl Send for OpenNode {}
+
+struct PendingOpen {
+    head: AtomicPtr<OpenNode>,
+}
+
+impl PendingOpen {
+    fn new(waiter: OpenWaiter) -> Self {
+        let pending = Self { head: AtomicPtr::new(std::ptr::null_mut()) };
+        pending.push(waiter);
+        pending
+    }
+
+    /// Push is lock-free. Callers hold the SN global read lock, which prevents the
+    /// Raft writer from removing this entry while a push is in progress.
+    fn push(&self, waiter: OpenWaiter) {
+        let node = Box::into_raw(Box::new(OpenNode { next: std::ptr::null_mut(), waiter }));
+        let mut head = self.head.load(Ordering::Acquire);
+        loop {
+            // SAFETY: this node is still private until its successful CAS.
+            unsafe { (*node).next = head };
+            match self.head.compare_exchange_weak(head, node, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return,
+                Err(actual) => head = actual,
+            }
+        }
+    }
+
+    /// Only call while holding the SN global write lock, after all pushers leave.
+    fn take(&self) -> Vec<OpenWaiter> {
+        let mut node = self.head.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        let mut waiters = Vec::new();
+        while !node.is_null() {
+            // SAFETY: the exclusive global lock excludes pushers and other drainers;
+            // this list was allocated by push and each node is reclaimed once.
+            let boxed = unsafe { Box::from_raw(node) };
+            node = boxed.next;
+            waiters.push(boxed.waiter);
+        }
+        waiters
+    }
+}
+
+impl Default for PendingOpen {
+    fn default() -> Self {
+        Self { head: AtomicPtr::new(std::ptr::null_mut()) }
+    }
+}
+
+impl Drop for PendingOpen {
+    fn drop(&mut self) {
+        for waiter in self.take() {
+            waiter.send(Resp::error(Status::Internal, "SN stopped before opening the extent"));
+        }
+    }
+}
+
+enum OpenCheck {
+    Answer(Resp),
+    Extent(ExtentData, SRoff),
+    Create,
+}
+
+fn open_check(state: &SNState, name: StreamName) -> OpenCheck {
+    let Some(stream) = state.shards[shard_of(name)].get(&name) else {
+        return OpenCheck::Answer(Resp::error(Status::NotFound, format!("no {name}")));
+    };
+    if !stream.deletion.readable(false) {
+        return OpenCheck::Answer(bad("stream is deleted"));
+    }
+    if let Some(id) = stream.open {
+        return OpenCheck::Extent(
+            state.extent_table[id.get() as usize].data.clone(),
+            stream.sealed_records,
+        );
+    }
+    if stream.sealed_stream {
+        return OpenCheck::Answer(Resp::number(Status::Sealed, stream.sealed_records.number()));
+    }
+    OpenCheck::Create
+}
+
+fn check_delete(
+    state: &SNState,
+    name: StreamName,
+    retention: Option<TimeIntSec64>,
+    hard: bool,
+    now: TimeSec,
+) -> Result<()> {
+    let stream = state.shards[shard_of(name)].get(&name).ok_or_else(|| Error::new("no stream"))?;
+    let flags = stream.deletion;
+    if flags.retired() {
+        return Ok(());
+    }
+    let old_until = state.stream_extras.get(&name).map(|extra| extra.retain_until);
+    match (retention, hard) {
+        (Some(interval), true) if !flags.soft_deleted() => {
+            if interval.get() >= 0 {
+                return Err(Error::new("combined deletion requires expired retention"));
+            }
+        }
+        (Some(_), true) | (None, true) => {
+            if !flags.soft_deleted()
+                || !flags.extra()
+                || !old_until.is_some_and(|until| until < now)
+            {
+                return Err(Error::new(
+                    "hard delete requires soft deletion with expired retention",
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    let first_soft = retention.is_some() && !flags.soft_deleted();
+    let first_hard = hard && !flags.deleted();
+    let add = retention.unwrap_or(TimeIntSec64::MIN);
+    let mut copies = HashMap::<ExtentId, u32>::new();
+    for id in stream.sealed.iter().copied().chain(stream.open) {
+        let count = copies.entry(id).or_default();
+        *count =
+            count.checked_add(1).ok_or_else(|| Error::new("extent reference count overflow"))?;
+    }
+    for (id, count) in copies {
+        let extent = state
+            .extent_table
+            .get(id.get() as usize)
+            .ok_or_else(|| Error::new("stream names an unknown extent"))?;
+        let key = (extent.data.id, extent.data.created);
+        let (soft, retained) = state.extent_extras.counts(&key, extent.deletion);
+        let soft_after = if first_soft {
+            if extent.deletion.soft_deleted() || soft < count {
+                return Err(Error::new("live reference count underflow"));
+            }
+            soft - count
+        } else {
+            soft
+        };
+        if first_hard {
+            if extent.deletion.deleted() || retained < count || retained - count < soft_after {
+                return Err(Error::new("retained reference count underflow"));
+            }
+            if retained == count {
+                let expired = if first_soft && soft_after == 0 {
+                    let previous = state
+                        .extent_extras
+                        .get(&key)
+                        .map_or(i64::MIN, |extra| i64::from(extra.references.max_retention.get()));
+                    previous.max(add.get()) < 0
+                } else {
+                    state.extent_extras.get(&key).is_some_and(|extra| extra.retain_until < now)
+                };
+                if !expired {
+                    return Err(Error::new(
+                        "hard delete requires soft deletion with expired retention",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_sn_action(state: &mut SNState, index: u64, action: &raft::Action) -> Result<()> {
+    match action.op {
+        Op::SnCreate => {
+            let cmd: CreateCmd = raft::codec::decode(&action.fields)?;
+            let end = cmd
+                .first
+                .number()
+                .checked_add(cmd.count)
+                .ok_or_else(|| Error::new("stream id run overflow"))?;
+            if end > u64::from(StreamId::MAX.get()) + 1 {
+                return Err(Error::new("stream id run exceeds stream id space"));
+            }
+            let SNState { shards, retired_streams, streams, .. } = state;
+            for offset in 0..cmd.count {
+                let stream_id = StreamId::of_number(cmd.first.number() + offset)?;
+                let name = StreamName { range: cmd.range, stream: stream_id, created: cmd.created };
+                if retired_streams.contains(&name) {
+                    return Err(Error::new("stream identity has been retired"));
+                }
+                let shard = &mut shards[shard_of(name)];
+                if let Some(stream) = shard.get(&name) {
+                    if !stream.deletion.readable(false) {
+                        return Err(Error::new("stream is deleted"));
+                    }
+                    continue;
+                }
+                shard.insert(
+                    name,
+                    Stream {
+                        deletion: Flags::default(),
+                        created: cmd.created,
+                        creator: cmd.creator,
+                        sealed: Vec::new(),
+                        open: None,
+                        sealed_records: SRoff::ZERO,
+                        sealed_stream: false,
+                    },
+                );
+                *streams += 1;
+            }
+            Ok(())
+        }
+        Op::SnConcat => {
+            let cmd: ConcatCmd = raft::codec::decode(&action.fields)?;
+            let SNState {
+                shards,
+                extent_table,
+                extent_extras,
+                retired_streams,
+                streams,
+                sealed,
+                ..
+            } = state;
+            if retired_streams.contains(&cmd.destination) {
+                return Err(Error::new("destination stream identity has been retired"));
+            }
+            let shard = &mut shards[shard_of(cmd.destination)];
+            if cmd.require_absent && shard.contains_key(&cmd.destination) {
+                return Err(Error::new("concat destination already exists"));
+            }
+            if cmd.require_exists && !shard.contains_key(&cmd.destination) {
+                return Err(Error::new("concat destination does not exist"));
+            }
+            if shard.get(&cmd.destination).is_some_and(|stream| {
+                stream.sealed_stream || stream.open.is_some() || !stream.sealed.is_empty()
+            }) {
+                return Err(Error::new("concat destination is not empty and open"));
+            }
+            let mut inserted = false;
+            let destination = shard.entry(cmd.destination).or_insert_with(|| {
+                inserted = true;
+                Stream {
+                    deletion: Flags::default(),
+                    created: cmd.destination.created,
+                    creator: cmd.creator,
+                    sealed: Vec::new(),
+                    open: None,
+                    sealed_records: SRoff::ZERO,
+                    sealed_stream: false,
+                }
+            });
+            let mut retained: Vec<ExtentId> = Vec::new();
+            for &id in &cmd.extents {
+                let extent = extent_table
+                    .get_mut(id.get() as usize)
+                    .ok_or_else(|| Error::new("concat names an unknown extent"))?;
+                if let Err(error) = extent_extras
+                    .retain((extent.data.id, extent.data.created), &mut extent.deletion)
+                {
+                    for prior in retained {
+                        let extent = &mut extent_table[prior.get() as usize];
+                        extent_extras
+                            .release(&(extent.data.id, extent.data.created), &mut extent.deletion)
+                            .expect("rollback retained extent");
+                    }
+                    if inserted {
+                        shard.remove(&cmd.destination);
+                    }
+                    return Err(error);
+                }
+                retained.push(id);
+            }
+            destination.sealed = cmd.extents;
+            destination.sealed_records = cmd.records;
+            if inserted {
+                *streams += 1;
+            }
+            *sealed += destination.sealed.len() as u64;
+            Ok(())
+        }
+        Op::SnOpen => {
+            let cmd: OpenCmd = raft::codec::decode(&action.fields)?;
+            if cmd.extent.id.is_none() {
+                return Err(Error::new("open action has no extent id"));
+            }
+            let SNState { shards, extent_table, extents, .. } = state;
+            let held = shards[shard_of(cmd.name)]
+                .get_mut(&cmd.name)
+                .ok_or_else(|| Error::new("open action names no stream"))?;
+            if !held.deletion.readable(false) || held.sealed_stream {
+                return Err(Error::new("open action names a deleted or sealed stream"));
+            }
+            if held.open.is_some() {
+                return Ok(());
+            }
+            let id = cmd.extent.id;
+            extent_table
+                .insert_at(
+                    id,
+                    Extent {
+                        link: MaybeUninit::uninit(),
+                        deletion: Flags::default(),
+                        data: cmd.extent,
+                    },
+                )
+                .map_err(|error| Error::new(error.to_string()))?;
+            held.open = Some(id);
+            *extents += 1;
+            Ok(())
+        }
+        Op::SnSeal => {
+            let cmd: SealCmd = raft::codec::decode(&action.fields)?;
+            let SNState { shards, extent_table, extents, sealed, sealed_streams, .. } = state;
+            let held = shards[shard_of(cmd.name)]
+                .get_mut(&cmd.name)
+                .ok_or_else(|| Error::new("seal action names no stream"))?;
+            if held.open != Some(cmd.id) {
+                return Ok(());
+            }
+            held.open = None;
+            held.sealed_records =
+                held.sealed_records.plus(SRoff::from_extent(cmd.came_to.records))?;
+            let data = &mut extent_table[cmd.id.get() as usize].data;
+            data.records = cmd.came_to.records;
+            data.logical = cmd.came_to.logical;
+            data.compressed = cmd.came_to.compressed;
+            held.sealed.push(cmd.id);
+            *sealed += 1;
+            if held.sealed.len() as u64 >= cmd.per_stream {
+                held.sealed_stream = true;
+                *sealed_streams += 1;
+            } else if let Some(next) = cmd.next {
+                let id = next.id;
+                extent_table
+                    .insert_at(
+                        id,
+                        Extent {
+                            link: MaybeUninit::uninit(),
+                            deletion: Flags::default(),
+                            data: next,
+                        },
+                    )
+                    .map_err(|error| Error::new(error.to_string()))?;
+                held.open = Some(id);
+                *extents += 1;
+            }
+            Ok(())
+        }
+        Op::SnSealStream => {
+            let cmd: SealStreamCmd = raft::codec::decode(&action.fields)?;
+            let SNState { shards, extent_table, sealed, sealed_streams, .. } = state;
+            let held = shards[shard_of(cmd.name)]
+                .get_mut(&cmd.name)
+                .ok_or_else(|| Error::new("seal-stream action names no stream"))?;
+            if held.sealed_stream {
+                return Ok(());
+            }
+            if held.open != Some(cmd.id) {
+                return Err(Error::new("seal-stream action names a stale extent"));
+            }
+            held.sealed_records =
+                held.sealed_records.plus(SRoff::from_extent(cmd.came_to.records))?;
+            let data = &mut extent_table[cmd.id.get() as usize].data;
+            data.records = cmd.came_to.records;
+            data.logical = cmd.came_to.logical;
+            data.compressed = cmd.came_to.compressed;
+            held.open = None;
+            held.sealed.push(cmd.id);
+            held.sealed_stream = true;
+            *sealed += 1;
+            *sealed_streams += 1;
+            Ok(())
+        }
+        Op::SnDelete => {
+            let cmd: DeleteCmd = raft::codec::decode(&action.fields)?;
+            let now = cmd.now;
+            let maximum = TimeIntSec64::new(cmd.maximum);
+            let SNState {
+                shards,
+                extent_table,
+                retired_streams,
+                stream_extras,
+                extent_extras,
+                pending_deletes,
+                ..
+            } = state;
+            let Some(stream) = shards[shard_of(cmd.name)].get_mut(&cmd.name) else {
+                if retired_streams.contains(&cmd.name) {
+                    pending_deletes.insert(
+                        index,
+                        PendingDelete { name: cmd.name, hard: cmd.hard, tasks: Vec::new() },
+                    );
+                    return Ok(());
+                }
+                return Err(Error::new("delete action names no stream"));
+            };
+            let first_hard = cmd.hard && !stream.deletion.deleted();
+            let first = stream_extras.transition(
+                cmd.name,
+                &mut stream.deletion,
+                now,
+                cmd.retention.map(TimeIntSec64::new),
+                cmd.hard,
+                maximum,
+            )?;
+            let interval = stream_extras.remaining(&cmd.name, now)?;
+            let ids: Vec<_> = stream.sealed.iter().copied().chain(stream.open).collect();
+            for id in &ids {
+                let extent = &mut extent_table[id.get() as usize];
+                let key = (extent.data.id, extent.data.created);
+                if first {
+                    extent_extras.release_soft(
+                        key,
+                        &mut extent.deletion,
+                        now,
+                        cmd.retention.map(TimeIntSec64::new).unwrap_or(interval),
+                        maximum,
+                    )?;
+                }
+                if let Some(retention) = cmd.retention {
+                    extent_extras.observe_retention(
+                        key,
+                        &mut extent.deletion,
+                        TimeIntSec64::new(retention),
+                        maximum,
+                    )?;
+                }
+                if first_hard {
+                    extent_extras.release_hard(&key, &mut extent.deletion)?;
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut tasks = Vec::new();
+            for id in ids {
+                if !seen.insert(id) {
+                    continue;
+                }
+                let extent = &mut extent_table[id.get() as usize];
+                if !extent.deletion.soft_deleted() || extent.deletion.retired() {
+                    continue;
+                }
+                let key = (extent.data.id, extent.data.created);
+                let hard = cmd.hard && extent.deletion.deleted();
+                if hard {
+                    extent_extras.delete(&key, &mut extent.deletion, now)?;
+                }
+                tasks.push(DeleteTask {
+                    id,
+                    created: extent.data.created,
+                    disks: extent.data.disks.clone(),
+                    interval: extent_extras.remaining(&key, now)?,
+                    hard,
+                });
+            }
+            pending_deletes.insert(index, PendingDelete { name: cmd.name, hard: cmd.hard, tasks });
+            Ok(())
+        }
+        Op::SnDeleteDone => {
+            let cmd: DeleteDoneCmd = raft::codec::decode(&action.fields)?;
+            let SNState {
+                shards,
+                extent_table,
+                retired_streams,
+                stream_extras,
+                extent_extras,
+                pending_deletes,
+                streams,
+                extents,
+                ..
+            } = state;
+            let pending = pending_deletes
+                .remove(&cmd.entry)
+                .ok_or_else(|| Error::new("delete completion has no pending work"))?;
+            if pending.hard {
+                for task in pending.tasks.iter().filter(|task| task.hard) {
+                    let extent = &mut extent_table[task.id.get() as usize];
+                    assert!(extent_extras.reclaim(
+                        &(task.id, task.created),
+                        &mut extent.deletion,
+                        cmd.now
+                    ));
+                    extent.data.disks.clear();
+                    *extents -= 1;
+                }
+                let shard = &mut shards[shard_of(pending.name)];
+                let stream = shard
+                    .get_mut(&pending.name)
+                    .ok_or_else(|| Error::new("hard delete completion has no stream"))?;
+                assert!(stream_extras.reclaim(&pending.name, &mut stream.deletion, cmd.now));
+                shard.remove(&pending.name);
+                retired_streams.insert(pending.name);
+                *streams -= 1;
+            }
+            Ok(())
+        }
+        _ => Err(Error::new(format!("unknown SN Raft action {}", action.op))),
     }
 }
 
@@ -409,8 +1230,20 @@ impl raft::execution::Application for SNState {
     }
 
     fn reset(&mut self) {
-        // Raft history currently contains no SN state actions, so rebuilding its
-        // cursor must not discard the live metadata that has not moved into Raft yet.
+        // The committed action history is the source of truth during a Raft restore.
+        for shard in &mut self.shards {
+            shard.clear();
+        }
+        self.extent_table.reset();
+        self.retired_streams.clear();
+        self.stream_extras = Extras::default();
+        self.extent_extras = Extras::default();
+        self.pending_deletes.clear();
+        // pending_opens is process-local and must survive replay until SnOpen applies.
+        self.streams = 0;
+        self.extents = 0;
+        self.sealed = 0;
+        self.sealed_streams = 0;
         self.applied = 0;
     }
 
@@ -495,22 +1328,24 @@ impl Service for SN {
     }
 
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
-        reply.send(self.answer(process, &request));
+        if request.op() == Op::OpenExtent {
+            if let Some(answer) = self.forward(&request) {
+                reply.send(answer);
+            } else {
+                self.open_to(process, &request, OpenWaiter::Reply(reply));
+            }
+        } else {
+            reply.send(self.answer(process, &request));
+        }
     }
 
     fn answer(&self, process: &Process, request: &Req) -> Resp {
-        match request.op() {
-            Op::Raft => self.raft_rpc(process, request),
-            Op::SoftDeleteStream | Op::DeleteStream => self.delete_stream(process, request),
-            Op::CreateStream => self.create(request),
-            Op::ConcatStreams => self.concat_streams(request),
-            Op::SealStream => self.seal_stream(request),
-            Op::OpenExtent => self.open_extent(process, request),
-            Op::LocateRecord => self.locate(request),
-            Op::ListExtents => self.list(request),
-            Op::SealExtent => self.seal(process, request),
-            _ => server::unbuilt(process, SERVES, request),
+        if self.forwardable(request.op()) {
+            if let Some(answer) = self.forward(request) {
+                return answer;
+            }
         }
+        self.answer_local(process, request)
     }
 
     fn status(&self, _process: &Process) -> Vec<String> {
@@ -526,6 +1361,37 @@ impl Service for SN {
 }
 
 impl SN {
+    fn answer_local(&self, process: &Process, request: &Req) -> Resp {
+        match request.op() {
+            Op::Raft => self.raft_rpc(process, request),
+            Op::SoftDeleteStream | Op::DeleteStream => self.delete_stream(process, request),
+            Op::CreateStream => self.create(request),
+            Op::ConcatStreams => self.concat_streams(request),
+            Op::SealStream => self.seal_stream(request),
+            Op::OpenExtent => self.open_extent(process, request),
+            Op::LocateRecord => self.locate(request),
+            Op::ListExtents => self.list(request),
+            Op::SealExtent => self.seal(process, request),
+            _ => server::unbuilt(process, SERVES, request),
+        }
+    }
+
+    fn commit_action(&self, action: raft::Action) -> Result<u64> {
+        let index = self.on_raft(move |host, node| {
+            if node.role != raft::Role::Leader || node.journal.failed {
+                return Err(Error::new("Raft is not a healthy leader"));
+            }
+            if node.state().last() != node.state().commit {
+                return Err(Error::new("SN has an outstanding Raft proposal; retry"));
+            }
+            let index = node.propose(raft::Command::Client(vec![action]))?;
+            host.refresh_application(node)?;
+            Ok(index)
+        })?;
+        self.wait_committed(index)?;
+        Ok(index)
+    }
+
     fn stop_raft(&self) -> Result<()> {
         self.snapshot_stopping.store(true, Ordering::SeqCst);
         self.wake_execution();
@@ -592,107 +1458,99 @@ impl SN {
     }
 
     fn delete_stream(&self, process: &Process, request: &Req) -> Resp {
-        match self.deleting_stream(process, request) {
-            Ok(()) => Resp::ok(),
-            Err(error) => error,
-        }
-    }
-
-    fn deleting_stream(&self, process: &Process, request: &Req) -> std::result::Result<(), Resp> {
         let deletion =
             Delete::of_with_limit(request, process.cluster.max_soft_delete_retention_secs)
-                .map_err(bad)?;
+                .map_err(bad);
+        let deletion = match deletion {
+            Ok(deletion) => deletion,
+            Err(error) => return error,
+        };
         let Target::Stream(name) = deletion.target else {
-            return Err(bad("expected a stream"));
+            return bad("expected a stream");
         };
         let _serial = self.deleting.lock().expect("deletion");
+        // A previous request may have committed its intent and then lost contact with an
+        // EN. Finish that durable outbox before creating a fresh intent.
+        loop {
+            let pending = {
+                let state = self.global_lock.read();
+                state
+                    .pending_deletes
+                    .iter()
+                    .filter(|(_, pending)| pending.name == name)
+                    .min_by_key(|(entry, _)| *entry)
+                    .map(|(&entry, pending)| (entry, pending.clone()))
+            };
+            let Some((entry, pending)) = pending else { break };
+            if let Err(error) = self.finish_delete(process, entry, pending) {
+                return error;
+            }
+        }
+
         let now = TimeSec::now();
-        let maximum = process.cluster.max_soft_delete_retention_secs;
-        let ids = {
-            let mut state = self.global_lock.write();
-            let SNState {
-                shards, extent_table, retired_streams, stream_extras, extent_extras, ..
-            } = &mut *state;
-            let Some(stream) = shards[shard_of(name)].get_mut(&name) else {
-                return if retired_streams.contains(&name) {
-                    Ok(())
-                } else {
-                    Err(Resp::error(Status::NotFound, "no stream"))
-                };
-            };
-            let first_hard = deletion.hard && !stream.deletion.deleted();
-            let first = stream_extras
-                .transition(
-                    name,
-                    &mut stream.deletion,
-                    now,
-                    deletion.retention,
-                    deletion.hard,
-                    maximum,
-                )
-                .map_err(bad)?;
-            let interval = stream_extras.remaining(&name, now).map_err(bad)?;
-            let ids: Vec<_> = stream.sealed.iter().copied().chain(stream.open).collect();
-            for id in &ids {
-                let extent = &mut extent_table[id.get() as usize];
-                let key = (extent.data.id, extent.data.created);
-                if first {
-                    extent_extras
-                        .release_soft(
-                            key,
-                            &mut extent.deletion,
-                            now,
-                            deletion.retention.unwrap_or(interval),
-                            maximum,
-                        )
-                        .map_err(bad)?;
-                }
-                if let Some(interval) = deletion.retention {
-                    extent_extras
-                        .observe_retention(key, &mut extent.deletion, interval, maximum)
-                        .map_err(bad)?;
-                }
-                if first_hard {
-                    extent_extras.release_hard(&key, &mut extent.deletion).map_err(bad)?;
-                }
+        {
+            let state = self.global_lock.read();
+            if state.retired_streams.contains(&name) {
+                return Resp::ok();
             }
-            ids
+            let Some(stream) = state.shards[shard_of(name)].get(&name) else {
+                return Resp::error(Status::NotFound, "no stream");
+            };
+            if stream.deletion.retired() {
+                return Resp::ok();
+            }
+            if let Err(error) = check_delete(&state, name, deletion.retention, deletion.hard, now) {
+                return bad(error);
+            }
+        }
+
+        let cmd = DeleteCmd {
+            name,
+            retention: deletion.retention.map(TimeIntSec64::get),
+            hard: deletion.hard,
+            now,
+            maximum: process.cluster.max_soft_delete_retention_secs.get(),
         };
-        let mut seen = std::collections::HashSet::new();
-        for id in ids {
-            if !seen.insert(id) {
-                continue;
-            }
-            let (created, disks, interval, hard) = {
-                let mut state = self.global_lock.write();
-                let SNState { extent_table, extent_extras, .. } = &mut *state;
-                let extent = &mut extent_table[id.get() as usize];
-                if !extent.deletion.soft_deleted() || extent.deletion.retired() {
-                    continue;
-                }
-                let key = (extent.data.id, extent.data.created);
-                let hard = deletion.hard && extent.deletion.deleted();
-                if hard {
-                    extent_extras
-                        .delete(&key, &mut extent.deletion, TimeSec::now())
-                        .map_err(bad)?;
-                }
-                (
-                    extent.data.created,
-                    extent.data.disks.clone(),
-                    extent_extras.remaining(&key, TimeSec::now()).map_err(bad)?,
-                    hard,
-                )
-            };
-            for disk in disks {
+        let action = match sn_action(Op::SnDelete, &cmd) {
+            Ok(action) => action,
+            Err(error) => return Resp::error(Status::Internal, error.to_string()),
+        };
+        let entry = match self.commit_action(action) {
+            Ok(entry) => entry,
+            Err(error) => return Resp::error(Status::Internal, error.to_string()),
+        };
+        let pending = self.global_lock.read().pending_deletes.get(&entry).cloned();
+        let Some(pending) = pending else {
+            return Resp::error(Status::Internal, "Raft applied deletion without an outbox");
+        };
+        if let Err(error) = self.finish_delete(process, entry, pending) {
+            return error;
+        }
+        Resp::ok()
+    }
+
+    fn finish_delete(
+        &self,
+        process: &Process,
+        entry: u64,
+        pending: PendingDelete,
+    ) -> std::result::Result<(), Resp> {
+        for task in &pending.tasks {
+            for &disk in &task.disks {
                 let (en, disk) = self.disk_at(disk);
-                let target = Target::Instance { en, disk, sn: self.mine, extent: id, created };
+                let target = Target::Instance {
+                    en,
+                    disk,
+                    sn: self.mine,
+                    extent: task.id,
+                    created: task.created,
+                };
                 forward(
                     process,
                     &format!("EN{en}"),
-                    Delete { target: target.clone(), retention: Some(interval), hard: false },
+                    Delete { target: target.clone(), retention: Some(task.interval), hard: false },
                 )?;
-                if hard {
+                if task.hard {
                     forward(
                         process,
                         &format!("EN{en}"),
@@ -700,30 +1558,12 @@ impl SN {
                     )?;
                 }
             }
-            if hard {
-                let mut state = self.global_lock.write();
-                let SNState { extent_table, extent_extras, .. } = &mut *state;
-                let extent = &mut extent_table[id.get() as usize];
-                assert!(extent_extras.reclaim(
-                    &(id, created),
-                    &mut extent.deletion,
-                    TimeSec::now()
-                ));
-                extent.data.disks = Vec::new();
-                self.extents.fetch_sub(1, Ordering::Relaxed);
-            }
         }
-        if deletion.hard {
-            let mut state = self.global_lock.write();
-            let SNState { shards, stream_extras, retired_streams, .. } = &mut *state;
-            let shard = &mut shards[shard_of(name)];
-            let stream = shard.get_mut(&name).unwrap();
-            assert!(stream_extras.reclaim(&name, &mut stream.deletion, TimeSec::now()));
-            shard.remove(&name);
-            retired_streams.insert(name);
-            self.streams.fetch_sub(1, Ordering::Relaxed);
-        }
-        Ok(())
+        let action = sn_action(Op::SnDeleteDone, &DeleteDoneCmd { entry, now: TimeSec::now() })
+            .map_err(|error| Resp::error(Status::Internal, error.to_string()))?;
+        self.commit_action(action)
+            .map(|_| ())
+            .map_err(|error| Resp::error(Status::Internal, error.to_string()))
     }
 
     fn disk_at(&self, id: SnDiskId) -> (EnId, DiskId) {
@@ -826,7 +1666,6 @@ impl SN {
     /// objects at once names a run of streams in one request, and they share the second —
     /// so it is the consecutive ids that keep the names apart (#110).
     fn create(&self, request: &Req) -> Resp {
-        let _serial = self.deleting.lock().expect("deletion");
         let (mut payload, rest) =
             match structure(&request.args(), Op::CreateStream, "a create-stream request") {
                 Ok(value) => value,
@@ -857,52 +1696,53 @@ impl SN {
         if let Err(e) = payload.done() {
             return Resp::error(Status::BadRequest, e.to_string());
         }
-
-        let mut made = 0;
-        for n in 0..count {
-            // Every stream of the run shares the second, which is what makes the ids have to
-            // differ — and they do, being consecutive (#110).
-            let Ok(stream) = StreamId::of_number(first.number() + n) else {
-                return Resp::error(
-                    Status::BadRequest,
-                    format!("{} is not a stream", first.number() + n),
-                );
-            };
-            let name = StreamName { range, stream, created };
-            let mut state = self.global_lock.write();
-            if state.retired_streams.contains(&name) {
-                return bad("stream identity has been retired");
-            }
-            let shard = &mut state.shards[shard_of(name)];
-            if let Some(stream) = shard.get(&name) {
-                if !stream.deletion.readable(false) {
-                    return bad("stream is deleted");
-                }
-                continue; // A create retry must not overwrite its extents or flags.
-            }
-            shard.insert(
-                name,
-                Stream {
-                    deletion: Flags::default(),
-                    created,
-                    creator: self.mine,
-                    sealed: Vec::new(),
-                    open: None,
-                    sealed_records: SRoff::ZERO,
-                    sealed_stream: false,
-                },
-            );
-            made += 1;
+        if count == 0 {
+            return Resp::ok();
         }
-        self.streams.fetch_add(made, Ordering::Relaxed);
-        Resp::ok()
+
+        let end = match first.number().checked_add(count) {
+            Some(end) if end <= u64::from(StreamId::MAX.get()) + 1 => end,
+            _ => return bad("stream id run exceeds stream id space"),
+        };
+        let _serial = self.deleting.lock().expect("deletion");
+        {
+            let state = self.global_lock.read();
+            let mut missing = false;
+            for number in first.number()..end {
+                let stream = StreamId::new(number as u32);
+                let name = StreamName { range, stream, created };
+                if state.retired_streams.contains(&name) {
+                    return bad("stream identity has been retired");
+                }
+                match state.shards[shard_of(name)].get(&name) {
+                    Some(stream) if !stream.deletion.readable(false) => {
+                        return bad("stream is deleted");
+                    }
+                    Some(_) => {}
+                    None => missing = true,
+                }
+            }
+            if !missing {
+                return Resp::ok();
+            }
+        }
+        let action = match sn_action(
+            Op::SnCreate,
+            &CreateCmd { range, first, count, created, creator: self.mine },
+        ) {
+            Ok(action) => action,
+            Err(error) => return Resp::error(Status::Internal, error.to_string()),
+        };
+        match self.commit_action(action) {
+            Ok(_) => Resp::ok(),
+            Err(error) => Resp::error(Status::Internal, error.to_string()),
+        }
     }
 
     /// Copy two sealed streams' extent references into an already-created destination
     /// stream. The destination remains open, so a caller can append after the copied
     /// data. Extents themselves are immutable references here; no EN data is copied.
     fn concat_streams(&self, request: &Req) -> Resp {
-        let _serial = self.deleting.lock().expect("deletion");
         let (mut payload, rest) =
             match structure(&request.args(), Op::ConcatStreams, "a concat-streams request") {
                 Ok(value) => value,
@@ -918,9 +1758,6 @@ impl SN {
             Ok(name) => name,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        if self.global_lock.read().retired_streams.contains(&destination) {
-            return bad("destination stream identity has been retired");
-        }
         let left = match stream_name(&mut payload) {
             Ok(name) => name,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
@@ -952,7 +1789,11 @@ impl SN {
         if destination.range != left.range || destination.range != right.range {
             return Resp::error(Status::BadRequest, "concat-streams streams have different ranges");
         }
+        if self.global_lock.read().retired_streams.contains(&destination) {
+            return bad("destination stream identity has been retired");
+        }
 
+        let _serial = self.deleting.lock().expect("deletion");
         {
             let state = self.global_lock.read();
             let shard = &state.shards[shard_of(destination)];
@@ -1024,78 +1865,156 @@ impl SN {
         let mut copied = Vec::with_capacity(extent_count);
         copied.extend(left_stream.sealed.iter().cloned());
         copied.extend(right_stream.sealed.iter().cloned());
-        let mut state = self.global_lock.write();
-        let SNState { shards, extent_table, extent_extras, retired_streams, .. } = &mut *state;
-        if retired_streams.contains(&destination) {
-            return bad("destination stream identity has been retired");
-        }
-        let shard = &mut shards[shard_of(destination)];
-        if require_absent && shard.contains_key(&destination) {
-            return Resp::error(
-                Status::BadRequest,
-                format!("destination {destination} already exists"),
-            );
-        }
-        if require_exists && !shard.contains_key(&destination) {
-            return Resp::error(Status::NotFound, format!("no {destination}"));
-        }
-        let destination_stream = shard.entry(destination).or_insert_with(|| Stream {
-            deletion: Flags::default(),
-            created: destination.created,
-            creator: self.mine,
-            sealed: Vec::new(),
-            open: None,
-            sealed_records: SRoff::ZERO,
-            sealed_stream: false,
-        });
-        if destination_stream.sealed_stream
-            || destination_stream.open.is_some()
-            || !destination_stream.sealed.is_empty()
         {
-            return Resp::error(Status::BadRequest, "destination stream is not empty and open");
-        }
-        let extents = extent_table;
-        let extras = extent_extras;
-        let mut retained: Vec<ExtentId> = Vec::new();
-        for &id in &copied {
-            let extent = &mut extents[id.get() as usize];
-            if let Err(e) =
-                extras.retain((extent.data.id, extent.data.created), &mut extent.deletion)
-            {
-                for prior in retained {
-                    let extent = &mut extents[prior.get() as usize];
-                    extras
-                        .release(&(extent.data.id, extent.data.created), &mut extent.deletion)
-                        .expect("retained reference");
-                }
-                return Resp::error(Status::BadRequest, e.to_string());
+            let state = self.global_lock.read();
+            let mut copies = HashMap::<ExtentId, u32>::new();
+            for &id in &copied {
+                let count = copies.entry(id).or_default();
+                *count = match count.checked_add(1) {
+                    Some(count) => count,
+                    None => return bad("concat extent reference count overflow"),
+                };
             }
-            retained.push(id);
+            for (id, add) in copies {
+                let Some(extent) = state.extent_table.get(id.get() as usize) else {
+                    return bad("concat names an unknown extent");
+                };
+                if extent.deletion.soft_deleted() || extent.deletion.deleted() {
+                    return bad("concat names a deleted extent");
+                }
+                let refs = state
+                    .extent_extras
+                    .counts(&(extent.data.id, extent.data.created), extent.deletion);
+                if refs.0 == 0 || refs.1 == 0 || u32::MAX - refs.0 < add || u32::MAX - refs.1 < add
+                {
+                    return bad("concat extent reference count overflow or retired");
+                }
+            }
         }
-        destination_stream.sealed = copied;
-        destination_stream.sealed_records = records;
-        self.sealed.fetch_add(extent_count as u64, Ordering::Relaxed);
-        Resp::ok()
+        let action = match sn_action(
+            Op::SnConcat,
+            &ConcatCmd {
+                destination,
+                creator: self.mine,
+                extents: copied,
+                records,
+                require_exists,
+                require_absent,
+            },
+        ) {
+            Ok(action) => action,
+            Err(error) => return Resp::error(Status::Internal, error.to_string()),
+        };
+        match self.commit_action(action) {
+            Ok(_) => Resp::ok(),
+            Err(error) => Resp::error(Status::Internal, error.to_string()),
+        }
     }
 
-    /// A stream's name, and back comes the extent to append to. The ENs are taken from the
-    /// roster, and the second from the clock.
+    /// A stream's name, and back comes the extent to append to.
     fn open_extent(&self, process: &Process, request: &Req) -> Resp {
+        let (send, receive) = sync_channel(1);
+        self.open_to(process, request, OpenWaiter::Forward(send));
+        receive.recv().unwrap_or_else(|_| {
+            Resp::error(Status::Internal, "SN stopped before answering the append")
+        })
+    }
+
+    fn extent_reply(&self, extent: ExtentData, first: SRoff) -> Resp {
+        Resp::from_args(Status::Ok, self.extent_args(&extent, first)).id(0)
+    }
+
+    fn open_to(&self, process: &Process, request: &Req, waiter: OpenWaiter) {
         let (mut payload, rest) =
             match structure(&request.args(), Op::OpenExtent, "an open-extent request") {
                 Ok(value) => value,
-                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+                Err(error) => {
+                    return waiter.send(Resp::error(Status::BadRequest, error.to_string()));
+                }
             };
         if !rest.is_empty() {
-            return Resp::error(
+            return waiter.send(Resp::error(
                 Status::BadRequest,
                 "an open-extent request has trailing arguments",
-            );
+            ));
         }
         let name = match stream_name(&mut payload).and_then(|name| payload.done().map(|()| name)) {
             Ok(name) => name,
-            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+            Err(error) => return waiter.send(Resp::error(Status::BadRequest, error.to_string())),
         };
+
+        // Existing extents and pending creates are checked under the same read lock.
+        // A pending entry cannot be removed while this waiter is being pushed.
+        {
+            let state = self.global_lock.read();
+            match open_check(&state, name) {
+                OpenCheck::Answer(answer) => {
+                    drop(state);
+                    return waiter.send(answer);
+                }
+                OpenCheck::Extent(extent, first) => {
+                    drop(state);
+                    return waiter.send(self.extent_reply(extent, first));
+                }
+                OpenCheck::Create => {}
+            }
+            if let Some(pending) = state.pending_opens.get(&name) {
+                pending.push(waiter);
+                return;
+            }
+        }
+
+        // Elect one appender to create the entry. Other appends can join it as soon
+        // as it is visible, even while the elected appender waits for the mutation
+        // turn or the Raft commit.
+        {
+            let mut state = self.global_lock.write();
+            match open_check(&state, name) {
+                OpenCheck::Answer(answer) => {
+                    drop(state);
+                    return waiter.send(answer);
+                }
+                OpenCheck::Extent(extent, first) => {
+                    drop(state);
+                    return waiter.send(self.extent_reply(extent, first));
+                }
+                OpenCheck::Create => {}
+            }
+            if let Some(pending) = state.pending_opens.get(&name) {
+                pending.push(waiter);
+                return;
+            }
+            if state.extent_table.len >= state.max_extents as usize {
+                drop(state);
+                return waiter.send(Resp::error(Status::Internal, "SN extent table is full"));
+            }
+            state.pending_opens.insert(name, PendingOpen::new(waiter));
+        }
+
+        let _serial = self.deleting.lock().expect("SN mutation");
+        let id = {
+            let state = self.global_lock.read();
+            match open_check(&state, name) {
+                OpenCheck::Answer(answer) => {
+                    drop(state);
+                    self.fail_open(name, answer);
+                    return;
+                }
+                OpenCheck::Extent(extent, first) => {
+                    drop(state);
+                    self.finish_open(name, self.extent_reply(extent, first));
+                    return;
+                }
+                OpenCheck::Create => {}
+            }
+            if state.extent_table.len >= state.max_extents as usize {
+                drop(state);
+                self.fail_open(name, Resp::error(Status::Internal, "SN extent table is full"));
+                return;
+            }
+            ExtentId::new(state.extent_table.len as u32)
+        };
+
         let assigned = process.assigned_of_kind(ServiceKind::En);
         if !assigned.is_empty() {
             let mut disks = self.disks.lock().expect("disks");
@@ -1109,12 +2028,48 @@ impl SN {
                 }
             }
         }
-        match self.open(name, TimeSec::now(), process.cluster.extents.instances) {
-            Ok(placed) => {
-                Resp::from_args(Status::Ok, self.extent_args(&placed.extent, placed.first)).id(0)
+        let disks = match pick_disks(
+            self.disks.lock().expect("disks").len(),
+            process.cluster.extents.instances,
+        ) {
+            Ok(disks) => disks,
+            Err(error) => {
+                self.fail_open(name, Resp::error(Status::Internal, error.to_string()));
+                return;
             }
-            Err(Full { records, why: None }) => Resp::number(Status::Sealed, records.number()),
-            Err(Full { why: Some(why), .. }) => Resp::error(Status::Internal, why.to_string()),
+        };
+        let extent = ExtentData {
+            logical: ELoff::ZERO,
+            compressed: ECoff::ZERO,
+            id,
+            records: ERoff::ZERO,
+            created: TimeSec::now(),
+            disks,
+        };
+        let action = match sn_action(Op::SnOpen, &OpenCmd { name, extent }) {
+            Ok(action) => action,
+            Err(error) => {
+                self.fail_open(name, Resp::error(Status::Internal, error.to_string()));
+                return;
+            }
+        };
+        if let Err(error) = self.commit_action(action) {
+            self.fail_open(name, Resp::error(Status::Internal, error.to_string()));
+        }
+    }
+
+    /// Remove a failed create while excluding appenders that could join its waiters.
+    fn fail_open(&self, name: StreamName, answer: Resp) {
+        self.finish_open(name, answer);
+    }
+
+    fn finish_open(&self, name: StreamName, answer: Resp) {
+        let waiters = {
+            let mut state = self.global_lock.write();
+            state.pending_opens.remove(&name).map(|pending| pending.take()).unwrap_or_default()
+        };
+        for waiter in waiters {
+            waiter.send(answer.clone());
         }
     }
 
@@ -1336,6 +2291,29 @@ impl SN {
 
     /// A stream's name, the sealed extent and what it came to: record it and open the next
     /// one, which is one round trip rather than two because whoever saw the seal wants both.
+    fn seal_reply(&self, name: StreamName, id: ExtentId) -> Option<Resp> {
+        let state = self.global_lock.read();
+        let Some(stream) = state.shards[shard_of(name)].get(&name) else {
+            return Some(Resp::error(Status::NotFound, format!("no {name}")));
+        };
+        if !stream.deletion.readable(false) {
+            return Some(bad("stream is deleted"));
+        }
+        if stream.open == Some(id) {
+            return None;
+        }
+        if stream.sealed_stream {
+            return Some(Resp::number(Status::Sealed, stream.sealed_records.number()));
+        }
+        let Some(open) = stream.open else {
+            return Some(Resp::error(Status::BadRequest, "stream has no open extent"));
+        };
+        let extent = state.extent_table[open.get() as usize].data.clone();
+        let first = stream.sealed_records;
+        drop(state);
+        Some(Resp::from_args(Status::Ok, self.extent_args(&extent, first)).id(0))
+    }
+
     fn seal(&self, process: &Process, request: &Req) -> Resp {
         let (mut payload, rest) =
             match structure(&request.args(), Op::SealExtent, "a seal-extent request") {
@@ -1362,22 +2340,113 @@ impl SN {
         if let Err(e) = payload.done() {
             return Resp::error(Status::BadRequest, e.to_string());
         }
-        match self.close(
-            name,
-            id,
-            came_to,
-            TimeSec::now(),
-            process.cluster.extents.instances,
-            process.cluster.extents.per_stream,
-        ) {
-            Ok(placed) => {
-                Resp::from_args(Status::Ok, self.extent_args(&placed.extent, placed.first)).id(0)
-            }
-            // The stream is full, which is the DN's business: it says what the
-            // stream came to so the object's next stream can carry on from there.
-            Err(Full { records, why: None }) => Resp::number(Status::Sealed, records.number()),
-            Err(Full { why: Some(why), .. }) => Resp::error(Status::Internal, why.to_string()),
+
+        if let Some(answer) = self.seal_reply(name, id) {
+            return answer;
         }
+        let _serial = self.deleting.lock().expect("SN mutation");
+        if let Some(answer) = self.seal_reply(name, id) {
+            return answer;
+        }
+        let (first, is_full, next_id) = {
+            let state = self.global_lock.read();
+            let stream = &state.shards[shard_of(name)][&name];
+            if stream.sealed_records.plus(SRoff::from_extent(came_to.records)).is_err() {
+                return Resp::error(Status::BadRequest, "seal-extent record total overflows");
+            }
+            (
+                stream.sealed_records,
+                stream.sealed.len() + 1 >= process.cluster.extents.per_stream,
+                state.extent_table.len,
+            )
+        };
+
+        let mut next = None;
+        let mut next_error = None;
+        if !is_full {
+            let max = self.global_lock.read().max_extents as usize;
+            if next_id >= max {
+                next_error = Some("SN extent table is full".to_string());
+            } else {
+                let disks = match pick_disks(
+                    self.disks.lock().expect("disks").len(),
+                    process.cluster.extents.instances,
+                ) {
+                    Ok(disks) => disks,
+                    Err(error) => {
+                        next_error = Some(error.to_string());
+                        Vec::new()
+                    }
+                };
+                if next_error.is_none() {
+                    next = Some(ExtentData {
+                        logical: ELoff::ZERO,
+                        compressed: ECoff::ZERO,
+                        id: ExtentId::new(next_id as u32),
+                        records: ERoff::ZERO,
+                        created: TimeSec::now(),
+                        disks,
+                    });
+                }
+            }
+        }
+        let action = match sn_action(
+            Op::SnSeal,
+            &SealCmd {
+                name,
+                id,
+                came_to,
+                per_stream: process.cluster.extents.per_stream as u64,
+                next,
+            },
+        ) {
+            Ok(action) => action,
+            Err(error) => return Resp::error(Status::Internal, error.to_string()),
+        };
+        if let Err(error) = self.commit_action(action) {
+            return Resp::error(Status::Internal, error.to_string());
+        }
+
+        let state = self.global_lock.read();
+        let Some(stream) = state.shards[shard_of(name)].get(&name) else {
+            return Resp::error(Status::Internal, "Raft removed stream while sealing extent");
+        };
+        if stream.sealed_stream {
+            return Resp::number(Status::Sealed, stream.sealed_records.number());
+        }
+        let Some(open) = stream.open else {
+            return Resp::error(
+                Status::Internal,
+                next_error.unwrap_or_else(|| {
+                    "Raft sealed extent without opening its successor".to_string()
+                }),
+            );
+        };
+        Resp::from_args(
+            Status::Ok,
+            self.extent_args(&state.extent_table[open.get() as usize].data, first),
+        )
+        .id(0)
+    }
+
+    fn seal_stream_reply(&self, name: StreamName, id: ExtentId, came_to: Filled) -> Option<Resp> {
+        let state = self.global_lock.read();
+        let Some(stream) = state.shards[shard_of(name)].get(&name) else {
+            return Some(Resp::error(Status::NotFound, format!("no {name}")));
+        };
+        if !stream.deletion.readable(false) {
+            return Some(bad("stream is deleted"));
+        }
+        if stream.sealed_stream {
+            return Some(Resp::number(Status::Ok, stream.sealed_records.number()));
+        }
+        if stream.open != Some(id) {
+            return Some(Resp::error(Status::BadRequest, "seal-stream named a stale extent"));
+        }
+        if stream.sealed_records.plus(SRoff::from_extent(came_to.records)).is_err() {
+            return Some(Resp::error(Status::BadRequest, "seal-stream record total overflows"));
+        }
+        None
     }
 
     fn seal_stream(&self, request: &Req) -> Resp {
@@ -1401,44 +2470,31 @@ impl SN {
         if !rest.is_empty() || payload.done().is_err() {
             return Resp::error(Status::BadRequest, "seal-stream has trailing arguments");
         }
-        let mut state = self.global_lock.write();
-        let SNState { shards, extent_table, .. } = &mut *state;
-        let shard = &mut shards[shard_of(name)];
-        let Some(stream) = shard.get_mut(&name) else {
-            return Resp::error(Status::NotFound, format!("no {name}"));
+
+        if let Some(answer) = self.seal_stream_reply(name, id, came_to) {
+            return answer;
+        }
+        let _serial = self.deleting.lock().expect("SN mutation");
+        if let Some(answer) = self.seal_stream_reply(name, id, came_to) {
+            return answer;
+        }
+        let action = match sn_action(Op::SnSealStream, &SealStreamCmd { name, id, came_to }) {
+            Ok(action) => action,
+            Err(error) => return Resp::error(Status::Internal, error.to_string()),
         };
-        if !stream.deletion.readable(false) {
-            return bad("stream is deleted");
+        if let Err(error) = self.commit_action(action) {
+            return Resp::error(Status::Internal, error.to_string());
         }
-        if stream.sealed_stream {
-            return Resp::number(Status::Ok, stream.sealed_records.number());
-        }
-        let Some(open) = stream.open else {
-            return Resp::error(Status::BadRequest, "stream has no open extent");
-        };
-        if open != id {
-            return Resp::error(Status::BadRequest, "seal-stream named a stale extent");
-        }
-        stream.sealed_records = stream
-            .sealed_records
-            .plus(SRoff::from_extent(came_to.records))
-            .expect("stream record position fits");
-        let extents = extent_table;
-        let extent = &mut extents[open.get() as usize].data;
-        extent.records = came_to.records;
-        extent.logical = came_to.logical;
-        extent.compressed = came_to.compressed;
-        stream.open = None;
-        stream.sealed.push(open);
-        stream.sealed_stream = true;
-        self.sealed.fetch_add(1, Ordering::Relaxed);
-        self.sealed_streams.fetch_add(1, Ordering::Relaxed);
-        Resp::number(Status::Ok, stream.sealed_records.number())
+        Resp::number(
+            Status::Ok,
+            self.global_lock.read().shards[shard_of(name)][&name].sealed_records.number(),
+        )
     }
 
     /// Seal the stream's open extent and name the next one, both under the shared
     /// lock, so a request that finds the extent already sealed gets the extent that
     /// replaced it rather than an error.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn close(
         &self,
@@ -1450,7 +2506,7 @@ impl SN {
         per_stream: usize,
     ) -> std::result::Result<Placed, Full> {
         let mut state = self.global_lock.write();
-        let SNState { shards, extent_table, .. } = &mut *state;
+        let SNState { shards, extent_table, extents, sealed, sealed_streams, .. } = &mut *state;
         let shard = &mut shards[shard_of(name)];
         let Some(held) = shard.get_mut(&name) else {
             return Err(Full::from(Error::new(format!("no {name}"))));
@@ -1475,19 +2531,22 @@ impl SN {
                 data.compressed = came_to.compressed;
             }
             held.sealed.push(extent);
+            *sealed += 1;
             self.sealed.fetch_add(1, Ordering::Relaxed);
             if held.sealed.len() >= per_stream {
                 held.sealed_stream = true;
+                *sealed_streams += 1;
                 self.sealed_streams.fetch_add(1, Ordering::Relaxed);
             }
         }
         if held.sealed_stream {
             return Err(Full::records(held.sealed_records));
         }
-        self.appendable(extent_table, held, second, instances).map_err(Full::from)
+        self.appendable(extent_table, held, extents, second, instances).map_err(Full::from)
     }
 
     /// The stream's open extent, allocating one if it has none.
+    #[cfg(test)]
     fn open(
         &self,
         name: StreamName,
@@ -1495,7 +2554,7 @@ impl SN {
         instances: usize,
     ) -> std::result::Result<Placed, Full> {
         let mut state = self.global_lock.write();
-        let SNState { shards, extent_table, .. } = &mut *state;
+        let SNState { shards, extent_table, extents, .. } = &mut *state;
         let shard = &mut shards[shard_of(name)];
         let Some(held) = shard.get_mut(&name) else {
             return Err(Full::from(Error::new(format!("no {name}"))));
@@ -1503,7 +2562,7 @@ impl SN {
         if held.sealed_stream {
             return Err(Full::records(held.sealed_records));
         }
-        self.appendable(extent_table, held, second, instances).map_err(Full::from)
+        self.appendable(extent_table, held, extents, second, instances).map_err(Full::from)
     }
 
     /// The extent this stream can be appended to, named here if there is not one.
@@ -1517,10 +2576,12 @@ impl SN {
     /// ⚠️ When opening an extent has to be recorded durably, this becomes a wait on
     /// somebody else's round trip, and blocking a worker per waiter would be the wrong
     /// shape — the waiters must attach to the one in flight instead.
+    #[cfg(test)]
     fn appendable(
         &self,
         extents: &mut ExtentTable,
         held: &mut Stream,
+        count: &mut u64,
         second: TimeSec,
         instances: usize,
     ) -> Result<Placed> {
@@ -1551,6 +2612,7 @@ impl SN {
             .map_err(|error| Error::new(format!("allocate SN extent slot: {error}")))?;
         let extent = extents[id.get() as usize].data.clone();
         held.open = Some(id);
+        *count += 1;
         self.extents.fetch_add(1, Ordering::Relaxed);
         Ok(Placed { extent, first })
     }
@@ -1560,16 +2622,49 @@ impl Host for SN {
     type Application = SNState;
 
     fn apply_client(&self, work: &raft::execution::Work) -> Result<()> {
-        raft::execution::execute_blocking(
+        let mut opened = Vec::new();
+        let applied = raft::execution::execute_blocking(
             &self.global_lock,
             &self.execution,
             work,
             Duration::from_millis(self.config.raft.execution_lock_ms),
-            |_state, _context, action| {
-                Err(Error::new(format!("SN does not execute Raft action {}", action.op)))
+            |state, context, action| {
+                apply_sn_action(state, context.index, action)?;
+                if action.op == Op::SnOpen {
+                    let command: OpenCmd = raft::codec::decode(&action.fields)?;
+                    if let Some(pending) = state.pending_opens.remove(&command.name) {
+                        let stream = state.shards[shard_of(command.name)].get(&command.name);
+                        let extent = stream.and_then(|stream| {
+                            stream.open.map(|id| {
+                                (
+                                    state.extent_table[id.get() as usize].data.clone(),
+                                    stream.sealed_records,
+                                )
+                            })
+                        });
+                        opened.push((pending.take(), extent));
+                    }
+                }
+                Ok(())
             },
-        )
-        .map(|_| ())
+        );
+        // Do not write responses while holding the application write lock.
+        for (waiters, extent) in opened {
+            let answer = extent.map_or_else(
+                || Resp::error(Status::Internal, "Raft opened no extent"),
+                |(extent, first)| self.extent_reply(extent, first),
+            );
+            for waiter in waiters {
+                waiter.send(answer.clone());
+            }
+        }
+        applied?;
+        let state = self.global_lock.read();
+        self.streams.store(state.streams, Ordering::Relaxed);
+        self.extents.store(state.extents, Ordering::Relaxed);
+        self.sealed.store(state.sealed, Ordering::Relaxed);
+        self.sealed_streams.store(state.sealed_streams, Ordering::Relaxed);
+        Ok(())
     }
 
     fn prepare_primary(&self, _node: &mut raft::Node) -> Result<()> {
@@ -1593,11 +2688,20 @@ impl Host for SN {
     }
 
     fn dispatch_forwarded(&self, process: &Process, request: &Req) -> Resp {
-        server::unbuilt(process, SERVES, request)
+        self.answer_local(process, request)
     }
 
-    fn forwardable(&self, _op: Op) -> bool {
-        false
+    fn forwardable(&self, op: Op) -> bool {
+        matches!(
+            op,
+            Op::SoftDeleteStream
+                | Op::DeleteStream
+                | Op::CreateStream
+                | Op::ConcatStreams
+                | Op::SealStream
+                | Op::OpenExtent
+                | Op::SealExtent
+        )
     }
 
     fn registered_endpoint(&self, _name: &str) -> Option<std::net::SocketAddr> {
@@ -1644,6 +2748,7 @@ mod tests {
         let id = placed.extent.id;
         {
             let mut state = sn.global_lock.write();
+            state.streams += 1;
             let snapshot = state.shards[shard_of(source)][&source].clone();
             state.shards[shard_of(other)].insert(other, snapshot);
         }
@@ -1659,10 +2764,12 @@ mod tests {
         let request = |name, retention, hard| {
             Delete { target: Target::Stream(name), retention, hard }.request().unwrap()
         };
+        let before = sn.on_raft(|_, node| Ok(node.state().commit)).unwrap();
         assert_eq!(
             sn.delete_stream(&process, &request(source, None, true)).status,
             Status::BadRequest
         );
+        assert_eq!(sn.on_raft(|_, node| Ok(node.state().commit)).unwrap(), before);
         assert_eq!(
             sn.delete_stream(&process, &request(source, Some(TimeIntSec64::MIN), false)).status,
             Status::Ok
@@ -1704,8 +2811,10 @@ mod tests {
                 .hard
                 .store(u32::MAX - 1, Ordering::Relaxed);
         }
+        let before = sn.on_raft(|_, node| Ok(node.state().commit)).unwrap();
         let response = sn.concat_streams(&concat_request(named(0, 9), named(0, 7), named(0, 7)));
         assert_eq!(response.status, Status::BadRequest);
+        assert_eq!(sn.on_raft(|_, node| Ok(node.state().commit)).unwrap(), before);
         let state = sn.global_lock.read();
         let SNState { extent_table, extent_extras, .. } = &*state;
         let table = extent_table;
@@ -1753,8 +2862,8 @@ mod tests {
         };
         {
             let mut state = sn.global_lock.write();
-            let SNState { extent_table, .. } = &mut *state;
-            sn.appendable(extent_table, &mut stream, TimeSec::new(100), 4).unwrap();
+            let SNState { extent_table, extents, .. } = &mut *state;
+            sn.appendable(extent_table, &mut stream, extents, TimeSec::new(100), 4).unwrap();
         }
 
         let state = sn.global_lock.read();
@@ -1993,6 +3102,138 @@ mod tests {
         assert_eq!(made.status, Status::Ok);
     }
 
+    #[test]
+    fn extent_actions_replay_from_checkpoint_history() {
+        let name = named(3, 19);
+        let sn = sn_with_stream(name.range.number(), name.stream.get());
+        let process = testing::process();
+        let open_req = Req::new(Op::OpenExtent).structure({
+            let mut payload = StructWriter::new();
+            payload.range_id(name.range);
+            payload.stream_id(name.stream);
+            payload.time_sec(name.created);
+            payload
+        });
+
+        assert_eq!(sn.open_extent(&process, &open_req).status, Status::Ok);
+        let id = sn.global_lock.read().shards[shard_of(name)][&name].open.unwrap();
+        let commit = sn.on_raft(|_, node| Ok(node.state().commit)).unwrap();
+        assert_eq!(sn.open_extent(&process, &open_req).status, Status::Ok);
+        assert_eq!(sn.on_raft(|_, node| Ok(node.state().commit)).unwrap(), commit);
+
+        let seal = |op: Op, id: ExtentId, filled: Filled| {
+            Req::new(op).structure({
+                let mut payload = StructWriter::new();
+                payload.range_id(name.range);
+                payload.stream_id(name.stream);
+                payload.time_sec(name.created);
+                payload.extent_id(id);
+                payload.eroff(filled.records);
+                payload.eloff(filled.logical);
+                payload.ecoff(filled.compressed);
+                payload
+            })
+        };
+        assert_eq!(sn.seal(&process, &seal(Op::SealExtent, id, came(7, 90))).status, Status::Ok);
+        let next = sn.global_lock.read().shards[shard_of(name)][&name].open.unwrap();
+        assert_eq!(sn.seal_stream(&seal(Op::SealStream, next, came(3, 50))).status, Status::Ok);
+
+        let expected = sn.global_lock.read();
+        let stream = &expected.shards[shard_of(name)][&name];
+        assert!(stream.sealed_stream);
+        assert_eq!(stream.sealed.len(), 2);
+        assert_eq!(expected.extent_table.len(), 2);
+        let history = sn.on_raft(|_, node| Ok(node.state().capture().application)).unwrap();
+        drop(expected);
+
+        let mut replay = SNState::new(sn.config.max_extents).unwrap();
+        for entry in history {
+            if let raft::Command::Client(actions) = entry.command {
+                for action in &actions {
+                    apply_sn_action(&mut replay, entry.index, action).unwrap();
+                }
+            }
+        }
+        let restored = &replay.shards[shard_of(name)][&name];
+        assert!(restored.sealed_stream);
+        assert_eq!(restored.sealed, vec![ExtentId::FIRST, ExtentId::new(1)]);
+        assert_eq!(restored.sealed_records, SRoff::new(10));
+        assert_eq!(replay.extent_table.len(), 2);
+        assert_eq!(replay.extent_table[0].data.records, ERoff::new(7));
+        assert_eq!(replay.extent_table[1].data.records, ERoff::new(3));
+    }
+
+    #[test]
+    fn wait_push() {
+        let name = named(1, 2);
+        let state = Arc::new(parking_lot::RwLock::new(SNState::new(1).unwrap()));
+        state.write().pending_opens.insert(name, PendingOpen::default());
+        let mut receivers = Vec::new();
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let mut senders = Vec::new();
+            for _ in 0..64 {
+                let (sender, receive) = sync_channel(1);
+                senders.push(sender);
+                receivers.push(receive);
+            }
+            let state = Arc::clone(&state);
+            workers.push(thread::spawn(move || {
+                for sender in senders {
+                    let held = state.read();
+                    held.pending_opens
+                        .get(&name)
+                        .expect("pending stream")
+                        .push(OpenWaiter::Forward(sender));
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let waiters = {
+            let mut held = state.write();
+            held.pending_opens.remove(&name).unwrap().take()
+        };
+        assert_eq!(waiters.len(), receivers.len());
+        for waiter in waiters {
+            waiter.send(Resp::ok());
+        }
+        for receive in receivers {
+            assert_eq!(receive.recv().unwrap().status, Status::Ok);
+        }
+    }
+
+    #[test]
+    fn wait_fanout() {
+        let name = named(3, 21);
+        let sn = sn_with_stream(name.range.number(), name.stream.get());
+        let (one, got_one) = sync_channel(1);
+        let (two, got_two) = sync_channel(1);
+        {
+            let mut state = sn.global_lock.write();
+            let waiters = PendingOpen::default();
+            waiters.push(OpenWaiter::Forward(one));
+            waiters.push(OpenWaiter::Forward(two));
+            state.pending_opens.insert(name, waiters);
+        }
+        let extent = ExtentData {
+            id: ExtentId::FIRST,
+            created: MADE,
+            records: ERoff::ZERO,
+            logical: ELoff::ZERO,
+            compressed: ECoff::ZERO,
+            disks: vec![SnDiskId::new(0); testing::extents().instances],
+        };
+        let action = sn_action(Op::SnOpen, &OpenCmd { name, extent }).unwrap();
+        sn.commit_action(action).unwrap();
+        let one = got_one.recv_timeout(Duration::from_secs(1)).unwrap();
+        let two = got_two.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(one.status, Status::Ok);
+        assert_eq!(one.payload, two.payload);
+        assert!(!sn.global_lock.read().pending_opens.contains_key(&name));
+    }
+
     fn concat_request(destination: StreamName, left: StreamName, right: StreamName) -> Req {
         concat_request_with_flags(destination, left, right, false, false)
     }
@@ -2169,8 +3410,8 @@ mod tests {
         };
         let first = {
             let mut state = sn.global_lock.write();
-            let SNState { extent_table, .. } = &mut *state;
-            sn.appendable(extent_table, &mut stream, TimeSec::new(100), 4).unwrap()
+            let SNState { extent_table, extents, .. } = &mut *state;
+            sn.appendable(extent_table, &mut stream, extents, TimeSec::new(100), 4).unwrap()
         };
         assert_eq!(first.extent.id, ExtentId::FIRST);
         assert_eq!(sn.config.max_extents, 1);
@@ -2178,8 +3419,8 @@ mod tests {
         stream.open = None;
         let result = {
             let mut state = sn.global_lock.write();
-            let SNState { extent_table, .. } = &mut *state;
-            sn.appendable(extent_table, &mut stream, TimeSec::new(101), 4)
+            let SNState { extent_table, extents, .. } = &mut *state;
+            sn.appendable(extent_table, &mut stream, extents, TimeSec::new(101), 4)
         };
         assert!(result.is_err());
         assert_eq!(sn.global_lock.read().extent_table.len(), 1);

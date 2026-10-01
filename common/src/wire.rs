@@ -301,6 +301,13 @@ ops! {
     ObjectInfoResp = 135, "object-info-response", Op::GROUP;
     CompoundResp = 136, "compound-response", Op::GROUP;
     CompoundReq = 137, "compound-request", Op::GROUP;
+    SnCreate = 138, "sn-create-action";
+    SnConcat = 139, "sn-concat-action";
+    SnOpen = 140, "sn-open-action";
+    SnSeal = 141, "sn-seal-action";
+    SnSealStream = 142, "sn-seal-stream-action";
+    SnDelete = 143, "sn-delete-action";
+    SnDeleteDone = 144, "sn-delete-done-action";
 }
 
 impl std::fmt::Display for Op {
