@@ -599,11 +599,9 @@ fn read_loop<S: Service>(
                     .and_then(|(mut payload, _)| payload.text())
                 {
                     Ok(sender) => {
-                        process
-                            .cluster
-                            .service(&sender)
-                            .is_some_and(|entry| entry.kind == ServiceKind::Ks)
-                            && auth.permits(input.peer_key(), &sender)
+                        process.cluster.service(&sender).is_some_and(|entry| {
+                            entry.kind == ServiceKind::Ks || entry.kind == process.entry.kind
+                        }) && auth.permits(input.peer_key(), &sender)
                     }
                     _ => false,
                 },

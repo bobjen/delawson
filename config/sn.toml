@@ -10,10 +10,23 @@ stream_share = 0.333
 # The limit should be at least the machine RAM size divided by the SN Extent size.
 max_extents = 1073741824
 
+# Raft consensus for this SN. With no members listed, this process is a singleton.
+# To replicate the SN group, configure the same ring and member map on every member.
+[raft]
+# ring = "SN0"
+# [raft.member_indexes]
+# SN0 = 0
+# SN1 = 1
+# SN2 = 2
+# [raft.members]
+# SN0 = "127.0.0.1:9500"
+# SN1 = "127.0.0.1:9501"
+# SN2 = "127.0.0.1:9502"
+
 # Threads answering requests off the read loop. Zero means one per core.
 [knobs]
 # Opt in to primary reads after quorum lease expiry (may return stale data).
 # Writes, committed-term readiness, and demotion checks are unchanged.
-# SN/DN will enforce this when their Raft admission is implemented.
+# SN/DN will enforce this when state-changing requests use Raft admission.
 allow_stale_reads = false
 workers = 0

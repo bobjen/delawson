@@ -12,9 +12,12 @@ path = "src/main.rs"
 
 [dependencies]
 delawson-common.workspace = true
+delawson-raft.workspace = true
 parking_lot.workspace = true
 delawson-pool.workspace = true
 delawson-random.workspace = true
 
 [dev-dependencies]
 delawson-common = { workspace = true, features = ["testing"] }
+delawson-raft = { workspace = true, features = ["testing"] }
+tempfile = "3"

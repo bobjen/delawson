@@ -133,6 +133,13 @@ pub struct Runtime<S> {
 
 impl<S: Default> Runtime<S> {
     pub fn new(runtime: Settings, node: Node, options: Options) -> Self {
+        Self::with_state(runtime, node, options, S::default())
+    }
+}
+
+impl<S> Runtime<S> {
+    /// Construct a runtime around application state that needs configuration to build.
+    pub fn with_state(runtime: Settings, node: Node, options: Options, initial: S) -> Self {
         let membership = node.state().membership();
         let placement = application::Placement::new(
             &membership.replacements(&membership.members()),
@@ -170,7 +177,7 @@ impl<S: Default> Runtime<S> {
             readiness_requests: Mutex::new(BTreeSet::new()),
             proposing: Mutex::new(()),
             raft_workers: Mutex::new(vec![]),
-            global_lock: RwLock::new(S::default()),
+            global_lock: RwLock::new(initial),
             execution: Mutex::new(crate::execution::Cursor::default()),
             application_generation: AtomicU64::new(0),
             metadata_generation: AtomicU64::new(0),

@@ -28,7 +28,7 @@ inline_ping = true
 [knobs]
 # Opt in to primary reads after quorum lease expiry (may return stale data).
 # Writes, committed-term readiness, and demotion checks are unchanged.
-# SN/DN will enforce this when their Raft admission is implemented.
+# SN/DN will enforce this when state-changing requests use Raft admission.
 allow_stale_reads = false
 workers = 0
 

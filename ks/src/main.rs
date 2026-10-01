@@ -47,6 +47,9 @@ impl raft::execution::Application for KeyHistory {
     fn set_applied(&mut self, index: u64) {
         self.applied = index;
     }
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 #[derive(Default)]

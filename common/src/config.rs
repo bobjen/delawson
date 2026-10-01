@@ -684,8 +684,8 @@ pub struct Knobs {
     pub workers: usize,
 }
 
-/// Ordinary Raft timing and bootstrap membership for KS. Addresses remain available
-/// before unlocking or registry service. Persisted membership wins after bootstrap.
+/// Ordinary Raft timing and bootstrap membership. Addresses remain available
+/// before registry service. Persisted membership wins after bootstrap.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RaftConfig {
@@ -850,6 +850,9 @@ fn default_max_concat_sources() -> u64 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SNConfig {
+    /// Raft membership and timing for this SN's metadata group.
+    #[serde(default)]
+    pub raft: RaftConfig,
     pub knobs: Knobs,
     /// Maximum number of extents this SN can name and hold in its extent table.
     /// The extent pool reserves virtual address space for this many entries.

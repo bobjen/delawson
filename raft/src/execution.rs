@@ -55,14 +55,13 @@ impl Committed for Work {
         self.commit
     }
 }
-pub trait Application: Default + Send + Sync {
+pub trait Application: Send + Sync {
     fn applied(&self) -> u64;
     fn set_applied(&mut self, index: u64);
+    /// Reset application state before rebuilding it from the committed history.
+    fn reset(&mut self);
     /// Reclaim application-owned state while the global lock is still exclusive.
     fn reclaim(&mut self) {}
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
 }
 #[derive(Default)]
 pub struct Cursor {
@@ -241,6 +240,9 @@ mod tests {
         }
         fn set_applied(&mut self, index: u64) {
             self.applied = index;
+        }
+        fn reset(&mut self) {
+            *self = Self::default();
         }
     }
     fn state() -> State {

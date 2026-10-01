@@ -17,7 +17,7 @@ use common::config::{SNConfig, ServiceKind};
 use common::deletion::{
     Delete, Extras, Flags, SharedExtras, Target, bad, forward, read_soft_deleted,
 };
-use common::ids::{DiskId, EnId, ExtentId, RangeId, SnDiskId, SnId, StreamId};
+use common::ids::{DiskId, EnId, ExtentId, SnDiskId, SnId, StreamId};
 use common::info::{ExtentRow, ExtentRun, Listing, StreamName, Totals};
 use common::offset::{ECoff, ELoff, ERoff, SCoff, SLoff, SRoff};
 use common::range::Filled;
@@ -25,8 +25,8 @@ use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::{Arg, Op, Req, Resp, Status, StructReader, StructWriter, structure};
 use common::{Error, Result};
-use parking_lot::RwLock;
 use pool::{InlineLinks, LockedPool};
+use raft::runtime::{Host, Settings as RaftSettings};
 use std::collections::HashMap;
 use std::mem::{MaybeUninit, align_of, offset_of};
 use std::ops::{Deref, DerefMut};
@@ -37,6 +37,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const SERVES: &[Op] = &[
+    Op::Raft,
     Op::SoftDeleteStream,
     Op::DeleteStream,
     Op::CreateStream,
@@ -379,9 +380,47 @@ struct SNState {
     retired_streams: std::collections::HashSet<StreamName>,
     stream_extras: Extras<StreamName>,
     extent_extras: SharedExtras<(ExtentId, TimeSec)>,
+    /// Highest Raft entry applied to this state. SN actions are not applied yet.
+    applied: u64,
+}
+
+impl SNState {
+    fn new(max_extents: u32) -> Result<Self> {
+        let extent_table = ExtentTable::new(max_extents)
+            .map_err(|error| Error::new(format!("reserve SN extent table: {error}")))?;
+        Ok(Self {
+            shards: (0..SHARDS).map(|_| HashMap::new()).collect(),
+            extent_table,
+            retired_streams: std::collections::HashSet::new(),
+            stream_extras: Extras::default(),
+            extent_extras: Extras::default(),
+            applied: 0,
+        })
+    }
+}
+
+impl raft::execution::Application for SNState {
+    fn applied(&self) -> u64 {
+        self.applied
+    }
+
+    fn set_applied(&mut self, index: u64) {
+        self.applied = index;
+    }
+
+    fn reset(&mut self) {
+        // Raft history currently contains no SN state actions, so rebuilding its
+        // cursor must not discard the live metadata that has not moved into Raft yet.
+        self.applied = 0;
+    }
+
+    fn reclaim(&mut self) {
+        self.extent_table.pool.reclaim();
+    }
 }
 
 struct SN {
+    common: raft::runtime::Runtime<SNState>,
     config: SNConfig,
     deleting: Mutex<()>,
     /// Maximum sealed extents one stream may hold, including extent references made by
@@ -396,14 +435,22 @@ struct SN {
     mine: SnId,
     /// All disks across all ENs that this SN can see.
     disks: Mutex<Vec<(EnId, DiskId)>>,
-    /// One lock for stream and extent state. Raft apply will use this same lock.
-    state: RwLock<SNState>,
     gc_stop: AtomicBool,
     gc_thread: Mutex<Option<JoinHandle<()>>>,
     streams: AtomicU64,
     extents: AtomicU64,
     sealed: AtomicU64,
     sealed_streams: AtomicU64,
+    #[cfg(test)]
+    _test_dir: Option<tempfile::TempDir>,
+}
+
+impl Deref for SN {
+    type Target = raft::runtime::Runtime<SNState>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
 }
 
 fn shard_of(name: StreamName) -> usize {
@@ -418,11 +465,17 @@ fn shard_of(name: StreamName) -> usize {
 
 impl Service for SN {
     fn start(self: &Arc<Self>) -> Result<()> {
-        self.start_gc()
+        self.start_gc()?;
+        if let Err(error) = self.start_raft() {
+            let _ = self.stop_gc();
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn stop(&self, _process: &Process) -> Result<()> {
-        self.stop_gc()
+        self.stop_gc()?;
+        self.stop_raft()
     }
 
     fn serves(&self) -> &'static [Op] {
@@ -431,6 +484,10 @@ impl Service for SN {
 
     fn workers(&self) -> usize {
         self.config.knobs.workers
+    }
+
+    fn defers(&self, op: Op) -> bool {
+        SERVES.contains(&op)
     }
 
     fn inline(&self, op: Op) -> bool {
@@ -443,6 +500,7 @@ impl Service for SN {
 
     fn answer(&self, process: &Process, request: &Req) -> Resp {
         match request.op() {
+            Op::Raft => self.raft_rpc(process, request),
             Op::SoftDeleteStream | Op::DeleteStream => self.delete_stream(process, request),
             Op::CreateStream => self.create(request),
             Op::ConcatStreams => self.concat_streams(request),
@@ -462,11 +520,38 @@ impl Service for SN {
             format!("sealed_extents {}", self.sealed.load(Ordering::Relaxed)),
             format!("sealed_streams {}", self.sealed_streams.load(Ordering::Relaxed)),
             format!("stream_share {}", self.config.stream_share),
+            self.raft_status(),
         ]
     }
 }
 
 impl SN {
+    fn stop_raft(&self) -> Result<()> {
+        self.snapshot_stopping.store(true, Ordering::SeqCst);
+        self.wake_execution();
+        loop {
+            let handles = std::mem::take(
+                &mut *self
+                    .raft_workers
+                    .lock()
+                    .map_err(|_| Error::new("Raft worker lock poisoned"))?,
+            );
+            if handles.is_empty() {
+                break;
+            }
+            for handle in &handles {
+                handle.thread().unpark();
+            }
+            for handle in handles {
+                handle.join().map_err(|_| Error::new("Raft worker panicked"))?;
+            }
+        }
+        if let Some(fence) = self.io_fence.get() {
+            fence.wait_all()?;
+        }
+        Ok(())
+    }
+
     fn start_gc(self: &Arc<Self>) -> Result<()> {
         let mut slot = self.gc_thread.lock().expect("GC thread");
         if slot.is_some() {
@@ -482,7 +567,7 @@ impl SN {
                     if sn.gc_stop.load(Ordering::Acquire) {
                         break;
                     }
-                    let guard = sn.state.read();
+                    let guard = sn.global_lock.read();
                     thread::sleep(Duration::from_millis(10));
                     drop(guard);
                     if sn.gc_stop.load(Ordering::Acquire) {
@@ -524,9 +609,10 @@ impl SN {
         let now = TimeSec::now();
         let maximum = process.cluster.max_soft_delete_retention_secs;
         let ids = {
-            let mut state = self.state.write();
-            let SNState { shards, extent_table, retired_streams, stream_extras, extent_extras } =
-                &mut *state;
+            let mut state = self.global_lock.write();
+            let SNState {
+                shards, extent_table, retired_streams, stream_extras, extent_extras, ..
+            } = &mut *state;
             let Some(stream) = shards[shard_of(name)].get_mut(&name) else {
                 return if retired_streams.contains(&name) {
                     Ok(())
@@ -578,7 +664,7 @@ impl SN {
                 continue;
             }
             let (created, disks, interval, hard) = {
-                let mut state = self.state.write();
+                let mut state = self.global_lock.write();
                 let SNState { extent_table, extent_extras, .. } = &mut *state;
                 let extent = &mut extent_table[id.get() as usize];
                 if !extent.deletion.soft_deleted() || extent.deletion.retired() {
@@ -615,7 +701,7 @@ impl SN {
                 }
             }
             if hard {
-                let mut state = self.state.write();
+                let mut state = self.global_lock.write();
                 let SNState { extent_table, extent_extras, .. } = &mut *state;
                 let extent = &mut extent_table[id.get() as usize];
                 assert!(extent_extras.reclaim(
@@ -628,7 +714,7 @@ impl SN {
             }
         }
         if deletion.hard {
-            let mut state = self.state.write();
+            let mut state = self.global_lock.write();
             let SNState { shards, stream_extras, retired_streams, .. } = &mut *state;
             let shard = &mut shards[shard_of(name)];
             let stream = shard.get_mut(&name).unwrap();
@@ -649,34 +735,91 @@ impl SN {
         extent.args(first, &disks)
     }
 
-    fn new(
+    fn with_runtime(
         config: SNConfig,
         per_stream: usize,
         mine: SnId,
         disks: Vec<(EnId, DiskId)>,
+        path: &std::path::Path,
+        runtime: RaftSettings,
     ) -> Result<SN> {
-        let extent_table = ExtentTable::new(config.max_extents)
-            .map_err(|error| Error::new(format!("reserve SN extent table: {error}")))?;
-        Ok(SN {
+        runtime.validate(&config.raft)?;
+        let mut initial = raft::State::initial(
+            runtime.ring.clone(),
+            if runtime.identities.is_empty() {
+                Default::default()
+            } else {
+                runtime.members.clone()
+            },
+            runtime.identities.clone(),
+        )?;
+        initial.ignore_ring_identity = runtime.ignore_ring_identity;
+        let journal = raft::journal::Journal::open(path, initial, 3, &runtime.name)?;
+        let id =
+            journal.state.membership().slot(&journal.identity.current).unwrap_or(raft::UNASSIGNED);
+        let mut node = raft::Node::new(id, journal);
+        node.merge_history_scn()?;
+        node.identity = Some(node.journal.identity.current.clone());
+        node.lease = raft::lease::Lease::configured(&config.raft);
+        if node.state().membership().members().len() == 1
+            && node.state().membership().members().contains(&id)
+        {
+            node.campaign()?;
+        }
+        let options = raft::runtime::Options {
+            raft: config.raft.clone(),
+            snapshot_min_log_bytes: 1024 * 1024,
+            snapshot_interval_secs: 86_400,
+            allow_stale_reads: config.knobs.allow_stale_reads,
+        };
+        let state = SNState::new(config.max_extents)?;
+        let sn = SN {
+            common: raft::runtime::Runtime::with_state(runtime, node, options, state),
             config,
             deleting: Mutex::new(()),
             per_stream,
             mine,
             disks: Mutex::new(disks),
-            state: RwLock::new(SNState {
-                shards: (0..SHARDS).map(|_| HashMap::new()).collect(),
-                extent_table,
-                retired_streams: std::collections::HashSet::new(),
-                stream_extras: Extras::default(),
-                extent_extras: Extras::default(),
-            }),
             gc_stop: AtomicBool::new(true),
             gc_thread: Mutex::new(None),
             streams: AtomicU64::new(0),
             extents: AtomicU64::new(0),
             sealed: AtomicU64::new(0),
             sealed_streams: AtomicU64::new(0),
-        })
+            #[cfg(test)]
+            _test_dir: None,
+        };
+        sn.ready.store(true, Ordering::SeqCst);
+        let commit = sn.on_raft(|host, node| {
+            host.refresh_application(node)?;
+            Ok(node.state().commit)
+        })?;
+        while sn.global_lock.read().applied < commit {
+            sn.execute_pending()?;
+        }
+        Ok(sn)
+    }
+
+    #[cfg(test)]
+    fn new(
+        config: SNConfig,
+        per_stream: usize,
+        mine: SnId,
+        disks: Vec<(EnId, DiskId)>,
+    ) -> Result<SN> {
+        let settings = RaftSettings::testing(&config.raft);
+        let directory = tempfile::tempdir()
+            .map_err(|error| Error::new(format!("create SN test directory: {error}")))?;
+        raft::journal::provision_test_founder(
+            directory.path(),
+            &settings.ring,
+            &settings.name,
+            settings.identities[&0].identity.clone(),
+        )?;
+        let mut sn =
+            Self::with_runtime(config, per_stream, mine, disks, directory.path(), settings)?;
+        sn._test_dir = Some(directory);
+        Ok(sn)
     }
 
     /// `(RangeId, first StreamId, count, creation second)`. A DN creating many
@@ -726,7 +869,7 @@ impl SN {
                 );
             };
             let name = StreamName { range, stream, created };
-            let mut state = self.state.write();
+            let mut state = self.global_lock.write();
             if state.retired_streams.contains(&name) {
                 return bad("stream identity has been retired");
             }
@@ -775,7 +918,7 @@ impl SN {
             Ok(name) => name,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        if self.state.read().retired_streams.contains(&destination) {
+        if self.global_lock.read().retired_streams.contains(&destination) {
             return bad("destination stream identity has been retired");
         }
         let left = match stream_name(&mut payload) {
@@ -811,7 +954,7 @@ impl SN {
         }
 
         {
-            let state = self.state.read();
+            let state = self.global_lock.read();
             let shard = &state.shards[shard_of(destination)];
             if let Some(destination_stream) = shard.get(&destination) {
                 if !destination_stream.deletion.readable(false)
@@ -831,11 +974,11 @@ impl SN {
             }
         }
         // Copy source state before taking the global write lock for the destination.
-        let left_stream = match self.state.read().shards[shard_of(left)].get(&left) {
+        let left_stream = match self.global_lock.read().shards[shard_of(left)].get(&left) {
             Some(stream) => stream.clone(),
             None => return Resp::error(Status::NotFound, format!("no {left}")),
         };
-        let right_stream = match self.state.read().shards[shard_of(right)].get(&right) {
+        let right_stream = match self.global_lock.read().shards[shard_of(right)].get(&right) {
             Some(stream) => stream.clone(),
             None => return Resp::error(Status::NotFound, format!("no {right}")),
         };
@@ -881,7 +1024,7 @@ impl SN {
         let mut copied = Vec::with_capacity(extent_count);
         copied.extend(left_stream.sealed.iter().cloned());
         copied.extend(right_stream.sealed.iter().cloned());
-        let mut state = self.state.write();
+        let mut state = self.global_lock.write();
         let SNState { shards, extent_table, extent_extras, retired_streams, .. } = &mut *state;
         if retired_streams.contains(&destination) {
             return bad("destination stream identity has been retired");
@@ -997,7 +1140,7 @@ impl SN {
             Ok(value) => value,
             Err(error) => return bad(error),
         };
-        let state = self.state.read();
+        let state = self.global_lock.read();
         let shard = &state.shards[shard_of(name)];
         let Some(held) = shard.get(&name) else {
             return Resp::error(Status::NotFound, format!("no {name}"));
@@ -1066,7 +1209,7 @@ impl SN {
         };
         let mut args = Vec::new();
         let mut room = asked.limit;
-        let state = self.state.read();
+        let state = self.global_lock.read();
         for (name, from) in &asked.at {
             let shard = &state.shards[shard_of(*name)];
             let Some(held) = shard.get(name) else {
@@ -1258,7 +1401,7 @@ impl SN {
         if !rest.is_empty() || payload.done().is_err() {
             return Resp::error(Status::BadRequest, "seal-stream has trailing arguments");
         }
-        let mut state = self.state.write();
+        let mut state = self.global_lock.write();
         let SNState { shards, extent_table, .. } = &mut *state;
         let shard = &mut shards[shard_of(name)];
         let Some(stream) = shard.get_mut(&name) else {
@@ -1306,7 +1449,7 @@ impl SN {
         instances: usize,
         per_stream: usize,
     ) -> std::result::Result<Placed, Full> {
-        let mut state = self.state.write();
+        let mut state = self.global_lock.write();
         let SNState { shards, extent_table, .. } = &mut *state;
         let shard = &mut shards[shard_of(name)];
         let Some(held) = shard.get_mut(&name) else {
@@ -1351,7 +1494,7 @@ impl SN {
         second: TimeSec,
         instances: usize,
     ) -> std::result::Result<Placed, Full> {
-        let mut state = self.state.write();
+        let mut state = self.global_lock.write();
         let SNState { shards, extent_table, .. } = &mut *state;
         let shard = &mut shards[shard_of(name)];
         let Some(held) = shard.get_mut(&name) else {
@@ -1413,13 +1556,66 @@ impl SN {
     }
 }
 
+impl Host for SN {
+    type Application = SNState;
+
+    fn apply_client(&self, work: &raft::execution::Work) -> Result<()> {
+        raft::execution::execute_blocking(
+            &self.global_lock,
+            &self.execution,
+            work,
+            Duration::from_millis(self.config.raft.execution_lock_ms),
+            |_state, _context, action| {
+                Err(Error::new(format!("SN does not execute Raft action {}", action.op)))
+            },
+        )
+        .map(|_| ())
+    }
+
+    fn prepare_primary(&self, _node: &mut raft::Node) -> Result<()> {
+        Ok(())
+    }
+
+    fn checkpoint_actions(
+        &self,
+        state: &raft::State,
+        _application: &Self::Application,
+    ) -> Result<Vec<raft::Entry>> {
+        Ok(state.capture().application)
+    }
+
+    fn peer_message(&self) -> Option<raft::Action> {
+        None
+    }
+
+    fn receive_client(&self, _process: &Process, _action: raft::Action) -> Result<Resp> {
+        Err(Error::new("SN has no Raft client actions yet"))
+    }
+
+    fn dispatch_forwarded(&self, process: &Process, request: &Req) -> Resp {
+        server::unbuilt(process, SERVES, request)
+    }
+
+    fn forwardable(&self, _op: Op) -> bool {
+        false
+    }
+
+    fn registered_endpoint(&self, _name: &str) -> Option<std::net::SocketAddr> {
+        None
+    }
+}
+
 fn main() {
     let result = server::main(|process| {
-        SN::new(
-            SNConfig::load(&process.config.service_config)?,
+        let config = SNConfig::load(&process.config.service_config)?;
+        let runtime = RaftSettings::for_process(process, &config.raft)?;
+        SN::with_runtime(
+            config,
             process.cluster.extents.per_stream,
             SnId::new(process.entry.number()),
             Vec::new(),
+            &process.config.data_dir.join("raft"),
+            runtime,
         )
     });
     if let Err(e) = result {
@@ -1447,13 +1643,13 @@ mod tests {
         let placed = sn.open(source, TimeSec::new(1_000_000), 4).unwrap();
         let id = placed.extent.id;
         {
-            let mut state = sn.state.write();
+            let mut state = sn.global_lock.write();
             let snapshot = state.shards[shard_of(source)][&source].clone();
             state.shards[shard_of(other)].insert(other, snapshot);
         }
         sn.streams.fetch_add(1, Ordering::Relaxed);
         {
-            let mut state = sn.state.write();
+            let mut state = sn.global_lock.write();
             let SNState { extent_table, extent_extras, .. } = &mut *state;
             retain(extent_extras, &mut extent_table[id.get() as usize]);
             // No network in this unit test; the live test verifies instance fanout.
@@ -1476,7 +1672,7 @@ mod tests {
             Status::Ok
         );
         {
-            let state = sn.state.read();
+            let state = sn.global_lock.read();
             let SNState { extent_table, extent_extras, .. } = &*state;
             let table = extent_table;
             let extent = &table[id.get() as usize];
@@ -1487,7 +1683,7 @@ mod tests {
         }
         assert_eq!(sn.delete_stream(&process, &request(source, None, true)).status, Status::Ok);
         assert_eq!(sn.delete_stream(&process, &request(source, None, true)).status, Status::Ok);
-        let state = sn.state.read();
+        let state = sn.global_lock.read();
         let SNState { extent_table, extent_extras, .. } = &*state;
         let table = extent_table;
         assert!(table[id.get() as usize].deletion.retired());
@@ -1498,7 +1694,7 @@ mod tests {
         let sn = sn_with_stream(0, 7);
         seal_for_concat(&sn, named(0, 7));
         {
-            let mut state = sn.state.write();
+            let mut state = sn.global_lock.write();
             let SNState { extent_table, extent_extras, .. } = &mut *state;
             retain(extent_extras, &mut extent_table[0]);
             extent_extras
@@ -1510,7 +1706,7 @@ mod tests {
         }
         let response = sn.concat_streams(&concat_request(named(0, 9), named(0, 7), named(0, 7)));
         assert_eq!(response.status, Status::BadRequest);
-        let state = sn.state.read();
+        let state = sn.global_lock.read();
         let SNState { extent_table, extent_extras, .. } = &*state;
         let table = extent_table;
         assert_eq!(table.len(), 1);
@@ -1556,12 +1752,12 @@ mod tests {
             sealed_stream: false,
         };
         {
-            let mut state = sn.state.write();
+            let mut state = sn.global_lock.write();
             let SNState { extent_table, .. } = &mut *state;
             sn.appendable(extent_table, &mut stream, TimeSec::new(100), 4).unwrap();
         }
 
-        let state = sn.state.read();
+        let state = sn.global_lock.read();
         let table = &state.extent_table;
         assert!(table[0].deletion.is_valid());
         assert_eq!(table.pool.issued_blocks(), 1);
@@ -1580,10 +1776,10 @@ mod tests {
         drop(spare);
         drop(state);
         {
-            let state = sn.state.write();
+            let state = sn.global_lock.write();
             state.extent_table.pool.reclaim();
         }
-        let state = sn.state.read();
+        let state = sn.global_lock.read();
         let reused = state.extent_table.pool.alloc().unwrap();
         assert_eq!(reused.index(), 1);
         assert!(!unsafe { (*reused.as_ptr().cast::<Extent>()).deletion.is_valid() });
@@ -1600,7 +1796,7 @@ mod tests {
     #[test]
     fn extent_rows_keep_extent_measures_while_stream_totals_widen() {
         let sn = SN::new(testing::sn_config(), 10, SnId::FIRST, Vec::new()).unwrap();
-        sn.state
+        sn.global_lock
             .write()
             .extent_table
             .insert(Extent {
@@ -1626,7 +1822,7 @@ mod tests {
             sealed_records: SRoff::new(14),
             sealed_stream: true,
         };
-        let state = sn.state.read();
+        let state = sn.global_lock.read();
         let (run, rows) =
             sn.run_of(&state.extent_table, &stream, StreamId::FIRST, SRoff::ZERO, 10, false);
         assert_eq!(run.totals.extents, ExtentId::new(2));
@@ -1647,7 +1843,7 @@ mod tests {
         let mut ids = Vec::new();
         for _ in 0..4 {
             ids.push(
-                sn.state
+                sn.global_lock
                     .write()
                     .extent_table
                     .insert(Extent {
@@ -1680,7 +1876,7 @@ mod tests {
             (ids[2], SRoff::new(7), SRoff::new(14)),
             (ids[3], SRoff::new(14), SRoff::NONE),
         ] {
-            let state = sn.state.read();
+            let state = sn.global_lock.read();
             let (run, rows) =
                 sn.run_of(&state.extent_table, &stream, StreamId::FIRST, from, 1, false);
             assert_eq!(run.totals.extents, ExtentId::new(3));
@@ -1689,7 +1885,7 @@ mod tests {
             assert_eq!(run.next, next);
             from = run.next;
         }
-        let state = sn.state.read();
+        let state = sn.global_lock.read();
         let (run, rows) =
             sn.run_of(&state.extent_table, &stream, StreamId::FIRST, SRoff::new(7), 0, false);
         assert!(rows.is_empty());
@@ -1716,6 +1912,7 @@ mod tests {
     }
 
     use super::*;
+    use common::ids::RangeId;
     use common::offset::{ECoff, ELoff};
     use common::testing;
 
@@ -1759,6 +1956,29 @@ mod tests {
         }));
         assert_eq!(made.status, Status::Ok);
         sn
+    }
+
+    #[test]
+    fn single_member_raft_runs_without_sn_actions() {
+        let sn = Arc::new(SN::new(testing::sn_config(), 10, SnId::FIRST, Vec::new()).unwrap());
+        sn.start().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline {
+            let (role, commit, applied) = sn
+                .on_raft(|_, node| Ok((node.role, node.state().commit)))
+                .map(|(role, commit)| (role, commit, sn.global_lock.read().applied))
+                .unwrap();
+            if role == raft::Role::Leader && commit != 0 && applied >= commit {
+                ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let status = sn.raft_status();
+        sn.stop_gc().unwrap();
+        sn.stop_raft().unwrap();
+        assert!(ready, "single-member SN Raft did not apply its no-op entry: {status}");
     }
 
     fn add_stream(sn: &SN, range: u64, stream: u32) {
@@ -1813,7 +2033,7 @@ mod tests {
         assert_eq!(answer.status, Status::Ok, "{}", answer.message().unwrap_or_default());
 
         let id = {
-            let state = sn.state.read();
+            let state = sn.global_lock.read();
             let destination = &state.shards[shard_of(named(0, 9))][&named(0, 9)];
             assert_eq!(destination.sealed.len(), 2, "A || A has two extent references");
             assert_eq!(destination.sealed_records, SRoff::new(24));
@@ -1825,7 +2045,7 @@ mod tests {
             );
             destination.sealed[0]
         };
-        let mut state = sn.state.write();
+        let mut state = sn.global_lock.write();
         let SNState { extent_table, extent_extras, .. } = &mut *state;
         let extents = extent_table;
         assert_eq!(extents.len(), 1);
@@ -1948,21 +2168,21 @@ mod tests {
             sealed_stream: false,
         };
         let first = {
-            let mut state = sn.state.write();
+            let mut state = sn.global_lock.write();
             let SNState { extent_table, .. } = &mut *state;
             sn.appendable(extent_table, &mut stream, TimeSec::new(100), 4).unwrap()
         };
         assert_eq!(first.extent.id, ExtentId::FIRST);
         assert_eq!(sn.config.max_extents, 1);
-        assert_eq!(sn.state.read().extent_table.len(), 1);
+        assert_eq!(sn.global_lock.read().extent_table.len(), 1);
         stream.open = None;
         let result = {
-            let mut state = sn.state.write();
+            let mut state = sn.global_lock.write();
             let SNState { extent_table, .. } = &mut *state;
             sn.appendable(extent_table, &mut stream, TimeSec::new(101), 4)
         };
         assert!(result.is_err());
-        assert_eq!(sn.state.read().extent_table.len(), 1);
+        assert_eq!(sn.global_lock.read().extent_table.len(), 1);
     }
 
     #[test]
@@ -2017,13 +2237,13 @@ mod tests {
     /// Where the open extent starts, for a test.
     impl SN {
         fn starts_at(&self, range: u64, stream: u32) -> SRoff {
-            self.state.read().shards[shard_of(named(range, stream))][&named(range, stream)]
+            self.global_lock.read().shards[shard_of(named(range, stream))][&named(range, stream)]
                 .sealed_records
         }
 
         /// The stream-local first record of every sealed extent, recomputed by summing.
         fn firsts(&self, range: u64, stream: u32) -> Vec<SRoff> {
-            let state = self.state.read();
+            let state = self.global_lock.read();
             state.shards[shard_of(named(range, stream))][&named(range, stream)]
                 .sealed_from(&state.extent_table)
                 .map(|(at, _)| at)
