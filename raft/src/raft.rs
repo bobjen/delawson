@@ -1008,7 +1008,13 @@ impl<S: Storage> Node<S> {
     }
     pub fn propose(&mut self, command: Command) -> Result<u64> {
         if self.role != Role::Leader {
-            return Err(Error::new("KS is not the Raft leader"));
+            let membership = self.state().membership();
+            let member = membership
+                .identities
+                .get(&self.id)
+                .map(|identity| identity.process.as_str())
+                .unwrap_or("unknown member");
+            return Err(Error::new(format!("{member} is not the Raft leader")));
         }
         if !self.write_authority()? {
             return Err(Error::new("Raft primary lease expired; retry after quorum heartbeat"));
@@ -2453,7 +2459,7 @@ pub mod tests {
         let is_reference = matches!(reference, Rpc::Checkpoint { .. });
         let before = nodes[2].receive(&0, &reference).unwrap();
         let known_leader = nodes[2].leader.clone();
-        // The receiver persists a copy obtained from KS1, without decrypting its contents.
+        // The receiver persists a copy obtained from another member, without decrypting it.
         nodes[2].journal.write(&[Record::Install(checkpoint)]).unwrap();
         let after = nodes[2].receive(&0, &reference).unwrap();
         nodes[0].response(&2, &reference, &after).unwrap();

@@ -1,5 +1,5 @@
 //! One ordered journal for Raft entries, terms/votes, commit markers and installs.
-//! Key commands are already encrypted; consensus metadata remains readable while locked.
+//! Applications encrypt private command data before proposing it; consensus metadata stays readable.
 use crate::codec::{self, Wire};
 use crate::raft::{INCARNATION, Member, MemberId, Membership, Record, Retirement, State};
 use crate::random_bytes;
@@ -276,7 +276,7 @@ impl Journal {
             .truncate(false)
             .mode(0o600)
             .open(directory.join("identity"))?;
-        ownership.try_lock().context("locking KS persistence directory")?;
+        ownership.try_lock().context(format!("locking {member} persistence directory"))?;
         // Observe creation intent once at startup, never by polling a running store.
         let bootstrap_pending = directory.join("need-bootstrap").try_exists()?;
         let saved_identity = read_identity(&mut ownership)?;
@@ -306,7 +306,7 @@ impl Journal {
         } else {
             let local = saved_identity.ok_or_else(|| Error::new("missing local identity"))?;
             if local.process != member || (!ignore && local.ring != initial.ring) {
-                return Err(Error::new("KS persistence ring/member mismatch"));
+                return Err(Error::new(format!("{member} persistence ring/member mismatch")));
             }
             if local.retired.contains(&local.current)
                 || local.retired.iter().collect::<std::collections::BTreeSet<_>>().len()
@@ -444,7 +444,8 @@ impl Journal {
             bootstrap_pending,
             disk: Arc::new(Mutex::new(Disk {
                 ownership,
-                file: active.ok_or_else(|| Error::new("no active KS journal"))?,
+                file: active
+                    .ok_or_else(|| Error::new(format!("no active journal for {member}")))?,
             })),
             io: None,
             pending_io: VecDeque::new(),
@@ -646,7 +647,10 @@ impl Journal {
     }
     pub fn write(&mut self, records: &[Record]) -> Result<()> {
         if self.failed {
-            return Err(Error::new("KS journal fenced after I/O failure; restart required"));
+            return Err(Error::new(format!(
+                "{} journal fenced after I/O failure; restart required",
+                self.identity.process
+            )));
         }
         if records.is_empty() {
             return Ok(());
@@ -698,7 +702,7 @@ impl Journal {
     }
     pub fn prepare_snapshot(&mut self, now: u64) -> Result<Option<PendingSnapshot>> {
         if self.failed {
-            return Err(Error::new("KS journal fenced"));
+            return Err(Error::new(format!("{} journal fenced", self.identity.process)));
         }
         if self.change_sequence <= self.snapshot_sequence {
             return Ok(None);
@@ -712,7 +716,7 @@ impl Journal {
         snapshot: crate::raft::Snapshot,
     ) -> Result<Option<PendingSnapshot>> {
         if self.failed {
-            return Err(Error::new("KS journal fenced"));
+            return Err(Error::new(format!("{} journal fenced", self.identity.process)));
         }
         snapshot.validate()?;
         self.state.check_ring(&snapshot)?;
@@ -771,11 +775,12 @@ impl Journal {
         let current_start = self.current_start;
         let bytes = [journal_header_after(&self.state, start), carried.to_vec()].concat();
         let footer = scn_footer(self.state.largest_scn());
+        let member = self.identity.process.clone();
         self.perform(move |disk| {
             let current = directory.join(CURRENT);
             let closed = named(&directory, "journal", current_start);
             if closed.try_exists()? {
-                return Err(Error::new("closed KS journal already exists"));
+                return Err(Error::new(format!("closed {member} journal already exists")));
             }
             disk.file.write_all(&footer)?;
             disk.file.sync_all()?;
@@ -958,7 +963,7 @@ fn quarantine(path: &Path, reason: &str) -> Result<()> {
     };
     std::fs::rename(path, &destination)?;
     sync_directory(path.parent().unwrap())?;
-    eprintln!("preserved corrupt KS file {}: {reason}", destination.display());
+    eprintln!("preserved corrupt Raft file {}: {reason}", destination.display());
     Ok(())
 }
 fn read_checkpoint(
@@ -974,7 +979,7 @@ fn read_checkpoint(
         return Err(Error::new("snapshot SCN changed while reading"));
     }
     if checkpoint.sequence != sequence || (!ignore && checkpoint.state.ring != ring) {
-        return Err(Error::new("KS snapshot identity mismatch"));
+        return Err(Error::new("snapshot ring or sequence identity mismatch"));
     }
     checkpoint.state.ignore_ring_identity = ignore;
     checkpoint.state.check_ring(&checkpoint.state.snapshot)?;
@@ -1040,7 +1045,7 @@ fn replay_segment_checked(
             if active {
                 break;
             }
-            return Err(Error::new("partial closed KS journal"));
+            return Err(Error::new("partial closed journal"));
         }
         let mut lengths = [0; 16];
         file.read_exact(&mut lengths)?;
@@ -1050,13 +1055,13 @@ fn replay_segment_checked(
         let length = u64::from_le_bytes(lengths[..8].try_into().unwrap());
         let inverse = u64::from_le_bytes(lengths[8..].try_into().unwrap());
         if inverse != !length || length < 32 || length > LIMIT as u64 {
-            return Err(Error::new("corrupt KS journal frame length"));
+            return Err(Error::new("corrupt journal frame length"));
         }
         if remaining < 16 + length {
             if active {
                 break;
             }
-            return Err(Error::new("partial closed KS journal frame"));
+            return Err(Error::new("partial closed journal frame"));
         }
         let mut bytes = vec![0; length as usize];
         file.read_exact(&mut bytes)?;
@@ -1289,15 +1294,15 @@ fn encode<T: Wire>(value: &T) -> Result<Vec<u8>> {
     let mut bytes = codec::encode(value)?;
     bytes.extend(Sha256::digest(&bytes));
     if bytes.len() > LIMIT {
-        return Err(Error::new("KS persistence frame too large"));
+        return Err(Error::new("Raft persistence frame too large"));
     }
     Ok(bytes)
 }
 fn decode<T: Wire>(bytes: &[u8]) -> Result<T> {
     let body =
-        bytes.len().checked_sub(32).ok_or_else(|| Error::new("short KS persistence frame"))?;
+        bytes.len().checked_sub(32).ok_or_else(|| Error::new("short Raft persistence frame"))?;
     if Sha256::digest(&bytes[..body]).as_slice() != &bytes[body..] {
-        return Err(Error::new("KS persistence checksum mismatch"));
+        return Err(Error::new("Raft persistence checksum mismatch"));
     }
     codec::decode(&bytes[..body])
 }
@@ -1319,9 +1324,9 @@ fn numbered(directory: &Path, kind: &str) -> Result<Vec<(u64, PathBuf)>> {
         }
         let sequence: u64 = name[kind.len() + 1..name.len() - suffix.len()]
             .parse()
-            .map_err(|_| Error::new("invalid numbered KS file"))?;
+            .map_err(|_| Error::new("invalid numbered Raft file"))?;
         if entry.path() != named(directory, kind, sequence) || !entry.file_type()?.is_file() {
-            return Err(Error::new("invalid numbered KS file"));
+            return Err(Error::new("invalid numbered Raft file"));
         }
         result.push((sequence, entry.path()));
     }
@@ -1382,7 +1387,7 @@ mod tests {
     #[ignore = "filesystem integration; run explicitly with --ignored"]
     fn asynchronous_writes_publish_durability_only_after_completion() {
         let dir = tempfile::tempdir().unwrap();
-        let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         journal.start_io(|| {}).unwrap();
         let (release, blocked) = std::sync::mpsc::channel();
         journal
@@ -1435,13 +1440,13 @@ mod tests {
             dir.path(),
             State::initial("01".repeat(64), Default::default(), Default::default()).unwrap(),
             3,
-            "KS0",
+            "member-0",
         )
         .unwrap();
         let mut membership = initial().membership();
         membership.identities.insert(
             0,
-            Member { identity: journal.identity.current.clone(), process: "KS0".into() },
+            Member { identity: journal.identity.current.clone(), process: "member-0".into() },
         );
         journal.write(&[Record::Bootstrap(membership)]).unwrap();
         journal
@@ -1469,7 +1474,7 @@ mod tests {
         let old = journal.identity.current.clone();
         journal.require_history_repair().unwrap();
         drop(journal);
-        let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert!(journal.identity.repairing);
         let mut replacement = initial().capture();
         replacement.index = 1;
@@ -1496,7 +1501,7 @@ mod tests {
         assert_eq!(journal.state.generation, 1);
         assert!(!journal.identity.repairing);
         drop(journal);
-        let restarted = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let restarted = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(restarted.identity.current, new);
         assert_eq!(restarted.pending_replacement().unwrap(), retirement);
         assert_eq!(restarted.state.history_at(1), Some((2, Scn::new(500))));
@@ -1523,7 +1528,7 @@ mod tests {
     fn interrupted_footer_write_keeps_current_journal_and_identity() {
         for length in [1, 7, 16, 32, 63, 64] {
             let dir = tempfile::tempdir().unwrap();
-            let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+            let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
             journal.write(&[Record::Hard { term: 1, vote: Some(0) }]).unwrap();
             let identity = journal.identity.current.clone();
             let path = dir.path().join(CURRENT);
@@ -1533,7 +1538,7 @@ mod tests {
             file.write_all(&scn_footer(None)[..length]).unwrap();
             file.sync_all().unwrap();
             drop(file);
-            let recovered = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+            let recovered = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
             let restored_size = std::fs::metadata(&path).unwrap().len();
             assert_eq!(recovered.identity.current, identity);
             assert_eq!(recovered.state.vote, Some(0));
@@ -1566,7 +1571,7 @@ mod tests {
     #[ignore = "filesystem integration; run explicitly with --ignored"]
     fn retained_journals_prove_compacted_terms_and_reject_wrong_boundaries() {
         let dir = tempfile::tempdir().unwrap();
-        let mut journal = Journal::open(dir.path(), initial(), 5, "KS0").unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 5, "member-0").unwrap();
         for index in 1..=3 {
             journal
                 .write(&[
@@ -1681,7 +1686,7 @@ mod tests {
     #[ignore = "filesystem integration; run explicitly with --ignored"]
     fn unparseable_checkpoint_falls_back_without_retiring_and_missing_identity_is_slotless() {
         let dir = tempfile::tempdir().unwrap();
-        let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         let identity = journal.identity.current.clone();
         journal.write(&[Record::Hard { term: 1, vote: Some(0) }]).unwrap();
         journal.snapshot(10).unwrap();
@@ -1691,19 +1696,19 @@ mod tests {
         let mut bad = b"not-a-tagged-frame".to_vec();
         bad.extend(Sha256::digest(&bad));
         std::fs::write(&path, &bad).unwrap();
-        let recovered = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let recovered = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(recovered.identity.current, identity);
         assert_eq!(recovered.state.vote, Some(0));
         drop(recovered);
         std::fs::remove_file(dir.path().join("identity")).unwrap();
-        let applicant = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let applicant = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert_ne!(applicant.identity.current, identity);
         assert!(applicant.identity.slot.is_none());
         assert!(applicant.identity.pending.is_none());
         assert!(applicant.state.vote.is_none());
         let new_identity = applicant.identity.current.clone();
         drop(applicant);
-        let restarted = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let restarted = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(restarted.identity.current, new_identity);
         assert!(restarted.identity.slot.is_none());
     }
@@ -1712,7 +1717,7 @@ mod tests {
     fn copied_journal_excludes_uncommitted_entries_and_preserves_local_votes() {
         let source = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
-        let mut journal = Journal::open(source.path(), initial(), 3, "KS0").unwrap();
+        let mut journal = Journal::open(source.path(), initial(), 3, "member-0").unwrap();
         journal
             .write(&[
                 Record::Hard { term: 2, vote: Some(0) },
@@ -1733,7 +1738,7 @@ mod tests {
         journal.snapshot(10).unwrap();
         let copied = journal.committed_suffix(0, 3).unwrap().unwrap();
         assert_eq!(copied.entries.len(), 2);
-        let mut dest = Journal::open(target.path(), initial(), 3, "KS0").unwrap();
+        let mut dest = Journal::open(target.path(), initial(), 3, "member-0").unwrap();
         dest.write(&[Record::Hard { term: 3, vote: Some(1) }]).unwrap();
         dest.import_committed(&copied, 2).unwrap();
         assert_eq!(dest.state.vote, Some(1));
@@ -1742,7 +1747,7 @@ mod tests {
         assert!(named(&target.path().join("copied-journals"), "journal", 1).exists());
         assert!(!target.path().join("copied-journals/current.log").exists());
         drop(dest);
-        let restarted = Journal::open(target.path(), initial(), 3, "KS0").unwrap();
+        let restarted = Journal::open(target.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(restarted.state.vote, Some(1));
         assert_eq!(restarted.state.commit, 2);
     }
@@ -1880,7 +1885,7 @@ mod tests {
     #[ignore = "filesystem integration; run explicitly with --ignored"]
     fn rotation_preserves_old_bytes_and_recovers_empty_current_start() {
         let dir = tempfile::tempdir().unwrap();
-        let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         journal.write(&[Record::Hard { term: 1, vote: Some(0) }]).unwrap();
         let old = std::fs::read(dir.path().join(CURRENT)).unwrap();
         let pending = journal.prepare_snapshot(10).unwrap().unwrap();
@@ -1895,13 +1900,13 @@ mod tests {
         pending.write().unwrap();
         journal.finish_snapshot(&pending).unwrap();
         drop(journal);
-        let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(journal.current_start, 2);
         journal.write(&[Record::Hard { term: 2, vote: Some(0) }]).unwrap();
         journal.snapshot(12).unwrap();
         let second_closed = named(dir.path(), "journal", 2).is_file();
         drop(journal);
-        let recovered = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let recovered = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert!(second_closed);
         assert_eq!(recovered.state.term, 2);
         assert_eq!(recovered.current_start, 3);
@@ -1912,7 +1917,7 @@ mod tests {
     fn missing_current_or_rotation_gap_never_resumes_an_old_journal() {
         for rename in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+            let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
             journal.write(&[Record::Hard { term: 1, vote: Some(0) }]).unwrap();
             journal.snapshot(10).unwrap();
             journal.write(&[Record::Hard { term: 2, vote: Some(0) }]).unwrap();
@@ -1924,12 +1929,12 @@ mod tests {
             } else {
                 std::fs::remove_file(dir.path().join(CURRENT)).unwrap();
             }
-            let recovered = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+            let recovered = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
             assert_eq!(recovered.identity.retired.len(), 1);
             assert!(dir.path().join(CURRENT).exists());
             let replacement = recovered.identity.current.clone();
             drop(recovered);
-            let restarted = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+            let restarted = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
             assert_eq!(restarted.identity.current, replacement);
         }
     }
@@ -2000,7 +2005,7 @@ mod tests {
     fn foreign_files_are_preserved_and_recovered_without_importing_their_state() {
         for kind in ["journal", "snapshot"] {
             let dir = tempfile::tempdir().unwrap();
-            let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+            let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
             let identity = journal.identity.current.clone();
             journal.write(&[Record::Hard { term: 1, vote: Some(0) }]).unwrap();
             journal.snapshot(10).unwrap();
@@ -2019,7 +2024,7 @@ mod tests {
                 checkpoint.bytes().unwrap()
             };
             std::fs::write(&path, &bytes).unwrap();
-            let recovered = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+            let recovered = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
             let corrupt = path.with_file_name(format!(
                 "{}.corrupt-0",
                 path.file_name().unwrap().to_string_lossy()
@@ -2122,7 +2127,7 @@ mod tests {
     fn copying_older_checkpoint_keeps_committed_and_uncommitted_suffix_across_restart() {
         for publish_snapshot in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+            let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
             let entries = (1..=4)
                 .map(|index| Entry {
                     scn: common::scn::Scn::new(index),
@@ -2146,7 +2151,7 @@ mod tests {
                 journal.finish_snapshot(&pending).unwrap();
             }
             drop(journal);
-            let recovered = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+            let recovered = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
             let positions = (recovered.state.commit, recovered.state.last(), recovered.state.term);
             let vote = recovered.state.vote.clone();
             assert_eq!(positions, (3, 4, 2));
@@ -2157,7 +2162,7 @@ mod tests {
     #[ignore = "filesystem integration; run explicitly with --ignored"]
     fn replay_restores_vote_uncommitted_suffix_and_commit_markers() {
         let dir = tempfile::tempdir().unwrap();
-        let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         journal
             .write(&[
                 Record::Hard { term: 3, vote: Some(0) },
@@ -2173,21 +2178,21 @@ mod tests {
             ])
             .unwrap();
         drop(journal);
-        let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(journal.state.term, 3);
         assert_eq!(journal.state.vote.as_ref(), Some(&0));
         assert_eq!(journal.state.commit, 0);
         assert_eq!(journal.state.last(), 1);
         journal.write(&[Record::Commit(1)]).unwrap();
         drop(journal);
-        let journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(journal.state.commit, 1);
     }
     #[test]
     #[ignore = "filesystem integration; run explicitly with --ignored"]
     fn partial_active_tail_is_discarded_but_corrupt_frames_retire_identity() {
         let source = tempfile::tempdir().unwrap();
-        let mut journal = Journal::open(source.path(), initial(), 3, "KS0").unwrap();
+        let mut journal = Journal::open(source.path(), initial(), 3, "member-0").unwrap();
         journal.write(&[Record::Hard { term: 1, vote: Some(0) }]).unwrap();
         drop(journal);
         let frame = std::fs::read(source.path().join(CURRENT)).unwrap();
@@ -2198,7 +2203,7 @@ mod tests {
             }
             let path = dir.path().join(CURRENT);
             std::fs::write(&path, &frame[..count]).unwrap();
-            let result = Journal::open(dir.path(), initial(), 3, "KS0");
+            let result = Journal::open(dir.path(), initial(), 3, "member-0");
             assert!(result.is_ok(), "partial length {count}");
             let size = std::fs::metadata(path).unwrap().len();
             assert_eq!(size, HEADER);
@@ -2206,7 +2211,7 @@ mod tests {
         let mut bad = frame.clone();
         bad[HEADER as usize + 20] ^= 1;
         std::fs::write(source.path().join(CURRENT), bad).unwrap();
-        let result = Journal::open(source.path(), initial(), 3, "KS0").unwrap();
+        let result = Journal::open(source.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(result.identity.retired.len(), 1);
         assert!(source.path().join("current.log.corrupt-0").exists());
     }
@@ -2214,7 +2219,7 @@ mod tests {
     #[ignore = "filesystem integration; run explicitly with --ignored"]
     fn snapshots_retain_complete_replay_suffixes_and_lock_survives_rotation() {
         let dir = tempfile::tempdir().unwrap();
-        let mut node = Node::new(0, Journal::open(dir.path(), initial(), 3, "KS0").unwrap());
+        let mut node = Node::new(0, Journal::open(dir.path(), initial(), 3, "member-0").unwrap());
         node.campaign().unwrap();
         for n in 0..5 {
             node.propose(Command::Client(vec![crate::Action::new(
@@ -2227,7 +2232,7 @@ mod tests {
         let expected = node.state().capture();
         let snapshots = numbered(dir.path(), "snapshot").unwrap();
         assert_eq!(snapshots.len(), 3);
-        let result = Journal::open(dir.path(), initial(), 3, "KS0");
+        let result = Journal::open(dir.path(), initial(), 3, "member-0");
         assert!(result.is_err());
         drop(node);
         for (sequence, snapshot) in snapshots {
@@ -2240,7 +2245,7 @@ mod tests {
                 }
             }
             std::fs::copy(dir.path().join(CURRENT), restore.path().join(CURRENT)).unwrap();
-            let restored = Journal::open(restore.path(), initial(), 3, "KS0").unwrap();
+            let restored = Journal::open(restore.path(), initial(), 3, "member-0").unwrap();
             assert_eq!(restored.state.capture(), expected);
         }
     }
@@ -2248,7 +2253,7 @@ mod tests {
     #[ignore = "filesystem integration; run explicitly with --ignored"]
     fn snapshot_preserves_uncommitted_suffix_and_replay_accepts_unpublished_rotation() {
         let dir = tempfile::tempdir().unwrap();
-        let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         journal
             .write(&[
                 Record::Hard { term: 1, vote: None },
@@ -2269,14 +2274,14 @@ mod tests {
         drop(journal);
         // Simulate snapshot publication never completing, leaving the switched journal.
         std::fs::remove_file(named(dir.path(), "snapshot", seq)).unwrap();
-        let restored = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let restored = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(restored.state.commit, 1);
     }
     #[test]
     #[ignore = "filesystem integration; run explicitly with --ignored"]
     fn snapshot_triggers_use_elapsed_time_and_previous_file_size_with_floor() {
         let dir = tempfile::tempdir().unwrap();
-        let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         journal.write(&[Record::Hard { term: 1, vote: None }]).unwrap();
         let time_due = journal.snapshot_due(u64::MAX, 1, journal.snapshot_second + 1);
         let not_yet = journal.snapshot_due(u64::MAX, 1, journal.snapshot_second);
@@ -2290,7 +2295,7 @@ mod tests {
     #[ignore = "filesystem integration; run explicitly with --ignored"]
     fn snapshot_write_can_overlap_new_journal_records_without_regressing_state() {
         let dir = tempfile::tempdir().unwrap();
-        let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         journal
             .write(&[
                 Record::Hard { term: 1, vote: None },
@@ -2337,7 +2342,7 @@ mod tests {
         assert_eq!(journal.state.commit, commit);
         let expected = journal.state.capture();
         drop(journal);
-        let restored = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let restored = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(restored.state.capture(), expected);
         assert_eq!(restored.state.term, term);
     }
@@ -2345,16 +2350,16 @@ mod tests {
     #[ignore = "filesystem integration; run explicitly with --ignored"]
     fn wrong_member_is_rejected_and_corrupt_journal_is_quarantined() {
         let dir = tempfile::tempdir().unwrap();
-        let mut journal = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         journal.write(&[Record::Hard { term: 1, vote: None }]).unwrap();
         drop(journal);
-        let wrong_member = Journal::open(dir.path(), initial(), 3, "KS1");
+        let wrong_member = Journal::open(dir.path(), initial(), 3, "member-1");
         assert!(wrong_member.is_err());
         let path = dir.path().join(CURRENT);
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[1] ^= 1;
         std::fs::write(path, bytes).unwrap();
-        let recovered = Journal::open(dir.path(), initial(), 3, "KS0").unwrap();
+        let recovered = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(recovered.identity.retired.len(), 1);
         assert!(dir.path().join("current.log.corrupt-0").exists());
     }

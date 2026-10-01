@@ -279,10 +279,10 @@ impl Settings {
                 .to_string(),
             members: founders.keys().copied().collect(),
             seeds: members,
-            registrar: Some((
-                process.cluster.registrar()?.identity.clone(),
-                process.cluster.ks.address,
-            )),
+            registrar: {
+                let registrar = process.cluster.registrar()?.identity.clone();
+                Some((registrar.clone(), process.peer(&registrar)?))
+            },
             admitted: process
                 .cluster
                 .services_of_kind(process.config.kind)
@@ -596,16 +596,16 @@ pub trait Host:
         let handle = std::thread::Builder::new()
             .name("raft-bootstrap".into())
             .spawn(move || {
-                while let Some(ks) = weak.upgrade() {
-                    if ks.snapshot_stopping.load(Ordering::SeqCst) {
+                while let Some(runtime) = weak.upgrade() {
+                    if runtime.snapshot_stopping.load(Ordering::SeqCst) {
                         break;
                     }
-                    match ks.bootstrap_step() {
+                    match runtime.bootstrap_step() {
                         Ok(true) => break,
                         Ok(false) => {}
                         Err(e) => logn!("Raft bootstrap waiting", "{e}"),
                     }
-                    drop(ks);
+                    drop(runtime);
                     std::thread::park_timeout(Duration::from_millis(200));
                 }
             })
@@ -660,12 +660,12 @@ pub trait Host:
         let handle = std::thread::Builder::new()
             .name("raft-checkpoints".into())
             .spawn(move || {
-                while let Some(ks) = weak.upgrade() {
-                    if ks.snapshot_stopping.load(Ordering::SeqCst) {
+                while let Some(runtime) = weak.upgrade() {
+                    if runtime.snapshot_stopping.load(Ordering::SeqCst) {
                         break;
                     }
-                    ks.maybe_snapshot();
-                    drop(ks);
+                    runtime.maybe_snapshot();
+                    drop(runtime);
                     std::thread::park_timeout(Duration::from_millis(200));
                 }
             })
@@ -1685,7 +1685,7 @@ pub trait Host:
         if !packet.ready && *sender != UNASSIGNED {
             self.readiness_requests
                 .lock()
-                .map_err(|_| Error::new("unlock request lock poisoned"))?
+                .map_err(|_| Error::new("peer readiness lock poisoned"))?
                 .insert(*sender);
         }
         match packet.message {
@@ -2104,17 +2104,17 @@ pub trait Host:
                 let mut unlocked = false;
                 let mut last_error: Option<String> = None;
                 loop {
-                    let Some(ks) = weak.upgrade() else {
+                    let Some(runtime) = weak.upgrade() else {
                         break;
                     };
-                    if ks.snapshot_stopping.load(Ordering::SeqCst)
+                    if runtime.snapshot_stopping.load(Ordering::SeqCst)
                         || cancelled.load(Ordering::SeqCst)
                     {
                         break;
                     }
                     let mut contacted = false;
                     let result = (|| -> Result<()> {
-                        let plan = ks.on_raft(move |_, node| {
+                        let plan = runtime.on_raft(move |_, node| {
                             let (contact, setup) =
                                 peer_eligibility(&node.state().membership(), node.id, peer);
                             if node.journal.failed || !contact {
@@ -2125,20 +2125,22 @@ pub trait Host:
                         let Some((request, setup)) = plan else {
                             return Ok(());
                         };
-                        let requested = ks
+                        let requested = runtime
                             .readiness_requests
                             .lock()
-                            .map_err(|_| Error::new("unlock request lock poisoned"))?
+                            .map_err(|_| Error::new("peer readiness lock poisoned"))?
                             .contains(&peer);
                         if setup && (!unlocked || requested) {
-                            if let Some(action) = ks.peer_message() {
-                                unlocked = ks.send_raft(&peer, Message::Client(action))?.status
-                                    == Status::Ok;
+                            if let Some(action) = runtime.peer_message() {
+                                unlocked =
+                                    runtime.send_raft(&peer, Message::Client(action))?.status
+                                        == Status::Ok;
                                 contacted |= unlocked;
                                 if unlocked {
-                                    ks.readiness_requests
+                                    runtime
+                                        .readiness_requests
                                         .lock()
-                                        .map_err(|_| Error::new("unlock request lock poisoned"))?
+                                        .map_err(|_| Error::new("peer readiness lock poisoned"))?
                                         .remove(&peer);
                                 }
                             }
@@ -2146,7 +2148,7 @@ pub trait Host:
                         if let Some(request) = request {
                             let sent = lease::now()?;
                             let response =
-                                ks.send_raft(&peer, Message::Consensus(request.clone()))?;
+                                runtime.send_raft(&peer, Message::Consensus(request.clone()))?;
                             if response.status != Status::Ok {
                                 return Err(Error::new(format!(
                                     "peer {peer} rejected Raft RPC: {:?}",
@@ -2163,7 +2165,7 @@ pub trait Host:
                             let response: ConsensusReply = parse(&bytes)?;
                             contacted = true;
                             unlocked = response.ready;
-                            ks.on_raft(move |host, node| {
+                            runtime.on_raft(move |host, node| {
                                 if let Some(retired) = response.retirement {
                                     if retired.previous != peer
                                         || response.member != Sender::Slot(retired.next)
@@ -2216,8 +2218,8 @@ pub trait Host:
                         }
                         Ok(()) => {}
                     }
-                    let interval = Duration::from_millis(ks.options.raft.heartbeat_ms);
-                    drop(ks);
+                    let interval = Duration::from_millis(runtime.options.raft.heartbeat_ms);
+                    drop(runtime);
                     std::thread::park_timeout(interval);
                 }
             })
@@ -2383,17 +2385,17 @@ mod tests {
     }
     #[test]
     fn clients_wait_off_the_raft_worker_including_forwarded_requests() {
-        let clients: Vec<_> = [Op::SnMasterKey, Op::RotateMasterKey, Op::RaftMembers]
+        let clients: Vec<_> = [Op::Ping, Op::Status, Op::RaftMembers]
             .iter()
             .copied()
-            .filter(|op| !matches!(op, Op::Raft | Op::Unlock | Op::Register | Op::Lookup))
+            .filter(|op| !matches!(op, Op::Raft | Op::Register | Op::Lookup))
             .collect();
         let all_clients = clients.iter().all(|op| needs_request_worker(&Req::new(*op)));
         let unknown_client = needs_request_worker(&Req::new(Op::BytesResp));
 
         let registration = needs_request_worker(&Req::new(Op::Register));
         let packet = |message| {
-            Req::new(Op::Raft).text("KS0").bytes(
+            Req::new(Op::Raft).text("member-0").bytes(
                 binary(&Packet {
                     target: None,
                     retirement: None,
@@ -2411,12 +2413,10 @@ mod tests {
             last: 0,
             last_term: 0,
         })));
-        let transfer = needs_request_worker(&packet(Message::Client(crate::Action::new(
-            Op::Unlock,
-            vec![0; 32],
-        ))));
+        let transfer =
+            needs_request_worker(&packet(Message::Client(crate::Action::new(Op::Ping, vec![]))));
         let forwarded = needs_request_worker(&packet(Message::Forward {
-            op: Op::SnMasterKey.code(),
+            op: Op::Ping.code(),
             payload: common::MessageBytes::new(),
             depth: 0,
         }));
