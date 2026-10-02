@@ -741,6 +741,95 @@ impl State {
         // Journal records have already passed State::apply before their write was queued.
         self.apply_record(record)
     }
+    pub(crate) fn apply_journal_batch(&mut self, records: &[Record]) -> Result<StateUndo> {
+        let mut undo = Vec::with_capacity(records.len());
+        for record in records {
+            match self.apply_journal_record(record) {
+                Ok(change) => {
+                    if let Err(error) = self.validate() {
+                        change.rollback(self);
+                        StateUndo(undo).rollback(self);
+                        return Err(error);
+                    }
+                    undo.push(change);
+                }
+                Err(error) => {
+                    StateUndo(undo).rollback(self);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(StateUndo(undo))
+    }
+    fn apply_journal_record(&mut self, record: &Record) -> Result<StateChange> {
+        if let Record::Install(snapshot) = record {
+            self.check_ring(snapshot)?;
+            snapshot.validate()?;
+            if snapshot.index < self.commit || snapshot.term > self.term {
+                return Err(Error::new("invalid Raft snapshot boundary"));
+            }
+            let keep = self.history_at(snapshot.index) == Some((snapshot.term, snapshot.scn));
+            let log = if keep {
+                self.log.iter().filter(|e| e.index > snapshot.index).cloned().collect()
+            } else {
+                EntryLog::default()
+            };
+            let old_log = std::mem::replace(&mut self.log, log);
+            let old_commit = std::mem::replace(&mut self.commit, snapshot.index);
+            let old_snapshot = std::mem::replace(&mut self.snapshot, snapshot.clone());
+            let old_ring = self
+                .ignore_ring_identity
+                .then(|| std::mem::replace(&mut self.ring, snapshot.ring.clone()));
+            let old_max_scn = self.max_scn;
+            if snapshot.index != 0 {
+                self.observe_scn(snapshot.scn);
+            }
+            for entry in &snapshot.application {
+                self.observe_scn(entry.scn);
+            }
+            return Ok(StateChange::Install {
+                snapshot: old_snapshot,
+                log: old_log,
+                commit: old_commit,
+                ring: old_ring,
+                max_scn: old_max_scn,
+            });
+        }
+
+        let change = match record {
+            Record::Contacts(contacts) => StateChange::Contacts(
+                contacts.keys().filter(|slot| !self.contacts.contains_key(slot)).copied().collect(),
+            ),
+            Record::Retired(retired) => StateChange::Retired(
+                retired.previous,
+                !self.retirements.contains_key(&retired.previous),
+            ),
+            Record::Bootstrap(_) if self.founders.is_none() => StateChange::Bootstrap {
+                founders: self.founders.clone(),
+                membership: self.snapshot.membership.clone(),
+            },
+            Record::Bootstrap(_) => StateChange::None,
+            Record::Hard { .. } => StateChange::Hard { term: self.term, vote: self.vote },
+            Record::Entries { from, .. } if *from == self.last().saturating_add(1) => {
+                StateChange::EntryAppend { len: self.log.len(), max_scn: self.max_scn }
+            }
+            Record::Entries { .. } => {
+                StateChange::Entries { log: self.log.clone(), max_scn: self.max_scn }
+            }
+            Record::Carry { .. } => StateChange::Carry {
+                log: self.log.clone(),
+                commit: self.commit,
+                max_scn: self.max_scn,
+            },
+            Record::Commit(_) => StateChange::Commit(self.commit),
+            Record::Install(_) => unreachable!(),
+        };
+        if let Err(error) = self.apply_record(record) {
+            change.rollback(self);
+            return Err(error);
+        }
+        Ok(change)
+    }
     fn apply_record(&mut self, record: &Record) -> Result<()> {
         match record {
             Record::Contacts(contacts) => {
@@ -873,6 +962,98 @@ impl State {
         Ok(())
     }
 }
+
+pub(crate) struct StateUndo(Vec<StateChange>);
+impl StateUndo {
+    pub(crate) fn rollback(mut self, state: &mut State) {
+        while let Some(change) = self.0.pop() {
+            change.rollback(state);
+        }
+    }
+}
+enum StateChange {
+    None,
+    Contacts(Vec<MemberId>),
+    Retired(MemberId, bool),
+    Bootstrap {
+        founders: Option<Membership>,
+        membership: Membership,
+    },
+    Hard {
+        term: u64,
+        vote: Option<MemberId>,
+    },
+    EntryAppend {
+        len: usize,
+        max_scn: Option<Scn>,
+    },
+    Entries {
+        log: EntryLog,
+        max_scn: Option<Scn>,
+    },
+    Carry {
+        log: EntryLog,
+        commit: u64,
+        max_scn: Option<Scn>,
+    },
+    Commit(u64),
+    Install {
+        snapshot: Snapshot,
+        log: EntryLog,
+        commit: u64,
+        ring: Option<String>,
+        max_scn: Option<Scn>,
+    },
+}
+impl StateChange {
+    fn rollback(self, state: &mut State) {
+        match self {
+            Self::None => {}
+            Self::Contacts(slots) => {
+                for slot in slots {
+                    state.contacts.remove(&slot);
+                }
+            }
+            Self::Retired(id, inserted) => {
+                if inserted {
+                    state.retirements.remove(&id);
+                }
+            }
+            Self::Bootstrap { founders, membership } => {
+                state.founders = founders;
+                state.snapshot.membership = membership;
+            }
+            Self::Hard { term, vote } => {
+                state.term = term;
+                state.vote = vote;
+            }
+            Self::EntryAppend { len, max_scn } => {
+                state.log.truncate(len);
+                state.max_scn = max_scn;
+            }
+            Self::Entries { log, max_scn } => {
+                state.log = log;
+                state.max_scn = max_scn;
+            }
+            Self::Carry { log, commit, max_scn } => {
+                state.log = log;
+                state.commit = commit;
+                state.max_scn = max_scn;
+            }
+            Self::Commit(commit) => state.commit = commit,
+            Self::Install { snapshot, log, commit, ring, max_scn } => {
+                state.snapshot = snapshot;
+                state.log = log;
+                state.commit = commit;
+                if let Some(ring) = ring {
+                    state.ring = ring;
+                }
+                state.max_scn = max_scn;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Record {
     Contacts(MemberNames),
@@ -1806,6 +1987,34 @@ pub mod tests {
         second.command = Command::Noop;
         log.set(0, second);
         assert_eq!(log.member_at(None), None);
+    }
+    #[test]
+    fn journal_batch_rolls_back_after_an_invalid_record() {
+        let mut state = State::initial("01".repeat(64), members(1), names()).unwrap();
+        let before = state.capture();
+        let scn = Scn::new(1);
+        let records = [
+            Record::Hard { term: 1, vote: None },
+            Record::Entries {
+                from: 1,
+                entries: vec![Entry {
+                    scn,
+                    index: 1,
+                    term: 1,
+                    command: Command::Noop,
+                    entry_buf: None,
+                }],
+            },
+            Record::Commit(2),
+        ];
+
+        assert!(state.apply_journal_batch(&records).is_err());
+        assert_eq!(state.term, 0);
+        assert_eq!(state.vote, None);
+        assert_eq!(state.commit, 0);
+        assert_eq!(state.last(), 0);
+        assert_eq!(state.max_scn, None);
+        assert_eq!(state.capture(), before);
     }
     #[cfg(test)]
     fn retirement(id: MemberId) -> Retirement {

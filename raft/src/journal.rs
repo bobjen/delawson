@@ -800,8 +800,7 @@ impl Journal {
         if held.is_empty() {
             return Ok(());
         }
-        // Keep one immutable serialization per entry. State/apply clones and the async
-        // journal write share this same backing buffer.
+        // Keep one immutable serialization per entry for state, apply, and journal I/O.
         for record in &mut held {
             if let Record::Entries { entries, .. } = record {
                 for entry in entries {
@@ -812,37 +811,39 @@ impl Journal {
                 }
             }
         }
-        // Validate the batch first; durable state advances only after its I/O ticket completes.
-        let mut state = self.state.clone();
-        for record in &held {
-            state.apply(record)?;
-        }
         let sequence =
             self.sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
         let batch = Batch { sequence, records: held };
         let frame = journal_frame(&batch)?;
+        let frame_len = frame.len() as u64;
         let durable_records = Arc::new(batch.records);
+        // Apply against the live state with a small undo log. The entry log is
+        // copy-on-write, so this retains only the prior log root and new entries.
+        let undo = self.state.apply_journal_batch(durable_records.as_slice())?;
         let mut identity = None;
-        self.sequence = sequence;
-        self.change_sequence = sequence;
-        self.state = state;
-        self.log_bytes += frame.len() as u64;
         if durable_records.iter().any(|record| matches!(record, Record::Bootstrap(_) | Record::Install(_))
             || matches!(record, Record::Entries { entries, .. } if entries.iter().any(|e| matches!(e.command, crate::raft::Command::Members(_))))) {
+            let mut updated = self.identity.clone();
             let membership = self.state.membership();
             let slot = membership.slot(&self.identity.current);
             let accepted = slot.is_some_and(|id| membership.members().contains(&id))
                 && self.identity.pending.as_ref().is_none_or(|r| !membership.members().contains(&r.previous));
-            self.identity.slot = slot.or(self.identity.slot);
-            self.identity.membership = Some(membership);
-            self.identity.founders = self.state.founders.clone();
-            if accepted { self.identity.pending = None; }
-            identity = Some(self.identity.clone());
+            updated.slot = slot.or(updated.slot);
+            updated.membership = Some(membership);
+            updated.founders = self.state.founders.clone();
+            if accepted { updated.pending = None; }
+            identity = Some(updated);
         }
-        let result = self.append_frame(frame, durable_records.clone(), identity);
-        if let Err(error) = result {
-            self.state = self.durable.clone();
+        let write_identity = identity.clone();
+        if let Err(error) = self.append_frame(frame, durable_records.clone(), write_identity) {
+            undo.rollback(&mut self.state);
             return Err(error);
+        }
+        self.sequence = sequence;
+        self.change_sequence = sequence;
+        self.log_bytes += frame_len;
+        if let Some(identity) = identity {
+            self.identity = identity;
         }
         self.track_change(DurableChange::Records(durable_records))?;
         Ok(())
