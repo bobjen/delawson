@@ -96,6 +96,26 @@ impl<T: Wire> Wire for Vec<T> {
         })
     }
 }
+impl Wire for crate::raft::EntryLog {
+    fn write(&self, w: &mut StructWriter) {
+        w.nested(Op::RaftList, |w| {
+            w.number_u64(self.len() as u64);
+            for entry in self.iter() {
+                entry.write(w);
+            }
+        });
+    }
+    fn read(r: &mut StructReader<'_>) -> Result<Self> {
+        r.nested(Op::RaftList, "entry log", |r| {
+            let n = r.number_u64()?;
+            let mut entries = common::checked_vec(n, r.remaining())?;
+            for _ in 0..n {
+                entries.push(crate::raft::Entry::read(r)?);
+            }
+            Ok(entries.into())
+        })
+    }
+}
 impl<T: Wire> Wire for Option<T> {
     fn write(&self, w: &mut StructWriter) {
         w.nested(Op::RaftOptional, |w| {
@@ -217,7 +237,7 @@ impl Wire for crate::Entry {
         })?;
         let bytes = r.raw_range(start, r.position() - start)?;
         let lazy_actions = matches!(&entry.command, crate::Command::Client(_));
-        entry.entry_buf = Some(Arc::new(crate::EntryBuf { bytes, depth, lazy_actions }));
+        entry.entry_buf = Some(Arc::new(crate::EntryBuf::new(bytes, depth, lazy_actions)));
         Ok(entry)
     }
 }
@@ -274,7 +294,7 @@ pub(crate) fn entry_buffer(entry: &crate::Entry) -> Result<Arc<crate::EntryBuf>>
     let depth = arg.depth;
     let bytes = arg.into_bytes().into();
     let lazy_actions = matches!(&entry.command, crate::Command::Client(_));
-    Ok(Arc::new(crate::EntryBuf { bytes, depth, lazy_actions }))
+    Ok(Arc::new(crate::EntryBuf::new(bytes, depth, lazy_actions)))
 }
 #[macro_export]
 macro_rules! wire_struct {

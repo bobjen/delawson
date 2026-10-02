@@ -1,7 +1,7 @@
 //! One ordered journal for Raft entries, terms/votes, commit markers and installs.
 //! Applications encrypt private command data before proposing it; consensus metadata stays readable.
 use crate::codec::{self, Wire};
-use crate::raft::{INCARNATION, Member, MemberId, Membership, Record, Retirement, State};
+use crate::raft::{INCARNATION, Member, MemberId, Membership, Record, Retirement, Snapshot, State};
 use crate::random_bytes;
 use common::scn::Scn;
 use common::{Context, Error, Result};
@@ -297,7 +297,7 @@ pub struct Journal {
     disk: Arc<Mutex<Disk>>,
     io: Option<crate::io::Queue>,
     durable: State,
-    pending_io: VecDeque<(u64, State)>,
+    pending_io: VecDeque<(u64, DurableChange)>,
     current_start: u64,
     sequence: u64,
     change_sequence: u64,
@@ -307,6 +307,36 @@ pub struct Journal {
     log_bytes: u64,
     retain: usize,
     pub failed: bool,
+}
+enum DurableChange {
+    Records(Arc<Vec<Record>>),
+    Snapshot(Snapshot),
+    Replace(State),
+}
+fn mark_records(records: &[Record], durable: bool) {
+    for record in records {
+        let entries: &[crate::raft::Entry] = match record {
+            Record::Entries { entries, .. } | Record::Carry { entries, .. } => entries,
+            Record::Install(snapshot) => &snapshot.application,
+            _ => continue,
+        };
+        for entry in entries {
+            if let Some(buffer) = &entry.entry_buf {
+                if durable {
+                    buffer.mark_durable();
+                } else {
+                    buffer.mark_written();
+                }
+            }
+        }
+    }
+}
+fn mark_loaded(state: &State) {
+    for entry in state.snapshot.application.iter().chain(state.log.iter()) {
+        if let Some(buffer) = &entry.entry_buf {
+            buffer.mark_durable();
+        }
+    }
 }
 impl crate::raft::Storage for Journal {
     fn history_repair_required(&self) -> bool {
@@ -489,6 +519,7 @@ impl Journal {
             drop(ownership);
             return Self::open(directory, initial, retain, member);
         }
+        mark_loaded(&state);
         let before = local.clone();
         local.initialized = true;
         let membership = state.membership();
@@ -552,16 +583,43 @@ impl Journal {
             }
         };
         while self.pending_io.front().is_some_and(|(ticket, _)| *ticket <= completed) {
-            self.durable = self.pending_io.pop_front().unwrap().1;
+            let change = self.pending_io.pop_front().unwrap().1;
+            if let Err(error) = self.apply_durable(change) {
+                self.failed = true;
+                return Err(error);
+            }
         }
         Ok(())
     }
-    fn track_durability(&mut self) {
-        if let Some(io) = &self.io {
-            self.pending_io.push_back((io.ticket(), self.state.clone()));
-        } else {
-            self.durable = self.state.clone();
+    fn apply_durable(&mut self, change: DurableChange) -> Result<()> {
+        match change {
+            DurableChange::Records(records) => {
+                for record in records.iter() {
+                    self.durable.apply_durable(record)?;
+                }
+            }
+            DurableChange::Snapshot(snapshot) => {
+                if snapshot.index >= self.durable.snapshot.index {
+                    self.durable.log.retain(|entry| entry.index > snapshot.index);
+                    self.durable.commit = self.durable.commit.max(snapshot.index);
+                    if self.durable.ignore_ring_identity {
+                        self.durable.ring = snapshot.ring.clone();
+                    }
+                    self.durable.snapshot = snapshot;
+                    self.durable.validate()?;
+                }
+            }
+            DurableChange::Replace(state) => self.durable = state,
         }
+        Ok(())
+    }
+    fn track_change(&mut self, change: DurableChange) -> Result<()> {
+        if let Some(io) = &self.io {
+            self.pending_io.push_back((io.ticket(), change));
+        } else {
+            self.apply_durable(change)?;
+        }
+        Ok(())
     }
     fn perform(
         &mut self,
@@ -579,10 +637,20 @@ impl Journal {
         }
         result
     }
-    fn append_shared_frame(&mut self, frame: JournalFrame) -> Result<()> {
+    fn append_frame(
+        &mut self,
+        frame: JournalFrame,
+        records: Arc<Vec<Record>>,
+        identity: Option<LocalIdentity>,
+    ) -> Result<()> {
         self.perform(move |disk| {
             frame.write_to(&mut disk.file)?;
+            mark_records(&records, false);
             disk.file.sync_all()?;
+            if let Some(identity) = identity {
+                append_identity(&mut disk.ownership, &identity)?;
+            }
+            mark_records(&records, true);
             Ok(())
         })
     }
@@ -704,7 +772,7 @@ impl Journal {
         self.snapshot_second = second;
         self.snapshot_bytes = snapshot_bytes;
         self.log_bytes = HEADER;
-        self.track_durability();
+        self.track_change(DurableChange::Replace(self.state.clone()))?;
         Ok(())
     }
     pub fn needs_bootstrap(&self) -> bool {
@@ -744,7 +812,7 @@ impl Journal {
                 }
             }
         }
-        // Validate the entire batch before writing; after sync its state is published atomically.
+        // Validate the batch first; durable state advances only after its I/O ticket completes.
         let mut state = self.state.clone();
         for record in &held {
             state.apply(record)?;
@@ -753,12 +821,13 @@ impl Journal {
             self.sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
         let batch = Batch { sequence, records: held };
         let frame = journal_frame(&batch)?;
+        let durable_records = Arc::new(batch.records);
         let mut identity = None;
         self.sequence = sequence;
         self.change_sequence = sequence;
         self.state = state;
         self.log_bytes += frame.len() as u64;
-        if batch.records.iter().any(|record| matches!(record, Record::Bootstrap(_) | Record::Install(_))
+        if durable_records.iter().any(|record| matches!(record, Record::Bootstrap(_) | Record::Install(_))
             || matches!(record, Record::Entries { entries, .. } if entries.iter().any(|e| matches!(e.command, crate::raft::Command::Members(_))))) {
             let membership = self.state.membership();
             let slot = membership.slot(&self.identity.current);
@@ -770,20 +839,12 @@ impl Journal {
             if accepted { self.identity.pending = None; }
             identity = Some(self.identity.clone());
         }
-        let result = if let Some(identity) = identity {
-            self.perform(move |disk| {
-                frame.write_to(&mut disk.file)?;
-                disk.file.sync_all()?;
-                append_identity(&mut disk.ownership, &identity)
-            })
-        } else {
-            self.append_shared_frame(frame)
-        };
+        let result = self.append_frame(frame, durable_records.clone(), identity);
         if let Err(error) = result {
             self.state = self.durable.clone();
             return Err(error);
         }
-        self.track_durability();
+        self.track_change(DurableChange::Records(durable_records))?;
         Ok(())
     }
     pub fn snapshot_due(&self, min_bytes: u64, seconds: u64, now: u64) -> bool {
@@ -826,7 +887,7 @@ impl Journal {
         state.snapshot = snapshot;
         let sequence = self.sequence;
         let captured_bytes = self.log_bytes;
-        let suffix = std::mem::take(&mut state.log);
+        let suffix: Vec<_> = std::mem::take(&mut state.log).iter().cloned().collect();
         let checkpoint = Checkpoint { sequence, second: now, state: state.clone() };
         let start =
             self.sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
@@ -891,9 +952,9 @@ impl Journal {
         }
         let snapshot = &pending.snapshot;
         // New entries, commits and terms may have arrived while the file was written.
-        if snapshot.index >= self.state.snapshot.index
-            && self.state.history_at(snapshot.index) == Some((snapshot.term, snapshot.scn))
-        {
+        let adopted = snapshot.index >= self.state.snapshot.index
+            && self.state.history_at(snapshot.index) == Some((snapshot.term, snapshot.scn));
+        if adopted {
             self.state.log.retain(|e| e.index > snapshot.index);
             if self.state.ignore_ring_identity {
                 self.state.ring = snapshot.ring.clone();
@@ -905,7 +966,9 @@ impl Journal {
         self.snapshot_bytes = pending.written_bytes.load(std::sync::atomic::Ordering::SeqCst);
         self.log_bytes = self.log_bytes.saturating_sub(pending.log_bytes);
         self.prune()?;
-        self.track_durability();
+        if adopted {
+            self.track_change(DurableChange::Snapshot(snapshot.clone()))?;
+        }
         Ok(())
     }
     #[cfg(any(test, feature = "testing"))]
@@ -1660,6 +1723,8 @@ mod tests {
 
         let recovered = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(recovered.state.commit, 1);
+        assert!(recovered.state.log[0].is_written());
+        assert!(recovered.state.log[0].is_durable());
         let actions = recovered.state.log[0].client_actions().unwrap();
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].fields, vec![53; 128 * 1024]);
@@ -1700,10 +1765,19 @@ mod tests {
         assert_eq!(journal.state.last(), 1);
         assert_eq!(journal.durable_state().last(), 0);
         assert_eq!(journal.durable_state().term, 0);
+        assert!(!journal.state.log[0].is_written());
+        assert!(!journal.state.log[0].is_durable());
         release.send(()).unwrap();
         journal.fence().unwrap().wait().unwrap();
         journal.poll_io().unwrap();
         assert_eq!(journal.durable_state().last(), 1);
+        assert!(journal.state.log[0].is_written());
+        assert!(journal.state.log[0].is_durable());
+        assert!(journal.durable_state().log[0].is_durable());
+        assert!(Arc::ptr_eq(
+            journal.state.log[0].entry_buf.as_ref().unwrap(),
+            journal.durable_state().log[0].entry_buf.as_ref().unwrap(),
+        ));
         journal.write(&[Record::Commit(1)]).unwrap();
         journal.fence().unwrap().wait().unwrap();
         journal.poll_io().unwrap();
@@ -2396,7 +2470,7 @@ mod tests {
         let before = original.clone();
         original.apply(&carry).unwrap();
         let same_log = original.log == before.log;
-        let recovered_suffix = published.log == before.log[1..];
+        let recovered_suffix = published.log.iter().eq(before.log.iter().skip(1));
         let committed = published.commit;
         let term = published.term;
         let vote = published.vote.clone();

@@ -1,5 +1,5 @@
 //! Shared action iteration and global-lock budgeting. Clients dispatch action tags.
-use crate::{Action, Command, Entry, Snapshot, State};
+use crate::{Action, Command, Entry, EntryLog, Snapshot, State};
 use common::{Error, Result};
 use parking_lot::RwLock;
 use std::collections::VecDeque;
@@ -13,14 +13,14 @@ pub struct Work {
     pub generation: u64,
     pub ring: String,
     pub snapshot: Arc<Snapshot>,
-    pub entries: Vec<Entry>,
+    pub entries: EntryLog,
     pub commit: u64,
 }
 pub trait Committed {
     fn generation(&self) -> u64;
     fn ring(&self) -> &str;
     fn snapshot(&self) -> &Snapshot;
-    fn entries(&self) -> &[Entry];
+    fn entries(&self) -> &EntryLog;
     fn commit(&self) -> u64;
 }
 impl Committed for State {
@@ -33,7 +33,7 @@ impl Committed for State {
     fn snapshot(&self) -> &Snapshot {
         &self.snapshot
     }
-    fn entries(&self) -> &[Entry] {
+    fn entries(&self) -> &EntryLog {
         &self.log
     }
     fn commit(&self) -> u64 {
@@ -50,7 +50,7 @@ impl Committed for Work {
     fn snapshot(&self) -> &Snapshot {
         &self.snapshot
     }
-    fn entries(&self) -> &[Entry] {
+    fn entries(&self) -> &EntryLog {
         &self.entries
     }
     fn commit(&self) -> u64 {
@@ -389,7 +389,9 @@ mod tests {
         execute_blocking(&global, &cursor, &applied, &old, Duration::MAX, apply).unwrap();
         let mut replacement = state();
         replacement.generation = 1;
-        replacement.log[0].command = Command::Client(vec![Action::new(Op::BytesResp, vec![9])]);
+        let mut first = replacement.log[0].clone();
+        first.command = Command::Client(vec![Action::new(Op::BytesResp, vec![9])]);
+        replacement.log.set(0, first);
         execute_blocking(&global, &cursor, &applied, &replacement, Duration::MAX, apply).unwrap();
         let data = global.read();
         assert_eq!(applied.load(Ordering::Acquire), 1);
@@ -398,7 +400,9 @@ mod tests {
     #[test]
     fn no_action_commit_advances_without_the_global_lock() {
         let mut committed = state();
-        committed.log[0].command = Command::Noop;
+        let mut first = committed.log[0].clone();
+        first.command = Command::Noop;
+        committed.log.set(0, first);
         committed.log.truncate(1);
         committed.commit = 1;
 
@@ -473,7 +477,8 @@ mod tests {
                             term: 1,
                             command: Command::Noop,
                             entry_buf: None,
-                        }],
+                        }]
+                        .into(),
                         commit: 1,
                     },
                 )?;
@@ -495,7 +500,7 @@ mod tests {
     fn yields_between_actions_and_does_not_apply_uncommitted_entries() {
         let mut state = state();
         let first = crate::codec::encode(&state.log[0]).unwrap();
-        state.log[0] = crate::codec::decode(&first).unwrap();
+        state.log.set(0, crate::codec::decode(&first).unwrap());
         assert!(matches!(&state.log[0].command, Command::Client(actions) if actions.is_empty()));
         let global = RwLock::new(Values::default());
         let cursor = Mutex::new(Cursor::default());

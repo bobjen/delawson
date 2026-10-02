@@ -39,6 +39,38 @@ finish() {
 }
 trap finish EXIT
 ./scripts/start-laws --release --run-dir "$output/run"
+laws=./target/release/laws
+cluster="$output/run/cluster-effective.toml"
+raft_nodes=()
+while read -r identity kind _; do
+    if [[ $kind == ks || $kind == sn ]]; then
+        raft_nodes+=("$identity")
+    fi
+done < <("$laws" --config "$cluster" services)
+
+# start-laws gates on the KS registrar; wait here for every KS member and SN
+# ring to report a known, healthy leader before the benchmark starts.
+deadline=$((SECONDS + 60))
+while true; do
+    missing=()
+    for identity in "${raft_nodes[@]}"; do
+        listen=$(sed -n 's/^listen = "\(.*\)"$/\1/p' "$output/run/$identity/process.toml")
+        state=$("$laws" --config "$cluster" --at "$listen" --to "$identity" status 2>&1) || state=""
+        if [[ ! $state =~ raft_leader[[:space:]]+[0-9]+ || $state != *"raft_failed false"* ]]; then
+            missing+=("$identity")
+        fi
+    done
+    ((${#missing[@]} == 0)) && break
+    if ((SECONDS >= deadline)); then
+        echo "benchmark: no healthy known Raft leader on: ${missing[*]}" >&2
+        for identity in "${missing[@]}"; do
+            listen=$(sed -n 's/^listen = "\(.*\)"$/\1/p' "$output/run/$identity/process.toml")
+            "$laws" --config "$cluster" --at "$listen" --to "$identity" status >&2 || true
+        done
+        exit 1
+    fi
+    sleep 0.02
+done
 client=(./target/release/laws --config "$output/run/cluster-effective.toml" --to FE0)
 "${client[@]}" bench-create --objects 20000000 --batch 1000 --clients 16 --depth 16 --trials 1
 "${client[@]}" bench-info --objects 20000000 --batch 1 --clients 16 --depth 16 --seconds 5 --trials 3 --trial 1
@@ -62,11 +94,13 @@ temporary run directories still use the same configured TCP ports. Do not run
 this while another development cluster is using those ports.
 
 `start-laws` waits for the registrar to report a healthy known Raft leader after
-starting/unlocking the KS members and before starting DNs. Preserve this gate:
-a ready file only proves the listener is up. Older launchers without it can fail
-DN0 registration with `Raft has no known Raft leader`; check historical launchers
-before running. If startup fails, allow cleanup to finish before another attempt.
-Never interpret failed startup or nonexistent-object lookups as a performance result.
+starting/unlocking the KS members and before starting DNs. The benchmark runner
+then checks every KS member and every SN for a healthy known leader before
+population. Preserve both gates: a ready file only proves the listener is up.
+Older launchers without the KS gate can fail DN0 registration with `Raft has no
+known Raft leader`; check historical launchers before running. If startup fails,
+allow cleanup to finish before another attempt. Never interpret failed startup
+or nonexistent-object lookups as a performance result.
 
 ## Interpreting results
 

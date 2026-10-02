@@ -4,7 +4,9 @@ use common::scn::Scn;
 use common::{Error, MessageBytes, Result};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Index;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Stable process identities within this ring. Endpoints are discovered, never voted on.
 // Low 32 bits are the logical slot; high 32 bits distinguish replacements.
@@ -186,11 +188,29 @@ pub enum Command {
     CheckpointStart(MemberId),
 }
 /// A single entry's encoded bytes, shared by journal I/O and apply work.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct EntryBuf {
     pub(crate) bytes: MessageBytes,
     pub(crate) depth: u8,
     pub(crate) lazy_actions: bool,
+    status: AtomicU8,
+}
+impl EntryBuf {
+    pub(crate) fn new(bytes: MessageBytes, depth: u8, lazy_actions: bool) -> Self {
+        Self { bytes, depth, lazy_actions, status: AtomicU8::new(0) }
+    }
+    pub fn is_written(&self) -> bool {
+        self.status.load(Ordering::Acquire) & 1 != 0
+    }
+    pub fn is_durable(&self) -> bool {
+        self.status.load(Ordering::Acquire) & 2 != 0
+    }
+    pub(crate) fn mark_written(&self) {
+        self.status.fetch_or(1, Ordering::Release);
+    }
+    pub(crate) fn mark_durable(&self) {
+        self.status.fetch_or(3, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +243,12 @@ impl PartialEq for Entry {
 }
 impl Eq for Entry {}
 impl Entry {
+    pub fn is_written(&self) -> bool {
+        self.entry_buf.as_ref().is_none_or(|buf| buf.is_written())
+    }
+    pub fn is_durable(&self) -> bool {
+        self.entry_buf.as_ref().is_none_or(|buf| buf.is_durable())
+    }
     /// Borrow already-decoded actions or decode a retained wire entry on demand.
     pub fn client_actions(&self) -> Result<Cow<'_, [crate::Action]>> {
         let Command::Client(actions) = &self.command else {
@@ -234,6 +260,224 @@ impl Entry {
         Ok(Cow::Owned(crate::codec::entry_actions(self.entry_buf.as_ref().unwrap())?))
     }
 }
+
+const LOG_CHUNK: usize = 64;
+
+/// Copy-on-write log storage. Cloning a State shares the log; edits copy only
+/// the chunk index and the final entry chunk, not every prior entry.
+#[derive(Clone, Debug, Default)]
+pub struct EntryLog {
+    chunks: Arc<Vec<Arc<Vec<Entry>>>>,
+    members: Option<usize>,
+    checkpoints: Option<usize>,
+    len: usize,
+}
+impl EntryLog {
+    fn last_pos(&self, member: bool) -> Option<usize> {
+        let mut base = self.len;
+        for chunk in self.chunks.iter().rev() {
+            base -= chunk.len();
+            if let Some((at, _)) = chunk.iter().enumerate().rev().find(|(_, entry)| {
+                if member {
+                    matches!(&entry.command, Command::Members(_))
+                } else {
+                    matches!(&entry.command, Command::CheckpointStart(_))
+                }
+            }) {
+                return Some(base + at);
+            }
+        }
+        None
+    }
+    fn last_mark(&self, at: Option<usize>, member: bool, through: Option<u64>) -> Option<&Entry> {
+        let entry = self.get(at?)?;
+        if through.is_none_or(|limit| entry.index <= limit) {
+            return Some(entry);
+        }
+        let limit = through?;
+        self.iter().rev().find(|entry| {
+            if entry.index > limit {
+                return false;
+            }
+            if member {
+                matches!(&entry.command, Command::Members(_))
+            } else {
+                matches!(&entry.command, Command::CheckpointStart(_))
+            }
+        })
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn get(&self, index: usize) -> Option<&Entry> {
+        if index >= self.len {
+            return None;
+        }
+        self.chunks.get(index / LOG_CHUNK)?.get(index % LOG_CHUNK)
+    }
+    pub fn last(&self) -> Option<&Entry> {
+        self.len.checked_sub(1).and_then(|index| self.get(index))
+    }
+    pub fn member_at(&self, through: Option<u64>) -> Option<&Entry> {
+        self.last_mark(self.members, true, through)
+    }
+    pub fn checkpoint_at(&self, through: Option<u64>) -> Option<&Entry> {
+        self.last_mark(self.checkpoints, false, through)
+    }
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Entry> + '_ {
+        self.chunks.iter().flat_map(|chunk| chunk.iter())
+    }
+    pub fn push(&mut self, entry: Entry) {
+        let len = self.len;
+        let is_member = matches!(&entry.command, Command::Members(_));
+        let is_checkpoint = matches!(&entry.command, Command::CheckpointStart(_));
+        let chunks = Arc::make_mut(&mut self.chunks);
+        if len % LOG_CHUNK == 0 {
+            chunks.push(Arc::new(Vec::with_capacity(LOG_CHUNK)));
+        }
+        Arc::make_mut(chunks.last_mut().expect("entry log chunk")).push(entry);
+        if is_member {
+            self.members = Some(len);
+        }
+        if is_checkpoint {
+            self.checkpoints = Some(len);
+        }
+        self.len = len + 1;
+    }
+    pub fn pop(&mut self) -> Option<Entry> {
+        if self.len == 0 {
+            return None;
+        }
+        let entry = {
+            let chunks = Arc::make_mut(&mut self.chunks);
+            let entry = Arc::make_mut(chunks.last_mut().expect("entry log chunk")).pop();
+            if chunks.last().is_some_and(|chunk| chunk.is_empty()) {
+                chunks.pop();
+            }
+            entry
+        };
+        self.len -= 1;
+        if let Some(entry) = &entry {
+            let at = self.len;
+            if matches!(&entry.command, Command::Members(_)) && self.members == Some(at) {
+                self.members = self.last_pos(true);
+            }
+            if matches!(&entry.command, Command::CheckpointStart(_)) && self.checkpoints == Some(at)
+            {
+                self.checkpoints = self.last_pos(false);
+            }
+        }
+        entry
+    }
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.len {
+            return;
+        }
+        let keep = len.div_ceil(LOG_CHUNK);
+        let chunks = Arc::make_mut(&mut self.chunks);
+        chunks.truncate(keep);
+        let tail = len % LOG_CHUNK;
+        if tail != 0 {
+            Arc::make_mut(chunks.last_mut().expect("entry log tail")).truncate(tail);
+        }
+        self.len = len;
+        if self.members.is_some_and(|at| at >= len) {
+            self.members = self.last_pos(true);
+        }
+        if self.checkpoints.is_some_and(|at| at >= len) {
+            self.checkpoints = self.last_pos(false);
+        }
+    }
+    pub fn clear(&mut self) {
+        self.chunks = Arc::new(Vec::new());
+        self.members = None;
+        self.checkpoints = None;
+        self.len = 0;
+    }
+    pub fn retain(&mut self, mut keep: impl FnMut(&Entry) -> bool) {
+        let mut retained = Self::default();
+        for entry in self.iter() {
+            if keep(entry) {
+                retained.push(entry.clone());
+            }
+        }
+        *self = retained;
+    }
+    pub fn partition_point(&self, mut before: impl FnMut(&Entry) -> bool) -> usize {
+        let (mut low, mut high) = (0, self.len);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if before(self.get(mid).expect("entry log index")) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        low
+    }
+    pub fn set(&mut self, index: usize, entry: Entry) -> Entry {
+        assert!(index < self.len, "entry log index");
+        let member = matches!(&entry.command, Command::Members(_));
+        let checkpoint = matches!(&entry.command, Command::CheckpointStart(_));
+        let chunks = Arc::make_mut(&mut self.chunks);
+        let old = std::mem::replace(
+            Arc::make_mut(chunks.get_mut(index / LOG_CHUNK).expect("entry log chunk"))
+                .get_mut(index % LOG_CHUNK)
+                .expect("entry log index"),
+            entry,
+        );
+        if member {
+            if self.members.is_none_or(|at| index > at) {
+                self.members = Some(index);
+            }
+        } else if self.members == Some(index) {
+            self.members = self.last_pos(true);
+        }
+        if checkpoint {
+            if self.checkpoints.is_none_or(|at| index > at) {
+                self.checkpoints = Some(index);
+            }
+        } else if self.checkpoints == Some(index) {
+            self.checkpoints = self.last_pos(false);
+        }
+        old
+    }
+}
+impl Extend<Entry> for EntryLog {
+    fn extend<I: IntoIterator<Item = Entry>>(&mut self, entries: I) {
+        for entry in entries {
+            self.push(entry);
+        }
+    }
+}
+impl FromIterator<Entry> for EntryLog {
+    fn from_iter<I: IntoIterator<Item = Entry>>(entries: I) -> Self {
+        let mut log = Self::default();
+        log.extend(entries);
+        log
+    }
+}
+impl From<Vec<Entry>> for EntryLog {
+    fn from(entries: Vec<Entry>) -> Self {
+        entries.into_iter().collect()
+    }
+}
+impl Index<usize> for EntryLog {
+    type Output = Entry;
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("entry log index")
+    }
+}
+impl PartialEq for EntryLog {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.iter().eq(other.iter())
+    }
+}
+impl Eq for EntryLog {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub scn: Scn,
@@ -308,7 +552,7 @@ pub struct State {
     pub term: u64,
     pub vote: Option<MemberId>,
     pub snapshot: Snapshot,
-    pub log: Vec<Entry>,
+    pub log: EntryLog,
     pub commit: u64,
 }
 impl State {
@@ -328,7 +572,7 @@ impl State {
         let mut previous = self.snapshot.index;
         let mut term = self.snapshot.term;
         let mut membership = &self.snapshot.membership;
-        for entry in &self.log {
+        for entry in self.log.iter() {
             if previous.checked_add(1) != Some(entry.index)
                 || entry.term < term
                 || entry.term > self.term
@@ -380,7 +624,7 @@ impl State {
                 application: vec![],
                 checkpoint_start: None,
             },
-            log: vec![],
+            log: EntryLog::default(),
             commit: 0,
         })
     }
@@ -434,9 +678,8 @@ impl State {
     pub fn membership(&self) -> Membership {
         let mut membership = self
             .log
-            .iter()
-            .rev()
-            .find_map(|e| match &e.command {
+            .member_at(None)
+            .and_then(|e| match &e.command {
                 Command::Members(m) => Some(m.clone()),
                 _ => None,
             })
@@ -457,10 +700,8 @@ impl State {
     }
     pub fn committed_membership(&self) -> Membership {
         self.log
-            .iter()
-            .rev()
-            .filter(|e| e.index <= self.commit)
-            .find_map(|e| match &e.command {
+            .member_at(Some(self.commit))
+            .and_then(|e| match &e.command {
                 Command::Members(m) => Some(m.clone()),
                 _ => None,
             })
@@ -468,10 +709,8 @@ impl State {
     }
     pub fn checkpoint_start(&self) -> Option<(u64, MemberId)> {
         self.log
-            .iter()
-            .rev()
-            .filter(|e| e.index <= self.commit)
-            .find_map(|e| match &e.command {
+            .checkpoint_at(Some(self.commit))
+            .and_then(|e| match &e.command {
                 Command::CheckpointStart(member) => Some((e.index, member.clone())),
                 _ => None,
             })
@@ -495,6 +734,14 @@ impl State {
         snapshot
     }
     pub fn apply(&mut self, record: &Record) -> Result<()> {
+        self.apply_record(record)?;
+        self.validate()
+    }
+    pub(crate) fn apply_durable(&mut self, record: &Record) -> Result<()> {
+        // Journal records have already passed State::apply before their write was queued.
+        self.apply_record(record)
+    }
+    fn apply_record(&mut self, record: &Record) -> Result<()> {
         match record {
             Record::Contacts(contacts) => {
                 let membership = self.membership();
@@ -555,9 +802,9 @@ impl State {
                 let suffix: Vec<_> =
                     entries.iter().filter(|e| e.index > self.commit).cloned().collect();
                 if let Some(first) = suffix.first() {
-                    self.apply(&Record::Entries { from: first.index, entries: suffix })?;
+                    self.apply_record(&Record::Entries { from: first.index, entries: suffix })?;
                 }
-                self.apply(&Record::Commit(self.commit.max(*commit)))?;
+                self.apply_record(&Record::Commit(self.commit.max(*commit)))?;
             }
             Record::Hard { term, vote } => {
                 if *term < self.term
@@ -587,7 +834,7 @@ impl State {
                         expected.checked_add(1).ok_or_else(|| Error::new("Raft index overflow"))?;
                 }
                 self.log.truncate((*from - self.snapshot.index - 1) as usize);
-                self.log.extend(entries.clone());
+                self.log.extend(entries.iter().cloned());
                 for entry in entries {
                     self.observe_scn(entry.scn);
                 }
@@ -608,7 +855,7 @@ impl State {
                 self.log = if keep {
                     self.log.iter().filter(|e| e.index > snapshot.index).cloned().collect()
                 } else {
-                    vec![]
+                    EntryLog::default()
                 };
                 self.commit = snapshot.index;
                 if self.ignore_ring_identity {
@@ -623,7 +870,7 @@ impl State {
                 }
             }
         }
-        self.validate()
+        Ok(())
     }
 }
 #[derive(Clone, Debug)]
@@ -842,7 +1089,9 @@ impl<S: Storage> Node<S> {
         let state = self.state();
         if state.commit > previous_commit {
             let first = state.log.partition_point(|entry| entry.index <= previous_commit);
-            for entry in state.log[first..].iter().take_while(|entry| entry.index <= state.commit) {
+            for entry in
+                state.log.iter().skip(first).take_while(|entry| entry.index <= state.commit)
+            {
                 common::logn!(
                     "Raft entry committed",
                     "member {},index {},term {}",
@@ -1473,6 +1722,91 @@ impl<S: Storage> Node<S> {
 #[cfg(any(test, feature = "testing"))]
 pub mod tests {
     use super::*;
+    #[test]
+    fn entry_log_clone_shares_chunks_without_sharing_mutations() {
+        let mut log = EntryLog::default();
+        for index in 1..=(LOG_CHUNK as u64 + 2) {
+            log.push(Entry {
+                scn: Scn::new(index),
+                index,
+                term: 1,
+                command: Command::Noop,
+                entry_buf: None,
+            });
+        }
+        log.push(Entry {
+            scn: Scn::new(LOG_CHUNK as u64 + 3),
+            index: LOG_CHUNK as u64 + 3,
+            term: 1,
+            command: Command::CheckpointStart(1),
+            entry_buf: None,
+        });
+        let saved = log.clone();
+        let mut first = log[0].clone();
+        first.command = Command::CheckpointStart(2);
+        log.set(0, first);
+        log.truncate(LOG_CHUNK);
+        log.push(Entry {
+            scn: Scn::new(999),
+            index: 999,
+            term: 1,
+            command: Command::Noop,
+            entry_buf: None,
+        });
+
+        assert_eq!(saved.len(), LOG_CHUNK + 3);
+        assert_eq!(saved[0].command, Command::Noop);
+        assert_eq!(saved.last().unwrap().index, LOG_CHUNK as u64 + 3);
+        assert_eq!(saved.checkpoint_at(None).unwrap().index, LOG_CHUNK as u64 + 3);
+        assert_eq!(log.len(), LOG_CHUNK + 1);
+        assert_eq!(log[0].command, Command::CheckpointStart(2));
+        assert_eq!(log.checkpoint_at(None).unwrap().index, 1);
+        assert_eq!(log.last().unwrap().index, 999);
+        assert_eq!(log.partition_point(|entry| entry.index <= 10), 10);
+        assert_eq!(log.iter().rev().next().unwrap().index, 999);
+    }
+    #[test]
+    fn entry_log_indexes_membership_records_across_truncate_and_set() {
+        let membership = Membership {
+            identities: names(),
+            old: members(1),
+            new: None,
+            retired: BTreeMap::new(),
+        };
+        let mut log = EntryLog::default();
+        for index in 1..=5 {
+            log.push(Entry {
+                scn: Scn::new(index),
+                index,
+                term: 1,
+                command: match index {
+                    2 | 4 => Command::Members(membership.clone()),
+                    3 | 5 => Command::CheckpointStart(index),
+                    _ => Command::Noop,
+                },
+                entry_buf: None,
+            });
+        }
+        assert_eq!(log.members, Some(3));
+        assert_eq!(log.checkpoints, Some(4));
+        assert_eq!(log.member_at(None).unwrap().index, 4);
+        assert_eq!(log.member_at(Some(1)), None);
+        assert_eq!(log.member_at(Some(2)).unwrap().index, 2);
+        assert_eq!(log.checkpoint_at(None).unwrap().index, 5);
+        assert_eq!(log.checkpoint_at(Some(4)).unwrap().index, 3);
+        log.truncate(1);
+        assert_eq!(log.member_at(None), None);
+        assert_eq!(log.checkpoint_at(None), None);
+
+        let mut second = log[0].clone();
+        second.command = Command::Members(membership);
+        log.set(0, second);
+        assert_eq!(log.member_at(None).unwrap().index, 1);
+        let mut second = log[0].clone();
+        second.command = Command::Noop;
+        log.set(0, second);
+        assert_eq!(log.member_at(None), None);
+    }
     #[cfg(test)]
     fn retirement(id: MemberId) -> Retirement {
         Retirement {

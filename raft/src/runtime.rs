@@ -111,14 +111,15 @@ impl WorkQueue {
         if snapshot.index != state.snapshot.index {
             *snapshot = Arc::new(state.snapshot.clone());
         }
-        let entries: Vec<_> = state
+        let entries: crate::raft::EntryLog = state
             .log
             .iter()
             .filter(|e| e.index > self.last && e.index <= state.commit)
             .cloned()
             .collect();
+        debug_assert!(entries.iter().all(|entry| entry.is_written() && entry.is_durable()));
         if let Some(PendingWork::Apply(work)) = &mut self.pending {
-            work.entries.extend(entries);
+            work.entries.extend(entries.iter().cloned());
             work.entries.retain(|e| e.index > snapshot.index);
             work.snapshot = snapshot.clone();
             work.commit = state.commit;
