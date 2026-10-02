@@ -74,6 +74,7 @@ mod tests {
             index: 1,
             term: 1,
             command: crate::raft::Command::CheckpointStart(1),
+            entry_buf: None,
         });
         lease.observe(state.checkpoint_start(), now);
         let uncommitted = lease.holder(now, duration).is_none();

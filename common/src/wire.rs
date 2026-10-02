@@ -568,6 +568,13 @@ impl StructWriter {
         }
     }
 
+    /// Append tagged bytes whose nesting starts at the current writer depth.
+    pub fn raw_message_depth(&mut self, value: &MessageBytes, depth: u8) {
+        self.maximum_depth =
+            self.maximum_depth.max(self.depth.saturating_add(depth.saturating_sub(1)));
+        self.raw_message_bytes(value);
+    }
+
     pub fn text(&mut self, value: &str) {
         self.bytes(value.as_bytes());
     }
@@ -590,18 +597,21 @@ impl StructWriter {
 enum StructureInput<'a> {
     Slice(&'a [u8]),
     Payload(&'a MessagePayload),
+    Message(&'a MessageBytes),
 }
 impl<'a> StructureInput<'a> {
     fn len(&self) -> usize {
         match self {
             Self::Slice(b) => b.len(),
             Self::Payload(b) => b.len(),
+            Self::Message(b) => b.len(),
         }
     }
     fn chunk(&self, at: usize) -> &'a [u8] {
         match self {
             Self::Slice(b) => &b[at..],
             Self::Payload(b) => b.chunk(at),
+            Self::Message(b) => b.chunk(at),
         }
     }
 }
@@ -611,10 +621,20 @@ pub struct StructReader<'a> {
     at: usize,
     depth: u8,
     maximum_depth: u8,
+    depth_capture: Option<u8>,
     parses_remaining: isize,
 }
 
 impl<'a> StructReader<'a> {
+    fn check_input(&self) -> Result<()> {
+        match &self.bytes {
+            StructureInput::Payload(bytes) => bytes.check()?,
+            StructureInput::Message(bytes) => bytes.check()?,
+            StructureInput::Slice(_) => {}
+        }
+        Ok(())
+    }
+
     pub fn new(bytes: &'a [u8], maximum_depth: u8) -> StructReader<'a> {
         StructReader {
             bytes: StructureInput::Slice(bytes),
@@ -622,6 +642,7 @@ impl<'a> StructReader<'a> {
             at: 0,
             depth: 1,
             maximum_depth,
+            depth_capture: None,
             parses_remaining: isize::try_from(bytes.len()).expect("slice length fits isize"),
         }
     }
@@ -636,8 +657,59 @@ impl<'a> StructReader<'a> {
             at: 0,
             depth: 1,
             maximum_depth,
+            depth_capture: None,
             parses_remaining: isize::try_from(bytes.len()).expect("payload length fits isize"),
         }
+    }
+
+    pub fn from_message(bytes: &'a MessageBytes, maximum_depth: u8) -> StructReader<'a> {
+        StructReader {
+            bytes: StructureInput::Message(bytes),
+            current: bytes.chunk(0),
+            at: 0,
+            depth: 1,
+            maximum_depth,
+            depth_capture: None,
+            parses_remaining: isize::try_from(bytes.len()).expect("message length fits isize"),
+        }
+    }
+
+    /// Capture the maximum nesting depth reached by one decoder call.
+    pub fn capture_depth<T>(
+        &mut self,
+        read: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<(T, u8)> {
+        debug_assert!(self.depth_capture.is_none());
+        self.depth_capture = Some(self.depth);
+        let result = read(self);
+        let maximum = self.depth_capture.take().unwrap_or(self.depth);
+        result.map(|value| (value, maximum.saturating_sub(self.depth).saturating_add(1)))
+    }
+
+    /// Copy a previously read byte range without moving the reader.
+    pub fn raw_range(&self, start: usize, length: usize) -> Result<MessageBytes> {
+        if start.checked_add(length).is_none_or(|end| end > self.bytes.len()) {
+            return Err(Error::new("structure range outside payload"));
+        }
+        self.check_input()?;
+        let mut out = MessageBytes::new();
+        let mut at = start;
+        let end = start + length;
+        while at < end {
+            let chunk = self.bytes.chunk(at);
+            if chunk.is_empty() {
+                return Err(Error::new("structure range ends mid-segment"));
+            }
+            let n = chunk.len().min(end - at);
+            out.extend_from_slice(&chunk[..n]);
+            at += n;
+        }
+        out.check()?;
+        Ok(out)
+    }
+
+    pub fn position(&self) -> usize {
+        self.at
     }
 
     // Charge structural attempts, including failures, without charging leaf reads.
@@ -663,9 +735,7 @@ impl<'a> StructReader<'a> {
     }
 
     fn read_into(&mut self, mut out: &mut [u8]) -> Result<()> {
-        if let StructureInput::Payload(bytes) = &self.bytes {
-            bytes.check()?;
-        }
+        self.check_input()?;
         if out.len() > self.remaining() {
             return Err(Error::new("structure payload ends mid-value"));
         }
@@ -800,11 +870,31 @@ impl<'a> StructReader<'a> {
         Ok(bytes)
     }
 
+    pub fn skip_bytes(&mut self) -> Result<()> {
+        let length = u32::from_le_bytes(self.read_array::<4>()?) as usize;
+        if length > self.remaining() {
+            return Err(Error::new("structure payload ends mid-value"));
+        }
+        self.check_input()?;
+        let mut left = length;
+        while left != 0 {
+            if self.current.is_empty() {
+                self.current = self.bytes.chunk(self.at);
+            }
+            let n = self.current.len().min(left);
+            if n == 0 {
+                return Err(Error::new("structure payload ends mid-value"));
+            }
+            self.current = &self.current[n..];
+            self.at += n;
+            left -= n;
+        }
+        Ok(())
+    }
+
     /// Read an owned serialized field without flattening large fields.
     pub fn raw_message_bytes(&mut self, length: usize) -> Result<MessageBytes> {
-        if let StructureInput::Payload(bytes) = &self.bytes {
-            bytes.check()?;
-        }
+        self.check_input()?;
         if length > self.remaining() {
             return Err(Error::new("structure payload ends mid-value"));
         }
@@ -850,6 +940,9 @@ impl<'a> StructReader<'a> {
             return Err(Error::new("message recursion depth exceeded"));
         }
         self.depth = depth;
+        if let Some(maximum) = &mut self.depth_capture {
+            *maximum = (*maximum).max(depth);
+        }
         let result = read(self);
         self.depth -= 1;
         result
@@ -865,6 +958,9 @@ impl<'a> StructReader<'a> {
             return Err(Error::new("message recursion depth exceeded"));
         }
         self.depth = depth;
+        if let Some(maximum) = &mut self.depth_capture {
+            *maximum = (*maximum).max(depth);
+        }
         let result = read(op, self);
         self.depth -= 1;
         result
@@ -874,9 +970,7 @@ impl<'a> StructReader<'a> {
     }
 
     pub fn done(&self) -> Result<()> {
-        if let StructureInput::Payload(bytes) = &self.bytes {
-            bytes.check()?;
-        }
+        self.check_input()?;
         if self.at == self.bytes.len() {
             Ok(())
         } else {

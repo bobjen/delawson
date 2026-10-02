@@ -2,6 +2,7 @@
 use crate::{Action, Command, Entry, Snapshot, State};
 use common::{Error, Result};
 use parking_lot::RwLock;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,6 +75,7 @@ pub struct Cursor {
     entry: u64,
     action: usize,
     applied: u64,
+    decoded: Option<(u64, Vec<Action>)>,
 }
 impl Cursor {
     pub fn new(generation: u64, applied: u64) -> Self {
@@ -98,17 +100,20 @@ pub fn execute<S: Application>(
     budget: Duration,
     apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
 ) -> Result<bool> {
-    execute_state(
+    execute_with_lock(
         global,
         progress,
         applied,
         state,
         budget,
         false,
+        false,
         |data| data.reset(),
         |_| true,
         apply,
+        |_| (),
     )
+    .map(|(progress, _)| progress.complete)
 }
 /// The application worker can sleep on the global lock without delaying consensus.
 pub fn execute_blocking<S: Application>(
@@ -151,6 +156,7 @@ where
         state,
         budget,
         true,
+        false,
         |data| data.reset(),
         |_| true,
         apply,
@@ -176,6 +182,7 @@ pub fn execute_state<S: Application>(
         state,
         budget,
         blocking,
+        true,
         reset,
         has_action,
         apply,
@@ -190,6 +197,7 @@ fn execute_with_lock<S: Application, T>(
     state: &impl Committed,
     budget: Duration,
     blocking: bool,
+    filter_pending: bool,
     reset: impl Fn(&mut S),
     has_action: impl Fn(&Action) -> bool,
     mut apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
@@ -197,19 +205,37 @@ fn execute_with_lock<S: Application, T>(
 ) -> Result<(Progress, Option<T>)> {
     let mut cursor = progress.lock().map_err(|_| Error::new("execution cursor poisoned"))?;
     let published = applied_index.load(Ordering::Acquire);
+    let mut ready_actions = VecDeque::new();
     if cursor.generation == state.generation() {
         cursor.applied = cursor.applied.max(published);
-        if cursor.restoring.is_none()
-            && cursor.applied >= state.snapshot().index
-            && !state.entries().iter().any(|entry| {
-                entry.index > cursor.applied
-                    && entry.index <= state.commit()
-                    && matches!(
-                        &entry.command,
-                        Command::Client(actions) if actions.iter().any(&has_action)
-                    )
-            })
-        {
+    }
+    if cursor.generation == state.generation()
+        && cursor.restoring.is_none()
+        && cursor.applied >= state.snapshot().index
+    {
+        let needs_apply = state
+            .entries()
+            .iter()
+            .filter(|entry| entry.index > cursor.applied && entry.index <= state.commit())
+            .try_fold(false, |found, entry| -> Result<bool> {
+                if !matches!(entry.command, Command::Client(_)) {
+                    return Ok(found);
+                }
+                let needs_apply = if !filter_pending {
+                    true
+                } else if let Some((_, actions)) =
+                    cursor.decoded.as_ref().filter(|(index, _)| *index == entry.index)
+                {
+                    !found && actions.iter().any(&has_action)
+                } else {
+                    let actions = entry.client_actions()?;
+                    let needs_apply = !found && actions.iter().any(&has_action);
+                    ready_actions.push_back((entry.index, actions));
+                    needs_apply
+                };
+                Ok(found || needs_apply)
+            })?;
+        if !needs_apply {
             cursor.applied = state.commit();
             applied_index.store(cursor.applied, Ordering::Release);
             return Ok((Progress { applied: cursor.applied, complete: true }, None));
@@ -251,20 +277,33 @@ fn execute_with_lock<S: Application, T>(
             if cursor.entry != entry.index {
                 cursor.entry = entry.index;
                 cursor.action = 0;
+                cursor.decoded = None;
             }
             match &entry.command {
-                Command::Client(actions) => {
-                    while cursor.action < actions.len() {
+                Command::Client(_) => {
+                    if cursor.decoded.as_ref().map(|(index, _)| *index) != Some(entry.index) {
+                        let actions = match ready_actions.front() {
+                            Some((index, _)) if *index == entry.index => {
+                                ready_actions.pop_front().unwrap().1
+                            }
+                            _ => entry.client_actions()?,
+                        };
+                        cursor.decoded = Some((entry.index, actions.into_owned()));
+                    }
+                    let length = cursor.decoded.as_ref().unwrap().1.len();
+                    while cursor.action < length {
+                        let action = &cursor.decoded.as_ref().unwrap().1[cursor.action];
                         apply(
                             data,
                             Context { ring: state.ring(), index: entry.index, term: entry.term },
-                            &actions[cursor.action],
+                            action,
                         )?;
                         cursor.action += 1;
                         if began.elapsed() >= budget {
                             return Ok(false);
                         }
                     }
+                    cursor.decoded = None;
                 }
                 Command::Noop | Command::Members(_) | Command::CheckpointStart(_) => {}
             }
@@ -330,6 +369,7 @@ mod tests {
                 command: Command::Client(
                     (1..=3).map(|n| Action::new(Op::BytesResp, vec![n])).collect(),
                 ),
+                entry_buf: None,
             })
             .collect();
         state.commit = 1;
@@ -432,6 +472,7 @@ mod tests {
                             index: 1,
                             term: 1,
                             command: Command::Noop,
+                            entry_buf: None,
                         }],
                         commit: 1,
                     },
@@ -452,7 +493,10 @@ mod tests {
     }
     #[test]
     fn yields_between_actions_and_does_not_apply_uncommitted_entries() {
-        let state = state();
+        let mut state = state();
+        let first = crate::codec::encode(&state.log[0]).unwrap();
+        state.log[0] = crate::codec::decode(&first).unwrap();
+        assert!(matches!(&state.log[0].command, Command::Client(actions) if actions.is_empty()));
         let global = RwLock::new(Values::default());
         let cursor = Mutex::new(Cursor::default());
         let applied = AtomicU64::new(0);

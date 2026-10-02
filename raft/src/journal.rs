@@ -8,7 +8,7 @@ use common::{Context, Error, Result};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{IoSlice, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -80,6 +80,70 @@ const LIMIT: usize = 64 * 1024 * 1024;
 struct Batch {
     sequence: u64,
     records: Vec<Record>,
+}
+
+enum JournalFrame {
+    Flat(Vec<u8>),
+    Shared(SharedFrame),
+}
+struct SharedFrame {
+    head: Vec<u8>,
+    entries: Vec<Arc<crate::raft::EntryBuf>>,
+    tail: Vec<u8>,
+    length: usize,
+}
+impl JournalFrame {
+    fn len(&self) -> usize {
+        match self {
+            Self::Flat(bytes) => bytes.len(),
+            Self::Shared(frame) => frame.length,
+        }
+    }
+    fn write_to(&self, out: &mut impl Write) -> std::io::Result<()> {
+        match self {
+            Self::Flat(bytes) => out.write_all(bytes),
+            Self::Shared(frame) => frame.write_to(out),
+        }
+    }
+}
+impl SharedFrame {
+    fn write_to(&self, out: &mut impl Write) -> std::io::Result<()> {
+        let mut pieces = Vec::new();
+        pieces.push(self.head.as_slice());
+        for entry in &self.entries {
+            let mut at = 0;
+            while at < entry.bytes.len() {
+                let chunk = entry.bytes.chunk(at);
+                if chunk.is_empty() {
+                    return Err(std::io::Error::other("empty Raft entry buffer segment"));
+                }
+                pieces.push(chunk);
+                at += chunk.len();
+            }
+        }
+        pieces.push(self.tail.as_slice());
+        let mut first = 0;
+        while first < pieces.len() {
+            let end = (first + 1024).min(pieces.len());
+            let written = {
+                let slices: Vec<_> =
+                    pieces[first..end].iter().map(|bytes| IoSlice::new(bytes)).collect();
+                out.write_vectored(&slices)?
+            };
+            if written == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "journal write"));
+            }
+            let mut left = written;
+            while first < pieces.len() && left >= pieces[first].len() {
+                left -= pieces[first].len();
+                first += 1;
+            }
+            if left != 0 {
+                pieces[first] = &pieces[first][left..];
+            }
+        }
+        Ok(())
+    }
 }
 struct Checkpoint {
     sequence: u64,
@@ -256,6 +320,9 @@ impl crate::raft::Storage for Journal {
     }
     fn write(&mut self, records: &[Record]) -> Result<()> {
         Journal::write(self, records)
+    }
+    fn write_owned(&mut self, records: Vec<Record>) -> Result<()> {
+        Journal::write_owned(self, records)
     }
     fn pending_replacement(&self) -> Option<Retirement> {
         self.identity.pending.clone()
@@ -512,10 +579,10 @@ impl Journal {
         }
         result
     }
-    fn append_frame(&mut self, frame: Vec<u8>) -> Result<()> {
-        self.perform(move |_disk| {
-            _disk.file.write_all(&frame)?;
-            _disk.file.sync_all()?;
+    fn append_shared_frame(&mut self, frame: JournalFrame) -> Result<()> {
+        self.perform(move |disk| {
+            frame.write_to(&mut disk.file)?;
+            disk.file.sync_all()?;
             Ok(())
         })
     }
@@ -653,29 +720,45 @@ impl Journal {
         Ok(())
     }
     pub fn write(&mut self, records: &[Record]) -> Result<()> {
+        self.write_owned(records.to_vec())
+    }
+    pub fn write_owned(&mut self, mut held: Vec<Record>) -> Result<()> {
         if self.failed {
             return Err(Error::new(format!(
                 "{} journal fenced after I/O failure; restart required",
                 self.identity.process
             )));
         }
-        if records.is_empty() {
+        if held.is_empty() {
             return Ok(());
+        }
+        // Keep one immutable serialization per entry. State/apply clones and the async
+        // journal write share this same backing buffer.
+        for record in &mut held {
+            if let Record::Entries { entries, .. } = record {
+                for entry in entries {
+                    entry.entry_buf = Some(codec::entry_buffer(entry)?);
+                    if let crate::raft::Command::Client(actions) = &mut entry.command {
+                        *actions = Vec::new();
+                    }
+                }
+            }
         }
         // Validate the entire batch before writing; after sync its state is published atomically.
         let mut state = self.state.clone();
-        for record in records {
+        for record in &held {
             state.apply(record)?;
         }
         let sequence =
             self.sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
-        let frame = frame(&Batch { sequence, records: records.to_vec() })?;
+        let batch = Batch { sequence, records: held };
+        let frame = journal_frame(&batch)?;
         let mut identity = None;
         self.sequence = sequence;
         self.change_sequence = sequence;
         self.state = state;
         self.log_bytes += frame.len() as u64;
-        if records.iter().any(|record| matches!(record, Record::Bootstrap(_) | Record::Install(_))
+        if batch.records.iter().any(|record| matches!(record, Record::Bootstrap(_) | Record::Install(_))
             || matches!(record, Record::Entries { entries, .. } if entries.iter().any(|e| matches!(e.command, crate::raft::Command::Members(_))))) {
             let membership = self.state.membership();
             let slot = membership.slot(&self.identity.current);
@@ -689,12 +772,12 @@ impl Journal {
         }
         let result = if let Some(identity) = identity {
             self.perform(move |disk| {
-                disk.file.write_all(&frame)?;
+                frame.write_to(&mut disk.file)?;
                 disk.file.sync_all()?;
                 append_identity(&mut disk.ownership, &identity)
             })
         } else {
-            self.append_frame(frame)
+            self.append_shared_frame(frame)
         };
         if let Err(error) = result {
             self.state = self.durable.clone();
@@ -1298,6 +1381,98 @@ fn frame(batch: &Batch) -> Result<Vec<u8>> {
     let length = bytes.len() as u64;
     Ok([length.to_le_bytes().as_slice(), (!length).to_le_bytes().as_slice(), &bytes].concat())
 }
+fn journal_frame(batch: &Batch) -> Result<JournalFrame> {
+    if let Some(frame) = shared_frame(batch)? {
+        return Ok(JournalFrame::Shared(frame));
+    }
+    Ok(JournalFrame::Flat(frame(batch)?))
+}
+fn shared_frame(batch: &Batch) -> Result<Option<SharedFrame>> {
+    let (from, entries, commit) = match batch.records.as_slice() {
+        [Record::Entries { from, entries }] => (*from, entries, None),
+        [Record::Entries { from, entries }, Record::Commit(commit)] => {
+            (*from, entries, Some(*commit))
+        }
+        _ => return Ok(None),
+    };
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let entries: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            entry
+                .entry_buf
+                .clone()
+                .ok_or_else(|| Error::new("journal entry has no shared serialization"))
+        })
+        .collect::<Result<_>>()?;
+    let depth = entries.iter().map(|entry| entry.depth).max().unwrap_or(1).saturating_add(4);
+    if depth > common::MAX_RECURSION_DEPTH {
+        return Err(Error::new("Raft encoding exceeds recursion limit"));
+    }
+
+    // This prefix is the normal tagged Batch/Record/Entries-list path up to its
+    // first entry. Entry bytes are separate shared pieces in the journal frame.
+    let mut prefix = Vec::with_capacity(64);
+    prefix.push(depth);
+    put_u16(&mut prefix, common::Op::RaftBatch.code());
+    put_u64(&mut prefix, batch.sequence);
+    put_u16(&mut prefix, common::Op::RaftList.code());
+    put_u64(&mut prefix, batch.records.len() as u64);
+    put_u16(&mut prefix, common::Op::RaftRecordEntries.code());
+    put_u64(&mut prefix, from);
+    put_u16(&mut prefix, common::Op::RaftList.code());
+    put_u64(&mut prefix, entries.len() as u64);
+
+    let mut tail = Vec::with_capacity(42);
+    if let Some(commit) = commit {
+        put_u16(&mut tail, common::Op::RaftRecordCommit.code());
+        put_u64(&mut tail, commit);
+    }
+    let entry_bytes = entries.iter().try_fold(0usize, |size, entry| {
+        entry.bytes.check()?;
+        size.checked_add(entry.bytes.len())
+            .ok_or_else(|| Error::new("journal entry frame length overflow"))
+    })?;
+    let body_len = prefix
+        .len()
+        .checked_add(entry_bytes)
+        .and_then(|size| size.checked_add(tail.len()))
+        .and_then(|size| size.checked_add(32))
+        .ok_or_else(|| Error::new("journal frame length overflow"))?;
+    if body_len > LIMIT {
+        return Err(Error::new("Raft persistence frame too large"));
+    }
+    let mut hash = Sha256::new();
+    hash.update(&prefix);
+    for entry in &entries {
+        let mut at = 0;
+        while at < entry.bytes.len() {
+            let chunk = entry.bytes.chunk(at);
+            if chunk.is_empty() {
+                return Err(Error::new("empty Raft entry buffer segment"));
+            }
+            hash.update(chunk);
+            at += chunk.len();
+        }
+    }
+    hash.update(&tail);
+    tail.extend(hash.finalize());
+
+    let length = body_len as u64;
+    let mut head = Vec::with_capacity(16 + prefix.len());
+    head.extend(length.to_le_bytes());
+    head.extend((!length).to_le_bytes());
+    head.extend(prefix);
+    Ok(Some(SharedFrame { head, entries, tail, length: 16 + body_len }))
+}
+fn put_u16(bytes: &mut Vec<u8>, value: u16) {
+    bytes.extend(value.to_le_bytes());
+}
+fn put_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend(value.to_le_bytes());
+}
 fn encode<T: Wire>(value: &T) -> Result<Vec<u8>> {
     let mut bytes = codec::encode(value)?;
     bytes.extend(Sha256::digest(&bytes));
@@ -1391,6 +1566,105 @@ fn publish_cancellable(path: &Path, bytes: &[u8], cancelled: impl Fn() -> bool) 
 mod tests {
     use super::*;
     use crate::raft::{Command, Entry, Members, Node, Storage};
+
+    #[test]
+    fn shared_entry_frames_match_the_regular_wire_encoding() {
+        let mut entry = Entry {
+            scn: Scn::new(1),
+            index: 1,
+            term: 1,
+            command: Command::Client(vec![crate::Action::new(
+                common::Op::BytesResp,
+                vec![37; 128 * 1024],
+            )]),
+            entry_buf: None,
+        };
+        entry.entry_buf = Some(codec::entry_buffer(&entry).unwrap());
+        let shared = entry.entry_buf.as_ref().unwrap();
+        assert!(shared.bytes.is_segmented());
+        let batch = Batch {
+            sequence: 7,
+            records: vec![
+                Record::Entries { from: 1, entries: vec![entry.clone()] },
+                Record::Commit(1),
+            ],
+        };
+
+        let mut actual = Vec::new();
+        journal_frame(&batch).unwrap().write_to(&mut actual).unwrap();
+        assert_eq!(actual, frame(&batch).unwrap());
+        let decoded: Batch = decode(&actual[16..]).unwrap();
+        match (&decoded.records[..], &batch.records[..]) {
+            (
+                [Record::Entries { entries: left, .. }, Record::Commit(left_commit)],
+                [Record::Entries { entries: right, .. }, Record::Commit(right_commit)],
+            ) => {
+                assert_eq!(left, right);
+                assert_eq!(left_commit, right_commit);
+            }
+            _ => panic!("shared frame decoded to different record structure"),
+        }
+
+        let cloned = entry.clone();
+        assert!(Arc::ptr_eq(entry.entry_buf.as_ref().unwrap(), cloned.entry_buf.as_ref().unwrap()));
+
+        let mut second = Entry {
+            scn: Scn::new(2),
+            index: 2,
+            term: 1,
+            command: Command::Client(vec![crate::Action::new(
+                common::Op::BytesResp,
+                vec![41; 16 * 1024],
+            )]),
+            entry_buf: None,
+        };
+        second.entry_buf = Some(codec::entry_buffer(&second).unwrap());
+        let batch = Batch {
+            sequence: 8,
+            records: vec![Record::Entries { from: 1, entries: vec![entry, second] }],
+        };
+        let mut actual = Vec::new();
+        journal_frame(&batch).unwrap().write_to(&mut actual).unwrap();
+        assert_eq!(actual, frame(&batch).unwrap());
+    }
+
+    #[test]
+    fn journal_replays_lazy_actions_from_the_shared_entry_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
+        journal.write(&[Record::Hard { term: 1, vote: None }]).unwrap();
+        journal
+            .write(&[
+                Record::Entries {
+                    from: 1,
+                    entries: vec![Entry {
+                        scn: Scn::new(1),
+                        index: 1,
+                        term: 1,
+                        command: Command::Client(vec![crate::Action::new(
+                            common::Op::BytesResp,
+                            vec![53; 128 * 1024],
+                        )]),
+                        entry_buf: None,
+                    }],
+                },
+                Record::Commit(1),
+            ])
+            .unwrap();
+        assert!(matches!(
+            &journal.state.log[0].command,
+            Command::Client(actions) if actions.is_empty()
+        ));
+        assert!(journal.state.log[0].entry_buf.as_ref().unwrap().bytes.is_segmented());
+        drop(journal);
+
+        let recovered = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
+        assert_eq!(recovered.state.commit, 1);
+        let actions = recovered.state.log[0].client_actions().unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].fields, vec![53; 128 * 1024]);
+    }
+
     #[test]
     #[ignore = "filesystem integration; run explicitly with --ignored"]
     fn asynchronous_writes_publish_durability_only_after_completion() {
@@ -1417,6 +1691,7 @@ mod tests {
                         index: 1,
                         term: 1,
                         command: Command::Noop,
+                        entry_buf: None,
                     }],
                 },
             ])
@@ -1468,6 +1743,7 @@ mod tests {
                             term: 2,
                             scn: Scn::new(index),
                             command: Command::Noop,
+                            entry_buf: None,
                         })
                         .collect(),
                 },
@@ -1591,6 +1867,7 @@ mod tests {
                             index,
                             term: index,
                             command: Command::Noop,
+                            entry_buf: None,
                         }],
                     },
                     Record::Commit(index),
@@ -1649,6 +1926,7 @@ mod tests {
                 index: 10,
                 term: 4,
                 command: crate::Command::Noop,
+                entry_buf: None,
             }],
         };
         // Ring identity and the retained prefix alone accept this abandoned history.
@@ -1679,6 +1957,7 @@ mod tests {
                 index: 1,
                 term: 1,
                 command: Command::Noop,
+                entry_buf: None,
             }],
         };
         assert!(good.validate(&state, 1).is_ok());
@@ -1737,6 +2016,7 @@ mod tests {
                             index,
                             term: 2,
                             command: Command::Noop,
+                            entry_buf: None,
                         })
                         .collect(),
                 },
@@ -1833,6 +2113,7 @@ mod tests {
                     index: 1,
                     term: 1,
                     command: Command::Members(membership),
+                    entry_buf: None,
                 }],
             }])
             .unwrap();
@@ -2096,6 +2377,7 @@ mod tests {
                 index,
                 term: 2,
                 command: Command::Noop,
+                entry_buf: None,
             })
             .collect();
         original.apply(&Record::Entries { from: 1, entries }).unwrap();
@@ -2142,6 +2424,7 @@ mod tests {
                     index,
                     term: 2,
                     command: Command::Noop,
+                    entry_buf: None,
                 })
                 .collect();
             journal
@@ -2181,6 +2464,7 @@ mod tests {
                         index: 1,
                         term: 3,
                         command: Command::Noop,
+                        entry_buf: None,
                     }],
                 },
             ])
@@ -2272,6 +2556,7 @@ mod tests {
                         index: 1,
                         term: 1,
                         command: Command::Noop,
+                        entry_buf: None,
                     }],
                 },
             ])
@@ -2317,6 +2602,7 @@ mod tests {
                             common::Op::BytesResp,
                             vec![8; 104],
                         )]),
+                        entry_buf: None,
                     }],
                 },
                 Record::Commit(1),
@@ -2336,6 +2622,7 @@ mod tests {
                             common::Op::BytesResp,
                             vec![9; 104],
                         )]),
+                        entry_buf: None,
                     }],
                 },
                 Record::Commit(2),

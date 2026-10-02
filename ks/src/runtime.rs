@@ -53,8 +53,12 @@ pub(super) fn apply_state(
     apply_action(&mut state.keys, key, context, action)
 }
 fn has_keys(state: &State) -> bool {
-    state.snapshot.application.iter().chain(state.log.iter().filter(|e| e.index <= state.commit))
-        .any(|e| matches!(&e.command, Command::Client(actions) if actions.iter().any(|a| a.op == Op::KsKey)))
+    state
+        .snapshot
+        .application
+        .iter()
+        .chain(state.log.iter().filter(|e| e.index <= state.commit))
+        .any(|e| e.client_actions().is_ok_and(|actions| actions.iter().any(|a| a.op == Op::KsKey)))
 }
 struct KeyFields {
     key: [u8; 32],
@@ -384,12 +388,14 @@ mod tests {
             index: 1,
             term: 1,
             command: Command::Client(vec![registration_action(&peer(9001))]),
+            entry_buf: None,
         });
         state.log.push(Entry {
             scn: common::scn::Scn::new(2),
             index: 2,
             term: 1,
             command: Command::Client(vec![registration_action(&peer(9002))]),
+            entry_buf: None,
         });
         state.commit = 1;
         let (before_commit, _) = routes(&state);
@@ -414,6 +420,7 @@ mod tests {
             index: 3,
             term: 1,
             command: Command::Client(vec![raft::Action::new(Op::KsKey, sealed)]),
+            entry_buf: None,
         });
         state.commit = 3;
         let snapshot = state.capture();
@@ -450,6 +457,7 @@ mod tests {
             index: 1,
             term: 1,
             command: Command::Client(actions),
+            entry_buf: None,
         });
         state.commit = 1;
         let (history, applied) = decode_history(&state, &key).unwrap();
@@ -474,6 +482,7 @@ mod tests {
                     index: 1,
                     term: 1,
                     command: Command::Client(vec![raft::Action::new(Op::KsKey, sealed)]),
+                    entry_buf: None,
                 }],
             })
             .unwrap();
@@ -505,6 +514,7 @@ mod tests {
                 index,
                 term: 1,
                 command: Command::Client(vec![raft::Action::new(Op::KsKey, encrypted)]),
+                entry_buf: None,
             });
         }
         state.commit = 2;

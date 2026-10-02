@@ -1,8 +1,10 @@
 //! Raft consensus. Disk mutations complete before the corresponding response is sent.
 use crate::journal::Journal;
 use common::scn::Scn;
-use common::{Error, Result};
+use common::{Error, MessageBytes, Result};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// Stable process identities within this ring. Endpoints are discovered, never voted on.
 // Low 32 bits are the logical slot; high 32 bits distinguish replacements.
@@ -183,12 +185,54 @@ pub enum Command {
     Members(Membership),
     CheckpointStart(MemberId),
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A single entry's encoded bytes, shared by journal I/O and apply work.
+#[derive(Clone, Debug)]
+pub struct EntryBuf {
+    pub(crate) bytes: MessageBytes,
+    pub(crate) depth: u8,
+    pub(crate) lazy_actions: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct Entry {
     pub scn: Scn,
     pub index: u64,
     pub term: u64,
     pub command: Command,
+    /// Serialized bytes are immutable and shared across journal and apply clones.
+    pub entry_buf: Option<Arc<EntryBuf>>,
+}
+impl PartialEq for Entry {
+    fn eq(&self, other: &Self) -> bool {
+        if self.scn != other.scn || self.index != other.index || self.term != other.term {
+            return false;
+        }
+        match (&self.command, &other.command) {
+            (Command::Client(left), Command::Client(right)) => {
+                if left == right {
+                    return true;
+                }
+                matches!(
+                    (self.client_actions(), other.client_actions()),
+                    (Ok(left), Ok(right)) if left == right
+                )
+            }
+            _ => self.command == other.command,
+        }
+    }
+}
+impl Eq for Entry {}
+impl Entry {
+    /// Borrow already-decoded actions or decode a retained wire entry on demand.
+    pub fn client_actions(&self) -> Result<Cow<'_, [crate::Action]>> {
+        let Command::Client(actions) = &self.command else {
+            return Err(Error::new("Raft entry is not a client command"));
+        };
+        if !actions.is_empty() || !self.entry_buf.as_ref().is_some_and(|bytes| bytes.lazy_actions) {
+            return Ok(Cow::Borrowed(actions));
+        }
+        Ok(Cow::Owned(crate::codec::entry_actions(self.entry_buf.as_ref().unwrap())?))
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
@@ -655,6 +699,9 @@ pub trait Storage {
         self.state()
     }
     fn write(&mut self, records: &[Record]) -> Result<()>;
+    fn write_owned(&mut self, records: Vec<Record>) -> Result<()> {
+        self.write(&records)
+    }
     fn pending_replacement(&self) -> Option<Retirement> {
         None
     }
@@ -774,21 +821,23 @@ impl<S: Storage> Node<S> {
             }
             _ => false,
         });
-        let previous_commit = self.state().commit;
-        self.journal.write(&records)?;
+        let mut accepted = Vec::new();
         for record in &records {
             if let Record::Entries { entries, .. } = record {
-                for entry in entries {
-                    common::logn!(
-                        "Raft entry accepted",
-                        "member {},index {},term {},scn {}",
-                        self.id,
-                        entry.index,
-                        entry.term,
-                        entry.scn
-                    );
-                }
+                accepted.extend(entries.iter().map(|entry| (entry.index, entry.term, entry.scn)));
             }
+        }
+        let previous_commit = self.state().commit;
+        self.journal.write_owned(records)?;
+        for (index, term, scn) in accepted {
+            common::logn!(
+                "Raft entry accepted",
+                "member {},index {},term {},scn {}",
+                self.id,
+                index,
+                term,
+                scn
+            );
         }
         let state = self.state();
         if state.commit > previous_commit {
@@ -1024,7 +1073,7 @@ impl<S: Storage> Node<S> {
         let scn = self.next_scn()?.ok_or_else(|| {
             Error::new("SCN allocation stalled; retry after clock synchronization")
         })?;
-        let entry = Entry { scn, index, term: self.state().term, command };
+        let entry = Entry { scn, index, term: self.state().term, command, entry_buf: None };
         self.persist(vec![Record::Entries { from: index, entries: vec![entry] }])?;
         self.advance()?;
         Ok(index)
@@ -1051,6 +1100,7 @@ impl<S: Storage> Node<S> {
                     index,
                     term: self.state().term,
                     command: Command::Noop,
+                    entry_buf: None,
                 }],
             }])?;
         }
@@ -1973,6 +2023,7 @@ pub mod tests {
                     index: 1,
                     term: 1,
                     command: Command::Members(retired.clone()),
+                    entry_buf: None,
                 }],
             })
             .unwrap();
@@ -1989,6 +2040,7 @@ pub mod tests {
                 index: 2,
                 term: 1,
                 command: Command::Members(rebound),
+                entry_buf: None,
             }],
         };
         let mut storage = Memory {
@@ -2730,8 +2782,6 @@ crate::wire_struct!(Member, RaftMember, {identity,process});
 crate::wire_struct!(Membership, RaftMembership, {identities,old,new,retired});
 
 crate::wire_struct!(Retirement, RaftRetirement, {previous,old,next,member});
-
-crate::wire_struct!(Entry, RaftEntry, {index,term,scn,command});
 
 crate::wire_struct!(Snapshot, RaftSnapshot, {ring,index,term,scn,membership,application,checkpoint_start});
 

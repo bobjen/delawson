@@ -2,6 +2,7 @@
 use common::{Error, Result};
 use common::{MAX_FRAME_BYTES, MAX_RECURSION_DEPTH, Op, StructReader, StructWriter};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 pub trait Wire: Sized {
     fn write(&self, w: &mut StructWriter);
     fn read(r: &mut StructReader<'_>) -> Result<Self>;
@@ -183,6 +184,98 @@ impl Wire for crate::Action {
         r.nested_any(|op, r| Ok(Self { op, fields: r.bytes()? }))
     }
 }
+
+impl Wire for crate::Entry {
+    fn write(&self, w: &mut StructWriter) {
+        if let Some(bytes) = self.entry_buf.as_ref().filter(|bytes| {
+            bytes.lazy_actions
+                && matches!(&self.command, crate::Command::Client(actions) if actions.is_empty())
+        }) {
+            w.raw_message_depth(&bytes.bytes, bytes.depth);
+            return;
+        }
+        w.nested(Op::RaftEntry, |w| {
+            self.index.write(w);
+            self.term.write(w);
+            self.scn.write(w);
+            self.command.write(w);
+        });
+    }
+
+    fn read(r: &mut StructReader<'_>) -> Result<Self> {
+        let start = r.position();
+        let (mut entry, depth) = r.capture_depth(|r| {
+            r.nested(Op::RaftEntry, "entry", |r| {
+                Ok(crate::Entry {
+                    index: Wire::read(r)?,
+                    term: Wire::read(r)?,
+                    scn: Wire::read(r)?,
+                    command: read_entry_command(r)?,
+                    entry_buf: None,
+                })
+            })
+        })?;
+        let bytes = r.raw_range(start, r.position() - start)?;
+        let lazy_actions = matches!(&entry.command, crate::Command::Client(_));
+        entry.entry_buf = Some(Arc::new(crate::EntryBuf { bytes, depth, lazy_actions }));
+        Ok(entry)
+    }
+}
+
+fn read_entry_command(r: &mut StructReader<'_>) -> Result<crate::Command> {
+    r.nested_any(|op, r| match op {
+        Op::RaftCommandNoop => Ok(crate::Command::Noop),
+        Op::RaftCommandClient => r.nested(Op::RaftList, "list", |r| {
+            let count = r.number_u64()?;
+            if count > (r.remaining() / 6) as u64 {
+                return Err(Error::new("client action count exceeds entry"));
+            }
+            for _ in 0..count {
+                r.nested_any(|_, r| r.skip_bytes())?;
+            }
+            Ok(crate::Command::Client(Vec::new()))
+        }),
+        Op::RaftCommandMembers => Ok(crate::Command::Members(Wire::read(r)?)),
+        Op::RaftCommandCheckpointStart => Ok(crate::Command::CheckpointStart(Wire::read(r)?)),
+        _ => Err(Error::new("unexpected Command tag")),
+    })
+}
+
+pub(crate) fn entry_actions(entry: &crate::EntryBuf) -> Result<Vec<crate::Action>> {
+    let mut reader = StructReader::from_message(&entry.bytes, entry.depth);
+    let command = reader.nested(Op::RaftEntry, "entry", |r| {
+        let _: u64 = Wire::read(r)?;
+        let _: u64 = Wire::read(r)?;
+        let _: common::scn::Scn = Wire::read(r)?;
+        <crate::Command as Wire>::read(r)
+    })?;
+    reader.done()?;
+    match command {
+        crate::Command::Client(actions) => Ok(actions),
+        _ => Err(Error::new("Raft entry is not a client command")),
+    }
+}
+
+pub(crate) fn entry_buffer(entry: &crate::Entry) -> Result<Arc<crate::EntryBuf>> {
+    if let Some(bytes) = entry.entry_buf.as_ref().filter(|bytes| {
+        bytes.lazy_actions
+            && matches!(&entry.command, crate::Command::Client(actions) if actions.is_empty())
+    }) {
+        return Ok(bytes.clone());
+    }
+    let mut writer = StructWriter::new();
+    writer.nested(Op::RaftEntry, |w| {
+        entry.index.write(w);
+        entry.term.write(w);
+        entry.scn.write(w);
+        entry.command.write(w);
+    });
+    let arg = writer.finish(Op::Raft);
+    let depth = arg.depth;
+    let bytes = arg.into_bytes().into();
+    let lazy_actions = matches!(&entry.command, crate::Command::Client(_));
+    Ok(Arc::new(crate::EntryBuf { bytes, depth, lazy_actions }))
+}
 #[macro_export]
 macro_rules! wire_struct {
     ($type:ty, $tag:ident, {$($field:ident),* $(,)?}) => {
@@ -210,11 +303,29 @@ mod tests {
                 crate::Action::new(Op::BytesResp, vec![1, 2, 3]),
                 crate::Action::new(Op::NumberResp, vec![4, 5]),
             ]),
+            entry_buf: None,
         };
         let bytes = encode(&entry).unwrap();
         let round_trip: crate::Entry = decode(&bytes).unwrap();
         assert_eq!(round_trip, entry);
+        assert!(
+            matches!(&round_trip.command, crate::Command::Client(actions) if actions.is_empty())
+        );
+        assert_eq!(
+            round_trip.client_actions().unwrap().as_ref(),
+            match &entry.command {
+                crate::Command::Client(actions) => actions.as_slice(),
+                _ => unreachable!(),
+            }
+        );
+        assert_eq!(encode(&round_trip).unwrap(), bytes);
         assert_eq!(u16::from_le_bytes(bytes[1..3].try_into().unwrap()), Op::RaftEntry.code());
+
+        let mut changed = round_trip.clone();
+        changed.command = crate::Command::Client(vec![crate::Action::new(Op::BytesResp, vec![9])]);
+        let changed: crate::Entry = decode(&encode(&changed).unwrap()).unwrap();
+        assert_eq!(changed.client_actions().unwrap()[0].fields, [9]);
+
         for n in 0..bytes.len() {
             let result = decode::<crate::Entry>(&bytes[..n]);
             assert!(result.is_err(), "length {n}");
@@ -291,6 +402,7 @@ impl Wire for common::MessageBytes {
 #[cfg(test)]
 mod message_storage_tests {
     use super::*;
+    use crate::raft::{Command, Entry, Rpc};
     #[test]
     fn segmented_network_encoding_matches_contiguous_byte_list() {
         let size = common::config::BufferPoolConfig::default().small_message_bytes * 3;
@@ -302,5 +414,49 @@ mod message_storage_tests {
         let decoded: common::MessageBytes = decode_message(&encoded).unwrap();
         assert_eq!(decoded, payload);
         assert_eq!(decode_message::<Vec<u8>>(&encoded).unwrap(), bytes);
+    }
+
+    #[test]
+    fn append_decode_keeps_one_lazy_serialization_per_entry() {
+        let rpc = Rpc::Append {
+            term: 1,
+            previous: 0,
+            previous_term: 0,
+            previous_scn: common::scn::Scn::new(0),
+            entries: vec![Entry {
+                scn: common::scn::Scn::new(1),
+                index: 1,
+                term: 1,
+                command: Command::Client(vec![crate::Action::new(
+                    Op::BytesResp,
+                    vec![29; 128 * 1024],
+                )]),
+                entry_buf: None,
+            }],
+            commit: 0,
+        };
+        let encoded = encode_message(&rpc).unwrap();
+        assert!(encoded.is_segmented());
+        let wire = encoded.to_vec();
+        let payload: common::MessagePayload = encoded.into();
+        let decoded: Rpc = decode_message(&payload).unwrap();
+        let Rpc::Append { entries, .. } = decoded else { panic!("not an append") };
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(&entries[0].command, Command::Client(actions) if actions.is_empty()));
+        assert!(entries[0].entry_buf.as_ref().unwrap().bytes.is_segmented());
+        assert_eq!(
+            encode_message(&Rpc::Append {
+                term: 1,
+                previous: 0,
+                previous_term: 0,
+                previous_scn: common::scn::Scn::new(0),
+                entries: entries.clone(),
+                commit: 0,
+            })
+            .unwrap()
+            .to_vec(),
+            wire
+        );
+        assert_eq!(entries[0].client_actions().unwrap()[0].fields.len(), 128 * 1024);
     }
 }

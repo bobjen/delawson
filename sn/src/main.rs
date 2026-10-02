@@ -3150,8 +3150,9 @@ mod tests {
 
         let mut replay = SNState::new(sn.config.max_extents).unwrap();
         for entry in history {
-            if let raft::Command::Client(actions) = entry.command {
-                for action in &actions {
+            if matches!(&entry.command, raft::Command::Client(_)) {
+                let actions = entry.client_actions().unwrap();
+                for action in actions.iter() {
                     apply_sn_action(&mut replay, entry.index, action).unwrap();
                 }
             }
