@@ -337,11 +337,12 @@ do not lengthen an active campaign.
 Use the actual configured listen addresses. Run `scripts/ring-identities` to
 create/reuse ring identifiers before starting members. Each process generates and
 persists its own random member identifier. For new ring creation only, run
-`scripts/member-identity EFFECTIVE_CLUSTER ROUTING_LABEL JOURNAL_DIRECTORY` for
-the founders; it places an empty `need-bootstrap` marker on just one coordinator
-per ring. `start-laws` does this on initial creation. The coordinator collects the
-founders' identifiers, journals the chosen table, distributes it, then removes the
-marker. An interrupted bootstrap reuses that same table.
+`scripts/member-identity EFFECTIVE_CLUSTER ROUTING_LABEL JOURNAL_DIRECTORY [KIND]`
+for the founders; it places an empty `need-bootstrap` marker on just one
+coordinator per ring and service kind. `start-laws` does this for KS and SN on
+initial creation. The coordinator collects the founders' identifiers, journals
+the chosen table, distributes it, then removes the marker. An interrupted
+bootstrap reuses that same table.
 
 **WARNING: `need-bootstrap` requests ring creation at the next process startup.
 Do not add it to repair an existing ring.** It is checked only at startup; adding

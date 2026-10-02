@@ -1,7 +1,6 @@
 //! KS action encryption and application; consensus and transport live in raft.
 use super::*;
 use common::{Error, Result};
-use parking_lot::RwLock;
 use raft::runtime::Host;
 pub use raft::runtime::Settings;
 use raft::{Command, Entry, Node, Role, State};
@@ -181,11 +180,9 @@ impl Ks {
         // Do not deduplicate against old applied state while a prior timed-out
         // registration could still commit a different endpoint.
         let action = registration_action(&peer);
-        let index = self.on_raft(move |host, node| {
-            let index = node.propose(Command::Client(vec![action]))?;
-            host.refresh_application(node)?;
-            Ok(index)
-        })?;
+        let ticket = self.queue_client(action)?;
+        drop(_proposal);
+        let index = ticket.wait()?;
         loop {
             self.on_raft(|host, node| {
                 if node.role != Role::Leader || node.journal.failed {
@@ -264,7 +261,7 @@ impl Ks {
             host.refresh_application(&node)?;
             Ok(index)
         })?;
-        self.wait_committed(index)?;
+        self.wait_applied(index)?;
         Ok(index)
     }
 }
@@ -286,20 +283,19 @@ impl Host for Ks {
             |state, context, action| apply_registration(&mut state.registrations, context, action),
         )
     }
-    fn apply_client(&self, state: &raft::execution::Work) -> Result<()> {
+    fn apply_client(&self, state: &raft::execution::Work) -> Result<raft::execution::Progress> {
         let key = self
             .unlock_key
             .lock()
             .map_err(|_| Error::new("unlock lock poisoned"))?
             .ok_or_else(|| Error::new("KS locked"))?;
-        raft::execution::execute_blocking(
+        raft::execution::exec_progress(
             &self.global_lock,
             &self.execution,
             state,
             Duration::from_millis(self.config.raft.execution_lock_ms),
             |state, ctx, action| apply_state(state, &key, ctx, action),
         )
-        .map(|_| ())
     }
     fn checkpoint_actions(&self, state: &State, _history: &KsState) -> Result<Vec<Entry>> {
         Ok(state.capture().application)
@@ -355,7 +351,7 @@ mod tests {
         }
     }
     fn routes(state: &State) -> KsState {
-        let global = RwLock::new(KsState::default());
+        let global = parking_lot::RwLock::new(KsState::default());
         let cursor = Mutex::new(raft::execution::Cursor::default());
         raft::execution::execute_state(
             &global,

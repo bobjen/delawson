@@ -512,6 +512,13 @@ impl Journal {
         }
         result
     }
+    fn append_frame(&mut self, frame: Vec<u8>) -> Result<()> {
+        self.perform(move |_disk| {
+            _disk.file.write_all(&frame)?;
+            _disk.file.sync_all()?;
+            Ok(())
+        })
+    }
     fn history(&self) -> History {
         History {
             state: self.state.clone(),
@@ -680,14 +687,15 @@ impl Journal {
             if accepted { self.identity.pending = None; }
             identity = Some(self.identity.clone());
         }
-        let result = self.perform(move |disk| {
-            disk.file.write_all(&frame)?;
-            disk.file.sync_all()?;
-            if let Some(identity) = identity {
-                append_identity(&mut disk.ownership, &identity)?;
-            }
-            Ok(())
-        });
+        let result = if let Some(identity) = identity {
+            self.perform(move |disk| {
+                disk.file.write_all(&frame)?;
+                disk.file.sync_all()?;
+                append_identity(&mut disk.ownership, &identity)
+            })
+        } else {
+            self.append_frame(frame)
+        };
         if let Err(error) = result {
             self.state = self.durable.clone();
             return Err(error);

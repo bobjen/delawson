@@ -1,6 +1,6 @@
 //! Raft transport, election timers, and the boundary between consensus and client execution.
 use crate::execution::Application;
-use crate::{Answer, Command, Entry, Members, Membership, Node, Role, Rpc, State};
+use crate::{Action, Answer, Command, Entry, Members, Membership, Node, Role, Rpc, State};
 use crate::{Member, MemberId, MemberNames, Retirement, Storage, UNASSIGNED};
 use crate::{application, journal, lease, raft, random_bytes};
 use common::Arg;
@@ -10,7 +10,7 @@ use common::time::TimeSec;
 use common::{Context, logn};
 use common::{Error, Result};
 use common::{MessagePayload, Op, Req, Resp, Status, structure};
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::{Condvar, Mutex as ParkMutex, RwLock, RwLockReadGuard};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -22,6 +22,53 @@ pub struct Options {
     pub snapshot_min_log_bytes: u64,
     pub snapshot_interval_secs: u64,
     pub allow_stale_reads: bool,
+}
+const CLIENT_BATCH: usize = 128;
+const CLIENT_INTERVAL: Duration = Duration::ZERO;
+// Applied progress wakes waiters; this only rechecks leadership and failures.
+const APPLY_TICK: Duration = Duration::from_millis(100);
+struct ApplyWatch {
+    applied: AtomicU64,
+    version: ParkMutex<u64>,
+    changed: Condvar,
+}
+impl ApplyWatch {
+    fn new(applied: u64) -> Self {
+        Self {
+            applied: AtomicU64::new(applied),
+            version: ParkMutex::new(0),
+            changed: Condvar::new(),
+        }
+    }
+    fn version(&self) -> u64 {
+        *self.version.lock()
+    }
+    fn publish(&self, applied: u64) {
+        self.applied.store(applied, Ordering::Release);
+        self.signal();
+    }
+    fn signal(&self) {
+        let mut version = self.version.lock();
+        *version = version.wrapping_add(1);
+        drop(version);
+        self.changed.notify_all();
+    }
+    fn wait(&self, version: u64, timeout: Duration) {
+        let mut current = self.version.lock();
+        if *current == version {
+            self.changed.wait_for(&mut current, timeout);
+        }
+    }
+}
+struct ClientProposal {
+    action: Action,
+    reply: std::sync::mpsc::SyncSender<Result<u64>>,
+}
+pub struct ClientTicket(std::sync::mpsc::Receiver<Result<u64>>);
+impl ClientTicket {
+    pub fn wait(self) -> Result<u64> {
+        self.0.recv().map_err(|_| Error::new("Raft proposal queue stopped"))?
+    }
 }
 pub enum PendingWork {
     Apply(crate::execution::Work),
@@ -116,9 +163,12 @@ pub struct Runtime<S> {
     pub ready: AtomicBool,
     pub readiness_requests: Mutex<BTreeSet<MemberId>>,
     pub proposing: Mutex<()>,
+    client_proposals: Mutex<Vec<ClientProposal>>,
+    client_last_send: Mutex<Option<Instant>>,
     pub raft_workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     pub global_lock: RwLock<S>,
     pub execution: Mutex<crate::execution::Cursor>,
+    apply_watch: ApplyWatch,
     pub application_generation: AtomicU64,
     pub metadata_generation: AtomicU64,
     pub work_queue: Mutex<WorkQueue>,
@@ -131,7 +181,7 @@ pub struct Runtime<S> {
     execution_receive: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
-impl<S: Default> Runtime<S> {
+impl<S: Default + Application> Runtime<S> {
     pub fn new(runtime: Settings, node: Node, options: Options) -> Self {
         Self::with_state(runtime, node, options, S::default())
     }
@@ -139,7 +189,11 @@ impl<S: Default> Runtime<S> {
 
 impl<S> Runtime<S> {
     /// Construct a runtime around application state that needs configuration to build.
-    pub fn with_state(runtime: Settings, node: Node, options: Options, initial: S) -> Self {
+    pub fn with_state(runtime: Settings, node: Node, options: Options, initial: S) -> Self
+    where
+        S: Application,
+    {
+        let applied = initial.applied();
         let membership = node.state().membership();
         let placement = application::Placement::new(
             &membership.replacements(&membership.members()),
@@ -176,9 +230,12 @@ impl<S> Runtime<S> {
             ready: AtomicBool::new(false),
             readiness_requests: Mutex::new(BTreeSet::new()),
             proposing: Mutex::new(()),
+            client_proposals: Mutex::new(Vec::new()),
+            client_last_send: Mutex::new(None),
             raft_workers: Mutex::new(vec![]),
             global_lock: RwLock::new(initial),
             execution: Mutex::new(crate::execution::Cursor::default()),
+            apply_watch: ApplyWatch::new(applied),
             application_generation: AtomicU64::new(0),
             metadata_generation: AtomicU64::new(0),
             work_queue: Mutex::new(WorkQueue::default()),
@@ -189,6 +246,122 @@ impl<S> Runtime<S> {
             execution_error: Mutex::new(None),
         }
     }
+    /// Queue one action for the leader. The first queued action wakes raft-main;
+    /// actions gathered before the next 10 ms send slot share one log entry.
+    pub fn queue_client(&self, action: Action) -> Result<ClientTicket> {
+        let (reply, receive) = std::sync::mpsc::sync_channel(1);
+        if self.host.get().is_none() {
+            let result =
+                self.journal.initial_call(|node| node.propose(Command::Client(vec![action])));
+            let _ = reply.send(result);
+            return Ok(ClientTicket(receive));
+        }
+        let wake = {
+            let mut pending = self
+                .client_proposals
+                .lock()
+                .map_err(|_| Error::new("client proposal queue poisoned"))?;
+            if self.snapshot_stopping.load(Ordering::SeqCst) {
+                return Err(Error::new("Raft runtime is stopping"));
+            }
+            let wake = pending.is_empty();
+            pending.push(ClientProposal { action, reply });
+            wake
+        };
+        if wake {
+            self.journal.wake();
+        }
+        Ok(ClientTicket(receive))
+    }
+    pub fn propose_client(&self, action: Action) -> Result<u64> {
+        self.queue_client(action)?.wait()
+    }
+    fn flush_client_proposals(&self, node: &mut Node) -> Result<()> {
+        if self
+            .client_proposals
+            .lock()
+            .map_err(|_| Error::new("client proposal queue poisoned"))?
+            .is_empty()
+        {
+            return Ok(());
+        }
+        let delay = client_delay(
+            *self.client_last_send.lock().map_err(|_| Error::new("client send time poisoned"))?,
+            Instant::now(),
+        );
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        let pending = {
+            let mut queue = self
+                .client_proposals
+                .lock()
+                .map_err(|_| Error::new("client proposal queue poisoned"))?;
+            take_client_batch(&mut queue)
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut actions = Vec::with_capacity(pending.len());
+        let mut replies = Vec::with_capacity(pending.len());
+        for proposal in pending {
+            actions.push(proposal.action);
+            replies.push(proposal.reply);
+        }
+        let result = node.propose(Command::Client(actions));
+        match result {
+            Ok(index) => {
+                *self
+                    .client_last_send
+                    .lock()
+                    .map_err(|_| Error::new("client send time poisoned"))? = Some(Instant::now());
+                for reply in replies {
+                    let _ = reply.send(Ok(index));
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                logn!(
+                    "Raft client batch rejected",
+                    "member {},count {},error {}",
+                    node.id,
+                    replies.len(),
+                    message
+                );
+                for reply in replies {
+                    let _ = reply.send(Err(Error::new(message.clone())));
+                }
+            }
+        }
+        let more = !self
+            .client_proposals
+            .lock()
+            .map_err(|_| Error::new("client proposal queue poisoned"))?
+            .is_empty();
+        if more {
+            self.journal.wake();
+        }
+        Ok(())
+    }
+    fn fail_client_proposals(&self, message: &str) {
+        let pending = self
+            .client_proposals
+            .lock()
+            .map(|mut queue| std::mem::take(&mut *queue))
+            .unwrap_or_default();
+        for proposal in pending {
+            let _ = proposal.reply.send(Err(Error::new(message)));
+        }
+    }
+}
+fn take_client_batch(queue: &mut Vec<ClientProposal>) -> Vec<ClientProposal> {
+    let count = queue.len().min(CLIENT_BATCH);
+    queue.drain(..count).collect()
+}
+fn client_delay(last_send: Option<Instant>, now: Instant) -> Duration {
+    last_send
+        .map(|last_send| (last_send + CLIENT_INTERVAL).saturating_duration_since(now))
+        .unwrap_or_default()
 }
 
 struct SnapshotProduction<'a>(&'a AtomicBool);
@@ -450,7 +623,7 @@ pub trait Host:
     std::ops::Deref<Target = Runtime<Self::Application>> + Send + Sync + Sized + 'static
 {
     type Application: crate::execution::Application;
-    fn apply_client(&self, state: &crate::execution::Work) -> Result<()>;
+    fn apply_client(&self, state: &crate::execution::Work) -> Result<crate::execution::Progress>;
     /// Small public routing state needed even by locked or non-applying members.
     /// Runs on the application worker, never on the consensus owner.
     fn has_metadata(&self) -> bool {
@@ -496,6 +669,26 @@ pub trait Host:
             fence.wait()?;
         }
         result
+    }
+    /// Run on raft-main and return after journal work is queued, without waiting for its
+    /// durability fence. Callers must wait for commit separately before reporting success.
+    fn on_raft_async<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Self, &mut Node) -> Result<R> + Send + 'static,
+    ) -> Result<R> {
+        if self.host.get().is_none() {
+            return self.journal.initial_call(|node| f(self, node));
+        }
+        let host = self
+            .host
+            .get()
+            .and_then(|weak| weak.upgrade())
+            .and_then(|host| host.downcast::<Self>().ok())
+            .ok_or_else(|| Error::new("Raft host has not started"))?;
+        self.journal.call(move |node| {
+            node.journal.poll_io()?;
+            f(&host, node)
+        })
     }
     fn accept_founders(&self, founders: Membership) -> Result<()> {
         founders.validate()?;
@@ -1128,7 +1321,8 @@ pub trait Host:
         let mut previous_error =
             self.execution_error.lock().map_err(|_| Error::new("execution error lock poisoned"))?;
         let current_error = result.as_ref().err().map(ToString::to_string);
-        if *previous_error != current_error {
+        let changed = *previous_error != current_error;
+        if changed {
             if let Some(error) = &current_error {
                 logn!("Raft client application failed", "error {}", error);
             } else {
@@ -1137,6 +1331,9 @@ pub trait Host:
         }
         *previous_error = current_error;
         drop(previous_error);
+        if changed {
+            self.apply_watch.signal();
+        }
         result
     }
     fn execute_pending_work(&self) -> Result<()> {
@@ -1184,14 +1381,16 @@ pub trait Host:
                         .map_err(|_| Error::new("execution cursor poisoned"))?;
                     self.global_lock.write().reset();
                     *cursor = crate::execution::Cursor::default();
+                    self.apply_watch.publish(0);
                     Ok(true)
                 }
                 PendingWork::Apply(work) => {
-                    self.apply_client(work)?;
-                    let complete = self.global_lock.read().applied() >= work.commit;
+                    let progress = self.apply_client(work)?;
+                    let complete = progress.complete && progress.applied >= work.commit;
                     if complete {
                         self.application_generation.store(work.generation, Ordering::SeqCst);
                     }
+                    self.apply_watch.publish(progress.applied);
                     Ok(complete)
                 }
             }
@@ -1295,11 +1494,11 @@ pub trait Host:
             std::thread::sleep(Duration::from_millis(5));
         }
     }
-    fn wait_committed(&self, index: u64) -> Result<()> {
-        let deadline = Instant::now()
-            + Duration::from_millis(self.options.raft.election_max_ms.saturating_mul(2));
+    fn wait_applied(&self, index: u64) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let committed = self.on_raft(move |host, node| {
+            let version = self.apply_watch.version();
+            let (committed, current_generation) = self.on_raft(move |host, node| {
                 if node.journal.failed {
                     return Err(Error::new("Raft journal failed"));
                 }
@@ -1309,11 +1508,14 @@ pub trait Host:
                     ));
                 }
                 host.refresh_application(node)?;
-                Ok(node.state().commit >= index
-                    && host.application_generation.load(Ordering::SeqCst)
-                        == node.state().generation)
+                Ok((
+                    node.state().commit >= index,
+                    host.application_generation.load(Ordering::SeqCst) == node.state().generation,
+                ))
             })?;
-            if committed && self.global_lock.try_read().is_some_and(|data| data.applied() >= index)
+            if committed
+                && current_generation
+                && self.apply_watch.applied.load(Ordering::Acquire) >= index
             {
                 return Ok(());
             }
@@ -1331,7 +1533,11 @@ pub trait Host:
             if Instant::now() >= deadline {
                 return Err(Error::new("Raft quorum timeout; request outcome may be unknown"));
             }
-            std::thread::sleep(Duration::from_millis(5));
+            if committed {
+                self.apply_watch.wait(version, APPLY_TICK);
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
     }
     fn raft_status(&self) -> String {
@@ -2007,6 +2213,7 @@ pub trait Host:
                 return false;
             };
             if host.snapshot_stopping.load(Ordering::SeqCst) {
+                host.fail_client_proposals("Raft runtime is stopping");
                 return false;
             }
             let result = (|| -> Result<()> {
@@ -2057,6 +2264,7 @@ pub trait Host:
                 node.advance()?;
                 node.accept_replacements()?;
                 host.prepare_primary(node)?;
+                host.flush_client_proposals(node)?;
                 host.refresh_application(&node)?;
                 let members = node.state().membership().participants();
                 let local_id = node.id;
@@ -2330,6 +2538,37 @@ impl crate::codec::Wire for Sender {
 mod tests {
     use super::*;
     #[test]
+    fn client_batches_preserve_actions_in_order() {
+        let mut queue = Vec::new();
+        let mut expected = Vec::new();
+        for number in 0..(CLIENT_BATCH + 2) {
+            let fields = if number == 5 { vec![number as u8; 4096] } else { vec![number as u8] };
+            let action = Action::new(Op::Ping, fields);
+            let (reply, _receive) = std::sync::mpsc::sync_channel(1);
+            expected.push(action.clone());
+            queue.push(ClientProposal { action, reply });
+        }
+
+        let first = take_client_batch(&mut queue);
+        assert_eq!(first.len(), CLIENT_BATCH);
+        for (proposal, action) in first.iter().zip(&expected) {
+            assert_eq!(&proposal.action, action);
+        }
+        let last = take_client_batch(&mut queue);
+        assert_eq!(last.len(), 2);
+        for (proposal, action) in last.iter().zip(&expected[CLIENT_BATCH..]) {
+            assert_eq!(&proposal.action, action);
+        }
+        assert!(queue.is_empty());
+    }
+    #[test]
+    fn client_batch_has_no_wait_when_interval_is_zero() {
+        let now = Instant::now();
+        assert_eq!(client_delay(None, now), Duration::ZERO);
+        assert_eq!(client_delay(Some(now - CLIENT_INTERVAL), now), Duration::ZERO);
+        assert_eq!(client_delay(Some(now), now), Duration::ZERO);
+    }
+    #[test]
     fn retired_and_inactive_peers_do_not_receive_client_setup() {
         let mut membership =
             State::initial("01".repeat(64), raft::tests::members(3), raft::tests::names())
@@ -2427,5 +2666,24 @@ mod tests {
         assert!(!consensus);
         assert!(transfer);
         assert!(forwarded);
+    }
+    #[test]
+    fn apply_watch_wakes_waiters_without_losing_early_signals() {
+        let watch = Arc::new(ApplyWatch::new(0));
+        let version = watch.version();
+        watch.publish(7);
+        watch.wait(version, Duration::ZERO);
+        assert_eq!(watch.applied.load(Ordering::Acquire), 7);
+
+        let version = watch.version();
+        let waiting = watch.clone();
+        let (wake, woke) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            waiting.wait(version, Duration::from_secs(5));
+            wake.send(waiting.applied.load(Ordering::Acquire)).unwrap();
+        });
+        watch.publish(9);
+        assert_eq!(woke.recv_timeout(Duration::from_secs(1)).unwrap(), 9);
+        worker.join().unwrap();
     }
 }

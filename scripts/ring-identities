@@ -33,14 +33,14 @@ def main():
                 continue
             name = service.get('identity', f'{kind.upper()}{number}')
             raft = {}
-            if kind == 'ks' and path:
+            if kind in ('ks', 'sn') and path:
                 cfg = path
                 if path.is_dir():
                     cfg = path / f'{name}.toml'
                     if not cfg.exists():
-                        cfg = path / 'ks.toml'
+                        cfg = path / f'{kind}.toml'
                 raft = tomllib.loads(cfg.read_text()).get('raft', {})
-            ring = raft.get('ring', 'KS0') if raft.get('members') else name
+            ring = raft.get('ring', name) if raft.get('members') else name
             rings.setdefault(ring, rings.get(name, secrets.token_hex(64)))
             if name in rings and rings[name] != rings[ring]:
                 raise SystemExit(f'{name} belongs to a different ring')

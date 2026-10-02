@@ -1565,6 +1565,24 @@ pub mod tests {
         assert_eq!(primary.journal.durable_state().commit, 0);
         primary.journal.durable = primary.state().clone();
         assert_eq!(primary.journal.durable_state().commit, 1);
+
+        let first = primary.propose(Command::Noop).unwrap();
+        let second = primary.propose(Command::Noop).unwrap();
+        assert_eq!((first, second), (2, 3));
+        assert_eq!(primary.state().last(), second);
+        assert_eq!(primary.state().commit, 1);
+
+        // Completing the write through index 2 may commit that prefix, but not index 3.
+        let mut through_first = primary.state().clone();
+        through_first.log.pop();
+        primary.journal.durable = through_first;
+        primary.advance().unwrap();
+        assert_eq!(primary.state().commit, first);
+        assert_eq!(primary.state().last(), second);
+
+        primary.journal.durable = primary.state().clone();
+        primary.advance().unwrap();
+        assert_eq!(primary.state().commit, second);
     }
 
     #[test]

@@ -330,7 +330,7 @@ struct DeleteCmd {
 }
 
 struct DeleteDoneCmd {
-    entry: u64,
+    name: StreamName,
     now: TimeSec,
 }
 
@@ -547,10 +547,10 @@ sn_wire!(
     DeleteDoneCmd,
     SnDeleteDone,
     |v: &DeleteDoneCmd, w: &mut StructWriter| {
-        w.number_u64(v.entry);
+        write_name(w, v.name);
         w.time_sec(v.now);
     },
-    |r: &mut StructReader<'_>| Ok(DeleteDoneCmd { entry: r.number_u64()?, now: r.time_sec()? })
+    |r: &mut StructReader<'_>| Ok(DeleteDoneCmd { name: read_name(r)?, now: r.time_sec()? })
 );
 
 fn sn_action<T: raft::codec::Wire>(op: Op, value: &T) -> Result<raft::Action> {
@@ -669,8 +669,8 @@ struct SNState {
     retired_streams: std::collections::HashSet<StreamName>,
     stream_extras: Extras<StreamName>,
     extent_extras: SharedExtras<(ExtentId, TimeSec)>,
-    /// In-flight EN deletion work; the entry key makes completion durable and retryable.
-    pending_deletes: HashMap<u64, PendingDelete>,
+    /// In-flight EN deletion work, keyed by stream name for batched Raft entries.
+    pending_deletes: HashMap<StreamName, PendingDelete>,
     /// Primary-only waiters for an extent that is being created by Raft.
     /// The global lock protects the map; each value has a lock-free waiter stack.
     pending_opens: HashMap<StreamName, PendingOpen>,
@@ -891,7 +891,7 @@ fn check_delete(
     Ok(())
 }
 
-fn apply_sn_action(state: &mut SNState, index: u64, action: &raft::Action) -> Result<()> {
+fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> Result<()> {
     match action.op {
         Op::SnCreate => {
             let cmd: CreateCmd = raft::codec::decode(&action.fields)?;
@@ -1110,7 +1110,7 @@ fn apply_sn_action(state: &mut SNState, index: u64, action: &raft::Action) -> Re
             let Some(stream) = shards[shard_of(cmd.name)].get_mut(&cmd.name) else {
                 if retired_streams.contains(&cmd.name) {
                     pending_deletes.insert(
-                        index,
+                        cmd.name,
                         PendingDelete { name: cmd.name, hard: cmd.hard, tasks: Vec::new() },
                     );
                     return Ok(());
@@ -1175,7 +1175,8 @@ fn apply_sn_action(state: &mut SNState, index: u64, action: &raft::Action) -> Re
                     hard,
                 });
             }
-            pending_deletes.insert(index, PendingDelete { name: cmd.name, hard: cmd.hard, tasks });
+            pending_deletes
+                .insert(cmd.name, PendingDelete { name: cmd.name, hard: cmd.hard, tasks });
             Ok(())
         }
         Op::SnDeleteDone => {
@@ -1192,7 +1193,7 @@ fn apply_sn_action(state: &mut SNState, index: u64, action: &raft::Action) -> Re
                 ..
             } = state;
             let pending = pending_deletes
-                .remove(&cmd.entry)
+                .remove(&cmd.name)
                 .ok_or_else(|| Error::new("delete completion has no pending work"))?;
             if pending.hard {
                 for task in pending.tasks.iter().filter(|task| task.hard) {
@@ -1376,19 +1377,17 @@ impl SN {
         }
     }
 
+    fn queue_action(&self, action: raft::Action) -> Result<raft::runtime::ClientTicket> {
+        self.common.queue_client(action)
+    }
+
+    fn propose_action(&self, action: raft::Action) -> Result<u64> {
+        self.queue_action(action)?.wait()
+    }
+
     fn commit_action(&self, action: raft::Action) -> Result<u64> {
-        let index = self.on_raft(move |host, node| {
-            if node.role != raft::Role::Leader || node.journal.failed {
-                return Err(Error::new("Raft is not a healthy leader"));
-            }
-            if node.state().last() != node.state().commit {
-                return Err(Error::new("SN has an outstanding Raft proposal; retry"));
-            }
-            let index = node.propose(raft::Command::Client(vec![action]))?;
-            host.refresh_application(node)?;
-            Ok(index)
-        })?;
-        self.wait_committed(index)?;
+        let index = self.propose_action(action)?;
+        self.wait_applied(index)?;
         Ok(index)
     }
 
@@ -1474,15 +1473,10 @@ impl SN {
         loop {
             let pending = {
                 let state = self.global_lock.read();
-                state
-                    .pending_deletes
-                    .iter()
-                    .filter(|(_, pending)| pending.name == name)
-                    .min_by_key(|(entry, _)| *entry)
-                    .map(|(&entry, pending)| (entry, pending.clone()))
+                state.pending_deletes.get(&name).cloned()
             };
-            let Some((entry, pending)) = pending else { break };
-            if let Err(error) = self.finish_delete(process, entry, pending) {
+            let Some(pending) = pending else { break };
+            if let Err(error) = self.finish_delete(process, name, pending) {
                 return error;
             }
         }
@@ -1515,15 +1509,15 @@ impl SN {
             Ok(action) => action,
             Err(error) => return Resp::error(Status::Internal, error.to_string()),
         };
-        let entry = match self.commit_action(action) {
-            Ok(entry) => entry,
+        match self.commit_action(action) {
+            Ok(_) => {}
             Err(error) => return Resp::error(Status::Internal, error.to_string()),
-        };
-        let pending = self.global_lock.read().pending_deletes.get(&entry).cloned();
+        }
+        let pending = self.global_lock.read().pending_deletes.get(&name).cloned();
         let Some(pending) = pending else {
             return Resp::error(Status::Internal, "Raft applied deletion without an outbox");
         };
-        if let Err(error) = self.finish_delete(process, entry, pending) {
+        if let Err(error) = self.finish_delete(process, name, pending) {
             return error;
         }
         Resp::ok()
@@ -1532,7 +1526,7 @@ impl SN {
     fn finish_delete(
         &self,
         process: &Process,
-        entry: u64,
+        name: StreamName,
         pending: PendingDelete,
     ) -> std::result::Result<(), Resp> {
         for task in &pending.tasks {
@@ -1559,7 +1553,7 @@ impl SN {
                 }
             }
         }
-        let action = sn_action(Op::SnDeleteDone, &DeleteDoneCmd { entry, now: TimeSec::now() })
+        let action = sn_action(Op::SnDeleteDone, &DeleteDoneCmd { name, now: TimeSec::now() })
             .map_err(|error| Resp::error(Status::Internal, error.to_string()))?;
         self.commit_action(action)
             .map(|_| ())
@@ -1733,9 +1727,27 @@ impl SN {
             Ok(action) => action,
             Err(error) => return Resp::error(Status::Internal, error.to_string()),
         };
-        match self.commit_action(action) {
+        let ticket = match self.queue_action(action) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                common::logn!("SN create queue failed", "error {}", error);
+                return Resp::error(Status::Internal, error.to_string());
+            }
+        };
+        drop(_serial);
+        let index = match ticket.wait() {
+            Ok(index) => index,
+            Err(error) => {
+                common::logn!("SN create proposal failed", "error {}", error);
+                return Resp::error(Status::Internal, error.to_string());
+            }
+        };
+        match self.wait_applied(index) {
             Ok(_) => Resp::ok(),
-            Err(error) => Resp::error(Status::Internal, error.to_string()),
+            Err(error) => {
+                common::logn!("SN create did not apply", "index {},error {}", index, error);
+                Resp::error(Status::Internal, error.to_string())
+            }
         }
     }
 
@@ -2621,9 +2633,9 @@ impl SN {
 impl Host for SN {
     type Application = SNState;
 
-    fn apply_client(&self, work: &raft::execution::Work) -> Result<()> {
+    fn apply_client(&self, work: &raft::execution::Work) -> Result<raft::execution::Progress> {
         let mut opened = Vec::new();
-        let applied = raft::execution::execute_blocking(
+        let (progress, ()) = raft::execution::exec_report(
             &self.global_lock,
             &self.execution,
             work,
@@ -2647,7 +2659,13 @@ impl Host for SN {
                 }
                 Ok(())
             },
-        );
+            |state| {
+                self.streams.store(state.streams, Ordering::Relaxed);
+                self.extents.store(state.extents, Ordering::Relaxed);
+                self.sealed.store(state.sealed, Ordering::Relaxed);
+                self.sealed_streams.store(state.sealed_streams, Ordering::Relaxed);
+            },
+        )?;
         // Do not write responses while holding the application write lock.
         for (waiters, extent) in opened {
             let answer = extent.map_or_else(
@@ -2658,13 +2676,7 @@ impl Host for SN {
                 waiter.send(answer.clone());
             }
         }
-        applied?;
-        let state = self.global_lock.read();
-        self.streams.store(state.streams, Ordering::Relaxed);
-        self.extents.store(state.extents, Ordering::Relaxed);
-        self.sealed.store(state.sealed, Ordering::Relaxed);
-        self.sealed_streams.store(state.sealed_streams, Ordering::Relaxed);
-        Ok(())
+        Ok(progress)
     }
 
     fn prepare_primary(&self, _node: &mut raft::Node) -> Result<()> {

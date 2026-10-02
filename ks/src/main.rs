@@ -480,7 +480,7 @@ impl Ks {
             host.initial_key(node)?;
             Ok(node.state().last())
         })?;
-        self.wait_committed(index)?;
+        self.wait_applied(index)?;
         self.ensure_future_key()
     }
 

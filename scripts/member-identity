@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mark one member per ring to coordinate first creation.
-Usage: member-identity EFFECTIVE_CLUSTER ROUTING_LABEL JOURNAL_DIRECTORY
-The default coordinator is the first KS routing label in that ring's roster.
+Usage: member-identity EFFECTIVE_CLUSTER ROUTING_LABEL JOURNAL_DIRECTORY [KIND]
+The default coordinator is the first member of KIND in that ring's roster.
 Each process generates its own voting identity. No IDs come from configuration.
 Never use this command to recover an existing ring with lost state.
 """
@@ -11,15 +11,16 @@ import sys
 import tomllib
 
 config_path, name, directory = sys.argv[1:4]
+kind = sys.argv[4] if len(sys.argv) > 4 else 'ks'
 config = tomllib.loads(Path(config_path).read_text())
 ring = config['ring_identities'][name]
 number = 0
 coordinator = None
 for service in config['service']:
-    if service['kind'] != 'ks':
+    if service['kind'] != kind:
         continue
     for _ in range(service.get('count', 1)):
-        candidate = service.get('identity', f'KS{number}')
+        candidate = service.get('identity', f'{kind.upper()}{number}')
         number += 1
         if config['ring_identities'][candidate] == ring and coordinator is None:
             coordinator = candidate

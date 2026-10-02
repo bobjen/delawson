@@ -63,6 +63,11 @@ pub trait Application: Send + Sync {
     /// Reclaim application-owned state while the global lock is still exclusive.
     fn reclaim(&mut self) {}
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Progress {
+    pub applied: u64,
+    pub complete: bool,
+}
 #[derive(Default)]
 pub struct Cursor {
     generation: u64,
@@ -107,7 +112,26 @@ pub fn execute_blocking<S: Application>(
     budget: Duration,
     apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
 ) -> Result<bool> {
-    execute_state(
+    exec_progress(global, progress, state, budget, apply).map(|progress| progress.complete)
+}
+pub fn exec_progress<S: Application>(
+    global: &RwLock<S>,
+    progress: &Mutex<Cursor>,
+    state: &impl Committed,
+    budget: Duration,
+    apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
+) -> Result<Progress> {
+    exec_report(global, progress, state, budget, apply, |_| ()).map(|(progress, ())| progress)
+}
+pub fn exec_report<S: Application, T>(
+    global: &RwLock<S>,
+    progress: &Mutex<Cursor>,
+    state: &impl Committed,
+    budget: Duration,
+    apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
+    finish: impl FnOnce(&S) -> T,
+) -> Result<(Progress, T)> {
+    execute_with_lock(
         global,
         progress,
         state,
@@ -117,7 +141,9 @@ pub fn execute_blocking<S: Application>(
         |data, index| data.set_applied(index),
         |data| data.reset(),
         apply,
+        finish,
     )
+    .map(|(progress, result)| (progress, result.expect("blocking apply holds the write lock")))
 }
 pub fn execute_state<S: Application>(
     global: &RwLock<S>,
@@ -130,9 +156,21 @@ pub fn execute_state<S: Application>(
     reset: impl Fn(&mut S),
     apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
 ) -> Result<bool> {
-    execute_with_lock(global, progress, state, budget, blocking, applied, set_applied, reset, apply)
+    execute_with_lock(
+        global,
+        progress,
+        state,
+        budget,
+        blocking,
+        applied,
+        set_applied,
+        reset,
+        apply,
+        |_| (),
+    )
+    .map(|(progress, _)| progress.complete)
 }
-fn execute_with_lock<S: Application>(
+fn execute_with_lock<S: Application, T>(
     global: &RwLock<S>,
     progress: &Mutex<Cursor>,
     state: &impl Committed,
@@ -142,14 +180,15 @@ fn execute_with_lock<S: Application>(
     set_applied: impl Fn(&mut S, u64),
     reset: impl Fn(&mut S),
     mut apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
-) -> Result<bool> {
+    finish: impl FnOnce(&S) -> T,
+) -> Result<(Progress, Option<T>)> {
     let mut cursor = progress.lock().map_err(|_| Error::new("execution cursor poisoned"))?;
     let mut data = if blocking {
         global.write()
     } else if let Some(data) = global.try_write() {
         data
     } else {
-        return Ok(false);
+        return Ok((Progress { applied: 0, complete: false }, None));
     };
     let result = (|| -> Result<bool> {
         if cursor.generation != state.generation() {
@@ -221,8 +260,10 @@ fn execute_with_lock<S: Application>(
         set_applied(&mut *data, state.commit());
         Ok(true)
     })();
+    let applied_now = applied(&data);
     (&mut *data).reclaim();
-    result
+    let report = if result.is_ok() { Some(finish(&data)) } else { None };
+    result.map(|complete| (Progress { applied: applied_now, complete }, report))
 }
 
 #[cfg(test)]

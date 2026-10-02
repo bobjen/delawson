@@ -178,10 +178,16 @@ while read -r identity kind domain _; do
     mkdir -p "$dir/data"
     cp "$cluster" "$dir/cluster.toml"
     cp "$service_config" "$dir/$kind.toml"
-    if [[ $kind == ks ]]; then
+    if [[ $kind == ks || $kind == sn ]]; then
         if [[ $creating_rings == true ]]; then
-            "$root/scripts/member-identity" "$cluster" "$identity" "$dir/data/master-keys"
+            if [[ $kind == ks ]]; then
+                "$root/scripts/member-identity" "$cluster" "$identity" "$dir/data/master-keys" "$kind"
+            else
+                "$root/scripts/member-identity" "$cluster" "$identity" "$dir/data/raft" "$kind"
+            fi
         fi
+    fi
+    if [[ $kind == ks ]]; then
         sed -i '/^require_unlock *=/d; /^unlock_verifier *=/d' "$dir/$kind.toml"
         sed -i "1i require_unlock = true\nunlock_verifier = \"$verifier\"" "$dir/$kind.toml"
     fi
