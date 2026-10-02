@@ -679,8 +679,6 @@ struct SNState {
     sealed: u64,
     sealed_streams: u64,
     max_extents: u32,
-    /// Highest Raft entry applied to this state.
-    applied: u64,
 }
 
 impl SNState {
@@ -700,7 +698,6 @@ impl SNState {
             sealed: 0,
             sealed_streams: 0,
             max_extents,
-            applied: 0,
         })
     }
 }
@@ -719,6 +716,11 @@ impl OpenWaiter {
             }
         }
     }
+}
+
+struct OpenDone {
+    waiters: Vec<OpenWaiter>,
+    extent: Option<(ExtentData, SRoff)>,
 }
 
 struct OpenNode {
@@ -1222,14 +1224,6 @@ fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> R
 }
 
 impl raft::execution::Application for SNState {
-    fn applied(&self) -> u64 {
-        self.applied
-    }
-
-    fn set_applied(&mut self, index: u64) {
-        self.applied = index;
-    }
-
     fn reset(&mut self) {
         // The committed action history is the source of truth during a Raft restore.
         for shard in &mut self.shards {
@@ -1245,7 +1239,6 @@ impl raft::execution::Application for SNState {
         self.extents = 0;
         self.sealed = 0;
         self.sealed_streams = 0;
-        self.applied = 0;
     }
 
     fn reclaim(&mut self) {
@@ -1628,7 +1621,7 @@ impl SN {
             host.refresh_application(node)?;
             Ok(node.state().commit)
         })?;
-        while sn.global_lock.read().applied < commit {
+        while sn.common.applied() < commit {
             sn.execute_pending()?;
         }
         Ok(sn)
@@ -2632,42 +2625,41 @@ impl SN {
 
 impl Host for SN {
     type Application = SNState;
+    type Done = OpenDone;
 
-    fn apply_client(&self, work: &raft::execution::Work) -> Result<raft::execution::Progress> {
-        let mut opened = Vec::new();
-        let (progress, ()) = raft::execution::exec_report(
-            &self.global_lock,
-            &self.execution,
-            work,
-            Duration::from_millis(self.config.raft.execution_lock_ms),
-            |state, context, action| {
-                apply_sn_action(state, context.index, action)?;
-                if action.op == Op::SnOpen {
-                    let command: OpenCmd = raft::codec::decode(&action.fields)?;
-                    if let Some(pending) = state.pending_opens.remove(&command.name) {
-                        let stream = state.shards[shard_of(command.name)].get(&command.name);
-                        let extent = stream.and_then(|stream| {
-                            stream.open.map(|id| {
-                                (
-                                    state.extent_table[id.get() as usize].data.clone(),
-                                    stream.sealed_records,
-                                )
-                            })
-                        });
-                        opened.push((pending.take(), extent));
-                    }
-                }
-                Ok(())
-            },
-            |state| {
-                self.streams.store(state.streams, Ordering::Relaxed);
-                self.extents.store(state.extents, Ordering::Relaxed);
-                self.sealed.store(state.sealed, Ordering::Relaxed);
-                self.sealed_streams.store(state.sealed_streams, Ordering::Relaxed);
-            },
-        )?;
+    fn apply_client(
+        &self,
+        state: &mut SNState,
+        context: raft::execution::Context<'_>,
+        action: &raft::Action,
+        done: &mut Vec<Self::Done>,
+    ) -> Result<()> {
+        apply_sn_action(state, context.index, action)?;
+        if action.op == Op::SnOpen {
+            let command: OpenCmd = raft::codec::decode(&action.fields)?;
+            if let Some(pending) = state.pending_opens.remove(&command.name) {
+                let stream = state.shards[shard_of(command.name)].get(&command.name);
+                let extent = stream.and_then(|stream| {
+                    stream.open.map(|id| {
+                        (state.extent_table[id.get() as usize].data.clone(), stream.sealed_records)
+                    })
+                });
+                done.push(OpenDone { waiters: pending.take(), extent });
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_apply(&self, state: &SNState) {
+        self.streams.store(state.streams, Ordering::Relaxed);
+        self.extents.store(state.extents, Ordering::Relaxed);
+        self.sealed.store(state.sealed, Ordering::Relaxed);
+        self.sealed_streams.store(state.sealed_streams, Ordering::Relaxed);
+    }
+
+    fn complete_apply(&self, opened: Vec<Self::Done>) {
         // Do not write responses while holding the application write lock.
-        for (waiters, extent) in opened {
+        for OpenDone { waiters, extent } in opened {
             let answer = extent.map_or_else(
                 || Resp::error(Status::Internal, "Raft opened no extent"),
                 |(extent, first)| self.extent_reply(extent, first),
@@ -2676,7 +2668,6 @@ impl Host for SN {
                 waiter.send(answer.clone());
             }
         }
-        Ok(progress)
     }
 
     fn prepare_primary(&self, _node: &mut raft::Node) -> Result<()> {
@@ -3086,10 +3077,9 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let mut ready = false;
         while std::time::Instant::now() < deadline {
-            let (role, commit, applied) = sn
-                .on_raft(|_, node| Ok((node.role, node.state().commit)))
-                .map(|(role, commit)| (role, commit, sn.global_lock.read().applied))
-                .unwrap();
+            let (role, commit) =
+                sn.on_raft(|_, node| Ok((node.role, node.state().commit))).unwrap();
+            let applied = sn.common.applied();
             if role == raft::Role::Leader && commit != 0 && applied >= commit {
                 ready = true;
                 break;

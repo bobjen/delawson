@@ -168,7 +168,9 @@ pub struct Runtime<S> {
     pub raft_workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     pub global_lock: RwLock<S>,
     pub execution: Mutex<crate::execution::Cursor>,
+    metadata_execution: Mutex<crate::execution::Cursor>,
     apply_watch: ApplyWatch,
+    metadata_applied: AtomicU64,
     pub application_generation: AtomicU64,
     pub metadata_generation: AtomicU64,
     pub work_queue: Mutex<WorkQueue>,
@@ -193,7 +195,7 @@ impl<S> Runtime<S> {
     where
         S: Application,
     {
-        let applied = initial.applied();
+        let applied = 0;
         let membership = node.state().membership();
         let placement = application::Placement::new(
             &membership.replacements(&membership.members()),
@@ -235,7 +237,9 @@ impl<S> Runtime<S> {
             raft_workers: Mutex::new(vec![]),
             global_lock: RwLock::new(initial),
             execution: Mutex::new(crate::execution::Cursor::default()),
+            metadata_execution: Mutex::new(crate::execution::Cursor::default()),
             apply_watch: ApplyWatch::new(applied),
+            metadata_applied: AtomicU64::new(0),
             application_generation: AtomicU64::new(0),
             metadata_generation: AtomicU64::new(0),
             work_queue: Mutex::new(WorkQueue::default()),
@@ -245,6 +249,15 @@ impl<S> Runtime<S> {
             execution_started: AtomicBool::new(false),
             execution_error: Mutex::new(None),
         }
+    }
+    pub fn applied(&self) -> u64 {
+        self.apply_watch.applied.load(Ordering::Acquire)
+    }
+    pub fn publish_applied(&self, index: u64) {
+        self.apply_watch.publish(index);
+    }
+    pub fn metadata_applied(&self) -> u64 {
+        self.metadata_applied.load(Ordering::Acquire)
     }
     /// Queue one action for the leader. The first queued action wakes raft-main;
     /// actions gathered before the next 10 ms send slot share one log entry.
@@ -623,14 +636,37 @@ pub trait Host:
     std::ops::Deref<Target = Runtime<Self::Application>> + Send + Sync + Sized + 'static
 {
     type Application: crate::execution::Application;
-    fn apply_client(&self, state: &crate::execution::Work) -> Result<crate::execution::Progress>;
+    type Done: Send + 'static;
+    /// Apply one committed action while Raft holds the global write lock.
+    fn apply_client(
+        &self,
+        state: &mut Self::Application,
+        context: crate::execution::Context<'_>,
+        action: &Action,
+        done: &mut Vec<Self::Done>,
+    ) -> Result<()>;
+    /// Copy service metrics or other small reports while the global lock is held.
+    fn finish_apply(&self, _state: &Self::Application) {}
+    /// Handle primary-local completions after Raft releases the global lock.
+    fn complete_apply(&self, _done: Vec<Self::Done>) {}
     /// Small public routing state needed even by locked or non-applying members.
     /// Runs on the application worker, never on the consensus owner.
     fn has_metadata(&self) -> bool {
         false
     }
-    fn apply_metadata(&self, _state: &crate::execution::Work) -> Result<bool> {
-        Ok(true)
+    fn apply_metadata(
+        &self,
+        _state: &mut Self::Application,
+        _context: crate::execution::Context<'_>,
+        _action: &Action,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn metadata_action(&self, _action: &Action) -> bool {
+        true
+    }
+    fn reset_metadata(&self, state: &mut Self::Application) {
+        state.reset();
     }
     fn prepare_primary(&self, node: &mut Node) -> Result<()>;
     fn checkpoint_actions(
@@ -1060,7 +1096,7 @@ pub trait Host:
         let now = TimeSec::now().number();
         // The application lock is obtained only by this checkpoint helper, never raft-main.
         let history = self.global_lock.read();
-        let applied = history.applied();
+        let applied = self.applied();
         let plan = self.on_raft(move |host, node| {
             if node.journal.failed || matches!(node.role, Role::Stopped | Role::Candidate) {
                 return Ok(None);
@@ -1353,7 +1389,18 @@ pub trait Host:
                     .take();
             }
             if let Some(PendingWork::Apply(work)) = active.as_ref() {
-                if self.apply_metadata(work)? {
+                let complete = crate::execution::execute_state(
+                    &self.global_lock,
+                    &self.metadata_execution,
+                    &self.metadata_applied,
+                    work,
+                    Duration::from_millis(self.options.raft.execution_lock_ms),
+                    true,
+                    |state| self.reset_metadata(state),
+                    |action| self.metadata_action(action),
+                    |state, context, action| self.apply_metadata(state, context, action),
+                )?;
+                if complete {
                     self.metadata_generation.store(work.generation, Ordering::SeqCst);
                     *active = None;
                 }
@@ -1385,12 +1432,26 @@ pub trait Host:
                     Ok(true)
                 }
                 PendingWork::Apply(work) => {
-                    let progress = self.apply_client(work)?;
+                    let mut done = Vec::new();
+                    let applied = crate::execution::exec_report(
+                        &self.global_lock,
+                        &self.execution,
+                        &self.apply_watch.applied,
+                        work,
+                        Duration::from_millis(self.options.raft.execution_lock_ms),
+                        |state, context, action| {
+                            self.apply_client(state, context, action, &mut done)
+                        },
+                        |state| self.finish_apply(state),
+                    );
+                    self.complete_apply(done);
+                    let (progress, ()) = applied?;
                     let complete = progress.complete && progress.applied >= work.commit;
                     if complete {
                         self.application_generation.store(work.generation, Ordering::SeqCst);
                     }
-                    self.apply_watch.publish(progress.applied);
+                    // exec_report has published the atomic index before unlocking state.
+                    self.apply_watch.signal();
                     Ok(complete)
                 }
             }
@@ -1471,8 +1532,11 @@ pub trait Host:
                     .then_some(node.state().commit))
             })?;
             if let Some(commit) = commit {
-                let guard = self.global_lock.try_read();
-                if guard.as_ref().is_some_and(|data| data.applied() >= commit) {
+                if self.applied() >= commit {
+                    let guard = if read { self.global_lock.try_read() } else { None };
+                    if read && guard.is_none() {
+                        continue;
+                    }
                     let valid = self.on_raft(move |host, node| {
                         Ok(node.can_admit_with_policy(
                             lease::now()?,
@@ -1481,7 +1545,7 @@ pub trait Host:
                         ))
                     })?;
                     if valid {
-                        return Ok(Admission { history: if read { guard } else { None } });
+                        return Ok(Admission { history: guard });
                     }
                 }
             }

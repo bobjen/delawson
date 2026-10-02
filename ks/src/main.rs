@@ -37,16 +37,9 @@ fn random_master_key() -> Result<[u8; 32]> {
 #[derive(Clone, Default)]
 struct KeyHistory {
     epochs: Vec<MasterEpoch>,
-    applied: u64,
 }
 
 impl raft::execution::Application for KeyHistory {
-    fn applied(&self) -> u64 {
-        self.applied
-    }
-    fn set_applied(&mut self, index: u64) {
-        self.applied = index;
-    }
     fn reset(&mut self) {
         *self = Self::default();
     }
@@ -58,12 +51,6 @@ struct KsState {
     registrations: runtime::Registrations,
 }
 impl raft::execution::Application for KsState {
-    fn applied(&self) -> u64 {
-        self.keys.applied
-    }
-    fn set_applied(&mut self, index: u64) {
-        self.keys.applied = index;
-    }
     fn reset(&mut self) {
         self.keys = KeyHistory::default();
     }
@@ -74,7 +61,6 @@ struct Ks {
     config: KsConfig,
     unlock_verifier: Option<[u8; 32]>,
     unlock_key: Mutex<Option<[u8; 32]>>,
-    metadata_cursor: Mutex<raft::execution::Cursor>,
     gc_stop: AtomicBool,
     gc_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -180,9 +166,10 @@ impl Service for Ks {
     }
 
     fn status(&self, _process: &Process) -> Vec<String> {
-        let (key_count, applied, registered) = {
+        let applied = self.common.applied();
+        let (key_count, registered) = {
             let state = self.global_lock.read();
-            (state.keys.epochs.len(), state.keys.applied, state.registrations.peers.len())
+            (state.keys.epochs.len(), state.registrations.peers.len())
         };
         vec![
             format!("lazy_day_keys {}", self.config.lazy_day_keys),
@@ -365,7 +352,6 @@ impl Ks {
             config,
             unlock_verifier,
             unlock_key: Mutex::new(None),
-            metadata_cursor: Mutex::new(raft::execution::Cursor::default()),
             gc_stop: AtomicBool::new(true),
             gc_thread: Mutex::new(None),
             common: raft::runtime::Runtime::new(runtime, node, options),
@@ -375,7 +361,7 @@ impl Ks {
             host.refresh_application(node)?;
             Ok(node.state().commit)
         })?;
-        while ks.global_lock.read().registrations.applied < commit {
+        while ks.common.metadata_applied() < commit {
             ks.execute_pending()?;
         }
         if test_mode {
@@ -397,13 +383,17 @@ impl Ks {
             ))
         })?;
         // Decryption and application locking happen outside the consensus loop.
-        let history =
-            if apply { runtime::decode_history(&state, &key)? } else { KeyHistory::default() };
+        let (history, applied) =
+            if apply { runtime::decode_history(&state, &key)? } else { (KeyHistory::default(), 0) };
         *self.unlock_key.lock().map_err(|_| common::Error::new("unlock lock poisoned"))? =
             Some(key);
         self.global_lock.write().keys = history;
         *self.execution.lock().map_err(|_| common::Error::new("execution cursor poisoned"))? =
-            raft::execution::Cursor::default();
+            raft::execution::Cursor::new(state.generation, applied);
+        self.common.publish_applied(applied);
+        if apply {
+            self.application_generation.store(state.generation, Ordering::SeqCst);
+        }
         self.ready.store(true, Ordering::SeqCst);
         // Only a leader establishes the first key, and never over an uncommitted proposal.
         self.on_raft(|host, node| {
@@ -798,7 +788,7 @@ mod persistence_tests {
         exchange(&mut leader, &mut follower);
         follower.journal.snapshot(100).unwrap();
         let follower = raft::tests::restart(&follower);
-        let history = runtime::decode_history(follower.state(), &key).unwrap();
+        let (history, _) = runtime::decode_history(follower.state(), &key).unwrap();
         assert_eq!(history.epochs[0].key, epoch.key);
         let wrong = runtime::decode_history(follower.state(), &[1; 32]);
         assert!(wrong.is_err());

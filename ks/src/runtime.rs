@@ -4,6 +4,7 @@ use common::{Error, Result};
 use raft::runtime::Host;
 pub use raft::runtime::Settings;
 use raft::{Command, Entry, Node, Role, State};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 pub fn needs_request_worker(request: &Req) -> bool {
     request.op() == Op::Register || raft::runtime::needs_request_worker(request)
@@ -12,7 +13,6 @@ pub fn needs_request_worker(request: &Req) -> bool {
 #[derive(Default)]
 pub struct Registrations {
     pub peers: BTreeMap<String, Peer>,
-    pub(super) applied: u64,
 }
 fn registration_action(peer: &Peer) -> raft::Action {
     let arg = peer.request().payload;
@@ -113,17 +113,24 @@ fn apply_action(
         _ => Err(Error::new("unknown KS action tag")),
     }
 }
-pub fn decode_history(state: &State, key: &[u8; 32]) -> Result<KeyHistory> {
+pub fn decode_history(state: &State, key: &[u8; 32]) -> Result<(KeyHistory, u64)> {
     let mut history = KeyHistory::default();
-    apply_history(state, key, &mut history)?;
-    Ok(history)
+    let applied = AtomicU64::new(0);
+    apply_history(state, key, &mut history, &applied)?;
+    Ok((history, applied.load(Ordering::Acquire)))
 }
-fn apply_history(state: &State, key: &[u8; 32], history: &mut KeyHistory) -> Result<()> {
+fn apply_history(
+    state: &State,
+    key: &[u8; 32],
+    history: &mut KeyHistory,
+    applied: &AtomicU64,
+) -> Result<()> {
     let global = parking_lot::RwLock::new(std::mem::take(history));
     let progress = Mutex::new(raft::execution::Cursor::default());
     let result = raft::execution::execute(
         &global,
         &progress,
+        applied,
         state,
         Duration::MAX,
         |history, ctx, action| apply_action(history, key, ctx, action),
@@ -149,7 +156,7 @@ impl Ks {
                     && host.metadata_generation.load(Ordering::SeqCst) == node.state().generation)
                     .then_some(node.state().commit))
             })?;
-            if commit.is_some_and(|index| self.global_lock.read().registrations.applied >= index) {
+            if commit.is_some_and(|index| self.metadata_applied() >= index) {
                 break;
             }
             if !self.execution_started.load(Ordering::SeqCst) {
@@ -162,10 +169,7 @@ impl Ks {
         }
         let (identical, applied) = {
             let state = self.global_lock.read();
-            (
-                state.registrations.peers.get(&peer.identity) == Some(&peer),
-                state.registrations.applied,
-            )
+            (state.registrations.peers.get(&peer.identity) == Some(&peer), self.metadata_applied())
         };
         if identical
             && self.on_raft(move |_, node| {
@@ -192,7 +196,7 @@ impl Ks {
                 }
                 host.refresh_application(node)
             })?;
-            if self.global_lock.read().registrations.applied >= index {
+            if self.metadata_applied() >= index {
                 break;
             }
             if !self.execution_started.load(Ordering::SeqCst) {
@@ -244,7 +248,7 @@ impl Ks {
                 .lock()
                 .map_err(|_| Error::new("unlock lock poisoned"))?
                 .ok_or_else(|| Error::new("KS is locked"))?;
-            let history = decode_history(node.state(), &key)?;
+            let (history, _) = decode_history(node.state(), &key)?;
             if history.epochs.last().is_some_and(|last| last.since >= epoch.since) {
                 return Err(Error::new(
                     "new key activation must be later than the last recorded activation",
@@ -267,35 +271,37 @@ impl Ks {
 }
 impl Host for Ks {
     type Application = KsState;
+    type Done = ();
     fn has_metadata(&self) -> bool {
         true
     }
-    fn apply_metadata(&self, state: &raft::execution::Work) -> Result<bool> {
-        raft::execution::execute_state(
-            &self.global_lock,
-            &self.metadata_cursor,
-            state,
-            Duration::from_millis(self.config.raft.execution_lock_ms),
-            true,
-            |state| state.registrations.applied,
-            |state, index| state.registrations.applied = index,
-            |state| state.registrations = Registrations::default(),
-            |state, context, action| apply_registration(&mut state.registrations, context, action),
-        )
+    fn apply_metadata(
+        &self,
+        state: &mut KsState,
+        context: raft::execution::Context<'_>,
+        action: &raft::Action,
+    ) -> Result<()> {
+        apply_registration(&mut state.registrations, context, action)
     }
-    fn apply_client(&self, state: &raft::execution::Work) -> Result<raft::execution::Progress> {
+    fn metadata_action(&self, action: &raft::Action) -> bool {
+        action.op == Op::Register
+    }
+    fn reset_metadata(&self, state: &mut KsState) {
+        state.registrations = Registrations::default();
+    }
+    fn apply_client(
+        &self,
+        state: &mut KsState,
+        context: raft::execution::Context<'_>,
+        action: &raft::Action,
+        _done: &mut Vec<Self::Done>,
+    ) -> Result<()> {
         let key = self
             .unlock_key
             .lock()
             .map_err(|_| Error::new("unlock lock poisoned"))?
             .ok_or_else(|| Error::new("KS locked"))?;
-        raft::execution::exec_progress(
-            &self.global_lock,
-            &self.execution,
-            state,
-            Duration::from_millis(self.config.raft.execution_lock_ms),
-            |state, ctx, action| apply_state(state, &key, ctx, action),
-        )
+        apply_state(state, &key, context, action)
     }
     fn checkpoint_actions(&self, state: &State, _history: &KsState) -> Result<Vec<Entry>> {
         Ok(state.capture().application)
@@ -350,22 +356,23 @@ mod tests {
             ring_identity: Some(common::ring::RingIdentity::try_from("01".repeat(64)).unwrap()),
         }
     }
-    fn routes(state: &State) -> KsState {
+    fn routes(state: &State) -> (KsState, u64) {
         let global = parking_lot::RwLock::new(KsState::default());
         let cursor = Mutex::new(raft::execution::Cursor::default());
+        let applied = AtomicU64::new(0);
         raft::execution::execute_state(
             &global,
             &cursor,
+            &applied,
             state,
             Duration::MAX,
             true,
-            |state| state.registrations.applied,
-            |state, index| state.registrations.applied = index,
             |state| state.registrations = Registrations::default(),
+            |action| action.op == Op::Register,
             |state, context, action| apply_registration(&mut state.registrations, context, action),
         )
         .unwrap();
-        global.into_inner()
+        (global.into_inner(), applied.load(Ordering::Acquire))
     }
     #[test]
     fn registrations_replay_only_committed_changes_without_unlock_material() {
@@ -385,7 +392,7 @@ mod tests {
             command: Command::Client(vec![registration_action(&peer(9002))]),
         });
         state.commit = 1;
-        let before_commit = routes(&state);
+        let (before_commit, _) = routes(&state);
         let key_present = has_keys(&state);
         assert_eq!(before_commit.registrations.peers["KS0-member1"], peer(9001));
         assert!(!key_present); // A registration must not suppress initial-key creation.
@@ -395,9 +402,9 @@ mod tests {
         state.commit = 2;
         let saved = raft::codec::encode(&state).unwrap();
         let recovered: State = raft::codec::decode(&saved).unwrap();
-        let after_commit = routes(&recovered);
+        let (after_commit, applied) = routes(&recovered);
         assert_eq!(after_commit.registrations.peers["KS0-member1"], peer(9002));
-        assert_eq!(after_commit.registrations.applied, 2);
+        assert_eq!(applied, 2);
         // Routing and key application can replay the same mixed checkpoint independently.
         let key = [55; 32];
         let epoch = MasterEpoch { key: [89; 32], since: TimeSec::new(100) };
@@ -411,8 +418,8 @@ mod tests {
         state.commit = 3;
         let snapshot = state.capture();
         state.apply(&raft::Record::Install(snapshot)).unwrap();
-        let locked = routes(&state);
-        let unlocked = decode_history(&state, &key).unwrap();
+        let (locked, _) = routes(&state);
+        let (unlocked, _) = decode_history(&state, &key).unwrap();
         assert_eq!(locked.registrations.peers["KS0-member1"], peer(9002));
         assert_eq!(unlocked.epochs[0].key, epoch.key);
         assert!(has_keys(&state));
@@ -445,9 +452,9 @@ mod tests {
             command: Command::Client(actions),
         });
         state.commit = 1;
-        let history = decode_history(&state, &key).unwrap();
+        let (history, applied) = decode_history(&state, &key).unwrap();
         assert_eq!(history.epochs.len(), 2);
-        assert_eq!(history.applied, 1);
+        assert_eq!(applied, 1);
         let persisted = raft::codec::encode(&state).unwrap();
         assert!(!persisted.windows(32).any(|bytes| bytes == [201; 32] || bytes == [202; 32]));
     }
@@ -476,7 +483,7 @@ mod tests {
         target.ignore_ring_identity = true;
         target.apply(&raft::Record::Hard { term: 1, vote: None }).unwrap();
         target.apply(&raft::Record::Install(source.capture())).unwrap();
-        let history = decode_history(&target, &key).unwrap();
+        let (history, _) = decode_history(&target, &key).unwrap();
         let wrong_key = decode_history(&target, &[43; 32]).is_err();
         let decoded: State = raft::codec::decode(&raft::codec::encode(&target).unwrap()).unwrap();
         assert_eq!(history.epochs[0].key, epoch.key);
@@ -502,20 +509,22 @@ mod tests {
         }
         state.commit = 2;
         let mut history = KeyHistory::default();
-        apply_history(&state, &key, &mut history).unwrap();
+        let applied = AtomicU64::new(0);
+        apply_history(&state, &key, &mut history, &applied).unwrap();
         let committed_count = history.epochs.len();
         let checkpoint = state.capture();
         state.apply(&raft::Record::Install(checkpoint)).unwrap();
         let mut promoted = KeyHistory::default();
-        apply_history(&state, &key, &mut promoted).unwrap();
+        let promoted_applied = AtomicU64::new(0);
+        apply_history(&state, &key, &mut promoted, &promoted_applied).unwrap();
         let promoted_count = promoted.epochs.len();
         // Already applied ciphertext need not be decrypted again.
         state.snapshot.application[0].command =
             Command::Client(vec![raft::Action::new(Op::KsKey, vec![])]);
         state.commit = 3;
-        apply_history(&state, &key, &mut history).unwrap();
+        apply_history(&state, &key, &mut history, &applied).unwrap();
         let final_count = history.epochs.len();
-        let final_index = history.applied;
+        let final_index = applied.load(Ordering::Acquire);
         assert_eq!(committed_count, 2);
         assert_eq!(promoted_count, 2);
         assert_eq!(final_count, 3);

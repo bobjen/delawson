@@ -4,6 +4,7 @@ use common::{Error, Result};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// A detached, immutable view of committed work. No consensus lock is retained.
@@ -56,8 +57,6 @@ impl Committed for Work {
     }
 }
 pub trait Application: Send + Sync {
-    fn applied(&self) -> u64;
-    fn set_applied(&mut self, index: u64);
     /// Reset application state before rebuilding it from the committed history.
     fn reset(&mut self);
     /// Reclaim application-owned state while the global lock is still exclusive.
@@ -74,6 +73,12 @@ pub struct Cursor {
     restoring: Option<u64>,
     entry: u64,
     action: usize,
+    applied: u64,
+}
+impl Cursor {
+    pub fn new(generation: u64, applied: u64) -> Self {
+        Self { generation, applied, ..Self::default() }
+    }
 }
 #[derive(Clone, Copy)]
 pub struct Context<'a> {
@@ -88,6 +93,7 @@ pub struct Context<'a> {
 pub fn execute<S: Application>(
     global: &RwLock<S>,
     progress: &Mutex<Cursor>,
+    applied: &AtomicU64,
     state: &impl Committed,
     budget: Duration,
     apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
@@ -95,12 +101,12 @@ pub fn execute<S: Application>(
     execute_state(
         global,
         progress,
+        applied,
         state,
         budget,
         false,
-        |data| data.applied(),
-        |data, index| data.set_applied(index),
         |data| data.reset(),
+        |_| true,
         apply,
     )
 }
@@ -108,63 +114,70 @@ pub fn execute<S: Application>(
 pub fn execute_blocking<S: Application>(
     global: &RwLock<S>,
     progress: &Mutex<Cursor>,
+    applied: &AtomicU64,
     state: &impl Committed,
     budget: Duration,
     apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
 ) -> Result<bool> {
-    exec_progress(global, progress, state, budget, apply).map(|progress| progress.complete)
+    exec_progress(global, progress, applied, state, budget, apply).map(|progress| progress.complete)
 }
 pub fn exec_progress<S: Application>(
     global: &RwLock<S>,
     progress: &Mutex<Cursor>,
+    applied: &AtomicU64,
     state: &impl Committed,
     budget: Duration,
     apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
 ) -> Result<Progress> {
-    exec_report(global, progress, state, budget, apply, |_| ()).map(|(progress, ())| progress)
+    exec_report(global, progress, applied, state, budget, apply, |_| ())
+        .map(|(progress, ())| progress)
 }
 pub fn exec_report<S: Application, T>(
     global: &RwLock<S>,
     progress: &Mutex<Cursor>,
+    applied: &AtomicU64,
     state: &impl Committed,
     budget: Duration,
     apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
     finish: impl FnOnce(&S) -> T,
-) -> Result<(Progress, T)> {
+) -> Result<(Progress, T)>
+where
+    T: Default,
+{
     execute_with_lock(
         global,
         progress,
+        applied,
         state,
         budget,
         true,
-        |data| data.applied(),
-        |data, index| data.set_applied(index),
         |data| data.reset(),
+        |_| true,
         apply,
         finish,
     )
-    .map(|(progress, result)| (progress, result.expect("blocking apply holds the write lock")))
+    .map(|(progress, result)| (progress, result.unwrap_or_default()))
 }
 pub fn execute_state<S: Application>(
     global: &RwLock<S>,
     progress: &Mutex<Cursor>,
+    applied: &AtomicU64,
     state: &impl Committed,
     budget: Duration,
     blocking: bool,
-    applied: impl Fn(&S) -> u64,
-    set_applied: impl Fn(&mut S, u64),
     reset: impl Fn(&mut S),
+    has_action: impl Fn(&Action) -> bool,
     apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
 ) -> Result<bool> {
     execute_with_lock(
         global,
         progress,
+        applied,
         state,
         budget,
         blocking,
-        applied,
-        set_applied,
         reset,
+        has_action,
         apply,
         |_| (),
     )
@@ -173,38 +186,58 @@ pub fn execute_state<S: Application>(
 fn execute_with_lock<S: Application, T>(
     global: &RwLock<S>,
     progress: &Mutex<Cursor>,
+    applied_index: &AtomicU64,
     state: &impl Committed,
     budget: Duration,
     blocking: bool,
-    applied: impl Fn(&S) -> u64,
-    set_applied: impl Fn(&mut S, u64),
     reset: impl Fn(&mut S),
+    has_action: impl Fn(&Action) -> bool,
     mut apply: impl FnMut(&mut S, Context<'_>, &Action) -> Result<()>,
     finish: impl FnOnce(&S) -> T,
 ) -> Result<(Progress, Option<T>)> {
     let mut cursor = progress.lock().map_err(|_| Error::new("execution cursor poisoned"))?;
+    let published = applied_index.load(Ordering::Acquire);
+    if cursor.generation == state.generation() {
+        cursor.applied = cursor.applied.max(published);
+        if cursor.restoring.is_none()
+            && cursor.applied >= state.snapshot().index
+            && !state.entries().iter().any(|entry| {
+                entry.index > cursor.applied
+                    && entry.index <= state.commit()
+                    && matches!(
+                        &entry.command,
+                        Command::Client(actions) if actions.iter().any(&has_action)
+                    )
+            })
+        {
+            cursor.applied = state.commit();
+            applied_index.store(cursor.applied, Ordering::Release);
+            return Ok((Progress { applied: cursor.applied, complete: true }, None));
+        }
+    }
     let mut data = if blocking {
         global.write()
     } else if let Some(data) = global.try_write() {
         data
     } else {
-        return Ok((Progress { applied: 0, complete: false }, None));
+        return Ok((Progress { applied: cursor.applied, complete: false }, None));
     };
     let result = (|| -> Result<bool> {
         if cursor.generation != state.generation() {
             reset(&mut *data);
             *cursor = Cursor { generation: state.generation(), ..Cursor::default() };
         }
-        if applied(&data) == state.commit() && cursor.restoring.is_none() {
+        if cursor.applied == state.commit() && cursor.restoring.is_none() {
             return Ok(true);
         }
-        if applied(&data) < state.snapshot().index
+        if cursor.applied < state.snapshot().index
             && cursor.restoring != Some(state.snapshot().index)
         {
             reset(&mut *data);
             cursor.restoring = Some(state.snapshot().index);
             cursor.entry = 0;
             cursor.action = 0;
+            cursor.applied = 0;
         }
         let began = Instant::now();
         let mut run = |entry: &Entry,
@@ -236,7 +269,7 @@ fn execute_with_lock<S: Application, T>(
                 Command::Noop | Command::Members(_) | Command::CheckpointStart(_) => {}
             }
             if !restoring {
-                set_applied(data, entry.index);
+                cursor.applied = entry.index;
                 common::logn!("Raft entry applied", "index {},term {}", entry.index, entry.term);
             }
             Ok(true)
@@ -247,22 +280,24 @@ fn execute_with_lock<S: Application, T>(
                     return Ok(false);
                 }
             }
-            set_applied(&mut *data, state.snapshot().index);
+            cursor.applied = state.snapshot().index;
             cursor.restoring = None;
             cursor.entry = 0;
             cursor.action = 0;
         }
         for entry in state.entries().iter().filter(|entry| entry.index <= state.commit()) {
-            if entry.index > applied(&data) && !run(entry, false, &mut *data, &mut cursor)? {
+            if entry.index > cursor.applied && !run(entry, false, &mut *data, &mut cursor)? {
                 return Ok(false);
             }
         }
-        set_applied(&mut *data, state.commit());
+        cursor.applied = state.commit();
         Ok(true)
     })();
-    let applied_now = applied(&data);
+    let applied_now = cursor.applied;
     (&mut *data).reclaim();
     let report = if result.is_ok() { Some(finish(&data)) } else { None };
+    applied_index.store(applied_now, Ordering::Release);
+    drop(data);
     result.map(|complete| (Progress { applied: applied_now, complete }, report))
 }
 
@@ -272,16 +307,9 @@ mod tests {
     use common::Op;
     #[derive(Default)]
     struct Values {
-        applied: u64,
         values: Vec<u8>,
     }
     impl Application for Values {
-        fn applied(&self) -> u64 {
-            self.applied
-        }
-        fn set_applied(&mut self, index: u64) {
-            self.applied = index;
-        }
         fn reset(&mut self) {
             *self = Self::default();
         }
@@ -315,16 +343,33 @@ mod tests {
     fn new_history_generation_resets_applied_state_even_when_commit_regresses() {
         let global = RwLock::new(Values::default());
         let cursor = Mutex::new(Cursor::default());
+        let applied = AtomicU64::new(0);
         let mut old = state();
         old.commit = 2;
-        execute_blocking(&global, &cursor, &old, Duration::MAX, apply).unwrap();
+        execute_blocking(&global, &cursor, &applied, &old, Duration::MAX, apply).unwrap();
         let mut replacement = state();
         replacement.generation = 1;
         replacement.log[0].command = Command::Client(vec![Action::new(Op::BytesResp, vec![9])]);
-        execute_blocking(&global, &cursor, &replacement, Duration::MAX, apply).unwrap();
+        execute_blocking(&global, &cursor, &applied, &replacement, Duration::MAX, apply).unwrap();
         let data = global.read();
-        assert_eq!(data.applied, 1);
+        assert_eq!(applied.load(Ordering::Acquire), 1);
         assert_eq!(data.values, vec![9]);
+    }
+    #[test]
+    fn no_action_commit_advances_without_the_global_lock() {
+        let mut committed = state();
+        committed.log[0].command = Command::Noop;
+        committed.log.truncate(1);
+        committed.commit = 1;
+
+        let global = RwLock::new(Values::default());
+        let cursor = Mutex::new(Cursor::default());
+        let applied = AtomicU64::new(0);
+        let _guard = global.write();
+
+        assert!(execute(&global, &cursor, &applied, &committed, Duration::ZERO, apply).unwrap());
+        assert_eq!(applied.load(Ordering::Acquire), 1);
+        assert_eq!(cursor.lock().unwrap().applied, 1);
     }
     #[test]
     fn blocked_client_action_does_not_block_heartbeat_or_commit() {
@@ -340,15 +385,23 @@ mod tests {
         let application = std::thread::spawn(move || {
             let global = RwLock::new(Values::default());
             let progress = Mutex::new(Cursor::default());
+            let applied = AtomicU64::new(0);
             let mut first = true;
-            execute_blocking(&global, &progress, &state(), Duration::MAX, |data, ctx, action| {
-                if first {
-                    first = false;
-                    entered.send(()).unwrap();
-                    released.recv().unwrap();
-                }
-                apply(data, ctx, action)
-            })
+            execute_blocking(
+                &global,
+                &progress,
+                &applied,
+                &state(),
+                Duration::MAX,
+                |data, ctx, action| {
+                    if first {
+                        first = false;
+                        entered.send(()).unwrap();
+                        released.recv().unwrap();
+                    }
+                    apply(data, ctx, action)
+                },
+            )
             .unwrap()
         });
         entering.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -402,19 +455,22 @@ mod tests {
         let state = state();
         let global = RwLock::new(Values::default());
         let cursor = Mutex::new(Cursor::default());
+        let applied = AtomicU64::new(0);
         for expected in 1..=3 {
-            let finished = execute(&global, &cursor, &state, Duration::ZERO, apply).unwrap();
+            let finished =
+                execute(&global, &cursor, &applied, &state, Duration::ZERO, apply).unwrap();
             assert!(!finished);
             let checkpoint_read = global.read();
             assert_eq!(checkpoint_read.values.len(), expected);
-            let blocked = execute(&global, &cursor, &state, Duration::MAX, apply).unwrap();
+            let blocked =
+                execute(&global, &cursor, &applied, &state, Duration::MAX, apply).unwrap();
             assert!(!blocked);
         }
-        let finished = execute(&global, &cursor, &state, Duration::MAX, apply).unwrap();
+        let finished = execute(&global, &cursor, &applied, &state, Duration::MAX, apply).unwrap();
         let data = global.read();
         assert!(finished);
         assert_eq!(data.values, vec![1, 2, 3]);
-        assert_eq!(data.applied, 1);
+        assert_eq!(applied.load(Ordering::Acquire), 1);
     }
     #[test]
     fn snapshot_restore_resumes_between_actions() {
@@ -422,11 +478,13 @@ mod tests {
         state.apply(&crate::Record::Install(state.capture())).unwrap();
         let global = RwLock::new(Values::default());
         let cursor = Mutex::new(Cursor::default());
+        let applied = AtomicU64::new(0);
         for _ in 0..3 {
-            let finished = execute(&global, &cursor, &state, Duration::ZERO, apply).unwrap();
+            let finished =
+                execute(&global, &cursor, &applied, &state, Duration::ZERO, apply).unwrap();
             assert!(!finished);
         }
-        let finished = execute(&global, &cursor, &state, Duration::MAX, apply).unwrap();
+        let finished = execute(&global, &cursor, &applied, &state, Duration::MAX, apply).unwrap();
         assert!(finished);
         assert_eq!(global.read().values, vec![1, 2, 3]);
     }
@@ -435,14 +493,16 @@ mod tests {
         let state = state();
         let global = RwLock::new(Values::default());
         let cursor = Mutex::new(Cursor::default());
-        let failed = execute(&global, &cursor, &state, Duration::MAX, |data, ctx, action| {
-            if action.fields == [2] {
-                return Err(Error::new("client failure"));
-            }
-            apply(data, ctx, action)
-        });
+        let applied = AtomicU64::new(0);
+        let failed =
+            execute(&global, &cursor, &applied, &state, Duration::MAX, |data, ctx, action| {
+                if action.fields == [2] {
+                    return Err(Error::new("client failure"));
+                }
+                apply(data, ctx, action)
+            });
         assert!(failed.is_err());
-        let finished = execute(&global, &cursor, &state, Duration::MAX, apply).unwrap();
+        let finished = execute(&global, &cursor, &applied, &state, Duration::MAX, apply).unwrap();
         assert!(finished);
         assert_eq!(global.read().values, vec![1, 2, 3]);
     }
