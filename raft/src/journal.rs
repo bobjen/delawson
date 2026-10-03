@@ -151,6 +151,12 @@ struct Checkpoint {
     state: State,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct CheckpointMark {
+    sequence: u64,
+    log_bytes: u64,
+}
+
 impl Checkpoint {
     fn bytes(&self) -> Result<Vec<u8>> {
         let mut bytes = encode(self)?;
@@ -863,9 +869,86 @@ impl Journal {
         if self.change_sequence <= self.snapshot_sequence {
             return Ok(None);
         }
-        self.prepare_copy(now, self.state.capture())
+        let mut state = self.state.clone();
+        let snapshot = state.capture();
+        let mark = self.begin_checkpoint(&state, &snapshot)?;
+        state.snapshot = snapshot;
+        state.log.retain(|entry| entry.index > state.snapshot.index);
+        self.prepare_checkpoint(now, state, mark)
     }
-    /// Adopt committed application state without importing another member's hard state.
+    /// Mark a state capture and carry its log suffix into the next journal segment.
+    pub fn begin_checkpoint(
+        &mut self,
+        state: &State,
+        snapshot: &Snapshot,
+    ) -> Result<CheckpointMark> {
+        if self.failed {
+            return Err(Error::new(format!("{} journal fenced", self.identity.process)));
+        }
+        let mark = CheckpointMark { sequence: self.sequence, log_bytes: self.log_bytes };
+        let start =
+            self.sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
+        snapshot.validate()?;
+        if snapshot.index > state.commit
+            || state.history_at(snapshot.index) != Some((snapshot.term, snapshot.scn))
+        {
+            return Err(Error::new("checkpoint does not match captured Raft history"));
+        }
+        let suffix: Vec<_> =
+            state.log.iter().filter(|entry| entry.index > snapshot.index).cloned().collect();
+        let carried = if suffix.is_empty() {
+            vec![]
+        } else {
+            frame(&Batch {
+                sequence: start,
+                records: vec![Record::Carry { entries: suffix, commit: state.commit }],
+            })?
+        };
+        self.rotate(start, &carried)?;
+        if !carried.is_empty() {
+            self.sequence = start;
+            self.log_bytes += carried.len() as u64;
+        }
+        Ok(mark)
+    }
+    /// Write captured Raft state; its log suffix lives in the journal after the checkpoint.
+    pub fn prepare_checkpoint(
+        &mut self,
+        now: u64,
+        mut state: State,
+        mark: CheckpointMark,
+    ) -> Result<Option<PendingSnapshot>> {
+        if self.failed {
+            return Err(Error::new(format!("{} journal fenced", self.identity.process)));
+        }
+        if mark.sequence <= self.snapshot_sequence {
+            return Ok(None);
+        }
+        if mark.sequence > self.sequence {
+            return Err(Error::new("checkpoint is ahead of journal"));
+        }
+        if state.ignore_ring_identity {
+            state.ring.clone_from(&self.identity.ring);
+            state.snapshot.ring.clone_from(&self.identity.ring);
+        }
+        state.log.clear();
+        state.commit = state.snapshot.index;
+        state.ignore_ring_identity = false;
+        state.validate()?;
+        let snapshot = state.snapshot.clone();
+        let checkpoint = Checkpoint { sequence: mark.sequence, second: now, state };
+        Ok(Some(PendingSnapshot {
+            path: named(&self.directory, "snapshot", mark.sequence),
+            checkpoint,
+            written_bytes: std::sync::atomic::AtomicU64::new(0),
+            sequence: mark.sequence,
+            second: now,
+            snapshot,
+            log_bytes: mark.log_bytes,
+        }))
+    }
+    /// Create this member's disk checkpoint from a peer's application snapshot.
+    /// The peer sends no Raft state; local term, vote and log suffix stay local.
     pub fn prepare_copy(
         &mut self,
         now: u64,
@@ -883,42 +966,9 @@ impl Journal {
             return Err(Error::new("checkpoint does not match local committed history"));
         }
         let mut state = self.state.clone();
-        state.log.retain(|e| e.index > snapshot.index);
-        state.commit = snapshot.index;
-        if self.state.ignore_ring_identity {
-            state.ring = snapshot.ring.clone();
-        }
-        state.snapshot = snapshot;
-        let sequence = self.sequence;
-        let captured_bytes = self.log_bytes;
-        let suffix: Vec<_> = std::mem::take(&mut state.log).iter().cloned().collect();
-        let checkpoint = Checkpoint { sequence, second: now, state: state.clone() };
-        let start =
-            self.sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
-        let carried = if suffix.is_empty() {
-            vec![]
-        } else {
-            frame(&Batch {
-                sequence: start,
-                records: vec![Record::Carry { entries: suffix, commit: self.state.commit }],
-            })?
-        };
-        // Rotation precedes snapshot publication. Old snapshots remain recoverable
-        // through the closed journals and current.log, including its carried suffix.
-        self.rotate(start, &carried)?;
-        if !carried.is_empty() {
-            self.sequence = start;
-            self.log_bytes += carried.len() as u64;
-        }
-        Ok(Some(PendingSnapshot {
-            path: named(&self.directory, "snapshot", sequence),
-            checkpoint,
-            written_bytes: std::sync::atomic::AtomicU64::new(0),
-            sequence,
-            second: now,
-            snapshot: state.snapshot,
-            log_bytes: captured_bytes,
-        }))
+        state.snapshot = snapshot.clone();
+        let mark = self.begin_checkpoint(&state, &snapshot)?;
+        self.prepare_checkpoint(now, state, mark)
     }
     /// Close the old segment before creating its successor. A crash in the gap
     /// deliberately leaves current.log missing, detecting possible voting-state loss.
@@ -1138,6 +1188,10 @@ fn read_checkpoint(
     }
     if checkpoint.sequence != sequence || (!ignore && checkpoint.state.ring != ring) {
         return Err(Error::new("snapshot ring or sequence identity mismatch"));
+    }
+    if ignore {
+        checkpoint.state.ring = ring.to_owned();
+        checkpoint.state.snapshot.ring = ring.to_owned();
     }
     checkpoint.state.ignore_ring_identity = ignore;
     checkpoint.state.check_ring(&checkpoint.state.snapshot)?;
@@ -1699,7 +1753,7 @@ mod tests {
     fn journal_replays_lazy_actions_from_the_shared_entry_buffer() {
         let dir = tempfile::tempdir().unwrap();
         let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
-        journal.write(&[Record::Hard { term: 1, vote: None }]).unwrap();
+        journal.write(&[Record::Hard { term: 1, vote: None, vote_scn: None }]).unwrap();
         journal
             .write(&[
                 Record::Entries {
@@ -1752,7 +1806,7 @@ mod tests {
             .unwrap();
         journal
             .write(&[
-                Record::Hard { term: 1, vote: Some(0) },
+                Record::Hard { term: 1, vote: Some(0), vote_scn: Some(common::scn::Scn::new(0)) },
                 Record::Entries {
                     from: 1,
                     entries: vec![Entry {
@@ -1812,7 +1866,7 @@ mod tests {
         journal.write(&[Record::Bootstrap(membership)]).unwrap();
         journal
             .write(&[
-                Record::Hard { term: 2, vote: Some(0) },
+                Record::Hard { term: 2, vote: Some(0), vote_scn: Some(common::scn::Scn::new(0)) },
                 Record::Entries {
                     from: 1,
                     entries: (1..=3)
@@ -1891,7 +1945,13 @@ mod tests {
         for length in [1, 7, 16, 32, 63, 64] {
             let dir = tempfile::tempdir().unwrap();
             let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
-            journal.write(&[Record::Hard { term: 1, vote: Some(0) }]).unwrap();
+            journal
+                .write(&[Record::Hard {
+                    term: 1,
+                    vote: Some(0),
+                    vote_scn: Some(common::scn::Scn::new(0)),
+                }])
+                .unwrap();
             let identity = journal.identity.current.clone();
             let path = dir.path().join(CURRENT);
             let size = std::fs::metadata(&path).unwrap().len();
@@ -1937,7 +1997,11 @@ mod tests {
         for index in 1..=3 {
             journal
                 .write(&[
-                    Record::Hard { term: index, vote: Some(0) },
+                    Record::Hard {
+                        term: index,
+                        vote: Some(0),
+                        vote_scn: Some(common::scn::Scn::new(0)),
+                    },
                     Record::Entries {
                         from: index,
                         entries: vec![Entry {
@@ -1977,7 +2041,10 @@ mod tests {
         replacement.index = 5;
         replacement.term = 9;
         journal
-            .write(&[Record::Hard { term: 9, vote: None }, Record::Install(replacement)])
+            .write(&[
+                Record::Hard { term: 9, vote: None, vote_scn: None },
+                Record::Install(replacement),
+            ])
             .unwrap();
         assert_eq!(journal.committed_term(1).unwrap(), None);
         // Losing all retained bases makes proof unavailable, not an assumed match.
@@ -2029,7 +2096,13 @@ mod tests {
     #[test]
     fn copied_journal_is_bounded_contiguous_and_ring_checked() {
         let mut state = initial();
-        state.apply(&Record::Hard { term: 2, vote: Some(0) }).unwrap();
+        state
+            .apply(&Record::Hard {
+                term: 2,
+                vote: Some(0),
+                vote_scn: Some(common::scn::Scn::new(0)),
+            })
+            .unwrap();
         let good = CommittedJournal {
             ring: state.ring.clone(),
             after: 0,
@@ -2058,7 +2131,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         let identity = journal.identity.current.clone();
-        journal.write(&[Record::Hard { term: 1, vote: Some(0) }]).unwrap();
+        journal
+            .write(&[Record::Hard {
+                term: 1,
+                vote: Some(0),
+                vote_scn: Some(common::scn::Scn::new(0)),
+            }])
+            .unwrap();
         journal.snapshot(10).unwrap();
         let path = numbered(dir.path(), "snapshot").unwrap().last().unwrap().1.clone();
         drop(journal);
@@ -2090,7 +2169,7 @@ mod tests {
         let mut journal = Journal::open(source.path(), initial(), 3, "member-0").unwrap();
         journal
             .write(&[
-                Record::Hard { term: 2, vote: Some(0) },
+                Record::Hard { term: 2, vote: Some(0), vote_scn: Some(common::scn::Scn::new(0)) },
                 Record::Entries {
                     from: 1,
                     entries: (1..=3)
@@ -2110,7 +2189,12 @@ mod tests {
         let copied = journal.committed_suffix(0, 3).unwrap().unwrap();
         assert_eq!(copied.entries.len(), 2);
         let mut dest = Journal::open(target.path(), initial(), 3, "member-0").unwrap();
-        dest.write(&[Record::Hard { term: 3, vote: Some(1) }]).unwrap();
+        dest.write(&[Record::Hard {
+            term: 3,
+            vote: Some(1),
+            vote_scn: Some(common::scn::Scn::new(0)),
+        }])
+        .unwrap();
         dest.import_committed(&copied, 2).unwrap();
         assert_eq!(dest.state.vote, Some(1));
         assert_eq!(dest.state.term, 3);
@@ -2166,7 +2250,13 @@ mod tests {
         provision_test_founder(dir.path(), &initial().ring, "member-0", old.clone()).unwrap();
         let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         for term in 1..=3 {
-            journal.write(&[Record::Hard { term, vote: Some(0) }]).unwrap();
+            journal
+                .write(&[Record::Hard {
+                    term,
+                    vote: Some(0),
+                    vote_scn: Some(common::scn::Scn::new(0)),
+                }])
+                .unwrap();
         }
         drop(journal);
         let path = dir.path().join(CURRENT);
@@ -2216,7 +2306,13 @@ mod tests {
         let old = crate::raft::tests::names()[&0].identity.clone();
         provision_test_founder(dir.path(), &initial().ring, "member-0", old.clone()).unwrap();
         let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
-        journal.write(&[Record::Hard { term: 2, vote: Some(0) }]).unwrap();
+        journal
+            .write(&[Record::Hard {
+                term: 2,
+                vote: Some(0),
+                vote_scn: Some(common::scn::Scn::new(0)),
+            }])
+            .unwrap();
         let mut local = journal.identity.clone();
         drop(journal);
         let new = common::ring::MemberIdentity::generate().unwrap();
@@ -2258,7 +2354,13 @@ mod tests {
     fn rotation_preserves_old_bytes_and_recovers_empty_current_start() {
         let dir = tempfile::tempdir().unwrap();
         let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
-        journal.write(&[Record::Hard { term: 1, vote: Some(0) }]).unwrap();
+        journal
+            .write(&[Record::Hard {
+                term: 1,
+                vote: Some(0),
+                vote_scn: Some(common::scn::Scn::new(0)),
+            }])
+            .unwrap();
         let old = std::fs::read(dir.path().join(CURRENT)).unwrap();
         let pending = journal.prepare_snapshot(10).unwrap().unwrap();
         let closed = std::fs::read(named(dir.path(), "journal", 1)).unwrap();
@@ -2274,7 +2376,13 @@ mod tests {
         drop(journal);
         let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(journal.current_start, 2);
-        journal.write(&[Record::Hard { term: 2, vote: Some(0) }]).unwrap();
+        journal
+            .write(&[Record::Hard {
+                term: 2,
+                vote: Some(0),
+                vote_scn: Some(common::scn::Scn::new(0)),
+            }])
+            .unwrap();
         journal.snapshot(12).unwrap();
         let second_closed = named(dir.path(), "journal", 2).is_file();
         drop(journal);
@@ -2290,9 +2398,21 @@ mod tests {
         for rename in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
-            journal.write(&[Record::Hard { term: 1, vote: Some(0) }]).unwrap();
+            journal
+                .write(&[Record::Hard {
+                    term: 1,
+                    vote: Some(0),
+                    vote_scn: Some(common::scn::Scn::new(0)),
+                }])
+                .unwrap();
             journal.snapshot(10).unwrap();
-            journal.write(&[Record::Hard { term: 2, vote: Some(0) }]).unwrap();
+            journal
+                .write(&[Record::Hard {
+                    term: 2,
+                    vote: Some(0),
+                    vote_scn: Some(common::scn::Scn::new(0)),
+                }])
+                .unwrap();
             let start = journal.current_start;
             drop(journal);
             if rename {
@@ -2362,6 +2482,104 @@ mod tests {
             .unwrap()
     }
     #[test]
+    fn checkpoint_serializes_captured_state_and_replays_later_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
+        journal
+            .write(&[
+                Record::Hard { term: 2, vote: Some(0), vote_scn: Some(Scn::new(100)) },
+                Record::Entries {
+                    from: 1,
+                    entries: (1..=2)
+                        .map(|index| Entry {
+                            scn: Scn::new(index),
+                            index,
+                            term: 2,
+                            command: Command::Noop,
+                            entry_buf: None,
+                        })
+                        .collect(),
+                },
+                Record::Commit(1),
+            ])
+            .unwrap();
+
+        let mut captured = journal.state.clone();
+        let snapshot = captured.capture();
+        let mark = journal.begin_checkpoint(&captured, &snapshot).unwrap();
+        journal
+            .write(&[Record::Hard { term: 3, vote: None, vote_scn: None }, Record::Commit(2)])
+            .unwrap();
+
+        captured.snapshot = snapshot;
+        captured.log.retain(|entry| entry.index > captured.snapshot.index);
+        let pending = journal.prepare_checkpoint(100, captured, mark).unwrap().unwrap();
+        assert_eq!(pending.checkpoint.state.term, 2);
+        assert_eq!(pending.checkpoint.state.vote, Some(0));
+        assert_eq!(pending.checkpoint.state.vote_scn, Some(Scn::new(100)));
+        assert_eq!(pending.checkpoint.state.max_scn, Some(Scn::new(100)));
+        assert_eq!(pending.checkpoint.state.snapshot.index, 1);
+        assert_eq!(pending.checkpoint.state.snapshot.term, 2);
+        assert_eq!(pending.checkpoint.state.snapshot.scn, Scn::new(1));
+        assert_eq!(pending.checkpoint.state.commit, 1);
+        assert!(pending.checkpoint.state.log.is_empty());
+
+        pending.write().unwrap();
+        journal.finish_snapshot(&pending).unwrap();
+        drop(journal);
+        let recovered = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
+        assert_eq!(recovered.state.term, 3);
+        assert_eq!(recovered.state.vote, None);
+        assert_eq!(recovered.state.vote_scn, None);
+        assert_eq!(recovered.state.max_scn, Some(Scn::new(100)));
+        assert_eq!(recovered.state.commit, 2);
+        assert_eq!(recovered.state.last(), 2);
+    }
+    #[test]
+    fn checkpoint_read_overrides_only_the_ring_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let ring = initial().ring;
+        let foreign = "02".repeat(64);
+        let mut state = initial();
+        state
+            .apply(&Record::Hard {
+                term: 1,
+                vote: Some(0),
+                vote_scn: Some(common::scn::Scn::new(0)),
+            })
+            .unwrap();
+        state
+            .apply(&Record::Entries {
+                from: 1,
+                entries: vec![Entry {
+                    scn: Scn::new(7),
+                    index: 1,
+                    term: 1,
+                    command: Command::Noop,
+                    entry_buf: None,
+                }],
+            })
+            .unwrap();
+        state.apply(&Record::Commit(1)).unwrap();
+        state.snapshot = state.capture();
+        state.log.clear();
+        state.ring = foreign.clone();
+        state.snapshot.ring = foreign;
+        let path = dir.path().join("snapshot.bin");
+        std::fs::write(&path, Checkpoint { sequence: 7, second: 9, state }.bytes().unwrap())
+            .unwrap();
+
+        let (state, _, _, _) = read_checkpoint(&path, 7, &ring, true).unwrap();
+        assert_eq!(state.ring, ring);
+        assert_eq!(state.snapshot.ring, ring);
+        assert_eq!(state.snapshot.index, 1);
+        assert_eq!(state.snapshot.term, 1);
+        assert_eq!(state.snapshot.scn, Scn::new(7));
+        assert_eq!(state.term, 1);
+        assert_eq!(state.vote, Some(0));
+        assert_eq!(state.commit, 1);
+    }
+    #[test]
     fn journal_header_requires_expected_ring_even_for_empty_journals() {
         let ring = "01".repeat(64);
         let other = "02".repeat(64);
@@ -2379,7 +2597,13 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
             let identity = journal.identity.current.clone();
-            journal.write(&[Record::Hard { term: 1, vote: Some(0) }]).unwrap();
+            journal
+                .write(&[Record::Hard {
+                    term: 1,
+                    vote: Some(0),
+                    vote_scn: Some(common::scn::Scn::new(0)),
+                }])
+                .unwrap();
             journal.snapshot(10).unwrap();
             drop(journal);
             let path = if kind == "journal" {
@@ -2453,7 +2677,13 @@ mod tests {
     #[test]
     fn carried_suffix_replays_with_or_without_checkpoint_without_regressing_hard_state() {
         let mut original = initial();
-        original.apply(&Record::Hard { term: 2, vote: Some(0) }).unwrap();
+        original
+            .apply(&Record::Hard {
+                term: 2,
+                vote: Some(0),
+                vote_scn: Some(common::scn::Scn::new(0)),
+            })
+            .unwrap();
         let entries: Vec<_> = (1..=4)
             .map(|index| Entry {
                 scn: common::scn::Scn::new(index),
@@ -2512,7 +2742,11 @@ mod tests {
                 .collect();
             journal
                 .write(&[
-                    Record::Hard { term: 2, vote: Some(0) },
+                    Record::Hard {
+                        term: 2,
+                        vote: Some(0),
+                        vote_scn: Some(common::scn::Scn::new(0)),
+                    },
                     Record::Entries { from: 1, entries },
                     Record::Commit(1),
                 ])
@@ -2539,7 +2773,7 @@ mod tests {
         let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         journal
             .write(&[
-                Record::Hard { term: 3, vote: Some(0) },
+                Record::Hard { term: 3, vote: Some(0), vote_scn: Some(common::scn::Scn::new(0)) },
                 Record::Entries {
                     from: 1,
                     entries: vec![Entry {
@@ -2568,7 +2802,13 @@ mod tests {
     fn partial_active_tail_is_discarded_but_corrupt_frames_retire_identity() {
         let source = tempfile::tempdir().unwrap();
         let mut journal = Journal::open(source.path(), initial(), 3, "member-0").unwrap();
-        journal.write(&[Record::Hard { term: 1, vote: Some(0) }]).unwrap();
+        journal
+            .write(&[Record::Hard {
+                term: 1,
+                vote: Some(0),
+                vote_scn: Some(common::scn::Scn::new(0)),
+            }])
+            .unwrap();
         drop(journal);
         let frame = std::fs::read(source.path().join(CURRENT)).unwrap();
         for count in HEADER as usize..frame.len() {
@@ -2631,7 +2871,7 @@ mod tests {
         let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         journal
             .write(&[
-                Record::Hard { term: 1, vote: None },
+                Record::Hard { term: 1, vote: None, vote_scn: None },
                 Record::Entries {
                     from: 1,
                     entries: vec![Entry {
@@ -2658,7 +2898,7 @@ mod tests {
     fn snapshot_triggers_use_elapsed_time_and_previous_file_size_with_floor() {
         let dir = tempfile::tempdir().unwrap();
         let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
-        journal.write(&[Record::Hard { term: 1, vote: None }]).unwrap();
+        journal.write(&[Record::Hard { term: 1, vote: None, vote_scn: None }]).unwrap();
         let time_due = journal.snapshot_due(u64::MAX, 1, journal.snapshot_second + 1);
         let not_yet = journal.snapshot_due(u64::MAX, 1, journal.snapshot_second);
         assert!(time_due);
@@ -2674,7 +2914,7 @@ mod tests {
         let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         journal
             .write(&[
-                Record::Hard { term: 1, vote: None },
+                Record::Hard { term: 1, vote: None, vote_scn: None },
                 Record::Entries {
                     from: 1,
                     entries: vec![crate::raft::Entry {
@@ -2709,7 +2949,7 @@ mod tests {
                     }],
                 },
                 Record::Commit(2),
-                Record::Hard { term: 2, vote: None },
+                Record::Hard { term: 2, vote: None, vote_scn: None },
             ])
             .unwrap();
         let term = journal.state.term;
@@ -2729,7 +2969,7 @@ mod tests {
     fn wrong_member_is_rejected_and_corrupt_journal_is_quarantined() {
         let dir = tempfile::tempdir().unwrap();
         let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
-        journal.write(&[Record::Hard { term: 1, vote: None }]).unwrap();
+        journal.write(&[Record::Hard { term: 1, vote: None, vote_scn: None }]).unwrap();
         drop(journal);
         let wrong_member = Journal::open(dir.path(), initial(), 3, "member-1");
         assert!(wrong_member.is_err());

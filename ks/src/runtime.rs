@@ -471,7 +471,7 @@ mod tests {
         let key = [42; 32];
         let mut source =
             State::initial("02".repeat(64), raft::tests::members(1), raft::tests::names()).unwrap();
-        source.apply(&raft::Record::Hard { term: 1, vote: None }).unwrap();
+        source.apply(&raft::Record::Hard { term: 1, vote: None, vote_scn: None }).unwrap();
         let epoch = MasterEpoch { key: [7; 32], since: TimeSec::new(1) };
         let sealed = seal_key(&key, &source.ring, 1, 1, &epoch).unwrap();
         source
@@ -490,7 +490,7 @@ mod tests {
         let mut target =
             State::initial("01".repeat(64), raft::tests::members(1), raft::tests::names()).unwrap();
         target.ignore_ring_identity = true;
-        target.apply(&raft::Record::Hard { term: 1, vote: None }).unwrap();
+        target.apply(&raft::Record::Hard { term: 1, vote: None, vote_scn: None }).unwrap();
         target.apply(&raft::Record::Install(source.capture())).unwrap();
         let (history, _) = decode_history(&target, &key).unwrap();
         let wrong_key = decode_history(&target, &[43; 32]).is_err();

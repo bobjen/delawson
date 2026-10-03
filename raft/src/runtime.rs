@@ -165,7 +165,7 @@ enum TipRead {
 }
 enum CheckpointPlan {
     Request(MemberId),
-    Produce(State),
+    Produce { state: State, snapshot: raft::Snapshot, mark: journal::CheckpointMark },
     Copy { after: u64, primary: Option<(MemberId, u64)>, peers: Vec<(MemberId, bool)> },
 }
 pub struct Runtime<S> {
@@ -1198,7 +1198,10 @@ pub trait Host:
                 }
                 host.cancel_snapshot.store(false, Ordering::SeqCst);
                 host.producing_snapshot.store(true, Ordering::SeqCst);
-                Ok(Some(CheckpointPlan::Produce(node.state().clone())))
+                let state = node.state().clone();
+                let snapshot = state.capture();
+                let mark = node.journal.begin_checkpoint(&state, &snapshot)?;
+                Ok(Some(CheckpointPlan::Produce { state, snapshot, mark }))
             } else {
                 Ok(Some(CheckpointPlan::Copy {
                     after: if node.repairing { u64::MAX } else { node.state().snapshot.index },
@@ -1218,22 +1221,24 @@ pub trait Host:
                 self.send_raft(&peer, Message::CheckpointStart)?;
                 Ok(())
             }
-            Some(CheckpointPlan::Produce(state)) => {
+            Some(CheckpointPlan::Produce { mut state, mut snapshot, mark }) => {
                 logn!("Raft checkpoint started", "index {},term {}", state.commit, state.term);
-                let mut snapshot = state.capture();
+                let checkpoint_index = state.commit;
                 snapshot.application = self.checkpoint_actions(&state, &history)?;
+                state.snapshot = snapshot;
+                state.log.retain(|entry| entry.index > state.snapshot.index);
                 let pending = self.on_raft(move |host, node| {
                     if host.cancel_snapshot.load(Ordering::SeqCst) {
                         return Ok(None);
                     }
-                    node.journal.prepare_copy(now, snapshot)
+                    node.journal.prepare_checkpoint(now, state, mark)
                 })?;
                 if let Some(pending) = pending {
                     pending.write_cancellable(|| self.cancel_snapshot.load(Ordering::SeqCst))?;
                     drop(history);
                     self.on_raft(move |_, node| node.journal.finish_snapshot(&pending))?;
                     self.checkpoint_requested.store(false, Ordering::SeqCst);
-                    logn!("Raft checkpoint completed", "index {}", state.commit);
+                    logn!("Raft checkpoint completed", "index {}", checkpoint_index);
                 }
                 Ok(())
             }
@@ -2665,7 +2670,7 @@ mod tests {
         let applied = Arc::new(AtomicU64::new(0));
         node.set_applied(applied);
         node.set_applying_state(true).unwrap();
-        node.journal.write(&[raft::Record::Hard { term: 1, vote: None }]).unwrap();
+        node.journal.write(&[raft::Record::Hard { term: 1, vote: None, vote_scn: None }]).unwrap();
         let entries: Vec<_> = (1..=5)
             .map(|index| Entry {
                 scn: common::scn::Scn::new(index),

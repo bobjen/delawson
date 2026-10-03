@@ -578,6 +578,8 @@ pub struct State {
     pub retirements: BTreeMap<MemberId, Retirement>,
     pub term: u64,
     pub vote: Option<MemberId>,
+    /// SCN at which this member cast its current vote.
+    pub vote_scn: Option<Scn>,
     pub snapshot: Snapshot,
     pub log: EntryLog,
     pub commit: u64,
@@ -585,6 +587,13 @@ pub struct State {
 impl State {
     pub fn validate(&self) -> Result<()> {
         self.snapshot.validate()?;
+        if self.vote.is_some() != self.vote_scn.is_some() {
+            return Err(Error::new("Raft vote SCN mismatch"));
+        }
+        if self.vote_scn.is_some_and(|scn| self.max_scn.is_none_or(|max| scn.compare(max).is_gt()))
+        {
+            return Err(Error::new("Raft vote SCN exceeds high-water"));
+        }
         if let Some(founders) = &self.founders {
             founders.validate()?;
         } else if self.term != 0 || self.vote.is_some() || self.last() != 0 || self.commit != 0 {
@@ -642,6 +651,7 @@ impl State {
             ignore_ring_identity: false,
             term: 0,
             vote: None,
+            vote_scn: None,
             snapshot: Snapshot {
                 scn: Scn::new(0),
                 ring,
@@ -674,10 +684,10 @@ impl State {
     pub fn largest_scn(&self) -> Option<Scn> {
         let mut maximum = self.max_scn;
         for scn in self
-            .snapshot
-            .application
+            .vote_scn
             .iter()
-            .map(|e| e.scn)
+            .copied()
+            .chain(self.snapshot.application.iter().map(|e| e.scn))
             .chain((self.snapshot.index != 0).then_some(self.snapshot.scn))
             .chain(self.log.iter().map(|e| e.scn))
         {
@@ -836,7 +846,12 @@ impl State {
                 membership: self.snapshot.membership.clone(),
             },
             Record::Bootstrap(_) => StateChange::None,
-            Record::Hard { .. } => StateChange::Hard { term: self.term, vote: self.vote },
+            Record::Hard { .. } => StateChange::Hard {
+                term: self.term,
+                vote: self.vote,
+                vote_scn: self.vote_scn,
+                max_scn: self.max_scn,
+            },
             Record::Entries { from, .. } if *from == self.last().saturating_add(1) => {
                 StateChange::EntryAppend { len: self.log.len(), max_scn: self.max_scn }
             }
@@ -922,14 +937,21 @@ impl State {
                 }
                 self.apply_record(&Record::Commit(self.commit.max(*commit)))?;
             }
-            Record::Hard { term, vote } => {
+            Record::Hard { term, vote, vote_scn } => {
                 if *term < self.term
                     || (*term == self.term && self.vote.is_some() && vote != &self.vote)
                 {
                     return Err(Error::new("Raft term or vote regression"));
                 }
+                if vote.is_some() != vote_scn.is_some() {
+                    return Err(Error::new("Raft vote SCN mismatch"));
+                }
                 self.term = *term;
                 self.vote = vote.clone();
+                self.vote_scn = *vote_scn;
+                if let Some(scn) = vote_scn {
+                    self.observe_scn(*scn);
+                }
             }
             Record::Entries { from, entries } => {
                 if *from <= self.commit
@@ -1009,6 +1031,8 @@ enum StateChange {
     Hard {
         term: u64,
         vote: Option<MemberId>,
+        vote_scn: Option<Scn>,
+        max_scn: Option<Scn>,
     },
     EntryAppend {
         len: usize,
@@ -1050,9 +1074,11 @@ impl StateChange {
                 state.founders = founders;
                 state.snapshot.membership = membership;
             }
-            Self::Hard { term, vote } => {
+            Self::Hard { term, vote, vote_scn, max_scn } => {
                 state.term = term;
                 state.vote = vote;
+                state.vote_scn = vote_scn;
+                state.max_scn = max_scn;
             }
             Self::EntryAppend { len, max_scn } => {
                 state.log.truncate(len);
@@ -1087,7 +1113,7 @@ pub enum Record {
     Retired(Retirement),
     Bootstrap(Membership),
     Carry { entries: Vec<Entry>, commit: u64 },
-    Hard { term: u64, vote: Option<MemberId> },
+    Hard { term: u64, vote: Option<MemberId>, vote_scn: Option<Scn> },
     Entries { from: u64, entries: Vec<Entry> },
     Commit(u64),
     Install(Snapshot),
@@ -1724,7 +1750,7 @@ impl<S: Storage> Node<S> {
             return self.stop_primary();
         }
         if term > self.state().term {
-            self.persist(vec![Record::Hard { term, vote: None }])?;
+            self.persist(vec![Record::Hard { term, vote: None, vote_scn: None }])?;
         }
         self.lease.reset();
         self.role = Role::Follower;
@@ -1753,7 +1779,14 @@ impl<S: Storage> Node<S> {
             .ok_or_else(|| Error::new("campaign deadline overflow"))?;
         let term =
             self.state().term.checked_add(1).ok_or_else(|| Error::new("Raft term overflow"))?;
-        self.persist(vec![Record::Hard { term, vote: Some(self.id.clone()) }])?;
+        let vote_scn = self.next_scn()?.ok_or_else(|| {
+            Error::new("SCN allocation stalled; retry after clock synchronization")
+        })?;
+        self.persist(vec![Record::Hard {
+            term,
+            vote: Some(self.id.clone()),
+            vote_scn: Some(vote_scn),
+        }])?;
         self.lease.reset();
         self.role = Role::Candidate;
         common::logn!(
@@ -2093,11 +2126,18 @@ impl<S: Storage> Node<S> {
                         self.state().term_at(self.state().last()).unwrap_or(0),
                         self.state().last(),
                     );
-                if fresh && self.state().vote.as_ref().is_none_or(|v| v == sender) {
-                    self.persist(vec![Record::Hard {
-                        term: self.state().term,
-                        vote: Some(*sender),
-                    }])?;
+                let current_vote = self.state().vote;
+                if fresh && current_vote.as_ref().is_none_or(|v| v == sender) {
+                    if current_vote.is_none() {
+                        let vote_scn = self.next_scn()?.ok_or_else(|| {
+                            Error::new("SCN allocation stalled; retry after clock synchronization")
+                        })?;
+                        self.persist(vec![Record::Hard {
+                            term: self.state().term,
+                            vote: Some(*sender),
+                            vote_scn: Some(vote_scn),
+                        }])?;
+                    }
                     self.contact = self.contact.wrapping_add(1);
                     answer.success = true;
                 }
@@ -2363,7 +2403,7 @@ pub mod tests {
         let before = state.capture();
         let scn = Scn::new(1);
         let records = [
-            Record::Hard { term: 1, vote: None },
+            Record::Hard { term: 1, vote: None, vote_scn: None },
             Record::Entries {
                 from: 1,
                 entries: vec![Entry {
@@ -2433,7 +2473,7 @@ pub mod tests {
         nodes[1].campaign().unwrap();
         pair(&mut nodes, 1, 2);
         let next = nodes[1].state().log.last().unwrap().scn;
-        assert_eq!(original, Scn::new(1001));
+        assert_eq!(original, Scn::new(1002));
         assert_eq!(copied, original);
         assert!(next.compare(original).is_gt());
     }
@@ -2445,7 +2485,8 @@ pub mod tests {
         let next = member.next_scn().unwrap().unwrap();
         assert!(answer.success);
         assert_eq!(member.state().last(), 0);
-        assert_eq!(next, Scn::new(5001));
+        assert_eq!(member.state().vote_scn, Some(Scn::new(5001)));
+        assert_eq!(next, Scn::new(5002));
     }
     #[test]
     fn matching_term_and_index_with_a_different_scn_is_not_a_matching_prefix() {
@@ -2483,18 +2524,20 @@ pub mod tests {
     }
     #[test]
     fn scn_stall_defers_new_term_entry_without_blocking_heartbeats() {
-        let mut primary = node(0, members(1));
-        primary.scn_stalled = true;
-        primary.campaign().unwrap();
-        let heartbeat = primary.request(&0);
-        let blocked = primary.propose(Command::Noop).is_err();
-        assert_eq!(primary.role, Role::Leader);
-        assert_eq!(primary.state().last(), 0);
+        let mut nodes = cluster(2);
+        nodes[0].campaign().unwrap();
+        nodes[0].scn_stalled = true;
+        pair(&mut nodes, 0, 1);
+        let heartbeat = nodes[0].request(&1);
+        let blocked = nodes[0].propose(Command::Noop).is_err();
+        assert_eq!(nodes[0].role, Role::Leader);
+        assert_eq!(nodes[0].state().last(), 0);
         assert!(matches!(heartbeat, Some(Rpc::Append { .. })));
         assert!(blocked);
-        primary.scn_stalled = false;
-        primary.advance().unwrap();
-        assert_eq!(primary.state().commit, 1);
+        nodes[0].scn_stalled = false;
+        nodes[0].advance().unwrap();
+        pair(&mut nodes, 0, 1);
+        assert_eq!(nodes[0].state().commit, 1);
     }
     #[test]
     fn accepted_local_entries_are_not_quorum_votes_until_journaled() {
@@ -3020,7 +3063,7 @@ pub mod tests {
     #[test]
     fn retired_member_slots_remain_bound_after_snapshot_and_restart() {
         let mut original = State::initial("01".repeat(64), members(3), names()).unwrap();
-        original.apply(&Record::Hard { term: 1, vote: None }).unwrap();
+        original.apply(&Record::Hard { term: 1, vote: None, vote_scn: None }).unwrap();
         let retired = Membership {
             retired: BTreeMap::new(),
             identities: names(),
@@ -3064,11 +3107,16 @@ pub mod tests {
         };
         let rejected = storage.write(&[record]).is_err();
         let old_name = storage.state.membership().identities[&1].clone();
-        let vote = crate::codec::encode(&Record::Hard { term: 2, vote: Some(1) }).unwrap();
+        let vote = crate::codec::encode(&Record::Hard {
+            term: 2,
+            vote: Some(1),
+            vote_scn: Some(common::scn::Scn::new(0)),
+        })
+        .unwrap();
         assert!(rejected);
         assert_eq!(old_name.process, "member-1");
         let decoded: Record = crate::codec::decode(&vote).unwrap();
-        assert!(matches!(decoded, Record::Hard { term: 2, vote: Some(1) }));
+        assert!(matches!(decoded, Record::Hard { term: 2, vote: Some(1), vote_scn: Some(_) }));
     }
     #[test]
     fn foreign_checkpoint_rejected_before_state_or_term_changes() {
@@ -3477,7 +3525,7 @@ pub mod tests {
             term: nodes[0].state().term,
             previous: 1,
             previous_term: 1,
-            previous_scn: common::scn::Scn::new(1),
+            previous_scn: nodes[1].state().scn_at(1).unwrap(),
             entries: vec![],
             commit: last,
         };
@@ -3842,9 +3890,10 @@ impl crate::codec::Wire for Record {
                 entries.write(w);
                 commit.write(w);
             }),
-            Self::Hard { term, vote } => w.nested(common::Op::RaftRecordHard, |w| {
+            Self::Hard { term, vote, vote_scn } => w.nested(common::Op::RaftRecordHard, |w| {
                 term.write(w);
                 vote.write(w);
+                vote_scn.write(w);
             }),
             Self::Entries { from, entries } => w.nested(common::Op::RaftRecordEntries, |w| {
                 from.write(w);
@@ -3867,9 +3916,11 @@ impl crate::codec::Wire for Record {
             common::Op::RaftRecordCarry => {
                 Ok(Self::Carry { entries: Wire::read(r)?, commit: Wire::read(r)? })
             }
-            common::Op::RaftRecordHard => {
-                Ok(Self::Hard { term: Wire::read(r)?, vote: Wire::read(r)? })
-            }
+            common::Op::RaftRecordHard => Ok(Self::Hard {
+                term: Wire::read(r)?,
+                vote: Wire::read(r)?,
+                vote_scn: Wire::read(r)?,
+            }),
             common::Op::RaftRecordEntries => {
                 Ok(Self::Entries { from: Wire::read(r)?, entries: Wire::read(r)? })
             }
@@ -3954,6 +4005,7 @@ impl crate::codec::Wire for State {
             self.retirements.write(w);
             self.term.write(w);
             self.vote.write(w);
+            self.vote_scn.write(w);
             self.snapshot.write(w);
             self.log.write(w);
             self.commit.write(w);
@@ -3972,6 +4024,7 @@ impl crate::codec::Wire for State {
                 retirements: Wire::read(r)?,
                 term: Wire::read(r)?,
                 vote: Wire::read(r)?,
+                vote_scn: Wire::read(r)?,
                 snapshot: Wire::read(r)?,
                 log: Wire::read(r)?,
                 commit: Wire::read(r)?,
