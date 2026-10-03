@@ -9,8 +9,8 @@
 //! way.** An append goes from the FE to the primary EN and is not seen here, so
 //! this is asked once per extent rather than once per write.
 //!
-//! State is in memory and stream lookup is sharded by id. Stream and extent state
-//! share one SN-wide lock so request handling and Raft apply can synchronize.
+//! State is in memory. Stream and extent state share one SN-wide lock so
+//! request handling and Raft apply can synchronize.
 //! Deleted extent slots remain tombstones; recycling them safely is a later step.
 
 use common::config::{SNConfig, ServiceKind};
@@ -25,7 +25,7 @@ use common::server::{self, Process, Reply, Service};
 use common::time::{TimeIntSec64, TimeSec};
 use common::{Arg, Op, Req, Resp, Status, StructReader, StructWriter, structure};
 use common::{Error, Result};
-use pool::{InlineLinks, LockedPool};
+use pool::LockedPool;
 use raft::runtime::{Host, Settings as RaftSettings};
 use std::collections::HashMap;
 use std::mem::{MaybeUninit, align_of, offset_of};
@@ -49,10 +49,6 @@ const SERVES: &[Op] = &[
     Op::SealExtent,
     Op::ListExtents,
 ];
-
-/// Locks over the stream table. Enough that sixteen cores rarely collide,
-/// few enough to walk when something wants a total.
-const SHARDS: usize = 64;
 
 fn stream_name(payload: &mut StructReader<'_>) -> common::Result<StreamName> {
     Ok(StreamName {
@@ -173,8 +169,7 @@ unsafe impl pool::PoolItem for Extent {
     }
 }
 
-type ExtentPool =
-    LockedPool<Extent, { align_of::<Extent>() }, InlineLinks<{ offset_of!(Extent, link) }>>;
+type ExtentPool = LockedPool<Extent, { align_of::<Extent>() }, { offset_of!(Extent, link) }>;
 
 /// A stable-index table backed by typed pool slots.
 struct ExtentTable {
@@ -661,8 +656,8 @@ struct SNState {
     /// Keyed by the whole name, `(RangeId, StreamId, CreateSec)`, not just the id (#109).
     /// A re-minted id in a later second is a different key, so stale references cannot
     /// silently find the new stream (`A-NAME-IS-NEVER-REMINTED-IN-ITS-OWN-SECOND`).
-    /// Shards keep lookup maps small; IDs remain stable indexes in the extent table.
-    shards: Vec<HashMap<StreamName, Stream>>,
+    /// Streams are keyed by their full name; IDs remain stable indexes in the extent table.
+    stream_map: HashMap<StreamName, Stream>,
     /// Stable extent indexes, protected by the same lock as the stream table.
     extent_table: ExtentTable,
     /// Side metadata whose lifetime follows its owning stream or extent.
@@ -686,7 +681,7 @@ impl SNState {
         let extent_table = ExtentTable::new(max_extents)
             .map_err(|error| Error::new(format!("reserve SN extent table: {error}")))?;
         Ok(Self {
-            shards: (0..SHARDS).map(|_| HashMap::new()).collect(),
+            stream_map: HashMap::new(),
             extent_table,
             retired_streams: std::collections::HashSet::new(),
             stream_extras: Extras::default(),
@@ -794,7 +789,7 @@ enum OpenCheck {
 }
 
 fn open_check(state: &SNState, name: StreamName) -> OpenCheck {
-    let Some(stream) = state.shards[shard_of(name)].get(&name) else {
+    let Some(stream) = state.stream_map.get(&name) else {
         return OpenCheck::Answer(Resp::error(Status::NotFound, format!("no {name}")));
     };
     if !stream.deletion.readable(false) {
@@ -819,7 +814,7 @@ fn check_delete(
     hard: bool,
     now: TimeSec,
 ) -> Result<()> {
-    let stream = state.shards[shard_of(name)].get(&name).ok_or_else(|| Error::new("no stream"))?;
+    let stream = state.stream_map.get(&name).ok_or_else(|| Error::new("no stream"))?;
     let flags = stream.deletion;
     if flags.retired() {
         return Ok(());
@@ -905,21 +900,20 @@ fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> R
             if end > u64::from(StreamId::MAX.get()) + 1 {
                 return Err(Error::new("stream id run exceeds stream id space"));
             }
-            let SNState { shards, retired_streams, streams, .. } = state;
+            let SNState { stream_map, retired_streams, streams, .. } = state;
             for offset in 0..cmd.count {
                 let stream_id = StreamId::of_number(cmd.first.number() + offset)?;
                 let name = StreamName { range: cmd.range, stream: stream_id, created: cmd.created };
                 if retired_streams.contains(&name) {
                     return Err(Error::new("stream identity has been retired"));
                 }
-                let shard = &mut shards[shard_of(name)];
-                if let Some(stream) = shard.get(&name) {
+                if let Some(stream) = stream_map.get(&name) {
                     if !stream.deletion.readable(false) {
                         return Err(Error::new("stream is deleted"));
                     }
                     continue;
                 }
-                shard.insert(
+                stream_map.insert(
                     name,
                     Stream {
                         deletion: Flags::default(),
@@ -938,7 +932,7 @@ fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> R
         Op::SnConcat => {
             let cmd: ConcatCmd = raft::codec::decode(&action.fields)?;
             let SNState {
-                shards,
+                stream_map,
                 extent_table,
                 extent_extras,
                 retired_streams,
@@ -949,20 +943,20 @@ fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> R
             if retired_streams.contains(&cmd.destination) {
                 return Err(Error::new("destination stream identity has been retired"));
             }
-            let shard = &mut shards[shard_of(cmd.destination)];
-            if cmd.require_absent && shard.contains_key(&cmd.destination) {
+            let map = stream_map;
+            if cmd.require_absent && map.contains_key(&cmd.destination) {
                 return Err(Error::new("concat destination already exists"));
             }
-            if cmd.require_exists && !shard.contains_key(&cmd.destination) {
+            if cmd.require_exists && !map.contains_key(&cmd.destination) {
                 return Err(Error::new("concat destination does not exist"));
             }
-            if shard.get(&cmd.destination).is_some_and(|stream| {
+            if map.get(&cmd.destination).is_some_and(|stream| {
                 stream.sealed_stream || stream.open.is_some() || !stream.sealed.is_empty()
             }) {
                 return Err(Error::new("concat destination is not empty and open"));
             }
             let mut inserted = false;
-            let destination = shard.entry(cmd.destination).or_insert_with(|| {
+            let destination = map.entry(cmd.destination).or_insert_with(|| {
                 inserted = true;
                 Stream {
                     deletion: Flags::default(),
@@ -989,7 +983,7 @@ fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> R
                             .expect("rollback retained extent");
                     }
                     if inserted {
-                        shard.remove(&cmd.destination);
+                        map.remove(&cmd.destination);
                     }
                     return Err(error);
                 }
@@ -1008,8 +1002,8 @@ fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> R
             if cmd.extent.id.is_none() {
                 return Err(Error::new("open action has no extent id"));
             }
-            let SNState { shards, extent_table, extents, .. } = state;
-            let held = shards[shard_of(cmd.name)]
+            let SNState { stream_map, extent_table, extents, .. } = state;
+            let held = stream_map
                 .get_mut(&cmd.name)
                 .ok_or_else(|| Error::new("open action names no stream"))?;
             if !held.deletion.readable(false) || held.sealed_stream {
@@ -1035,8 +1029,8 @@ fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> R
         }
         Op::SnSeal => {
             let cmd: SealCmd = raft::codec::decode(&action.fields)?;
-            let SNState { shards, extent_table, extents, sealed, sealed_streams, .. } = state;
-            let held = shards[shard_of(cmd.name)]
+            let SNState { stream_map, extent_table, extents, sealed, sealed_streams, .. } = state;
+            let held = stream_map
                 .get_mut(&cmd.name)
                 .ok_or_else(|| Error::new("seal action names no stream"))?;
             if held.open != Some(cmd.id) {
@@ -1073,8 +1067,8 @@ fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> R
         }
         Op::SnSealStream => {
             let cmd: SealStreamCmd = raft::codec::decode(&action.fields)?;
-            let SNState { shards, extent_table, sealed, sealed_streams, .. } = state;
-            let held = shards[shard_of(cmd.name)]
+            let SNState { stream_map, extent_table, sealed, sealed_streams, .. } = state;
+            let held = stream_map
                 .get_mut(&cmd.name)
                 .ok_or_else(|| Error::new("seal-stream action names no stream"))?;
             if held.sealed_stream {
@@ -1101,7 +1095,7 @@ fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> R
             let now = cmd.now;
             let maximum = TimeIntSec64::new(cmd.maximum);
             let SNState {
-                shards,
+                stream_map,
                 extent_table,
                 retired_streams,
                 stream_extras,
@@ -1109,7 +1103,7 @@ fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> R
                 pending_deletes,
                 ..
             } = state;
-            let Some(stream) = shards[shard_of(cmd.name)].get_mut(&cmd.name) else {
+            let Some(stream) = stream_map.get_mut(&cmd.name) else {
                 if retired_streams.contains(&cmd.name) {
                     pending_deletes.insert(
                         cmd.name,
@@ -1184,7 +1178,7 @@ fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> R
         Op::SnDeleteDone => {
             let cmd: DeleteDoneCmd = raft::codec::decode(&action.fields)?;
             let SNState {
-                shards,
+                stream_map,
                 extent_table,
                 retired_streams,
                 stream_extras,
@@ -1208,12 +1202,12 @@ fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> R
                     extent.data.disks.clear();
                     *extents -= 1;
                 }
-                let shard = &mut shards[shard_of(pending.name)];
-                let stream = shard
+                let map = stream_map;
+                let stream = map
                     .get_mut(&pending.name)
                     .ok_or_else(|| Error::new("hard delete completion has no stream"))?;
                 assert!(stream_extras.reclaim(&pending.name, &mut stream.deletion, cmd.now));
-                shard.remove(&pending.name);
+                map.remove(&pending.name);
                 retired_streams.insert(pending.name);
                 *streams -= 1;
             }
@@ -1226,9 +1220,7 @@ fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> R
 impl raft::execution::Application for SNState {
     fn reset(&mut self) {
         // The committed action history is the source of truth during a Raft restore.
-        for shard in &mut self.shards {
-            shard.clear();
-        }
+        self.stream_map.clear();
         self.extent_table.reset();
         self.retired_streams.clear();
         self.stream_extras = Extras::default();
@@ -1278,16 +1270,6 @@ impl Deref for SN {
     fn deref(&self) -> &Self::Target {
         &self.common
     }
-}
-
-fn shard_of(name: StreamName) -> usize {
-    // Stream ids from one range are consecutive, so mixing the low bits spreads a
-    // batch of them across every shard rather than filling one. ⚠️ The second is *not*
-    // mixed in: streams made together share it, and hashing it would undo the spreading
-    // the id gives — and two streams differing only in the second are a recycled id, which
-    // is rare by construction (#110).
-    (name.stream.number().wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ name.range.number()) as usize
-        % SHARDS
 }
 
 impl Service for SN {
@@ -1480,7 +1462,7 @@ impl SN {
             if state.retired_streams.contains(&name) {
                 return Resp::ok();
             }
-            let Some(stream) = state.shards[shard_of(name)].get(&name) else {
+            let Some(stream) = state.stream_map.get(&name) else {
                 return Resp::error(Status::NotFound, "no stream");
             };
             if stream.deletion.retired() {
@@ -1701,7 +1683,7 @@ impl SN {
                 if state.retired_streams.contains(&name) {
                     return bad("stream identity has been retired");
                 }
-                match state.shards[shard_of(name)].get(&name) {
+                match state.stream_map.get(&name) {
                     Some(stream) if !stream.deletion.readable(false) => {
                         return bad("stream is deleted");
                     }
@@ -1801,8 +1783,8 @@ impl SN {
         let _serial = self.deleting.lock().expect("deletion");
         {
             let state = self.global_lock.read();
-            let shard = &state.shards[shard_of(destination)];
-            if let Some(destination_stream) = shard.get(&destination) {
+            let map = &state.stream_map;
+            if let Some(destination_stream) = map.get(&destination) {
                 if !destination_stream.deletion.readable(false)
                     || destination_stream.sealed_stream
                     || destination_stream.open.is_some()
@@ -1820,11 +1802,11 @@ impl SN {
             }
         }
         // Copy source state before taking the global write lock for the destination.
-        let left_stream = match self.global_lock.read().shards[shard_of(left)].get(&left) {
+        let left_stream = match self.global_lock.read().stream_map.get(&left) {
             Some(stream) => stream.clone(),
             None => return Resp::error(Status::NotFound, format!("no {left}")),
         };
-        let right_stream = match self.global_lock.read().shards[shard_of(right)].get(&right) {
+        let right_stream = match self.global_lock.read().stream_map.get(&right) {
             Some(stream) => stream.clone(),
             None => return Resp::error(Status::NotFound, format!("no {right}")),
         };
@@ -2101,8 +2083,8 @@ impl SN {
             Err(error) => return bad(error),
         };
         let state = self.global_lock.read();
-        let shard = &state.shards[shard_of(name)];
-        let Some(held) = shard.get(&name) else {
+        let map = &state.stream_map;
+        let Some(held) = map.get(&name) else {
             return Resp::error(Status::NotFound, format!("no {name}"));
         };
         if !held.deletion.readable(include) {
@@ -2171,8 +2153,8 @@ impl SN {
         let mut room = asked.limit;
         let state = self.global_lock.read();
         for (name, from) in &asked.at {
-            let shard = &state.shards[shard_of(*name)];
-            let Some(held) = shard.get(name) else {
+            let map = &state.stream_map;
+            let Some(held) = map.get(name) else {
                 return Resp::error(Status::NotFound, format!("no {name}"));
             };
             if !held.deletion.readable(include) {
@@ -2298,7 +2280,7 @@ impl SN {
     /// one, which is one round trip rather than two because whoever saw the seal wants both.
     fn seal_reply(&self, name: StreamName, id: ExtentId) -> Option<Resp> {
         let state = self.global_lock.read();
-        let Some(stream) = state.shards[shard_of(name)].get(&name) else {
+        let Some(stream) = state.stream_map.get(&name) else {
             return Some(Resp::error(Status::NotFound, format!("no {name}")));
         };
         if !stream.deletion.readable(false) {
@@ -2355,7 +2337,7 @@ impl SN {
         }
         let (first, is_full, next_id) = {
             let state = self.global_lock.read();
-            let stream = &state.shards[shard_of(name)][&name];
+            let stream = &state.stream_map[&name];
             if stream.sealed_records.plus(SRoff::from_extent(came_to.records)).is_err() {
                 return Resp::error(Status::BadRequest, "seal-extent record total overflows");
             }
@@ -2413,7 +2395,7 @@ impl SN {
         }
 
         let state = self.global_lock.read();
-        let Some(stream) = state.shards[shard_of(name)].get(&name) else {
+        let Some(stream) = state.stream_map.get(&name) else {
             return Resp::error(Status::Internal, "Raft removed stream while sealing extent");
         };
         if stream.sealed_stream {
@@ -2436,7 +2418,7 @@ impl SN {
 
     fn seal_stream_reply(&self, name: StreamName, id: ExtentId, came_to: Filled) -> Option<Resp> {
         let state = self.global_lock.read();
-        let Some(stream) = state.shards[shard_of(name)].get(&name) else {
+        let Some(stream) = state.stream_map.get(&name) else {
             return Some(Resp::error(Status::NotFound, format!("no {name}")));
         };
         if !stream.deletion.readable(false) {
@@ -2490,10 +2472,7 @@ impl SN {
         if let Err(error) = self.commit_action(action) {
             return Resp::error(Status::Internal, error.to_string());
         }
-        Resp::number(
-            Status::Ok,
-            self.global_lock.read().shards[shard_of(name)][&name].sealed_records.number(),
-        )
+        Resp::number(Status::Ok, self.global_lock.read().stream_map[&name].sealed_records.number())
     }
 
     /// Seal the stream's open extent and name the next one, both under the shared
@@ -2511,9 +2490,9 @@ impl SN {
         per_stream: usize,
     ) -> std::result::Result<Placed, Full> {
         let mut state = self.global_lock.write();
-        let SNState { shards, extent_table, extents, sealed, sealed_streams, .. } = &mut *state;
-        let shard = &mut shards[shard_of(name)];
-        let Some(held) = shard.get_mut(&name) else {
+        let SNState { stream_map, extent_table, extents, sealed, sealed_streams, .. } = &mut *state;
+        let map = stream_map;
+        let Some(held) = map.get_mut(&name) else {
             return Err(Full::from(Error::new(format!("no {name}"))));
         };
         // Only whoever names the open extent seals it. Two appends can find the same
@@ -2559,9 +2538,9 @@ impl SN {
         instances: usize,
     ) -> std::result::Result<Placed, Full> {
         let mut state = self.global_lock.write();
-        let SNState { shards, extent_table, extents, .. } = &mut *state;
-        let shard = &mut shards[shard_of(name)];
-        let Some(held) = shard.get_mut(&name) else {
+        let SNState { stream_map, extent_table, extents, .. } = &mut *state;
+        let map = stream_map;
+        let Some(held) = map.get_mut(&name) else {
             return Err(Full::from(Error::new(format!("no {name}"))));
         };
         if held.sealed_stream {
@@ -2638,7 +2617,7 @@ impl Host for SN {
         if action.op == Op::SnOpen {
             let command: OpenCmd = raft::codec::decode(&action.fields)?;
             if let Some(pending) = state.pending_opens.remove(&command.name) {
-                let stream = state.shards[shard_of(command.name)].get(&command.name);
+                let stream = state.stream_map.get(&command.name);
                 let extent = stream.and_then(|stream| {
                     stream.open.map(|id| {
                         (state.extent_table[id.get() as usize].data.clone(), stream.sealed_records)
@@ -2752,8 +2731,8 @@ mod tests {
         {
             let mut state = sn.global_lock.write();
             state.streams += 1;
-            let snapshot = state.shards[shard_of(source)][&source].clone();
-            state.shards[shard_of(other)].insert(other, snapshot);
+            let snapshot = state.stream_map[&source].clone();
+            state.stream_map.insert(other, snapshot);
         }
         sn.streams.fetch_add(1, Ordering::Relaxed);
         {
@@ -3118,7 +3097,7 @@ mod tests {
         });
 
         assert_eq!(sn.open_extent(&process, &open_req).status, Status::Ok);
-        let id = sn.global_lock.read().shards[shard_of(name)][&name].open.unwrap();
+        let id = sn.global_lock.read().stream_map[&name].open.unwrap();
         let commit = sn.on_raft(|_, node| Ok(node.state().commit)).unwrap();
         assert_eq!(sn.open_extent(&process, &open_req).status, Status::Ok);
         assert_eq!(sn.on_raft(|_, node| Ok(node.state().commit)).unwrap(), commit);
@@ -3137,11 +3116,11 @@ mod tests {
             })
         };
         assert_eq!(sn.seal(&process, &seal(Op::SealExtent, id, came(7, 90))).status, Status::Ok);
-        let next = sn.global_lock.read().shards[shard_of(name)][&name].open.unwrap();
+        let next = sn.global_lock.read().stream_map[&name].open.unwrap();
         assert_eq!(sn.seal_stream(&seal(Op::SealStream, next, came(3, 50))).status, Status::Ok);
 
         let expected = sn.global_lock.read();
-        let stream = &expected.shards[shard_of(name)][&name];
+        let stream = &expected.stream_map[&name];
         assert!(stream.sealed_stream);
         assert_eq!(stream.sealed.len(), 2);
         assert_eq!(expected.extent_table.len(), 2);
@@ -3157,7 +3136,7 @@ mod tests {
                 }
             }
         }
-        let restored = &replay.shards[shard_of(name)][&name];
+        let restored = &replay.stream_map[&name];
         assert!(restored.sealed_stream);
         assert_eq!(restored.sealed, vec![ExtentId::FIRST, ExtentId::new(1)]);
         assert_eq!(restored.sealed_records, SRoff::new(10));
@@ -3278,7 +3257,7 @@ mod tests {
 
         let id = {
             let state = sn.global_lock.read();
-            let destination = &state.shards[shard_of(named(0, 9))][&named(0, 9)];
+            let destination = &state.stream_map[&named(0, 9)];
             assert_eq!(destination.sealed.len(), 2, "A || A has two extent references");
             assert_eq!(destination.sealed_records, SRoff::new(24));
             assert!(destination.open.is_none(), "concatenation does not open an extent");
@@ -3481,14 +3460,13 @@ mod tests {
     /// Where the open extent starts, for a test.
     impl SN {
         fn starts_at(&self, range: u64, stream: u32) -> SRoff {
-            self.global_lock.read().shards[shard_of(named(range, stream))][&named(range, stream)]
-                .sealed_records
+            self.global_lock.read().stream_map[&named(range, stream)].sealed_records
         }
 
         /// The stream-local first record of every sealed extent, recomputed by summing.
         fn firsts(&self, range: u64, stream: u32) -> Vec<SRoff> {
             let state = self.global_lock.read();
-            state.shards[shard_of(named(range, stream))][&named(range, stream)]
+            state.stream_map[&named(range, stream)]
                 .sealed_from(&state.extent_table)
                 .map(|(at, _)| at)
                 .collect()

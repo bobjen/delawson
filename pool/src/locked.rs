@@ -1,7 +1,7 @@
 //! Fixed-size pool whose reclamation is protected by a caller-owned lock.
-use super::{Error, ExternalLinks, Links, Mapping, NONE, PoolItem, Result};
+use super::{Error, Mapping, NONE, PoolItem, Result};
 use std::marker::PhantomData;
-use std::mem::{MaybeUninit, align_of, size_of};
+use std::mem::{align_of, size_of};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 
@@ -39,9 +39,8 @@ impl Bucket {
 /// deleted lists to free lists. `T` supplies slot size, alignment, and fresh-slot
 /// initialization; this pool never resets or destroys slots. Callers must reset
 /// each item before returning it and destroy live `T` values before pool teardown.
-pub struct LockedPool<T: PoolItem, const ALIGN: usize, L: Links = ExternalLinks> {
-    // Links must be dropped before the mapping they may refer to.
-    links: L,
+/// `LINK` must be the offset of a `MaybeUninit<AtomicU32>` field in `T`.
+pub struct LockedPool<T: PoolItem, const ALIGN: usize, const LINK: usize> {
     mapping: Mapping,
     max_blocks: u32,
     next: AtomicU32,
@@ -51,19 +50,24 @@ pub struct LockedPool<T: PoolItem, const ALIGN: usize, L: Links = ExternalLinks>
 
 // SAFETY: list operations use atomics; the caller's lock excludes operations
 // from reclamation. Mapping addresses stay fixed when this pool moves.
-unsafe impl<T: PoolItem + Send, const A: usize, L: Links> Send for LockedPool<T, A, L> {}
-unsafe impl<T: PoolItem + Send + Sync, const A: usize, L: Links> Sync for LockedPool<T, A, L> {}
+unsafe impl<T: PoolItem + Send, const A: usize, const L: usize> Send for LockedPool<T, A, L> {}
+unsafe impl<T: PoolItem + Send + Sync, const A: usize, const L: usize> Sync
+    for LockedPool<T, A, L>
+{
+}
 
-impl<T: PoolItem, const A: usize, L: Links> LockedPool<T, A, L> {
+impl<T: PoolItem, const A: usize, const L: usize> LockedPool<T, A, L> {
     pub fn new(max_blocks: u32, initial_blocks: u32) -> Result<Self> {
         if !A.is_power_of_two()
+            || A < align_of::<AtomicU32>()
             || size_of::<T>() == 0
             || size_of::<T>() % A != 0
             || align_of::<T>() > A
+            || size_of::<T>() % align_of::<AtomicU32>() != 0
+            || L % align_of::<AtomicU32>() != 0
+            || L.checked_add(size_of::<AtomicU32>()).is_none_or(|end| end > size_of::<T>())
         {
-            return Err(Error::new(
-                "slot size must be a positive multiple of power-of-two alignment at least as large as the slot alignment",
-            ));
+            return Err(Error::new("slot size, alignment, and inline link offset are invalid"));
         }
         if max_blocks == 0 {
             return Err(Error::new("pool needs max_blocks >= 1"));
@@ -76,10 +80,7 @@ impl<T: PoolItem, const A: usize, L: Links> LockedPool<T, A, L> {
             .checked_mul(max_blocks as usize)
             .ok_or_else(|| Error::new("block pool is too large"))?;
         let mapping = Mapping::new(bytes, A)?;
-        // SAFETY: mapping remains alive until after links, including on drop.
-        let links = unsafe { L::new(mapping.base, size_of::<T>(), max_blocks)? };
         let pool = Self {
-            links,
             mapping,
             max_blocks,
             next: AtomicU32::new(initial_blocks),
@@ -90,7 +91,7 @@ impl<T: PoolItem, const A: usize, L: Links> LockedPool<T, A, L> {
             // SAFETY: each index is new writable storage, initialized once.
             unsafe { T::init(pool.slot(index)) };
             // SAFETY: each index has one stable link initialized before publication.
-            unsafe { pool.links.init(index) };
+            unsafe { pool.init_link(index) };
             let next = index as u64 + BUCKETS as u64;
             pool.link(index)
                 .store(if next < initial_blocks as u64 { next as u32 } else { NONE }, SeqCst);
@@ -104,7 +105,21 @@ impl<T: PoolItem, const A: usize, L: Links> LockedPool<T, A, L> {
     #[inline]
     fn link(&self, index: u32) -> &AtomicU32 {
         // SAFETY: internal callers use initialized pool indexes.
-        unsafe { self.links.link(index) }
+        unsafe { &*self.link_ptr(index) }
+    }
+
+    #[inline]
+    fn link_ptr(&self, index: u32) -> *mut AtomicU32 {
+        // SAFETY: internal callers use indexes within the reserved mapping.
+        unsafe {
+            self.mapping.base.as_ptr().add(index as usize * size_of::<T>() + L).cast::<AtomicU32>()
+        }
+    }
+
+    #[inline]
+    unsafe fn init_link(&self, index: u32) {
+        // SAFETY: called once for fresh storage before the slot is published.
+        unsafe { self.link_ptr(index).write(AtomicU32::new(NONE)) };
     }
 
     #[inline]
@@ -164,7 +179,7 @@ impl<T: PoolItem, const A: usize, L: Links> LockedPool<T, A, L> {
         // SAFETY: fetch_update granted this caller one new writable index.
         unsafe { T::init(self.slot(index)) };
         // SAFETY: each fresh index has its link initialized before use.
-        unsafe { self.links.init(index) };
+        unsafe { self.init_link(index) };
         Ok(LockedBlock { pool: self, index })
     }
 
@@ -208,12 +223,12 @@ impl<T: PoolItem, const A: usize, L: Links> LockedPool<T, A, L> {
 /// Ownership of one pool index. Its destructor pushes the index onto the
 /// deleted list without reclaiming it. The caller must drop it while holding
 /// the shared or exclusive lock that also protects calls to `LockedPool::alloc`.
-pub struct LockedBlock<'a, T: PoolItem, const ALIGN: usize, L: Links = ExternalLinks> {
-    pool: &'a LockedPool<T, ALIGN, L>,
+pub struct LockedBlock<'a, T: PoolItem, const ALIGN: usize, const LINK: usize> {
+    pool: &'a LockedPool<T, ALIGN, LINK>,
     index: u32,
 }
 
-impl<T: PoolItem, const A: usize, L: Links> LockedBlock<'_, T, A, L> {
+impl<T: PoolItem, const A: usize, const L: usize> LockedBlock<'_, T, A, L> {
     pub fn index(&self) -> u32 {
         self.index
     }
@@ -228,19 +243,7 @@ impl<T: PoolItem, const A: usize, L: Links> LockedBlock<'_, T, A, L> {
     }
 }
 
-impl<T: PoolItem, const A: usize> LockedBlock<'_, T, A, ExternalLinks> {
-    pub fn as_slice(&self) -> &[MaybeUninit<u8>] {
-        // SAFETY: the external link never overlaps these exclusively owned bytes.
-        unsafe { std::slice::from_raw_parts(self.as_ptr().cast(), size_of::<T>()) }
-    }
-
-    pub fn as_mut_slice(&mut self) -> &mut [MaybeUninit<u8>] {
-        // SAFETY: the handle uniquely owns the payload; pool readers only use links.
-        unsafe { std::slice::from_raw_parts_mut(self.as_ptr().cast(), size_of::<T>()) }
-    }
-}
-
-impl<T: PoolItem, const A: usize, L: Links> Drop for LockedBlock<'_, T, A, L> {
+impl<T: PoolItem, const A: usize, const L: usize> Drop for LockedBlock<'_, T, A, L> {
     fn drop(&mut self) {
         self.pool.retire(self.index);
     }
@@ -249,15 +252,24 @@ impl<T: PoolItem, const A: usize, L: Links> Drop for LockedBlock<'_, T, A, L> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::InlineLinks;
     use std::collections::HashSet;
+    use std::mem::MaybeUninit;
     use std::sync::Barrier;
     use std::sync::RwLock;
-    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
     use std::thread;
     use std::time::Duration;
 
-    type TestPool = LockedPool<[u8; 16], 4>;
+    #[repr(C)]
+    struct TestItem {
+        link: MaybeUninit<AtomicU32>,
+        bytes: [MaybeUninit<u8>; 12],
+    }
+
+    // SAFETY: every field is MaybeUninit, so a fresh slot is a valid TestItem.
+    unsafe impl PoolItem for TestItem {}
+
+    type TestPool = LockedPool<TestItem, 4, { std::mem::offset_of!(TestItem, link) }>;
 
     #[test]
     fn reclaim_only() {
@@ -319,8 +331,8 @@ mod tests {
     }
 
     #[test]
-    fn inline_link_reuse() {
-        let pool = LockedPool::<[u8; 16], 4, InlineLinks<4>>::new(3, 1).unwrap();
+    fn link_reuse() {
+        let pool = TestPool::new(3, 1).unwrap();
         let lock = RwLock::new(());
         let first = {
             let _read = lock.read().unwrap();

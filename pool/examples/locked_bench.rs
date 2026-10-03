@@ -2,7 +2,9 @@
 use parking_lot::RwLock;
 use pool::LockedPool;
 use random::Rng;
+use std::mem::MaybeUninit;
 use std::sync::Barrier;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,7 +17,16 @@ const RECLAIM_PERIOD_US: u64 = 50;
 const RECLAIM_PERIOD: Duration = Duration::from_micros(RECLAIM_PERIOD_US);
 const SEED: u64 = 42;
 
-type TestPool = LockedPool<[u8; 4096], 4096>;
+#[repr(C, align(4096))]
+struct BenchBlock {
+    link: MaybeUninit<AtomicU32>,
+    bytes: [MaybeUninit<u8>; 4092],
+}
+
+// SAFETY: all fields are MaybeUninit, so a fresh slot is a valid BenchBlock.
+unsafe impl pool::PoolItem for BenchBlock {}
+
+type TestPool = LockedPool<BenchBlock, 4096, { std::mem::offset_of!(BenchBlock, link) }>;
 
 fn run_pool(pool: &TestPool, global: &RwLock<()>) -> (Duration, [u64; 3], u64) {
     let ready = Barrier::new(THREADS + 2);
