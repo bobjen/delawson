@@ -1998,7 +1998,19 @@ impl<S: Storage> Node<S> {
     pub fn request_reference(&self, peer: &MemberId) -> Option<Rpc> {
         self.make_request(peer, false)
     }
+    /// Build the next replication request from an explicit pipeline offset.
+    pub fn request_from(&self, peer: &MemberId, next: u64) -> Option<Rpc> {
+        self.make_request_at(peer, false, Some(next))
+    }
     fn make_request(&self, peer: &MemberId, contents: bool) -> Option<Rpc> {
+        self.make_request_at(peer, contents, None)
+    }
+    fn make_request_at(
+        &self,
+        peer: &MemberId,
+        contents: bool,
+        requested_next: Option<u64>,
+    ) -> Option<Rpc> {
         let s = self.state();
         match self.role {
             Role::Follower | Role::Stopped => None,
@@ -2014,7 +2026,10 @@ impl<S: Storage> Node<S> {
                 })
             }
             Role::Leader => {
-                let next = self.next.get(peer).copied().unwrap_or(s.last().saturating_add(1));
+                let next = requested_next
+                    .or_else(|| self.next.get(peer).copied())
+                    .unwrap_or(s.last().saturating_add(1))
+                    .max(1);
                 if next <= s.snapshot.index {
                     return Some(if contents {
                         Rpc::Install { term: s.term, snapshot: s.snapshot.clone() }
@@ -2286,21 +2301,39 @@ impl<S: Storage> Node<S> {
                         .entry(*peer)
                         .and_modify(|v| *v = (*v).max(matched))
                         .or_insert(matched);
-                    self.next.insert(*peer, matched.saturating_add(1));
+                    let next = self.next.entry(*peer).or_insert(matched.saturating_add(1));
+                    *next = (*next).max(matched.saturating_add(1));
                     self.advance()?;
                 } else {
-                    let next = self.next.entry(*peer).or_insert(previous.saturating_add(1));
-                    *next = next.saturating_sub(1).max(1);
+                    let matched = self.matched.get(peer).copied().unwrap_or(0);
+                    if matched < *previous {
+                        let next = self.next.entry(*peer).or_insert(previous.saturating_add(1));
+                        if *next > matched.saturating_add(1) {
+                            *next = next.saturating_sub(1).max(1);
+                        }
+                    }
                 }
             }
             Rpc::Checkpoint { index, .. } if self.role == Role::Leader && answer.success => {
-                self.matched.insert(*peer, *index);
-                self.next.insert(*peer, index.saturating_add(1));
+                self.matched
+                    .entry(*peer)
+                    .and_modify(|matched| *matched = (*matched).max(*index))
+                    .or_insert(*index);
+                self.next
+                    .entry(*peer)
+                    .and_modify(|next| *next = (*next).max(index.saturating_add(1)))
+                    .or_insert(index.saturating_add(1));
                 self.advance()?;
             }
             Rpc::Install { snapshot, .. } if self.role == Role::Leader && answer.success => {
-                self.matched.insert(*peer, snapshot.index);
-                self.next.insert(*peer, snapshot.index.saturating_add(1));
+                self.matched
+                    .entry(*peer)
+                    .and_modify(|matched| *matched = (*matched).max(snapshot.index))
+                    .or_insert(snapshot.index);
+                self.next
+                    .entry(*peer)
+                    .and_modify(|next| *next = (*next).max(snapshot.index.saturating_add(1)))
+                    .or_insert(snapshot.index.saturating_add(1));
                 self.advance()?;
             }
             _ => {}
@@ -3569,6 +3602,29 @@ pub mod tests {
         assert!(!answer.success);
         assert!(unchanged);
         assert_eq!(role, Role::Leader);
+    }
+    #[test]
+    fn late_reply_safe() {
+        let mut nodes = cluster(3);
+        nodes[0].campaign().unwrap();
+        pair(&mut nodes, 0, 1);
+        nodes[0].propose(Command::Noop).unwrap();
+        nodes[0].propose(Command::Noop).unwrap();
+        let term = nodes[0].state().term;
+
+        let mut older = nodes[0].request_from(&1, 1).unwrap();
+        if let Rpc::Append { entries, .. } = &mut older {
+            entries.retain(|entry| entry.index <= 2);
+        } else {
+            panic!("expected Append");
+        }
+        let newer = nodes[0].request_from(&1, 3).unwrap();
+        nodes[0].response(&1, &newer, &Answer { term, success: true, matched: 3 }).unwrap();
+        assert_eq!(nodes[0].next[&1], 4);
+
+        nodes[0].response(&1, &older, &Answer { term, success: false, matched: 0 }).unwrap();
+        assert_eq!(nodes[0].matched[&1], 3);
+        assert_eq!(nodes[0].next[&1], 4);
     }
     #[test]
     fn checkpoint_reference_acknowledges_only_after_peer_copy_then_resumes_append() {

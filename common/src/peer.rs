@@ -80,6 +80,10 @@ impl Peer {
         self.sending.close();
         let _ = self.socket.shutdown(std::net::Shutdown::Both);
     }
+    /// Close a connection whose asynchronous request did not complete in time.
+    pub fn close(&self) {
+        self.disconnect();
+    }
     fn deliver(&self, response: Resp) {
         let then = self.waiting.lock().expect("peer").remove(&response.id);
         if let Some(then) = then {

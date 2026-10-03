@@ -191,6 +191,7 @@ pub struct Runtime<S> {
     client_proposals: Mutex<Vec<ClientProposal>>,
     client_last_send: Mutex<Option<Instant>>,
     pub raft_workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    peer_threads: Mutex<BTreeMap<MemberId, std::thread::Thread>>,
     pub global_lock: RwLock<S>,
     pub execution: Mutex<crate::execution::Cursor>,
     metadata_execution: Mutex<crate::execution::Cursor>,
@@ -264,6 +265,7 @@ impl<S> Runtime<S> {
             client_proposals: Mutex::new(Vec::new()),
             client_last_send: Mutex::new(None),
             raft_workers: Mutex::new(vec![]),
+            peer_threads: Mutex::new(BTreeMap::new()),
             global_lock: RwLock::new(initial),
             execution: Mutex::new(crate::execution::Cursor::default()),
             metadata_execution: Mutex::new(crate::execution::Cursor::default()),
@@ -281,6 +283,13 @@ impl<S> Runtime<S> {
     }
     pub fn applied(&self) -> u64 {
         self.apply_watch.applied.load(Ordering::Acquire)
+    }
+    fn wake_peers(&self) {
+        if let Ok(peers) = self.peer_threads.lock() {
+            for thread in peers.values() {
+                thread.unpark();
+            }
+        }
     }
     pub fn publish_applied(&self, index: u64) {
         self.apply_watch.publish(index);
@@ -570,11 +579,36 @@ enum Sender {
     Slot(MemberId),
     Applicant(common::ring::MemberIdentity),
 }
-struct ConsensusReply {
+pub struct ConsensusReply {
     member: Sender,
     retirement: Option<Retirement>,
     answer: Answer,
     ready: bool,
+}
+const APPEND_WINDOW: usize = 2;
+struct PendingRpc {
+    id: u64,
+    request: Rpc,
+    sent: Duration,
+    started: Instant,
+    connection: Arc<common::peer::Peer>,
+}
+struct PeerAnswer {
+    id: u64,
+    result: std::result::Result<ConsensusReply, String>,
+}
+
+fn decode_consensus(response: Resp) -> Result<ConsensusReply> {
+    if response.status != Status::Ok {
+        return Err(Error::new(format!("peer rejected Raft RPC: {:?}", response.message())));
+    }
+    let (mut body, rest) = structure(response.args(), Op::BytesResp, "Raft response")?;
+    let bytes = body.bytes()?;
+    body.done()?;
+    if !rest.is_empty() {
+        return Err(Error::new("trailing Raft response"));
+    }
+    parse(&bytes)
 }
 
 /// Keep client setup, forwarding, and checkpoint waits off the shared RPC workers.
@@ -1750,6 +1784,14 @@ pub trait Host:
         } else {
             self.options.raft.request_timeout_ms
         };
+        let request = self.raft_request(target, message)?;
+        self.transport
+            .as_ref()
+            .ok_or_else(|| Error::new("no Raft transport"))?
+            .get(name, || self.member_address(name))?
+            .call_timeout(&request, Duration::from_millis(timeout))
+    }
+    fn raft_request(&self, target: Option<MemberId>, message: Message) -> Result<Req> {
         let applying = Some(
             self.placement
                 .lock()
@@ -1757,7 +1799,7 @@ pub trait Host:
                 .selected
                 .clone(),
         );
-        let (member, retirement) = self.on_raft(|_, node| {
+        let (member, retirement) = self.on_raft_async(|_, node| {
             Ok((
                 if node.id == UNASSIGNED {
                     Sender::Applicant(node.journal.identity.current.clone())
@@ -1767,21 +1809,47 @@ pub trait Host:
                 node.journal.pending_replacement(),
             ))
         })?;
-        let request = Req::new(Op::Raft).text(&self.runtime.name).bytes(
-            crate::codec::encode_message(&Packet {
+        Ok(Req::new(Op::Raft).text(&self.runtime.name).bytes(crate::codec::encode_message(
+            &Packet {
                 member,
                 target,
                 retirement,
                 applying,
                 ready: self.ready.load(Ordering::SeqCst),
                 message,
-            })?,
-        );
-        self.transport
+            },
+        )?))
+    }
+    fn peer_name(&self, peer: MemberId) -> Result<String> {
+        self.on_raft_async(move |host, node| {
+            node.state()
+                .membership()
+                .identities
+                .get(&peer)
+                .or_else(|| node.state().contacts.get(&peer))
+                .map(|m| m.process.clone())
+                .or_else(|| host.runtime.founders.get(&peer).cloned())
+                .ok_or_else(|| Error::new("unknown member index"))
+        })
+    }
+    fn ask_raft(
+        &self,
+        peer: MemberId,
+        message: Message,
+        then: impl FnOnce(Resp) + Send + 'static,
+    ) -> Result<Arc<common::peer::Peer>> {
+        let name = self.peer_name(peer)?;
+        let request = self.raft_request(Some(peer), message)?;
+        let connection = self
+            .transport
             .as_ref()
             .ok_or_else(|| Error::new("no Raft transport"))?
-            .get(name, || self.member_address(name))?
-            .call_timeout(&request, Duration::from_millis(timeout))
+            .get(&name, || self.member_address(&name))?;
+        if let Err(error) = connection.ask(&request, then) {
+            connection.close();
+            return Err(error);
+        }
+        Ok(connection)
     }
     fn forward(&self, request: &Req) -> Option<Resp> {
         let (local, target) = match self.on_raft(|_, node| {
@@ -2346,6 +2414,8 @@ pub trait Host:
                 if node.journal.failed {
                     return Ok(());
                 }
+                let before =
+                    (node.role, node.state().term, node.state().last(), node.state().commit);
                 node.journal.poll_io()?;
                 // Apply the current penalty to the base deadline: starting or finishing
                 // a checkpoint between heartbeats must affect election preference too.
@@ -2392,6 +2462,11 @@ pub trait Host:
                 host.prepare_primary(node)?;
                 host.flush_client_proposals(node)?;
                 host.refresh_application(node)?;
+                if before
+                    != (node.role, node.state().term, node.state().last(), node.state().commit)
+                {
+                    host.wake_peers();
+                }
                 let members = node.state().membership().participants();
                 let local_id = node.id;
                 peers.retain(|id, cancelled| {
@@ -2430,13 +2505,71 @@ pub trait Host:
         self.start_checkpoints()?;
         Ok(())
     }
+    fn record_peer_reply(
+        &self,
+        peer: MemberId,
+        request: Rpc,
+        response: ConsensusReply,
+        sent: Duration,
+    ) -> Result<(bool, Option<bool>, bool)> {
+        self.on_raft_async(move |host, node| {
+            let before = (node.role, node.state().term, node.state().last(), node.state().commit);
+            let ready = response.ready;
+            let success = response.answer.success;
+            if let Some(retired) = response.retirement {
+                if retired.previous != peer || response.member != Sender::Slot(retired.next) {
+                    return Err(Error::new("retirement reply does not match requested member"));
+                }
+                node.observe_retirement(retired)?;
+                return Ok((ready, None, false));
+            }
+            let identity_matches = match &response.member {
+                Sender::Slot(slot) => *slot == peer,
+                Sender::Applicant(identity) => node
+                    .state()
+                    .membership()
+                    .identities
+                    .get(&peer)
+                    .is_some_and(|m| &m.identity == identity),
+            };
+            if !identity_matches {
+                return Err(Error::new("Raft reply came from the wrong member"));
+            }
+            host.placement
+                .lock()
+                .map_err(|_| Error::new("placement lock poisoned"))?
+                .acknowledge(&peer, Instant::now());
+            let before_next = node.next.get(&peer).copied().unwrap_or_else(|| match &request {
+                Rpc::Append { previous, .. } => previous.saturating_add(1),
+                _ => 0,
+            });
+            node.response_sent(&peer, &request, &response.answer, sent)?;
+            let retry_now = !success
+                && matches!(request, Rpc::Append { .. })
+                && node.next.get(&peer).is_some_and(|next| *next < before_next);
+            host.refresh_application(node)?;
+            if before != (node.role, node.state().term, node.state().last(), node.state().commit) {
+                host.wake_peers();
+            }
+            Ok((ready, Some(success), retry_now))
+        })
+    }
     fn start_peer(self: &Arc<Self>, peer: MemberId, cancelled: Arc<AtomicBool>) -> Result<()> {
         let weak = Arc::downgrade(self);
+        let heartbeat = Duration::from_millis(self.options.raft.heartbeat_ms);
+        let request_timeout = Duration::from_millis(self.options.raft.request_timeout_ms);
         let handle = std::thread::Builder::new()
             .name(format!("raft-{peer}"))
             .spawn(move || {
                 let mut unlocked = false;
                 let mut last_error: Option<String> = None;
+                let current = std::thread::current();
+                let (answer_tx, answer_rx) = std::sync::mpsc::channel::<PeerAnswer>();
+                let mut pending: Vec<PendingRpc> = Vec::new();
+                let mut request_id = 0u64;
+                let mut next_heartbeat = Instant::now();
+                let mut retry_at: Option<Instant> = None;
+                let mut stalled = false;
                 loop {
                     let Some(runtime) = weak.upgrade() else {
                         break;
@@ -2446,118 +2579,305 @@ pub trait Host:
                     {
                         break;
                     }
+
                     let mut contacted = false;
-                    let result = (|| -> Result<()> {
-                        let plan = runtime.on_raft(move |_, node| {
-                            let (contact, setup) =
-                                peer_eligibility(&node.state().membership(), node.id, peer);
-                            if node.journal.failed || !contact {
-                                return Ok(None);
-                            }
-                            Ok(Some((node.request_reference(&peer), setup)))
-                        })?;
-                        let Some((request, setup)) = plan else {
-                            return Ok(());
+                    while let Ok(answer) = answer_rx.try_recv() {
+                        let Some(at) = pending.iter().position(|entry| entry.id == answer.id) else {
+                            continue;
                         };
-                        let requested = runtime
-                            .readiness_requests
-                            .lock()
-                            .map_err(|_| Error::new("peer readiness lock poisoned"))?
-                            .contains(&peer);
-                        if setup && (!unlocked || requested) {
-                            if let Some(action) = runtime.peer_message() {
-                                unlocked =
-                                    runtime.send_raft(&peer, Message::Client(action))?.status
-                                        == Status::Ok;
-                                contacted |= unlocked;
-                                if unlocked {
-                                    runtime
-                                        .readiness_requests
-                                        .lock()
-                                        .map_err(|_| Error::new("peer readiness lock poisoned"))?
-                                        .remove(&peer);
+                        let entry = pending.remove(at);
+                        match answer.result {
+                            Err(message) => {
+                                if last_error.as_ref() != Some(&message) {
+                                    logn!("Raft peer failed", "peer {},error {}", peer, message);
+                                    last_error = Some(message);
+                                }
+                                unlocked = false;
+                                stalled = true;
+                                retry_at = Some(Instant::now() + heartbeat);
+                                if pending.is_empty() {
+                                    stalled = false;
                                 }
                             }
-                        }
-                        if let Some(request) = request {
-                            let sent = lease::now()?;
-                            let response =
-                                runtime.send_raft(&peer, Message::Consensus(request.clone()))?;
-                            if response.status != Status::Ok {
-                                return Err(Error::new(format!(
-                                    "peer {peer} rejected Raft RPC: {:?}",
-                                    response.message()
-                                )));
-                            }
-                            let (mut body, rest) =
-                                structure(response.args(), Op::BytesResp, "Raft response")?;
-                            let bytes = body.bytes()?;
-                            body.done()?;
-                            if !rest.is_empty() {
-                                return Err(Error::new("trailing Raft response"));
-                            }
-                            let response: ConsensusReply = parse(&bytes)?;
-                            contacted = true;
-                            unlocked = response.ready;
-                            runtime.on_raft(move |host, node| {
-                                if let Some(retired) = response.retirement {
-                                    if retired.previous != peer
-                                        || response.member != Sender::Slot(retired.next)
-                                    {
-                                        return Err(Error::new(
-                                            "retirement reply does not match requested member",
-                                        ));
+                            Ok(response) => {
+                                match runtime.record_peer_reply(
+                                    peer,
+                                    entry.request,
+                                    response,
+                                    entry.sent,
+                                ) {
+                                    Ok((ready, success, retry_now)) => {
+                                        contacted = true;
+                                        unlocked = ready;
+                                        if success == Some(false) {
+                                            stalled = true;
+                                        }
+                                        if retry_now {
+                                            next_heartbeat = Instant::now();
+                                        }
+                                        retry_at = None;
+                                        if let Some(message) = last_error.take() {
+                                            logn!("Raft peer recovered", "peer {}", peer);
+                                            let _ = message;
+                                        }
                                     }
-                                    node.observe_retirement(retired)?;
-                                    return Ok(());
+                                    Err(error) => {
+                                        let message = error.to_string();
+                                        if last_error.as_ref() != Some(&message) {
+                                            logn!(
+                                                "Raft peer failed",
+                                                "peer {},error {}",
+                                                peer,
+                                                message
+                                            );
+                                            last_error = Some(message);
+                                        }
+                                        unlocked = false;
+                                        stalled = true;
+                                        retry_at = Some(Instant::now() + heartbeat);
+                                    }
                                 }
-                                let identity_matches = match &response.member {
-                                    Sender::Slot(slot) => *slot == peer,
-                                    Sender::Applicant(identity) => node
-                                        .state()
-                                        .membership()
-                                        .identities
-                                        .get(&peer)
-                                        .is_some_and(|m| &m.identity == identity),
-                                };
-                                if !identity_matches {
-                                    return Err(Error::new(
-                                        "Raft reply came from the wrong member",
-                                    ));
-                                }
-
-                                host.placement
-                                    .lock()
-                                    .map_err(|_| Error::new("placement lock poisoned"))?
-                                    .acknowledge(&peer, Instant::now());
-
-                                node.response_sent(&peer, &request, &response.answer, sent)?;
-                                host.refresh_application(node)?;
-                                Ok(())
-                            })?;
+                            }
                         }
-                        Ok(())
-                    })();
-                    match result {
+                    }
+                    if pending.is_empty() {
+                        stalled = false;
+                    }
+
+                    let now = Instant::now();
+                    if let Some(at) =
+                        pending.iter().position(|entry| now >= entry.started + request_timeout)
+                    {
+                        let message =
+                            format!("peer {peer} did not answer a pipelined Raft RPC in time");
+                        if last_error.as_ref() != Some(&message) {
+                            logn!("Raft peer failed", "peer {},error {}", peer, message);
+                            last_error = Some(message);
+                        }
+                        pending[at].connection.close();
+                        pending.clear();
+                        stalled = false;
+                        unlocked = false;
+                        retry_at = Some(now + heartbeat);
+                    }
+
+                    let retry_ready = retry_at.is_none_or(|at| now >= at);
+                    let pending_empty = pending.is_empty();
+                    let pending_tails: Vec<_> = pending
+                        .iter()
+                        .filter_map(|entry| match &entry.request {
+                            Rpc::Append { previous, entries, .. } => Some((
+                                entry.request.term(),
+                                entries.last().map_or(*previous, |e| e.index).saturating_add(1),
+                            )),
+                            _ => None,
+                        })
+                        .collect();
+                    let can_send = !stalled && retry_ready && pending.len() < APPEND_WINDOW;
+                    let plan = runtime.on_raft_async(move |_, node| {
+                        let (contact, setup) =
+                            peer_eligibility(&node.state().membership(), node.id, peer);
+                        if node.journal.failed || !contact {
+                            return Ok(None);
+                        }
+                        let request = if node.role == Role::Leader {
+                            let next = node
+                                .next
+                                .get(&peer)
+                                .copied()
+                                .unwrap_or(node.state().last().saturating_add(1));
+                            let cursor = pending_tails
+                                .iter()
+                                .filter(|(term, _)| *term == node.state().term)
+                                .map(|(_, next)| *next)
+                                .max()
+                                .unwrap_or(1)
+                                .max(next);
+                            node.request_from(&peer, cursor)
+                        } else if pending_empty {
+                            node.request_reference(&peer)
+                        } else {
+                            None
+                        };
+                        Ok(Some((request, setup)))
+                    });
+
+                    let mut sent_data = false;
+                    match plan {
                         Err(error) => {
-                            unlocked = false;
                             let message = error.to_string();
                             if last_error.as_ref() != Some(&message) {
                                 logn!("Raft peer failed", "peer {},error {}", peer, message);
                                 last_error = Some(message);
                             }
+                            retry_at = Some(Instant::now() + heartbeat);
                         }
-                        Ok(()) if contacted && last_error.take().is_some() => {
-                            logn!("Raft peer recovered", "peer {}", peer);
+                        Ok(Some((request, setup))) => {
+                            let requested = runtime
+                                .readiness_requests
+                                .lock()
+                                .map_err(|_| Error::new("peer readiness lock poisoned"));
+                            let requested = match requested {
+                                Ok(requested) => requested.contains(&peer),
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    if last_error.as_ref() != Some(&message) {
+                                        logn!(
+                                            "Raft peer failed",
+                                            "peer {},error {}",
+                                            peer,
+                                            message
+                                        );
+                                        last_error = Some(message);
+                                    }
+                                    false
+                                }
+                            };
+                            if pending_empty && setup && (!unlocked || requested) {
+                                if let Some(action) = runtime.peer_message() {
+                                    match runtime.send_raft(&peer, Message::Client(action)) {
+                                        Ok(response) => {
+                                            unlocked = response.status == Status::Ok;
+                                            contacted |= unlocked;
+                                            if unlocked {
+                                                if let Ok(mut requests) =
+                                                    runtime.readiness_requests.lock()
+                                                {
+                                                    requests.remove(&peer);
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            let message = error.to_string();
+                                            if last_error.as_ref() != Some(&message) {
+                                                logn!(
+                                                    "Raft peer failed",
+                                                    "peer {},error {}",
+                                                    peer,
+                                                    message
+                                                );
+                                                last_error = Some(message);
+                                            }
+                                            unlocked = false;
+                                            retry_at = Some(Instant::now() + heartbeat);
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(request) = request {
+                                let is_append = matches!(request, Rpc::Append { .. });
+                                let is_data = matches!(&request, Rpc::Append { entries, .. } if !entries.is_empty());
+                                let send_heartbeat = pending_empty && now >= next_heartbeat;
+                                let should_send = can_send
+                                    && if is_append {
+                                        is_data || send_heartbeat
+                                    } else {
+                                        pending_empty
+                                    };
+                                if should_send {
+                                    match lease::now() {
+                                        Err(error) => {
+                                            let message = error.to_string();
+                                            if last_error.as_ref() != Some(&message) {
+                                                logn!(
+                                                    "Raft peer failed",
+                                                    "peer {},error {}",
+                                                    peer,
+                                                    message
+                                                );
+                                                last_error = Some(message);
+                                            }
+                                            retry_at = Some(Instant::now() + heartbeat);
+                                        }
+                                        Ok(sent) => {
+                                            request_id = request_id.wrapping_add(1);
+                                            let id = request_id;
+                                            let tx = answer_tx.clone();
+                                            let wake = current.clone();
+                                            let request_for_answer = request.clone();
+                                            let result = runtime.ask_raft(
+                                                peer,
+                                                Message::Consensus(request.clone()),
+                                                move |response| {
+                                                    let result = decode_consensus(response)
+                                                        .map_err(|error| error.to_string());
+                                                    let _ = tx.send(PeerAnswer { id, result });
+                                                    wake.unpark();
+                                                },
+                                            );
+                                            match result {
+                                                Ok(connection) => {
+                                                    pending.push(PendingRpc {
+                                                        id,
+                                                        request: request_for_answer,
+                                                            sent,
+                                                            started: Instant::now(),
+                                                            connection,
+                                                        });
+                                                    next_heartbeat = Instant::now() + heartbeat;
+                                                    sent_data = is_data;
+                                                }
+                                                Err(error) => {
+                                                    let message = error.to_string();
+                                                    if last_error.as_ref() != Some(&message) {
+                                                        logn!(
+                                                            "Raft peer failed",
+                                                            "peer {},error {}",
+                                                            peer,
+                                                            message
+                                                        );
+                                                        last_error = Some(message);
+                                                    }
+                                                    unlocked = false;
+                                                    retry_at = Some(Instant::now() + heartbeat);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        Ok(()) => {}
+                        Ok(None) => {}
                     }
-                    let interval = Duration::from_millis(runtime.options.raft.heartbeat_ms);
+
+                    if contacted && last_error.take().is_some() {
+                        logn!("Raft peer recovered", "peer {}", peer);
+                    }
+                    if sent_data && pending.len() < APPEND_WINDOW {
+                        drop(runtime);
+                        continue;
+                    }
+
+                    let now = Instant::now();
+                    let deadline = if pending.is_empty() {
+                        retry_at.filter(|retry| *retry > now).unwrap_or(next_heartbeat.max(now))
+                    } else {
+                        pending
+                            .iter()
+                            .map(|entry| entry.started + request_timeout)
+                            .min()
+                            .unwrap_or(now + heartbeat)
+                    };
+                    let wait = deadline.saturating_duration_since(now);
                     drop(runtime);
-                    std::thread::park_timeout(interval);
+                    if wait.is_zero() {
+                        continue;
+                    }
+                    std::thread::park_timeout(wait);
+                }
+                if let Some(runtime) = weak.upgrade() {
+                    if let Ok(mut peers) = runtime.peer_threads.lock() {
+                        if peers.get(&peer).is_some_and(|thread| thread.id() == current.id()) {
+                            peers.remove(&peer);
+                        }
+                    }
                 }
             })
             .context("starting Raft peer worker")?;
+        self.peer_threads
+            .lock()
+            .map_err(|_| Error::new("peer thread lock poisoned"))?
+            .insert(peer, handle.thread().clone());
         self.raft_workers.lock().map_err(|_| Error::new("worker lock poisoned"))?.push(handle);
         Ok(())
     }
