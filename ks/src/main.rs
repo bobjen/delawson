@@ -332,7 +332,7 @@ impl Ks {
         let journal = journal::Journal::open(path, initial, config.snapshot_retain, &runtime.name)?;
         let id =
             journal.state.membership().slot(&journal.identity.current).unwrap_or(raft::UNASSIGNED);
-        let mut node = raft::Node::new(id, journal);
+        let mut node = raft::Node::new_with_log2(id, journal, config.raft.log2_entries)?;
         node.merge_history_scn()?;
         node.identity = Some(node.journal.identity.current.clone());
         node.lease = lease::Lease::configured(&config.raft);

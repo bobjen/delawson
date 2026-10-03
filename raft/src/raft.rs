@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Index;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// Stable process identities within this ring. Endpoints are discovered, never voted on.
 // Low 32 bits are the logical slot; high 32 bits distinguish replacements.
@@ -263,11 +263,11 @@ impl Entry {
 
 const LOG_CHUNK: usize = 64;
 
-/// Copy-on-write log storage. Cloning a State shares the log; edits copy only
-/// the chunk index and the final entry chunk, not every prior entry.
+/// Copy-on-write log storage. Cloning a State shares the log; entries also stay
+/// shared when a retained-history queue pins them beyond a checkpoint.
 #[derive(Clone, Debug, Default)]
 pub struct EntryLog {
-    chunks: Arc<Vec<Arc<Vec<Entry>>>>,
+    chunks: Arc<Vec<Arc<Vec<Arc<Entry>>>>>,
     members: Option<usize>,
     checkpoints: Option<usize>,
     len: usize,
@@ -316,6 +316,18 @@ impl EntryLog {
         if index >= self.len {
             return None;
         }
+        self.chunks.get(index / LOG_CHUNK)?.get(index % LOG_CHUNK).map(Arc::as_ref)
+    }
+    pub fn shared(&self, index: usize) -> Option<Arc<Entry>> {
+        if index >= self.len {
+            return None;
+        }
+        self.chunks.get(index / LOG_CHUNK)?.get(index % LOG_CHUNK).cloned()
+    }
+    pub fn shared_ref(&self, index: usize) -> Option<&Arc<Entry>> {
+        if index >= self.len {
+            return None;
+        }
         self.chunks.get(index / LOG_CHUNK)?.get(index % LOG_CHUNK)
     }
     pub fn last(&self) -> Option<&Entry> {
@@ -328,9 +340,15 @@ impl EntryLog {
         self.last_mark(self.checkpoints, false, through)
     }
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Entry> + '_ {
+        self.chunks.iter().flat_map(|chunk| chunk.iter().map(Arc::as_ref))
+    }
+    pub fn shared_iter(&self) -> impl DoubleEndedIterator<Item = &Arc<Entry>> + '_ {
         self.chunks.iter().flat_map(|chunk| chunk.iter())
     }
     pub fn push(&mut self, entry: Entry) {
+        self.push_shared(Arc::new(entry));
+    }
+    pub fn push_shared(&mut self, entry: Arc<Entry>) {
         let len = self.len;
         let is_member = matches!(&entry.command, Command::Members(_));
         let is_checkpoint = matches!(&entry.command, Command::CheckpointStart(_));
@@ -370,7 +388,7 @@ impl EntryLog {
                 self.checkpoints = self.last_pos(false);
             }
         }
-        entry
+        entry.map(|entry| Arc::try_unwrap(entry).unwrap_or_else(|entry| (*entry).clone()))
     }
     pub fn truncate(&mut self, len: usize) {
         if len >= self.len {
@@ -399,9 +417,9 @@ impl EntryLog {
     }
     pub fn retain(&mut self, mut keep: impl FnMut(&Entry) -> bool) {
         let mut retained = Self::default();
-        for entry in self.iter() {
+        for entry in self.shared_iter() {
             if keep(entry) {
-                retained.push(entry.clone());
+                retained.push_shared(Arc::clone(entry));
             }
         }
         *self = retained;
@@ -427,7 +445,7 @@ impl EntryLog {
             Arc::make_mut(chunks.get_mut(index / LOG_CHUNK).expect("entry log chunk"))
                 .get_mut(index % LOG_CHUNK)
                 .expect("entry log index"),
-            entry,
+            Arc::new(entry),
         );
         if member {
             if self.members.is_none_or(|at| index > at) {
@@ -443,7 +461,7 @@ impl EntryLog {
         } else if self.checkpoints == Some(index) {
             self.checkpoints = self.last_pos(false);
         }
-        old
+        Arc::try_unwrap(old).unwrap_or_else(|old| (*old).clone())
     }
 }
 impl Extend<Entry> for EntryLog {
@@ -457,6 +475,15 @@ impl FromIterator<Entry> for EntryLog {
     fn from_iter<I: IntoIterator<Item = Entry>>(entries: I) -> Self {
         let mut log = Self::default();
         log.extend(entries);
+        log
+    }
+}
+impl FromIterator<Arc<Entry>> for EntryLog {
+    fn from_iter<I: IntoIterator<Item = Arc<Entry>>>(entries: I) -> Self {
+        let mut log = Self::default();
+        for entry in entries {
+            log.push_shared(entry);
+        }
         log
     }
 }
@@ -1135,6 +1162,162 @@ pub trait Storage {
     }
 }
 
+/// A bounded shared-entry index kept by every replica.
+struct EntryRing {
+    slots: Vec<Option<Arc<Entry>>>,
+    mask: usize,
+    first: u64,
+    len: usize,
+    previous: (u64, Scn),
+}
+impl EntryRing {
+    fn from_state(state: &State, log2: u8) -> Result<Self> {
+        let size = 1usize
+            .checked_shl(u32::from(log2))
+            .ok_or_else(|| Error::new("invalid retained log size"))?;
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(size).map_err(|_| Error::new("unable to reserve retained log"))?;
+        slots.resize_with(size, || None);
+        let mut retained =
+            Self { slots, mask: size - 1, first: 0, len: 0, previous: (0, Scn::new(0)) };
+        retained.reset(state)?;
+        Ok(retained)
+    }
+    fn reset(&mut self, state: &State) -> Result<()> {
+        let count = state.log.len().min(self.slots.len());
+        let first = state
+            .last()
+            .checked_sub(count as u64)
+            .and_then(|index| index.checked_add(1))
+            .ok_or_else(|| Error::new("retained log index overflow"))?;
+        self.reset_from(state, first)
+    }
+    fn reset_from(&mut self, state: &State, requested: u64) -> Result<()> {
+        for slot in &mut self.slots {
+            *slot = None;
+        }
+        let first = requested
+            .max(state.snapshot.index.saturating_add(1))
+            .min(state.last().saturating_add(1));
+        let count = if first > state.last() {
+            0
+        } else {
+            usize::try_from(state.last() - first + 1).unwrap_or(usize::MAX).min(self.slots.len())
+        };
+        let previous_index = first - 1;
+        let previous = state
+            .history_at(previous_index)
+            .ok_or_else(|| Error::new("missing retained log predecessor"))?;
+        for index in first..first + count as u64 {
+            let position = index
+                .checked_sub(state.snapshot.index)
+                .and_then(|value| value.checked_sub(1))
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| Error::new("invalid retained log position"))?;
+            let entry = state
+                .log
+                .shared(position)
+                .ok_or_else(|| Error::new("missing retained log entry"))?;
+            self.slots[index as usize & self.mask] = Some(entry);
+        }
+        self.first = first;
+        self.len = count;
+        self.previous = previous;
+        Ok(())
+    }
+    fn end(&self) -> u64 {
+        self.first + self.len as u64
+    }
+    fn evict(&mut self) {
+        debug_assert!(self.len > 0);
+        let at = self.first as usize & self.mask;
+        let entry = self.slots[at].take().expect("retained log head");
+        debug_assert_eq!(entry.index, self.first);
+        self.previous = (entry.term, entry.scn);
+        self.first += 1;
+        self.len -= 1;
+    }
+    fn make_room(&mut self, count: usize, through: u64) -> usize {
+        let wanted = count.min(self.slots.len());
+        while self.len + wanted > self.slots.len() && self.len > 0 && self.first <= through {
+            self.evict();
+        }
+        self.slots.len().saturating_sub(self.len).min(count)
+    }
+    fn fill(&mut self, state: &State) -> Result<()> {
+        while self.len < self.slots.len() && self.end() <= state.last() {
+            let index = self.end();
+            let position = index
+                .checked_sub(state.snapshot.index)
+                .and_then(|value| value.checked_sub(1))
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| Error::new("invalid retained log position"))?;
+            let entry = state
+                .log
+                .shared(position)
+                .ok_or_else(|| Error::new("missing retained log entry"))?;
+            self.push(entry)?;
+        }
+        Ok(())
+    }
+    fn truncate(&mut self, from: u64) {
+        if from >= self.end() {
+            return;
+        }
+        debug_assert!(from >= self.first);
+        while self.end() > from {
+            let at = (self.end() - 1) as usize & self.mask;
+            self.slots[at] = None;
+            self.len -= 1;
+        }
+    }
+    fn push(&mut self, entry: Arc<Entry>) -> Result<()> {
+        if self.len == self.slots.len() || entry.index != self.end() {
+            return Err(Error::new("retained log is full or nonsequential"));
+        }
+        let at = entry.index as usize & self.mask;
+        self.slots[at] = Some(entry);
+        self.len += 1;
+        Ok(())
+    }
+    fn get(&self, index: u64) -> Option<&Arc<Entry>> {
+        if index < self.first || index >= self.end() {
+            return None;
+        }
+        self.slots[index as usize & self.mask].as_ref()
+    }
+    fn tip(&self, index: u64) -> Option<(u64, Scn)> {
+        if index.checked_add(1) == Some(self.first) {
+            Some(self.previous)
+        } else {
+            self.get(index).map(|entry| (entry.term, entry.scn))
+        }
+    }
+    fn suffix(
+        &self,
+        ring: &str,
+        after: u64,
+        through: u64,
+        commit: u64,
+    ) -> Option<crate::journal::CommittedJournal> {
+        let last = commit.min(through);
+        if after >= last || after.checked_add(1)? < self.first || after >= self.end() {
+            return None;
+        }
+        let (previous_term, previous_scn) = self.tip(after)?;
+        let end = last.min(after.checked_add(128)?);
+        let entries =
+            (after + 1..=end).map(|index| self.get(index).cloned()).collect::<Option<Vec<_>>>()?;
+        Some(crate::journal::CommittedJournal {
+            ring: ring.to_owned(),
+            after,
+            previous_term,
+            previous_scn,
+            entries,
+        })
+    }
+}
+
 pub struct Node<S: Storage = Journal> {
     pub id: MemberId,
     pub identity: Option<common::ring::MemberIdentity>,
@@ -1151,6 +1334,9 @@ pub struct Node<S: Storage = Journal> {
     pub contact: u64,
     pub leader_contact: Option<std::time::Instant>,
     pub lease: crate::lease::Lease,
+    retained: EntryRing,
+    applied: Option<Arc<AtomicU64>>,
+    applying_state: bool,
     #[cfg(any(test, feature = "testing"))]
     clock: Option<std::time::Duration>,
     #[cfg(any(test, feature = "testing"))]
@@ -1160,7 +1346,14 @@ pub struct Node<S: Storage = Journal> {
 }
 impl<S: Storage> Node<S> {
     pub fn new(id: MemberId, journal: S) -> Self {
-        Self {
+        Self::new_with_log2(id, journal, 16).expect("default retained log size is valid")
+    }
+    pub fn new_with_log2(id: MemberId, journal: S, log2_entries: u8) -> Result<Self> {
+        if !(1..=27).contains(&log2_entries) {
+            return Err(Error::new("Raft log2_entries must be between 1 and 27"));
+        }
+        let retained = EntryRing::from_state(journal.state(), log2_entries)?;
+        Ok(Self {
             #[cfg(any(test, feature = "testing"))]
             scn_clock: journal.state().largest_scn().unwrap_or(Scn::new(0)),
             #[cfg(any(test, feature = "testing"))]
@@ -1179,9 +1372,116 @@ impl<S: Storage> Node<S> {
             // Restart must not erase the quiet period and immediately grant a vote.
             leader_contact: Some(std::time::Instant::now()),
             lease: crate::lease::Lease::default(),
+            retained,
+            applied: None,
+            applying_state: false,
             #[cfg(any(test, feature = "testing"))]
             clock: None,
+        })
+    }
+    pub(crate) fn set_applied(&mut self, applied: Arc<AtomicU64>) {
+        self.applied = Some(applied);
+    }
+    pub(crate) fn set_applying_state(&mut self, applying: bool) -> Result<()> {
+        if self.applying_state == applying {
+            return Ok(());
         }
+        self.applying_state = applying;
+        self.reset_retained_for_mode()
+    }
+    fn reset_retained_for_mode(&mut self) -> Result<()> {
+        let active = self.role == Role::Leader || self.applying_state;
+        let applied = self.applied.as_ref().map_or(0, |value| value.load(Ordering::Acquire));
+        let state = self.journal.state();
+        if active {
+            self.retained.reset_from(state, applied.saturating_add(1))
+        } else {
+            self.retained.reset(state)
+        }
+    }
+    pub(crate) fn reset_retained(&mut self) -> Result<()> {
+        self.reset_retained_for_mode()
+    }
+    pub fn refresh_retained(&mut self) -> Result<()> {
+        if self.retained.first <= self.journal.state().snapshot.index {
+            self.reset_retained_for_mode()?;
+        }
+        let state = self.journal.state();
+        let active = self.role == Role::Leader || self.applying_state;
+        if !active {
+            let tail = state.log.len().checked_sub(1).and_then(|at| state.log.shared(at));
+            let matches = self.retained.end() == state.last().saturating_add(1)
+                && tail.is_none_or(|entry| {
+                    self.retained
+                        .get(entry.index)
+                        .is_some_and(|retained| Arc::ptr_eq(retained, &entry))
+                });
+            if !matches {
+                self.retained.reset(state)?;
+            }
+            return Ok(());
+        }
+        let through = self.evict_through();
+        let retained = &mut self.retained;
+        while retained.len == retained.slots.len()
+            && retained.end() <= state.last()
+            && retained.first <= through
+        {
+            retained.evict();
+        }
+        retained.fill(state)?;
+        Ok(())
+    }
+    /// Drop entries only through the state boundary this replica has completed.
+    pub fn has_entry_room(&mut self) -> bool {
+        self.entry_room(1).is_ok_and(|room| room == 1)
+    }
+    fn entry_room(&mut self, count: usize) -> Result<usize> {
+        self.refresh_retained()?;
+        let through = self.evict_through();
+        if self.role != Role::Leader && !self.applying_state {
+            return Ok(self.retained.make_room(count, through));
+        }
+        let wanted = count.min(self.retained.slots.len());
+        loop {
+            let free = self.retained.slots.len() - self.retained.len;
+            if free >= wanted || self.retained.first > through {
+                return Ok(free.min(count));
+            }
+            self.retained.evict();
+            self.retained.fill(self.journal.state())?;
+        }
+    }
+    fn evict_through(&self) -> u64 {
+        if self.role == Role::Leader || self.applying_state {
+            self.applied.as_ref().map_or(0, |value| value.load(Ordering::Acquire))
+        } else {
+            self.state().commit
+        }
+    }
+    /// Resolve an entry through the retained ring, falling back to the journal log
+    /// for older entries outside the bounded window.
+    pub fn shared_entry_in(&self, state: &State, index: u64) -> Option<Arc<Entry>> {
+        if index <= state.snapshot.index || index > state.last() {
+            return None;
+        }
+        let position = index.checked_sub(state.snapshot.index)?.checked_sub(1)?;
+        let position = usize::try_from(position).ok()?;
+        let entry = state.log.shared_ref(position)?;
+        if entry.index != index {
+            return None;
+        }
+        self.retained
+            .get(index)
+            .filter(|retained| Arc::ptr_eq(retained, entry))
+            .cloned()
+            .or_else(|| Some(Arc::clone(entry)))
+    }
+    pub fn shared_entry(&self, index: u64) -> Option<Arc<Entry>> {
+        self.shared_entry_in(self.state(), index)
+    }
+    pub fn entry_capacity(&self) -> usize {
+        self.retained.slots.len()
     }
     pub fn state(&self) -> &State {
         self.journal.state()
@@ -1250,13 +1550,48 @@ impl<S: Storage> Node<S> {
             _ => false,
         });
         let mut accepted = Vec::new();
+        let mut changed_from = Vec::new();
+        let mut installed = false;
         for record in &records {
-            if let Record::Entries { entries, .. } = record {
-                accepted.extend(entries.iter().map(|entry| (entry.index, entry.term, entry.scn)));
+            match record {
+                Record::Entries { from, entries } => {
+                    changed_from.push(*from);
+                    accepted
+                        .extend(entries.iter().map(|entry| (entry.index, entry.term, entry.scn)));
+                }
+                Record::Install(_) => installed = true,
+                _ => {}
             }
         }
         let previous_commit = self.state().commit;
         self.journal.write_owned(records)?;
+        let snapshot_index = self.journal.state().snapshot.index;
+        if installed
+            || self.retained.first <= snapshot_index
+            || self.retained.end() <= snapshot_index
+        {
+            self.reset_retained_for_mode()?;
+        } else {
+            let mut reset = false;
+            {
+                let state = self.journal.state();
+                for from in changed_from {
+                    if from < self.retained.end() {
+                        if from < self.retained.first {
+                            reset = true;
+                            break;
+                        }
+                        self.retained.truncate(from);
+                    }
+                }
+                if !reset {
+                    self.retained.fill(state)?;
+                }
+            }
+            if reset {
+                self.reset_retained_for_mode()?;
+            }
+        }
         for (index, term, scn) in accepted {
             common::logn!(
                 "Raft entry accepted",
@@ -1307,6 +1642,7 @@ impl<S: Storage> Node<S> {
         if self.role != Role::Leader
             || !self.write_authority()?
             || self.state().last() != self.state().commit
+            || !self.has_entry_room()
         {
             return Ok(());
         }
@@ -1455,8 +1791,9 @@ impl<S: Storage> Node<S> {
     fn win(&mut self) -> Result<()> {
         self.expire_campaign()?;
         if self.role == Role::Candidate && self.state().membership().quorum(&self.votes) {
-            self.lease.start(self.state().term, self.now()?);
             self.role = Role::Leader;
+            self.reset_retained_for_mode()?;
+            self.lease.start(self.state().term, self.now()?);
             common::logn!(
                 "Raft primary elected",
                 "member {},term {},votes {:?},last {},commit {}",
@@ -1498,6 +1835,9 @@ impl<S: Storage> Node<S> {
         if !self.write_authority()? {
             return Err(Error::new("Raft primary lease expired; retry after quorum heartbeat"));
         }
+        if !self.has_entry_room() {
+            return Err(Error::new("Raft retained history is full; waiting for apply"));
+        }
         let index =
             self.state().last().checked_add(1).ok_or_else(|| Error::new("Raft index overflow"))?;
         let scn = self.next_scn()?.ok_or_else(|| {
@@ -1515,6 +1855,9 @@ impl<S: Storage> Node<S> {
         // A stalled SCN allocator must not stall the consensus owner. Retry the
         // mandatory current-term entry on maintenance ticks; heartbeats still run.
         if self.state().term_at(self.state().last()) != Some(self.state().term) {
+            if !self.has_entry_room() {
+                return Ok(());
+            }
             let Some(scn) = self.next_scn()? else {
                 return Ok(());
             };
@@ -1563,12 +1906,14 @@ impl<S: Storage> Node<S> {
         if committed.new.is_some() && committed == self.state().membership() {
             let new =
                 committed.new.clone().ok_or_else(|| Error::new("missing joint configuration"))?;
-            self.propose(Command::Members(Membership {
-                retired: membership.retired.clone(),
-                identities: membership.identities.clone(),
-                old: new,
-                new: None,
-            }))?;
+            if self.has_entry_room() {
+                self.propose(Command::Members(Membership {
+                    retired: membership.retired.clone(),
+                    identities: membership.identities.clone(),
+                    old: new,
+                    new: None,
+                }))?;
+            }
         }
         let current = self.state().membership();
         let final_committed = self.state().committed_membership() == current;
@@ -1576,6 +1921,19 @@ impl<S: Storage> Node<S> {
             self.follow(self.state().term)?;
         }
         Ok(())
+    }
+    pub fn retained_tip(&self, index: u64) -> Option<(u64, Scn)> {
+        if index > self.state().commit {
+            return None;
+        }
+        self.retained.tip(index)
+    }
+    pub fn retained_suffix(
+        &self,
+        after: u64,
+        through: u64,
+    ) -> Option<crate::journal::CommittedJournal> {
+        self.retained.suffix(&self.state().ring, after, through, self.state().commit)
     }
     pub fn election_quiet(&self, now: std::time::Instant, minimum: std::time::Duration) -> bool {
         self.role == Role::Leader
@@ -1642,7 +2000,10 @@ impl<S: Storage> Node<S> {
                     previous,
                     previous_term: s.term_at(previous)?,
                     previous_scn: s.scn_at(previous)?,
-                    entries: s.log.iter().filter(|e| e.index >= next).take(128).cloned().collect(),
+                    entries: (next..=s.last())
+                        .take(128)
+                        .map(|index| self.shared_entry(index).map(|entry| (*entry).clone()))
+                        .collect::<Option<Vec<_>>>()?,
                     commit: s.commit,
                 })
             }
@@ -1791,6 +2152,7 @@ impl<S: Storage> Node<S> {
                         expected.checked_add(1).ok_or_else(|| Error::new("Raft index overflow"))?;
                 }
                 let mut records = vec![];
+                let mut matched = expected - 1;
                 if let Some(start) = entries
                     .iter()
                     .position(|e| self.state().history_at(e.index) != Some((e.term, e.scn)))
@@ -1799,12 +2161,18 @@ impl<S: Storage> Node<S> {
                         self.repairing = true;
                         return Ok(answer);
                     }
-                    records.push(Record::Entries {
-                        from: entries[start].index,
-                        entries: entries[start..].to_vec(),
-                    });
+                    let new_count = entries.len() - start;
+                    let accepted = self.entry_room(new_count)?;
+                    if accepted > 0 {
+                        records.push(Record::Entries {
+                            from: entries[start].index,
+                            entries: entries[start..start + accepted].to_vec(),
+                        });
+                        matched = entries[start + accepted - 1].index;
+                    } else {
+                        matched = entries[start].index - 1;
+                    }
                 }
-                let matched = expected - 1;
                 let new_commit = (*commit).min(matched);
                 if new_commit > self.state().commit {
                     records.push(Record::Commit(new_commit));
@@ -1872,7 +2240,8 @@ impl<S: Storage> Node<S> {
             }
             Rpc::Append { previous, entries, .. } if self.role == Role::Leader => {
                 if answer.success {
-                    let matched = entries.last().map_or(*previous, |e| e.index);
+                    let sent = entries.last().map_or(*previous, |e| e.index);
+                    let matched = answer.matched.min(sent);
                     self.matched
                         .entry(*peer)
                         .and_modify(|v| *v = (*v).max(matched))
@@ -2479,6 +2848,106 @@ pub mod tests {
             id as u64,
             Memory { pending: None, initial: state.clone(), state, records: vec![], failed: false },
         )
+    }
+    #[test]
+    fn ring_waits_apply() {
+        let primary = node(0, members(1));
+        let mut primary = Node::new_with_log2(primary.id, primary.journal, 1).unwrap();
+        let applied = Arc::new(AtomicU64::new(0));
+        primary.set_applied(Arc::clone(&applied));
+        primary.campaign().unwrap();
+        assert_eq!(primary.state().commit, 1);
+
+        let original = primary.retained.get(1).unwrap().clone();
+        assert!(Arc::ptr_eq(&original, &primary.state().log.shared(0).expect("state entry")));
+        assert_eq!(primary.propose(Command::Noop).unwrap(), 2);
+        assert!(primary.propose(Command::Noop).is_err());
+
+        applied.store(1, Ordering::Release);
+        assert_eq!(primary.propose(Command::Noop).unwrap(), 3);
+        assert_eq!(primary.retained_tip(1), Some((original.term, original.scn)));
+        let suffix = primary.retained_suffix(1, 3).unwrap();
+        assert_eq!(suffix.entries.iter().map(|entry| entry.index).collect::<Vec<_>>(), [2, 3]);
+        assert!(Arc::ptr_eq(
+            &suffix.entries[0],
+            &primary.state().log.shared(1).expect("state entry")
+        ));
+        let wire = crate::codec::encode(&suffix).unwrap();
+        let decoded: crate::journal::CommittedJournal = crate::codec::decode(&wire).unwrap();
+        assert_eq!(decoded.entries[0].index, 2);
+    }
+    #[test]
+    fn replica_ring_evicts_at_commit_or_apply() {
+        let entries: Vec<_> = (1..=3)
+            .map(|index| Entry {
+                scn: Scn::new(index),
+                index,
+                term: 1,
+                command: Command::Noop,
+                entry_buf: None,
+            })
+            .collect();
+        for applying in [false, true] {
+            let base = node(1, members(2));
+            let mut follower = Node::new_with_log2(base.id, base.journal, 1).unwrap();
+            let applied = Arc::new(AtomicU64::new(0));
+            if applying {
+                follower.set_applied(Arc::clone(&applied));
+                follower.set_applying_state(true).unwrap();
+            }
+            let first = follower
+                .receive(
+                    &0,
+                    &Rpc::Append {
+                        term: 1,
+                        previous: 0,
+                        previous_term: 0,
+                        previous_scn: Scn::new(0),
+                        entries: entries.clone(),
+                        commit: 0,
+                    },
+                )
+                .unwrap();
+            assert!(first.success);
+            assert_eq!(first.matched, 2, "replica accepted only its two free slots");
+
+            let commit = follower
+                .receive(
+                    &0,
+                    &Rpc::Append {
+                        term: 1,
+                        previous: 2,
+                        previous_term: 1,
+                        previous_scn: Scn::new(2),
+                        entries: vec![],
+                        commit: 2,
+                    },
+                )
+                .unwrap();
+            assert!(commit.success);
+            assert_eq!(follower.state().commit, 2);
+
+            let third = Rpc::Append {
+                term: 1,
+                previous: 2,
+                previous_term: 1,
+                previous_scn: Scn::new(2),
+                entries: vec![entries[2].clone()],
+                commit: 2,
+            };
+            let answer = follower.receive(&0, &third).unwrap();
+            if applying {
+                assert_eq!(answer.matched, 2, "applying replica retains unapplied entries");
+                assert_eq!(follower.state().last(), 2);
+                applied.store(1, Ordering::Release);
+                assert_eq!(follower.receive(&0, &third).unwrap().matched, 3);
+            } else {
+                assert_eq!(answer.matched, 3, "cold replica reclaims through commit");
+            }
+            assert_eq!(follower.retained.first, 2);
+            assert_eq!(follower.retained.get(2).unwrap().index, 2);
+            assert_eq!(follower.retained.get(3).unwrap().index, 3);
+        }
     }
     #[cfg(test)]
     fn exchange(a: &mut TestNode, b: &mut TestNode) {

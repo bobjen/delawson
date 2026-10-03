@@ -37,6 +37,8 @@ workers = 0
 # with distinct process IDs, listen addresses, and data directories.
 # [raft]
 # ring = "KS0"
+# Number of recent shared entries retained by each member is 2^log2_entries.
+# log2_entries = 16
 # Primary plus hot backups; at least two in a multi-member ring.
 # apply_members = 3
 # Release/reacquire the global write lock between actions after this much execution.

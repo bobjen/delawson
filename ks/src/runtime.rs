@@ -266,7 +266,7 @@ impl Ks {
             let sealed = seal_key(&key, &node.state().ring, index, node.state().term, &epoch)?;
             let index =
                 node.propose(Command::Client(vec![raft::Action::new(Op::KsKey, sealed)]))?;
-            host.refresh_application(&node)?;
+            host.refresh_application(node)?;
             Ok(index)
         })?;
         self.wait_applied(index)?;

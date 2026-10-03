@@ -28,14 +28,14 @@ const CLIENT_INTERVAL: Duration = Duration::ZERO;
 // Applied progress wakes waiters; this only rechecks leadership and failures.
 const APPLY_TICK: Duration = Duration::from_millis(100);
 struct ApplyWatch {
-    applied: AtomicU64,
+    applied: Arc<AtomicU64>,
     version: ParkMutex<u64>,
     changed: Condvar,
 }
 impl ApplyWatch {
     fn new(applied: u64) -> Self {
         Self {
-            applied: AtomicU64::new(applied),
+            applied: Arc::new(AtomicU64::new(applied)),
             version: ParkMutex::new(0),
             changed: Condvar::new(),
         }
@@ -83,7 +83,12 @@ pub struct WorkQueue {
     enabled: bool,
 }
 impl WorkQueue {
-    fn enqueue(&mut self, state: &State, enabled: bool) {
+    pub(crate) fn enqueue<S: Storage>(
+        &mut self,
+        node: &Node<S>,
+        state: &State,
+        enabled: bool,
+    ) -> Result<()> {
         let changed = self.generation != state.generation;
         if changed {
             *self = Self { generation: state.generation, ..Self::default() };
@@ -96,48 +101,67 @@ impl WorkQueue {
                 self.snapshot = None;
             }
             self.enabled = false;
-            return;
+            return Ok(());
         }
         if !self.enabled {
-            self.last = 0;
+            self.last = state.snapshot.index;
             self.snapshot = None;
             self.pending = None;
         }
         self.enabled = true;
-        if state.commit <= self.last && !changed {
-            return;
-        }
         let snapshot = self.snapshot.get_or_insert_with(|| Arc::new(state.snapshot.clone()));
         if snapshot.index != state.snapshot.index {
             *snapshot = Arc::new(state.snapshot.clone());
+            self.last = self.last.max(snapshot.index);
         }
-        let entries: crate::raft::EntryLog = state
-            .log
-            .iter()
-            .filter(|e| e.index > self.last && e.index <= state.commit)
-            .cloned()
-            .collect();
+        let queued = match &self.pending {
+            Some(PendingWork::Apply(work)) => work.entries.len(),
+            _ => 0,
+        };
+        let room = node.entry_capacity().saturating_sub(queued);
+        let start = self.last.saturating_add(1).max(snapshot.index.saturating_add(1));
+        let end = state.commit.min(start.saturating_add(room.saturating_sub(1) as u64));
+        let mut entries = crate::raft::EntryLog::default();
+        if room > 0 && start <= end {
+            for index in start..=end {
+                let entry = node
+                    .shared_entry_in(state, index)
+                    .ok_or_else(|| Error::new("committed Raft entry missing from retained log"))?;
+                entries.push_shared(entry);
+            }
+        }
         debug_assert!(entries.iter().all(|entry| entry.is_written() && entry.is_durable()));
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let through = entries.last().map_or(self.last, |entry| entry.index);
         if let Some(PendingWork::Apply(work)) = &mut self.pending {
-            work.entries.extend(entries.iter().cloned());
+            for entry in entries.shared_iter() {
+                work.entries.push_shared(Arc::clone(entry));
+            }
             work.entries.retain(|e| e.index > snapshot.index);
             work.snapshot = snapshot.clone();
-            work.commit = state.commit;
+            work.commit = through;
         } else {
             self.pending = Some(PendingWork::Apply(crate::execution::Work {
                 generation: state.generation,
                 ring: state.ring.clone(),
                 snapshot: snapshot.clone(),
                 entries,
-                commit: state.commit,
+                commit: through,
             }));
         }
-        self.last = state.commit;
+        self.last = through;
+        Ok(())
     }
 }
 pub enum Deferred {
     Message(Message),
     Read(crate::io::Read<Vec<u8>>),
+}
+enum TipRead {
+    Retained((u64, common::scn::Scn)),
+    Disk(crate::io::Read<Option<(u64, common::scn::Scn)>>),
 }
 enum CheckpointPlan {
     Request(MemberId),
@@ -192,16 +216,20 @@ impl<S: Default + Application> Runtime<S> {
 
 impl<S> Runtime<S> {
     /// Construct a runtime around application state that needs configuration to build.
-    pub fn with_state(runtime: Settings, node: Node, options: Options, initial: S) -> Self
+    pub fn with_state(runtime: Settings, mut node: Node, options: Options, initial: S) -> Self
     where
         S: Application,
     {
         let applied = 0;
+        let apply_watch = ApplyWatch::new(applied);
+        node.set_applied(Arc::clone(&apply_watch.applied));
         let membership = node.state().membership();
         let placement = application::Placement::new(
             &membership.replacements(&membership.members()),
             options.raft.apply_members,
         );
+        let applying = placement.selected.contains(&node.id);
+        node.set_applying_state(applying).expect("valid retained log range");
         let transport = runtime.messaging.as_ref().map(|messaging| {
             let mut messaging = messaging.clone();
             messaging.peer_conns = 1;
@@ -214,7 +242,7 @@ impl<S> Runtime<S> {
         Self {
             execution_wake,
             execution_receive: Mutex::new(Some(execution_receive)),
-            applying: AtomicBool::new(placement.selected.contains(&node.id)),
+            applying: AtomicBool::new(applying),
             placement: Mutex::new(placement),
             options,
             runtime,
@@ -239,7 +267,7 @@ impl<S> Runtime<S> {
             global_lock: RwLock::new(initial),
             execution: Mutex::new(crate::execution::Cursor::default()),
             metadata_execution: Mutex::new(crate::execution::Cursor::default()),
-            apply_watch: ApplyWatch::new(applied),
+            apply_watch,
             metadata_applied: AtomicU64::new(0),
             application_generation: AtomicU64::new(0),
             metadata_generation: AtomicU64::new(0),
@@ -256,6 +284,7 @@ impl<S> Runtime<S> {
     }
     pub fn publish_applied(&self, index: u64) {
         self.apply_watch.publish(index);
+        self.journal.wake();
     }
     pub fn metadata_applied(&self) -> u64 {
         self.metadata_applied.load(Ordering::Acquire)
@@ -297,6 +326,9 @@ impl<S> Runtime<S> {
             .map_err(|_| Error::new("client proposal queue poisoned"))?
             .is_empty()
         {
+            return Ok(());
+        }
+        if !node.has_entry_room() {
             return Ok(());
         }
         let delay = client_delay(
@@ -843,14 +875,20 @@ pub trait Host:
         self.raft_workers.lock().map_err(|_| Error::new("worker lock poisoned"))?.push(handle);
         Ok(())
     }
-    fn accept_placement(&self, selected: Option<&BTreeSet<MemberId>>, node: &Node) -> Result<()> {
+    fn accept_placement(
+        &self,
+        selected: Option<&BTreeSet<MemberId>>,
+        node: &mut Node,
+    ) -> Result<()> {
         if let Some(selected) = selected {
             let members = node.state().membership().members();
             let mut placement =
                 self.placement.lock().map_err(|_| Error::new("placement lock poisoned"))?;
             placement.selected =
                 selected.iter().filter(|id| members.contains(*id)).cloned().collect();
-            self.applying.store(placement.selected.contains(&node.id), Ordering::SeqCst);
+            let applying = placement.selected.contains(&node.id);
+            node.set_applying_state(applying)?;
+            self.applying.store(applying, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -921,10 +959,18 @@ pub trait Host:
             if node.role != Role::Leader || node.state().term != term {
                 return Err(Error::new("history proof requires the current primary"));
             }
-            Ok(Some(node.journal.read_history(move |history| history.committed_tip(index))?))
+            if let Some(tip) = node.retained_tip(index) {
+                return Ok(Some(TipRead::Retained(tip)));
+            }
+            Ok(Some(TipRead::Disk(
+                node.journal.read_history(move |history| history.committed_tip(index))?,
+            )))
         })?;
         if let Some(value) = local {
-            return value.wait();
+            return match value {
+                TipRead::Retained(tip) => Ok(Some(tip)),
+                TipRead::Disk(read) => read.wait(),
+            };
         }
         let response = self.send_raft(&primary, Message::JournalTip { index, term })?;
         if response.status != Status::Ok {
@@ -1070,6 +1116,7 @@ pub trait Host:
                     node.merge_scn(scn)?;
                 }
                 node.journal.import_committed(&copied, through)?;
+                node.reset_retained()?;
                 logn!(
                     "Raft committed journal copied",
                     "peer {},after {},through {}",
@@ -1078,7 +1125,7 @@ pub trait Host:
                     through
                 );
                 node.refresh_slot();
-                host.refresh_application(&node)?;
+                host.refresh_application(node)?;
                 Ok(true)
             })? {
                 return Ok(true);
@@ -1274,6 +1321,7 @@ pub trait Host:
                                 node.merge_scn(scn)?;
                             }
                             node.journal.write(&[install])?;
+                            node.reset_retained()?;
                             node.refresh_slot();
                         }
                         logn!(
@@ -1315,10 +1363,11 @@ pub trait Host:
             }
         }
     }
-    fn refresh_application(&self, node: &Node) -> Result<()> {
+    fn refresh_application(&self, node: &mut Node) -> Result<()> {
         if node.repairing {
             return Ok(());
         }
+        node.refresh_retained()?;
         // A candidate can keep writing. Only winning requires abandoning production;
         // singleton primaries remain the explicit checkpoint-production exception.
         if cancel_checkpoint_after_election(node.role, node.state().membership().members().len())
@@ -1333,7 +1382,7 @@ pub trait Host:
         if self.has_metadata() {
             let mut queue =
                 self.metadata_queue.lock().map_err(|_| Error::new("metadata queue poisoned"))?;
-            queue.enqueue(node.journal.durable_state(), true);
+            queue.enqueue(node, node.journal.durable_state(), true)?;
             if queue.pending.is_some() {
                 self.wake_execution();
             }
@@ -1342,7 +1391,7 @@ pub trait Host:
             && (node.role == Role::Leader || self.applying.load(Ordering::SeqCst));
         let mut queue =
             self.work_queue.lock().map_err(|_| Error::new("application queue poisoned"))?;
-        queue.enqueue(node.journal.durable_state(), enabled);
+        queue.enqueue(node, node.journal.durable_state(), enabled)?;
         let pending = queue.pending.is_some();
         drop(queue);
         if pending {
@@ -1453,6 +1502,7 @@ pub trait Host:
                     }
                     // exec_report has published the atomic index before unlocking state.
                     self.apply_watch.signal();
+                    self.journal.wake();
                     Ok(complete)
                 }
             }
@@ -1979,7 +2029,7 @@ pub trait Host:
                 {
                     return Err(Error::new("checkpoint writer is not an unlocked applying member"));
                 }
-                self.refresh_application(&node)?;
+                self.refresh_application(node)?;
                 let lease = self
                     .checkpoint_lease
                     .lock()
@@ -2000,6 +2050,9 @@ pub trait Host:
                 if node.role != Role::Leader || node.state().term != term {
                     return Err(Error::new("journal history proof requires the current primary"));
                 }
+                if let Some(tip) = node.retained_tip(index) {
+                    return Ok(Resp::bytes(binary(&Some(tip))?));
+                }
                 let read = node
                     .journal
                     .read_history(move |history| binary(&history.committed_tip(index)?))?;
@@ -2013,6 +2066,9 @@ pub trait Host:
                     || (node.role == Role::Leader && !primary_fallback)
                 {
                     return Err(Error::new("journal source unavailable"));
+                }
+                if let Some(suffix) = node.retained_suffix(after, through) {
+                    return Ok(Resp::bytes(binary(&Some(suffix))?));
                 }
                 let read = node.journal.read_history(move |history| {
                     binary(&history.committed_suffix(after, through)?)
@@ -2081,14 +2137,14 @@ pub trait Host:
                     && rpc.term() == node.state().term
                     && node.leader.as_ref() == Some(sender)
                 {
-                    self.accept_placement(packet.applying.as_ref(), &node)?;
+                    self.accept_placement(packet.applying.as_ref(), node)?;
                     if let Rpc::Checkpoint { index, .. } = rpc {
                         if !answer.success {
                             self.checkpoint_needed.fetch_max(index, Ordering::SeqCst);
                         }
                     }
                 }
-                self.refresh_application(&node)?;
+                self.refresh_application(node)?;
                 Ok(Resp::bytes(crate::codec::encode_message(&ConsensusReply {
                     member: if node.id == UNASSIGNED {
                         Sender::Applicant(node.journal.identity.current.clone())
@@ -2330,7 +2386,7 @@ pub trait Host:
                 node.accept_replacements()?;
                 host.prepare_primary(node)?;
                 host.flush_client_proposals(node)?;
-                host.refresh_application(&node)?;
+                host.refresh_application(node)?;
                 let members = node.state().membership().participants();
                 let local_id = node.id;
                 peers.retain(|id, cancelled| {
@@ -2471,7 +2527,7 @@ pub trait Host:
                                     .acknowledge(&peer, Instant::now());
 
                                 node.response_sent(&peer, &request, &response.answer, sent)?;
-                                host.refresh_application(&node)?;
+                                host.refresh_application(node)?;
                                 Ok(())
                             })?;
                         }
@@ -2602,6 +2658,46 @@ impl crate::codec::Wire for Sender {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_loads_committed_entries_in_bounded_chunks() {
+        let base = raft::tests::node(0, raft::tests::members(1));
+        let mut node = Node::new_with_log2(base.id, base.journal, 2).unwrap();
+        let applied = Arc::new(AtomicU64::new(0));
+        node.set_applied(applied);
+        node.set_applying_state(true).unwrap();
+        node.journal.write(&[raft::Record::Hard { term: 1, vote: None }]).unwrap();
+        let entries: Vec<_> = (1..=5)
+            .map(|index| Entry {
+                scn: common::scn::Scn::new(index),
+                index,
+                term: 1,
+                command: Command::Noop,
+                entry_buf: None,
+            })
+            .collect();
+        node.journal
+            .write(&[raft::Record::Entries { from: 1, entries }, raft::Record::Commit(5)])
+            .unwrap();
+        node.refresh_retained().unwrap();
+
+        let mut queue = WorkQueue::default();
+        queue.enqueue(&node, node.journal.durable_state(), true).unwrap();
+        let Some(PendingWork::Apply(work)) = queue.pending.as_ref() else {
+            panic!("expected replay work");
+        };
+        assert_eq!(work.entries.len(), 4);
+        assert_eq!(work.commit, 4);
+        assert!(Arc::ptr_eq(&node.shared_entry(1).unwrap(), &work.entries.shared(0).unwrap()));
+
+        queue.pending.take();
+        queue.enqueue(&node, node.journal.durable_state(), true).unwrap();
+        let Some(PendingWork::Apply(work)) = queue.pending.as_ref() else {
+            panic!("expected remaining replay work");
+        };
+        assert_eq!(work.entries.len(), 1);
+        assert_eq!(work.entries.get(0).unwrap().index, 5);
+        assert_eq!(work.commit, 5);
+    }
     #[test]
     fn client_batches_preserve_actions_in_order() {
         let mut queue = Vec::new();

@@ -691,6 +691,8 @@ pub struct Knobs {
 pub struct RaftConfig {
     /// Maximum execution time before yielding the global write lock between actions.
     pub execution_lock_ms: u64,
+    /// Base-2 log of recent shared entries retained by each Raft member.
+    pub log2_entries: u8,
     /// Primary plus hot backups. Every member still journals and votes.
     pub apply_members: usize,
     /// Extra randomized-election delay for members without application state.
@@ -721,6 +723,7 @@ impl Default for RaftConfig {
     fn default() -> Self {
         Self {
             execution_lock_ms: 10,
+            log2_entries: 16,
             apply_members: 3,
             cold_election_delay_ms: 1000,
             lost_state_election_delay_ms: 200,
@@ -739,6 +742,9 @@ impl Default for RaftConfig {
 
 impl RaftConfig {
     pub fn validate_timing(&self) -> Result<()> {
+        if !(1..=27).contains(&self.log2_entries) {
+            return Err(Error::new("Raft log2_entries must be between 1 and 27"));
+        }
         if self.checkpoint_lease_secs == 0
             || self.checkpoint_election_delay_ms == 0
             || self.checkpoint_election_delay_ms >= self.cold_election_delay_ms

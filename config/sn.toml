@@ -13,6 +13,8 @@ max_extents = 1073741824
 # Raft consensus for this SN. With no members listed, this process is a singleton.
 # To replicate the SN group, configure the same ring and member map on every member.
 [raft]
+# Number of recent shared entries retained by each member is 2^log2_entries.
+log2_entries = 16
 # ring = "SN0"
 # [raft.member_indexes]
 # SN0 = 0

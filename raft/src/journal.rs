@@ -217,7 +217,7 @@ pub struct CommittedJournal {
     pub after: u64,
     pub previous_term: u64,
     pub previous_scn: Scn,
-    pub entries: Vec<crate::raft::Entry>,
+    pub entries: Vec<Arc<crate::raft::Entry>>,
 }
 impl CommittedJournal {
     pub fn largest_scn(&self) -> Option<Scn> {
@@ -693,7 +693,10 @@ impl Journal {
             publish(&name, &bytes)
         })?;
         self.write(&[
-            Record::Entries { from: copied.after + 1, entries: copied.entries.clone() },
+            Record::Entries {
+                from: copied.after + 1,
+                entries: copied.entries.iter().map(|entry| (**entry).clone()).collect(),
+            },
             Record::Commit(copied.entries.last().unwrap().index),
         ])
     }
@@ -1095,7 +1098,7 @@ impl History {
                 .ok_or_else(|| Error::new("missing journal prefix SCN"))?,
             entries: state
                 .log
-                .iter()
+                .shared_iter()
                 .filter(|e| e.index > after && e.index <= state.commit.min(through))
                 .take(128)
                 .cloned()
@@ -1996,24 +1999,29 @@ mod tests {
             after: 9,
             previous_term: 4,
             previous_scn: state.snapshot.scn,
-            entries: vec![crate::Entry {
+            entries: vec![Arc::new(crate::Entry {
                 scn: common::scn::Scn::new(10),
                 index: 10,
                 term: 4,
                 command: crate::Command::Noop,
                 entry_buf: None,
-            }],
+            })],
         };
         // Ring identity and the retained prefix alone accept this abandoned history.
         let structurally_valid = copied.validate(&state, 10).is_ok();
         let matches_primary = copied.matches_tip(10, (6, Scn::new(10)));
         assert!(structurally_valid);
         assert!(!matches_primary);
-        copied.entries[0].term = 6;
+        Arc::make_mut(&mut copied.entries[0]).term = 6;
         let valid =
             copied.validate(&state, 10).is_ok() && copied.matches_tip(10, (6, Scn::new(10)));
         assert!(valid);
-        state.apply(&Record::Entries { from: 10, entries: copied.entries }).unwrap();
+        state
+            .apply(&Record::Entries {
+                from: 10,
+                entries: copied.entries.into_iter().map(|entry| (*entry).clone()).collect(),
+            })
+            .unwrap();
         state.apply(&Record::Commit(10)).unwrap();
         assert_eq!(state.term_at(10), Some(6));
         assert_eq!(state.commit, 10);
@@ -2027,20 +2035,20 @@ mod tests {
             after: 0,
             previous_term: 0,
             previous_scn: Scn::new(0),
-            entries: vec![Entry {
+            entries: vec![Arc::new(Entry {
                 scn: common::scn::Scn::new(1),
                 index: 1,
                 term: 1,
                 command: Command::Noop,
                 entry_buf: None,
-            }],
+            })],
         };
         assert!(good.validate(&state, 1).is_ok());
         let mut wrong = good.clone();
         wrong.ring = "02".repeat(64);
         assert!(wrong.validate(&state, 1).is_err());
         let mut gap = good.clone();
-        gap.entries[0].index = 2;
+        Arc::make_mut(&mut gap.entries[0]).index = 2;
         assert!(gap.validate(&state, 2).is_err());
         assert!(good.validate(&state, 0).is_err());
     }

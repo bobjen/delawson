@@ -96,6 +96,14 @@ impl<T: Wire> Wire for Vec<T> {
         })
     }
 }
+impl<T: Wire> Wire for Arc<T> {
+    fn write(&self, w: &mut StructWriter) {
+        self.as_ref().write(w);
+    }
+    fn read(r: &mut StructReader<'_>) -> Result<Self> {
+        T::read(r).map(Arc::new)
+    }
+}
 impl Wire for crate::raft::EntryLog {
     fn write(&self, w: &mut StructWriter) {
         w.nested(Op::RaftList, |w| {
