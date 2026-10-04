@@ -2,6 +2,7 @@
 use super::{Error, Mapping, PoolItem, Result};
 use std::marker::PhantomData;
 use std::mem::{MaybeUninit, align_of, size_of};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
 
 const BITS: usize = 64;
@@ -210,10 +211,82 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
         None
     }
 
+    fn take_index(&self, index: u32) -> bool {
+        let (at, bit) = bit_at(index as usize);
+        let mask = 1u64 << bit;
+        let word = self.word(at);
+        let mut free = word.load(SeqCst);
+        loop {
+            if free & mask == 0 {
+                return false;
+            }
+            match word.compare_exchange_weak(free, free & !mask, SeqCst, SeqCst) {
+                Ok(_) => return true,
+                Err(actual) => free = actual,
+            }
+        }
+    }
+
     /// Number of indexes initialized so far, including currently free indexes.
     /// Concurrent growth may have reserved indexes that are still initializing.
     pub fn issued_blocks(&self) -> u32 {
         self.next.load(SeqCst)
+    }
+
+    /// Stable pointer to slot zero, initialized during construction.
+    pub fn base_ptr(&self) -> NonNull<T> {
+        self.mapping.base.cast()
+    }
+
+    /// Whether an issued index is currently available for allocation.
+    pub fn is_free(&self, index: u32) -> Result<bool> {
+        if index >= self.max_blocks || index >= self.issued_blocks() {
+            return Err(Error::new("block pool index is outside the issued range"));
+        }
+        let (word, bit) = bit_at(index as usize);
+        Ok(self.word(word).load(SeqCst) & (1u64 << bit) != 0)
+    }
+
+    /// Release a claimed index after its `Block` handle has been forgotten.
+    /// Exclusive access prevents releasing an index while a live handle can
+    /// still refer to it.
+    pub fn release(&mut self, index: u32) -> Result<()> {
+        if index >= self.max_blocks || index >= self.issued_blocks() {
+            return Err(Error::new("block pool index is outside the issued range"));
+        }
+        let (word, bit) = bit_at(index as usize);
+        let mask = 1u64 << bit;
+        if self.word(word).fetch_or(mask, SeqCst) & mask != 0 {
+            return Err(Error::new("block pool index is already free"));
+        }
+        Ok(())
+    }
+
+    /// Reserve one exact index. If `index` is beyond the issued range, initialize
+    /// through it and leave the intervening indexes free. Requires exclusive pool
+    /// access; a previously allocated or out-of-capacity index fails.
+    pub fn reserve(&mut self, index: u32) -> Result<Block<'_, T, A>> {
+        if index >= self.max_blocks {
+            return Err(Error::new("block pool index is out of range"));
+        }
+
+        let issued = self.next.load(SeqCst);
+        if index < issued {
+            if !self.take_index(index) {
+                return Err(Error::new("block pool index is already allocated"));
+            }
+        } else {
+            for gap in issued..index {
+                // SAFETY: exclusive access reserves each previously unissued slot.
+                unsafe { T::init(self.slot(gap)) };
+                self.set_free(gap);
+            }
+            // SAFETY: exclusive access reserves this previously unissued slot.
+            unsafe { T::init(self.slot(index)) };
+            self.next.store(index + 1, SeqCst);
+        }
+
+        Ok(Block { pool: self, index })
     }
 
     pub const fn block_bytes(&self) -> usize {
@@ -407,6 +480,55 @@ mod tests {
         let block = pool.alloc().unwrap();
         assert!(pool.index_of(block.as_ptr()).unwrap() < 128);
         assert_eq!(pool.issued_blocks(), 128);
+    }
+
+    #[test]
+    fn reserve_matches_a_block_from_another_pool() {
+        let source = Pool::<[u8; 64], 64>::new(8, 0).unwrap();
+        let mut target = Pool::<[u8; 64], 64>::new(8, 0).unwrap();
+        let source_block = source.alloc().unwrap();
+        let index = source_block.index();
+
+        let reserved = target.reserve(index).unwrap();
+        assert_eq!(reserved.index(), index);
+        std::mem::forget(reserved);
+        assert!(target.reserve(index).is_err());
+    }
+
+    #[test]
+    fn release_once() {
+        let mut pool = Pool::<[u8; 64], 64>::new(8, 0).unwrap();
+        let block = pool.alloc().unwrap();
+        let index = block.index();
+        std::mem::forget(block);
+
+        assert!(!pool.is_free(index).unwrap());
+        pool.release(index).unwrap();
+        assert!(pool.is_free(index).unwrap());
+        assert!(pool.release(index).is_err());
+        let reused = pool.reserve(index).unwrap();
+        assert_eq!(reused.index(), index);
+    }
+
+    #[test]
+    fn reserve_grows_through_a_block_from_another_pool() {
+        let source = Pool::<[u8; 64], 64>::new(16, 0).unwrap();
+        let mut source_blocks = vec![source.alloc().unwrap()];
+        source_blocks.extend((1..8).map(|_| source.alloc_fresh().unwrap()));
+        let index = source_blocks.last().unwrap().index();
+        assert_eq!(index, 7);
+
+        let mut target = Pool::<[u8; 64], 64>::new(16, 0).unwrap();
+        let reserved = target.reserve(index).unwrap();
+        assert_eq!(reserved.index(), index);
+        std::mem::forget(reserved);
+        assert_eq!(target.issued_blocks(), index + 1);
+        assert!(target.reserve(16).is_err());
+
+        let held: Vec<_> = (0..index).map(|_| target.alloc().unwrap()).collect();
+        let mut found: Vec<_> = held.iter().map(|block| block.index()).collect();
+        found.sort_unstable();
+        assert_eq!(found, (0..index).collect::<Vec<_>>());
     }
 
     #[test]

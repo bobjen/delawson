@@ -25,10 +25,10 @@ use common::server::{self, Process, Reply, Service};
 use common::time::{TimeIntSec64, TimeSec};
 use common::{Arg, Op, Req, Resp, Status, StructReader, StructWriter, structure};
 use common::{Error, Result};
-use pool::LockedPool;
+use pool::Pool;
 use raft::runtime::{Host, Settings as RaftSettings};
 use std::collections::HashMap;
-use std::mem::{MaybeUninit, align_of, offset_of};
+use std::mem::align_of;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
@@ -132,7 +132,6 @@ impl Stream {
 #[repr(C)]
 #[derive(Debug)]
 struct Extent {
-    link: MaybeUninit<std::sync::atomic::AtomicU32>,
     deletion: Flags,
     data: ExtentData,
 }
@@ -140,7 +139,6 @@ struct Extent {
 impl Extent {
     fn blank() -> Self {
         Self {
-            link: MaybeUninit::uninit(),
             deletion: Flags::default(),
             data: ExtentData {
                 logical: ELoff::ZERO,
@@ -169,7 +167,7 @@ unsafe impl pool::PoolItem for Extent {
     }
 }
 
-type ExtentPool = LockedPool<Extent, { align_of::<Extent>() }, { offset_of!(Extent, link) }>;
+type ExtentPool = Pool<Extent, { align_of::<Extent>() }>;
 
 /// A stable-index table backed by typed pool slots.
 struct ExtentTable {
@@ -192,38 +190,78 @@ impl ExtentTable {
         Ok(Self { pool, base, len: 0, max: max_extents })
     }
 
-    fn insert_at(&mut self, wanted: ExtentId, mut extent: Extent) -> pool::Result<ExtentId> {
+    #[cfg(test)]
+    fn insert_at(&mut self, wanted: ExtentId, extent: Extent) -> Result<ExtentId> {
+        self.check_vacant(wanted)?;
+        let block =
+            self.pool.reserve(wanted.get()).map_err(|error| Error::new(error.to_string()))?;
+        std::mem::forget(block);
+        self.insert_reserved(wanted, extent)
+    }
+
+    fn alloc_id(&self) -> pool::Result<ExtentId> {
         let block = self.pool.alloc()?;
-        let index = block.index() as usize;
         let id = ExtentId::new(block.index());
-        assert_eq!(id, wanted, "extent pool index differs from committed Raft action");
-        let pointer = block.as_ptr().cast::<Extent>();
-        // New slots are initialized by the pool; reused slots were invalidated before release.
-        unsafe {
-            let slot = &mut *pointer;
-            debug_assert!(!slot.deletion.is_valid());
-            extent.deletion.set_valid();
-            extent.data.id = id;
-            slot.deletion = extent.deletion;
-            slot.data = extent.data;
-        }
-        if self.len == 0 {
-            assert_eq!(index, 0, "the first extent must use the first pool slot");
-            self.base = NonNull::new(pointer).expect("extent pool mapping is non-null");
-        }
-        if index >= self.len {
-            // Pool slots can be assigned out of order; unused gaps stay
-            // initialized and invalid until an extent receives that index.
-            self.len = index + 1;
-        }
-        // Keep the allocated slot owned by the table; dropping this handle would
-        // return the slot to the pool before extent retirement is implemented.
+        // The action owns this claim until it is applied or rolled back.
         std::mem::forget(block);
         Ok(id)
     }
 
+    fn is_free(&self, id: ExtentId) -> pool::Result<bool> {
+        self.pool.is_free(id.get())
+    }
+
+    fn reserve_id(&mut self, id: ExtentId) -> pool::Result<()> {
+        let block = self.pool.reserve(id.get())?;
+        std::mem::forget(block);
+        Ok(())
+    }
+
+    fn release_id(&mut self, id: ExtentId) -> pool::Result<()> {
+        self.pool.release(id.get())
+    }
+
+    fn is_live(&self, id: ExtentId) -> bool {
+        let index = id.get() as usize;
+        index < self.len && self[index].deletion.is_valid()
+    }
+
+    fn check_vacant(&self, id: ExtentId) -> Result<()> {
+        let index = id.get() as usize;
+        if id.is_none() || index >= self.max as usize {
+            return Err(Error::new("extent slot is out of range"));
+        }
+        if self.is_live(id) {
+            return Err(Error::new("extent slot is already occupied"));
+        }
+        Ok(())
+    }
+
+    /// Write an extent into a slot whose bitmap claim is already held.
+    fn insert_reserved(&mut self, wanted: ExtentId, mut extent: Extent) -> Result<ExtentId> {
+        self.check_vacant(wanted)?;
+        if self.pool.is_free(wanted.get()).map_err(|error| Error::new(error.to_string()))? {
+            return Err(Error::new("reserved extent slot is free"));
+        }
+        let index = wanted.get() as usize;
+        let pointer = unsafe { self.base.as_ptr().add(index) };
+        // SAFETY: exact reservation initialized this stable pool slot and it is
+        // not currently a live extent.
+        unsafe {
+            let slot = &mut *pointer;
+            extent.deletion.set_valid();
+            extent.data.id = wanted;
+            slot.deletion = extent.deletion;
+            slot.data = extent.data;
+        }
+        if index >= self.len {
+            self.len = index + 1;
+        }
+        Ok(wanted)
+    }
+
     #[cfg(test)]
-    fn insert(&mut self, extent: Extent) -> pool::Result<ExtentId> {
+    fn insert(&mut self, extent: Extent) -> Result<ExtentId> {
         let id = ExtentId::new(self.len as u32);
         self.insert_at(id, extent)
     }
@@ -265,9 +303,8 @@ impl Drop for ExtentTable {
 struct ExtentData {
     logical: ELoff,
     compressed: ECoff,
-    /// ⚠️ **`u32`, and safe because the id was never the name.** An extent is
-    /// `(SN, id, second)` (§4.6.3), so an id only has to be unique among the extents one
-    /// SN makes in one second — which 4.3 × 10^9 is not close to (§17.29.2).
+    /// The slot index in this SN's extent pool. The full extent name also includes
+    /// the SN and creation second, but Raft members must agree on this slot.
     id: ExtentId,
     /// Records it holds, and **zero until it is sealed**, because until then the count
     /// grows with every append. `ERoff`, so it cannot be handed to anything counting a
@@ -343,6 +380,80 @@ struct PendingDelete {
     name: StreamName,
     hard: bool,
     tasks: Vec<DeleteTask>,
+}
+
+type ExtentActionKey = (u16, Vec<u8>);
+
+fn extent_action_key(action: &raft::Action) -> ExtentActionKey {
+    (action.op.code(), action.fields.clone())
+}
+
+fn release_extent_id(table: &mut ExtentTable, id: ExtentId) {
+    if table.is_live(id) {
+        common::logn!("SN extent slot rollback failed", "extent {:?} is live", id);
+        return;
+    }
+    match table.is_free(id) {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Err(error) = table.release_id(id) {
+                common::logn!("SN extent slot rollback failed", "extent {:?}, error {}", id, error);
+            }
+        }
+        Err(error) => {
+            common::logn!("SN extent slot rollback failed", "extent {:?}, error {}", id, error)
+        }
+    }
+}
+
+/// Claim one exact slot before changing any application state. On secondaries,
+/// `reserve_id` claims the replicated index; the primary proves its earlier
+/// allocation is still held. Any impossible mismatch is logged and fails the
+/// whole action before its other fields are applied.
+fn claim_extent_id(
+    table: &mut ExtentTable,
+    id: ExtentId,
+    local_id: Option<ExtentId>,
+) -> Result<()> {
+    if let Some(local) = local_id {
+        if local != id {
+            common::logn!(
+                "SN extent slot claim failed",
+                "action extent {:?}, local extent {:?}",
+                id,
+                local
+            );
+            return Err(Error::new("local extent reservation does not match Raft action"));
+        }
+        match table.is_free(id) {
+            Ok(false) => {}
+            Ok(true) => {
+                common::logn!("SN extent slot claim failed", "primary slot {:?} is free", id);
+                return Err(Error::new("primary extent slot is free"));
+            }
+            Err(error) => {
+                common::logn!(
+                    "SN extent slot claim failed",
+                    "primary slot {:?}, error {}",
+                    id,
+                    error
+                );
+                return Err(Error::new(error.to_string()));
+            }
+        }
+    } else if let Err(error) = table.reserve_id(id) {
+        common::logn!("SN extent slot claim failed", "secondary slot {:?}, error {}", id, error);
+        return Err(Error::new(error.to_string()));
+    }
+
+    if let Err(error) = table.check_vacant(id) {
+        if local_id.is_none() {
+            release_extent_id(table, id);
+        }
+        common::logn!("SN extent slot claim failed", "occupied slot {:?}, error {}", id, error);
+        return Err(Error::new(error.to_string()));
+    }
+    Ok(())
 }
 
 fn write_name(w: &mut StructWriter, name: StreamName) {
@@ -673,7 +784,6 @@ struct SNState {
     extents: u64,
     sealed: u64,
     sealed_streams: u64,
-    max_extents: u32,
 }
 
 impl SNState {
@@ -692,7 +802,6 @@ impl SNState {
             extents: 0,
             sealed: 0,
             sealed_streams: 0,
-            max_extents,
         })
     }
 }
@@ -888,7 +997,19 @@ fn check_delete(
     Ok(())
 }
 
-fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> Result<()> {
+#[cfg(test)]
+fn apply_sn_action(state: &mut SNState, index: u64, action: &raft::Action) -> Result<()> {
+    let mut local_used = false;
+    apply_sn_slot(state, index, action, None, &mut local_used)
+}
+
+fn apply_sn_slot(
+    state: &mut SNState,
+    _index: u64,
+    action: &raft::Action,
+    local_id: Option<ExtentId>,
+    local_used: &mut bool,
+) -> Result<()> {
     match action.op {
         Op::SnCreate => {
             let cmd: CreateCmd = raft::codec::decode(&action.fields)?;
@@ -1013,18 +1134,18 @@ fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> R
                 return Ok(());
             }
             let id = cmd.extent.id;
-            extent_table
-                .insert_at(
-                    id,
-                    Extent {
-                        link: MaybeUninit::uninit(),
-                        deletion: Flags::default(),
-                        data: cmd.extent,
-                    },
-                )
-                .map_err(|error| Error::new(error.to_string()))?;
+            claim_extent_id(extent_table, id, local_id)?;
+            if let Err(error) = extent_table
+                .insert_reserved(id, Extent { deletion: Flags::default(), data: cmd.extent })
+            {
+                if local_id.is_none() {
+                    release_extent_id(extent_table, id);
+                }
+                return Err(Error::new(error.to_string()));
+            }
             held.open = Some(id);
             *extents += 1;
+            *local_used = true;
             Ok(())
         }
         Op::SnSeal => {
@@ -1036,31 +1157,46 @@ fn apply_sn_action(state: &mut SNState, _index: u64, action: &raft::Action) -> R
             if held.open != Some(cmd.id) {
                 return Ok(());
             }
-            held.open = None;
-            held.sealed_records =
+            if !extent_table.is_live(cmd.id) {
+                return Err(Error::new("seal action names an invalid extent slot"));
+            }
+            let sealed_records =
                 held.sealed_records.plus(SRoff::from_extent(cmd.came_to.records))?;
+            let is_full = held.sealed.len() as u64 + 1 >= cmd.per_stream;
+            let next_id = if let Some(next) = cmd.next {
+                if is_full {
+                    return Err(Error::new("seal action creates an extent for a full stream"));
+                }
+                let id = next.id;
+                claim_extent_id(extent_table, id, local_id)?;
+                if let Err(error) = extent_table
+                    .insert_reserved(id, Extent { deletion: Flags::default(), data: next })
+                {
+                    if local_id.is_none() {
+                        release_extent_id(extent_table, id);
+                    }
+                    return Err(Error::new(error.to_string()));
+                }
+                *local_used = true;
+                Some(id)
+            } else if local_id.is_some() {
+                return Err(Error::new("local extent reservation is absent from seal action"));
+            } else {
+                None
+            };
+            held.open = None;
+            held.sealed_records = sealed_records;
             let data = &mut extent_table[cmd.id.get() as usize].data;
             data.records = cmd.came_to.records;
             data.logical = cmd.came_to.logical;
             data.compressed = cmd.came_to.compressed;
             held.sealed.push(cmd.id);
             *sealed += 1;
-            if held.sealed.len() as u64 >= cmd.per_stream {
+            if is_full {
                 held.sealed_stream = true;
                 *sealed_streams += 1;
-            } else if let Some(next) = cmd.next {
-                let id = next.id;
-                extent_table
-                    .insert_at(
-                        id,
-                        Extent {
-                            link: MaybeUninit::uninit(),
-                            deletion: Flags::default(),
-                            data: next,
-                        },
-                    )
-                    .map_err(|error| Error::new(error.to_string()))?;
-                held.open = Some(id);
+            } else if let Some(next_id) = next_id {
+                held.open = Some(next_id);
                 *extents += 1;
             }
             Ok(())
@@ -1232,16 +1368,14 @@ impl raft::execution::Application for SNState {
         self.sealed = 0;
         self.sealed_streams = 0;
     }
-
-    fn reclaim(&mut self) {
-        self.extent_table.pool.reclaim();
-    }
 }
 
 struct SN {
     common: raft::runtime::Runtime<SNState>,
     config: SNConfig,
     deleting: Mutex<()>,
+    /// Primary-owned pool slots keyed by the exact serialized action that uses them.
+    pending_extents: Mutex<HashMap<ExtentActionKey, ExtentId>>,
     /// Maximum sealed extents one stream may hold, including extent references made by
     /// concatenation rather than by appending.
     per_stream: usize,
@@ -1362,6 +1496,58 @@ impl SN {
 
     fn commit_action(&self, action: raft::Action) -> Result<u64> {
         let index = self.propose_action(action)?;
+        self.wait_applied(index)?;
+        Ok(index)
+    }
+
+    fn remember_ext(&self, action: &raft::Action, id: ExtentId) -> Result<()> {
+        let key = extent_action_key(action);
+        let mut pending =
+            self.pending_extents.lock().map_err(|_| Error::new("pending extent lock poisoned"))?;
+        if pending.contains_key(&key) {
+            return Err(Error::new("extent action already has a local reservation"));
+        }
+        pending.insert(key, id);
+        Ok(())
+    }
+
+    /// Caller holds the global write lock before taking the pending map lock,
+    /// matching Raft apply's lock order.
+    fn cancel_ext_action(&self, key: &ExtentActionKey) {
+        let mut state = self.global_lock.write();
+        let id = self.pending_extents.lock().expect("pending extents").remove(key);
+        if let Some(id) = id {
+            release_extent_id(&mut state.extent_table, id);
+        }
+    }
+
+    fn release_extent_id(&self, id: ExtentId) {
+        let mut state = self.global_lock.write();
+        release_extent_id(&mut state.extent_table, id);
+    }
+
+    fn commit_ext_action(&self, action: raft::Action, id: ExtentId) -> Result<u64> {
+        let key = extent_action_key(&action);
+        if let Err(error) = self.remember_ext(&action, id) {
+            self.release_extent_id(id);
+            return Err(error);
+        }
+        let ticket = match self.queue_action(action) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.cancel_ext_action(&key);
+                return Err(error);
+            }
+        };
+        let index = match ticket.wait() {
+            Ok(index) => index,
+            Err(error) => {
+                self.cancel_ext_action(&key);
+                return Err(error);
+            }
+        };
+        // Once proposed, the action may still apply after a wait error, so keep
+        // its slot reserved until apply consumes or rejects the exact action.
         self.wait_applied(index)?;
         Ok(index)
     }
@@ -1586,6 +1772,7 @@ impl SN {
             common: raft::runtime::Runtime::with_state(runtime, node, options, state),
             config,
             deleting: Mutex::new(()),
+            pending_extents: Mutex::new(HashMap::new()),
             per_stream,
             mine,
             disks: Mutex::new(disks),
@@ -1971,10 +2158,6 @@ impl SN {
                 pending.push(waiter);
                 return;
             }
-            if state.extent_table.len >= state.max_extents as usize {
-                drop(state);
-                return waiter.send(Resp::error(Status::Internal, "SN extent table is full"));
-            }
             state.pending_opens.insert(name, PendingOpen::new(waiter));
         }
 
@@ -1994,12 +2177,17 @@ impl SN {
                 }
                 OpenCheck::Create => {}
             }
-            if state.extent_table.len >= state.max_extents as usize {
-                drop(state);
-                self.fail_open(name, Resp::error(Status::Internal, "SN extent table is full"));
-                return;
+            match state.extent_table.alloc_id() {
+                Ok(id) => id,
+                Err(error) => {
+                    drop(state);
+                    self.fail_open(
+                        name,
+                        Resp::error(Status::Internal, format!("SN extent table is full: {error}")),
+                    );
+                    return;
+                }
             }
-            ExtentId::new(state.extent_table.len as u32)
         };
 
         let assigned = process.assigned_of_kind(ServiceKind::En);
@@ -2021,6 +2209,7 @@ impl SN {
         ) {
             Ok(disks) => disks,
             Err(error) => {
+                self.release_extent_id(id);
                 self.fail_open(name, Resp::error(Status::Internal, error.to_string()));
                 return;
             }
@@ -2036,11 +2225,12 @@ impl SN {
         let action = match sn_action(Op::SnOpen, &OpenCmd { name, extent }) {
             Ok(action) => action,
             Err(error) => {
+                self.release_extent_id(id);
                 self.fail_open(name, Resp::error(Status::Internal, error.to_string()));
                 return;
             }
         };
-        if let Err(error) = self.commit_action(action) {
+        if let Err(error) = self.commit_ext_action(action, id) {
             self.fail_open(name, Resp::error(Status::Internal, error.to_string()));
         }
     }
@@ -2335,45 +2525,43 @@ impl SN {
         if let Some(answer) = self.seal_reply(name, id) {
             return answer;
         }
-        let (first, is_full, next_id) = {
+        let (first, next_result) = {
             let state = self.global_lock.read();
             let stream = &state.stream_map[&name];
             if stream.sealed_records.plus(SRoff::from_extent(came_to.records)).is_err() {
                 return Resp::error(Status::BadRequest, "seal-extent record total overflows");
             }
-            (
-                stream.sealed_records,
-                stream.sealed.len() + 1 >= process.cluster.extents.per_stream,
-                state.extent_table.len,
-            )
+            let is_full = stream.sealed.len() + 1 >= process.cluster.extents.per_stream;
+            (stream.sealed_records, (!is_full).then(|| state.extent_table.alloc_id()))
         };
 
         let mut next = None;
         let mut next_error = None;
-        if !is_full {
-            let max = self.global_lock.read().max_extents as usize;
-            if next_id >= max {
-                next_error = Some("SN extent table is full".to_string());
-            } else {
-                let disks = match pick_disks(
+        let mut next_id = None;
+        if let Some(allocated) = next_result {
+            match allocated {
+                Ok(id) => match pick_disks(
                     self.disks.lock().expect("disks").len(),
                     process.cluster.extents.instances,
                 ) {
-                    Ok(disks) => disks,
-                    Err(error) => {
-                        next_error = Some(error.to_string());
-                        Vec::new()
+                    Ok(disks) => {
+                        next_id = Some(id);
+                        next = Some(ExtentData {
+                            logical: ELoff::ZERO,
+                            compressed: ECoff::ZERO,
+                            id,
+                            records: ERoff::ZERO,
+                            created: TimeSec::now(),
+                            disks,
+                        });
                     }
-                };
-                if next_error.is_none() {
-                    next = Some(ExtentData {
-                        logical: ELoff::ZERO,
-                        compressed: ECoff::ZERO,
-                        id: ExtentId::new(next_id as u32),
-                        records: ERoff::ZERO,
-                        created: TimeSec::now(),
-                        disks,
-                    });
+                    Err(error) => {
+                        self.release_extent_id(id);
+                        next_error = Some(error.to_string());
+                    }
+                },
+                Err(error) => {
+                    next_error = Some(format!("SN extent table is full: {error}"));
                 }
             }
         }
@@ -2388,9 +2576,18 @@ impl SN {
             },
         ) {
             Ok(action) => action,
-            Err(error) => return Resp::error(Status::Internal, error.to_string()),
+            Err(error) => {
+                if let Some(id) = next_id {
+                    self.release_extent_id(id);
+                }
+                return Resp::error(Status::Internal, error.to_string());
+            }
         };
-        if let Err(error) = self.commit_action(action) {
+        let result = match next_id {
+            Some(id) => self.commit_ext_action(action, id),
+            None => self.commit_action(action),
+        };
+        if let Err(error) = result {
             return Resp::error(Status::Internal, error.to_string());
         }
 
@@ -2588,11 +2785,7 @@ impl SN {
             disks,
         };
         let id = extents
-            .insert(Extent {
-                link: MaybeUninit::uninit(),
-                deletion: Flags::default(),
-                data: extent,
-            })
+            .insert(Extent { deletion: Flags::default(), data: extent })
             .map_err(|error| Error::new(format!("allocate SN extent slot: {error}")))?;
         let extent = extents[id.get() as usize].data.clone();
         held.open = Some(id);
@@ -2613,7 +2806,22 @@ impl Host for SN {
         action: &raft::Action,
         done: &mut Vec<Self::Done>,
     ) -> Result<()> {
-        apply_sn_action(state, context.index, action)?;
+        let local_id = if matches!(action.op, Op::SnOpen | Op::SnSeal) {
+            self.pending_extents
+                .lock()
+                .map_err(|_| Error::new("pending extent lock poisoned"))?
+                .remove(&extent_action_key(action))
+        } else {
+            None
+        };
+        let mut local_used = false;
+        let result = apply_sn_slot(state, context.index, action, local_id, &mut local_used);
+        if let Some(id) = local_id {
+            if result.is_err() || !local_used {
+                release_extent_id(&mut state.extent_table, id);
+            }
+        }
+        result?;
         if action.op == Op::SnOpen {
             let command: OpenCmd = raft::codec::decode(&action.fields)?;
             if let Some(pending) = state.pending_opens.remove(&command.name) {
@@ -2865,12 +3073,6 @@ mod tests {
         }
         assert!(!unsafe { (*pointer).deletion.is_valid() });
         drop(spare);
-        drop(state);
-        {
-            let state = sn.global_lock.write();
-            state.extent_table.pool.reclaim();
-        }
-        let state = sn.global_lock.read();
         let reused = state.extent_table.pool.alloc().unwrap();
         assert_eq!(reused.index(), 1);
         assert!(!unsafe { (*reused.as_ptr().cast::<Extent>()).deletion.is_valid() });
@@ -2891,7 +3093,6 @@ mod tests {
             .write()
             .extent_table
             .insert(Extent {
-                link: MaybeUninit::uninit(),
                 deletion: Flags::default(),
                 data: ExtentData {
                     id: ExtentId::FIRST,
@@ -2938,7 +3139,6 @@ mod tests {
                     .write()
                     .extent_table
                     .insert(Extent {
-                        link: MaybeUninit::uninit(),
                         deletion: Flags::default(),
                         data: ExtentData {
                             id: ExtentId::FIRST,
@@ -3017,6 +3217,108 @@ mod tests {
 
     fn named(range: u64, stream: u32) -> StreamName {
         StreamName { range: RangeId::new(range), stream: StreamId::new(stream), created: MADE }
+    }
+
+    fn empty_stream() -> Stream {
+        Stream {
+            deletion: Flags::default(),
+            created: MADE,
+            creator: SnId::FIRST,
+            sealed: Vec::new(),
+            open: None,
+            sealed_records: SRoff::ZERO,
+            sealed_stream: false,
+        }
+    }
+
+    #[test]
+    fn same_extent_slot() {
+        let name = named(3, 7);
+        let mut primary = SNState::new(8).unwrap();
+        let mut secondary = SNState::new(8).unwrap();
+        primary.stream_map.insert(name, empty_stream());
+        secondary.stream_map.insert(name, empty_stream());
+
+        let id = primary.extent_table.alloc_id().unwrap();
+        let action = sn_action(
+            Op::SnOpen,
+            &OpenCmd {
+                name,
+                extent: ExtentData {
+                    logical: ELoff::ZERO,
+                    compressed: ECoff::ZERO,
+                    id,
+                    records: ERoff::ZERO,
+                    created: MADE,
+                    disks: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+
+        let mut used = false;
+        apply_sn_slot(&mut primary, 1, &action, Some(id), &mut used).unwrap();
+        apply_sn_action(&mut secondary, 1, &action).unwrap();
+
+        assert!(used);
+        assert_eq!(primary.stream_map[&name].open, Some(id));
+        assert_eq!(secondary.stream_map[&name].open, Some(id));
+        assert!(primary.extent_table.is_live(id));
+        assert!(secondary.extent_table.is_live(id));
+        assert!(!primary.extent_table.is_free(id).unwrap());
+        assert!(!secondary.extent_table.is_free(id).unwrap());
+    }
+
+    #[test]
+    fn seal_slot_conflict() {
+        let name = named(3, 8);
+        let mut state = SNState::new(8).unwrap();
+        state.stream_map.insert(name, empty_stream());
+        let current = ExtentId::FIRST;
+        let open = sn_action(
+            Op::SnOpen,
+            &OpenCmd {
+                name,
+                extent: ExtentData {
+                    logical: ELoff::ZERO,
+                    compressed: ECoff::ZERO,
+                    id: current,
+                    records: ERoff::ZERO,
+                    created: MADE,
+                    disks: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        apply_sn_action(&mut state, 1, &open).unwrap();
+        let taken = ExtentId::new(1);
+        state.extent_table.reserve_id(taken).unwrap();
+
+        let seal = sn_action(
+            Op::SnSeal,
+            &SealCmd {
+                name,
+                id: current,
+                came_to: came(7, 90),
+                per_stream: 10,
+                next: Some(ExtentData {
+                    logical: ELoff::ZERO,
+                    compressed: ECoff::ZERO,
+                    id: taken,
+                    records: ERoff::ZERO,
+                    created: MADE,
+                    disks: Vec::new(),
+                }),
+            },
+        )
+        .unwrap();
+
+        assert!(apply_sn_action(&mut state, 2, &seal).is_err());
+        assert_eq!(state.stream_map[&name].open, Some(current));
+        assert!(state.stream_map[&name].sealed.is_empty());
+        assert_eq!(state.extent_table[current.get() as usize].data.records, ERoff::ZERO);
+        assert!(!state.extent_table.is_free(taken).unwrap());
+        assert!(!state.extent_table.is_live(taken));
     }
 
     fn default_disks() -> Vec<(EnId, DiskId)> {
