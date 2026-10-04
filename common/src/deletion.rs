@@ -154,6 +154,20 @@ impl Flags {
     const SOFT_DELETED: u8 = 2;
     const DELETED: u8 = 4;
     const VALID: u8 = 8;
+    const ALL: u8 = Self::EXTRA | Self::SOFT_DELETED | Self::DELETED | Self::VALID;
+
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+    pub fn from_bits(bits: u8) -> Result<Self> {
+        if bits & !Self::ALL != 0 {
+            return Err(Error::new("unknown deletion flag bits"));
+        }
+        Ok(Self(bits))
+    }
+    pub fn live() -> Self {
+        Self(Self::VALID)
+    }
     pub fn vacant() -> Self {
         Self(Self::SOFT_DELETED | Self::DELETED)
     }
@@ -886,6 +900,7 @@ mod tests {
         assert!(!Flags::default().extra());
         assert!(Flags::default().readable(false));
     }
+
     #[test]
     fn both_conditions_and_strictly_past_are_required() {
         let mut extras = Extras::<_>::default();

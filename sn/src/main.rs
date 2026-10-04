@@ -110,15 +110,12 @@ impl Stream {
     fn sealed_from<'a>(
         &'a self,
         extents: &'a [Extent],
-    ) -> impl Iterator<Item = (SRoff, &'a ExtentData)> {
-        self.sealed.iter().map(|id| &extents[id.get() as usize].data).scan(
-            SRoff::ZERO,
-            |at, sealed| {
-                let first = *at;
-                *at = at.plus(sealed.records()).expect("stream record position fits");
-                Some((first, sealed))
-            },
-        )
+    ) -> impl Iterator<Item = (SRoff, &'a Extent)> {
+        self.sealed.iter().map(|id| &extents[id.get() as usize]).scan(SRoff::ZERO, |at, sealed| {
+            let first = *at;
+            *at = at.plus(SRoff::from_extent(sealed.records)).expect("stream record position fits");
+            Some((first, sealed))
+        })
     }
 }
 
@@ -133,22 +130,54 @@ impl Stream {
 #[derive(Debug)]
 struct Extent {
     deletion: Flags,
-    data: ExtentData,
+    logical: ELoff,
+    compressed: ECoff,
+    id: ExtentId,
+    records: ERoff,
+    created: TimeSec,
+    disks: Vec<SnDiskId>,
 }
 
 impl Extent {
     fn blank() -> Self {
         Self {
             deletion: Flags::default(),
-            data: ExtentData {
-                logical: ELoff::ZERO,
-                compressed: ECoff::ZERO,
-                id: ExtentId::NONE,
-                records: ERoff::ZERO,
-                created: TimeSec::EPOCH,
-                disks: Vec::new(),
-            },
+            logical: ELoff::ZERO,
+            compressed: ECoff::ZERO,
+            id: ExtentId::NONE,
+            records: ERoff::ZERO,
+            created: TimeSec::EPOCH,
+            disks: Vec::new(),
         }
+    }
+
+    fn snapshot(&self) -> ExtentData {
+        ExtentData {
+            deletion: self.deletion,
+            logical: self.logical,
+            compressed: self.compressed,
+            id: self.id,
+            records: self.records,
+            created: self.created,
+            disks: self.disks.clone(),
+        }
+    }
+
+    fn from_data(data: ExtentData) -> Self {
+        Self {
+            deletion: data.deletion,
+            logical: data.logical,
+            compressed: data.compressed,
+            id: data.id,
+            records: data.records,
+            created: data.created,
+            disks: data.disks,
+        }
+    }
+
+    fn holds(&self, first: SRoff, record: SRoff) -> bool {
+        let records = SRoff::from_extent(self.records);
+        record >= first && record < first.plus(records).expect("stream record position fits")
     }
 
     fn init(&mut self) {
@@ -238,7 +267,7 @@ impl ExtentTable {
     }
 
     /// Write an extent into a slot whose bitmap claim is already held.
-    fn insert_reserved(&mut self, wanted: ExtentId, mut extent: Extent) -> Result<ExtentId> {
+    fn insert_reserved(&mut self, wanted: ExtentId, extent: Extent) -> Result<ExtentId> {
         self.check_vacant(wanted)?;
         if self.pool.is_free(wanted.get()).map_err(|error| Error::new(error.to_string()))? {
             return Err(Error::new("reserved extent slot is free"));
@@ -247,12 +276,14 @@ impl ExtentTable {
         let pointer = unsafe { self.base.as_ptr().add(index) };
         // SAFETY: exact reservation initialized this stable pool slot and it is
         // not currently a live extent.
+        if !extent.deletion.is_valid() {
+            return Err(Error::new("extent action is missing its valid flag"));
+        }
         unsafe {
             let slot = &mut *pointer;
-            extent.deletion.set_valid();
-            extent.data.id = wanted;
-            slot.deletion = extent.deletion;
-            slot.data = extent.data;
+            let mut extent = extent;
+            extent.id = wanted;
+            *slot = extent;
         }
         if index >= self.len {
             self.len = index + 1;
@@ -298,9 +329,11 @@ impl Drop for ExtentTable {
         }
     }
 }
-/// A snapshot for an answer, never an owning reference.
+/// Persistent extent fields copied into Raft action payloads and held until replies are built.
+/// Later lifecycle changes are separate Raft actions that update these flags.
 #[derive(Clone, Debug)]
 struct ExtentData {
+    deletion: Flags,
     logical: ELoff,
     compressed: ECoff,
     /// The slot index in this SN's extent pool. The full extent name also includes
@@ -467,6 +500,7 @@ fn read_name(r: &mut StructReader<'_>) -> Result<StreamName> {
 }
 
 fn write_extent(w: &mut StructWriter, extent: &ExtentData) {
+    w.number_u8(extent.deletion.bits());
     w.extent_id(extent.id);
     w.eloff(extent.logical);
     w.ecoff(extent.compressed);
@@ -479,6 +513,7 @@ fn write_extent(w: &mut StructWriter, extent: &ExtentData) {
 }
 
 fn read_extent(r: &mut StructReader<'_>) -> Result<ExtentData> {
+    let deletion = Flags::from_bits(r.number_u8()?)?;
     let id = r.extent_id()?;
     let logical = r.eloff()?;
     let compressed = r.ecoff()?;
@@ -493,7 +528,7 @@ fn read_extent(r: &mut StructReader<'_>) -> Result<ExtentData> {
     for _ in 0..count {
         disks.push(SnDiskId::new(r.number_u32()?));
     }
-    Ok(ExtentData { logical, compressed, id, records, created, disks })
+    Ok(ExtentData { deletion, logical, compressed, id, records, created, disks })
 }
 
 fn write_filled(w: &mut StructWriter, filled: Filled) {
@@ -676,40 +711,6 @@ fn sn_action<T: raft::codec::Wire>(op: Op, value: &T) -> Result<raft::Action> {
 struct Placed {
     extent: ExtentData,
     first: SRoff,
-}
-
-impl ExtentData {
-    fn records(&self) -> SRoff {
-        SRoff::from_extent(self.records)
-    }
-    fn logical(&self) -> SLoff {
-        SLoff::from_extent(self.logical)
-    }
-    fn compressed(&self) -> SCoff {
-        SCoff::from_extent(self.compressed)
-    }
-    fn holds(&self, first: SRoff, record: SRoff) -> bool {
-        record >= first && record < first.plus(self.records()).expect("stream record position fits")
-    }
-    /// The id, the second, the first record, how many records it holds, then the disks
-    /// with the primary first as `(EnId, DiskId)` pairs.
-    ///
-    /// ⚠️ **The caller supplies `first`**, because the extent does not know it. That is
-    /// the whole of §17.29.1 in one signature: position is the stream's to say.
-    fn args(&self, first: SRoff, disk_table: &[(EnId, DiskId)]) -> Vec<Arg> {
-        let mut payload = StructWriter::new();
-        payload.extent_id(self.id);
-        payload.time_sec(self.created);
-        payload.sroff(first);
-        payload.eroff(self.records);
-        payload.number_u32(self.disks.len() as u32);
-        for sn_disk in &self.disks {
-            let (en, disk) = disk_table[sn_disk.get() as usize];
-            payload.en_id(en);
-            payload.disk_id(disk);
-        }
-        vec![payload.finish(Op::ExtentResp)]
-    }
 }
 
 /// A stream that will hold no more extents, and how many records it came to. Not a
@@ -906,7 +907,7 @@ fn open_check(state: &SNState, name: StreamName) -> OpenCheck {
     }
     if let Some(id) = stream.open {
         return OpenCheck::Extent(
-            state.extent_table[id.get() as usize].data.clone(),
+            state.extent_table[id.get() as usize].snapshot(),
             stream.sealed_records,
         );
     }
@@ -962,7 +963,7 @@ fn check_delete(
             .extent_table
             .get(id.get() as usize)
             .ok_or_else(|| Error::new("stream names an unknown extent"))?;
-        let key = (extent.data.id, extent.data.created);
+        let key = (extent.id, extent.created);
         let (soft, retained) = state.extent_extras.counts(&key, extent.deletion);
         let soft_after = if first_soft {
             if extent.deletion.soft_deleted() || soft < count {
@@ -1094,13 +1095,13 @@ fn apply_sn_slot(
                 let extent = extent_table
                     .get_mut(id.get() as usize)
                     .ok_or_else(|| Error::new("concat names an unknown extent"))?;
-                if let Err(error) = extent_extras
-                    .retain((extent.data.id, extent.data.created), &mut extent.deletion)
+                if let Err(error) =
+                    extent_extras.retain((extent.id, extent.created), &mut extent.deletion)
                 {
                     for prior in retained {
                         let extent = &mut extent_table[prior.get() as usize];
                         extent_extras
-                            .release(&(extent.data.id, extent.data.created), &mut extent.deletion)
+                            .release(&(extent.id, extent.created), &mut extent.deletion)
                             .expect("rollback retained extent");
                     }
                     if inserted {
@@ -1135,9 +1136,7 @@ fn apply_sn_slot(
             }
             let id = cmd.extent.id;
             claim_extent_id(extent_table, id, local_id)?;
-            if let Err(error) = extent_table
-                .insert_reserved(id, Extent { deletion: Flags::default(), data: cmd.extent })
-            {
+            if let Err(error) = extent_table.insert_reserved(id, Extent::from_data(cmd.extent)) {
                 if local_id.is_none() {
                     release_extent_id(extent_table, id);
                 }
@@ -1169,9 +1168,7 @@ fn apply_sn_slot(
                 }
                 let id = next.id;
                 claim_extent_id(extent_table, id, local_id)?;
-                if let Err(error) = extent_table
-                    .insert_reserved(id, Extent { deletion: Flags::default(), data: next })
-                {
+                if let Err(error) = extent_table.insert_reserved(id, Extent::from_data(next)) {
                     if local_id.is_none() {
                         release_extent_id(extent_table, id);
                     }
@@ -1186,7 +1183,7 @@ fn apply_sn_slot(
             };
             held.open = None;
             held.sealed_records = sealed_records;
-            let data = &mut extent_table[cmd.id.get() as usize].data;
+            let data = &mut extent_table[cmd.id.get() as usize];
             data.records = cmd.came_to.records;
             data.logical = cmd.came_to.logical;
             data.compressed = cmd.came_to.compressed;
@@ -1215,7 +1212,7 @@ fn apply_sn_slot(
             }
             held.sealed_records =
                 held.sealed_records.plus(SRoff::from_extent(cmd.came_to.records))?;
-            let data = &mut extent_table[cmd.id.get() as usize].data;
+            let data = &mut extent_table[cmd.id.get() as usize];
             data.records = cmd.came_to.records;
             data.logical = cmd.came_to.logical;
             data.compressed = cmd.came_to.compressed;
@@ -1262,7 +1259,7 @@ fn apply_sn_slot(
             let ids: Vec<_> = stream.sealed.iter().copied().chain(stream.open).collect();
             for id in &ids {
                 let extent = &mut extent_table[id.get() as usize];
-                let key = (extent.data.id, extent.data.created);
+                let key = (extent.id, extent.created);
                 if first {
                     extent_extras.release_soft(
                         key,
@@ -1294,15 +1291,15 @@ fn apply_sn_slot(
                 if !extent.deletion.soft_deleted() || extent.deletion.retired() {
                     continue;
                 }
-                let key = (extent.data.id, extent.data.created);
+                let key = (extent.id, extent.created);
                 let hard = cmd.hard && extent.deletion.deleted();
                 if hard {
                     extent_extras.delete(&key, &mut extent.deletion, now)?;
                 }
                 tasks.push(DeleteTask {
                     id,
-                    created: extent.data.created,
-                    disks: extent.data.disks.clone(),
+                    created: extent.created,
+                    disks: extent.disks.clone(),
                     interval: extent_extras.remaining(&key, now)?,
                     hard,
                 });
@@ -1335,7 +1332,7 @@ fn apply_sn_slot(
                         &mut extent.deletion,
                         cmd.now
                     ));
-                    extent.data.disks.clear();
+                    extent.disks.clear();
                     *extents -= 1;
                 }
                 let map = stream_map;
@@ -1725,9 +1722,35 @@ impl SN {
         self.disks.lock().expect("disks")[id.get() as usize]
     }
 
-    fn extent_args(&self, extent: &ExtentData, first: SRoff) -> Vec<Arg> {
+    fn extent_args(&self, extent: &Extent, first: SRoff) -> Vec<Arg> {
+        self.extent_fields_args(extent.id, extent.created, extent.records, &extent.disks, first)
+    }
+
+    fn extent_data_args(&self, extent: &ExtentData, first: SRoff) -> Vec<Arg> {
+        self.extent_fields_args(extent.id, extent.created, extent.records, &extent.disks, first)
+    }
+
+    fn extent_fields_args(
+        &self,
+        id: ExtentId,
+        created: TimeSec,
+        records: ERoff,
+        extent_disks: &[SnDiskId],
+        first: SRoff,
+    ) -> Vec<Arg> {
         let disks = self.disks.lock().expect("disks");
-        extent.args(first, &disks)
+        let mut payload = StructWriter::new();
+        payload.extent_id(id);
+        payload.time_sec(created);
+        payload.sroff(first);
+        payload.eroff(records);
+        payload.number_u32(extent_disks.len() as u32);
+        for sn_disk in extent_disks {
+            let (en, disk) = disks[sn_disk.get() as usize];
+            payload.en_id(en);
+            payload.disk_id(disk);
+        }
+        vec![payload.finish(Op::ExtentResp)]
     }
 
     fn with_runtime(
@@ -2056,9 +2079,8 @@ impl SN {
                 if extent.deletion.soft_deleted() || extent.deletion.deleted() {
                     return bad("concat names a deleted extent");
                 }
-                let refs = state
-                    .extent_extras
-                    .counts(&(extent.data.id, extent.data.created), extent.deletion);
+                let refs =
+                    state.extent_extras.counts(&(extent.id, extent.created), extent.deletion);
                 if refs.0 == 0 || refs.1 == 0 || u32::MAX - refs.0 < add || u32::MAX - refs.1 < add
                 {
                     return bad("concat extent reference count overflow or retired");
@@ -2095,7 +2117,7 @@ impl SN {
     }
 
     fn extent_reply(&self, extent: ExtentData, first: SRoff) -> Resp {
-        Resp::from_args(Status::Ok, self.extent_args(&extent, first)).id(0)
+        Resp::from_args(Status::Ok, self.extent_data_args(&extent, first)).id(0)
     }
 
     fn open_to(&self, process: &Process, request: &Req, waiter: OpenWaiter) {
@@ -2215,6 +2237,7 @@ impl SN {
             }
         };
         let extent = ExtentData {
+            deletion: Flags::live(),
             logical: ELoff::ZERO,
             compressed: ECoff::ZERO,
             id,
@@ -2302,7 +2325,7 @@ impl SN {
             // routed to it and the EN says whether it is there.
             Some(extent) if record >= held.sealed_records => Resp::from_args(
                 Status::Ok,
-                self.extent_args(&extents[extent.get() as usize].data, held.sealed_records),
+                self.extent_args(&extents[extent.get() as usize], held.sealed_records),
             )
             .id(0),
             Some(_) | None => Resp::error(
@@ -2410,7 +2433,7 @@ impl SN {
             && sealed_seen == held.sealed.len()
             && let Some(open) = &held.open
         {
-            let open = &extents[open.get() as usize].data;
+            let open = &extents[open.get() as usize];
             rows.push(ExtentRow {
                 sn: held.creator,
                 id: open.id,
@@ -2450,10 +2473,13 @@ impl SN {
             compressed: SCoff::ZERO,
         };
         for id in &held.sealed {
-            let sealed = &extents[id.get() as usize].data;
-            totals.logical = totals.logical.plus(sealed.logical()).expect("stream bytes fit");
-            totals.compressed =
-                totals.compressed.plus(sealed.compressed()).expect("stream bytes fit");
+            let sealed = &extents[id.get() as usize];
+            totals.logical =
+                totals.logical.plus(SLoff::from_extent(sealed.logical)).expect("stream bytes fit");
+            totals.compressed = totals
+                .compressed
+                .plus(SCoff::from_extent(sealed.compressed))
+                .expect("stream bytes fit");
         }
         (
             ExtentRun {
@@ -2485,10 +2511,10 @@ impl SN {
         let Some(open) = stream.open else {
             return Some(Resp::error(Status::BadRequest, "stream has no open extent"));
         };
-        let extent = state.extent_table[open.get() as usize].data.clone();
+        let extent = state.extent_table[open.get() as usize].snapshot();
         let first = stream.sealed_records;
         drop(state);
-        Some(Resp::from_args(Status::Ok, self.extent_args(&extent, first)).id(0))
+        Some(Resp::from_args(Status::Ok, self.extent_data_args(&extent, first)).id(0))
     }
 
     fn seal(&self, process: &Process, request: &Req) -> Resp {
@@ -2547,6 +2573,7 @@ impl SN {
                     Ok(disks) => {
                         next_id = Some(id);
                         next = Some(ExtentData {
+                            deletion: Flags::live(),
                             logical: ELoff::ZERO,
                             compressed: ECoff::ZERO,
                             id,
@@ -2608,7 +2635,7 @@ impl SN {
         };
         Resp::from_args(
             Status::Ok,
-            self.extent_args(&state.extent_table[open.get() as usize].data, first),
+            self.extent_args(&state.extent_table[open.get() as usize], first),
         )
         .id(0)
     }
@@ -2706,7 +2733,7 @@ impl SN {
                 .plus(SRoff::from_extent(came_to.records))
                 .expect("stream record position fits");
             {
-                let data = &mut extent_table[extent.get() as usize].data;
+                let data = &mut extent_table[extent.get() as usize];
                 data.records = came_to.records;
                 data.logical = came_to.logical;
                 data.compressed = came_to.compressed;
@@ -2773,10 +2800,11 @@ impl SN {
         // was already there or is being made now.
         let first = held.sealed_records;
         if let Some(id) = held.open {
-            return Ok(Placed { extent: extents[id.get() as usize].data.clone(), first });
+            return Ok(Placed { extent: extents[id.get() as usize].snapshot(), first });
         }
         let disks = pick_disks(self.disks.lock().expect("disks").len(), instances)?;
         let extent = ExtentData {
+            deletion: Flags::live(),
             id: ExtentId::NONE,
             created: second,
             records: ERoff::ZERO,
@@ -2785,9 +2813,9 @@ impl SN {
             disks,
         };
         let id = extents
-            .insert(Extent { deletion: Flags::default(), data: extent })
+            .insert(Extent::from_data(extent))
             .map_err(|error| Error::new(format!("allocate SN extent slot: {error}")))?;
-        let extent = extents[id.get() as usize].data.clone();
+        let extent = extents[id.get() as usize].snapshot();
         held.open = Some(id);
         *count += 1;
         self.extents.fetch_add(1, Ordering::Relaxed);
@@ -2828,7 +2856,7 @@ impl Host for SN {
                 let stream = state.stream_map.get(&command.name);
                 let extent = stream.and_then(|stream| {
                     stream.open.map(|id| {
-                        (state.extent_table[id.get() as usize].data.clone(), stream.sealed_records)
+                        (state.extent_table[id.get() as usize].snapshot(), stream.sealed_records)
                     })
                 });
                 done.push(OpenDone { waiters: pending.take(), extent });
@@ -2921,11 +2949,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     fn counts(extras: &SharedExtras<(ExtentId, TimeSec)>, extent: &Extent) -> (u32, u32) {
-        extras.counts(&(extent.data.id, extent.data.created), extent.deletion)
+        extras.counts(&(extent.id, extent.created), extent.deletion)
     }
 
     fn retain(extras: &mut SharedExtras<(ExtentId, TimeSec)>, extent: &mut Extent) {
-        extras.retain((extent.data.id, extent.data.created), &mut extent.deletion).unwrap();
+        extras.retain((extent.id, extent.created), &mut extent.deletion).unwrap();
     }
 
     #[test]
@@ -2948,7 +2976,7 @@ mod tests {
             let SNState { extent_table, extent_extras, .. } = &mut *state;
             retain(extent_extras, &mut extent_table[id.get() as usize]);
             // No network in this unit test; the live test verifies instance fanout.
-            extent_table[id.get() as usize].data.disks.clear();
+            extent_table[id.get() as usize].disks.clear();
         }
         let process = testing::process();
         let request = |name, retention, hard| {
@@ -2995,7 +3023,7 @@ mod tests {
             let SNState { extent_table, extent_extras, .. } = &mut *state;
             retain(extent_extras, &mut extent_table[0]);
             extent_extras
-                .get(&(extent_table[0].data.id, extent_table[0].data.created))
+                .get(&(extent_table[0].id, extent_table[0].created))
                 .unwrap()
                 .references
                 .hard
@@ -3010,7 +3038,7 @@ mod tests {
         let table = extent_table;
         assert_eq!(table.len(), 1);
         assert_eq!(counts(extent_extras, &table[0]).1, u32::MAX - 1);
-        assert_eq!(table[0].data.records, ERoff::new(12));
+        assert_eq!(table[0].records, ERoff::new(12));
     }
 
     #[test]
@@ -3092,17 +3120,15 @@ mod tests {
         sn.global_lock
             .write()
             .extent_table
-            .insert(Extent {
-                deletion: Flags::default(),
-                data: ExtentData {
-                    id: ExtentId::FIRST,
-                    records: ERoff::new(7),
-                    created: TimeSec::new(100),
-                    disks: Vec::new(),
-                    logical: ELoff::MAX,
-                    compressed: ECoff::new(123),
-                },
-            })
+            .insert(Extent::from_data(ExtentData {
+                deletion: Flags::live(),
+                id: ExtentId::FIRST,
+                records: ERoff::new(7),
+                created: TimeSec::new(100),
+                disks: Vec::new(),
+                logical: ELoff::MAX,
+                compressed: ECoff::new(123),
+            }))
             .unwrap();
         let extent = ExtentId::FIRST;
         let stream = Stream {
@@ -3138,17 +3164,15 @@ mod tests {
                 sn.global_lock
                     .write()
                     .extent_table
-                    .insert(Extent {
-                        deletion: Flags::default(),
-                        data: ExtentData {
-                            id: ExtentId::FIRST,
-                            records: ERoff::new(7),
-                            created: TimeSec::new(100),
-                            disks: Vec::new(),
-                            logical: ELoff::new(100),
-                            compressed: ECoff::new(80),
-                        },
-                    })
+                    .insert(Extent::from_data(ExtentData {
+                        deletion: Flags::live(),
+                        id: ExtentId::FIRST,
+                        records: ERoff::new(7),
+                        created: TimeSec::new(100),
+                        disks: Vec::new(),
+                        logical: ELoff::new(100),
+                        compressed: ECoff::new(80),
+                    }))
                     .unwrap(),
             );
         }
@@ -3245,6 +3269,7 @@ mod tests {
             &OpenCmd {
                 name,
                 extent: ExtentData {
+                    deletion: Flags::live(),
                     logical: ELoff::ZERO,
                     compressed: ECoff::ZERO,
                     id,
@@ -3270,6 +3295,49 @@ mod tests {
     }
 
     #[test]
+    fn extent_flags_round_trip_in_open_action() {
+        let name = named(3, 70);
+        let id = ExtentId::FIRST;
+        let mut deletion = Flags::live();
+        let mut extras = Extras::<_>::default();
+        extras
+            .soft_delete(
+                (id, MADE),
+                &mut deletion,
+                MADE,
+                TimeIntSec64::ZERO,
+                TimeIntSec64::new(100),
+            )
+            .unwrap();
+        let action = sn_action(
+            Op::SnOpen,
+            &OpenCmd {
+                name,
+                extent: ExtentData {
+                    deletion,
+                    logical: ELoff::ZERO,
+                    compressed: ECoff::ZERO,
+                    id,
+                    records: ERoff::ZERO,
+                    created: MADE,
+                    disks: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+
+        let decoded: OpenCmd = raft::codec::decode(&action.fields).unwrap();
+        assert_eq!(decoded.extent.deletion.bits(), deletion.bits());
+        assert!(decoded.extent.deletion.is_valid());
+        assert!(decoded.extent.deletion.soft_deleted());
+        assert!(Flags::from_bits(0x10).is_err());
+
+        let mut truncated = action;
+        truncated.fields.pop();
+        assert!(raft::codec::decode::<OpenCmd>(&truncated.fields).is_err());
+    }
+
+    #[test]
     fn seal_slot_conflict() {
         let name = named(3, 8);
         let mut state = SNState::new(8).unwrap();
@@ -3280,6 +3348,7 @@ mod tests {
             &OpenCmd {
                 name,
                 extent: ExtentData {
+                    deletion: Flags::live(),
                     logical: ELoff::ZERO,
                     compressed: ECoff::ZERO,
                     id: current,
@@ -3302,6 +3371,7 @@ mod tests {
                 came_to: came(7, 90),
                 per_stream: 10,
                 next: Some(ExtentData {
+                    deletion: Flags::live(),
                     logical: ELoff::ZERO,
                     compressed: ECoff::ZERO,
                     id: taken,
@@ -3316,7 +3386,7 @@ mod tests {
         assert!(apply_sn_action(&mut state, 2, &seal).is_err());
         assert_eq!(state.stream_map[&name].open, Some(current));
         assert!(state.stream_map[&name].sealed.is_empty());
-        assert_eq!(state.extent_table[current.get() as usize].data.records, ERoff::ZERO);
+        assert_eq!(state.extent_table[current.get() as usize].records, ERoff::ZERO);
         assert!(!state.extent_table.is_free(taken).unwrap());
         assert!(!state.extent_table.is_live(taken));
     }
@@ -3443,8 +3513,8 @@ mod tests {
         assert_eq!(restored.sealed, vec![ExtentId::FIRST, ExtentId::new(1)]);
         assert_eq!(restored.sealed_records, SRoff::new(10));
         assert_eq!(replay.extent_table.len(), 2);
-        assert_eq!(replay.extent_table[0].data.records, ERoff::new(7));
-        assert_eq!(replay.extent_table[1].data.records, ERoff::new(3));
+        assert_eq!(replay.extent_table[0].records, ERoff::new(7));
+        assert_eq!(replay.extent_table[1].records, ERoff::new(3));
     }
 
     #[test]
@@ -3502,6 +3572,7 @@ mod tests {
             state.pending_opens.insert(name, waiters);
         }
         let extent = ExtentData {
+            deletion: Flags::live(),
             id: ExtentId::FIRST,
             created: MADE,
             records: ERoff::ZERO,
@@ -3577,7 +3648,7 @@ mod tests {
         let extent = &mut extents[id.get() as usize];
         assert_eq!(counts(extent_extras, extent).1, 3);
         let extras = extent_extras;
-        let key = (extent.data.id, extent.data.created);
+        let key = (extent.id, extent.created);
         assert!(!extras.release(&key, &mut extent.deletion).unwrap());
         assert!(!extras.release(&key, &mut extent.deletion).unwrap());
         assert!(!extent.deletion.extra());
@@ -3795,7 +3866,7 @@ mod tests {
 
         // And the answer on the wire says so, which is the argument that was wrong: third
         // field is the first record, fourth is the count.
-        let answer = sn.extent_args(&next.extent, next.first);
+        let answer = sn.extent_data_args(&next.extent, next.first);
         let (mut payload, rest) = structure(&answer, Op::ExtentResp, "an extent").unwrap();
         assert!(rest.is_empty());
         let _id = payload.extent_id().unwrap();
