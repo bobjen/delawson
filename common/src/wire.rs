@@ -37,6 +37,11 @@ pub fn configure_message_pool(config: crate::config::BufferPoolConfig) -> Result
     buffer::shared_pool(config).map(|_| ())
 }
 
+/// Return the process-wide pool used by segmented buffers.
+pub fn message_pool() -> Result<&'static pool::ChunkPool> {
+    buffer::shared_pool(buffer::pool_config())
+}
+
 pub use buffer::{FrameBuffer, Message, MessageBuffer};
 
 use crate::config::Messaging;

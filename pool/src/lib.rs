@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering::SeqCst};
 
 mod segmented;
 pub use segmented::*;
+mod linear;
+pub use linear::LinearHash;
 mod bitmap;
 pub use bitmap::*;
 mod locked;
