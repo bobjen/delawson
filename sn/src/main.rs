@@ -28,10 +28,10 @@ use common::{Error, Result};
 use pool::Pool;
 use raft::runtime::{Host, Settings as RaftSettings};
 use std::collections::HashMap;
-use std::mem::{MaybeUninit, align_of};
+use std::mem::align_of;
 use std::ops::{Deref, DerefMut, Index};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -60,9 +60,8 @@ fn stream_name(payload: &mut StructReader<'_>) -> common::Result<StreamName> {
 
 #[repr(C)]
 struct Stream {
-    /// Reused by LockedPool while this stream slot is on a free/deleted list.
-    #[allow(dead_code)]
-    link: MaybeUninit<AtomicU32>,
+    /// Next stream in its hash bucket while live, or next pool slot while free.
+    link: u32,
     deletion: Flags,
     /// When it was made. Nothing reads it yet; whether a stream needs a creation
     /// timestamp of its own at all is an open question.
@@ -103,7 +102,7 @@ struct Stream {
 impl Clone for Stream {
     fn clone(&self) -> Self {
         Self {
-            link: MaybeUninit::uninit(),
+            link: StreamId::NONE.get(),
             deletion: self.deletion,
             created: self.created,
             creator: self.creator,
@@ -117,9 +116,17 @@ impl Clone for Stream {
 
 impl Stream {
     fn new(created: TimeSec, creator: SnId) -> Self {
+        Self::with_flags(created, creator, Flags::live())
+    }
+
+    fn blank() -> Self {
+        Self::with_flags(TimeSec::EPOCH, SnId::FIRST, Flags::default())
+    }
+
+    fn with_flags(created: TimeSec, creator: SnId, deletion: Flags) -> Self {
         Self {
-            link: MaybeUninit::uninit(),
-            deletion: Flags::default(),
+            link: StreamId::NONE.get(),
+            deletion,
             created,
             creator,
             sealed: Vec::new(),
@@ -129,11 +136,7 @@ impl Stream {
         }
     }
 
-    fn blank() -> Self {
-        Self::new(TimeSec::EPOCH, SnId::FIRST)
-    }
-
-    /// Replace stream data without touching the inline pool link at offset zero.
+    /// Initialize or replace stream data while preserving its slot link.
     fn set(&mut self, mut stream: Stream) {
         self.deletion = stream.deletion;
         self.created = stream.created;
@@ -142,9 +145,11 @@ impl Stream {
         self.open = stream.open;
         self.sealed_records = stream.sealed_records;
         self.sealed_stream = stream.sealed_stream;
+        self.deletion.set_valid();
     }
 
     fn clear(&mut self) {
+        self.link = StreamId::NONE.get();
         self.deletion = Flags::default();
         self.created = TimeSec::EPOCH;
         self.creator = SnId::FIRST;
@@ -209,17 +214,11 @@ impl StreamTable {
         unsafe { &mut *self.base.as_ptr().add(index as usize) }
     }
 
-    fn alloc_index(&self) -> Result<u32> {
-        let block = self
-            .pool
-            .alloc()
-            .map_err(|error| Error::new(format!("allocate SN stream slot: {error}")))?;
-        let index = block.index();
-        std::mem::forget(block);
-        Ok(index)
+    fn alloc_index(&mut self) -> Result<u32> {
+        self.pool.alloc().map_err(|error| Error::new(format!("allocate SN stream slot: {error}")))
     }
 
-    fn retire_index(&self, index: u32) {
+    fn retire_index(&mut self, index: u32) {
         // SAFETY: the map owned this unique index and removed it before returning it.
         unsafe { self.pool.retire_index(index) };
     }
@@ -262,6 +261,7 @@ impl StreamTable {
             }
         }
         for ((name, stream), index) in entries.into_iter().zip(indexes) {
+            debug_assert!(!self.slot(index).deletion.is_valid());
             self.slot_mut(index).set(stream);
             assert!(self.names.insert(name, index).is_none());
         }
@@ -294,7 +294,7 @@ impl StreamTable {
     }
 
     /// The application hook calls this while Raft holds the global write lock.
-    fn reclaim(&self) {
+    fn reclaim(&mut self) {
         self.pool.reclaim();
     }
 
@@ -315,17 +315,31 @@ impl Index<&StreamName> for StreamTable {
 impl Drop for StreamTable {
     fn drop(&mut self) {
         for index in 0..self.pool.issued_blocks() {
-            // PoolItem::init created a valid Stream in every issued slot.
+            // PoolItem::init created an initialized Stream in every issued slot.
             unsafe { std::ptr::drop_in_place(self.base.as_ptr().add(index as usize)) };
         }
     }
 }
 
-// SAFETY: a fresh slot receives a valid empty Stream before its link is initialized.
+// SAFETY: a fresh slot receives an empty, invalid Stream with its typed link sentinel.
 unsafe impl pool::PoolItem for Stream {
     unsafe fn init(slot: *mut Self) {
         // SAFETY: the pool provides aligned, fresh storage for one Stream.
         unsafe { slot.write(Stream::blank()) };
+    }
+}
+
+// SAFETY: the stream link is the successor index in the pool/hash chain, and
+// every allocation starts with an invalid stream and no successor.
+unsafe impl pool::LockedItem for Stream {
+    const LINK_NONE: u32 = StreamId::NONE.get();
+
+    unsafe fn on_alloc(slot: *mut Self) {
+        // SAFETY: the pool calls this for an initialized, exclusively owned slot.
+        unsafe {
+            (*slot).link = StreamId::NONE.get();
+            (*slot).deletion = Flags::default();
+        }
     }
 }
 
@@ -391,7 +405,7 @@ impl Extent {
     }
 
     fn init(&mut self) {
-        self.deletion.clear_valid();
+        self.deletion = Flags::default();
     }
 }
 
@@ -412,13 +426,14 @@ type ExtentPool = Pool<Extent, { align_of::<Extent>() }>;
 struct ExtentTable {
     pool: ExtentPool,
     base: NonNull<Extent>,
-    /// One past the highest extent index assigned to a live table entry.
-    len: usize,
+    /// Initialized pool prefix, including slots currently free in the bitmap.
+    /// This can lag `pool.next` while a growth range is being initialized.
+    len: AtomicUsize,
     max: u32,
 }
 
 // SAFETY: base points into the owned pool's stable mapping; SN accesses the
-// table under its shared state RwLock, and Extents are Send + Sync.
+// table under its shared state RwLock, len is atomic, and Extents are Send + Sync.
 unsafe impl Send for ExtentTable {}
 unsafe impl Sync for ExtentTable {}
 
@@ -426,20 +441,12 @@ impl ExtentTable {
     fn new(max_extents: u32) -> pool::Result<Self> {
         let pool = ExtentPool::new(max_extents, 0)?;
         let base = pool.base_ptr();
-        Ok(Self { pool, base, len: 0, max: max_extents })
-    }
-
-    #[cfg(test)]
-    fn insert_at(&mut self, wanted: ExtentId, extent: Extent) -> Result<ExtentId> {
-        self.check_vacant(wanted)?;
-        let block =
-            self.pool.reserve(wanted.get()).map_err(|error| Error::new(error.to_string()))?;
-        std::mem::forget(block);
-        self.insert_reserved(wanted, extent)
+        let len = pool.issued_blocks() as usize;
+        Ok(Self { pool, base, len: AtomicUsize::new(len), max: max_extents })
     }
 
     fn alloc_id(&self) -> pool::Result<ExtentId> {
-        let block = self.pool.alloc()?;
+        let block = self.pool.alloc_with_len(&self.len)?;
         let id = ExtentId::new(block.index());
         // The action owns this claim until it is applied or rolled back.
         std::mem::forget(block);
@@ -451,9 +458,13 @@ impl ExtentTable {
     }
 
     fn reserve_id(&mut self, id: ExtentId) -> pool::Result<()> {
-        let block = self.pool.reserve(id.get())?;
+        let block = self.pool.reserve_with_len(id.get(), &self.len)?;
         std::mem::forget(block);
         Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.len.load(Ordering::Acquire)
     }
 
     fn release_id(&mut self, id: ExtentId) -> pool::Result<()> {
@@ -462,7 +473,7 @@ impl ExtentTable {
 
     fn is_live(&self, id: ExtentId) -> bool {
         let index = id.get() as usize;
-        index < self.len && self[index].deletion.is_valid()
+        index < self.len() && self[index].deletion.is_valid()
     }
 
     fn check_vacant(&self, id: ExtentId) -> Result<()> {
@@ -470,8 +481,16 @@ impl ExtentTable {
         if id.is_none() || index >= self.max as usize {
             return Err(Error::new("extent slot is out of range"));
         }
-        if self.is_live(id) {
-            return Err(Error::new("extent slot is already occupied"));
+        if index < self.len() {
+            // Every slot in the published prefix is initialized, including
+            // slots the bitmap currently considers free.
+            let flags = unsafe { (*self.base.as_ptr().add(index)).deletion };
+            if flags.is_valid() {
+                return Err(Error::new("extent slot is already occupied"));
+            }
+            if flags.bits() != 0 {
+                return Err(Error::new("extent slot flags are not clear"));
+            }
         }
         Ok(())
     }
@@ -495,16 +514,15 @@ impl ExtentTable {
             extent.id = wanted;
             *slot = extent;
         }
-        if index >= self.len {
-            self.len = index + 1;
-        }
         Ok(wanted)
     }
 
     #[cfg(test)]
     fn insert(&mut self, extent: Extent) -> Result<ExtentId> {
-        let id = ExtentId::new(self.len as u32);
-        self.insert_at(id, extent)
+        let id = self
+            .alloc_id()
+            .map_err(|error| Error::new(format!("allocate SN extent slot: {error}")))?;
+        self.insert_reserved(id, extent)
     }
 
     fn reset(&mut self) {
@@ -516,16 +534,16 @@ impl Deref for ExtentTable {
     type Target = [Extent];
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: insert initializes one contiguous slot before increasing len;
-        // slots remain initialized and stationary until this table is dropped.
-        unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.len) }
+        // SAFETY: len covers only initialized, stationary slots in the pool.
+        unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.len()) }
     }
 }
 
 impl DerefMut for ExtentTable {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: SN's shared state RwLock serializes mutation and slots are stable.
-        unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr(), self.len) }
+        // SAFETY: SN's state write lock serializes mutation and slots are stable.
+        let len = self.len();
+        unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr(), len) }
     }
 }
 
@@ -3448,16 +3466,60 @@ mod tests {
         let index = table.pool_index(&first).unwrap();
         assert_eq!(table.names.get(&first), Some(&index));
         assert_eq!(table.get(&first).unwrap().created, MADE);
+        assert!(table.slot(index).deletion.is_valid());
+        assert_eq!(table.slot(index).deletion.bits(), Flags::live().bits());
+        assert_eq!(table.slot(index).link, StreamId::NONE.get());
         assert_eq!(table.pool.issued_blocks(), 1);
 
         assert!(table.remove(&first));
         assert!(!table.contains_key(&first));
+        assert!(!table.slot(index).deletion.is_valid());
+        assert_eq!(table.slot(index).deletion.bits(), Flags::default().bits());
+        assert_eq!(table.slot(index).link, StreamId::NONE.get());
         table.reclaim();
         table.insert(second, empty_stream()).unwrap();
 
         assert_eq!(table.pool_index(&second), Some(index));
         assert_eq!(table.pool.issued_blocks(), 1);
         assert!(table.get(&second).is_some());
+        assert!(table.slot(index).deletion.is_valid());
+        assert_eq!(table.slot(index).deletion.bits(), Flags::live().bits());
+        assert_eq!(table.slot(index).link, StreamId::NONE.get());
+    }
+
+    #[test]
+    fn extent_init_clears_all_flags() {
+        let mut extent = Extent::blank();
+        extent.deletion = Flags::from_bits(15).unwrap();
+        extent.init();
+        assert_eq!(extent.deletion.bits(), 0);
+    }
+
+    #[test]
+    fn extent_slot_requires_clear_flags() {
+        let table = ExtentTable::new(8).unwrap();
+        let id = table.alloc_id().unwrap();
+        assert!(table.check_vacant(id).is_ok());
+
+        // A slot with non-valid deletion bits is still not in the free state.
+        unsafe {
+            (*table.base.as_ptr().add(id.get() as usize)).deletion = Flags::vacant();
+        }
+        assert!(table.check_vacant(id).is_err());
+    }
+
+    #[test]
+    fn extent_len_includes_free_pool_slots() {
+        let table = ExtentTable::new(512).unwrap();
+        for _ in 0..130 {
+            table.alloc_id().unwrap();
+        }
+
+        assert_eq!(table.len(), table.pool.issued_blocks() as usize);
+        let free = (0..table.len())
+            .find(|&index| table.pool.is_free(index as u32).unwrap())
+            .expect("the pool refills with a free slot");
+        assert_eq!(table[free].deletion.bits(), 0);
     }
 
     #[test]
@@ -3469,6 +3531,13 @@ mod tests {
         secondary.stream_map.insert(name, empty_stream()).unwrap();
 
         let id = primary.extent_table.alloc_id().unwrap();
+        assert_eq!(primary.extent_table.len(), primary.extent_table.pool.issued_blocks() as usize);
+        assert_eq!(
+            secondary.extent_table.len(),
+            secondary.extent_table.pool.issued_blocks() as usize
+        );
+        assert_eq!(primary.extent_table[id.get() as usize].deletion.bits(), 0);
+        assert_eq!(secondary.extent_table[id.get() as usize].deletion.bits(), 0);
         let action = sn_action(
             Op::SnOpen,
             &OpenCmd {
@@ -3495,6 +3564,8 @@ mod tests {
         assert_eq!(secondary.stream_map[&name].open, Some(id));
         assert!(primary.extent_table.is_live(id));
         assert!(secondary.extent_table.is_live(id));
+        assert_eq!(primary.extent_table[id.get() as usize].deletion.bits(), Flags::live().bits());
+        assert_eq!(secondary.extent_table[id.get() as usize].deletion.bits(), Flags::live().bits());
         assert!(!primary.extent_table.is_free(id).unwrap());
         assert!(!secondary.extent_table.is_free(id).unwrap());
     }

@@ -3,7 +3,8 @@ use super::{Error, Mapping, PoolItem, Result};
 use std::marker::PhantomData;
 use std::mem::{MaybeUninit, align_of, size_of};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, Ordering::SeqCst};
 
 const BITS: usize = 64;
 const INTERLEAVE_BITS: usize = 4096;
@@ -43,8 +44,10 @@ pub struct Pool<T: PoolItem, const ALIGN: usize> {
     pub(super) mapping: Mapping,
     bits: Mapping,
     max_blocks: u32,
+    /// Reserved prefix; growth may advance this before new slots are initialized.
     next: AtomicU32,
     refill: AtomicU32,
+    growth: Mutex<()>,
     random_probes: usize,
     _slot: PhantomData<fn() -> T>,
 }
@@ -101,6 +104,7 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
             max_blocks,
             next: AtomicU32::new(initial_blocks),
             refill: AtomicU32::new(0),
+            growth: Mutex::new(()),
             random_probes,
             _slot: PhantomData,
         };
@@ -150,7 +154,7 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
 
     /// Pays at most one fixed-size part of the reserve target. The busy bit
     /// keeps a concurrent full scan from scheduling the same reserve twice.
-    fn refill(&self) {
+    fn refill(&self, len: Option<&AtomicUsize>) {
         let state = self.refill.load(SeqCst);
         if state == 0 || state & REFILL_BUSY != 0 {
             return;
@@ -164,6 +168,7 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
         {
             return;
         }
+        let _growth = self.growth.lock().expect("pool growth lock");
 
         let start = loop {
             let next = self.next.load(SeqCst);
@@ -180,6 +185,9 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
             for index in start..start + count {
                 // SAFETY: this caller reserved a unique fresh index range.
                 unsafe { T::init(self.slot(index)) };
+            }
+            if let Some(len) = len {
+                len.fetch_max((start + count) as usize, Ordering::Release);
             }
             self.set_free_range(start, count);
         }
@@ -227,8 +235,8 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
         }
     }
 
-    /// Number of indexes initialized so far, including currently free indexes.
-    /// Concurrent growth may have reserved indexes that are still initializing.
+    /// Number of indexes reserved so far, including indexes being initialized.
+    /// Concurrent growth can reserve indexes before publishing them as free.
     pub fn issued_blocks(&self) -> u32 {
         self.next.load(SeqCst)
     }
@@ -266,6 +274,16 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
     /// through it and leave the intervening indexes free. Requires exclusive pool
     /// access; a previously allocated or out-of-capacity index fails.
     pub fn reserve(&mut self, index: u32) -> Result<Block<'_, T, A>> {
+        self.reserve_inner(index, None)
+    }
+
+    /// Reserve one exact index, publishing newly initialized slots to `len`
+    /// before exposing any gaps as free in the bitmap.
+    pub fn reserve_with_len(&mut self, index: u32, len: &AtomicUsize) -> Result<Block<'_, T, A>> {
+        self.reserve_inner(index, Some(len))
+    }
+
+    fn reserve_inner(&mut self, index: u32, len: Option<&AtomicUsize>) -> Result<Block<'_, T, A>> {
         if index >= self.max_blocks {
             return Err(Error::new("block pool index is out of range"));
         }
@@ -276,14 +294,15 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
                 return Err(Error::new("block pool index is already allocated"));
             }
         } else {
-            for gap in issued..index {
+            for slot in issued..=index {
                 // SAFETY: exclusive access reserves each previously unissued slot.
-                unsafe { T::init(self.slot(gap)) };
-                self.set_free(gap);
+                unsafe { T::init(self.slot(slot)) };
             }
-            // SAFETY: exclusive access reserves this previously unissued slot.
-            unsafe { T::init(self.slot(index)) };
             self.next.store(index + 1, SeqCst);
+            if let Some(len) = len {
+                len.fetch_max(index as usize + 1, Ordering::Release);
+            }
+            self.set_free_range(issued, index - issued);
         }
 
         Ok(Block { pool: self, index })
@@ -318,6 +337,16 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
     /// Searches the bitmap with the configured probe policy, then grows if needed.
     #[inline]
     pub fn alloc(&self) -> Result<Block<'_, T, A>> {
+        self.alloc_inner(None)
+    }
+
+    /// Allocate while publishing any newly initialized slots to `len` before
+    /// making spare slots available in the bitmap.
+    pub fn alloc_with_len(&self, len: &AtomicUsize) -> Result<Block<'_, T, A>> {
+        self.alloc_inner(Some(len))
+    }
+
+    fn alloc_inner(&self, len: Option<&AtomicUsize>) -> Result<Block<'_, T, A>> {
         let random = || random::thread_u64();
         let mut issued;
         loop {
@@ -349,7 +378,7 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
 
             if let Some(index) = self.take_word_from(at, free) {
                 if probes > PROBE_LIMIT {
-                    self.refill();
+                    self.refill(len);
                 }
                 return Ok(Block { pool: self, index });
             }
@@ -357,26 +386,34 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
             // sequence with the current issued bitmap length.
         }
 
-        let block = self.alloc_fresh()?;
+        let block = self.alloc_fresh_inner(len)?;
         let issued_after = self.next.load(SeqCst);
         let scheduled =
             issued_after == issued + 1 && self.schedule_refill(issued / (2 * BITS as u32));
         if !scheduled {
             // A failed probe search allocates one fresh block for its caller. If
             // another call already scheduled reserve work, help pay it here.
-            self.refill();
+            self.refill(len);
         }
         Ok(block)
     }
 
     /// Grows by one fresh index without searching or reusing free indexes.
     pub fn alloc_fresh(&self) -> Result<Block<'_, T, A>> {
+        self.alloc_fresh_inner(None)
+    }
+
+    fn alloc_fresh_inner(&self, len: Option<&AtomicUsize>) -> Result<Block<'_, T, A>> {
+        let _growth = self.growth.lock().expect("pool growth lock");
         let index = self
             .next
             .fetch_update(SeqCst, SeqCst, |next| (next < self.max_blocks).then(|| next + 1))
             .map_err(|_| Error::new("block pool exhausted"))?;
         // SAFETY: fetch_update granted this caller a unique fresh index.
         unsafe { T::init(self.slot(index)) };
+        if let Some(len) = len {
+            len.fetch_max(index as usize + 1, Ordering::Release);
+        }
         Ok(Block { pool: self, index })
     }
 
@@ -421,7 +458,56 @@ impl<T: PoolItem, const A: usize> Drop for Block<'_, T, A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::sync::{Barrier, OnceLock};
+
+    #[allow(dead_code)]
+    struct Gated([u8; 8]);
+
+    static INIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static INIT_PAUSE: OnceLock<(Barrier, Barrier)> = OnceLock::new();
+
+    unsafe impl PoolItem for Gated {
+        unsafe fn init(slot: *mut Self) {
+            // SAFETY: the pool provides aligned, fresh storage for Gated.
+            unsafe { slot.write(Self([0; 8])) };
+            if INIT_COUNT.fetch_add(1, Ordering::Relaxed) == 1 {
+                let (entered, resume) =
+                    INIT_PAUSE.get_or_init(|| (Barrier::new(2), Barrier::new(2)));
+                entered.wait();
+                resume.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn extent_len_can_lag_reserved_slots_until_init_finishes() {
+        INIT_COUNT.store(0, Ordering::Relaxed);
+        let (entered, resume) = INIT_PAUSE.get_or_init(|| (Barrier::new(2), Barrier::new(2)));
+        let pool = Pool::<Gated, 8>::new(8, 1).unwrap();
+        let len = AtomicUsize::new(1);
+        assert!(pool.schedule_refill(2));
+
+        std::thread::scope(|scope| {
+            let grow = scope.spawn(|| pool.refill(Some(&len)));
+            entered.wait();
+            let reserved = pool.issued_blocks();
+            let initialized = len.load(Ordering::Acquire);
+            let first_free = pool.is_free(1).unwrap();
+            let second_free = pool.is_free(2).unwrap();
+            resume.wait();
+            grow.join().unwrap();
+
+            assert_eq!(reserved, 3);
+            assert_eq!(initialized, 1);
+            assert!(!first_free);
+            assert!(!second_free);
+        });
+
+        assert_eq!(len.load(Ordering::Acquire), 3);
+        assert!(pool.is_free(1).unwrap());
+        assert!(pool.is_free(2).unwrap());
+    }
 
     #[test]
     fn interleaved_bits() {
