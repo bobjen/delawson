@@ -28,10 +28,10 @@ use common::{Error, Result};
 use pool::Pool;
 use raft::runtime::{Host, Settings as RaftSettings};
 use std::collections::HashMap;
-use std::mem::align_of;
-use std::ops::{Deref, DerefMut};
+use std::mem::{MaybeUninit, align_of};
+use std::ops::{Deref, DerefMut, Index};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -58,8 +58,11 @@ fn stream_name(payload: &mut StructReader<'_>) -> common::Result<StreamName> {
     })
 }
 
-#[derive(Clone)]
+#[repr(C)]
 struct Stream {
+    /// Reused by LockedPool while this stream slot is on a free/deleted list.
+    #[allow(dead_code)]
+    link: MaybeUninit<AtomicU32>,
     deletion: Flags,
     /// When it was made. Nothing reads it yet; whether a stream needs a creation
     /// timestamp of its own at all is an open question.
@@ -97,7 +100,60 @@ struct Stream {
     sealed_stream: bool,
 }
 
+impl Clone for Stream {
+    fn clone(&self) -> Self {
+        Self {
+            link: MaybeUninit::uninit(),
+            deletion: self.deletion,
+            created: self.created,
+            creator: self.creator,
+            sealed: self.sealed.clone(),
+            open: self.open,
+            sealed_records: self.sealed_records,
+            sealed_stream: self.sealed_stream,
+        }
+    }
+}
+
 impl Stream {
+    fn new(created: TimeSec, creator: SnId) -> Self {
+        Self {
+            link: MaybeUninit::uninit(),
+            deletion: Flags::default(),
+            created,
+            creator,
+            sealed: Vec::new(),
+            open: None,
+            sealed_records: SRoff::ZERO,
+            sealed_stream: false,
+        }
+    }
+
+    fn blank() -> Self {
+        Self::new(TimeSec::EPOCH, SnId::FIRST)
+    }
+
+    /// Replace stream data without touching the inline pool link at offset zero.
+    fn set(&mut self, mut stream: Stream) {
+        self.deletion = stream.deletion;
+        self.created = stream.created;
+        self.creator = stream.creator;
+        self.sealed = std::mem::take(&mut stream.sealed);
+        self.open = stream.open;
+        self.sealed_records = stream.sealed_records;
+        self.sealed_stream = stream.sealed_stream;
+    }
+
+    fn clear(&mut self) {
+        self.deletion = Flags::default();
+        self.created = TimeSec::EPOCH;
+        self.creator = SnId::FIRST;
+        self.sealed = Vec::new();
+        self.open = None;
+        self.sealed_records = SRoff::ZERO;
+        self.sealed_stream = false;
+    }
+
     /// Each sealed extent with the stream-local number of its first record — the running
     /// total of everything before it.
     ///
@@ -116,6 +172,160 @@ impl Stream {
             *at = at.plus(SRoff::from_extent(sealed.records)).expect("stream record position fits");
             Some((first, sealed))
         })
+    }
+}
+
+const MAX_STREAMS: u32 = u32::MAX;
+type StreamPool =
+    pool::LockedPool<Stream, { align_of::<Stream>() }, { std::mem::offset_of!(Stream, link) }>;
+
+/// The map keeps compact, member-local pool indexes; callers still address streams by name.
+struct StreamTable {
+    pool: StreamPool,
+    base: NonNull<Stream>,
+    names: HashMap<StreamName, u32>,
+}
+
+// SAFETY: slots remain at stable addresses and access is serialized by SN's state lock.
+unsafe impl Send for StreamTable {}
+unsafe impl Sync for StreamTable {}
+
+impl StreamTable {
+    fn new(max_streams: u32) -> pool::Result<Self> {
+        let pool = StreamPool::new(max_streams, 0)?;
+        let base = pool.base_ptr();
+        Ok(Self { pool, base, names: HashMap::new() })
+    }
+
+    #[inline]
+    fn slot(&self, index: u32) -> &Stream {
+        // SAFETY: every issued slot is initialized and remains at this address.
+        unsafe { &*self.base.as_ptr().add(index as usize) }
+    }
+
+    #[inline]
+    fn slot_mut(&mut self, index: u32) -> &mut Stream {
+        // SAFETY: exclusive table access protects the claimed slot.
+        unsafe { &mut *self.base.as_ptr().add(index as usize) }
+    }
+
+    fn alloc_index(&self) -> Result<u32> {
+        let block = self
+            .pool
+            .alloc()
+            .map_err(|error| Error::new(format!("allocate SN stream slot: {error}")))?;
+        let index = block.index();
+        std::mem::forget(block);
+        Ok(index)
+    }
+
+    fn retire_index(&self, index: u32) {
+        // SAFETY: the map owned this unique index and removed it before returning it.
+        unsafe { self.pool.retire_index(index) };
+    }
+
+    fn get(&self, name: &StreamName) -> Option<&Stream> {
+        self.names.get(name).map(|index| self.slot(*index))
+    }
+
+    fn get_mut(&mut self, name: &StreamName) -> Option<&mut Stream> {
+        let index = *self.names.get(name)?;
+        Some(self.slot_mut(index))
+    }
+
+    fn contains_key(&self, name: &StreamName) -> bool {
+        self.names.contains_key(name)
+    }
+
+    /// Insert a group atomically if the pool has enough free or fresh slots.
+    fn insert_many(&mut self, entries: Vec<(StreamName, Stream)>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.names
+            .try_reserve(entries.len())
+            .map_err(|error| Error::new(format!("reserve SN stream map: {error}")))?;
+        let mut indexes = Vec::new();
+        indexes
+            .try_reserve(entries.len())
+            .map_err(|error| Error::new(format!("reserve SN stream indexes: {error}")))?;
+        for _ in 0..entries.len() {
+            match self.alloc_index() {
+                Ok(index) => indexes.push(index),
+                Err(error) => {
+                    for index in indexes {
+                        self.slot_mut(index).clear();
+                        self.retire_index(index);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        for ((name, stream), index) in entries.into_iter().zip(indexes) {
+            self.slot_mut(index).set(stream);
+            assert!(self.names.insert(name, index).is_none());
+        }
+        Ok(())
+    }
+
+    fn insert(&mut self, name: StreamName, stream: Stream) -> Result<()> {
+        if let Some(index) = self.names.get(&name).copied() {
+            self.slot_mut(index).set(stream);
+            return Ok(());
+        }
+        self.insert_many(vec![(name, stream)])
+    }
+
+    fn remove(&mut self, name: &StreamName) -> bool {
+        let Some(index) = self.names.remove(name) else { return false };
+        self.slot_mut(index).clear();
+        self.retire_index(index);
+        true
+    }
+
+    /// Reset runs under the global write lock, so returned slots can be reclaimed here.
+    fn clear(&mut self) {
+        let indexes: Vec<_> = self.names.drain().map(|(_, index)| index).collect();
+        for index in indexes {
+            self.slot_mut(index).clear();
+            self.retire_index(index);
+        }
+        self.pool.reclaim();
+    }
+
+    /// The application hook calls this while Raft holds the global write lock.
+    fn reclaim(&self) {
+        self.pool.reclaim();
+    }
+
+    #[cfg(test)]
+    fn pool_index(&self, name: &StreamName) -> Option<u32> {
+        self.names.get(name).copied()
+    }
+}
+
+impl Index<&StreamName> for StreamTable {
+    type Output = Stream;
+
+    fn index(&self, name: &StreamName) -> &Self::Output {
+        self.get(name).expect("stream name is present")
+    }
+}
+
+impl Drop for StreamTable {
+    fn drop(&mut self) {
+        for index in 0..self.pool.issued_blocks() {
+            // PoolItem::init created a valid Stream in every issued slot.
+            unsafe { std::ptr::drop_in_place(self.base.as_ptr().add(index as usize)) };
+        }
+    }
+}
+
+// SAFETY: a fresh slot receives a valid empty Stream before its link is initialized.
+unsafe impl pool::PoolItem for Stream {
+    unsafe fn init(slot: *mut Self) {
+        // SAFETY: the pool provides aligned, fresh storage for one Stream.
+        unsafe { slot.write(Stream::blank()) };
     }
 }
 
@@ -769,7 +979,7 @@ struct SNState {
     /// A re-minted id in a later second is a different key, so stale references cannot
     /// silently find the new stream (`A-NAME-IS-NEVER-REMINTED-IN-ITS-OWN-SECOND`).
     /// Streams are keyed by their full name; IDs remain stable indexes in the extent table.
-    stream_map: HashMap<StreamName, Stream>,
+    stream_map: StreamTable,
     /// Stable extent indexes, protected by the same lock as the stream table.
     extent_table: ExtentTable,
     /// Side metadata whose lifetime follows its owning stream or extent.
@@ -789,10 +999,12 @@ struct SNState {
 
 impl SNState {
     fn new(max_extents: u32) -> Result<Self> {
+        let stream_map = StreamTable::new(MAX_STREAMS)
+            .map_err(|error| Error::new(format!("reserve SN stream table: {error}")))?;
         let extent_table = ExtentTable::new(max_extents)
             .map_err(|error| Error::new(format!("reserve SN extent table: {error}")))?;
         Ok(Self {
-            stream_map: HashMap::new(),
+            stream_map,
             extent_table,
             retired_streams: std::collections::HashSet::new(),
             stream_extras: Extras::default(),
@@ -1023,6 +1235,7 @@ fn apply_sn_slot(
                 return Err(Error::new("stream id run exceeds stream id space"));
             }
             let SNState { stream_map, retired_streams, streams, .. } = state;
+            let mut count = 0usize;
             for offset in 0..cmd.count {
                 let stream_id = StreamId::of_number(cmd.first.number() + offset)?;
                 let name = StreamName { range: cmd.range, stream: stream_id, created: cmd.created };
@@ -1035,20 +1248,21 @@ fn apply_sn_slot(
                     }
                     continue;
                 }
-                stream_map.insert(
-                    name,
-                    Stream {
-                        deletion: Flags::default(),
-                        created: cmd.created,
-                        creator: cmd.creator,
-                        sealed: Vec::new(),
-                        open: None,
-                        sealed_records: SRoff::ZERO,
-                        sealed_stream: false,
-                    },
-                );
-                *streams += 1;
+                count += 1;
             }
+            let mut new_streams = Vec::new();
+            new_streams
+                .try_reserve(count)
+                .map_err(|error| Error::new(format!("reserve SN stream batch: {error}")))?;
+            for offset in 0..cmd.count {
+                let stream_id = StreamId::of_number(cmd.first.number() + offset)?;
+                let name = StreamName { range: cmd.range, stream: stream_id, created: cmd.created };
+                if !stream_map.contains_key(&name) {
+                    new_streams.push((name, Stream::new(cmd.created, cmd.creator)));
+                }
+            }
+            stream_map.insert_many(new_streams)?;
+            *streams += count as u64;
             Ok(())
         }
         Op::SnConcat => {
@@ -1077,19 +1291,10 @@ fn apply_sn_slot(
             }) {
                 return Err(Error::new("concat destination is not empty and open"));
             }
-            let mut inserted = false;
-            let destination = map.entry(cmd.destination).or_insert_with(|| {
-                inserted = true;
-                Stream {
-                    deletion: Flags::default(),
-                    created: cmd.destination.created,
-                    creator: cmd.creator,
-                    sealed: Vec::new(),
-                    open: None,
-                    sealed_records: SRoff::ZERO,
-                    sealed_stream: false,
-                }
-            });
+            let inserted = !map.contains_key(&cmd.destination);
+            if inserted {
+                map.insert(cmd.destination, Stream::new(cmd.destination.created, cmd.creator))?;
+            }
             let mut retained: Vec<ExtentId> = Vec::new();
             for &id in &cmd.extents {
                 let extent = extent_table
@@ -1111,6 +1316,7 @@ fn apply_sn_slot(
                 }
                 retained.push(id);
             }
+            let destination = map.get_mut(&cmd.destination).expect("concat destination exists");
             destination.sealed = cmd.extents;
             destination.sealed_records = cmd.records;
             if inserted {
@@ -1364,6 +1570,10 @@ impl raft::execution::Application for SNState {
         self.extents = 0;
         self.sealed = 0;
         self.sealed_streams = 0;
+    }
+
+    fn reclaim(&mut self) {
+        self.stream_map.reclaim();
     }
 }
 
@@ -2968,7 +3178,7 @@ mod tests {
             let mut state = sn.global_lock.write();
             state.streams += 1;
             let snapshot = state.stream_map[&source].clone();
-            state.stream_map.insert(other, snapshot);
+            state.stream_map.insert(other, snapshot).unwrap();
         }
         sn.streams.fetch_add(1, Ordering::Relaxed);
         {
@@ -3069,15 +3279,7 @@ mod tests {
         let mut config = testing::sn_config();
         config.max_extents = 2;
         let sn = SN::new(config, 10, SnId::FIRST, default_disks()).unwrap();
-        let mut stream = Stream {
-            deletion: Flags::default(),
-            created: TimeSec::new(100),
-            creator: SnId::FIRST,
-            sealed: Vec::new(),
-            open: None,
-            sealed_records: SRoff::ZERO,
-            sealed_stream: false,
-        };
+        let mut stream = Stream::new(TimeSec::new(100), SnId::FIRST);
         {
             let mut state = sn.global_lock.write();
             let SNState { extent_table, extents, .. } = &mut *state;
@@ -3131,15 +3333,10 @@ mod tests {
             }))
             .unwrap();
         let extent = ExtentId::FIRST;
-        let stream = Stream {
-            deletion: Flags::default(),
-            created: TimeSec::new(100),
-            creator: SnId::FIRST,
-            sealed: vec![extent.clone(), extent],
-            open: None,
-            sealed_records: SRoff::new(14),
-            sealed_stream: true,
-        };
+        let mut stream = Stream::new(TimeSec::new(100), SnId::FIRST);
+        stream.sealed = vec![extent.clone(), extent];
+        stream.sealed_records = SRoff::new(14);
+        stream.sealed_stream = true;
         let state = sn.global_lock.read();
         let (run, rows) =
             sn.run_of(&state.extent_table, &stream, StreamId::FIRST, SRoff::ZERO, 10, false);
@@ -3176,15 +3373,10 @@ mod tests {
                     .unwrap(),
             );
         }
-        let stream = Stream {
-            deletion: Flags::default(),
-            created: TimeSec::new(100),
-            creator: SnId::FIRST,
-            sealed: vec![ids[1], ids[2]],
-            open: Some(ids[3]),
-            sealed_records: SRoff::new(14),
-            sealed_stream: false,
-        };
+        let mut stream = Stream::new(TimeSec::new(100), SnId::FIRST);
+        stream.sealed = vec![ids[1], ids[2]];
+        stream.open = Some(ids[3]);
+        stream.sealed_records = SRoff::new(14);
         let mut from = SRoff::ZERO;
         for (id, first, next) in [
             (ids[1], SRoff::ZERO, SRoff::new(7)),
@@ -3244,15 +3436,28 @@ mod tests {
     }
 
     fn empty_stream() -> Stream {
-        Stream {
-            deletion: Flags::default(),
-            created: MADE,
-            creator: SnId::FIRST,
-            sealed: Vec::new(),
-            open: None,
-            sealed_records: SRoff::ZERO,
-            sealed_stream: false,
-        }
+        Stream::new(MADE, SnId::FIRST)
+    }
+
+    #[test]
+    fn stream_table_reuses_retired_slots() {
+        let mut table = StreamTable::new(8).unwrap();
+        let first = named(0, 1);
+        let second = named(0, 2);
+        table.insert(first, empty_stream()).unwrap();
+        let index = table.pool_index(&first).unwrap();
+        assert_eq!(table.names.get(&first), Some(&index));
+        assert_eq!(table.get(&first).unwrap().created, MADE);
+        assert_eq!(table.pool.issued_blocks(), 1);
+
+        assert!(table.remove(&first));
+        assert!(!table.contains_key(&first));
+        table.reclaim();
+        table.insert(second, empty_stream()).unwrap();
+
+        assert_eq!(table.pool_index(&second), Some(index));
+        assert_eq!(table.pool.issued_blocks(), 1);
+        assert!(table.get(&second).is_some());
     }
 
     #[test]
@@ -3260,8 +3465,8 @@ mod tests {
         let name = named(3, 7);
         let mut primary = SNState::new(8).unwrap();
         let mut secondary = SNState::new(8).unwrap();
-        primary.stream_map.insert(name, empty_stream());
-        secondary.stream_map.insert(name, empty_stream());
+        primary.stream_map.insert(name, empty_stream()).unwrap();
+        secondary.stream_map.insert(name, empty_stream()).unwrap();
 
         let id = primary.extent_table.alloc_id().unwrap();
         let action = sn_action(
@@ -3341,7 +3546,7 @@ mod tests {
     fn seal_slot_conflict() {
         let name = named(3, 8);
         let mut state = SNState::new(8).unwrap();
-        state.stream_map.insert(name, empty_stream());
+        state.stream_map.insert(name, empty_stream()).unwrap();
         let current = ExtentId::FIRST;
         let open = sn_action(
             Op::SnOpen,
@@ -3754,15 +3959,7 @@ mod tests {
         let mut config = testing::sn_config();
         config.max_extents = 1;
         let sn = SN::new(config, 10, SnId::FIRST, default_disks()).unwrap();
-        let mut stream = Stream {
-            deletion: Flags::default(),
-            created: TimeSec::new(100),
-            creator: SnId::FIRST,
-            sealed: Vec::new(),
-            open: None,
-            sealed_records: SRoff::ZERO,
-            sealed_stream: false,
-        };
+        let mut stream = Stream::new(TimeSec::new(100), SnId::FIRST);
         let first = {
             let mut state = sn.global_lock.write();
             let SNState { extent_table, extents, .. } = &mut *state;

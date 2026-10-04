@@ -200,6 +200,17 @@ impl<T: PoolItem, const A: usize, const L: usize> LockedPool<T, A, L> {
         }
     }
 
+    /// Return a pool index whose ownership is tracked by the caller instead of a block handle.
+    ///
+    /// # Safety
+    /// `index` must name one currently allocated block owned by the caller, and that block
+    /// must not be returned again. Call this under the same caller-owned lock used for
+    /// `alloc`; `reclaim` must remain excluded until the operation is complete.
+    pub unsafe fn retire_index(&self, index: u32) {
+        assert!(index < self.issued_blocks(), "retired pool index was never issued");
+        self.retire(index);
+    }
+
     /// Move every bucket's deleted list onto its free list.
     ///
     /// The caller must hold its global lock exclusively. No pool operation may
