@@ -1,16 +1,34 @@
 //! Linear-hash bucket heads stored in a segmented buffer.
 //!
-//! The directory grows one bucket at a time, keeping at least one bucket per
-//! item. It shrinks when it has more than two buckets per live item. The byte
-//! buffer allocates a 64 KiB leaf only at boundaries.
+//! The directory starts at its configured size and grows one bucket at a time,
+//! keeping at least one bucket per item. It shrinks above two buckets per live
+//! item. The byte buffer allocates a 64 KiB leaf only at boundaries.
 //! Items and their chain links remain owned by the caller.
-use super::{ChunkPool, LockedItem, LockedPool, SegmentedBuffer};
+use super::{CHUNK_BYTES, ChunkPool, LockedItem, LockedPool, SegmentedBuffer};
 use crate::{Error, Result};
 use std::ops::Index;
 use std::ptr::NonNull;
 
-const MIN_BUCKETS: u64 = 64;
+const MIN_BUCKETS: u64 = 1;
 const HEAD_BYTES: usize = std::mem::size_of::<u32>();
+static EMPTY_HEADS: [u8; CHUNK_BYTES] = [0xff; CHUNK_BYTES];
+
+fn append_empty(heads: &mut SegmentedBuffer<'_>, buckets: u64) -> Result<()> {
+    let mut bytes = buckets
+        .checked_mul(HEAD_BYTES as u64)
+        .ok_or_else(|| Error::new("linear-hash directory size overflow"))?;
+    while bytes != 0 {
+        let count = bytes.min(CHUNK_BYTES as u64) as usize;
+        heads.append(&EMPTY_HEADS[..count])?;
+        bytes -= count as u64;
+    }
+    Ok(())
+}
+
+fn bucket_shape(buckets: u64) -> (u32, u64) {
+    let level = u64::BITS - 1 - buckets.leading_zeros();
+    (level, buckets - (1u64 << level))
+}
 
 /// Bucket directory used internally by `LinearPool`.
 struct LinearHash<'a> {
@@ -19,15 +37,24 @@ struct LinearHash<'a> {
     level: u32,
     split: u64,
     max_buckets: u64,
+    initial_buckets: u64,
 }
 
 impl<'a> LinearHash<'a> {
-    /// Make a directory up to max_buckets large, with a minimum of 64 buckets.
-    fn new(pool: &'a ChunkPool, max_buckets: u64) -> Result<Self> {
+    fn with_buckets(pool: &'a ChunkPool, max_buckets: u64, initial_buckets: u64) -> Result<Self> {
         let max_buckets = max_buckets.max(MIN_BUCKETS);
-        let mut heads = SegmentedBuffer::with_retained_leaves(pool, 1);
-        heads.append(&[0xff; (MIN_BUCKETS as usize) * HEAD_BYTES])?;
-        Ok(Self { heads, buckets: MIN_BUCKETS, level: 6, split: 0, max_buckets })
+        let initial_buckets = initial_buckets.max(MIN_BUCKETS);
+        if initial_buckets > max_buckets {
+            return Err(Error::new("initial linear-hash size exceeds its item limit"));
+        }
+        let initial_bytes = initial_buckets * HEAD_BYTES as u64;
+        let retained = initial_bytes.div_ceil(CHUNK_BYTES as u64).max(1);
+        let retained = u32::try_from(retained)
+            .map_err(|_| Error::new("linear-hash directory is too large"))?;
+        let mut heads = SegmentedBuffer::with_retained_leaves(pool, retained);
+        append_empty(&mut heads, initial_buckets)?;
+        let (level, split) = bucket_shape(initial_buckets);
+        Ok(Self { heads, buckets: initial_buckets, level, split, max_buckets, initial_buckets })
     }
 
     /// Bucket for an integer key, using its low bits.
@@ -105,13 +132,12 @@ impl<'a> LinearHash<'a> {
         self.heads.truncate(self.buckets * HEAD_BYTES as u64)
     }
 
-    /// Return to the initial directory while retaining its first leaf.
+    /// Return to the configured directory size and clear its bucket heads.
     fn reset(&mut self) -> Result<()> {
         self.heads.reset();
-        self.heads.append(&[0xff; (MIN_BUCKETS as usize) * HEAD_BYTES])?;
-        self.buckets = MIN_BUCKETS;
-        self.level = 6;
-        self.split = 0;
+        append_empty(&mut self.heads, self.initial_buckets)?;
+        self.buckets = self.initial_buckets;
+        (self.level, self.split) = bucket_shape(self.initial_buckets);
         Ok(())
     }
 }
@@ -157,11 +183,20 @@ unsafe impl<T: LinearEntry + Send + Sync, const A: usize, const L: usize> Sync
 }
 
 impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L> {
-    /// Create a pool that can hold max_items entries, initially using 64 buckets.
+    /// Create a pool that can hold max_items entries, initially using one bucket.
     pub fn new(chunks: &'a ChunkPool, max_items: u32) -> Result<Self> {
+        Self::with_buckets(chunks, max_items, 0)
+    }
+
+    /// Create a pool with an explicit initial bucket count; zero means one.
+    pub fn with_buckets(
+        chunks: &'a ChunkPool,
+        max_items: u32,
+        initial_buckets: u32,
+    ) -> Result<Self> {
         let max_items = max_items.max(1);
         let max_buckets = u64::from(max_items);
-        let hash = LinearHash::new(chunks, max_buckets)?;
+        let hash = LinearHash::with_buckets(chunks, max_buckets, u64::from(initial_buckets))?;
         let slots = LockedPool::new(max_items, 0)?;
         let base = slots.base_ptr();
         Ok(Self { slots, base, hash, len: 0 })
@@ -396,16 +431,16 @@ mod tests {
     #[test]
     fn grow_shrink() {
         let pool = ChunkPool::new(8, 1).unwrap();
-        let mut hash = LinearHash::new(&pool, 256).unwrap();
-        assert_eq!(hash.bucket_count(), 64);
+        let mut hash = LinearHash::with_buckets(&pool, 256, 0).unwrap();
+        assert_eq!(hash.bucket_count(), 1);
 
-        // The low six bits select the initial buckets.
-        assert_eq!(hash.bucket(0x41), 1);
-        assert_eq!(hash.bucket(0x82), 2);
-        assert_eq!(hash.bucket(0x1_0000_0003), 3);
-        assert_eq!(hash.head(63).unwrap(), u32::MAX);
+        // Every key initially maps to the single bucket.
+        assert_eq!(hash.bucket(0x41), 0);
+        assert_eq!(hash.bucket(0x82), 0);
+        assert_eq!(hash.bucket(0x1_0000_0003), 0);
+        assert_eq!(hash.head(0).unwrap(), u32::MAX);
 
-        for expected in 65..=256 {
+        for expected in 2..=256 {
             hash.grow_one(|_, _, _, head| (head, u32::MAX)).unwrap();
             assert_eq!(hash.bucket_count(), expected);
         }
@@ -413,7 +448,7 @@ mod tests {
         assert_eq!(hash.bucket(128), 128);
         assert_eq!(hash.bucket(192), 192);
 
-        for expected in (64..256).rev() {
+        for expected in (1..256).rev() {
             hash.shrink_one(|_, _, keep, _| keep).unwrap();
             assert_eq!(hash.bucket_count(), expected);
         }
@@ -424,7 +459,8 @@ mod tests {
     #[test]
     fn capacity_reset() {
         let pool = ChunkPool::new(8, 1).unwrap();
-        let mut hash = LinearHash::new(&pool, 65).unwrap();
+        let mut hash = LinearHash::with_buckets(&pool, 65, 64).unwrap();
+        assert_eq!(hash.bucket_count(), 64);
         hash.grow_one(|_, _, _, head| (head, u32::MAX)).unwrap();
         assert_eq!(hash.bucket_count(), 65);
         assert!(hash.grow_one(|_, _, _, head| (head, u32::MAX)).is_err());
@@ -547,6 +583,7 @@ mod tests {
     fn capacity_is_exact() {
         let chunks = ChunkPool::new(8, 1).unwrap();
         let mut table = LinearPool::<Entry, 4, 0>::new(&chunks, 65).unwrap();
+        assert_eq!(table.hash.bucket_count(), 1);
         for key in 0..65 {
             add(&mut table, key, entry(key));
         }
@@ -591,5 +628,27 @@ mod tests {
         assert_eq!(table.len(), 64);
         assert_eq!(table.hash.bucket_count(), 128);
         assert_sorted(&table);
+    }
+
+    #[test]
+    fn keeps_configured_bucket_count_after_remove_and_clear() {
+        let chunks = ChunkPool::new(8, 1).unwrap();
+        let mut table = LinearPool::<Entry, 4, 0>::with_buckets(&chunks, 128, 100).unwrap();
+        assert_eq!(table.hash.bucket_count(), 100);
+
+        for key in 0..100 {
+            add(&mut table, key, entry(key));
+        }
+        assert_eq!(table.hash.bucket_count(), 100);
+        for key in 0..100 {
+            assert!(table.remove(&key));
+        }
+        assert_eq!(table.hash.bucket_count(), MIN_BUCKETS);
+
+        table.clear();
+        assert_eq!(table.hash.bucket_count(), 100);
+        for bucket in 0..100 {
+            assert_eq!(table.hash.head(bucket).unwrap(), Entry::LINK_NONE);
+        }
     }
 }

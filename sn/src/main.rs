@@ -923,7 +923,7 @@ impl SNState {
     fn new(max_extents: u32) -> Result<Self> {
         let chunks = common::message_pool()
             .map_err(|error| Error::new(format!("get segmented-buffer pool: {error}")))?;
-        let stream_map = StreamTable::new(chunks, MAX_STREAMS)
+        let stream_map = StreamTable::with_buckets(chunks, MAX_STREAMS, 0)
             .map_err(|error| Error::new(format!("reserve SN stream table: {error}")))?;
         let extent_table = ExtentTable::new(max_extents)
             .map_err(|error| Error::new(format!("reserve SN extent table: {error}")))?;
