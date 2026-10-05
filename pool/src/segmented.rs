@@ -375,7 +375,18 @@ impl<'a> SegmentedBuffer<'a> {
     /// Release bytes at and after an absolute offset within the live range.
     pub fn truncate(&mut self, end: u64) -> Result<()> {
         self.check_range(end, 0)?;
+        if end == self.end {
+            return Ok(());
+        }
+        let old_end = self.end;
         self.end = end;
+        if end > self.start
+            && end.div_ceil(CHUNK_BYTES as u64) == old_end.div_ceil(CHUNK_BYTES as u64)
+        {
+            // The nonempty range still covers the same leaves. Keep the tree
+            // and cached tail; no storage can be released by this truncation.
+            return Ok(());
+        }
         self.prune();
         Ok(())
     }
@@ -609,6 +620,26 @@ mod tests {
         assert_eq!(b.chunk(0), Some(vec![3; CHUNK_BYTES].as_slice()));
         assert_eq!(b.chunk(CHUNK_BYTES as u64), Some([9].as_slice()));
         audit(&b);
+        drop(b);
+        all_returned(&pool, 8);
+    }
+
+    #[test]
+    fn truncate_skips_prune_without_releasing_a_leaf() {
+        let pool = pool(8);
+        let mut b = SegmentedBuffer::new(&pool);
+        b.append(&vec![7; CHUNK_BYTES * 2]).unwrap();
+        let tail = b.tail;
+        let prunes = PRUNE_CALLS.get();
+
+        b.truncate(b.end()).unwrap();
+        b.truncate((CHUNK_BYTES * 2 - 1) as u64).unwrap();
+        assert_eq!(PRUNE_CALLS.get(), prunes);
+        assert_eq!(b.tail, tail);
+
+        b.truncate(CHUNK_BYTES as u64).unwrap();
+        assert_eq!(PRUNE_CALLS.get(), prunes + 1);
+        assert_eq!(audit(&b), 1);
         drop(b);
         all_returned(&pool, 8);
     }

@@ -93,15 +93,15 @@ impl<'a> LinearHash<'a> {
         if self.buckets >= self.max_buckets {
             return Err(Error::new("linear-hash directory reached its item limit"));
         }
-        self.heads.append(&[0xff; HEAD_BYTES])?;
         let old = self.split;
         let new = self.buckets;
         let bit = 1u64 << self.level;
         let head = self.head(old)?;
+        self.heads.append(&[0xff; HEAD_BYTES])?;
         let (old_head, new_head) = split_chain(old, new, bit, head);
         self.buckets += 1;
-        self.set_head(old, old_head)?;
-        self.set_head(new, new_head)?;
+        self.set_head(old, old_head).expect("split bucket remains in range");
+        self.set_head(new, new_head).expect("new bucket was appended");
         self.split += 1;
         if self.split == 1u64 << self.level {
             self.level += 1;
@@ -268,11 +268,6 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L>
             return Err(Error::new("linear-hash directory reached its item limit"));
         }
         let grows = final_len > self.hash.bucket_count();
-        while final_len > self.hash.bucket_count() {
-            self.grow()?;
-        }
-        let (bucket, previous, next) =
-            if grows { self.seek(&key, hash) } else { (bucket, previous, next) };
         let value = create(key);
         let index = self.slots.alloc()?;
         self.slot_mut(index).init(key, value);
@@ -282,6 +277,21 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L>
             self.hash.set_head(bucket, index).expect("linear-hash bucket exists");
         } else {
             self.slot_mut(previous).set_next(index);
+        }
+        if grows {
+            // Split after linking so the new item is repartitioned with its
+            // original chain. A failed append leaves the old table intact.
+            if let Err(error) = self.grow() {
+                if previous == T::LINK_NONE {
+                    self.hash.set_head(bucket, next).expect("rollback bucket remains in range");
+                } else {
+                    self.slot_mut(previous).set_next(next);
+                }
+                self.slot_mut(index).clear();
+                // SAFETY: this unique entry was unlinked above.
+                unsafe { self.slots.retire_index(index) };
+                return Err(error);
+            }
         }
         self.len = final_len;
         Ok((self.slot_mut(index), true))
@@ -370,7 +380,6 @@ fn split_chain<T: LinearEntry>(base: NonNull<T>, head: u32, bit: u64) -> (u32, u
         let ptr = unsafe { base.as_ptr().add(index as usize) };
         let next = unsafe { (*ptr).next() };
         let move_to_new = unsafe { (T::hash(&(*ptr).key()) & bit) != 0 };
-        unsafe { (*ptr).set_next(T::LINK_NONE) };
         let (list_head, list_tail) = if move_to_new {
             (&mut move_head, &mut move_tail)
         } else {
@@ -385,6 +394,14 @@ fn split_chain<T: LinearEntry>(base: NonNull<T>, head: u32, bit: u64) -> (u32, u
         }
         *list_tail = index;
         index = next;
+    }
+    if keep_tail != T::LINK_NONE {
+        // SAFETY: keep_tail is the last live item in the kept output chain.
+        unsafe { (*base.as_ptr().add(keep_tail as usize)).set_next(T::LINK_NONE) };
+    }
+    if move_tail != T::LINK_NONE {
+        // SAFETY: move_tail is the last live item in the moved output chain.
+        unsafe { (*base.as_ptr().add(move_tail as usize)).set_next(T::LINK_NONE) };
     }
     (keep_head, move_head)
 }
@@ -591,6 +608,22 @@ mod tests {
         assert_eq!(table.len(), 65);
         assert_eq!(table.hash.bucket_count(), 65);
         assert!(table.get(&64).unwrap().valid);
+    }
+
+    #[test]
+    fn failed_growth_rolls_back_insert() {
+        let chunks = ChunkPool::new(1, 1).unwrap();
+        let mut table = LinearPool::<Entry, 4, 0>::with_buckets(&chunks, 16_385, 16_384).unwrap();
+        for key in 0..16_384 {
+            add(&mut table, key, entry(key));
+        }
+
+        assert!(table.find_or_create(16_384, entry).is_err());
+        assert_eq!(table.len(), 16_384);
+        assert_eq!(table.hash.bucket_count(), 16_384);
+        assert!(table.get(&16_383).unwrap().valid);
+        assert!(table.get(&16_384).is_none());
+        assert_sorted(&table);
     }
 
     #[test]
