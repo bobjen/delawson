@@ -216,6 +216,10 @@ impl pool::LinearEntry for Stream {
         self.link = next;
     }
 
+    unsafe fn next_ptr(&mut self) -> *mut u32 {
+        std::ptr::addr_of_mut!(self.link)
+    }
+
     fn init(&mut self, key: Self::Key, value: Self) {
         self.set(key, value);
     }

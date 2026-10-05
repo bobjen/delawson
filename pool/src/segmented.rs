@@ -238,6 +238,48 @@ impl<'a> SegmentedBuffer<'a> {
         self.append_slow(bytes)
     }
 
+    /// Append `count` copies of `byte`, initializing each destination leaf directly.
+    pub fn append_fill(&mut self, byte: u8, count: u64) -> Result<()> {
+        self.end
+            .checked_add(count)
+            .ok_or_else(|| Error::new("segmented buffer offset overflow"))?;
+        if count == 0 {
+            return Ok(());
+        }
+        let within = self.end as usize % CHUNK_BYTES;
+        let spare = (CHUNK_BYTES - within) as u64;
+        if self.tail != NONE && (within != 0 || self.end == 0) && count <= spare {
+            // SAFETY: tail owns the current leaf and the fill stays within it.
+            unsafe { std::ptr::write_bytes(self.ptr(self.tail).add(within), byte, count as usize) };
+            self.end += count;
+            return Ok(());
+        }
+        self.append_fill_slow(byte, count)
+    }
+
+    fn append_fill_slow(&mut self, byte: u8, mut count: u64) -> Result<()> {
+        let old_end = self.end;
+        self.tail = NONE;
+        while count != 0 {
+            let index = match self.ensure_leaf(self.end / CHUNK_BYTES as u64) {
+                Ok(index) => index,
+                Err(error) => {
+                    self.end = old_end;
+                    self.prune();
+                    return Err(error);
+                }
+            };
+            let offset = self.end as usize % CHUNK_BYTES;
+            let len = count.min((CHUNK_BYTES - offset) as u64) as usize;
+            // SAFETY: this buffer exclusively owns the leaf and `len` fits.
+            unsafe { std::ptr::write_bytes(self.ptr(index).add(offset), byte, len) };
+            self.end += len as u64;
+            self.tail = index;
+            count -= len as u64;
+        }
+        Ok(())
+    }
+
     fn append_slow(&mut self, bytes: &[u8]) -> Result<()> {
         #[cfg(test)]
         tests::APPEND_SLOW_CALLS.with(|count| count.set(count.get() + 1));
@@ -706,6 +748,30 @@ mod tests {
         audit(&b);
         drop(b);
         all_returned(&pool, 16);
+    }
+
+    #[test]
+    fn fill_append_crosses_leaves_and_rolls_back() {
+        let chunks = pool(8);
+        let mut b = SegmentedBuffer::new(&chunks);
+        b.append(b"head").unwrap();
+        b.append_fill(0x7f, (CHUNK_BYTES * 2 + 3) as u64).unwrap();
+        assert_eq!(b.len(), (4 + CHUNK_BYTES * 2 + 3) as u64);
+        let first = b.chunk(0).unwrap();
+        assert_eq!(&first[..4], b"head");
+        assert!(first[4..].iter().all(|byte| *byte == 0x7f));
+        assert_eq!(b.chunk(CHUNK_BYTES as u64).unwrap(), &[0x7f; CHUNK_BYTES]);
+        assert_eq!(b.chunk((CHUNK_BYTES * 2) as u64).unwrap(), &[0x7f; 7]);
+        drop(b);
+        all_returned(&chunks, 8);
+
+        let chunks = pool(2);
+        let mut b = SegmentedBuffer::new(&chunks);
+        b.append(b"ok").unwrap();
+        assert!(b.append_fill(0xff, (CHUNK_BYTES * 2) as u64).is_err());
+        assert_eq!(b.chunks().flatten().copied().collect::<Vec<_>>(), b"ok");
+        drop(b);
+        all_returned(&chunks, 2);
     }
 
     #[test]
