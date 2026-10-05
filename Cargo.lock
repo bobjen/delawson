@@ -198,7 +198,6 @@ dependencies = [
 [[package]]
 name = "crc64-nvme"
 version = "0.1.0"
-source = "git+https://github.com/bobjen/crc64nvme#1f02c885d1a0cbb9e6294958d9d4ebc231079af5"
 
 [[package]]
 name = "crypto-common"
@@ -332,6 +331,7 @@ dependencies = [
  "delawson-raft",
  "delawson-random",
  "parking_lot",
+ "spookyhash",
  "tempfile",
 ]
 
@@ -771,6 +771,10 @@ name = "softaes"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "45e14297decde697ddf377c25752aead0927d5cfc89c2684d2af96901a4ceeea"
+
+[[package]]
+name = "spookyhash"
+version = "0.1.0"
 
 [[package]]
 name = "strsim"

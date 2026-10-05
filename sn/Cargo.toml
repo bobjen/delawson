@@ -16,6 +16,7 @@ delawson-raft.workspace = true
 parking_lot.workspace = true
 delawson-pool.workspace = true
 delawson-random.workspace = true
+spookyhash.workspace = true
 
 [dev-dependencies]
 delawson-common = { workspace = true, features = ["testing"] }

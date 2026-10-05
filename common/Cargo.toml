@@ -20,7 +20,7 @@ delawson-pool.workspace = true
 delawson-random.workspace = true
 aes-gcm = "0.10.3"
 aegis = "0.9.15"
-crc64-nvme = { git = "https://github.com/bobjen/crc64nvme", version = "0.1.0" }
+crc64-nvme.workspace = true
 hkdf = "0.12.4"
 libc = "0.2.189"
 lz4_flex = "0.14.0"

@@ -15,12 +15,10 @@
 //! the fast implementation more than of this one, and it is why nothing here asks a
 //! caller to hold a CRC object: there is one per process, built on first use.
 //!
-//! The implementation is `crc64-nvme`, a port of the Cosmos 64-bit CRC authorized by
-//! Microsoft, bitwise compatible with the CRC Azure uses, at about 16 GB/s
-//! single-threaded. It is a dependency rather than a copy — and one we own, so where
-//! it needs work (its fast path is x86 carryless multiply, so an ARM branch wants
-//! doing properly on an ARM machine) that is our work rather than somebody's to wait
-//! for.
+//! The implementation is the in-tree crc64-nvme crate, a port of the Cosmos 64-bit
+//! CRC authorized by Microsoft, bitwise compatible with the CRC Azure uses, at about
+//! 16 GB/s single-threaded. Its source is vendored under ./crc so builds do not
+//! follow changes to the upstream repository.
 
 use crc64_nvme::Crc;
 
