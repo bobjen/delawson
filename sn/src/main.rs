@@ -29,7 +29,7 @@ use pool::Pool;
 use raft::runtime::{Host, Settings as RaftSettings};
 use std::collections::HashMap;
 use std::mem::align_of;
-use std::ops::{Deref, DerefMut, Index};
+use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
@@ -183,8 +183,12 @@ impl Stream {
 }
 
 const MAX_STREAMS: u32 = u32::MAX;
-type StreamPool =
-    pool::LockedPool<Stream, { align_of::<Stream>() }, { std::mem::offset_of!(Stream, link) }>;
+type StreamTable = pool::LinearPool<
+    'static,
+    Stream,
+    { align_of::<Stream>() },
+    { std::mem::offset_of!(Stream, link) },
+>;
 
 #[inline]
 fn stream_hash(name: &StreamName) -> u64 {
@@ -193,291 +197,31 @@ fn stream_hash(name: &StreamName) -> u64 {
     words[0]
 }
 
-/// Bucket heads and links form a linear hash with sorted chains. Callers address
-/// streams by full name; the directory uses the low bits of its SpookyHash.
-struct StreamTable {
-    pool: StreamPool,
-    base: NonNull<Stream>,
-    hash: pool::LinearHash<'static>,
-    len: u64,
-}
+impl pool::LinearEntry for Stream {
+    type Key = StreamName;
 
-// SAFETY: slots remain at stable addresses and access is serialized by SN's state lock.
-unsafe impl Send for StreamTable {}
-unsafe impl Sync for StreamTable {}
-
-impl StreamTable {
-    fn new(max_streams: u32) -> Result<Self> {
-        let chunks = common::message_pool()
-            .map_err(|error| Error::new(format!("get segmented-buffer pool: {error}")))?;
-        let hash = pool::LinearHash::new(chunks, max_streams)
-            .map_err(|error| Error::new(format!("create SN stream hash: {error}")))?;
-        let pool = StreamPool::new(max_streams, 0)
-            .map_err(|error| Error::new(format!("create SN stream pool: {error}")))?;
-        let base = pool.base_ptr();
-        Ok(Self { pool, base, hash, len: 0 })
+    fn key(&self) -> Self::Key {
+        self.name
     }
 
-    #[inline]
-    fn slot(&self, index: u32) -> &Stream {
-        // SAFETY: every issued slot is initialized and remains at this address.
-        unsafe { &*self.base.as_ptr().add(index as usize) }
+    fn hash(key: &Self::Key) -> u64 {
+        stream_hash(key)
     }
 
-    #[inline]
-    fn slot_mut(&mut self, index: u32) -> &mut Stream {
-        // SAFETY: exclusive table access protects the claimed slot.
-        unsafe { &mut *self.base.as_ptr().add(index as usize) }
+    fn next(&self) -> u32 {
+        self.link
     }
 
-    fn alloc_index(&mut self) -> Result<u32> {
-        self.pool.alloc().map_err(|error| Error::new(format!("allocate SN stream slot: {error}")))
+    fn set_next(&mut self, next: u32) {
+        self.link = next;
     }
 
-    fn retire_index(&mut self, index: u32) {
-        // SAFETY: the map owned this unique index and removed it before returning it.
-        unsafe { self.pool.retire_index(index) };
+    fn put(&mut self, key: Self::Key, value: Self) {
+        self.set(key, value);
     }
 
-    /// Find the first chain position whose name is not less than `name`.
-    fn seek(&self, name: &StreamName) -> (u64, u32, u32) {
-        self.seek_hash(name, stream_hash(name))
-    }
-
-    fn seek_hash(&self, name: &StreamName, hash: u64) -> (u64, u32, u32) {
-        let bucket = self.hash.bucket(hash);
-        let mut previous = StreamId::NONE.get();
-        let mut index = self.hash.head(bucket).expect("stream hash bucket exists");
-        while index != StreamId::NONE.get() && self.slot(index).name < *name {
-            previous = index;
-            index = self.slot(index).link;
-        }
-        (bucket, previous, index)
-    }
-
-    fn find_index(&self, name: &StreamName) -> Option<u32> {
-        let (_, _, index) = self.seek(name);
-        (index != StreamId::NONE.get() && self.slot(index).name == *name).then_some(index)
-    }
-
-    fn get(&self, name: &StreamName) -> Option<&Stream> {
-        self.find_index(name).map(|index| self.slot(index))
-    }
-
-    fn get_mut(&mut self, name: &StreamName) -> Option<&mut Stream> {
-        let index = self.find_index(name)?;
-        Some(self.slot_mut(index))
-    }
-
-    fn contains_key(&self, name: &StreamName) -> bool {
-        self.find_index(name).is_some()
-    }
-
-    fn split_chain(base: NonNull<Stream>, head: u32, bit: u64) -> (u32, u32) {
-        let mut keep_head = StreamId::NONE.get();
-        let mut keep_tail = StreamId::NONE.get();
-        let mut move_head = StreamId::NONE.get();
-        let mut move_tail = StreamId::NONE.get();
-        let mut index = head;
-        while index != StreamId::NONE.get() {
-            // SAFETY: all linked slots are live and the table is exclusively
-            // borrowed while a split rewrites their links.
-            let ptr = unsafe { base.as_ptr().add(index as usize) };
-            let next = unsafe { (*ptr).link };
-            let move_to_new = unsafe { (stream_hash(&(*ptr).name) & bit) != 0 };
-            unsafe { (*ptr).link = StreamId::NONE.get() };
-            let (list_head, list_tail) = if move_to_new {
-                (&mut move_head, &mut move_tail)
-            } else {
-                (&mut keep_head, &mut keep_tail)
-            };
-            if *list_head == StreamId::NONE.get() {
-                *list_head = index;
-            } else {
-                let tail = unsafe { base.as_ptr().add(*list_tail as usize) };
-                // SAFETY: tail belongs to this list and is live under the X lock.
-                unsafe { (*tail).link = index };
-            }
-            *list_tail = index;
-            index = next;
-        }
-        (keep_head, move_head)
-    }
-
-    fn merge_chain(base: NonNull<Stream>, mut left: u32, mut right: u32) -> u32 {
-        let mut head = StreamId::NONE.get();
-        let mut tail = StreamId::NONE.get();
-        while left != StreamId::NONE.get() && right != StreamId::NONE.get() {
-            // SAFETY: linked slots are live and the table is exclusively borrowed
-            // while this stable merge rewrites their links.
-            let left_ptr = unsafe { base.as_ptr().add(left as usize) };
-            let right_ptr = unsafe { base.as_ptr().add(right as usize) };
-            let take_left = unsafe { (*left_ptr).name <= (*right_ptr).name };
-            let (take, next) = if take_left {
-                (left, unsafe { (*left_ptr).link })
-            } else {
-                (right, unsafe { (*right_ptr).link })
-            };
-            if head == StreamId::NONE.get() {
-                head = take;
-            } else {
-                // SAFETY: tail is the last live node already linked into output.
-                unsafe { (*base.as_ptr().add(tail as usize)).link = take };
-            }
-            tail = take;
-            if take_left {
-                left = next;
-            } else {
-                right = next;
-            }
-        }
-        let rest = if left != StreamId::NONE.get() { left } else { right };
-        if tail == StreamId::NONE.get() {
-            return rest;
-        }
-        // SAFETY: tail is the last output node and `rest` starts the remaining
-        // sorted suffix from one of the input chains.
-        unsafe { (*base.as_ptr().add(tail as usize)).link = rest };
-        head
-    }
-
-    fn grow(&mut self) -> Result<()> {
-        let base = self.base;
-        self.hash
-            .grow_by_64(|_, _, bit, head| Self::split_chain(base, head, bit))
-            .map_err(|error| Error::new(format!("grow SN stream hash: {error}")))
-    }
-
-    fn shrink(&mut self) {
-        let base = self.base;
-        self.hash
-            .shrink_by_64(|_, _, keep, add| Self::merge_chain(base, keep, add))
-            .expect("stream hash shrinks by one valid group");
-    }
-
-    fn ensure_buckets(&mut self, items: u64) -> Result<()> {
-        while items > self.hash.bucket_count() {
-            self.grow()?;
-        }
-        Ok(())
-    }
-
-    fn link_before(&mut self, bucket: u64, previous: u32, index: u32, next: u32) {
-        self.slot_mut(index).link = next;
-        if previous == StreamId::NONE.get() {
-            self.hash.set_head(bucket, index).expect("stream hash bucket exists");
-        } else {
-            self.slot_mut(previous).link = index;
-        }
-    }
-
-    fn insert_at(
-        &mut self,
-        name: StreamName,
-        stream: Stream,
-        bucket: u64,
-        previous: u32,
-        next: u32,
-    ) -> Result<()> {
-        let index = self.alloc_index()?;
-        debug_assert!(!self.slot(index).deletion.is_valid());
-        debug_assert!(next == StreamId::NONE.get() || self.slot(next).name > name);
-        self.slot_mut(index).set(name, stream);
-        self.link_before(bucket, previous, index, next);
-        self.len += 1;
-        Ok(())
-    }
-
-    fn rollback(&mut self, names: &[StreamName]) {
-        for name in names.iter().rev() {
-            assert!(self.unlink(name), "rollback lost inserted stream");
-        }
-    }
-
-    fn insert(&mut self, name: StreamName, stream: Stream) -> Result<()> {
-        let hash = stream_hash(&name);
-        let (bucket, previous, next) = self.seek_hash(&name, hash);
-        if next != StreamId::NONE.get() && self.slot(next).name == name {
-            self.slot_mut(next).set(name, stream);
-            return Ok(());
-        }
-        let final_len =
-            self.len.checked_add(1).ok_or_else(|| Error::new("SN stream count overflow"))?;
-        let grows = final_len > self.hash.bucket_count();
-        self.ensure_buckets(final_len)?;
-        let (bucket, previous, next) =
-            if grows { self.seek_hash(&name, hash) } else { (bucket, previous, next) };
-        self.insert_at(name, stream, bucket, previous, next)
-    }
-
-    fn unlink(&mut self, name: &StreamName) -> bool {
-        let (bucket, previous, index) = self.seek(name);
-        if index == StreamId::NONE.get() || self.slot(index).name != *name {
-            return false;
-        }
-        let next = self.slot(index).link;
-        if previous == StreamId::NONE.get() {
-            self.hash.set_head(bucket, next).expect("stream hash bucket exists");
-        } else {
-            self.slot_mut(previous).link = next;
-        }
-        self.slot_mut(index).clear();
-        self.retire_index(index);
-        self.len -= 1;
-        true
-    }
-
-    fn remove(&mut self, name: &StreamName) -> bool {
-        if !self.unlink(name) {
-            return false;
-        }
-        while self.hash.bucket_count() > 64 && self.len * 2 < self.hash.bucket_count() {
-            self.shrink();
-        }
-        true
-    }
-
-    /// Reset runs under the global write lock, so returned slots can be reclaimed here.
     fn clear(&mut self) {
-        for bucket in 0..self.hash.bucket_count() {
-            let mut index = self.hash.head(bucket).expect("stream hash bucket exists");
-            while index != StreamId::NONE.get() {
-                let next = self.slot(index).link;
-                self.slot_mut(index).clear();
-                self.retire_index(index);
-                index = next;
-            }
-        }
-        self.len = 0;
-        self.hash.reset().expect("reset stream hash directory");
-        self.pool.reclaim();
-    }
-
-    /// The application hook calls this while Raft holds the global write lock.
-    fn reclaim(&mut self) {
-        self.pool.reclaim();
-    }
-
-    #[cfg(test)]
-    fn pool_index(&self, name: &StreamName) -> Option<u32> {
-        self.find_index(name)
-    }
-}
-
-impl Index<&StreamName> for StreamTable {
-    type Output = Stream;
-
-    fn index(&self, name: &StreamName) -> &Self::Output {
-        self.get(name).expect("stream name is present")
-    }
-}
-
-impl Drop for StreamTable {
-    fn drop(&mut self) {
-        for index in 0..self.pool.issued_blocks() {
-            // PoolItem::init created an initialized Stream in every issued slot.
-            unsafe { std::ptr::drop_in_place(self.base.as_ptr().add(index as usize)) };
-        }
+        Stream::clear(self);
     }
 }
 
@@ -1177,7 +921,9 @@ struct SNState {
 
 impl SNState {
     fn new(max_extents: u32) -> Result<Self> {
-        let stream_map = StreamTable::new(MAX_STREAMS)
+        let chunks = common::message_pool()
+            .map_err(|error| Error::new(format!("get segmented-buffer pool: {error}")))?;
+        let stream_map = StreamTable::new(chunks, MAX_STREAMS)
             .map_err(|error| Error::new(format!("reserve SN stream table: {error}")))?;
         let extent_table = ExtentTable::new(max_extents)
             .map_err(|error| Error::new(format!("reserve SN extent table: {error}")))?;
@@ -1418,38 +1164,37 @@ fn apply_sn_slot(
                 let stream_id = StreamId::of_number(cmd.first.number() + offset)?;
                 let name = StreamName { range: cmd.range, stream: stream_id, created: cmd.created };
                 if retired_streams.contains(&name) {
-                    stream_map.rollback(&added);
+                    for name in added.iter().rev() {
+                        assert!(stream_map.remove(name), "rollback lost inserted stream");
+                    }
                     return Err(Error::new("stream identity has been retired"));
                 }
-                let (bucket, prev, next) = stream_map.seek(&name);
-                if next != StreamId::NONE.get() && stream_map.slot(next).name == name {
-                    if !stream_map.slot(next).deletion.readable(false) {
-                        stream_map.rollback(&added);
+                if let Some(existing) = stream_map.get(&name) {
+                    if !existing.deletion.readable(false) {
+                        for name in added.iter().rev() {
+                            assert!(stream_map.remove(name), "rollback lost inserted stream");
+                        }
                         return Err(Error::new("stream is deleted"));
                     }
                 } else {
                     if added.len() == added.capacity() {
                         if let Err(error) = added.try_reserve(1) {
-                            stream_map.rollback(&added);
+                            for name in added.iter().rev() {
+                                assert!(stream_map.remove(name), "rollback lost inserted stream");
+                            }
                             return Err(Error::new(format!("reserve SN stream batch: {error}")));
                         }
                     }
-                    if let Err(error) = stream_map.insert_at(
-                        name,
-                        Stream::new(cmd.created, cmd.creator),
-                        bucket,
-                        prev,
-                        next,
-                    ) {
-                        stream_map.rollback(&added);
-                        return Err(error);
+                    if let Err(error) =
+                        stream_map.insert(name, Stream::new(cmd.created, cmd.creator))
+                    {
+                        for name in added.iter().rev() {
+                            assert!(stream_map.remove(name), "rollback lost inserted stream");
+                        }
+                        return Err(Error::new(format!("insert SN stream: {error}")));
                     }
                     added.push(name);
                 }
-            }
-            if let Err(error) = stream_map.ensure_buckets(stream_map.len) {
-                stream_map.rollback(&added);
-                return Err(error);
             }
             *streams += added.len() as u64;
             Ok(())
@@ -1482,7 +1227,8 @@ fn apply_sn_slot(
             }
             let inserted = !map.contains_key(&cmd.destination);
             if inserted {
-                map.insert(cmd.destination, Stream::new(cmd.destination.created, cmd.creator))?;
+                map.insert(cmd.destination, Stream::new(cmd.destination.created, cmd.creator))
+                    .map_err(|error| Error::new(format!("insert SN stream: {error}")))?;
             }
             let mut retained: Vec<ExtentId> = Vec::new();
             for &id in &cmd.extents {
@@ -3624,17 +3370,8 @@ mod tests {
         StreamName { range: RangeId::new(range), stream: StreamId::new(stream), created: MADE }
     }
 
-    fn assert_ordered(table: &StreamTable) {
-        for bucket in 0..table.hash.bucket_count() {
-            let mut previous: Option<StreamName> = None;
-            let mut index = table.hash.head(bucket).expect("stream hash bucket exists");
-            while index != StreamId::NONE.get() {
-                let name = table.slot(index).name;
-                assert!(previous.map_or(true, |prior| prior < name));
-                previous = Some(name);
-                index = table.slot(index).link;
-            }
-        }
+    fn stream_table(max: u32) -> StreamTable {
+        StreamTable::new(common::message_pool().unwrap(), max).unwrap()
     }
 
     fn empty_stream() -> Stream {
@@ -3666,12 +3403,12 @@ mod tests {
 
         apply_create(&mut state, 1, 3).unwrap();
         assert_eq!(state.streams, 3);
-        assert_eq!(state.stream_map.len, 3);
+        assert_eq!(state.stream_map.len(), 3);
         assert!(state.stream_map.get(&existing).unwrap().sealed_stream);
 
         apply_create(&mut state, 1, 3).unwrap();
         assert_eq!(state.streams, 3);
-        assert_eq!(state.stream_map.len, 3);
+        assert_eq!(state.stream_map.len(), 3);
         assert!(state.stream_map.get(&existing).unwrap().sealed_stream);
     }
 
@@ -3682,56 +3419,45 @@ mod tests {
 
         assert!(apply_create(&mut state, 1, 3).is_err());
         assert_eq!(state.streams, 0);
-        assert_eq!(state.stream_map.len, 0);
+        assert_eq!(state.stream_map.len(), 0);
         assert!(!state.stream_map.contains_key(&named(42, 1)));
         assert!(!state.stream_map.contains_key(&named(42, 2)));
-        assert_ordered(&state.stream_map);
     }
 
     #[test]
     fn stream_table_reuses_retired_slots() {
-        let mut table = StreamTable::new(8).unwrap();
+        let mut table = stream_table(8);
         let first = named(0, 1);
         let second = named(0, 2);
         table.insert(first, empty_stream()).unwrap();
-        let index = table.pool_index(&first).unwrap();
-        assert_eq!(table.find_index(&first), Some(index));
         assert_eq!(table.get(&first).unwrap().name.created, MADE);
-        assert!(table.slot(index).deletion.is_valid());
-        assert_eq!(table.slot(index).deletion.bits(), Flags::live().bits());
-        assert_eq!(table.slot(index).link, StreamId::NONE.get());
-        assert_eq!(table.pool.issued_blocks(), 1);
+        assert!(table.get(&first).unwrap().deletion.is_valid());
+        assert_eq!(table.get(&first).unwrap().deletion.bits(), Flags::live().bits());
+        assert_eq!(table.get(&first).unwrap().link, StreamId::NONE.get());
 
         assert!(table.remove(&first));
         assert!(!table.contains_key(&first));
-        assert!(!table.slot(index).deletion.is_valid());
-        assert_eq!(table.slot(index).deletion.bits(), Flags::default().bits());
-        assert_eq!(table.slot(index).link, StreamId::NONE.get());
         table.reclaim();
         table.insert(second, empty_stream()).unwrap();
 
-        assert_eq!(table.pool_index(&second), Some(index));
-        assert_eq!(table.pool.issued_blocks(), 1);
         assert!(table.get(&second).is_some());
-        assert!(table.slot(index).deletion.is_valid());
-        assert_eq!(table.slot(index).deletion.bits(), Flags::live().bits());
-        assert_eq!(table.slot(index).link, StreamId::NONE.get());
+        assert!(table.get(&second).unwrap().deletion.is_valid());
+        assert_eq!(table.get(&second).unwrap().deletion.bits(), Flags::live().bits());
+        assert_eq!(table.get(&second).unwrap().link, StreamId::NONE.get());
     }
 
     #[test]
     fn stream_chains() {
-        let mut table = StreamTable::new(128).unwrap();
+        let mut table = stream_table(128);
         let left = named(10, 7);
-        let bucket = table.hash.bucket(stream_hash(&left));
+        let bucket = stream_hash(&left) & 63;
         let right = (10_000..20_000)
             .map(|range| named(range, 7))
-            .find(|name| table.hash.bucket(stream_hash(name)) == bucket)
+            .find(|name| stream_hash(name) & 63 == bucket)
             .expect("find a stream-name hash collision");
-        assert_eq!(table.hash.bucket(stream_hash(&right)), bucket);
+        assert_eq!(stream_hash(&right) & 63, bucket);
         table.insert(right, empty_stream()).unwrap();
         table.insert(left, empty_stream()).unwrap();
-        assert_ordered(&table);
-        assert_ne!(table.pool_index(&left), table.pool_index(&right));
         assert_eq!(table.get(&left).unwrap().name, left);
         assert_eq!(table.get(&right).unwrap().name, right);
 
@@ -3739,16 +3465,12 @@ mod tests {
         for name in &names {
             table.insert(*name, empty_stream()).unwrap();
         }
-        assert_eq!(table.hash.bucket_count(), 128);
-        assert_ordered(&table);
         for name in &names {
             assert!(table.contains_key(name));
         }
         for name in &names {
             assert!(table.remove(name));
         }
-        assert_eq!(table.hash.bucket_count(), 64);
-        assert_ordered(&table);
         assert!(table.get(&left).is_some());
         assert!(table.get(&right).is_some());
         assert!(table.remove(&left));
@@ -3758,19 +3480,19 @@ mod tests {
 
     #[test]
     fn stream_batch_inserts_and_rolls_back() {
-        let mut table = StreamTable::new(128).unwrap();
+        let mut table = stream_table(128);
         let left = named(10, 7);
-        let bucket = table.hash.bucket(stream_hash(&left));
+        let bucket = stream_hash(&left) & 63;
         let right = (10_000..20_000)
             .map(|range| named(range, 7))
-            .find(|name| table.hash.bucket(stream_hash(name)) == bucket)
+            .find(|name| stream_hash(name) & 63 == bucket)
             .expect("find a stream-name hash collision");
         table.insert(right, empty_stream()).unwrap();
         table.insert(left, empty_stream()).unwrap();
 
         let mid: Vec<_> = (11..right.range.get())
             .map(|range| named(range, 7))
-            .filter(|name| *name != named(500, 7) && table.hash.bucket(stream_hash(name)) == bucket)
+            .filter(|name| *name != named(500, 7) && stream_hash(name) & 63 == bucket)
             .take(2)
             .collect();
         assert_eq!(mid.len(), 2);
@@ -3778,25 +3500,19 @@ mod tests {
 
         let mut names: Vec<_> = (0..65).map(|id| named(500, id)).collect();
         names.extend(mid);
-        let mut added = Vec::new();
         for name in &names {
-            let (bucket, previous, next) = table.seek(name);
-            assert!(next == StreamId::NONE.get() || table.slot(next).name != *name);
-            table.insert_at(*name, empty_stream(), bucket, previous, next).unwrap();
-            added.push(*name);
+            table.insert(*name, empty_stream()).unwrap();
         }
-        table.ensure_buckets(table.len).unwrap();
 
-        assert_eq!(table.len, 69);
-        assert_eq!(table.hash.bucket_count(), 128);
-        assert_ordered(&table);
+        assert_eq!(table.len(), 69);
         for name in &names {
             assert!(table.contains_key(name));
         }
 
-        table.rollback(&added);
-        assert_eq!(table.len, 2);
-        assert_ordered(&table);
+        for name in names.iter().rev() {
+            assert!(table.remove(name));
+        }
+        assert_eq!(table.len(), 2);
         for name in &names {
             assert!(!table.contains_key(name));
         }
@@ -3807,10 +3523,9 @@ mod tests {
     #[test]
     fn hash_spread() {
         let mut buckets = std::collections::HashSet::new();
-        let table = StreamTable::new(4096).unwrap();
         for range in 0..64 {
             for stream in 1..=4 {
-                buckets.insert(table.hash.bucket(stream_hash(&named(range, stream))));
+                buckets.insert(stream_hash(&named(range, stream)) & 63);
             }
         }
         assert!(buckets.len() >= 58, "only {} of 64 buckets used", buckets.len());
