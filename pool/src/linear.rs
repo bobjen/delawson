@@ -466,9 +466,7 @@ fn split_chain<T: LinearEntry>(
     bit: u64,
 ) -> Result<()> {
     let mut link = head_ptr_at(heads, old_bucket)?;
-    let mut keep_tail = T::LINK_NONE;
     let mut index;
-    let first_next;
     loop {
         // SAFETY: link points at the old bucket head or a live entry link.
         index = unsafe { *link };
@@ -479,27 +477,24 @@ fn split_chain<T: LinearEntry>(
         let ptr = unsafe { base.as_ptr().add(index as usize) };
         let move_to_new = unsafe { (T::hash(&(*ptr).key()) & bit) != 0 };
         if move_to_new {
-            // SAFETY: ptr names a live slot; next_ptr addresses its link field.
-            let next = unsafe { (*ptr).next_ptr() };
-            // SAFETY: next points at this slot's initialized link.
-            first_next = unsafe { *next };
             break;
         }
-        keep_tail = index;
         // SAFETY: ptr names a live slot; next_ptr addresses its link field.
         link = unsafe { (*ptr).next_ptr() };
     }
 
     let mut keep_head = T::LINK_NONE;
+    let mut keep_tail = T::LINK_NONE;
     let mut move_head = index;
     let mut move_tail = index;
     let mut previous = index;
-    index = first_next;
-    while index != T::LINK_NONE {
+    let mut move_to_new = true;
+    // The first item to move is already known and starts the new chain.
+    // SAFETY: index names a live slot in the old chain.
+    let mut ptr = unsafe { base.as_ptr().add(index as usize) };
+    let mut next = unsafe { (*ptr).next() };
+    while next != T::LINK_NONE {
         // SAFETY: all linked slots are live and the table is exclusively borrowed.
-        let ptr = unsafe { base.as_ptr().add(index as usize) };
-        let next = unsafe { (*ptr).next() };
-        let move_to_new = unsafe { (T::hash(&(*ptr).key()) & bit) != 0 };
         let (list_head, list_tail) = if move_to_new {
             (&mut move_head, &mut move_tail)
         } else {
@@ -515,27 +510,42 @@ fn split_chain<T: LinearEntry>(
         *list_tail = index;
         previous = index;
         index = next;
+        // SAFETY: next is a live slot in the old chain.
+        ptr = unsafe { base.as_ptr().add(index as usize) };
+        move_to_new = unsafe { (T::hash(&(*ptr).key()) & bit) != 0 };
+        next = unsafe { (*ptr).next() };
     }
-    if keep_tail != T::LINK_NONE && keep_tail != previous {
-        // SAFETY: keep_tail is the last live item in the kept output chain.
-        unsafe { (*base.as_ptr().add(keep_tail as usize)).set_next(T::LINK_NONE) };
-    }
-    if move_tail != T::LINK_NONE && move_tail != previous {
-        // SAFETY: move_tail is the last live item in the moved output chain.
+
+    // `index` is now the last item, whose existing next link is NONE. Append
+    // it to its output list and terminate the other list.
+    if move_to_new {
+        if move_tail != previous {
+            // SAFETY: move_tail is live and its next link must point here.
+            unsafe { (*base.as_ptr().add(move_tail as usize)).set_next(index) };
+        }
+        if keep_tail != T::LINK_NONE {
+            // SAFETY: the kept suffix must end before this moved item.
+            unsafe { (*base.as_ptr().add(keep_tail as usize)).set_next(T::LINK_NONE) };
+        }
+    } else {
+        if keep_head == T::LINK_NONE {
+            keep_head = index;
+        } else if keep_tail != previous {
+            // SAFETY: keep_tail is live and its next link must point here.
+            unsafe { (*base.as_ptr().add(keep_tail as usize)).set_next(index) };
+        }
+        // SAFETY: the moved chain must end before this kept item.
         unsafe { (*base.as_ptr().add(move_tail as usize)).set_next(T::LINK_NONE) };
     }
+
     // `link` still points at the old-chain link that led to the first moved
     // item. That link may be the bucket head or the previous kept item's next.
     // SAFETY: link remains a valid link slot throughout the in-place split.
-    if unsafe { *link } != keep_head {
-        unsafe { *link = keep_head };
-    }
-    if move_head != T::LINK_NONE {
-        // New heads are initialized to NONE as part of directory growth.
-        let new_link = head_ptr_at(heads, new_bucket)?;
-        // SAFETY: new_link addresses the initialized new bucket head.
-        unsafe { *new_link = move_head };
-    }
+    unsafe { *link = keep_head };
+    // New heads are initialized to NONE as part of directory growth.
+    let new_link = head_ptr_at(heads, new_bucket)?;
+    // SAFETY: new_link addresses the initialized new bucket head.
+    unsafe { *new_link = move_head };
     Ok(())
 }
 
@@ -767,6 +777,11 @@ mod tests {
         assert_eq!(chain_keys(&entries, keep), [1, 2]);
         assert_eq!(chain_keys(&entries, moved), [8, 24]);
         assert_eq!(entries.iter().map(|entry| entry.next_writes).collect::<Vec<_>>(), [1, 1, 1, 0]);
+
+        let (entries, keep, moved) = split_for_test(&[1, 8, 2, 24], 8);
+        assert_eq!(chain_keys(&entries, keep), [1, 2]);
+        assert_eq!(chain_keys(&entries, moved), [8, 24]);
+        assert_eq!(entries.iter().map(|entry| entry.next_writes).collect::<Vec<_>>(), [0, 1, 1, 0]);
     }
 
     fn add(table: &mut LinearPool<'_, Entry, 4, 0>, key: u32, value: Entry) {
