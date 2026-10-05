@@ -138,7 +138,7 @@ impl Stream {
         }
     }
 
-    /// Initialize or replace stream data while preserving its slot link.
+    /// Initialize a new slot while preserving its pool link.
     fn set(&mut self, name: StreamName, mut stream: Stream) {
         self.name = name;
         self.deletion = stream.deletion;
@@ -216,7 +216,7 @@ impl pool::LinearEntry for Stream {
         self.link = next;
     }
 
-    fn put(&mut self, key: Self::Key, value: Self) {
+    fn init(&mut self, key: Self::Key, value: Self) {
         self.set(key, value);
     }
 
@@ -1169,31 +1169,33 @@ fn apply_sn_slot(
                     }
                     return Err(Error::new("stream identity has been retired"));
                 }
-                if let Some(existing) = stream_map.get(&name) {
-                    if !existing.deletion.readable(false) {
+                let (stream, inserted) = match stream_map
+                    .find_or_create(name, |name| Stream::new(name.created, cmd.creator))
+                {
+                    Ok(result) => result,
+                    Err(error) => {
                         for name in added.iter().rev() {
                             assert!(stream_map.remove(name), "rollback lost inserted stream");
                         }
-                        return Err(Error::new("stream is deleted"));
+                        return Err(Error::new(format!("insert SN stream: {error}")));
                     }
-                } else {
+                };
+                if inserted {
                     if added.len() == added.capacity() {
                         if let Err(error) = added.try_reserve(1) {
+                            assert!(stream_map.remove(&name), "rollback lost new stream");
                             for name in added.iter().rev() {
                                 assert!(stream_map.remove(name), "rollback lost inserted stream");
                             }
                             return Err(Error::new(format!("reserve SN stream batch: {error}")));
                         }
                     }
-                    if let Err(error) =
-                        stream_map.insert(name, Stream::new(cmd.created, cmd.creator))
-                    {
-                        for name in added.iter().rev() {
-                            assert!(stream_map.remove(name), "rollback lost inserted stream");
-                        }
-                        return Err(Error::new(format!("insert SN stream: {error}")));
-                    }
                     added.push(name);
+                } else if !stream.deletion.readable(false) {
+                    for name in added.iter().rev() {
+                        assert!(stream_map.remove(name), "rollback lost inserted stream");
+                    }
+                    return Err(Error::new("stream is deleted"));
                 }
             }
             *streams += added.len() as u64;
@@ -1227,8 +1229,10 @@ fn apply_sn_slot(
             }
             let inserted = !map.contains_key(&cmd.destination);
             if inserted {
-                map.insert(cmd.destination, Stream::new(cmd.destination.created, cmd.creator))
+                let (_, created) = map
+                    .find_or_create(cmd.destination, |name| Stream::new(name.created, cmd.creator))
                     .map_err(|error| Error::new(format!("insert SN stream: {error}")))?;
+                assert!(created, "SN concat destination appeared under the exclusive lock");
             }
             let mut retained: Vec<ExtentId> = Vec::new();
             for &id in &cmd.extents {
@@ -3113,7 +3117,7 @@ mod tests {
             let mut state = sn.global_lock.write();
             state.streams += 1;
             let snapshot = state.stream_map[&source].clone();
-            state.stream_map.insert(other, snapshot).unwrap();
+            put_stream(&mut state.stream_map, other, snapshot);
         }
         sn.streams.fetch_add(1, Ordering::Relaxed);
         {
@@ -3378,6 +3382,11 @@ mod tests {
         Stream::new(MADE, SnId::FIRST)
     }
 
+    fn put_stream(table: &mut StreamTable, name: StreamName, stream: Stream) {
+        let (_, inserted) = table.find_or_create(name, |_| stream).unwrap();
+        assert!(inserted);
+    }
+
     fn apply_create(state: &mut SNState, first: u32, count: u64) -> Result<()> {
         let action = sn_action(
             Op::SnCreate,
@@ -3397,7 +3406,7 @@ mod tests {
     fn stream_create_keeps_existing_and_is_idempotent() {
         let mut state = SNState::new(8).unwrap();
         let existing = named(42, 2);
-        state.stream_map.insert(existing, empty_stream()).unwrap();
+        put_stream(&mut state.stream_map, existing, empty_stream());
         state.stream_map.get_mut(&existing).unwrap().sealed_stream = true;
         state.streams = 1;
 
@@ -3429,7 +3438,7 @@ mod tests {
         let mut table = stream_table(8);
         let first = named(0, 1);
         let second = named(0, 2);
-        table.insert(first, empty_stream()).unwrap();
+        put_stream(&mut table, first, empty_stream());
         assert_eq!(table.get(&first).unwrap().name.created, MADE);
         assert!(table.get(&first).unwrap().deletion.is_valid());
         assert_eq!(table.get(&first).unwrap().deletion.bits(), Flags::live().bits());
@@ -3438,7 +3447,7 @@ mod tests {
         assert!(table.remove(&first));
         assert!(!table.contains_key(&first));
         table.reclaim();
-        table.insert(second, empty_stream()).unwrap();
+        put_stream(&mut table, second, empty_stream());
 
         assert!(table.get(&second).is_some());
         assert!(table.get(&second).unwrap().deletion.is_valid());
@@ -3456,14 +3465,14 @@ mod tests {
             .find(|name| stream_hash(name) & 63 == bucket)
             .expect("find a stream-name hash collision");
         assert_eq!(stream_hash(&right) & 63, bucket);
-        table.insert(right, empty_stream()).unwrap();
-        table.insert(left, empty_stream()).unwrap();
+        put_stream(&mut table, right, empty_stream());
+        put_stream(&mut table, left, empty_stream());
         assert_eq!(table.get(&left).unwrap().name, left);
         assert_eq!(table.get(&right).unwrap().name, right);
 
         let names: Vec<_> = (0..65).map(|id| named(12, id)).collect();
         for name in &names {
-            table.insert(*name, empty_stream()).unwrap();
+            put_stream(&mut table, *name, empty_stream());
         }
         for name in &names {
             assert!(table.contains_key(name));
@@ -3487,8 +3496,8 @@ mod tests {
             .map(|range| named(range, 7))
             .find(|name| stream_hash(name) & 63 == bucket)
             .expect("find a stream-name hash collision");
-        table.insert(right, empty_stream()).unwrap();
-        table.insert(left, empty_stream()).unwrap();
+        put_stream(&mut table, right, empty_stream());
+        put_stream(&mut table, left, empty_stream());
 
         let mid: Vec<_> = (11..right.range.get())
             .map(|range| named(range, 7))
@@ -3501,7 +3510,7 @@ mod tests {
         let mut names: Vec<_> = (0..65).map(|id| named(500, id)).collect();
         names.extend(mid);
         for name in &names {
-            table.insert(*name, empty_stream()).unwrap();
+            put_stream(&mut table, *name, empty_stream());
         }
 
         assert_eq!(table.len(), 69);
@@ -3571,8 +3580,8 @@ mod tests {
         let name = named(3, 7);
         let mut primary = SNState::new(8).unwrap();
         let mut secondary = SNState::new(8).unwrap();
-        primary.stream_map.insert(name, empty_stream()).unwrap();
-        secondary.stream_map.insert(name, empty_stream()).unwrap();
+        put_stream(&mut primary.stream_map, name, empty_stream());
+        put_stream(&mut secondary.stream_map, name, empty_stream());
 
         let id = primary.extent_table.alloc_id().unwrap();
         assert_eq!(primary.extent_table.len(), primary.extent_table.pool.issued_blocks() as usize);
@@ -3661,7 +3670,7 @@ mod tests {
     fn seal_slot_conflict() {
         let name = named(3, 8);
         let mut state = SNState::new(8).unwrap();
-        state.stream_map.insert(name, empty_stream()).unwrap();
+        put_stream(&mut state.stream_map, name, empty_stream());
         let current = ExtentId::FIRST;
         let open = sn_action(
             Op::SnOpen,
