@@ -1,10 +1,10 @@
-//! Linear-hash bucket heads stored in a segmented buffer.
+//! Linear-hash bucket heads stored in a contiguous virtual array.
 //!
 //! The directory starts at at least 64 buckets and grows or shrinks in batches
 //! of 64. It grows when items exceed buckets and shrinks above two buckets per
-//! live item. The byte buffer allocates a 64 KiB leaf only at boundaries.
-//! Items and their chain links remain owned by the caller.
-use super::{CHUNK_BYTES, ChunkPool, LockedItem, LockedPool, SegmentedBuffer};
+//! live item. Pool blocks are mapped into the directory's reserved virtual range
+//! as it grows. Items and their chain links remain owned by the caller.
+use super::{Block, CHUNK_BYTES, ChunkPool, LockedItem, LockedPool, Mapping};
 use crate::{Error, Result};
 use std::ops::Index;
 use std::ptr::NonNull;
@@ -12,28 +12,168 @@ use std::ptr::NonNull;
 const MIN_BUCKETS: u64 = 64;
 const BUCKET_BATCH: u64 = 64;
 const HEAD_BYTES: usize = std::mem::size_of::<u32>();
-const HEADS_PER_LEAF: u64 = (CHUNK_BYTES / HEAD_BYTES) as u64;
+const HEADS_PER_BLOCK: u64 = (CHUNK_BYTES / HEAD_BYTES) as u64;
 
-fn append_empty(heads: &mut SegmentedBuffer<'_>, buckets: u64) -> Result<()> {
-    let bytes = buckets
-        .checked_mul(HEAD_BYTES as u64)
-        .ok_or_else(|| Error::new("linear-hash directory size overflow"))?;
-    heads.append_fill(0xff, bytes)
+type HeadBlock<'a> = Block<'a, [u8; CHUNK_BYTES], CHUNK_BYTES>;
+
+/// A contiguous bucket-head range backed by 64 KiB blocks from `ChunkPool`.
+/// Each pool block remains owned while its pages are aliased into the reserved
+/// virtual range. Field order ensures the alias mapping is removed before the
+/// block handles return those pages to the pool.
+struct VirtualHeads<'a> {
+    pool: &'a ChunkPool,
+    mapping: Mapping,
+    blocks: Vec<HeadBlock<'a>>,
+    capacity: u64,
+    max_buckets: u64,
 }
 
-fn head_ptr_at(heads: &mut SegmentedBuffer<'_>, bucket: u64) -> Result<*mut u32> {
-    let at = bucket * HEAD_BYTES as u64;
-    let mut chunks = heads.chunks_mut_range(at..at + HEAD_BYTES as u64)?;
-    let bytes =
-        chunks.next().ok_or_else(|| Error::new("linear-hash bucket head is not allocated"))?;
-    if bytes.len() != HEAD_BYTES {
-        return Err(Error::new("linear-hash bucket head crosses a leaf"));
+impl<'a> VirtualHeads<'a> {
+    fn new(pool: &'a ChunkPool, max_buckets: u64, initial: u64) -> Result<Self> {
+        let block_count = max_buckets.div_ceil(HEADS_PER_BLOCK).max(1);
+        let bytes = block_count
+            .checked_mul(CHUNK_BYTES as u64)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(|| Error::new("linear-hash virtual array is too large"))?;
+        let mapping = Mapping::new(bytes, CHUNK_BYTES)?;
+        let mut heads = Self { pool, mapping, blocks: Vec::new(), capacity: 0, max_buckets };
+        heads.extend_to(initial)?;
+        Ok(heads)
     }
-    let ptr = bytes.as_mut_ptr().cast::<u32>();
-    if (ptr as usize) % std::mem::align_of::<u32>() != 0 {
-        return Err(Error::new("linear-hash bucket head is unaligned"));
+
+    #[inline]
+    fn base(&self) -> *mut u32 {
+        self.mapping.base.as_ptr().cast()
     }
-    Ok(ptr)
+
+    fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    fn extend_to(&mut self, buckets: u64) -> Result<()> {
+        if buckets > self.max_buckets {
+            return Err(Error::new("linear-hash virtual array capacity exceeded"));
+        }
+        let needed = buckets.div_ceil(HEADS_PER_BLOCK).max(1) as usize;
+        while self.blocks.len() < needed {
+            self.blocks
+                .try_reserve(1)
+                .map_err(|e| Error::new(format!("linear-hash block list: {e}")))?;
+            let block = self.pool.alloc()?;
+            // New directory slots are NONE, including unused heads in this block.
+            unsafe { block.as_ptr().write_bytes(0xff, CHUNK_BYTES) };
+            let offset = self.blocks.len() * CHUNK_BYTES;
+            let dest = unsafe { self.mapping.base.as_ptr().add(offset) };
+            map_block(block.as_ptr(), dest)?;
+            self.blocks.push(block);
+            self.capacity = (self.blocks.len() as u64 * HEADS_PER_BLOCK).min(self.max_buckets);
+        }
+        if buckets > self.capacity {
+            // A shrink can leave a partial final block mapped. Clear its newly
+            // exposed suffix before making those bucket heads addressable again.
+            let count = usize::try_from(buckets - self.capacity)
+                .map_err(|_| Error::new("linear-hash capacity is too large"))?;
+            unsafe {
+                std::ptr::write_bytes(
+                    self.base().add(self.capacity as usize).cast::<u8>(),
+                    0xff,
+                    count * HEAD_BYTES,
+                )
+            };
+            self.capacity = buckets;
+        }
+        Ok(())
+    }
+
+    fn truncate(&mut self, buckets: u64) -> Result<()> {
+        if buckets > self.capacity {
+            return Err(Error::new("linear-hash truncate exceeds capacity"));
+        }
+        let needed = buckets.div_ceil(HEADS_PER_BLOCK).max(1) as usize;
+        let retained_capacity = (needed as u64 * HEADS_PER_BLOCK).min(self.max_buckets);
+        if buckets < retained_capacity {
+            let count = usize::try_from(retained_capacity - buckets)
+                .map_err(|_| Error::new("linear-hash capacity is too large"))?;
+            unsafe {
+                std::ptr::write_bytes(
+                    self.base().add(buckets as usize).cast::<u8>(),
+                    0xff,
+                    count * HEAD_BYTES,
+                )
+            };
+        }
+        while self.blocks.len() > needed {
+            let offset = (self.blocks.len() - 1) * CHUNK_BYTES;
+            let dest = unsafe { self.mapping.base.as_ptr().add(offset) };
+            reserve_block(dest)?;
+            self.blocks.pop();
+            self.capacity = (self.blocks.len() as u64 * HEADS_PER_BLOCK).min(self.max_buckets);
+        }
+        self.capacity = buckets;
+        Ok(())
+    }
+
+    fn reset(&mut self, initial: u64) -> Result<()> {
+        self.truncate(initial)?;
+        let bytes = usize::try_from(initial)
+            .ok()
+            .and_then(|count| count.checked_mul(HEAD_BYTES))
+            .ok_or_else(|| Error::new("linear-hash reset size is too large"))?;
+        unsafe { std::ptr::write_bytes(self.base().cast::<u8>(), 0xff, bytes) };
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn map_block(source: *mut u8, dest: *mut u8) -> Result<()> {
+    let mapped = unsafe {
+        libc::mremap(
+            source.cast(),
+            0,
+            CHUNK_BYTES,
+            libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED,
+            dest.cast::<libc::c_void>(),
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        Err(Error::new(format!("map linear-hash pool block: {}", std::io::Error::last_os_error())))
+    } else {
+        debug_assert_eq!(mapped, dest.cast());
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn map_block(_source: *mut u8, _dest: *mut u8) -> Result<()> {
+    Err(Error::new("linear-hash virtual arrays require Linux"))
+}
+
+#[cfg(target_os = "linux")]
+fn reserve_block(dest: *mut u8) -> Result<()> {
+    let reserved = unsafe {
+        libc::mmap(
+            dest.cast(),
+            CHUNK_BYTES,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+            -1,
+            0,
+        )
+    };
+    if reserved == libc::MAP_FAILED {
+        Err(Error::new(format!(
+            "release linear-hash pool block: {}",
+            std::io::Error::last_os_error()
+        )))
+    } else {
+        debug_assert_eq!(reserved, dest.cast());
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reserve_block(_dest: *mut u8) -> Result<()> {
+    Err(Error::new("linear-hash virtual arrays require Linux"))
 }
 
 fn bucket_shape(buckets: u64) -> (u32, u64) {
@@ -42,7 +182,7 @@ fn bucket_shape(buckets: u64) -> (u32, u64) {
 }
 
 fn head_cap(buckets: u64, max_buckets: u64) -> u64 {
-    buckets.div_ceil(HEADS_PER_LEAF).saturating_mul(HEADS_PER_LEAF).min(max_buckets)
+    buckets.div_ceil(HEADS_PER_BLOCK).saturating_mul(HEADS_PER_BLOCK).min(max_buckets)
 }
 
 fn batch_cap(buckets: u64) -> u64 {
@@ -51,7 +191,7 @@ fn batch_cap(buckets: u64) -> u64 {
 
 /// Bucket directory used internally by `LinearPool`.
 struct LinearHash<'a> {
-    heads: SegmentedBuffer<'a>,
+    heads: VirtualHeads<'a>,
     buckets: u64,
     level: u32,
     split: u64,
@@ -67,12 +207,7 @@ impl<'a> LinearHash<'a> {
             return Err(Error::new("initial linear-hash size exceeds its item limit"));
         }
         let init_cap = head_cap(initial_buckets, max_buckets);
-        let initial_bytes = init_cap * HEAD_BYTES as u64;
-        let retained = initial_bytes.div_ceil(CHUNK_BYTES as u64).max(1);
-        let retained = u32::try_from(retained)
-            .map_err(|_| Error::new("linear-hash directory is too large"))?;
-        let mut heads = SegmentedBuffer::with_retained_leaves(pool, retained);
-        append_empty(&mut heads, init_cap)?;
+        let heads = VirtualHeads::new(pool, max_buckets, init_cap)?;
         let (level, split) = bucket_shape(initial_buckets);
         Ok(Self { heads, buckets: initial_buckets, level, split, max_buckets, initial_buckets })
     }
@@ -89,39 +224,31 @@ impl<'a> LinearHash<'a> {
     }
 
     fn head_capacity(&self) -> u64 {
-        self.heads.end() / HEAD_BYTES as u64
+        self.heads.capacity()
     }
 
     /// Mutable pointer to an initialized head slot, including reserved slots.
-    fn head_ptr(&mut self, bucket: u64) -> Result<*mut u32> {
-        if bucket >= self.head_capacity() {
-            return Err(Error::new("linear-hash bucket head is not allocated"));
-        }
-        head_ptr_at(&mut self.heads, bucket)
+    #[inline]
+    fn head_ptr(&mut self, bucket: u64) -> *mut u32 {
+        debug_assert!(bucket < self.head_capacity());
+        unsafe { self.heads.base().add(bucket as usize) }
     }
 
-    fn head(&self, bucket: u64) -> Result<u32> {
-        if bucket >= self.buckets {
-            return Err(Error::new("linear-hash bucket is out of range"));
-        }
-        let mut bytes = [0; HEAD_BYTES];
-        self.heads.read_at(bucket * HEAD_BYTES as u64, &mut bytes)?;
-        Ok(u32::from_ne_bytes(bytes))
+    #[inline]
+    fn head(&self, bucket: u64) -> u32 {
+        debug_assert!(bucket < self.buckets);
+        unsafe { *self.heads.base().add(bucket as usize) }
     }
 
-    fn set_head(&mut self, bucket: u64, index: u32) -> Result<()> {
-        if bucket >= self.buckets {
-            return Err(Error::new("linear-hash bucket is out of range"));
-        }
-        self.heads.write_at(bucket * HEAD_BYTES as u64, &index.to_ne_bytes())
+    #[inline]
+    fn set_head(&mut self, bucket: u64, index: u32) {
+        debug_assert!(bucket < self.buckets);
+        unsafe { self.heads.base().add(bucket as usize).write(index) };
     }
 
     /// Split 64 buckets, letting the caller repartition each chain by bit.
     /// The callback rewrites each old and new bucket pair in place.
-    fn grow_batch(
-        &mut self,
-        mut split_chain: impl FnMut(&mut SegmentedBuffer<'a>, u64, u64, u64) -> Result<()>,
-    ) -> Result<()> {
+    fn grow_batch(&mut self, mut split_chain: impl FnMut(*mut u32, u64, u64, u64)) -> Result<()> {
         let old_buckets = self.buckets;
         let new_buckets = old_buckets + BUCKET_BATCH;
         if new_buckets > self.max_buckets {
@@ -132,14 +259,15 @@ impl<'a> LinearHash<'a> {
         let new_cap = head_cap(new_buckets, self.max_buckets);
         let old_cap = self.head_capacity();
         if new_cap > old_cap {
-            append_empty(&mut self.heads, new_cap - old_cap)?;
+            self.heads.extend_to(new_cap)?;
         }
 
         let bit = 1u64 << old_level;
+        let heads = self.heads.base();
         for offset in 0..BUCKET_BATCH {
             let old = old_split + offset;
             let new = old_buckets + offset;
-            split_chain(&mut self.heads, old, new, bit)?;
+            split_chain(heads, old, new, bit);
         }
 
         self.buckets = new_buckets;
@@ -170,14 +298,14 @@ impl<'a> LinearHash<'a> {
         for offset in 0..BUCKET_BATCH {
             let partner = base - offset;
             let removed = old_buckets - 1 - offset;
-            let partner_head = self.head(partner).expect("merge partner remains in range");
-            let removed_head = self.head(removed).expect("removed bucket remains in range");
+            let partner_head = self.head(partner);
+            let removed_head = self.head(removed);
             let head = merge_chain(partner, removed, partner_head, removed_head);
             if head != partner_head {
-                self.set_head(partner, head).expect("merge partner remains in range");
+                self.set_head(partner, head);
             }
             if removed_head != u32::MAX {
-                self.set_head(removed, u32::MAX).expect("removed bucket remains in range");
+                self.set_head(removed, u32::MAX);
             }
         }
 
@@ -185,15 +313,15 @@ impl<'a> LinearHash<'a> {
         self.split = new_split;
         let new_cap = head_cap(self.buckets, self.max_buckets);
         if new_cap < self.head_capacity() {
-            self.heads.truncate(new_cap * HEAD_BYTES as u64)?;
+            self.heads.truncate(new_cap)?;
         }
         Ok(())
     }
 
     /// Return to the configured directory size and clear its bucket heads.
     fn reset(&mut self) -> Result<()> {
-        self.heads.reset();
-        append_empty(&mut self.heads, head_cap(self.initial_buckets, self.max_buckets))?;
+        let init_cap = head_cap(self.initial_buckets, self.max_buckets);
+        self.heads.reset(init_cap)?;
         self.buckets = self.initial_buckets;
         (self.level, self.split) = bucket_shape(self.initial_buckets);
         Ok(())
@@ -287,7 +415,7 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L>
     }
 
     fn seek_link(&mut self, key: &T::Key, bucket: u64) -> Result<(*mut u32, u32)> {
-        let mut link = self.hash.head_ptr(bucket)?;
+        let mut link = self.hash.head_ptr(bucket);
         loop {
             // SAFETY: `link` points to a bucket head or a live entry link.
             let index = unsafe { *link };
@@ -309,7 +437,7 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L>
     fn seek(&self, key: &T::Key, hash: u64) -> (u64, u32, u32) {
         let bucket = self.hash.bucket(hash);
         let mut previous = T::LINK_NONE;
-        let mut index = self.hash.head(bucket).expect("linear hash bucket exists");
+        let mut index = self.hash.head(bucket);
         while index != T::LINK_NONE && self.slot(index).key() < *key {
             previous = index;
             index = self.slot(index).next();
@@ -391,7 +519,7 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L>
         }
         let next = self.slot(index).next();
         if previous == T::LINK_NONE {
-            self.hash.set_head(bucket, next).expect("linear hash bucket exists");
+            self.hash.set_head(bucket, next);
         } else {
             self.slot_mut(previous).set_next(next);
         }
@@ -409,7 +537,7 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L>
 
     pub fn clear(&mut self) {
         for bucket in 0..self.hash.bucket_count() {
-            let mut index = self.hash.head(bucket).expect("linear hash bucket exists");
+            let mut index = self.hash.head(bucket);
             while index != T::LINK_NONE {
                 let next = self.slot(index).next();
                 self.slot_mut(index).clear();
@@ -459,20 +587,20 @@ impl<T: LinearEntry, const A: usize, const L: usize> Index<&T::Key> for LinearPo
 }
 
 fn split_chain<T: LinearEntry>(
-    heads: &mut SegmentedBuffer<'_>,
+    heads: *mut u32,
     base: NonNull<T>,
     old_bucket: u64,
     new_bucket: u64,
     bit: u64,
-) -> Result<()> {
-    let mut oldp = head_ptr_at(heads, old_bucket)?; // walks old bucket
+) {
+    let mut oldp = unsafe { heads.add(old_bucket as usize) }; // walks old bucket
     let mut index; // index of current item
     let mut ptr; // pointer to current item
     loop {
         // SAFETY: oldp points at the old bucket head or a live entry link.
         index = unsafe { *oldp };
         if index == T::LINK_NONE {
-            return Ok(()); // all items stayed in the old list, nothing changes
+            return; // all items stayed in the old list, nothing changes
         }
         // SAFETY: all linked slots are live and the table is exclusively borrowed.
         ptr = unsafe { base.as_ptr().add(index as usize) };
@@ -484,7 +612,7 @@ fn split_chain<T: LinearEntry>(
     }
     // index==*oldp, ptr==base[index], *ptr needs to move to new bucket
 
-    let mut newp = head_ptr_at(heads, new_bucket)?; // tail of new bucket (*newp is NONE)
+    let mut newp = unsafe { heads.add(new_bucket as usize) }; // tail of new bucket
     let mut moving = true; // the current item needs to move to the new bucket
     let mut old_move = false; // the previous item did not need to move
     let mut nextp = unsafe { (*ptr).next_ptr() };
@@ -525,7 +653,6 @@ fn split_chain<T: LinearEntry>(
         }
         unsafe { *newp = T::LINK_NONE };
     }
-    Ok(())
 }
 
 fn merge_chain<T: LinearEntry>(base: NonNull<T>, mut left: u32, mut right: u32) -> u32 {
@@ -577,10 +704,10 @@ mod tests {
         assert_eq!(hash.bucket(0x41), 1);
         assert_eq!(hash.bucket(0x82), 2);
         assert_eq!(hash.bucket(0x1_0000_0003), 3);
-        assert_eq!(hash.head(0).unwrap(), u32::MAX);
+        assert_eq!(hash.head(0), u32::MAX);
 
         for expected in [128, 192, 256] {
-            hash.grow_batch(|_, _, _, _| Ok(())).unwrap();
+            hash.grow_batch(|_, _, _, _| {}).unwrap();
             assert_eq!(hash.bucket_count(), expected);
         }
         assert_eq!(hash.bucket(64), 64);
@@ -600,40 +727,31 @@ mod tests {
         let pool = ChunkPool::new(8, 1).unwrap();
         let mut hash = LinearHash::with_buckets(&pool, 128, 64).unwrap();
         assert_eq!(hash.bucket_count(), 64);
-        hash.grow_batch(|_, _, _, _| Ok(())).unwrap();
+        hash.grow_batch(|_, _, _, _| {}).unwrap();
         assert_eq!(hash.bucket_count(), 128);
-        assert!(hash.grow_batch(|_, _, _, _| Ok(())).is_err());
+        assert!(hash.grow_batch(|_, _, _, _| {}).is_err());
         hash.reset().unwrap();
         assert_eq!(hash.bucket_count(), 64);
-        assert_eq!(hash.head(0).unwrap(), u32::MAX);
-    }
-
-    fn raw_head(hash: &LinearHash<'_>, bucket: u64) -> u32 {
-        let mut bytes = [0; HEAD_BYTES];
-        hash.heads.read_at(bucket * HEAD_BYTES as u64, &mut bytes).unwrap();
-        u32::from_ne_bytes(bytes)
+        assert_eq!(hash.head(0), u32::MAX);
     }
 
     #[test]
     fn head_reuse() {
         let pool = ChunkPool::new(4, 1).unwrap();
-        let max = HEADS_PER_LEAF + BUCKET_BATCH;
-        let mut hash = LinearHash::with_buckets(&pool, max, HEADS_PER_LEAF).unwrap();
-        assert_eq!(hash.head_capacity(), HEADS_PER_LEAF);
-        assert_eq!(raw_head(&hash, HEADS_PER_LEAF - 1), u32::MAX);
+        let max = HEADS_PER_BLOCK + BUCKET_BATCH;
+        let mut hash = LinearHash::with_buckets(&pool, max, HEADS_PER_BLOCK).unwrap();
+        assert_eq!(hash.head_capacity(), HEADS_PER_BLOCK);
+        assert_eq!(hash.head(HEADS_PER_BLOCK - 1), u32::MAX);
 
-        hash.set_head(0, 17).unwrap();
-        hash.grow_batch(|heads, _, new, _| {
-            heads.write_at(new * HEAD_BYTES as u64, &23u32.to_ne_bytes())
-        })
-        .unwrap();
+        hash.set_head(0, 17);
+        hash.grow_batch(|heads, _, new, _| unsafe { heads.add(new as usize).write(23) }).unwrap();
         assert_eq!(hash.bucket_count(), max);
-        assert_eq!(hash.head(HEADS_PER_LEAF).unwrap(), 23);
+        assert_eq!(hash.head(HEADS_PER_BLOCK), 23);
 
         hash.shrink_batch(|_, _, keep, _| keep).unwrap();
-        assert_eq!(hash.head_capacity(), HEADS_PER_LEAF);
-        hash.grow_batch(|_, _, _, _| Ok(())).unwrap();
-        assert_eq!(hash.head(HEADS_PER_LEAF).unwrap(), u32::MAX);
+        assert_eq!(hash.head_capacity(), HEADS_PER_BLOCK);
+        hash.grow_batch(|_, _, _, _| {}).unwrap();
+        assert_eq!(hash.head(HEADS_PER_BLOCK), u32::MAX);
     }
 
     #[repr(C)]
@@ -720,19 +838,12 @@ mod tests {
 
     fn split_for_test(keys: &[u32], bit: u64) -> (Vec<Entry>, u32, u32) {
         let pool = ChunkPool::new(1, 1).unwrap();
-        let mut heads = SegmentedBuffer::new(&pool);
-        append_empty(&mut heads, 128).unwrap();
+        let heads = VirtualHeads::new(&pool, 128, 128).unwrap();
         let mut entries = chain(keys);
         let base = NonNull::new(entries.as_mut_ptr()).unwrap();
-        heads.write_at(0, &0u32.to_ne_bytes()).unwrap();
-        split_chain::<Entry>(&mut heads, base, 0, 64, bit).unwrap();
-
-        let read_head = |bucket| {
-            let mut bytes = [0; HEAD_BYTES];
-            heads.read_at(bucket * HEAD_BYTES as u64, &mut bytes).unwrap();
-            u32::from_ne_bytes(bytes)
-        };
-        (entries, read_head(0), read_head(64))
+        unsafe { heads.base().write(0) };
+        split_chain::<Entry>(heads.base(), base, 0, 64, bit);
+        (entries, unsafe { heads.base().read() }, unsafe { heads.base().add(64).read() })
     }
 
     #[test]
@@ -762,7 +873,7 @@ mod tests {
     fn assert_sorted(table: &LinearPool<'_, Entry, 4, 0>) {
         for bucket in 0..table.hash.bucket_count() {
             let mut previous = None;
-            let mut index = table.hash.head(bucket).unwrap();
+            let mut index = table.hash.head(bucket);
             while index != Entry::LINK_NONE {
                 let key = table.slot(index).key;
                 assert!(previous.is_none_or(|prior| prior < key));
@@ -891,7 +1002,7 @@ mod tests {
         table.clear();
         assert_eq!(table.hash.bucket_count(), 128);
         for bucket in 0..128 {
-            assert_eq!(table.hash.head(bucket).unwrap(), Entry::LINK_NONE);
+            assert_eq!(table.hash.head(bucket), Entry::LINK_NONE);
         }
     }
 }
