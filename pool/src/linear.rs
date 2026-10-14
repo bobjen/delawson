@@ -465,87 +465,66 @@ fn split_chain<T: LinearEntry>(
     new_bucket: u64,
     bit: u64,
 ) -> Result<()> {
-    let mut link = head_ptr_at(heads, old_bucket)?;
-    let mut index;
+    let mut oldp = head_ptr_at(heads, old_bucket)?; // walks old bucket
+    let mut index; // index of current item
+    let mut ptr; // pointer to current item
     loop {
-        // SAFETY: link points at the old bucket head or a live entry link.
-        index = unsafe { *link };
+        // SAFETY: oldp points at the old bucket head or a live entry link.
+        index = unsafe { *oldp };
         if index == T::LINK_NONE {
-            return Ok(());
+            return Ok(()); // all items stayed in the old list, nothing changes
         }
         // SAFETY: all linked slots are live and the table is exclusively borrowed.
-        let ptr = unsafe { base.as_ptr().add(index as usize) };
-        let move_to_new = unsafe { (T::hash(&(*ptr).key()) & bit) != 0 };
-        if move_to_new {
-            break;
+        ptr = unsafe { base.as_ptr().add(index as usize) };
+        if unsafe { (T::hash(&(*ptr).key()) & bit) != 0 } {
+            break; // need to move ptr (base[index]) to new list
         }
         // SAFETY: ptr names a live slot; next_ptr addresses its link field.
-        link = unsafe { (*ptr).next_ptr() };
+        oldp = unsafe { (*ptr).next_ptr() }; // oldp now points past index
     }
+    // index==*oldp, ptr==base[index], *ptr needs to move to new bucket
 
-    let mut keep_head = T::LINK_NONE;
-    let mut keep_tail = T::LINK_NONE;
-    let mut move_head = index;
-    let mut move_tail = index;
-    let mut previous = index;
-    let mut move_to_new = true;
-    // The first item to move is already known and starts the new chain.
-    // SAFETY: index names a live slot in the old chain.
-    let mut ptr = unsafe { base.as_ptr().add(index as usize) };
-    let mut next = unsafe { (*ptr).next() };
+    let mut newp = head_ptr_at(heads, new_bucket)?; // tail of new bucket (*newp is NONE)
+    let mut moving = true; // the current item needs to move to the new bucket
+    let mut old_move = false; // the previous item did not need to move
+    let mut nextp = unsafe { (*ptr).next_ptr() };
+    let mut next = unsafe { *nextp };
     while next != T::LINK_NONE {
-        // SAFETY: all linked slots are live and the table is exclusively borrowed.
-        let (list_head, list_tail) = if move_to_new {
-            (&mut move_head, &mut move_tail)
+        if moving {
+            if moving != old_move {
+                unsafe { *newp = index }; // move to new bucket
+            }
+            newp = nextp;
         } else {
-            (&mut keep_head, &mut keep_tail)
-        };
-        if *list_head == T::LINK_NONE {
-            *list_head = index;
-        } else if *list_tail != previous {
-            let tail = unsafe { base.as_ptr().add(*list_tail as usize) };
-            // SAFETY: tail is a live item in this output list.
-            unsafe { (*tail).set_next(index) };
+            if moving != old_move {
+                unsafe { *oldp = index };
+            }
+            oldp = nextp;
         }
-        *list_tail = index;
-        previous = index;
+
+        ptr = unsafe { base.as_ptr().add(next as usize) };
+        old_move = moving;
+        moving = unsafe { (T::hash(&(*ptr).key()) & bit) != 0 };
         index = next;
-        // SAFETY: next is a live slot in the old chain.
-        ptr = unsafe { base.as_ptr().add(index as usize) };
-        move_to_new = unsafe { (T::hash(&(*ptr).key()) & bit) != 0 };
-        next = unsafe { (*ptr).next() };
+        nextp = unsafe { (*ptr).next_ptr() };
+        next = unsafe { *nextp };
     }
+    // Postcondition: index and ptr identify the last item; next is NONE;
+    // moving and old_move classify this item and its predecessor. oldp and
+    // newp point at the output tails' links, or an empty bucket head. The
+    // final branch attaches the item if needed, then terminates the other list.
 
-    // `index` is now the last item, whose existing next link is NONE. Append
-    // it to its output list and terminate the other list.
-    if move_to_new {
-        if move_tail != previous {
-            // SAFETY: move_tail is live and its next link must point here.
-            unsafe { (*base.as_ptr().add(move_tail as usize)).set_next(index) };
+    if moving {
+        if moving != old_move {
+            unsafe { *newp = index };
         }
-        if keep_tail != T::LINK_NONE {
-            // SAFETY: the kept suffix must end before this moved item.
-            unsafe { (*base.as_ptr().add(keep_tail as usize)).set_next(T::LINK_NONE) };
-        }
+        unsafe { *oldp = T::LINK_NONE };
     } else {
-        if keep_head == T::LINK_NONE {
-            keep_head = index;
-        } else if keep_tail != previous {
-            // SAFETY: keep_tail is live and its next link must point here.
-            unsafe { (*base.as_ptr().add(keep_tail as usize)).set_next(index) };
+        if moving != old_move {
+            unsafe { *oldp = index };
         }
-        // SAFETY: the moved chain must end before this kept item.
-        unsafe { (*base.as_ptr().add(move_tail as usize)).set_next(T::LINK_NONE) };
+        unsafe { *newp = T::LINK_NONE };
     }
-
-    // `link` still points at the old-chain link that led to the first moved
-    // item. That link may be the bucket head or the previous kept item's next.
-    // SAFETY: link remains a valid link slot throughout the in-place split.
-    unsafe { *link = keep_head };
-    // New heads are initialized to NONE as part of directory growth.
-    let new_link = head_ptr_at(heads, new_bucket)?;
-    // SAFETY: new_link addresses the initialized new bucket head.
-    unsafe { *new_link = move_head };
     Ok(())
 }
 
@@ -662,13 +641,12 @@ mod tests {
         next: u32,
         key: u32,
         valid: bool,
-        next_writes: u32,
     }
 
     unsafe impl super::super::PoolItem for Entry {
         unsafe fn init(slot: *mut Self) {
             // SAFETY: the pool provides aligned, fresh storage for one Entry.
-            unsafe { slot.write(Self { next: u32::MAX, key: 0, valid: false, next_writes: 0 }) };
+            unsafe { slot.write(Self { next: u32::MAX, key: 0, valid: false }) };
         }
     }
 
@@ -680,7 +658,6 @@ mod tests {
             unsafe {
                 (*slot).next = Self::LINK_NONE;
                 (*slot).valid = false;
-                (*slot).next_writes = 0;
             }
         }
     }
@@ -702,7 +679,6 @@ mod tests {
 
         fn set_next(&mut self, next: u32) {
             self.next = next;
-            self.next_writes += 1;
         }
 
         unsafe fn next_ptr(&mut self) -> *mut u32 {
@@ -712,19 +688,17 @@ mod tests {
         fn init(&mut self, key: Self::Key, value: Self) {
             self.key = key;
             self.valid = value.valid;
-            self.next_writes = 0;
         }
 
         fn clear(&mut self) {
             self.next = Self::LINK_NONE;
             self.key = 0;
             self.valid = false;
-            self.next_writes = 0;
         }
     }
 
     fn entry(key: u32) -> Entry {
-        Entry { next: Entry::LINK_NONE, key, valid: true, next_writes: 0 }
+        Entry { next: Entry::LINK_NONE, key, valid: true }
     }
 
     fn chain(keys: &[u32]) -> Vec<Entry> {
@@ -762,26 +736,22 @@ mod tests {
     }
 
     #[test]
-    fn split_writes() {
+    fn split_chains() {
         let (entries, keep, moved) = split_for_test(&[1, 2, 3], 8);
         assert_eq!(chain_keys(&entries, keep), [1, 2, 3]);
         assert_eq!(moved, Entry::LINK_NONE);
-        assert!(entries.iter().all(|entry| entry.next_writes == 0));
 
         let (entries, keep, moved) = split_for_test(&[8, 24, 40], 8);
         assert_eq!(keep, Entry::LINK_NONE);
         assert_eq!(chain_keys(&entries, moved), [8, 24, 40]);
-        assert!(entries.iter().all(|entry| entry.next_writes == 0));
 
         let (entries, keep, moved) = split_for_test(&[8, 1, 24, 2], 8);
         assert_eq!(chain_keys(&entries, keep), [1, 2]);
         assert_eq!(chain_keys(&entries, moved), [8, 24]);
-        assert_eq!(entries.iter().map(|entry| entry.next_writes).collect::<Vec<_>>(), [1, 1, 1, 0]);
 
         let (entries, keep, moved) = split_for_test(&[1, 8, 2, 24], 8);
         assert_eq!(chain_keys(&entries, keep), [1, 2]);
         assert_eq!(chain_keys(&entries, moved), [8, 24]);
-        assert_eq!(entries.iter().map(|entry| entry.next_writes).collect::<Vec<_>>(), [0, 1, 1, 0]);
     }
 
     fn add(table: &mut LinearPool<'_, Entry, 4, 0>, key: u32, value: Entry) {
