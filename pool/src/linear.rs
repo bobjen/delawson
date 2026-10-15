@@ -1,16 +1,15 @@
 //! Linear-hash bucket heads stored in a contiguous virtual array.
 //!
-//! The directory starts at at least 64 buckets and grows or shrinks in batches
-//! of 64. It grows when items exceed buckets and shrinks above two buckets per
-//! live item. Pool blocks are mapped into the directory's reserved virtual range
+//! The directory starts at at least 256 buckets and grows or shrinks in batches
+//! of 256. It grows above two items per bucket and shrinks when buckets outnumber
+//! items. Pool blocks are mapped into the directory's reserved virtual range
 //! as it grows. Items and their chain links remain owned by the caller.
 use super::{Block, CHUNK_BYTES, ChunkPool, LockedItem, LockedPool, Mapping};
 use crate::{Error, Result};
 use std::ops::Index;
 use std::ptr::NonNull;
 
-const MIN_BUCKETS: u64 = 64;
-const BUCKET_BATCH: u64 = 64;
+const BUCKET_GROUP: u64 = 256;
 const HEAD_BYTES: usize = std::mem::size_of::<u32>();
 const HEADS_PER_BLOCK: u64 = (CHUNK_BYTES / HEAD_BYTES) as u64;
 
@@ -186,7 +185,7 @@ fn head_cap(buckets: u64, max_buckets: u64) -> u64 {
 }
 
 fn batch_cap(buckets: u64) -> u64 {
-    buckets.div_ceil(BUCKET_BATCH).saturating_mul(BUCKET_BATCH)
+    buckets.div_ceil(BUCKET_GROUP).saturating_mul(BUCKET_GROUP)
 }
 
 /// Bucket directory used internally by `LinearPool`.
@@ -201,8 +200,8 @@ struct LinearHash<'a> {
 
 impl<'a> LinearHash<'a> {
     fn with_buckets(pool: &'a ChunkPool, max_buckets: u64, initial_buckets: u64) -> Result<Self> {
-        let max_buckets = max_buckets.max(MIN_BUCKETS);
-        let initial_buckets = batch_cap(initial_buckets.max(MIN_BUCKETS));
+        let max_buckets = max_buckets.max(BUCKET_GROUP);
+        let initial_buckets = batch_cap(initial_buckets.max(BUCKET_GROUP));
         if initial_buckets > max_buckets {
             return Err(Error::new("initial linear-hash size exceeds its item limit"));
         }
@@ -246,11 +245,11 @@ impl<'a> LinearHash<'a> {
         unsafe { self.heads.base().add(bucket as usize).write(index) };
     }
 
-    /// Split 64 buckets, letting the caller repartition each chain by bit.
+    /// Split one bucket group, letting the caller repartition each chain by bit.
     /// The callback rewrites each old and new bucket pair in place.
     fn grow_batch(&mut self, mut split_chain: impl FnMut(*mut u32, u64, u64, u64)) -> Result<()> {
         let old_buckets = self.buckets;
-        let new_buckets = old_buckets + BUCKET_BATCH;
+        let new_buckets = old_buckets + BUCKET_GROUP;
         if new_buckets > self.max_buckets {
             return Err(Error::new("linear-hash directory reached its item limit"));
         }
@@ -264,14 +263,14 @@ impl<'a> LinearHash<'a> {
 
         let bit = 1u64 << old_level;
         let heads = self.heads.base();
-        for offset in 0..BUCKET_BATCH {
+        for offset in 0..BUCKET_GROUP {
             let old = old_split + offset;
             let new = old_buckets + offset;
             split_chain(heads, old, new, bit);
         }
 
         self.buckets = new_buckets;
-        self.split = old_split + BUCKET_BATCH;
+        self.split = old_split + BUCKET_GROUP;
         if self.split == 1u64 << old_level {
             self.level += 1;
             self.split = 0;
@@ -279,23 +278,23 @@ impl<'a> LinearHash<'a> {
         Ok(())
     }
 
-    /// Merge 64 buckets into their partners, then trim directory capacity.
+    /// Merge one bucket group into its partner buckets, then trim directory capacity.
     fn shrink_batch(
         &mut self,
         mut merge_chain: impl FnMut(u64, u64, u32, u32) -> u32,
     ) -> Result<()> {
-        if self.buckets < MIN_BUCKETS + BUCKET_BATCH {
+        if self.buckets < BUCKET_GROUP * 2 {
             return Err(Error::new("linear-hash directory is at its minimum size"));
         }
         let old_buckets = self.buckets;
         let old_split = self.split;
         let (base, new_split) = if old_split == 0 {
             self.level -= 1;
-            ((1u64 << self.level) - 1, (1u64 << self.level) - BUCKET_BATCH)
+            ((1u64 << self.level) - 1, (1u64 << self.level) - BUCKET_GROUP)
         } else {
-            (old_split - 1, old_split - BUCKET_BATCH)
+            (old_split - 1, old_split - BUCKET_GROUP)
         };
-        for offset in 0..BUCKET_BATCH {
+        for offset in 0..BUCKET_GROUP {
             let partner = base - offset;
             let removed = old_buckets - 1 - offset;
             let partner_head = self.head(partner);
@@ -309,7 +308,7 @@ impl<'a> LinearHash<'a> {
             }
         }
 
-        self.buckets = old_buckets - BUCKET_BATCH;
+        self.buckets = old_buckets - BUCKET_GROUP;
         self.split = new_split;
         let new_cap = head_cap(self.buckets, self.max_buckets);
         if new_cap < self.head_capacity() {
@@ -376,12 +375,12 @@ unsafe impl<T: LinearEntry + Send + Sync, const A: usize, const L: usize> Sync
 }
 
 impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L> {
-    /// Create a pool that can hold max_items entries, initially using 64 buckets.
+    /// Create a pool that can hold max_items entries, initially using 256 buckets.
     pub fn new(chunks: &'a ChunkPool, max_items: u32) -> Result<Self> {
         Self::with_buckets(chunks, max_items, 0)
     }
 
-    /// Create a pool with an explicit initial bucket count; zero means 64.
+    /// Create a pool with an explicit initial bucket count; zero means 256.
     pub fn with_buckets(
         chunks: &'a ChunkPool,
         max_items: u32,
@@ -389,7 +388,7 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L>
     ) -> Result<Self> {
         assert_eq!(T::LINK_NONE, u32::MAX, "LinearPool needs LINK_NONE = u32::MAX");
         let max_items = max_items.max(1);
-        let max_buckets = batch_cap(u64::from(max_items)).max(MIN_BUCKETS);
+        let max_buckets = batch_cap(u64::from(max_items)).max(BUCKET_GROUP);
         let hash = LinearHash::with_buckets(chunks, max_buckets, u64::from(initial_buckets))?;
         let slots = LockedPool::new(max_items, 0)?;
         let base = slots.base_ptr();
@@ -482,7 +481,7 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L>
         if final_len > u64::from(self.max_items) {
             return Err(Error::new("linear pool reached its item limit"));
         }
-        let grows = final_len > self.hash.bucket_count();
+        let grows = final_len > self.hash.bucket_count() * 2;
         let value = create(key);
         let index = self.slots.alloc()?;
         self.slot_mut(index).init(key, value);
@@ -527,9 +526,7 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L>
         // SAFETY: this unique live entry was removed from its chain above.
         unsafe { self.slots.retire_index(index) };
         self.len -= 1;
-        while self.hash.bucket_count() >= MIN_BUCKETS + BUCKET_BATCH
-            && self.hash.bucket_count() > self.len * 2
-        {
+        while self.hash.bucket_count() >= BUCKET_GROUP * 2 && self.hash.bucket_count() > self.len {
             self.shrink();
         }
         true
@@ -693,52 +690,54 @@ fn merge_chain<T: LinearEntry>(base: NonNull<T>, mut left: u32, mut right: u32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn grow_shrink() {
         let pool = ChunkPool::new(8, 1).unwrap();
-        let mut hash = LinearHash::with_buckets(&pool, 256, 0).unwrap();
-        assert_eq!(hash.bucket_count(), 64);
+        let group = BUCKET_GROUP;
+        let mut hash = LinearHash::with_buckets(&pool, group * 4, 0).unwrap();
+        assert_eq!(hash.bucket_count(), group);
 
-        // Keys initially map across the minimum 64 buckets.
-        assert_eq!(hash.bucket(0x41), 1);
-        assert_eq!(hash.bucket(0x82), 2);
-        assert_eq!(hash.bucket(0x1_0000_0003), 3);
+        // Keys initially map across the minimum bucket group.
+        assert_eq!(hash.bucket(group + 1), 1);
+        assert_eq!(hash.bucket(group * 2 + 2), 2);
+        assert_eq!(hash.bucket(group * 3 + 3), 3);
         assert_eq!(hash.head(0), u32::MAX);
 
-        for expected in [128, 192, 256] {
+        for expected in [group * 2, group * 3, group * 4] {
             hash.grow_batch(|_, _, _, _| {}).unwrap();
             assert_eq!(hash.bucket_count(), expected);
         }
-        assert_eq!(hash.bucket(64), 64);
-        assert_eq!(hash.bucket(128), 128);
-        assert_eq!(hash.bucket(192), 192);
+        assert_eq!(hash.bucket(group), group);
+        assert_eq!(hash.bucket(group * 2), group * 2);
+        assert_eq!(hash.bucket(group * 3), group * 3);
 
-        for expected in [192, 128, 64] {
+        for expected in [group * 3, group * 2, group] {
             hash.shrink_batch(|_, _, keep, _| keep).unwrap();
             assert_eq!(hash.bucket_count(), expected);
         }
-        assert_eq!(hash.bucket(192), 0);
+        assert_eq!(hash.bucket(group), 0);
         assert!(hash.shrink_batch(|_, _, keep, _| keep).is_err());
     }
 
     #[test]
     fn capacity_reset() {
         let pool = ChunkPool::new(8, 1).unwrap();
-        let mut hash = LinearHash::with_buckets(&pool, 128, 64).unwrap();
-        assert_eq!(hash.bucket_count(), 64);
+        let mut hash = LinearHash::with_buckets(&pool, BUCKET_GROUP * 5, BUCKET_GROUP * 4).unwrap();
+        assert_eq!(hash.bucket_count(), BUCKET_GROUP * 4);
         hash.grow_batch(|_, _, _, _| {}).unwrap();
-        assert_eq!(hash.bucket_count(), 128);
+        assert_eq!(hash.bucket_count(), BUCKET_GROUP * 5);
         assert!(hash.grow_batch(|_, _, _, _| {}).is_err());
         hash.reset().unwrap();
-        assert_eq!(hash.bucket_count(), 64);
+        assert_eq!(hash.bucket_count(), BUCKET_GROUP * 4);
         assert_eq!(hash.head(0), u32::MAX);
     }
 
     #[test]
     fn head_reuse() {
         let pool = ChunkPool::new(4, 1).unwrap();
-        let max = HEADS_PER_BLOCK + BUCKET_BATCH;
+        let max = HEADS_PER_BLOCK + BUCKET_GROUP;
         let mut hash = LinearHash::with_buckets(&pool, max, HEADS_PER_BLOCK).unwrap();
         assert_eq!(hash.head_capacity(), HEADS_PER_BLOCK);
         assert_eq!(hash.head(HEADS_PER_BLOCK - 1), u32::MAX);
@@ -830,6 +829,8 @@ mod tests {
     fn chain_keys(entries: &[Entry], mut index: u32) -> Vec<u32> {
         let mut keys = Vec::new();
         while index != Entry::LINK_NONE {
+            assert!(keys.len() < entries.len(), "cycle in test chain");
+            assert!((index as usize) < entries.len(), "invalid index in test chain");
             keys.push(entries[index as usize].key);
             index = entries[index as usize].next;
         }
@@ -841,7 +842,8 @@ mod tests {
         let heads = VirtualHeads::new(&pool, 128, 128).unwrap();
         let mut entries = chain(keys);
         let base = NonNull::new(entries.as_mut_ptr()).unwrap();
-        unsafe { heads.base().write(0) };
+        let first = if entries.is_empty() { Entry::LINK_NONE } else { 0 };
+        unsafe { heads.base().write(first) };
         split_chain::<Entry>(heads.base(), base, 0, 64, bit);
         (entries, unsafe { heads.base().read() }, unsafe { heads.base().add(64).read() })
     }
@@ -865,6 +867,88 @@ mod tests {
         assert_eq!(chain_keys(&entries, moved), [8, 24]);
     }
 
+    #[test]
+    fn split_all_patterns_up_to_four() {
+        let bit = 8u32;
+        let mut cases = 0;
+        for len in 0..=4 {
+            for pattern in 0..(1u32 << len) {
+                let mut keys = Vec::with_capacity(len);
+                let mut expected_keep = Vec::new();
+                let mut expected_move = Vec::new();
+                for at in 0..len {
+                    let low = at as u32;
+                    if pattern & (1 << at) == 0 {
+                        keys.push(low);
+                        expected_keep.push(low);
+                    } else {
+                        let key = bit | low;
+                        keys.push(key);
+                        expected_move.push(key);
+                    }
+                }
+
+                let (entries, keep, moved) = split_for_test(&keys, u64::from(bit));
+                assert_eq!(
+                    chain_keys(&entries, keep),
+                    expected_keep,
+                    "len={len}, pattern={pattern:#x}"
+                );
+                assert_eq!(
+                    chain_keys(&entries, moved),
+                    expected_move,
+                    "len={len}, pattern={pattern:#x}"
+                );
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 31);
+    }
+
+    #[test]
+    #[ignore = "manual linear-hash growth timing"]
+    fn time_growth_batch() {
+        const TRIALS: usize = 10_000;
+        let group = BUCKET_GROUP;
+        let pool = ChunkPool::new(8, 1).unwrap();
+        let mut hash = LinearHash::with_buckets(&pool, group * 2, group).unwrap();
+        let mut entries = (0..group as u32)
+            .map(|bucket| {
+                let key = if bucket & 1 == 0 { bucket + group as u32 } else { bucket };
+                Entry { next: Entry::LINK_NONE, key, valid: true }
+            })
+            .collect::<Vec<_>>();
+        let base = NonNull::new(entries.as_mut_ptr()).unwrap();
+        let mut samples = Vec::with_capacity(TRIALS);
+
+        for _ in 0..TRIALS {
+            hash.reset().unwrap();
+            for (bucket, entry) in entries.iter_mut().enumerate() {
+                entry.next = Entry::LINK_NONE;
+                hash.set_head(bucket as u64, bucket as u32);
+            }
+
+            let start = Instant::now();
+            hash.grow_batch(|heads, old, new, bit| {
+                split_chain::<Entry>(heads, base, old, new, bit)
+            })
+            .unwrap();
+            samples.push(start.elapsed().as_nanos());
+            std::hint::black_box(hash.bucket_count());
+        }
+
+        samples.sort_unstable();
+        let total: u128 = samples.iter().sum();
+        println!(
+            "linear_growth buckets={group} trials={TRIALS} moved_per_batch={} mean_ns={:.1} median_ns={} p95_ns={} max_ns={}",
+            group / 2,
+            total as f64 / TRIALS as f64,
+            samples[TRIALS / 2],
+            samples[TRIALS * 95 / 100],
+            samples[TRIALS - 1],
+        );
+    }
+
     fn add(table: &mut LinearPool<'_, Entry, 4, 0>, key: u32, value: Entry) {
         let (_, inserted) = table.find_or_create(key, |_| value).unwrap();
         assert!(inserted);
@@ -886,61 +970,68 @@ mod tests {
     #[test]
     fn entries_resize_and_reuse() {
         let chunks = ChunkPool::new(8, 1).unwrap();
-        let mut table = LinearPool::<Entry, 4, 0>::new(&chunks, 256).unwrap();
-        for key in (0..129).map(|n| n * 64 + 7).rev() {
+        let count = (BUCKET_GROUP * 2 + 1) as u32;
+        let stride = BUCKET_GROUP as u32;
+        let mut table = LinearPool::<Entry, 4, 0>::new(&chunks, count).unwrap();
+        for key in (0..count).map(|n| n * stride + 7).rev() {
             add(&mut table, key, entry(key));
             assert_sorted(&table);
         }
-        assert_eq!(table.len(), 129);
-        for key in 0..129 {
-            assert_eq!(table.get(&(key * 64 + 7)).unwrap().key, key * 64 + 7);
+        assert_eq!(table.len(), u64::from(count));
+        for key in 0..count {
+            assert_eq!(table.get(&(key * stride + 7)).unwrap().key, key * stride + 7);
         }
 
-        for key in (0..129).step_by(2) {
-            assert!(table.remove(&(key * 64 + 7)));
+        for key in (0..count).step_by(2) {
+            assert!(table.remove(&(key * stride + 7)));
             assert_sorted(&table);
         }
-        for key in (1..129).step_by(2) {
-            assert!(table.remove(&(key * 64 + 7)));
+        for key in (1..count).step_by(2) {
+            assert!(table.remove(&(key * stride + 7)));
         }
         assert!(table.is_empty());
-        assert_eq!(table.hash.bucket_count(), MIN_BUCKETS);
+        assert_eq!(table.hash.bucket_count(), BUCKET_GROUP);
 
         table.reclaim();
         add(&mut table, 17, entry(17));
         assert!(table.get(&17).unwrap().valid);
         table.clear();
         assert!(table.is_empty());
-        assert_eq!(table.hash.bucket_count(), MIN_BUCKETS);
+        assert_eq!(table.hash.bucket_count(), BUCKET_GROUP);
     }
 
     #[test]
     fn capacity_is_exact() {
         let chunks = ChunkPool::new(8, 1).unwrap();
-        let mut table = LinearPool::<Entry, 4, 0>::new(&chunks, 65).unwrap();
-        assert_eq!(table.hash.bucket_count(), 64);
-        for key in 0..65 {
+        let max_items = (BUCKET_GROUP * 4 + 1) as u32;
+        let mut table = LinearPool::<Entry, 4, 0>::new(&chunks, max_items).unwrap();
+        assert_eq!(table.hash.bucket_count(), BUCKET_GROUP);
+        for key in 0..max_items {
             add(&mut table, key, entry(key));
         }
-        assert!(table.find_or_create(65, entry).is_err());
-        assert_eq!(table.len(), 65);
-        assert_eq!(table.hash.bucket_count(), 128);
-        assert!(table.get(&64).unwrap().valid);
+        assert!(table.find_or_create(max_items, entry).is_err());
+        assert_eq!(table.len(), u64::from(max_items));
+        assert_eq!(table.hash.bucket_count(), BUCKET_GROUP * 3);
+        assert!(table.get(&(max_items - 1)).unwrap().valid);
     }
 
     #[test]
     fn failed_growth_rolls_back_insert() {
         let chunks = ChunkPool::new(1, 1).unwrap();
-        let mut table = LinearPool::<Entry, 4, 0>::with_buckets(&chunks, 16_385, 16_384).unwrap();
-        for key in 0..16_384 {
+        let initial_buckets = HEADS_PER_BLOCK as u32;
+        let full_len = initial_buckets * 2;
+        let mut table =
+            LinearPool::<Entry, 4, 0>::with_buckets(&chunks, full_len + 1, initial_buckets)
+                .unwrap();
+        for key in 0..full_len {
             add(&mut table, key, entry(key));
         }
 
-        assert!(table.find_or_create(16_384, entry).is_err());
-        assert_eq!(table.len(), 16_384);
-        assert_eq!(table.hash.bucket_count(), 16_384);
-        assert!(table.get(&16_383).unwrap().valid);
-        assert!(table.get(&16_384).is_none());
+        assert!(table.find_or_create(full_len, entry).is_err());
+        assert_eq!(table.len(), u64::from(full_len));
+        assert_eq!(table.hash.bucket_count(), u64::from(initial_buckets));
+        assert!(table.get(&(full_len - 1)).unwrap().valid);
+        assert!(table.get(&full_len).is_none());
         assert_sorted(&table);
     }
 
@@ -962,46 +1053,55 @@ mod tests {
     #[test]
     fn grows_and_shrinks_in_batches() {
         let chunks = ChunkPool::new(8, 1).unwrap();
-        let mut table = LinearPool::<Entry, 4, 0>::new(&chunks, 256).unwrap();
-        for key in 0..129 {
+        let group = BUCKET_GROUP as u32;
+        let count = group * 2 + 1;
+        let mut table = LinearPool::<Entry, 4, 0>::new(&chunks, count).unwrap();
+        for key in 0..count {
             add(&mut table, key, entry(key));
         }
-        assert_eq!(table.len(), 129);
-        assert_eq!(table.hash.bucket_count(), 192);
+        assert_eq!(table.len(), u64::from(count));
+        assert_eq!(table.hash.bucket_count(), u64::from(group * 2));
 
-        for key in 0..64 {
+        for key in 0..group {
             assert!(table.remove(&key));
         }
-        assert_eq!(table.len(), 65);
-        assert_eq!(table.hash.bucket_count(), 128);
+        assert_eq!(table.len(), u64::from(group + 1));
+        assert_eq!(table.hash.bucket_count(), u64::from(group));
 
-        assert!(table.remove(&64));
-        assert_eq!(table.len(), 64);
-        assert_eq!(table.hash.bucket_count(), 128);
-        assert!(table.remove(&65));
-        assert_eq!(table.len(), 63);
-        assert_eq!(table.hash.bucket_count(), 64);
+        assert!(table.remove(&group));
+        assert_eq!(table.len(), u64::from(group));
+        assert_eq!(table.hash.bucket_count(), u64::from(group));
+        assert!(table.remove(&(group + 1)));
+        assert_eq!(table.len(), u64::from(group - 1));
+        assert_eq!(table.hash.bucket_count(), u64::from(group));
         assert_sorted(&table);
     }
 
     #[test]
     fn keeps_configured_bucket_count_after_remove_and_clear() {
         let chunks = ChunkPool::new(8, 1).unwrap();
-        let mut table = LinearPool::<Entry, 4, 0>::with_buckets(&chunks, 128, 100).unwrap();
-        assert_eq!(table.hash.bucket_count(), 128);
+        let initial_items = BUCKET_GROUP * 6;
+        let initial_buckets = batch_cap(initial_items + BUCKET_GROUP / 2);
+        let mut table = LinearPool::<Entry, 4, 0>::with_buckets(
+            &chunks,
+            initial_buckets as u32,
+            (initial_items + BUCKET_GROUP / 2) as u32,
+        )
+        .unwrap();
+        assert_eq!(table.hash.bucket_count(), initial_buckets);
 
-        for key in 0..100 {
+        for key in 0..initial_items as u32 {
             add(&mut table, key, entry(key));
         }
-        assert_eq!(table.hash.bucket_count(), 128);
-        for key in 0..100 {
+        assert_eq!(table.hash.bucket_count(), initial_buckets);
+        for key in 0..initial_items as u32 {
             assert!(table.remove(&key));
         }
-        assert_eq!(table.hash.bucket_count(), MIN_BUCKETS);
+        assert_eq!(table.hash.bucket_count(), BUCKET_GROUP);
 
         table.clear();
-        assert_eq!(table.hash.bucket_count(), 128);
-        for bucket in 0..128 {
+        assert_eq!(table.hash.bucket_count(), initial_buckets);
+        for bucket in 0..initial_buckets {
             assert_eq!(table.hash.head(bucket), Entry::LINK_NONE);
         }
     }
