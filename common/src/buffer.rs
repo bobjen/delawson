@@ -41,7 +41,10 @@ pub struct MessageBuffer {
 }
 impl MessageBuffer {
     pub fn new(pool: &'static ChunkPool) -> Self {
-        Self { bytes: SegmentedBuffer::with_retained_leaves(pool, RETAINED_LEAVES) }
+        Self::with_retained(pool, RETAINED_LEAVES)
+    }
+    pub(super) fn with_retained(pool: &'static ChunkPool, leaves: u32) -> Self {
+        Self { bytes: SegmentedBuffer::with_retained_leaves(pool, leaves) }
     }
     pub fn empty_like(&self) -> Self {
         Self::new(self.bytes.pool())
@@ -54,6 +57,9 @@ impl MessageBuffer {
     }
     pub fn clear(&mut self) {
         self.bytes.reset();
+    }
+    pub(super) fn set_retained_leaves(&mut self, leaves: u32) {
+        self.bytes.set_retained_leaves(leaves);
     }
     pub fn append(&mut self, bytes: &[u8]) -> Result<()> {
         self.bytes.append(bytes).context("message buffer append")

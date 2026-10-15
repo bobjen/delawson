@@ -82,6 +82,15 @@ impl<'a> SegmentedBuffer<'a> {
         buffer
     }
 
+    /// Change the retained prefix, also keeping any currently allocated prefix
+    /// leaves when the buffer is a zero-based contiguous range.
+    pub fn set_retained_leaves(&mut self, leaves: u32) {
+        self.retain_leaves = leaves;
+        if self.start == 0 && self.base == 0 {
+            self.retained = self.retained.max(leaves.min(self.allocated_end as u32));
+        }
+    }
+
     /// Start a new zero-based byte range, retaining only the configured capacity.
     pub fn reset(&mut self) {
         self.start = 0;
@@ -664,6 +673,21 @@ mod tests {
         audit(&b);
         drop(b);
         all_returned(&pool, 8);
+    }
+
+    #[test]
+    fn retained_prefix_can_grow_after_a_large_use() {
+        let pool = ChunkPool::new(64, 0).unwrap();
+        let mut buffer = SegmentedBuffer::with_retained_leaves(&pool, 1);
+        let bytes = vec![7; CHUNK_BYTES * 4];
+        buffer.append(&bytes).unwrap();
+        buffer.set_retained_leaves(4);
+        buffer.reset();
+        assert_eq!(buffer.retained, 4);
+        buffer.append(&bytes).unwrap();
+        let mut actual = vec![0; bytes.len()];
+        buffer.read_at(0, &mut actual).unwrap();
+        assert_eq!(actual, bytes);
     }
 
     #[test]

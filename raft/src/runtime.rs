@@ -234,7 +234,7 @@ impl<S> Runtime<S> {
         let transport = runtime.messaging.as_ref().map(|messaging| {
             let mut messaging = messaging.clone();
             messaging.peer_conns = 1;
-            common::peer::Peers::new(
+            common::peer::Peers::new_raft(
                 messaging,
                 Duration::from_millis(options.raft.request_timeout_ms),
             )

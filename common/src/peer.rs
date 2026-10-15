@@ -38,6 +38,7 @@ pub struct Peer {
     waiting: Mutex<HashMap<u32, Then>>,
     next_id: AtomicU32,
     timeout: Duration,
+    raft: bool,
     broken: AtomicBool,
     socket: TcpStream,
 }
@@ -47,18 +48,20 @@ impl Peer {
         address: SocketAddr,
         config: &Messaging,
         timeout: Duration,
+        raft: bool,
     ) -> Result<Arc<Peer>> {
         let stream = TcpStream::connect_timeout(&address, timeout)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
         let control = stream.try_clone()?;
-        let link = wire::connect(stream, config)?;
+        let link = wire::connect_peer(stream, config, raft)?;
         control.set_read_timeout(None)?;
         let peer = Arc::new(Peer {
             sending: Outbox::start(link.wire),
             waiting: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(0),
             timeout,
+            raft,
             broken: AtomicBool::new(false),
             socket: control,
         });
@@ -105,16 +108,19 @@ impl Peer {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         self.waiting.lock().expect("peer").insert(id, Box::new(then));
 
-        // Framed here, sent by this connection's sender along with whatever else
-        // has arrived meanwhile.
-        FRAME
-            .with(|scratch| -> Result<()> {
+        // Raft entries can be large. Encode them directly into the reusable
+        // Outbox buffer rather than cloning the request and copying a frame.
+        let result = if self.raft {
+            self.sending.put_request(request, id)
+        } else {
+            FRAME.with(|scratch| -> Result<()> {
                 let mut framed = scratch.borrow_mut();
                 framed.clear();
                 put_request(&mut *framed, &request.clone().id(id))?;
-                self.sending.put(&framed)?;
-                Ok(())
+                self.sending.put(&framed)
             })
+        };
+        result
             .inspect_err(|_| {
                 self.waiting.lock().expect("peer").remove(&id);
             })
@@ -159,11 +165,26 @@ pub struct Peers {
     timeout: Duration,
     open: Mutex<HashMap<String, Vec<Arc<Peer>>>>,
     turn: AtomicU32,
+    raft: bool,
 }
 
 impl Peers {
     pub fn new(config: Messaging, timeout: Duration) -> Peers {
-        Peers { config, timeout, open: Mutex::new(HashMap::new()), turn: AtomicU32::new(0) }
+        Peers {
+            config,
+            timeout,
+            open: Mutex::new(HashMap::new()),
+            turn: AtomicU32::new(0),
+            raft: false,
+        }
+    }
+
+    /// Build peer connections whose buffers retain bounded capacity for large
+    /// replicated entries.
+    pub fn new_raft(config: Messaging, timeout: Duration) -> Peers {
+        let mut peers = Self::new(config, timeout);
+        peers.raft = true;
+        peers
     }
 
     /// The connection to `identity`, opening it if this is the first need for it.
@@ -195,7 +216,7 @@ impl Peers {
         config.expected_peer = Some(identity.into());
         let mut fan = Vec::with_capacity(self.config.peer_conns.max(1));
         for _ in 0..self.config.peer_conns.max(1) {
-            fan.push(Peer::connect(address, &config, self.timeout)?);
+            fan.push(Peer::connect(address, &config, self.timeout, self.raft)?);
         }
         let peer = Arc::clone(&fan[turn % fan.len()]);
         self.open.lock().expect("peers").insert(identity.to_string(), fan);

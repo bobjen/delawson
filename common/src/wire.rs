@@ -90,6 +90,10 @@ where
 /// connection cannot make the far side allocate without bound.
 pub const MAX_SEGMENT_BYTES: usize = 64 << 20;
 
+// Experimental: this may not be necessary at all. It's a premature
+// optimization, but avoiding copies of large Raft messages may be useful later.
+const RAFT_KEEP: u32 = 16;
+
 /// Every request has one payload. Its Op is the first field of that payload;
 /// the request header contains only the correlation ID and depth limit.
 
@@ -1106,7 +1110,11 @@ impl Req {
     }
 
     fn encode_to(&self, out: &mut impl Write) -> std::io::Result<()> {
-        out.write_all(&self.id.to_le_bytes())?;
+        self.encode_with_id(self.id, out)
+    }
+
+    fn encode_with_id(&self, id: u32, out: &mut impl Write) -> std::io::Result<()> {
+        out.write_all(&id.to_le_bytes())?;
         out.write_all(&[message_depth(std::slice::from_ref(&self.payload))])?;
         encode_arg(&self.payload, out)
     }
@@ -1711,12 +1719,13 @@ pub struct Wire {
     stream: crate::machine::Stream,
     seal: Seal,
     sealed: MessageBuffer,
+    keep: u32,
 }
 
 impl Wire {
     /// Create an empty batch sharing this connection's process-wide pool.
     pub fn new_buffer(&self) -> MessageBuffer {
-        self.sealed.empty_like()
+        MessageBuffer::with_retained(self.sealed.bytes.pool(), self.keep)
     }
 
     /// Seal and send a batch, splitting large batches at message boundaries.
@@ -1751,6 +1760,7 @@ pub struct Reader {
     /// honest start for a duration, being when the bytes got here rather than
     /// when a thread got to them.
     arrived: Instant,
+    may_be_raft: bool,
 }
 
 impl Reader {
@@ -1818,9 +1828,19 @@ impl Reader {
     }
 
     pub fn request(&mut self) -> Result<Req> {
-        self.decode_next("discard consumed request", |reader, length| {
-            Req::decode_from(reader, length)
-        })
+        let reader = self.next()?;
+        let length = reader.remaining() as usize;
+        let result = Req::decode_from(reader, length);
+        if self.may_be_raft {
+            if result.as_ref().is_ok_and(|request| request.op() == Op::Raft) {
+                self.open.set_retained_leaves(RAFT_KEEP);
+                self.sealed.set_retained_leaves(RAFT_KEEP);
+            }
+            // The first request identifies this accepted connection's purpose.
+            self.may_be_raft = false;
+        }
+        self.discard_consumed("discard consumed request")?;
+        result
     }
 
     pub fn response(&mut self) -> Result<Resp> {
@@ -1905,13 +1925,26 @@ impl Outbox {
         outbox
     }
 
-    /// Append one framed message. The lock is held for a copy, never for a write.
+    /// Append a preframed message, copying it under the lock.
     pub fn put(&self, framed: &MessageBytes) -> Result<()> {
         let mut filling = self.filling.lock().expect("outbox");
         let woke = filling.is_empty();
         filling.append_payload(framed)?;
         drop(filling);
         // Waking is only needed when the sender has nothing else to find.
+        if woke {
+            self.ready.notify_one();
+        }
+        Ok(())
+    }
+
+    /// Encode directly into the filling buffer, avoiding a frame staging copy.
+    /// The Outbox lock stays held for serialization.
+    pub(crate) fn put_request(&self, request: &Req, id: u32) -> Result<()> {
+        let mut filling = self.filling.lock().expect("outbox");
+        let woke = filling.is_empty();
+        put_request_with_id(&mut *filling, request, id)?;
+        drop(filling);
         if woke {
             self.ready.notify_one();
         }
@@ -1949,6 +1982,25 @@ pub fn put_request(plain: &mut impl FrameBuffer, request: &Req) -> Result<()> {
     plain.append_message(request)
 }
 
+struct ReqWithId<'a> {
+    request: &'a Req,
+    id: u32,
+}
+
+impl Message for ReqWithId<'_> {
+    fn encode_into(&self, out: &mut impl Write) -> std::io::Result<()> {
+        self.request.encode_with_id(self.id, out)
+    }
+}
+
+pub(crate) fn put_request_with_id(
+    plain: &mut impl FrameBuffer,
+    request: &Req,
+    id: u32,
+) -> Result<()> {
+    plain.append_message(&ReqWithId { request, id })
+}
+
 pub fn put_response(plain: &mut impl FrameBuffer, response: &Resp) -> Result<()> {
     plain.append_message(response)
 }
@@ -1972,6 +2024,14 @@ impl Link {
 /// sealed. Directions differ by a byte in the nonce, so one prefix is enough for
 /// both and no two segments under one key can share a nonce.
 pub fn connect(stream: TcpStream, config: &Messaging) -> Result<Link> {
+    connect_with_keep(stream, config, 1)
+}
+
+pub(crate) fn connect_peer(stream: TcpStream, config: &Messaging, raft: bool) -> Result<Link> {
+    connect_with_keep(stream, config, if raft { RAFT_KEEP } else { 1 })
+}
+
+fn connect_with_keep(stream: TcpStream, config: &Messaging, keep: u32) -> Result<Link> {
     let pool = buffer::shared_pool(config.buffer_pool)?;
     stream.set_nodelay(true)?;
     let stream = crate::machine::Stream::new(stream, config, false)?;
@@ -1984,18 +2044,20 @@ pub fn connect(stream: TcpStream, config: &Messaging) -> Result<Link> {
         reader: Reader {
             stream: stream.try_clone()?,
             seal: Seal::new(config, prefix, 1)?,
-            open: MessageBuffer::new(pool),
-            sealed: MessageBuffer::new(pool),
+            open: MessageBuffer::with_retained(pool, keep),
+            sealed: MessageBuffer::with_retained(pool, keep),
             sealed_scratch: Vec::new(),
             at: 0,
             arrived: Instant::now(),
+            may_be_raft: false,
         },
         wire: Wire {
             stream: writing,
             seal: Seal::new(config, prefix, 0)?,
-            sealed: MessageBuffer::new(pool),
+            sealed: MessageBuffer::with_retained(pool, keep),
+            keep,
         },
-        plain: MessageBuffer::new(pool),
+        plain: MessageBuffer::with_retained(pool, keep),
     })
 }
 
@@ -2017,8 +2079,14 @@ pub fn accept(stream: TcpStream, config: &Messaging) -> Result<(Reader, Wire)> {
             sealed_scratch: Vec::new(),
             at: 0,
             arrived: Instant::now(),
+            may_be_raft: config.local_ring.is_some(),
         },
-        Wire { stream, seal: Seal::new(config, prefix, 1)?, sealed: MessageBuffer::new(pool) },
+        Wire {
+            stream,
+            seal: Seal::new(config, prefix, 1)?,
+            sealed: MessageBuffer::new(pool),
+            keep: 1,
+        },
     ))
 }
 
@@ -2049,6 +2117,15 @@ mod tests {
             .flag(true)
             .bytes(vec![1, 2, 3]);
         assert_eq!(round_trip_request(&request), request);
+    }
+
+    #[test]
+    fn request_id_can_be_overridden_without_cloning_payload() {
+        let request = Req::new(Op::AppendRecord).id(7).text("payload");
+        let mut plain = Vec::new();
+        put_request_with_id(&mut plain, &request, 29).unwrap();
+        let decoded = Req::decode(&plain[4..]).unwrap();
+        assert_eq!(decoded, request.id(29));
     }
 
     #[test]
