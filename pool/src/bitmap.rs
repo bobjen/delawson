@@ -17,6 +17,84 @@ const REFILL_BATCH: u32 = 64;
 const REFILL_BUSY: u32 = 1 << 31;
 const REFILL_MASK: u32 = !REFILL_BUSY;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+#[repr(usize)]
+pub(super) enum Race {
+    ClaimLost,
+    FreeRace,
+    DrainRace,
+    EmptyScan,
+    FreshRace,
+    ScheduleRace,
+    RefillBusy,
+    RefillCASLoss,
+    RefillDone,
+}
+
+#[cfg(test)]
+impl Race {
+    pub(super) const ALL: [Self; 9] = [
+        Self::ClaimLost,
+        Self::FreeRace,
+        Self::DrainRace,
+        Self::EmptyScan,
+        Self::FreshRace,
+        Self::ScheduleRace,
+        Self::RefillBusy,
+        Self::RefillCASLoss,
+        Self::RefillDone,
+    ];
+
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Self::ClaimLost => "claim CAS lost",
+            Self::FreeRace => "free raced with claim",
+            Self::DrainRace => "candidate drained",
+            Self::EmptyScan => "probe scan empty",
+            Self::FreshRace => "concurrent fresh issue",
+            Self::ScheduleRace => "refill schedule race",
+            Self::RefillBusy => "refill already busy",
+            Self::RefillCASLoss => "refill claim CAS lost",
+            Self::RefillDone => "refill published blocks",
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RACE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn clear_hits() {
+    RACE_HITS.with(|hits| hits.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn take_hits() -> u64 {
+    RACE_HITS.with(|hits| hits.replace(0))
+}
+
+#[cfg(test)]
+#[inline]
+fn record_race(race: Race) {
+    let flag = 1u64 << race as usize;
+    RACE_HITS.with(|hits| {
+        let seen = hits.get();
+        if seen & flag == 0 {
+            hits.set(seen | flag);
+        }
+    });
+}
+
+#[cfg(test)]
+macro_rules! race_hit {
+    ($race:ident) => {
+        record_race(Race::$race);
+    };
+}
+
 /// Spreads each 4096-index group over 64 bitmap words.
 #[inline]
 fn bit_at(index: usize) -> (usize, u32) {
@@ -149,14 +227,26 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
             return false;
         }
         let count = count.min(REFILL_MASK);
-        self.refill.compare_exchange(0, count, SeqCst, SeqCst).is_ok()
+        match self.refill.compare_exchange(0, count, SeqCst, SeqCst) {
+            Ok(_) => true,
+            Err(_) => {
+                #[cfg(test)]
+                race_hit!(ScheduleRace);
+                false
+            }
+        }
     }
 
     /// Pays at most one fixed-size part of the reserve target. The busy bit
     /// keeps a concurrent full scan from scheduling the same reserve twice.
     fn refill(&self, len: Option<&AtomicUsize>) {
         let state = self.refill.load(SeqCst);
-        if state == 0 || state & REFILL_BUSY != 0 {
+        if state == 0 {
+            return;
+        }
+        if state & REFILL_BUSY != 0 {
+            #[cfg(test)]
+            race_hit!(RefillBusy);
             return;
         }
         let pending = state & REFILL_MASK;
@@ -166,6 +256,8 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
             .compare_exchange(state, REFILL_BUSY | (pending - count), SeqCst, SeqCst)
             .is_err()
         {
+            #[cfg(test)]
+            race_hit!(RefillCASLoss);
             return;
         }
         let _growth = self.growth.lock().expect("pool growth lock");
@@ -190,6 +282,8 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
                 len.fetch_max((start + count) as usize, Ordering::Release);
             }
             self.set_free_range(start, count);
+            #[cfg(test)]
+            race_hit!(RefillDone);
         }
         self.refill.fetch_and(REFILL_MASK, SeqCst);
     }
@@ -213,9 +307,21 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
             let bit = free.trailing_zeros();
             match word.compare_exchange_weak(free, free & !(1u64 << bit), SeqCst, SeqCst) {
                 Ok(_) => return Some(self.claim(at, bit)),
-                Err(actual) => free = actual,
+                Err(actual) => {
+                    if actual != free {
+                        #[cfg(test)]
+                        race_hit!(ClaimLost);
+                        if actual & !free != 0 {
+                            #[cfg(test)]
+                            race_hit!(FreeRace);
+                        }
+                    }
+                    free = actual;
+                }
             }
         }
+        #[cfg(test)]
+        race_hit!(DrainRace);
         None
     }
 
@@ -386,8 +492,15 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
             // sequence with the current issued bitmap length.
         }
 
+        #[cfg(test)]
+        race_hit!(EmptyScan);
+
         let block = self.alloc_fresh_inner(len)?;
         let issued_after = self.next.load(SeqCst);
+        #[cfg(test)]
+        if issued_after != issued + 1 {
+            race_hit!(FreshRace);
+        }
         let scheduled =
             issued_after == issued + 1 && self.schedule_refill(issued / (2 * BITS as u32));
         if !scheduled {
@@ -458,7 +571,7 @@ impl<T: PoolItem, const A: usize> Drop for Block<'_, T, A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Barrier, OnceLock};
 
     #[allow(dead_code)]
@@ -728,47 +841,6 @@ mod tests {
             "issued {} blocks",
             pool.issued_blocks()
         );
-        drop(held);
-    }
-
-    #[test]
-    fn concurrent_reuse() {
-        const COUNT: usize = 64;
-        let pool = Pool::<[u8; 64], 64>::new(COUNT as u32, 0).unwrap();
-        let owners: [AtomicU32; COUNT] = std::array::from_fn(|_| AtomicU32::new(0));
-        std::thread::scope(|scope| {
-            for id in 1..=8u32 {
-                let pool = &pool;
-                let owners = &owners;
-                scope.spawn(move || {
-                    for _ in 0..20_000 {
-                        match pool.alloc() {
-                            Ok(block) => {
-                                let owner =
-                                    &owners[pool.index_of(block.as_ptr()).unwrap() as usize];
-                                assert_eq!(
-                                    owner.compare_exchange(
-                                        0,
-                                        id,
-                                        Ordering::SeqCst,
-                                        Ordering::SeqCst
-                                    ),
-                                    Ok(0)
-                                );
-                                assert_eq!(owner.swap(0, Ordering::SeqCst), id);
-                                drop(block);
-                            }
-                            Err(_) => std::thread::yield_now(),
-                        }
-                    }
-                });
-            }
-        });
-        let mut held = Vec::new();
-        while let Ok(block) = pool.alloc() {
-            held.push(block);
-        }
-        assert_eq!(held.len(), pool.issued_blocks() as usize);
         drop(held);
     }
 }

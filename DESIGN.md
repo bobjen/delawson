@@ -7723,66 +7723,33 @@ much more than it does — and that is worth deciding rather than assuming (#46)
 after — the same stand-in bargain as DN's in-memory object index (§17.5g), and the same
 caution: nothing about the in-memory version is evidence about what the durable one costs.
 
-The shared `pool` interface owns fixed-size blocks in a contiguous virtual
-reservation. `Pool<ALIGN, BYTES, Links>` selects alignment, block size, and link layout
-at compile time, using static trait dispatch. Block size must be a positive multiple
-of the power-of-two alignment. Construction takes maximum and initial block counts;
-it reserves `BYTES * max_blocks + ALIGN - 1` bytes with anonymous `mmap` and rounds
-the base up to alignment. An atomic cursor hands out previously unused indexes in
-ascending order. Physical pages are supplied on demand: initial blocks are made
-available on the free list, not necessarily prefaulted. Mappings stay until pool
-destruction; returning a block does not call `munmap` or discard its pages.
+The `pool` crate exposes two fixed-size pools. `Pool<T, ALIGN>` uses an atomic
+bitmap and backs slots with one aligned contiguous virtual mapping; construction
+reserves `size_of::<T>() * max_blocks + ALIGN - 1` bytes and rounds the base up to
+`ALIGN`. A separate bitmap mapping tracks issued slots. Each slot is initialized
+once when first issued, and its pages are supplied on demand. Allocation probes
+bitmap words and claims a free bit with CAS; a dropped `Block` returns its index
+with an atomic bit update. Exact `reserve(index)` supports matching an index on
+another replica, and `index_of(ptr)` validates an issued slot address. Mappings
+remain until pool destruction.
 
-The implementation is a standalone workspace crate in `pool/`, imported as `pool`.
-It is intended for indexed items in SN and DN virtual arrays. Their motivation is compact, persistable 4-byte indexes instead of 8-byte pointers, dense item storage in a virtual array, and efficient address calculation for lookup by index. The pool need not outperform malloc/free to provide these representation benefits. Persisting indexes still requires preserving or reconstructing the corresponding array layout and allocation state. Each consumer creates
-its own pool with runtime maximum and initial counts; there is no process-global
-pool or automatic daemon initialization. Its only production dependency is libc;
-its tests and benchmark reuse common's RNG through a development dependency.
-Checkpoints and EN buffers can use system allocation directly; the malloc and
-aligned-allocation variants exist only in the comparison benchmark, not the pool
-API. `alloc(random)` returns a result
-containing an owning handle, and drop or `pool::free` returns the block. The handle
-borrows the pool, so its mappings cannot disappear while a block is live. Exhaustion
-is reported if neither a reusable nor a new index is available; delayed reclamation
-can make that failure temporary.
+`Pool<T, ALIGN>` requires `T` to implement `PoolItem`; its `init` hook initializes
+fresh slots but does not reset reused values. A zero initial count means one slot,
+and maximum capacity must be nonzero. The pool chooses bitmap words with the
+calling thread's RNG. If a scan finds no free bit, allocation grows by one slot
+for its caller and may schedule spare capacity; later allocations publish that
+reserve in batches. Checkpoints and EN buffers can use system allocation directly.
 
-`ExternalLinks` reserves `4 * max_blocks + 3` bytes separately and aligns a packed
-array of atomic 32-bit links. It allows the full payload to be exposed as mutable
-uninitialized bytes. `InlineLinks<OFFSET>` instead locates the link inside each item;
-`offset_of!(Item, field)` can supply the offset. Inline links remain atomic throughout
-the item's lifetime, though their values may serve another purpose while allocated.
-The inline handle exposes a raw item pointer and the atomic link, not a mutable
-slice covering the link. Typed item access must likewise avoid an exclusive
-reference spanning the link or non-atomic writes to it. Other link layouts can
-implement the unsafe `Links` contract. Index `u32::MAX` is reserved as the empty-list
-sentinel, permitting at most `u32::MAX` blocks.
+The standalone workspace crate is imported as `pool`. The bitmap pool serves
+segmented byte buffers and SN extents. `LockedPool<T, ALIGN, LINK>` serves
+SN metadata whose indexes must be reclaimed only under the caller's global
+exclusive lock; it uses an in-item `u32` link and performs no locking itself.
+Each consumer owns its pool configuration. Messaging currently shares one
+process-wide `ChunkPool`, initialized from its buffer-pool settings.
 
-Recycling within each bucket uses one free list and two deleted lists, each deleted list protected by
-an `AtomicI64` reader/writer counter. An atomic selector identifies the current group. Both allocation from
-the free list and return to a deleted list try its shared lock and recheck the
-selector before reading list state. Returns push onto the current deleted list;
-allocations pop from the free list. Empty-list allocation releases the shared lock,
-tries reclamation, then retries the free list before taking a fresh index.
-
-A recycler tries the inactive list's exclusive lock and rechecks the selector.
-It splices that retired chain onto the free list with a head CAS, appending the
-existing free list to the remembered tail of the chain. This makes transfer
-constant-time. It then selects the emptied list as current before releasing its
-exclusive lock. No separate rotation mutex or pending-group state is needed:
-another switch to that list also requires its exclusive lock. Acquiring that lock
-establishes that the list's previous participants have drained, including any
-that could have observed items retired into the other group. Holding it through
-the selector update prevents a delayed recycler from switching after intervening
-rotations. New operations retry during the short interval between selection and
-write-lock release; a suspended recycler at that point can delay them.
-
-Empty-list allocation attempts up to two such turns, retrying the free list after
-each, before taking a fresh index. Two turns allow a return to the initially active
-list to become reusable on the next allocation, without a spurious capacity error
-in a single-threaded pool. Exclusive acquisition uses try-locks throughout, so an
-undrained inactive group does not prevent allocation from the free list, growth,
-or return to the current group. The initial implementation conservatively uses
-sequentially consistent atomics.
+The following pool benchmark notes are retained history of the removed list-pool
+prototype. Its `ExternalLinks`/`InlineLinks` API, deleted-list algorithm and
+benchmark settings are not current code. The bitmap and locked pools replaced it.
 
 An `AtomicI64` counter-lock prototype was compared with `RwLock`. Its readers
 incremented the count, rolling back if the old value was negative; writers CASed
@@ -8361,7 +8328,7 @@ selector tests were removed; the measurements above remain as experiment history
 The CPU-first mode names in that history are no longer supported by the benchmark.
 
 **Pool-backed segmented byte buffer.** `pool::SegmentedBuffer` uses
-`pool::ChunkPool` (`Pool<CHUNK_BYTES, CHUNK_BYTES, ExternalLinks>`) for both data
+`pool::ChunkPool` (`Pool<[u8; CHUNK_BYTES], CHUNK_BYTES>`) for both data
 leaves and index nodes. `CHUNK_BYTES` is the single hardcoded block-size choice,
 currently 64KiB; alignment, index capacity, tree spans and maximum depth are
 derived from it. Every index node holds `CHUNK_BYTES / size_of::<u32>()` (16,384) u32
@@ -8426,7 +8393,7 @@ by block size (currently 524,288), default `initial_blocks` to zero, and derive
 uses these defaults. This reserves 32GiB of block virtual address space plus
 2MiB of packed external links, with
 physical pages supplied on demand. Subsequent connections must use the same pool
-configuration. Thread-local RNGs choose allocation buckets. Pool exhaustion
+configuration. Thread-local RNGs choose bitmap words. Pool exhaustion
 propagates as an error rather than publishing a partially framed message.
 
 Per-message framing scratch uses hybrid storage in producer threads; its small
@@ -8535,95 +8502,28 @@ against a contiguous reference model, range/offset overflow, allocation failure
 at every level, and unwinding through an RNG panic. Ownership audits and draining
 the pool after destruction check duplicate and lost blocks.
 
-Two rules are essential. **POOL-REUSE-AFTER-GRACE:** a popped index cannot reappear
-on the free list until every pool operation that could hold its old head value
-has ended. Shared participation, selector revalidation, and exclusive locking through
-each switch establish this, preventing ABA. **POOL-LINK-STAYS-ATOMIC:** a stale allocator may
-read an item's link after another allocator has given the item to its caller.
-That read is atomic even if the field now holds an application value. The stale
-head CAS must fail, and the candidate next index is never dereferenced before
-success. This is why an inline link cannot become ordinary mutable payload.
-Deterministic stalled-participant tests cover both same-group and cross-group
-retirement, and concurrent tests exercise both link layouts and exclusive ownership.
-The segmented buffer now builds on this pool; disk staging and extent persistence
-remain to be implemented.
+The bitmap-pool concurrency test follows Bob's
+[coverage-flags pattern](https://burtleburtle.net/bob/testing/concurrencyflags.html).
+Eight workers each run a 3 ms random alloc/return trial against a fresh pool
+configured with 64 initial and 256 maximum slots. A payload owner field detects
+simultaneous handout or an unexpected owner on return. After each trial, every
+issued slot must be free and have no remaining owner. Operation choices use
+independent seeded RNGs; OS thread scheduling is not replayed.
 
-The randomized pool tests follow Bob's [coverage-flags pattern](https://burtleburtle.net/bob/testing/concurrencyflags.html).
-There are two top-level tests, one per link layout, sharing a generic runner and
-12 branch flags. Eight workers randomly allocate or return one of their held
-blocks from a 16-block pool. Every loop starts with no issued blocks and retains
-at most 4096 operation records per worker, including final returns. Each trial is exactly one loop: its 3 ms clock starts when the workers are ready,
-without charging thread startup against that interval. Workers stop at the time
-or history limit, then the pool is audited and discarded.
-Histories include thread identity, indexes, and tickets bracketing each API call;
-the tickets describe observed invocation/completion order, not linearization points.
-A failure prints the loop seed and histories. `POOL_TEST_SEED` selects the initial
-seed for repeating operation choices, although thread scheduling is not replayed.
+Test-only, thread-local counters record nine bitmap conditions: losing a claim
+CAS, observing a concurrent free during a claim retry, draining a candidate word,
+finding all sampled words empty, overlapping fresh-slot issuance, losing a refill
+schedule CAS, observing a refill already in progress, losing the refill-claim CAS,
+and publishing refill slots. Counters add no cross-thread synchronization and are
+compiled out of non-test builds.
 
-Counting completed records from the existing histories after each trial (no new
-worker-loop instrumentation), 1,000 trials per layout and build profile measured:
-
-| Build | Links | Mean operations/trial | Trial operation range | Mean operations/worker | Mean elapsed/trial |
-|---|---|---:|---:|---:|---:|
-| Debug | External | 5,644.7 | 4,659–7,066 | 705.6 | 3.326 ms |
-| Debug | Inline | 5,700.6 | 4,885–6,971 | 712.6 | 3.329 ms |
-| Release | External | 8,672.8 | 7,372–9,430 | 1,084.1 | 3.273 ms |
-| Release | Inline | 7,651.0 | 6,642–8,951 | 956.4 | 3.281 ms |
-
-Counts include failed allocation attempts and cleanup returns, across eight
-workers per trial; elapsed time includes setup and auditing. None of the 32,000
-worker loops reached even 4,080 records, so the time limit, not the history limit,
-stopped these trials. All twelve coverage flags appeared in every trial. The
-3 ms worker interval divided by mean operations per worker is approximately
-2.77 microseconds for external links and 3.14 for inline links in release mode;
-these are approximate concurrent per-worker costs, not single-thread latency.
-The ignored `validate_` tests now print these operation counts and ranges.
-
-The flags cover recycled allocation, fresh allocation, exhaustion, return to empty
-and nonempty deleted lists, recycling an empty deleted list, splicing onto empty
-and nonempty free lists, retries of each of the three head CAS operations, and an
-unavailable inactive-list write lock. Invariants do not need flags: no simultaneous
-owners, no change to an allocated atomic field, aligned/index-consistent addresses,
-and, after all returns, every issued index appears exactly once across the three
-lists, with no cycles, invalid indexes, lost blocks, or incorrect deleted-list tails.
-
-Each top-level test stops once all flags are observed, with at most forty 3 ms
-trials (120 ms of work plus setup and teardown). A separate one-second cooperative
-watchdog bounds retry-loop failures; it does not shorten the forty trials to absorb
-normal setup overhead. Test-only cancellation checks in
-the pool's retry loops prevent an algorithmic spin from hanging the test; a
-cancelled pool is failed and discarded. OS scheduling, thread teardown and printing
-failure histories can extend wall-clock time beyond the deadline. Probes, bounds
-checks and cancellation are all compiled out of non-test pool code.
-
-The ignored `calibrate_external_links` and `calibrate_inline_links` tests count
-all event hits with per-thread counters for one second, three times. Dividing
-elapsed time by the rarest count estimates its mean interval; under an independent
-arrival model, multiplying that interval by ln(2) estimates the half-hit time.
-The initial debug-build measurements found 511–600 rare hits/second externally
-and 386–426 inline: estimated half-hit times no greater than 1.8 ms. Bob chose one
-3 ms loop per trial; the repetition count supplies the confidence rather than
-padding each trial. These measurements are about coverage reachability, not
-production pool throughput.
-
-The ignored `validate_external_windows` and `validate_inline_windows` tests each
-check 1000 single-loop trials without early success and report every flag's frequency.
-Hits after a trial's 3 ms deadline do not count. Run rate measurement with
-`cargo test -p delawson-common --features testing pool::concurrency::calibrate_
--- --ignored --nocapture --test-threads=1`; replace `calibrate_` with `validate_`
-for the window-frequency check. `POOL_CALIBRATION_WINDOWS` can shorten validation.
-The per-case miss bound of 2^-40 assumes a conditional hit probability of at least
-one half in every trial. Measured frequencies support that assumption for the
-tested workload and machine, not all hardware or scheduling. For twelve cases
-the union bound on missing any case is twelve times 2^-40. Coverage is explicit,
-so missing a case fails the test.
-
-Validation of single 3 ms loops hit the least frequent external-link case in
-856/1000 trials; the least frequent inline-link case hit in 999/1000 trials. Deliberately
-dropping the existing free chain during a splice made the test fail its lost-block
-audit and print history. Deliberately holding the current list's write lock made
-it fail at the watchdog deadline. Both injected faults were removed before the
-final tests.
+The test calibrates for five seconds, estimating each condition's per-trial hit
+rate `p`. It then chooses the smallest trial count `t` for which
+`sum((1 - p)^t)` across all nine conditions is at most `2^-40`; this union bound
+accounts for the chance of missing any condition, not just the rarest one. It runs
+that many fresh validation trials and fails unless every calibrated condition was
+seen. The bound is based on measured rates for this machine and workload; it is a
+coverage target, not a formal guarantee about other hardware or schedules.
 
 #### 8.1.5.3 When transactions arrive, the EN's part of them lives in the journal
 
