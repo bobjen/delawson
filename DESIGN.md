@@ -8504,26 +8504,27 @@ the pool after destruction check duplicate and lost blocks.
 
 The bitmap-pool concurrency test follows Bob's
 [coverage-flags pattern](https://burtleburtle.net/bob/testing/concurrencyflags.html).
-Eight workers each run a 3 ms random alloc/return trial against a fresh pool
-configured with 64 initial and 256 maximum slots. A payload owner field detects
-simultaneous handout or an unexpected owner on return. After each trial, every
-issued slot must be free and have no remaining owner. Operation choices use
-independent seeded RNGs; OS thread scheduling is not replayed.
+Eight long-lived workers each run 3 ms random alloc/return trials against a fresh
+pool configured with 64 initial and 256 maximum slots. They use their normal
+thread-local RNG state across trials; OS thread scheduling is not replayed. A
+payload owner field detects simultaneous handout or an unexpected owner on return.
+After each trial, every issued slot must be free and have no remaining owner.
 
-Test-only, thread-local counters record nine bitmap conditions: losing a claim
+Test-only, thread-local bit flags record nine bitmap conditions: losing a claim
 CAS, observing a concurrent free during a claim retry, draining a candidate word,
 finding all sampled words empty, overlapping fresh-slot issuance, losing a refill
 schedule CAS, observing a refill already in progress, losing the refill-claim CAS,
-and publishing refill slots. Counters add no cross-thread synchronization and are
-compiled out of non-test builds.
+and publishing refill slots. Each worker sets a condition bit only once per trial;
+the workers' masks are ORed at trial end and checked against the all-conditions
+mask. This adds no shared synchronization and is compiled out of non-test builds.
 
-The test calibrates for five seconds, estimating each condition's per-trial hit
-rate `p`. It then chooses the smallest trial count `t` for which
-`sum((1 - p)^t)` across all nine conditions is at most `2^-40`; this union bound
-accounts for the chance of missing any condition, not just the rarest one. It runs
-that many fresh validation trials and fails unless every calibrated condition was
-seen. The bound is based on measured rates for this machine and workload; it is a
-coverage target, not a formal guarantee about other hardware or schedules.
+The normal test runs at most 2,048 trials and exits as soon as every condition has
+been seen. The cap is about twice the largest suggested cap from manual calibration
+runs, which estimated the trial count needed to keep the union-bound miss estimate
+below `2^-40`. An ignored `calibrate_races` test measures per-trial hit rates for
+five seconds and prints a suggested cap; run it manually if the workload or race
+conditions change. These estimates describe this workload and machine, not a
+formal guarantee about other schedules or hardware.
 
 #### 8.1.5.3 When transactions arrive, the EN's part of them lives in the journal
 

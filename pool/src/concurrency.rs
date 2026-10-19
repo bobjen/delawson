@@ -1,10 +1,9 @@
-//! Calibrated contention coverage for the bitmap pool.
+//! Contention coverage for the bitmap pool.
 //!
 //! This follows the coverage-driven method described at
-//! https://burtleburtle.net/bob/testing/concurrencyflags.html: measure each
-//! condition's chance of appearing in one independent trial, then run enough
-//! fresh trials that the union-bound chance of missing any condition is at
-//! most 2^-40.
+//! https://burtleburtle.net/bob/testing/concurrencyflags.html. The normal test
+//! uses a calibrated trial cap and exits early once every condition is hit. Run
+//! the ignored calibration test manually when the workload or conditions change.
 
 use super::bitmap::{Race, clear_hits, take_hits};
 use super::{Block, Pool, PoolItem};
@@ -23,6 +22,9 @@ const RANDOM_PROBES: usize = 16;
 const TRIAL_TIME: Duration = Duration::from_millis(3);
 const CALIB_TIME: Duration = Duration::from_secs(5);
 const FAILURE_TARGET: f64 = 1.0 / ((1u64 << 40) as f64);
+// Manual calibrations have needed at most 1,041 trials for the 2^-40 target.
+// Keep about 2x headroom; the normal test exits as soon as all flags are set.
+const MAX_TRIALS: usize = 2048;
 const CASES: usize = Race::ALL.len();
 const ALL_FLAGS: u64 = (1u64 << CASES) - 1;
 type Hits = u64;
@@ -143,8 +145,8 @@ impl Harness {
             let start = Arc::clone(&start);
             let ready = Arc::clone(&ready);
             joins.push(std::thread::spawn(move || {
-                // Initialize the regular per-thread RNG before calibration;
-                // it remains attached to this worker for every trial.
+                // Initialize the regular per-thread RNG once; it remains
+                // attached to this worker for every trial.
                 let _ = random::thread_u64();
                 ready.wait();
                 while let Ok(cmd) = cmd_rx.recv() {
@@ -238,7 +240,8 @@ fn need_trials(rates: &[f64]) -> usize {
 }
 
 #[test]
-fn bitmap_races() {
+#[ignore = "manual calibration; run when race conditions or workload change"]
+fn calibrate_races() {
     let harness = Harness::new();
     let cal_start = Instant::now();
     let mut cal_trials = 0usize;
@@ -266,22 +269,9 @@ fn bitmap_races() {
         })
         .collect();
     let required = need_trials(&rates);
-    let mut covered = 0u64;
-    let valid_start = Instant::now();
-    let mut valid_trials = 0usize;
-    for _ in 0..required {
-        let hits = harness.run_trial();
-        valid_trials += 1;
-        covered |= hits;
-        if covered == ALL_FLAGS {
-            break;
-        }
-    }
-
     println!(
-        "bitmap race calibration: {cal_trials} trials in {:.2}s; validation: {valid_trials}/{required} trials in {:.2}s; estimated miss probability <= {:.3e}",
+        "bitmap race calibration: {cal_trials} trials in {:.2}s; suggested validation cap: {required}; estimated miss probability <= {:.3e}",
         cal_time.as_secs_f64(),
-        valid_start.elapsed().as_secs_f64(),
         miss_bound(required, &rates),
     );
     for (at, race) in Race::ALL.iter().enumerate() {
@@ -291,8 +281,31 @@ fn bitmap_races() {
             cond_trials[at],
             cal_trials,
             rates[at],
-            if covered & (1u64 << at) != 0 { "hit" } else { "MISSED" },
+            if cond_trials[at] != 0 { "hit" } else { "MISSED" },
         );
     }
-    assert_eq!(covered, ALL_FLAGS, "validation missed a calibrated bitmap condition");
+}
+
+#[test]
+fn bitmap_races() {
+    let harness = Harness::new();
+    let start = Instant::now();
+    let mut covered = 0u64;
+    for trial in 1..=MAX_TRIALS {
+        covered |= harness.run_trial();
+        if covered == ALL_FLAGS {
+            println!(
+                "bitmap races: all conditions hit in {trial} trials ({:.2}s)",
+                start.elapsed().as_secs_f64()
+            );
+            return;
+        }
+    }
+
+    let missing: Vec<_> = Race::ALL
+        .iter()
+        .enumerate()
+        .filter_map(|(at, race)| (covered & (1u64 << at) == 0).then_some(race.name()))
+        .collect();
+    panic!("bitmap races missed {missing:?} after {MAX_TRIALS} trials");
 }
