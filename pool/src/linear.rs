@@ -6,6 +6,7 @@
 //! as it grows. Items and their chain links remain owned by the caller.
 use super::{Block, CHUNK_BYTES, ChunkPool, LockedItem, LockedPool, Mapping};
 use crate::{Error, Result};
+use std::cmp::Ordering;
 use std::ops::Index;
 use std::ptr::NonNull;
 
@@ -188,8 +189,8 @@ fn batch_cap(buckets: u64) -> u64 {
     buckets.div_ceil(BUCKET_GROUP).saturating_mul(BUCKET_GROUP)
 }
 
-/// Bucket directory used internally by `LinearPool`.
-struct LinearHash<'a> {
+/// Bucket directory used internally by `LinearHash`.
+struct HashDir<'a> {
     heads: VirtualHeads<'a>,
     buckets: u64,
     level: u32,
@@ -198,7 +199,7 @@ struct LinearHash<'a> {
     initial_buckets: u64,
 }
 
-impl<'a> LinearHash<'a> {
+impl<'a> HashDir<'a> {
     fn with_buckets(pool: &'a ChunkPool, max_buckets: u64, initial_buckets: u64) -> Result<Self> {
         let max_buckets = max_buckets.max(BUCKET_GROUP);
         let initial_buckets = batch_cap(initial_buckets.max(BUCKET_GROUP));
@@ -295,17 +296,18 @@ impl<'a> LinearHash<'a> {
             (old_split - 1, old_split - BUCKET_GROUP)
         };
         for offset in 0..BUCKET_GROUP {
-            let partner = base - offset;
             let removed = old_buckets - 1 - offset;
-            let partner_head = self.head(partner);
             let removed_head = self.head(removed);
+            if removed_head == u32::MAX {
+                continue;
+            }
+            let partner = base - offset;
+            let partner_head = self.head(partner);
             let head = merge_chain(partner, removed, partner_head, removed_head);
             if head != partner_head {
                 self.set_head(partner, head);
             }
-            if removed_head != u32::MAX {
-                self.set_head(removed, u32::MAX);
-            }
+            self.set_head(removed, u32::MAX);
         }
 
         self.buckets = old_buckets - BUCKET_GROUP;
@@ -327,7 +329,7 @@ impl<'a> LinearHash<'a> {
     }
 }
 
-/// Behavior `LinearPool` needs from its fixed-size entries.
+/// Behavior `LinearHash` needs from its fixed-size entries.
 pub trait LinearEntry: LockedItem {
     type Key: Copy + Ord;
 
@@ -356,25 +358,25 @@ pub trait LinearEntry: LockedItem {
 /// All methods that mutate the pool or table require exclusive access. Callers
 /// protect shared reads and mutations with their service-wide lock. Adds grow
 /// the directory as needed; removes shrink it above two buckets per live item.
-pub struct LinearPool<'a, T: LinearEntry, const ALIGN: usize, const LINK: usize> {
+pub struct LinearHash<'a, T: LinearEntry, const ALIGN: usize, const LINK: usize> {
     slots: LockedPool<T, ALIGN, LINK>,
     base: NonNull<T>,
-    hash: LinearHash<'a>,
+    hash: HashDir<'a>,
     len: u64,
     max_items: u32,
 }
 
 // SAFETY: slots are stable and all access is serialized by the caller's lock.
 unsafe impl<T: LinearEntry + Send, const A: usize, const L: usize> Send
-    for LinearPool<'_, T, A, L>
+    for LinearHash<'_, T, A, L>
 {
 }
 unsafe impl<T: LinearEntry + Send + Sync, const A: usize, const L: usize> Sync
-    for LinearPool<'_, T, A, L>
+    for LinearHash<'_, T, A, L>
 {
 }
 
-impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L> {
+impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearHash<'a, T, A, L> {
     /// Create a pool that can hold max_items entries, initially using 256 buckets.
     pub fn new(chunks: &'a ChunkPool, max_items: u32) -> Result<Self> {
         Self::with_buckets(chunks, max_items, 0)
@@ -386,10 +388,10 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L>
         max_items: u32,
         initial_buckets: u32,
     ) -> Result<Self> {
-        assert_eq!(T::LINK_NONE, u32::MAX, "LinearPool needs LINK_NONE = u32::MAX");
+        assert_eq!(T::LINK_NONE, u32::MAX, "LinearHash needs LINK_NONE = u32::MAX");
         let max_items = max_items.max(1);
         let max_buckets = batch_cap(u64::from(max_items)).max(BUCKET_GROUP);
-        let hash = LinearHash::with_buckets(chunks, max_buckets, u64::from(initial_buckets))?;
+        let hash = HashDir::with_buckets(chunks, max_buckets, u64::from(initial_buckets))?;
         let slots = LockedPool::new(max_items, 0)?;
         let base = slots.base_ptr();
         Ok(Self { slots, base, hash, len: 0, max_items })
@@ -413,45 +415,55 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L>
         unsafe { &mut *self.base.as_ptr().add(index as usize) }
     }
 
-    fn seek_link(&mut self, key: &T::Key, bucket: u64) -> Result<(*mut u32, u32)> {
+    fn seek_link(
+        &mut self,
+        key: &T::Key,
+        bucket: u64,
+    ) -> Result<(*mut u32, u32, Option<Ordering>)> {
         let mut link = self.hash.head_ptr(bucket);
         loop {
             // SAFETY: `link` points to a bucket head or a live entry link.
             let index = unsafe { *link };
             if index == T::LINK_NONE {
-                return Ok((link, index));
+                return Ok((link, index, None));
             }
             // SAFETY: linked indexes name initialized, live slots.
             let item = unsafe { self.base.as_ptr().add(index as usize) };
             // SAFETY: the entry is live and exclusively protected by the caller.
             let found = unsafe { (*item).key() };
-            if found >= *key {
-                return Ok((link, index));
+            let ordering = found.cmp(key);
+            if ordering != Ordering::Less {
+                return Ok((link, index, Some(ordering)));
             }
             // SAFETY: this live entry exposes its mutable link field.
             link = unsafe { (*item).next_ptr() };
         }
     }
 
-    fn seek(&self, key: &T::Key, hash: u64) -> (u64, u32, u32) {
+    fn seek(&self, key: &T::Key, hash: u64) -> (u64, u32, u32, Option<Ordering>) {
         let bucket = self.hash.bucket(hash);
         let mut previous = T::LINK_NONE;
         let mut index = self.hash.head(bucket);
-        while index != T::LINK_NONE && self.slot(index).key() < *key {
+        while index != T::LINK_NONE {
+            let item = self.slot(index);
+            let ordering = item.key().cmp(key);
+            if ordering != Ordering::Less {
+                return (bucket, previous, index, Some(ordering));
+            }
             previous = index;
-            index = self.slot(index).next();
+            index = item.next();
         }
-        (bucket, previous, index)
+        (bucket, previous, index, None)
     }
 
     pub fn get(&self, key: &T::Key) -> Option<&T> {
-        let (_, _, index) = self.seek(key, T::hash(key));
-        (index != T::LINK_NONE && self.slot(index).key() == *key).then(|| self.slot(index))
+        let (_, _, index, ordering) = self.seek(key, T::hash(key));
+        (ordering == Some(Ordering::Equal)).then(|| self.slot(index))
     }
 
     pub fn get_mut(&mut self, key: &T::Key) -> Option<&mut T> {
-        let (_, _, index) = self.seek(key, T::hash(key));
-        if index == T::LINK_NONE || self.slot(index).key() != *key {
+        let (_, _, index, ordering) = self.seek(key, T::hash(key));
+        if ordering != Some(Ordering::Equal) {
             return None;
         }
         Some(self.slot_mut(index))
@@ -471,8 +483,8 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L>
     ) -> Result<(&mut T, bool)> {
         let hash = T::hash(&key);
         let bucket = self.hash.bucket(hash);
-        let (link, next) = self.seek_link(&key, bucket)?;
-        if next != T::LINK_NONE && self.slot(next).key() == key {
+        let (link, next, ordering) = self.seek_link(&key, bucket)?;
+        if ordering == Some(Ordering::Equal) {
             return Ok((self.slot_mut(next), false));
         }
 
@@ -496,7 +508,7 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L>
             // Split after linking so the new item is repartitioned with its
             // original chain. A failed append leaves the old table intact.
             if let Err(error) = self.grow() {
-                let (rollback, found) =
+                let (rollback, found, _) =
                     self.seek_link(&key, bucket).expect("rollback bucket remains in range");
                 debug_assert_eq!(found, index);
                 // SAFETY: rollback points at this entry in its current chain.
@@ -512,8 +524,8 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L>
     }
 
     pub fn remove(&mut self, key: &T::Key) -> bool {
-        let (bucket, previous, index) = self.seek(key, T::hash(key));
-        if index == T::LINK_NONE || self.slot(index).key() != *key {
+        let (bucket, previous, index, ordering) = self.seek(key, T::hash(key));
+        if ordering != Some(Ordering::Equal) {
             return false;
         }
         let next = self.slot(index).next();
@@ -566,7 +578,7 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearPool<'a, T, A, L>
     }
 }
 
-impl<T: LinearEntry, const A: usize, const L: usize> Drop for LinearPool<'_, T, A, L> {
+impl<T: LinearEntry, const A: usize, const L: usize> Drop for LinearHash<'_, T, A, L> {
     fn drop(&mut self) {
         for index in 0..self.slots.issued_blocks() {
             // PoolItem::init initialized each issued slot, including retired slots.
@@ -575,7 +587,7 @@ impl<T: LinearEntry, const A: usize, const L: usize> Drop for LinearPool<'_, T, 
     }
 }
 
-impl<T: LinearEntry, const A: usize, const L: usize> Index<&T::Key> for LinearPool<'_, T, A, L> {
+impl<T: LinearEntry, const A: usize, const L: usize> Index<&T::Key> for LinearHash<'_, T, A, L> {
     type Output = T;
 
     fn index(&self, key: &T::Key) -> &Self::Output {
@@ -696,7 +708,7 @@ mod tests {
     fn grow_shrink() {
         let pool = ChunkPool::new(8, 1).unwrap();
         let group = BUCKET_GROUP;
-        let mut hash = LinearHash::with_buckets(&pool, group * 4, 0).unwrap();
+        let mut hash = HashDir::with_buckets(&pool, group * 4, 0).unwrap();
         assert_eq!(hash.bucket_count(), group);
 
         // Keys initially map across the minimum bucket group.
@@ -724,7 +736,7 @@ mod tests {
     #[test]
     fn capacity_reset() {
         let pool = ChunkPool::new(8, 1).unwrap();
-        let mut hash = LinearHash::with_buckets(&pool, BUCKET_GROUP * 5, BUCKET_GROUP * 4).unwrap();
+        let mut hash = HashDir::with_buckets(&pool, BUCKET_GROUP * 5, BUCKET_GROUP * 4).unwrap();
         assert_eq!(hash.bucket_count(), BUCKET_GROUP * 4);
         hash.grow_batch(|_, _, _, _| {}).unwrap();
         assert_eq!(hash.bucket_count(), BUCKET_GROUP * 5);
@@ -738,7 +750,7 @@ mod tests {
     fn head_reuse() {
         let pool = ChunkPool::new(4, 1).unwrap();
         let max = HEADS_PER_BLOCK + BUCKET_GROUP;
-        let mut hash = LinearHash::with_buckets(&pool, max, HEADS_PER_BLOCK).unwrap();
+        let mut hash = HashDir::with_buckets(&pool, max, HEADS_PER_BLOCK).unwrap();
         assert_eq!(hash.head_capacity(), HEADS_PER_BLOCK);
         assert_eq!(hash.head(HEADS_PER_BLOCK - 1), u32::MAX);
 
@@ -911,7 +923,7 @@ mod tests {
         const TRIALS: usize = 10_000;
         let group = BUCKET_GROUP;
         let pool = ChunkPool::new(8, 1).unwrap();
-        let mut hash = LinearHash::with_buckets(&pool, group * 2, group).unwrap();
+        let mut hash = HashDir::with_buckets(&pool, group * 2, group).unwrap();
         let mut entries = (0..group as u32)
             .map(|bucket| {
                 let key = if bucket & 1 == 0 { bucket + group as u32 } else { bucket };
@@ -949,12 +961,12 @@ mod tests {
         );
     }
 
-    fn add(table: &mut LinearPool<'_, Entry, 4, 0>, key: u32, value: Entry) {
+    fn add(table: &mut LinearHash<'_, Entry, 4, 0>, key: u32, value: Entry) {
         let (_, inserted) = table.find_or_create(key, |_| value).unwrap();
         assert!(inserted);
     }
 
-    fn assert_sorted(table: &LinearPool<'_, Entry, 4, 0>) {
+    fn assert_sorted(table: &LinearHash<'_, Entry, 4, 0>) {
         for bucket in 0..table.hash.bucket_count() {
             let mut previous = None;
             let mut index = table.hash.head(bucket);
@@ -972,7 +984,7 @@ mod tests {
         let chunks = ChunkPool::new(8, 1).unwrap();
         let count = (BUCKET_GROUP * 2 + 1) as u32;
         let stride = BUCKET_GROUP as u32;
-        let mut table = LinearPool::<Entry, 4, 0>::new(&chunks, count).unwrap();
+        let mut table = LinearHash::<Entry, 4, 0>::new(&chunks, count).unwrap();
         for key in (0..count).map(|n| n * stride + 7).rev() {
             add(&mut table, key, entry(key));
             assert_sorted(&table);
@@ -1004,7 +1016,7 @@ mod tests {
     fn capacity_is_exact() {
         let chunks = ChunkPool::new(8, 1).unwrap();
         let max_items = (BUCKET_GROUP * 4 + 1) as u32;
-        let mut table = LinearPool::<Entry, 4, 0>::new(&chunks, max_items).unwrap();
+        let mut table = LinearHash::<Entry, 4, 0>::new(&chunks, max_items).unwrap();
         assert_eq!(table.hash.bucket_count(), BUCKET_GROUP);
         for key in 0..max_items {
             add(&mut table, key, entry(key));
@@ -1021,7 +1033,7 @@ mod tests {
         let initial_buckets = HEADS_PER_BLOCK as u32;
         let full_len = initial_buckets * 2;
         let mut table =
-            LinearPool::<Entry, 4, 0>::with_buckets(&chunks, full_len + 1, initial_buckets)
+            LinearHash::<Entry, 4, 0>::with_buckets(&chunks, full_len + 1, initial_buckets)
                 .unwrap();
         for key in 0..full_len {
             add(&mut table, key, entry(key));
@@ -1038,7 +1050,7 @@ mod tests {
     #[test]
     fn find_or_create_keeps_the_existing_entry() {
         let chunks = ChunkPool::new(8, 1).unwrap();
-        let mut table = LinearPool::<Entry, 4, 0>::new(&chunks, 8).unwrap();
+        let mut table = LinearHash::<Entry, 4, 0>::new(&chunks, 8).unwrap();
         let (first, inserted) = table.find_or_create(7, entry).unwrap();
         assert!(inserted);
         first.valid = false;
@@ -1055,7 +1067,7 @@ mod tests {
         let chunks = ChunkPool::new(8, 1).unwrap();
         let group = BUCKET_GROUP as u32;
         let count = group * 2 + 1;
-        let mut table = LinearPool::<Entry, 4, 0>::new(&chunks, count).unwrap();
+        let mut table = LinearHash::<Entry, 4, 0>::new(&chunks, count).unwrap();
         for key in 0..count {
             add(&mut table, key, entry(key));
         }
@@ -1082,7 +1094,7 @@ mod tests {
         let chunks = ChunkPool::new(8, 1).unwrap();
         let initial_items = BUCKET_GROUP * 6;
         let initial_buckets = batch_cap(initial_items + BUCKET_GROUP / 2);
-        let mut table = LinearPool::<Entry, 4, 0>::with_buckets(
+        let mut table = LinearHash::<Entry, 4, 0>::with_buckets(
             &chunks,
             initial_buckets as u32,
             (initial_items + BUCKET_GROUP / 2) as u32,

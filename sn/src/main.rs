@@ -183,7 +183,7 @@ impl Stream {
 }
 
 const MAX_STREAMS: u32 = u32::MAX;
-type StreamTable = pool::LinearPool<
+type StreamTable = pool::LinearHash<
     'static,
     Stream,
     { align_of::<Stream>() },
