@@ -1327,7 +1327,7 @@ impl DN {
         if let Some((left, right, extents, logical, compressed)) = optimized {
             let sn = format!("SN{}", left.sn);
             let sn_number = left.sn;
-            let stream = match self.reserve_streams(1) {
+            let stream = match self.reserve_stream() {
                 Ok(id) => id,
                 Err(e) => return reply.send(Resp::error(Status::Internal, e.to_string())),
             };
@@ -1403,7 +1403,7 @@ impl DN {
         };
         let sn_number =
             SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
-        let stream = match self.reserve_streams(1) {
+        let stream = match self.reserve_stream() {
             Ok(id) => id,
             Err(e) => return reply.send(Resp::error(Status::Internal, e.to_string())),
         };
@@ -1432,12 +1432,8 @@ impl DN {
             shard.insert(destination.clone().into_boxed_str(), object);
         }
 
-        let mut create = StructWriter::new();
-        create.number_u64(self.mine.get());
-        create.number_u32(stream.get());
-        create.number_u64(1);
-        create.number_u64(created.number());
-        let ask = Req::new(Op::CreateStream).structure(create);
+        let stream_name = StreamName { range: self.mine, stream, created };
+        let ask = create_streams(std::slice::from_ref(&stream_name));
         let dn = Arc::clone(self);
         let named = sn.clone();
         let destination_name = destination.clone();
@@ -1690,12 +1686,12 @@ impl DN {
             return reply.send(say(self, 0));
         }
 
-        // The first name as well as the range: the name matches this line with
-        // FE's, the range matches it with the SN's.
+        // Keep one reserved stream identity for each object name. Stream IDs may
+        // eventually be recycled, so a batch is an explicit list, never a range.
         let named_first = mine[0].clone();
         let count = mine.len() as u64;
-        let first = match self.reserve_streams(mine.len()) {
-            Ok(id) => id.number(),
+        let streams = match self.reserve_streams(mine.len()) {
+            Ok(ids) => ids,
             Err(e) => {
                 let failed = self.give_back(&mine, Status::Internal, e.to_string());
                 self.wake(&mine, Some(&failed));
@@ -1710,12 +1706,11 @@ impl DN {
                 return reply.send(failed);
             }
         };
-        let mut payload = StructWriter::new();
-        payload.number_u64(self.mine.get());
-        payload.number_u32(first as u32);
-        payload.number_u64(count);
-        payload.number_u64(created.number());
-        let ask = Req::new(Op::CreateStream).structure(payload);
+        let names: Vec<StreamName> = streams
+            .iter()
+            .map(|stream| StreamName { range: self.mine, stream: *stream, created })
+            .collect();
+        let ask = create_streams(&names);
 
         let dn = Arc::clone(self);
         let sn_number =
@@ -1729,23 +1724,16 @@ impl DN {
                 dn.wake(&mine, Some(&failed));
                 return reply.send(failed);
             }
-            for (n, name) in mine.iter().enumerate() {
+            for (name, stream) in mine.iter().zip(streams) {
                 let mut shard = dn.shards[shard_of(name)].lock().expect("objects");
                 if let Some(object) = shard.get_mut(name.as_str()) {
                     let made = object.created;
-                    object.streams.push(dn.install_stream(Stream::new(
-                        StreamId::new((first + n as u64) as u32),
-                        sn_number,
-                        made,
-                    )));
+                    object.streams.push(dn.install_stream(Stream::new(stream, sn_number, made)));
                 }
             }
             dn.objects.fetch_add(count, Ordering::Relaxed);
             dn.wake(&mine, None);
-            // The stream range is how this request is matched with the SN's line
-            // for it: SN does not know names, and should not.
-            reply
-                .about(format_args!("{named_first} count {count} streams from {first} on {named}"));
+            reply.about(format_args!("{named_first} count {count} streams on {named}"));
             reply.send(say(&dn, count));
         });
         if let Err(e) = asked {
@@ -1843,8 +1831,8 @@ impl DN {
         mut reply: Reply,
     ) {
         let created = TimeSec::now();
-        let stream = match self.reserve_streams(1) {
-            Ok(id) => id.number(),
+        let stream = match self.reserve_stream() {
+            Ok(id) => id,
             Err(e) => return reply.send(self.gave_up(&name, Status::Internal, e.to_string())),
         };
         let sn = match process.pick(ServiceKind::Sn) {
@@ -1853,12 +1841,8 @@ impl DN {
         };
         let sn_number =
             SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
-        let mut payload = StructWriter::new();
-        payload.number_u64(self.mine.get());
-        payload.number_u32(stream as u32);
-        payload.number_u64(1);
-        payload.number_u64(created.number());
-        let ask = Req::new(Op::CreateStream).structure(payload);
+        let stream_name = StreamName { range: self.mine, stream, created };
+        let ask = create_streams(std::slice::from_ref(&stream_name));
 
         let dn = Arc::clone(self);
         let named = sn.clone();
@@ -1874,11 +1858,7 @@ impl DN {
             {
                 let mut shard = dn.shards[shard_of(&name)].lock().expect("objects");
                 if let Some(object) = shard.get_mut(name.as_str()) {
-                    object.streams.push(dn.install_stream(Stream::new(
-                        StreamId::new(stream as u32),
-                        sn_number,
-                        created,
-                    )));
+                    object.streams.push(dn.install_stream(Stream::new(stream, sn_number, created)));
                     object.extending = false;
                 }
             }
@@ -2385,7 +2365,14 @@ impl DN {
 }
 
 impl DN {
-    fn reserve_streams(&self, count: usize) -> common::Result<StreamId> {
+    fn reserve_stream(&self) -> common::Result<StreamId> {
+        self.reserve_streams(1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| common::Error::new("no stream was reserved"))
+    }
+
+    fn reserve_streams(&self, count: usize) -> common::Result<Vec<StreamId>> {
         let mut table = self.stream_table.write().expect("streams");
         let first = table.len();
         let end = first
@@ -2393,12 +2380,15 @@ impl DN {
             .filter(|end| *end as u64 <= StreamId::NONE.number())
             .ok_or_else(|| common::Error::new("stream table is full"))?;
         table.try_reserve(count).map_err(|e| common::Error::new(e.to_string()))?;
+        let mut ids = Vec::new();
+        ids.try_reserve(count).map_err(|e| common::Error::new(e.to_string()))?;
         for n in first..end {
             let mut stream = Stream::new(StreamId::new(n as u32), SnId::NONE, TimeSec::EPOCH);
             stream.deletion = Flags::vacant();
             table.push(stream);
+            ids.push(StreamId::new(n as u32));
         }
-        Ok(StreamId::new(first as u32))
+        Ok(ids)
     }
 
     fn install_stream(&self, stream: Stream) -> StreamId {
@@ -2568,6 +2558,17 @@ struct Piece {
 }
 
 /// Decode the rollover request using the same ID and record widths as its writer.
+fn create_streams(names: &[StreamName]) -> Req {
+    let mut payload = StructWriter::new();
+    payload.number_u64(names.len() as u64);
+    for name in names {
+        payload.range_id(name.range);
+        payload.stream_id(name.stream);
+        payload.time_sec(name.created);
+    }
+    Req::new(Op::CreateStream).structure(payload)
+}
+
 fn extension(request: &Req) -> common::Result<(String, StreamId, SRoff)> {
     let (mut payload, rest) =
         structure(&request.args(), Op::ExtendObject, "an extend-object request")?;
@@ -2761,7 +2762,7 @@ mod tests {
     #[test]
     fn shared_stream_metadata_and_reference_rollback() {
         let dn = DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST);
-        let id = dn.reserve_streams(1).unwrap();
+        let id = dn.reserve_stream().unwrap();
         assert_eq!(id, StreamId::FIRST);
         dn.install_stream(held(id.get(), 0, Some(12)));
         dn.retain_streams(&[id, id]).unwrap();
@@ -3774,5 +3775,35 @@ mod tests {
         let (mut reader, rest) = structure(&request.args(), Op::CreateObject, "a create").unwrap();
         assert!(rest.is_empty());
         assert!(Wanted::read(&mut reader).is_err());
+    }
+
+    #[test]
+    fn stream_create_request_lists_full_nonconsecutive_names() {
+        let names = [
+            StreamName {
+                range: RangeId::new(7),
+                stream: StreamId::new(2),
+                created: TimeSec::new(11),
+            },
+            StreamName {
+                range: RangeId::new(7),
+                stream: StreamId::new(19),
+                created: TimeSec::new(11),
+            },
+        ];
+        let request = create_streams(&names);
+        let (mut payload, rest) =
+            structure(&request.args(), Op::CreateStream, "stream names").unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(payload.number_u64().unwrap(), 2);
+        let got = (0..2)
+            .map(|_| StreamName {
+                range: payload.range_id().unwrap(),
+                stream: payload.stream_id().unwrap(),
+                created: payload.time_sec().unwrap(),
+            })
+            .collect::<Vec<_>>();
+        payload.done().unwrap();
+        assert_eq!(got, names);
     }
 }

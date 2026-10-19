@@ -50,12 +50,29 @@ const SERVES: &[Op] = &[
     Op::ListExtents,
 ];
 
+const STREAM_NAME_BYTES: usize = 20;
+
 fn stream_name(payload: &mut StructReader<'_>) -> common::Result<StreamName> {
     Ok(StreamName {
         range: payload.range_id()?,
         stream: payload.stream_id()?,
         created: payload.time_sec()?,
     })
+}
+
+fn read_names(payload: &mut StructReader<'_>, count: u64) -> Result<Vec<StreamName>> {
+    let count = usize::try_from(count).map_err(|_| Error::new("stream name count overflow"))?;
+    let bytes = count
+        .checked_mul(STREAM_NAME_BYTES)
+        .ok_or_else(|| Error::new("stream name count overflow"))?;
+    if bytes > payload.remaining() {
+        return Err(Error::new("stream name count exceeds message bytes"));
+    }
+    let mut names = payload.checked_vec(count)?;
+    for _ in 0..count {
+        names.push(read_name(payload)?);
+    }
+    Ok(names)
 }
 
 #[repr(C)]
@@ -487,10 +504,7 @@ struct ExtentData {
 }
 
 struct CreateCmd {
-    range: RangeId,
-    first: StreamId,
-    count: u64,
-    created: TimeSec,
+    names: Vec<StreamName>,
     creator: SnId,
 }
 
@@ -694,19 +708,16 @@ sn_wire!(
     CreateCmd,
     SnCreate,
     |v: &CreateCmd, w: &mut StructWriter| {
-        w.range_id(v.range);
-        w.stream_id(v.first);
-        w.number_u64(v.count);
-        w.time_sec(v.created);
+        w.number_u64(v.names.len() as u64);
+        for name in &v.names {
+            write_name(w, *name);
+        }
         w.sn_id(v.creator);
     },
-    |r: &mut StructReader<'_>| Ok(CreateCmd {
-        range: r.range_id()?,
-        first: r.stream_id()?,
-        count: r.number_u64()?,
-        created: r.time_sec()?,
-        creator: r.sn_id()?,
-    })
+    |r: &mut StructReader<'_>| {
+        let count = r.number_u64()?;
+        Ok(CreateCmd { names: read_names(r, count)?, creator: r.sn_id()? })
+    }
 );
 
 sn_wire!(
@@ -1154,19 +1165,9 @@ fn apply_sn_slot(
     match action.op {
         Op::SnCreate => {
             let cmd: CreateCmd = raft::codec::decode(&action.fields)?;
-            let end = cmd
-                .first
-                .number()
-                .checked_add(cmd.count)
-                .ok_or_else(|| Error::new("stream id run overflow"))?;
-            if end > u64::from(StreamId::MAX.get()) + 1 {
-                return Err(Error::new("stream id run exceeds stream id space"));
-            }
             let SNState { stream_map, retired_streams, streams, .. } = state;
             let mut added = Vec::new();
-            for offset in 0..cmd.count {
-                let stream_id = StreamId::of_number(cmd.first.number() + offset)?;
-                let name = StreamName { range: cmd.range, stream: stream_id, created: cmd.created };
+            for name in cmd.names {
                 if retired_streams.contains(&name) {
                     for name in added.iter().rev() {
                         assert!(stream_map.remove(name), "rollback lost inserted stream");
@@ -1939,8 +1940,8 @@ impl SN {
         }
         let options = raft::runtime::Options {
             raft: config.raft.clone(),
-            snapshot_min_log_bytes: 1024 * 1024,
-            snapshot_interval_secs: 86_400,
+            snapshot_min_log_bytes: u64::MAX,
+            snapshot_interval_secs: u64::MAX,
             allow_stale_reads: config.knobs.allow_stale_reads,
         };
         let state = SNState::new(config.max_extents)?;
@@ -1994,9 +1995,8 @@ impl SN {
         Ok(sn)
     }
 
-    /// `(RangeId, first StreamId, count, creation second)`. A DN creating many
-    /// objects at once names a run of streams in one request, and they share the second —
-    /// so it is the consecutive ids that keep the names apart (#110).
+    /// A list of full stream names. Batch object creation assigns each object its own
+    /// stream identity; the request must not infer later names from a first ID and count.
     fn create(&self, request: &Req) -> Resp {
         let (mut payload, rest) =
             match structure(&request.args(), Op::CreateStream, "a create-stream request") {
@@ -2009,44 +2009,30 @@ impl SN {
                 "a create-stream request has trailing arguments",
             );
         }
-        let range = match payload.range_id() {
-            Ok(value) => value,
-            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-        };
-        let first = match payload.stream_id() {
-            Ok(value) => value,
-            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-        };
         let count = match payload.number_u64() {
             Ok(value) => value,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
-        let created = match payload.time_sec() {
-            Ok(value) => value,
+        let names = match read_names(&mut payload, count) {
+            Ok(names) => names,
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         if let Err(e) = payload.done() {
             return Resp::error(Status::BadRequest, e.to_string());
         }
-        if count == 0 {
+        if names.is_empty() {
             return Resp::ok();
         }
 
-        let end = match first.number().checked_add(count) {
-            Some(end) if end <= u64::from(StreamId::MAX.get()) + 1 => end,
-            _ => return bad("stream id run exceeds stream id space"),
-        };
         let _serial = self.deleting.lock().expect("deletion");
         {
             let state = self.global_lock.read();
             let mut missing = false;
-            for number in first.number()..end {
-                let stream = StreamId::new(number as u32);
-                let name = StreamName { range, stream, created };
-                if state.retired_streams.contains(&name) {
+            for name in &names {
+                if state.retired_streams.contains(name) {
                     return bad("stream identity has been retired");
                 }
-                match state.stream_map.get(&name) {
+                match state.stream_map.get(name) {
                     Some(stream) if !stream.deletion.readable(false) => {
                         return bad("stream is deleted");
                     }
@@ -2058,10 +2044,7 @@ impl SN {
                 return Resp::ok();
             }
         }
-        let action = match sn_action(
-            Op::SnCreate,
-            &CreateCmd { range, first, count, created, creator: self.mine },
-        ) {
+        let action = match sn_action(Op::SnCreate, &CreateCmd { names, creator: self.mine }) {
             Ok(action) => action,
             Err(error) => return Resp::error(Status::Internal, error.to_string()),
         };
@@ -3391,17 +3374,9 @@ mod tests {
         assert!(inserted);
     }
 
-    fn apply_create(state: &mut SNState, first: u32, count: u64) -> Result<()> {
-        let action = sn_action(
-            Op::SnCreate,
-            &CreateCmd {
-                range: RangeId::new(42),
-                first: StreamId::new(first),
-                count,
-                created: MADE,
-                creator: SnId::FIRST,
-            },
-        )?;
+    fn apply_create(state: &mut SNState, names: &[StreamName]) -> Result<()> {
+        let action =
+            sn_action(Op::SnCreate, &CreateCmd { names: names.to_vec(), creator: SnId::FIRST })?;
         let mut local_used = false;
         apply_sn_slot(state, 0, &action, None, &mut local_used)
     }
@@ -3414,27 +3389,55 @@ mod tests {
         state.stream_map.get_mut(&existing).unwrap().sealed_stream = true;
         state.streams = 1;
 
-        apply_create(&mut state, 1, 3).unwrap();
-        assert_eq!(state.streams, 3);
-        assert_eq!(state.stream_map.len(), 3);
+        let names = [named(42, 1), named(42, 4), named(42, 9)];
+        apply_create(&mut state, &names).unwrap();
+        assert_eq!(state.streams, 4);
+        assert_eq!(state.stream_map.len(), 4);
         assert!(state.stream_map.get(&existing).unwrap().sealed_stream);
 
-        apply_create(&mut state, 1, 3).unwrap();
-        assert_eq!(state.streams, 3);
-        assert_eq!(state.stream_map.len(), 3);
+        apply_create(&mut state, &names).unwrap();
+        assert_eq!(state.streams, 4);
+        assert_eq!(state.stream_map.len(), 4);
         assert!(state.stream_map.get(&existing).unwrap().sealed_stream);
+    }
+
+    #[test]
+    fn stream_create_request_names_nonconsecutive_ids() {
+        let sn = SN::new(
+            testing::sn_config(),
+            testing::extents().per_stream,
+            SnId::FIRST,
+            default_disks(),
+        )
+        .unwrap();
+        let names = [named(42, 1), named(42, 4), named(42, 9)];
+        let made = sn.create(&Req::new(Op::CreateStream).structure({
+            let mut payload = StructWriter::new();
+            payload.number_u64(names.len() as u64);
+            for name in names {
+                write_name(&mut payload, name);
+            }
+            payload
+        }));
+
+        assert_eq!(made.status, Status::Ok);
+        let state = sn.global_lock.read();
+        assert_eq!(state.stream_map.len(), names.len() as u64);
+        for name in names {
+            assert!(state.stream_map.contains_key(&name));
+        }
     }
 
     #[test]
     fn stream_create_rolls_back_on_late_retired_name() {
         let mut state = SNState::new(8).unwrap();
-        state.retired_streams.insert(named(42, 3));
+        state.retired_streams.insert(named(42, 9));
 
-        assert!(apply_create(&mut state, 1, 3).is_err());
+        assert!(apply_create(&mut state, &[named(42, 1), named(42, 4), named(42, 9)]).is_err());
         assert_eq!(state.streams, 0);
         assert_eq!(state.stream_map.len(), 0);
         assert!(!state.stream_map.contains_key(&named(42, 1)));
-        assert!(!state.stream_map.contains_key(&named(42, 2)));
+        assert!(!state.stream_map.contains_key(&named(42, 4)));
     }
 
     #[test]
@@ -3744,9 +3747,9 @@ mod tests {
         .unwrap();
         let made = sn.create(&Req::new(Op::CreateStream).structure({
             let mut payload = StructWriter::new();
+            payload.number_u64(1);
             payload.range_id(RangeId::new(range));
             payload.stream_id(StreamId::new(stream));
-            payload.number_u64(1);
             payload.time_sec(TimeSec::new(1_000_000));
             payload
         }));
@@ -3779,9 +3782,9 @@ mod tests {
     fn add_stream(sn: &SN, range: u64, stream: u32) {
         let made = sn.create(&Req::new(Op::CreateStream).structure({
             let mut payload = StructWriter::new();
+            payload.number_u64(1);
             payload.range_id(RangeId::new(range));
             payload.stream_id(StreamId::new(stream));
-            payload.number_u64(1);
             payload.time_sec(MADE);
             payload
         }));

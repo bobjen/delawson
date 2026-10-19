@@ -15594,20 +15594,21 @@ bytes of line, which is why §17.5g.1's remaining lever is the length of the hea
 around it. The simpler code stays in both cases.
 
 **So each line carries what the argument is conducted in.** The correlator is not a request id — §17.5d
-says why there cannot be one for every line — it is the name, and where the name stops, the stream
-range:
+says why there cannot be one for every line — it is the name, and where the name stops, the exact
+stream name or names:
 
 ```
-SN  answered, op create-stream status ok    in    10 us  about count 1 from 1 for dn 0
-DN  answered, op create        status ok    in  1750 us  about /bob/notes count 1 streams from 1 on SN0
+SN  answered, op create-stream status ok    in    10 us  about 1 stream name from DN0
+DN  answered, op create        status ok    in  1750 us  about /bob/notes count 1 streams on SN0
 FE  answered, op create        status ok    in  3816 us  about /bob/notes dn DN0
 DN  answered, op object-info   status ok    in    40 us  about /bob/notes
 FE  answered, op object-info   status ok    in   109 us  about /bob/notes dn DN0
 DN  answered, op object-info   status not found in 31 us  about /bob/nothing
 ```
 
-FE to DN is matched by name; DN to SN by the stream range, because SN does not know names and should
-not — it indexes by `(DnId, StreamId)`. Read the pairs: a lookup took 109 µs at FE of which 40 µs was
+FE to DN is matched by object name; DN to SN carries every full stream name it is creating, rather
+than a first ID and count. SN knows stream names, not object paths, and indexes them by
+`(RangeId, StreamId, CreateSec)`. Read the pairs: a lookup took 109 µs at FE of which 40 µs was
 DN, so the hop is 69 µs and neither side was slow. That is the shape of the answer to the question
 this logging exists for.
 

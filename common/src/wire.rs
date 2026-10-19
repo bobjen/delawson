@@ -174,7 +174,7 @@ ops! {
     BatchCreate = 25, "batch-create";
     BatchInfo = 26, "batch-object-info";
 
-    // SN, from a DN: a stream is named by the DN that owns it.
+    // SN, from a DN: an explicit list of full stream names to create.
     CreateStream = 27, "create-stream";
     // And from an FE: the extent a stream is currently appendable at, opened if
     // there is not one already, and which extent holds a given record.
