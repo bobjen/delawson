@@ -254,15 +254,12 @@ struct Object {
     /// Where one record ends and the next begins, declared here and never
     /// changed: everything that reads or writes this object's records needs it.
     framing: Framing,
-    /// The streams this object is made of, in order. Empty while the name is taken
-    /// and the first stream is not named yet, which is what stops two creates of
-    /// one name from making two streams.
+    /// The streams this object is made of, in order. The first stream definition
+    /// is committed with the object; SN creation follows outside the DN Raft action.
     ///
     /// A stream fills, so an object grows more of them; the last is the one appends
     /// go to and the record ranges say which holds what.
     streams: Vec<StreamId>,
-    /// The DN row and stream definition are durable, but the SN has not confirmed it yet.
-    creating: bool,
     /// An extension is being asked of an SN, so anything else that wants one waits
     /// rather than asking for a second.
     extending: bool,
@@ -420,11 +417,10 @@ impl Object {
         })
     }
 
-    /// Nothing here can be appended to or read yet: the first stream is being made,
-    /// or the next one is being asked for. Waiting is better than being told there is
-    /// no stream, which is true for a moment and useless to hear.
+    /// Nothing here can be appended to or read yet: it has no stream, or the next
+    /// one is being asked for. Waiting is better than a transient missing-stream answer.
     fn between_streams(&self) -> bool {
-        self.creating || self.streams.is_empty() || self.extending
+        self.streams.is_empty() || self.extending
     }
 
     /// What this object is, at one of its streams: the last for an append, or the one
@@ -436,9 +432,6 @@ impl Object {
         dn: DnId,
         record: Option<ORoff>,
     ) -> Option<Vec<Arg>> {
-        if self.creating {
-            return None;
-        }
         // ⚠️ The position comes back *with* the stream, because the stream does not carry
         // it (§17.33.1) — the same shape as `sn::Placed`, and for the same reason.
         let (first, held) = match record {
@@ -563,6 +556,7 @@ impl Object {
 /// silently lacks extents the caller asked for. §17's rule: a well-formed request for something that
 /// did not work says so.
 fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, asked: &[ExtentAsk], answer: Resp) {
+    let answer = pending_stream_answer(answer, asked);
     let ready = {
         let mut held = gather.lock().expect("gather");
         held.left -= 1;
@@ -643,6 +637,28 @@ fn receive_extents(
         slots[ask.row] = Some(reply);
     }
     Ok(())
+}
+
+/// A detailed read consults both DN and SN. If DN names a stream that SN has
+/// not created, report the cross-service mismatch as pending; DN-only reads do
+/// not pass through this path and continue to return the declared stream.
+fn pending_stream_answer(answer: Resp, asked: &[ExtentAsk]) -> Resp {
+    if answer.status != Status::NotFound {
+        return answer;
+    }
+    let Some(message) = answer.message() else {
+        return answer;
+    };
+    let Some(missing) = message.strip_prefix("no ") else {
+        return answer;
+    };
+    let Some(ask) = asked.iter().find(|ask| ask.name.to_string() == missing) else {
+        return answer;
+    };
+    Resp::error(
+        Status::NotFound,
+        format!("pending: DN declares {}, but SN has not created it", ask.name),
+    )
 }
 
 /// Convert an object position to the stream's space; later streams start at zero.
@@ -1041,8 +1057,8 @@ impl DN {
                     Err(Resp::error(Status::NotFound, "no object"))
                 };
             };
-            if object.creating || object.extending || object.streams.is_empty() {
-                return Err(bad("object creation or extension is in progress; retry deletion"));
+            if object.extending || object.streams.is_empty() {
+                return Err(bad("object extension is in progress; retry deletion"));
             }
             // `purge_only` is an object's persistent deletion policy. On its first
             // delete, perform the soft and hard transitions together and ignore the
@@ -1415,7 +1431,6 @@ impl DN {
                         id: ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32),
                         framing: framing.expect("at least two sources"),
                         streams: Vec::new(),
-                        creating: false,
                         extending: true,
                         waiting: vec![reply],
                         keyed: keyed.expect("at least two sources"),
@@ -1494,7 +1509,6 @@ impl DN {
                 id: ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32),
                 framing: framing.expect("at least two sources"),
                 streams: copied,
-                creating: false,
                 extending: true,
                 waiting: vec![reply],
                 keyed: keyed.expect("at least two sources"),
@@ -1737,8 +1751,9 @@ impl DN {
         self.record(process, wanted, flags, |_, made| Resp::number(Status::Ok, made))
     }
 
-    /// Replicate pending names first, create the streams on SN, then replicate ready.
-    /// The SN call is always outside the global lock.
+    /// Commit DN's object and stream declarations, then create the SN streams.
+    /// The SN call is outside the global lock; if it fails, the DN declaration
+    /// remains and reads that also consult SN can report the mismatch as pending.
     fn record(
         &self,
         process: &Process,
@@ -1750,82 +1765,66 @@ impl DN {
             return say(self, 0);
         }
         let created = TimeSec::now();
-        // A pending action survives a failed or interrupted SN call. A repeated
-        // create can finish that exact declaration because CreateStream is idempotent.
-        let candidate = if let Some(rows) = self.pending_for(&wanted) {
-            rows
-        } else {
-            let sn = match process.pick(ServiceKind::Sn) {
-                Ok(sn) => sn.to_string(),
-                Err(error) => return Resp::error(Status::Internal, error.to_string()),
-            };
-            let sn_number =
-                SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
-            let first_object =
-                match claim_ids(&self.next_object, wanted.len(), ObjectId::NONE.number(), "object")
-                {
-                    Ok(first) => first,
-                    Err(error) => return Resp::error(Status::Internal, error.to_string()),
-                };
-            let streams = match self.allocate_stream_ids(wanted.len()) {
-                Ok(streams) => streams,
-                Err(error) => return Resp::error(Status::Internal, error.to_string()),
-            };
-            let rows: Vec<_> = wanted
-                .iter()
-                .zip(streams)
-                .enumerate()
-                .map(|(offset, (one, stream))| DnCreateRow {
-                    name: one.name.clone(),
-                    id: ObjectId::new((first_object + offset as u64) as u32),
-                    keyed: one.keyed,
-                    framing: one.framing,
-                    created,
-                    stream,
-                    sn: sn_number,
-                })
-                .collect();
-            let action = match dn_action(&DnCreateCmd { rows: rows.clone(), flags }) {
-                Ok(action) => action,
-                Err(error) => return Resp::error(Status::Internal, error.to_string()),
-            };
-            let ticket = match self.queue_client(action) {
-                Ok(ticket) => ticket,
-                Err(error) => return Resp::error(Status::Internal, error.to_string()),
-            };
-            let index = match ticket.wait() {
-                Ok(index) => index,
-                Err(error) => return Resp::error(Status::Internal, error.to_string()),
-            };
-            if let Err(error) = self.wait_applied(index) {
-                logw!("DN create action did not finish", "error {error}");
-                return Resp::error(Status::Internal, error.to_string());
-            }
-            if let Some(answer) = self
-                .create_rejects
-                .lock()
-                .expect("create rejects")
-                .take(ObjectId::new(first_object as u32))
-            {
-                return answer;
-            }
-            rows
+        let sn = match process.pick(ServiceKind::Sn) {
+            Ok(sn) => sn.to_string(),
+            Err(error) => return Resp::error(Status::Internal, error.to_string()),
         };
-
-        // A name collision makes the initial Raft action a no-op for the whole
-        // batch. Resolve the stream owner from the persisted row: an exact stream
-        // identity collision reuses the original stream and its SN.
-        let Some(rows) = self.pending_rows(&candidate) else {
-            return say(self, 0);
+        let sn_number =
+            SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
+        let first_object =
+            match claim_ids(&self.next_object, wanted.len(), ObjectId::NONE.number(), "object") {
+                Ok(first) => first,
+                Err(error) => return Resp::error(Status::Internal, error.to_string()),
+            };
+        let streams = match self.allocate_stream_ids(wanted.len()) {
+            Ok(streams) => streams,
+            Err(error) => return Resp::error(Status::Internal, error.to_string()),
         };
-        let mut by_sn = HashMap::<SnId, Vec<StreamName>>::new();
-        for row in &rows {
-            by_sn.entry(row.sn).or_default().push(StreamName {
-                range: self.mine,
-                stream: row.stream,
-                created: row.created,
-            });
+        let rows: Vec<_> = wanted
+            .iter()
+            .zip(streams)
+            .enumerate()
+            .map(|(offset, (one, stream))| DnCreateRow {
+                name: one.name.clone(),
+                id: ObjectId::new((first_object + offset as u64) as u32),
+                keyed: one.keyed,
+                framing: one.framing,
+                created,
+                stream,
+                sn: sn_number,
+            })
+            .collect();
+        let action = match dn_action(&DnCreateCmd { rows: rows.clone(), flags }) {
+            Ok(action) => action,
+            Err(error) => return Resp::error(Status::Internal, error.to_string()),
+        };
+        let ticket = match self.queue_client(action) {
+            Ok(ticket) => ticket,
+            Err(error) => return Resp::error(Status::Internal, error.to_string()),
+        };
+        let index = match ticket.wait() {
+            Ok(index) => index,
+            Err(error) => return Resp::error(Status::Internal, error.to_string()),
+        };
+        if let Err(error) = self.wait_applied(index) {
+            logw!("DN create action did not finish", "error {error}");
+            return Resp::error(Status::Internal, error.to_string());
         }
+        if let Some(answer) = self
+            .create_rejects
+            .lock()
+            .expect("create rejects")
+            .take(ObjectId::new(first_object as u32))
+        {
+            return answer;
+        }
+
+        // Read the rows actually applied: accepted collisions reuse the existing
+        // object's streams, while new names use the rows from this command.
+        let (by_sn, made) = match self.create_targets(&wanted, &rows) {
+            Ok(targets) => targets,
+            Err(error) => return Resp::error(Status::Internal, error.to_string()),
+        };
         for (sn_id, names) in by_sn {
             let Some(sn) = process
                 .cluster
@@ -1841,116 +1840,48 @@ impl DN {
                 Err(error) => return Resp::error(Status::Internal, error.to_string()),
             };
             if answer.status != Status::Ok {
-                return Resp::error(
-                    answer.status,
-                    format!("SN{sn_id} would not make {} streams", names.len()),
-                );
+                return answer;
             }
         }
-
-        let ready = DnCreateReadyCmd {
-            rows: rows
-                .iter()
-                .map(|row| DnReadyRow {
-                    name: row.name.clone(),
-                    id: row.id,
-                    stream: row.stream,
-                    created: row.created,
-                    sn: row.sn,
-                })
-                .collect(),
-        };
-        let action = match dn_ready_action(&ready) {
-            Ok(action) => action,
-            Err(error) => return Resp::error(Status::Internal, error.to_string()),
-        };
-        let ticket = match self.queue_client(action) {
-            Ok(ticket) => ticket,
-            Err(error) => return Resp::error(Status::Internal, error.to_string()),
-        };
-        let index = match ticket.wait() {
-            Ok(index) => index,
-            Err(error) => return Resp::error(Status::Internal, error.to_string()),
-        };
-        if let Err(error) = self.wait_applied(index) {
-            return Resp::error(Status::Internal, error.to_string());
-        }
         let _state = self.global_lock.read();
-        say(self, rows.len() as u64)
+        say(self, made)
     }
 
-    fn pending_for(&self, wanted: &[Wanted]) -> Option<Vec<DnCreateRow>> {
-        if wanted.is_empty() {
-            return None;
-        }
+    fn create_targets(
+        &self,
+        wanted: &[Wanted],
+        planned: &[DnCreateRow],
+    ) -> common::Result<(HashMap<SnId, Vec<StreamName>>, u64)> {
         let _state = self.global_lock.read();
-        let objects = self.object_table.read().ok()?;
-        let streams = self.stream_table.read().ok()?;
-        let mut seen = std::collections::HashSet::new();
-        let mut rows = Vec::with_capacity(wanted.len());
+        let objects = self.object_table.read().expect("objects");
+        let streams = self.stream_table.read().expect("streams");
+        let planned: HashMap<_, _> =
+            planned.iter().map(|row| (row.name.as_str(), row.id)).collect();
+        let mut by_sn = HashMap::<SnId, Vec<StreamName>>::new();
+        let mut made = 0;
         for one in wanted {
-            if !seen.insert(one.name.as_str()) {
-                return None;
+            let object = objects
+                .get(one.name.as_str())
+                .ok_or_else(|| common::Error::new(format!("{} vanished after create", one.name)))?;
+            if planned.get(one.name.as_str()) == Some(&object.id) {
+                made += 1;
             }
-            let object = objects.get(one.name.as_str())?;
-            if !object.creating
-                || object.keyed != one.keyed
-                || object.framing != one.framing
-                || object.streams.len() != 1
-            {
-                return None;
+            if object.deletion.soft_deleted() || object.deletion.deleted() {
+                continue;
             }
-            let stream_id = object.streams[0];
-            let stream = streams.get(stream_id.get() as usize)?;
-            if stream.id != stream_id
-                || stream.created != object.created
-                || stream.deletion.soft_deleted()
-                || stream.deletion.deleted()
-            {
-                return None;
+            for id in &object.streams {
+                let stream = streams
+                    .get(id.get() as usize)
+                    .filter(|stream| stream.id == *id)
+                    .ok_or_else(|| common::Error::new(format!("stream {id} is missing in DN")))?;
+                by_sn.entry(stream.sn).or_default().push(StreamName {
+                    range: self.mine,
+                    stream: stream.id,
+                    created: stream.created,
+                });
             }
-            rows.push(DnCreateRow {
-                name: one.name.clone(),
-                id: object.id,
-                keyed: object.keyed,
-                framing: object.framing,
-                created: object.created,
-                stream: stream_id,
-                sn: stream.sn,
-            });
         }
-        Some(rows)
-    }
-
-    fn pending_rows(&self, expected: &[DnCreateRow]) -> Option<Vec<DnCreateRow>> {
-        let _state = self.global_lock.read();
-        let objects = self.object_table.read().ok()?;
-        let streams = self.stream_table.read().ok()?;
-        let mut rows = Vec::with_capacity(expected.len());
-        for row in expected {
-            let object = objects.get(row.name.as_str())?;
-            if !object.creating
-                || object.id != row.id
-                || object.created != row.created
-                || object.keyed != row.keyed
-                || object.framing != row.framing
-                || object.streams.as_slice() != [row.stream]
-            {
-                return None;
-            }
-            let stream = streams.get(row.stream.get() as usize)?;
-            if stream.id != row.stream
-                || stream.created != row.created
-                || stream.deletion.soft_deleted()
-                || stream.deletion.deleted()
-            {
-                return None;
-            }
-            let mut row = row.clone();
-            row.sn = stream.sn;
-            rows.push(row);
-        }
-        Some(rows)
+        Ok((by_sn, made))
     }
 
     /// `(name, sealed stream, records)`: that stream is full, so give the object
@@ -1974,11 +1905,6 @@ impl DN {
             let mut objects = self.object_table.write().expect("objects");
             match objects.get_mut(name.as_str()) {
                 None => Next::Say(Resp::error(Status::NotFound, format!("no object {name}"))),
-                Some(object) if object.creating => {
-                    object.waiting.push(carry.take().expect("a reply"));
-                    self.parked.fetch_add(1, Ordering::Relaxed);
-                    Next::Wait
-                }
                 Some(object) if !object.deletion.readable(false) => {
                     Next::Say(bad("object is deleted"))
                 }
@@ -2321,9 +2247,7 @@ impl DN {
         }
     }
 
-    /// Answer everything parked on these names, now that their streams exist. A name
-    /// whose create failed is answered too, with whatever the failure was, so nothing
-    /// waits for an answer that is never coming.
+    /// Answer requests parked while an object's stream list was being extended.
     fn wake(&self, names: &[String], failed: Option<&Resp>) {
         for name in names {
             let (waiters, args) = {
@@ -2616,8 +2540,7 @@ fn validate_create_names(wanted: &[Wanted]) -> Result<(), Resp> {
 }
 
 impl DN {
-    /// Declare a batch as pending. ObjectInfo cannot expose these rows until the
-    /// matching ready action follows successful stream creation at the SN.
+    /// Declare objects and their initial streams together in DN's committed state.
     fn apply_create(&self, cmd: DnCreateCmd) -> common::Result<Option<CreateReject>> {
         #[derive(Clone, Copy)]
         enum Choice {
@@ -2762,7 +2685,6 @@ impl DN {
                     id: row.id,
                     framing: row.framing,
                     streams: vec![row.stream],
-                    creating: true,
                     extending: false,
                     waiting: Vec::new(),
                     keyed: row.keyed,
@@ -2777,49 +2699,6 @@ impl DN {
         self.objects.fetch_add(added, Ordering::Relaxed);
         self.streams.fetch_add(added, Ordering::Relaxed);
         Ok(None)
-    }
-
-    /// Make the batch visible after SN creation. Validate every row before the first
-    /// state change; replaying an already-applied ready action is harmless.
-    fn apply_ready(&self, cmd: DnCreateReadyCmd) -> common::Result<Vec<String>> {
-        if cmd.rows.is_empty() {
-            return Err(common::Error::new("empty DN ready action"));
-        }
-        let mut names = std::collections::HashSet::new();
-        let mut objects = self.object_table.write().expect("objects");
-        let streams = self.stream_table.read().expect("streams");
-        for row in &cmd.rows {
-            if !names.insert(row.name.as_str()) {
-                return Err(common::Error::new("DN ready action repeats a name"));
-            }
-            let object = objects.get(row.name.as_str()).ok_or_else(|| {
-                common::Error::new(format!("pending object {} is missing", row.name))
-            })?;
-            if object.id != row.id
-                || object.created != row.created
-                || object.streams.as_slice() != [row.stream]
-            {
-                return Err(common::Error::new(format!("DN ready action mismatches {}", row.name)));
-            }
-            let stream = streams
-                .get(row.stream.get() as usize)
-                .ok_or_else(|| common::Error::new(format!("stream {} is missing", row.stream)))?;
-            if stream.id != row.stream || stream.created != row.created || stream.sn != row.sn {
-                return Err(common::Error::new(format!(
-                    "DN ready action mismatches stream {}",
-                    row.stream
-                )));
-            }
-        }
-        let mut ready = Vec::with_capacity(cmd.rows.len());
-        for row in cmd.rows {
-            let object = objects.get_mut(row.name.as_str()).expect("validated object");
-            if object.creating {
-                object.creating = false;
-                ready.push(row.name);
-            }
-        }
-        Ok(ready)
     }
 
     fn reserve_stream(&self) -> common::Result<StreamId> {
@@ -3011,6 +2890,7 @@ fn batch_arrived(
     answer: Resp,
     limit: u64,
 ) {
+    let answer = pending_stream_answer(answer, asked);
     let mut held = gather.lock().expect("batch-info gather");
     if answer.status != Status::Ok {
         held.failed.get_or_insert(answer);
@@ -3113,20 +2993,6 @@ struct DnCreateCmd {
     flags: AppendFlags,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DnReadyRow {
-    name: String,
-    id: ObjectId,
-    stream: StreamId,
-    created: TimeSec,
-    sn: SnId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DnCreateReadyCmd {
-    rows: Vec<DnReadyRow>,
-}
-
 impl Wire for DnCreateCmd {
     fn write(&self, w: &mut StructWriter) {
         w.nested(Op::DnCreate, |w| {
@@ -3171,48 +3037,8 @@ impl Wire for DnCreateCmd {
     }
 }
 
-impl Wire for DnCreateReadyCmd {
-    fn write(&self, w: &mut StructWriter) {
-        w.nested(Op::DnCreateReady, |w| {
-            w.number_u64(self.rows.len() as u64);
-            for row in &self.rows {
-                w.nested(Op::RaftPair, |w| {
-                    w.text(&row.name);
-                    w.number_u32(row.id.get());
-                    w.stream_id(row.stream);
-                    w.time_sec(row.created);
-                    w.sn_id(row.sn);
-                });
-            }
-        });
-    }
-
-    fn read(r: &mut common::StructReader<'_>) -> common::Result<Self> {
-        r.nested(Op::DnCreateReady, "DN create-ready action", |r| {
-            let count = r.number_u64()?;
-            let mut rows = common::checked_vec(count, r.remaining())?;
-            for _ in 0..count {
-                rows.push(r.nested(Op::RaftPair, "DN ready row", |r| {
-                    Ok(DnReadyRow {
-                        name: r.text()?,
-                        id: ObjectId::new(r.number_u32()?),
-                        stream: r.stream_id()?,
-                        created: r.time_sec()?,
-                        sn: r.sn_id()?,
-                    })
-                })?);
-            }
-            Ok(DnCreateReadyCmd { rows })
-        })
-    }
-}
-
 fn dn_action(cmd: &DnCreateCmd) -> common::Result<raft::Action> {
     Ok(raft::Action::new(Op::DnCreate, raft::codec::encode(cmd)?))
-}
-
-fn dn_ready_action(cmd: &DnCreateReadyCmd) -> common::Result<raft::Action> {
-    Ok(raft::Action::new(Op::DnCreateReady, raft::codec::encode(cmd)?))
 }
 
 fn claim_ids(next: &AtomicU64, count: usize, limit: u64, kind: &str) -> common::Result<u64> {
@@ -3258,14 +3084,14 @@ fn extension(request: &Req) -> common::Result<(String, StreamId, SRoff)> {
 
 impl Host for DN {
     type Application = DNState;
-    type Done = String;
+    type Done = ();
 
     fn apply_client(
         &self,
         _state: &mut DNState,
         context: raft::execution::Context<'_>,
         action: &raft::Action,
-        done: &mut Vec<Self::Done>,
+        _done: &mut Vec<Self::Done>,
     ) -> common::Result<()> {
         match action.op {
             Op::DnCreate => {
@@ -3282,16 +3108,8 @@ impl Host for DN {
                     .record(context.index, id, reject);
                 Ok(())
             }
-            Op::DnCreateReady => {
-                done.extend(self.apply_ready(raft::codec::decode(&action.fields)?)?);
-                Ok(())
-            }
             _ => Err(common::Error::new(format!("DN does not apply {}", action.op))),
         }
-    }
-
-    fn complete_apply(&self, names: Vec<Self::Done>) {
-        self.wake(&names, None);
     }
 
     fn reset_metadata(&self, _state: &mut DNState) {
@@ -3530,7 +3348,7 @@ mod tests {
     }
 
     #[test]
-    fn single_member_raft_applies_one_batch_create_action() {
+    fn single_member_raft_applies_batch_create_as_one_action() {
         let dn =
             std::sync::Arc::new(DN::new(common::testing::dn_config(), DnId::FIRST, RangeId::FIRST));
         dn.start_raft().unwrap();
@@ -3572,31 +3390,6 @@ mod tests {
         let index = dn.queue_client(action).unwrap().wait().unwrap();
         dn.wait_applied(index).unwrap();
         assert_eq!(dn.objects.load(Ordering::Relaxed), 2);
-        assert!(
-            dn.look("/raft/one").is_none(),
-            "pending objects stay hidden until SN confirms them"
-        );
-        let action = dn_ready_action(&DnCreateReadyCmd {
-            rows: vec![
-                DnReadyRow {
-                    name: "/raft/one".into(),
-                    id: ObjectId::new(0),
-                    stream: StreamId::new(0),
-                    created: TimeSec::new(800),
-                    sn: SnId::new(1),
-                },
-                DnReadyRow {
-                    name: "/raft/two".into(),
-                    id: ObjectId::new(1),
-                    stream: StreamId::new(1),
-                    created: TimeSec::new(800),
-                    sn: SnId::new(1),
-                },
-            ],
-        })
-        .unwrap();
-        let index = dn.queue_client(action).unwrap().wait().unwrap();
-        dn.wait_applied(index).unwrap();
         assert!(dn.look("/raft/one").is_some());
         assert!(dn.look("/raft/two").is_some());
         let status = dn.raft_status();
@@ -3856,7 +3649,6 @@ mod tests {
             keyed: false,
             created: TimeSec::new(100),
             streams: vec![StreamId::new(0), StreamId::new(1)],
-            creating: false,
         };
         let extents: OEoff = object.cached_extents(&table);
         let logical: OLoff = object.logical(&table);
@@ -3904,7 +3696,6 @@ mod tests {
                 id: ObjectId::new(2),
                 framing: Framing::Lf,
                 streams: vec![install(&dn, held(0, 0, None))],
-                creating: false,
                 extending: false,
                 waiting: Vec::new(),
                 keyed: false,
@@ -3951,7 +3742,6 @@ mod tests {
                     id: ObjectId::new(dn.next_object.fetch_add(1, Ordering::Relaxed) as u32),
                     framing: Framing::Lf,
                     streams: Vec::new(),
-                    creating: false,
                     extending: false,
                     waiting: Vec::new(),
                     keyed: false,
@@ -4011,8 +3801,8 @@ mod tests {
     use common::range::Start;
     use common::testing;
 
-    /// An object as `record` leaves it before the SN has answered: the name is
-    /// taken and the stream is not named.
+    /// A temporary object whose stream list has not been attached yet, as can
+    /// occur while a concat destination is being built.
     fn half_made(dn: &DN, name: &str) {
         dn.object_table.write().unwrap().insert(
             Box::from(name),
@@ -4022,7 +3812,6 @@ mod tests {
                 id: ObjectId::new(1),
                 framing: Framing::Lf,
                 streams: Vec::new(),
-                creating: false,
                 extending: false,
                 waiting: Vec::new(),
                 keyed: false,
@@ -4031,11 +3820,9 @@ mod tests {
         );
     }
 
-    /// The stream is what everything below the DN needs, so an object without one
-    /// is not something to describe — the name is taken, and that is a different
-    /// answer from "no object".
+    /// An object without a DN stream reference is incomplete and cannot be described.
     #[test]
-    fn an_object_being_made_does_not_look_like_a_finished_one() {
+    fn object_without_stream_is_incomplete_in_dn_only_reads() {
         let dn = DN::new(testing::dn_config(), DnId::new(0), RangeId::new(0));
         half_made(&dn, "/half");
         assert!(dn.look("/half").is_none(), "nothing to say about it yet");
@@ -4062,38 +3849,53 @@ mod tests {
         assert!(!waits("/half"), "and it is no longer half made");
     }
 
-    /// A name is taken before its stream is asked for, so two creates of one name
-    /// ask for one stream. That is the rule that stops a create leaving a stream
-    /// behind when it loses the race.
+    /// Accepted collisions keep and reuse the already-declared stream identity.
     #[test]
-    fn one_name_is_taken_once() {
+    fn accepted_create_collision_reuses_existing_stream() {
         let dn = DN::new(testing::dn_config(), DnId::new(0), RangeId::new(0));
-        let mine = |dn: &DN| {
-            let mut taken = Vec::new();
-            let name = "/same".to_string();
-            let mut objects = dn.object_table.write().unwrap();
-            if !objects.contains_key(name.as_str()) {
-                objects.insert(
-                    Box::from(name.as_str()),
-                    Object {
-                        deletion: Flags::default(),
-                        purge_only: false,
-                        id: ObjectId::new(dn.next_object.fetch_add(1, Ordering::Relaxed) as u32),
-                        framing: Framing::Lf,
-                        streams: Vec::new(),
-                        creating: false,
-                        extending: false,
-                        waiting: Vec::new(),
-                        keyed: false,
-                        created: TimeSec::new(1_000_000),
-                    },
-                );
-                taken.push(name);
-            }
-            taken
+        let original = DnCreateRow {
+            name: "/same".into(),
+            id: ObjectId::new(0),
+            keyed: false,
+            framing: Framing::Lf,
+            created: TimeSec::new(500),
+            stream: StreamId::new(0),
+            sn: SnId::new(1),
         };
-        assert_eq!(mine(&dn).len(), 1, "the first one takes it");
-        assert!(mine(&dn).is_empty(), "the second finds it there");
+        assert!(
+            dn.apply_create(DnCreateCmd {
+                rows: vec![original.clone()],
+                flags: AppendFlags::default(),
+            })
+            .unwrap()
+            .is_none()
+        );
+
+        let candidate = DnCreateRow {
+            id: ObjectId::new(1),
+            stream: StreamId::new(1),
+            created: TimeSec::new(501),
+            ..original.clone()
+        };
+        assert!(
+            dn.apply_create(DnCreateCmd {
+                rows: vec![candidate.clone()],
+                flags: AppendFlags::default(),
+            })
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(dn.objects.load(Ordering::Relaxed), 1);
+        assert_eq!(dn.stream_table.read().unwrap().len(), 1);
+        assert_eq!(dn.object_table.read().unwrap()["/same"].id, original.id);
+
+        let wanted = [Wanted { name: "/same".into(), keyed: false, framing: Framing::Lf }];
+        let (by_sn, made) = dn.create_targets(&wanted, &[candidate]).unwrap();
+        assert_eq!(made, 0);
+        assert_eq!(
+            by_sn[&SnId::new(1)],
+            [StreamName { range: dn.mine, stream: original.stream, created: original.created }]
+        );
     }
 
     /// An object grows streams, and the record ranges are what make its numbering
@@ -4108,7 +3910,6 @@ mod tests {
             id: ObjectId::new(1),
             framing: Framing::Lf,
             streams: Vec::new(),
-            creating: false,
             extending: false,
             waiting: Vec::new(),
             keyed: false,
@@ -4140,7 +3941,6 @@ mod tests {
             id: ObjectId::new(1),
             framing: Framing::Lf,
             streams: Vec::new(),
-            creating: false,
             extending: false,
             waiting: Vec::new(),
             keyed: false,
@@ -4272,6 +4072,24 @@ mod tests {
             receive_extents(&mut slots, &groups[&rows[0].sn], &answer(&[50])).is_err(),
             "missing replies must not silently reuse another occurrence"
         );
+    }
+
+    #[test]
+    fn detailed_reads_report_an_sn_stream_mismatch_as_pending() {
+        let name = StreamName {
+            range: RangeId::new(4),
+            stream: StreamId::new(7),
+            created: TimeSec::new(500),
+        };
+        let asked = [ExtentAsk { row: 0, name, from: SRoff::ZERO }];
+        let answer =
+            pending_stream_answer(Resp::error(Status::NotFound, format!("no {name}")), &asked);
+        assert_eq!(answer.status, Status::NotFound);
+        let expected = format!("pending: DN declares {name}, but SN has not created it");
+        assert_eq!(answer.message(), Some(expected));
+
+        let deleted = Resp::error(Status::NotFound, "stream is deleted");
+        assert_eq!(pending_stream_answer(deleted.clone(), &asked), deleted);
     }
 
     #[test]
@@ -4618,7 +4436,6 @@ mod tests {
                     id: ObjectId::new(n as u32 + 1),
                     framing: Framing::Lf,
                     streams: vec![install(&dn, held(n as u32 + 1, 0, None))],
-                    creating: false,
                     extending: false,
                     waiting: Vec::new(),
                     keyed: false,
