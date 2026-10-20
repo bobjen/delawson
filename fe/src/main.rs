@@ -26,7 +26,7 @@ use common::config::{FEConfig, ServiceKind};
 use common::deletion::{read_soft_deleted, with_read_soft_deleted};
 use common::framing::Framing;
 use common::ids::{DiskId, DnId, EnId, ExtentId, SnId, StreamId};
-use common::info::{Batch, Described, Expecting, Shape, StreamName, UNKNOWN, Wanted};
+use common::info::{AppendFlags, Batch, Described, Expecting, Shape, StreamName, UNKNOWN, Wanted};
 use common::logw;
 use common::offset::{ELoff, ERoff, OCoff, OEoff, OLoff, ORoff, SRoff};
 use common::range::{
@@ -154,6 +154,7 @@ struct Wanting {
     path: String,
     located: Located,
     framing: Framing,
+    flags: AppendFlags,
     crc: u64,
     body: Vec<u8>,
     /// What the writer said the block holds: compressed size, logical size, records.
@@ -349,7 +350,7 @@ impl FE {
                     .get(&located.stream)
                     .and_then(|s| s.open.clone());
                 if let Some(open) = cached {
-                    fe.force_seal(process, path, located, open, reply);
+                    fe.force_seal(process, path, located, open, reply, None);
                     return;
                 }
                 let mut payload = StructWriter::new();
@@ -369,7 +370,7 @@ impl FE {
                     else {
                         return reply.send(answer);
                     };
-                    fe2.force_seal(&callback_process, path2, located, open, reply);
+                    fe2.force_seal(&callback_process, path2, located, open, reply, None);
                 }) {
                     logw!("could not reach an SN", "sn {sn},{e}");
                 }
@@ -384,6 +385,7 @@ impl FE {
         located: Located,
         open: Open,
         reply: Reply,
+        after: Option<Resp>,
     ) {
         let Some(&(en, disk)) = open.disks.first() else {
             return reply.send(Resp::error(Status::Internal, "the open extent has no primary"));
@@ -456,8 +458,13 @@ impl FE {
                 payload.sroff(records);
                 let ask = Req::new(Op::SealObject).structure(payload);
                 if let Err(e) =
-                    stream_process
-                        .ask(&format!("DN{}", located.dn), &ask, move |answer| reply.send(answer))
+                    stream_process.ask(&format!("DN{}", located.dn), &ask, move |answer| {
+                        if answer.status == Status::Ok {
+                            reply.send(after.unwrap_or(answer));
+                        } else {
+                            reply.send(answer);
+                        }
+                    })
                 {
                     logw!("could not reach a DN", "dn {},{e}", located.dn);
                 }
@@ -483,7 +490,20 @@ impl FE {
         reply: Reply,
         then: impl FnOnce(&Arc<FE>, &Arc<Process>, Located, Reply) + Send + 'static,
     ) {
-        self.resolving(process, path, None, expect, make, true, false, reply, then)
+        self.resolve_flags(process, path, expect, make, AppendFlags::default(), reply, then)
+    }
+
+    fn resolve_flags(
+        self: &Arc<Self>,
+        process: &Arc<Process>,
+        path: &str,
+        expect: Expecting,
+        make: Option<Framing>,
+        flags: AppendFlags,
+        reply: Reply,
+        then: impl FnOnce(&Arc<FE>, &Arc<Process>, Located, Reply) + Send + 'static,
+    ) {
+        self.resolving(process, path, None, expect, make, flags, true, false, reply, then)
     }
 
     /// Look up the specific stream holding an object-local record number (`ORoff`),
@@ -499,7 +519,18 @@ impl FE {
         reply: Reply,
         then: impl FnOnce(&Arc<FE>, &Arc<Process>, Located, Reply) + Send + 'static,
     ) {
-        self.resolving(process, path, Some(record), expect, None, false, include, reply, then)
+        self.resolving(
+            process,
+            path,
+            Some(record),
+            expect,
+            None,
+            AppendFlags::default(),
+            false,
+            include,
+            reply,
+            then,
+        )
     }
 
     /// Resolve an object path at the owning Directory Node (DN).
@@ -521,6 +552,7 @@ impl FE {
         record: Option<ORoff>,
         expect: Expecting,
         make: Option<Framing>,
+        flags: AppendFlags,
         again: bool,
         include: bool,
         reply: Reply,
@@ -546,7 +578,9 @@ impl FE {
             // An append may make the object it is appending to, which is one more
             // hop and only on the first append.
             if let (Status::NotFound, Some(framing)) = (answer.status, make) {
-                return make_object(&fe, &onward, &named, &path, framing, again, reply, then);
+                return make_object(
+                    &fe, &onward, &named, &path, framing, flags, again, reply, then,
+                );
             }
             if answer.status != Status::Ok {
                 return reply.send(answer);
@@ -561,6 +595,12 @@ impl FE {
                 return reply
                     .send(Resp::error(Status::Internal, format!("{path} has no stream yet")));
             }
+            if flags.require_new() || flags.overwrite() {
+                let framing = make.unwrap_or(located.framing);
+                return make_object(
+                    &fe, &onward, &named, &path, framing, flags, false, reply, then,
+                );
+            }
             then(&fe, &onward, located, reply);
         });
         if let Err(e) = asked {
@@ -571,22 +611,23 @@ impl FE {
     /// An append: resolve the name — making the object if it is not there — find the
     /// extent, and hand the bytes to its primary.
     fn append(self: &Arc<Self>, process: &Arc<Process>, request: &Req, mut reply: Reply) {
-        let ParsedAppend { path, expect, framing, first, tail } = match ParsedAppend::of(request)
-            .and_then(|mut append| {
+        let ParsedAppend { path, expect, framing, flags, first, tail } =
+            match ParsedAppend::of(request).and_then(|mut append| {
                 append.wrap_bytes(process.cluster.extents.max_append_bytes)?;
                 Ok(append)
             }) {
-            Ok(append) => append,
-            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
-        };
+                Ok(append) => append,
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            };
         let AppendPart { holds, crc, body } = first;
         reply.about(format_args!("{path},bytes {},logical {}", body.len(), holds.logical));
         let named = path.clone();
-        self.resolve(
+        self.resolve_flags(
             process,
             &path,
             expect,
             Some(framing),
+            flags,
             reply,
             move |fe, process, located, reply| {
                 // The object's own framing wins, and a writer that disagrees about it is
@@ -604,6 +645,7 @@ impl FE {
                     path: named,
                     located,
                     framing,
+                    flags,
                     crc,
                     body,
                     holds,
@@ -740,7 +782,8 @@ impl FE {
     /// with them: the primary is what counts the records and what broadcasts to the
     /// others, and the SN is not in this path to be asked again.
     fn to_primary(self: &Arc<Self>, process: &Arc<Process>, wanting: Wanting, open: Open) {
-        let Wanting { path, located, framing, crc, body, holds, tail, tries, reply } = wanting;
+        let Wanting { path, located, framing, flags, crc, body, holds, tail, tries, reply } =
+            wanting;
         let identity = format!("EN{}", open.disks[0].0);
         let ask =
             append_request(&open, framing, AppendPart { holds, crc, body: body.clone() }, &tail);
@@ -750,10 +793,15 @@ impl FE {
         let asked = process.ask(&identity, &ask, move |answer| {
             if answer.status == Status::Sealed {
                 let wanting =
-                    Wanting { path, located, framing, crc, body, holds, tail, tries, reply };
+                    Wanting { path, located, framing, flags, crc, body, holds, tail, tries, reply };
                 return fe.after_seal(&onward, wanting, open, answer);
             }
-            let _ = (path, framing, crc, tries, onward, fe);
+            let _ = (framing, crc, tries);
+            if answer.status == Status::Ok && flags.seal() {
+                let ack = receipt(&located, &open, answer);
+                return fe.force_seal(&onward, path, located, open, reply, Some(ack));
+            }
+            let _ = (path, onward, fe);
             reply.send(receipt(&located, &open, answer));
         });
         if let Err(e) = asked {
@@ -816,7 +864,8 @@ impl FE {
                     ));
                 }
             };
-        let Wanting { path, located, framing, crc, body, holds, tail, tries, reply } = wanting;
+        let Wanting { path, located, framing, flags, crc, body, holds, tail, tries, reply } =
+            wanting;
         // Nothing may hand out an extent of a stream that will take no more, and what
         // is remembered about it is no use to an append either.
         self.streams.lock().expect("streams").remove(&located.stream);
@@ -843,8 +892,18 @@ impl FE {
                     format!("{path} was extended and is still on stream {}", next.stream),
                 ));
             }
-            let wanting =
-                Wanting { path, located: next, framing, crc, body, holds, tail, tries, reply };
+            let wanting = Wanting {
+                path,
+                located: next,
+                framing,
+                flags,
+                crc,
+                body,
+                holds,
+                tail,
+                tries,
+                reply,
+            };
             fe.somewhere(&onward, wanting, None);
         });
         if let Err(e) = asked {
@@ -1155,6 +1214,7 @@ struct ParsedAppend {
     path: String,
     expect: Expecting,
     framing: Framing,
+    flags: AppendFlags,
     first: AppendPart,
     tail: Vec<AppendPart>,
 }
@@ -1211,12 +1271,13 @@ impl ParsedAppend {
                 body: payload.bytes()?,
             });
         }
+        let flags = AppendFlags::read(&mut payload)?;
         payload.done()?;
         if !rest.is_empty() {
             return Err(common::Error::new("an append request has trailing arguments"));
         }
         let first = parts.remove(0);
-        Ok(Self { path, expect, framing, first, tail: parts })
+        Ok(Self { path, expect, framing, flags, first, tail: parts })
     }
 }
 
@@ -1297,6 +1358,7 @@ fn make_object(
     dn: &str,
     path: &str,
     framing: Framing,
+    flags: AppendFlags,
     again: bool,
     reply: Reply,
     then: impl FnOnce(&Arc<FE>, &Arc<Process>, Located, Reply) + Send + 'static,
@@ -1311,6 +1373,7 @@ fn make_object(
     payload.number_u32(width);
     payload.text("");
     payload.flag(false);
+    flags.write(&mut payload);
     let ask = Req::new(Op::CreateObject).structure(payload);
     let fe = Arc::clone(fe);
     let onward = Arc::clone(process);
@@ -1319,7 +1382,7 @@ fn make_object(
     let asked = process.ask(dn, &ask, move |answer| {
         // Somebody else made it first. For a create that is the answer; for an
         // append it is only a reason to look again.
-        if answer.status == Status::BadRequest && again {
+        if answer.status == Status::BadRequest && again && !flags.require_new() {
             // ⚠️ No expectation on the retry: this is the losing side of a create race looking
             // the object up again, and what it wants is whatever won, not what it guessed.
             return fe.resolving(
@@ -1328,6 +1391,7 @@ fn make_object(
                 None,
                 Expecting::whatever(),
                 Some(framing),
+                flags,
                 false,
                 false,
                 reply,
@@ -1911,7 +1975,7 @@ impl FE {
     /// true of one DN; spreading over several makes it worse, which is why a DN that refuses
     /// fails the whole batch rather than being quietly subtracted (§17.31.1).
     fn create(self: &Arc<Self>, process: &Arc<Process>, request: &Req, mut reply: Reply) {
-        let wanted = {
+        let (wanted, flags) = {
             let (mut payload, rest) =
                 match structure(&request.args(), Op::BatchCreate, "a batch-create request") {
                     Ok(value) => value,
@@ -1935,6 +1999,10 @@ impl FE {
                     }
                 }
             }
+            let flags = match AppendFlags::read(&mut payload) {
+                Ok(flags) => flags,
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            };
             if let Err(e) = payload.done() {
                 return reply.send(Resp::error(Status::BadRequest, e.to_string()));
             }
@@ -1944,7 +2012,7 @@ impl FE {
                     "a batch-create request has trailing arguments",
                 ));
             }
-            wanted
+            (wanted, flags)
         };
         let dns: Vec<String> =
             process.all_of(ServiceKind::Dn).iter().map(|dn| dn.to_string()).collect();
@@ -1969,6 +2037,7 @@ impl FE {
             for one in at.iter().map(|at| &wanted[*at]) {
                 one.write(&mut payload);
             }
+            flags.write(&mut payload);
             let ask = Req::new(Op::BatchCreate).structure(payload);
             let identity = dns[dn].clone();
             let waiting = Arc::clone(&making);
@@ -2222,6 +2291,7 @@ mod tests {
                 path: "/bytes".into(),
                 expect: Expecting::whatever(),
                 framing: Framing::Bytes,
+                flags: AppendFlags::default(),
                 first: AppendPart {
                     holds: Holds::of(Framing::Bytes, b"", plain, stored.len()).unwrap(),
                     crc: common::crc::of(plain),
@@ -2302,6 +2372,7 @@ mod tests {
         // Different checksums on adjacent pieces detect dropping, swapping, and
         // recomputation. Zero also stays zero (checksum disabled).
         for checksums in [[crc, 0], [0, crc]] {
+            let flags = AppendFlags::PURGE_ONLY | AppendFlags::SEAL;
             let mut payload = StructWriter::new();
             payload.text("/x");
             Expecting::whatever().write(&mut payload);
@@ -2315,7 +2386,9 @@ mod tests {
                 payload.number_u64(checksum);
                 payload.bytes(&stored);
             }
+            flags.write(&mut payload);
             let parsed = ParsedAppend::of(&Req::new(Op::AppendRecord).structure(payload)).unwrap();
+            assert_eq!(parsed.flags, flags);
             assert_eq!(parsed.first.crc, checksums[0]);
             assert_eq!(parsed.tail[0].crc, checksums[1]);
             let request = append_request(&extent(1, 0), parsed.framing, parsed.first, &parsed.tail);

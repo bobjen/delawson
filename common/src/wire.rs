@@ -318,6 +318,7 @@ ops! {
     SnDelete = 143, "sn-delete-action";
     SnDeleteDone = 144, "sn-delete-done-action";
     DnCreate = 145, "dn-create-action";
+    DnCreateReady = 146, "dn-create-ready-action";
 }
 
 impl std::fmt::Display for Op {

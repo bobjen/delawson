@@ -351,6 +351,98 @@ impl Expecting {
     }
 }
 
+/// Policies shared by append and create requests.
+///
+/// A missing trailing byte means no flags, so older requests keep their meaning.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AppendFlags(u8);
+
+impl AppendFlags {
+    pub const NONE: Self = Self(0x00);
+    pub const REQUIRE_EXISTS: Self = Self(0x01);
+    pub const REQUIRE_NEW: Self = Self(0x02);
+    pub const OVERWRITE: Self = Self(0x04);
+    /// Store this as an object policy: deleting the object purges it immediately.
+    pub const PURGE_ONLY: Self = Self(0x08);
+    pub const SEAL: Self = Self(0x10);
+    const ALL: u8 = Self::REQUIRE_EXISTS.0
+        | Self::REQUIRE_NEW.0
+        | Self::OVERWRITE.0
+        | Self::PURGE_ONLY.0
+        | Self::SEAL.0;
+
+    pub fn from_bits(bits: u8) -> Result<Self> {
+        if bits & !Self::ALL != 0 {
+            return Err(Error::new("unknown append flag bits"));
+        }
+        let flags = Self(bits);
+        flags.validate()?;
+        Ok(flags)
+    }
+
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub fn require_exists(self) -> bool {
+        self.0 & Self::REQUIRE_EXISTS.0 != 0
+    }
+
+    pub fn require_new(self) -> bool {
+        self.0 & Self::REQUIRE_NEW.0 != 0
+    }
+
+    pub fn overwrite(self) -> bool {
+        self.0 & Self::OVERWRITE.0 != 0
+    }
+
+    pub fn purge_only(self) -> bool {
+        self.0 & Self::PURGE_ONLY.0 != 0
+    }
+
+    pub fn seal(self) -> bool {
+        self.0 & Self::SEAL.0 != 0
+    }
+
+    pub fn write(self, payload: &mut StructWriter) {
+        if self.0 != 0 {
+            payload.number_u8(self.0);
+        }
+    }
+
+    pub fn read(payload: &mut StructReader<'_>) -> Result<Self> {
+        if payload.remaining() == 0 {
+            Ok(Self::default())
+        } else {
+            Self::from_bits(payload.number_u8()?)
+        }
+    }
+
+    fn validate(self) -> Result<()> {
+        if self.require_exists() && self.require_new() {
+            return Err(Error::new("require-exists and require-new are mutually exclusive"));
+        }
+        if self.require_new() && self.overwrite() {
+            return Err(Error::new("require-new and overwrite are mutually exclusive"));
+        }
+        Ok(())
+    }
+}
+
+impl std::ops::BitOr for AppendFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for AppendFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
 /// One object a create asks for: a name, a flavour, and a framing.
 ///
 /// ⚠️ **Here rather than in `dn`, on §17.13.3's rule.** A batch create has to be *divided* by
@@ -820,6 +912,49 @@ impl ExtentRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::Req;
+
+    #[test]
+    fn append_flags_are_one_shared_set_and_old_payloads_default_to_none() {
+        let flags = AppendFlags::REQUIRE_NEW | AppendFlags::PURGE_ONLY | AppendFlags::SEAL;
+        assert!(flags.purge_only());
+        let mut payload = StructWriter::new();
+        flags.write(&mut payload);
+        let request = Req::new(Op::ObjectInfo).structure(payload);
+        let (mut reader, _) = structure(&request.args(), Op::ObjectInfo, "test flags").unwrap();
+        assert_eq!(AppendFlags::read(&mut reader).unwrap(), flags);
+        reader.done().unwrap();
+
+        let request = Req::new(Op::ObjectInfo).structure(StructWriter::new());
+        let (mut reader, _) = structure(&request.args(), Op::ObjectInfo, "test flags").unwrap();
+        assert_eq!(AppendFlags::read(&mut reader).unwrap(), AppendFlags::default());
+        reader.done().unwrap();
+    }
+
+    #[test]
+    fn append_flags_are_a_composable_u8_mask() {
+        assert_eq!(AppendFlags::REQUIRE_EXISTS.bits(), 0x01);
+        assert_eq!(AppendFlags::REQUIRE_NEW.bits(), 0x02);
+        assert_eq!(AppendFlags::OVERWRITE.bits(), 0x04);
+        assert_eq!(AppendFlags::PURGE_ONLY.bits(), 0x08);
+        assert_eq!(AppendFlags::SEAL.bits(), 0x10);
+        let flags = AppendFlags::REQUIRE_NEW | AppendFlags::PURGE_ONLY | AppendFlags::SEAL;
+        assert_eq!(flags.bits(), 0x1a);
+        assert_eq!(AppendFlags::from_bits(flags.bits()).unwrap(), flags);
+    }
+
+    #[test]
+    fn append_flags_reject_unknown_bits_and_conflicting_policies() {
+        assert!(AppendFlags::from_bits(0x80).is_err());
+        assert!(
+            AppendFlags::from_bits((AppendFlags::REQUIRE_EXISTS | AppendFlags::REQUIRE_NEW).bits())
+                .is_err()
+        );
+        assert!(
+            AppendFlags::from_bits((AppendFlags::REQUIRE_NEW | AppendFlags::OVERWRITE).bits())
+                .is_err()
+        );
+    }
 
     #[test]
     fn unknown_stream_counts_keep_the_existing_wire_sentinel() {

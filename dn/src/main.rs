@@ -6,9 +6,8 @@
 //! what a create costs. DN owns the `StreamId`; the SN it picks records
 //! `(RangeId, StreamId)`.
 //!
-//! ⚠️ **The hash table sharded by name is a stand-in for a B-tree** with a read and
-//! a write lock per node, walked by locking a parent and then a child. Nothing is
-//! recycled yet: deleted array entries remain tombstones.
+//! ⚠️ **The hash table by name is a stand-in for a B-tree** with a read and a
+//! write lock. Nothing is recycled yet: deleted array entries remain tombstones.
 //!
 //! A create waits on an SN, and waits without holding a worker: the names are
 //! taken, the streams are asked for, and the client's `Reply` travels with that
@@ -22,8 +21,8 @@ use common::deletion::{
 use common::framing::Framing;
 use common::ids::{DnId, ExtentId, ObjectId, RangeId, SnId, StreamId};
 use common::info::{
-    Batch, Described, Expecting, ExtentRow, ExtentRun, Listing, ObjectName, Shape, StreamName,
-    StreamRow, Totals, UNKNOWN, Wanted,
+    AppendFlags, Batch, Described, Expecting, ExtentRow, ExtentRun, Listing, ObjectName, Shape,
+    StreamName, StreamRow, Totals, UNKNOWN, Wanted,
 };
 use common::logw;
 use common::offset::{OCoff, OEoff, OLoff, ORoff, SCoff, SLoff, SRoff};
@@ -34,7 +33,7 @@ use common::time::TimeSec;
 use common::{Arg, Op, Req, Resp, Status, StructWriter, structure};
 use raft::codec::Wire;
 use raft::runtime::{Host, Settings as RaftSettings};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Deref;
 #[cfg(test)]
 use std::sync::atomic::AtomicU32;
@@ -66,12 +65,11 @@ const SERVES: &[Op] = &[
     Op::TimeRange,
 ];
 
-const SHARDS: usize = 64;
-
 /// A single open stream can grow to just under 2^62 records. Do not create one
 /// above this point, so the object's record offset remains representable even
 /// though the stream itself does not need to know the object's total.
 const OPEN_STREAM_RECORD_LIMIT: u64 = 3 * (1u64 << 62);
+const CREATE_REJECT_KEEP: u64 = 1 << 16;
 
 type ExtentReply = (ExtentRun, Vec<ExtentRow>);
 
@@ -246,6 +244,8 @@ impl Levelled {
 
 struct Object {
     deletion: Flags,
+    /// Permanently skip the soft-delete interval when this object is deleted.
+    purge_only: bool,
     /// ⚠️ **`u32`, minted per range**, so an object's name is `(RangeId, ObjectId, CreateSec)` —
     /// the same triple as a stream's and an extent's (§17.35.2). **A path is not part of it**: a
     /// path points at a name and may be repointed as often as a user likes, which is exactly what
@@ -261,13 +261,15 @@ struct Object {
     /// A stream fills, so an object grows more of them; the last is the one appends
     /// go to and the record ranges say which holds what.
     streams: Vec<StreamId>,
+    /// The DN row and stream definition are durable, but the SN has not confirmed it yet.
+    creating: bool,
     /// An extension is being asked of an SN, so anything else that wants one waits
     /// rather than asking for a second.
     extending: bool,
     /// Requests waiting for this object to have a stream they can use: the first
     /// stream while it is being made, or the next one while it is being asked for.
     ///
-    /// ⚠️ **They live here, under the shard's lock, and not in a table of their
+    /// ⚠️ **They live here, under the object-table lock, and not in a table of their
     /// own.** Deciding to wait and then waiting have to be one step: with a lock
     /// released in between, the work can finish and wake nobody, and the waiter is
     /// left holding a `Reply` that nothing will ever answer.
@@ -422,7 +424,7 @@ impl Object {
     /// or the next one is being asked for. Waiting is better than being told there is
     /// no stream, which is true for a moment and useless to hear.
     fn between_streams(&self) -> bool {
-        self.streams.is_empty() || self.extending
+        self.creating || self.streams.is_empty() || self.extending
     }
 
     /// What this object is, at one of its streams: the last for an append, or the one
@@ -434,6 +436,9 @@ impl Object {
         dn: DnId,
         record: Option<ORoff>,
     ) -> Option<Vec<Arg>> {
+        if self.creating {
+            return None;
+        }
         // ⚠️ The position comes back *with* the stream, because the stream does not carry
         // it (§17.33.1) — the same shape as `sn::Placed`, and for the same reason.
         let (first, held) = match record {
@@ -772,11 +777,12 @@ struct DN {
     gc_thread: Mutex<Option<JoinHandle<()>>>,
     deleting: Mutex<()>,
     retired_objects: Mutex<std::collections::HashSet<String>>,
+    create_rejects: Mutex<CreateRejects>,
     /// This DN's own identity.
     dn: DnId,
     /// The RangeId managed by this DN (#109, `routing::range_of_dn`).
     mine: RangeId,
-    shards: Vec<Mutex<HashMap<Box<str>, Object>>>,
+    object_table: RwLock<HashMap<Box<str>, Object>>,
     /// How many requests are waiting for an object to have a stream, for `status`.
     parked: AtomicU64,
     objects: AtomicU64,
@@ -784,8 +790,9 @@ struct DN {
     /// costs.
     streams: AtomicU64,
     next_object: AtomicU64,
+    next_stream: AtomicU64,
     /// The current DN serves one range (`mine`). StreamId indexes this range's table.
-    /// Lock an object shard before this table; never hold either across a network call.
+    /// Lock the object table before this table; never hold either across a network call.
     stream_table: RwLock<Vec<Stream>>,
     // Sparse, range-scoped metadata. Lock owner before extras, never the reverse.
     object_extras: Mutex<Extras<(ObjectId, TimeSec)>>,
@@ -794,23 +801,45 @@ struct DN {
     _test_dir: Option<tempfile::TempDir>,
 }
 
+struct CreateReject {
+    status: Status,
+    message: String,
+}
+
+#[derive(Default)]
+struct CreateRejects {
+    by_id: HashMap<ObjectId, (u64, CreateReject)>,
+    order: VecDeque<(u64, ObjectId)>,
+}
+
+impl CreateRejects {
+    fn record(&mut self, index: u64, id: ObjectId, reject: Option<CreateReject>) {
+        let oldest = index.saturating_sub(CREATE_REJECT_KEEP);
+        while self.order.front().is_some_and(|(at, _)| *at < oldest) {
+            let (at, id) = self.order.pop_front().unwrap();
+            if self.by_id.get(&id).is_some_and(|(stored, _)| *stored == at) {
+                self.by_id.remove(&id);
+            }
+        }
+        if let Some(reject) = reject {
+            self.by_id.insert(id, (index, reject));
+            self.order.push_back((index, id));
+        } else {
+            self.by_id.remove(&id);
+        }
+    }
+
+    fn take(&mut self, id: ObjectId) -> Option<Resp> {
+        self.by_id.remove(&id).map(|(_, reject)| Resp::error(reject.status, reject.message))
+    }
+}
+
 impl Deref for DN {
     type Target = raft::runtime::Runtime<DNState>;
 
     fn deref(&self) -> &Self::Target {
         &self.common
     }
-}
-
-fn shard_of(name: &str) -> usize {
-    // A cheap spread over the name: the tail varies most in a generated name,
-    // and a hash of the whole string costs more than this decides.
-    let bytes = name.as_bytes();
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes.iter().rev().take(8).chain(bytes.first()) {
-        hash = (hash ^ *byte as u64).wrapping_mul(0x100_0000_01b3);
-    }
-    hash as usize % SHARDS
 }
 
 impl Service for DN {
@@ -1003,18 +1032,22 @@ impl DN {
         let _serial = self.deleting.lock().expect("deletion");
         let now = TimeSec::now();
         let maximum = process.cluster.max_soft_delete_retention_secs;
-        let ids = {
-            let mut shard = self.shards[shard_of(path)].lock().expect("objects");
-            let Some(object) = shard.get_mut(path.as_str()) else {
+        let (ids, deletion) = {
+            let mut objects = self.object_table.write().expect("objects");
+            let Some(object) = objects.get_mut(path.as_str()) else {
                 return if self.retired_objects.lock().unwrap().contains(path) {
                     Ok(())
                 } else {
                     Err(Resp::error(Status::NotFound, "no object"))
                 };
             };
-            if object.extending || object.streams.is_empty() {
+            if object.creating || object.extending || object.streams.is_empty() {
                 return Err(bad("object creation or extension is in progress; retry deletion"));
             }
+            // `purge_only` is an object's persistent deletion policy. On its first
+            // delete, perform the soft and hard transitions together and ignore the
+            // caller's ordinary retention window.
+            let deletion = deletion_policy(deletion.clone(), object.purge_only);
             let key = (object.id, object.created);
             let mut extras = self.object_extras.lock().expect("object extras");
             let first_hard = deletion.hard && !object.deletion.deleted();
@@ -1055,7 +1088,7 @@ impl DN {
                     stream_extras.release_hard(&key, &mut stream.deletion).map_err(bad)?;
                 }
             }
-            object.streams.clone()
+            (object.streams.clone(), deletion)
         };
         // Each occurrence released a reference above; fan out once per distinct child.
         let mut seen = std::collections::HashSet::new();
@@ -1106,15 +1139,15 @@ impl DN {
             }
         }
         if deletion.hard {
-            let mut shard = self.shards[shard_of(path)].lock().unwrap();
-            let object = shard.get_mut(path.as_str()).expect("deleting object");
+            let mut objects = self.object_table.write().unwrap();
+            let object = objects.get_mut(path.as_str()).expect("deleting object");
             let key = (object.id, object.created);
             assert!(self.object_extras.lock().unwrap().reclaim(
                 &key,
                 &mut object.deletion,
                 TimeSec::now()
             ));
-            shard.remove(path.as_str());
+            objects.remove(path.as_str());
             self.retired_objects.lock().unwrap().insert(path.clone());
             self.objects.fetch_sub(1, Ordering::Relaxed);
         }
@@ -1143,8 +1176,8 @@ impl DN {
             return reply
                 .send(Resp::error(Status::BadRequest, "seal-object has trailing arguments"));
         }
-        let mut shard = self.shards[shard_of(&name)].lock().expect("objects");
-        let Some(object) = shard.get_mut(name.as_str()) else {
+        let mut objects = self.object_table.write().expect("objects");
+        let Some(object) = objects.get_mut(name.as_str()) else {
             return reply.send(Resp::error(Status::NotFound, format!("no object {name}")));
         };
         if !object.deletion.readable(false) {
@@ -1233,7 +1266,6 @@ impl DN {
             ));
         }
 
-        let destination_shard = shard_of(&destination);
         let mut copied = Vec::new();
         let mut records = ORoff::ZERO;
         let mut framing = None;
@@ -1248,8 +1280,8 @@ impl DN {
                     "concat destination must differ from its sources",
                 ));
             }
-            let shard = self.shards[shard_of(source)].lock().expect("objects");
-            let Some(object) = shard.get(source.as_str()) else {
+            let objects = self.object_table.read().expect("objects");
+            let Some(object) = objects.get(source.as_str()) else {
                 return reply.send(Resp::error(Status::NotFound, format!("no object {source}")));
             };
             if !object.deletion.readable(false) {
@@ -1368,20 +1400,22 @@ impl DN {
             };
             let created = TimeSec::now();
             {
-                let mut shard = self.shards[destination_shard].lock().expect("objects");
-                if shard.contains_key(destination.as_str()) {
+                let mut objects = self.object_table.write().expect("objects");
+                if objects.contains_key(destination.as_str()) {
                     return reply.send(Resp::error(
                         Status::BadRequest,
                         format!("{destination} exists already"),
                     ));
                 }
-                shard.insert(
+                objects.insert(
                     destination.clone().into_boxed_str(),
                     Object {
                         deletion: Flags::default(),
+                        purge_only: false,
                         id: ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32),
                         framing: framing.expect("at least two sources"),
                         streams: Vec::new(),
+                        creating: false,
                         extending: true,
                         waiting: vec![reply],
                         keyed: keyed.expect("at least two sources"),
@@ -1444,8 +1478,8 @@ impl DN {
         };
         let created = TimeSec::now();
         {
-            let mut shard = self.shards[destination_shard].lock().expect("objects");
-            if shard.contains_key(destination.as_str()) {
+            let mut objects = self.object_table.write().expect("objects");
+            if objects.contains_key(destination.as_str()) {
                 return reply.send(Resp::error(
                     Status::BadRequest,
                     format!("{destination} exists already"),
@@ -1456,15 +1490,17 @@ impl DN {
             }
             let object = Object {
                 deletion: Flags::default(),
+                purge_only: false,
                 id: ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32),
                 framing: framing.expect("at least two sources"),
                 streams: copied,
+                creating: false,
                 extending: true,
                 waiting: vec![reply],
                 keyed: keyed.expect("at least two sources"),
                 created,
             };
-            shard.insert(destination.clone().into_boxed_str(), object);
+            objects.insert(destination.clone().into_boxed_str(), object);
         }
 
         let stream_name = StreamName { range: self.mine, stream, created };
@@ -1535,12 +1571,12 @@ impl DN {
 
     /// Complete the asynchronous stream creation behind an object concat.
     fn finish_concat(&self, name: &str, stream: StreamId, sn: SnId) {
-        let mut shard = self.shards[shard_of(name)].lock().expect("objects");
-        let Some(object) = shard.get_mut(name) else { return };
+        let mut objects = self.object_table.write().expect("objects");
+        let Some(object) = objects.get_mut(name) else { return };
         object.streams.push(self.install_stream(Stream::new(stream, sn, object.created)));
         object.extending = false;
         self.objects.fetch_add(1, Ordering::Relaxed);
-        drop(shard);
+        drop(objects);
         self.wake(&[name.to_string()], None);
     }
 
@@ -1554,8 +1590,8 @@ impl DN {
         logical: SLoff,
         compressed: SCoff,
     ) {
-        let mut shard = self.shards[shard_of(name)].lock().expect("objects");
-        let Some(object) = shard.get_mut(name) else { return };
+        let mut objects = self.object_table.write().expect("objects");
+        let Some(object) = objects.get_mut(name) else { return };
         object.streams.push(self.install_stream(Stream {
             deletion: Flags::default(),
             id: stream,
@@ -1568,15 +1604,16 @@ impl DN {
         }));
         object.extending = false;
         self.objects.fetch_add(1, Ordering::Relaxed);
-        drop(shard);
+        drop(objects);
         self.wake(&[name.to_string()], None);
     }
 
     /// Remove a concat object that could not obtain its final stream and answer all
     /// readers that were parked behind its creation.
     fn fail_concat(&self, name: &str, failure: Resp) {
-        let waiters = self.shards[shard_of(name)]
-            .lock()
+        let waiters = self
+            .object_table
+            .write()
             .expect("objects")
             .remove(name)
             .map(|object| {
@@ -1627,6 +1664,10 @@ impl DN {
                 return Resp::error(Status::BadRequest, e.to_string());
             }
         }
+        let flags = match AppendFlags::read(&mut payload) {
+            Ok(flags) => flags,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
         if let Err(e) = payload.done() {
             return Resp::error(Status::BadRequest, e.to_string());
         }
@@ -1636,13 +1677,14 @@ impl DN {
                 "a create-object request has trailing arguments",
             );
         }
+        if let Err(answer) = validate_create_names(std::slice::from_ref(&wanted)) {
+            return answer;
+        }
         let name = wanted.name.clone();
-        self.record(process, vec![wanted], move |dn, made| {
-            if made == 0 {
-                return Resp::error(Status::BadRequest, format!("{name} exists already"));
-            }
+        self.record(process, vec![wanted], flags, move |dn, _made| {
             // The object it just made, in the same shape object-info answers, so an
-            // append that had to create one needs no second lookup to go on with.
+            // append that had to create one needs no second lookup to go on with. An
+            // accepted name collision returns the existing row here as well.
             match dn.look(&name) {
                 Some(args) => Resp::from_args(Status::Ok, args).id(0),
                 None => Resp::error(Status::Internal, format!("{name} went missing")),
@@ -1676,6 +1718,10 @@ impl DN {
                 }
             }
         }
+        let flags = match AppendFlags::read(&mut payload) {
+            Ok(flags) => flags,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
         if let Err(e) = payload.done() {
             return Resp::error(Status::BadRequest, e.to_string());
         }
@@ -1685,130 +1731,226 @@ impl DN {
                 "a batch-create request has trailing arguments",
             );
         }
-        self.record(process, wanted, |_, made| Resp::number(Status::Ok, made))
+        if let Err(answer) = validate_create_names(&wanted) {
+            return answer;
+        }
+        self.record(process, wanted, flags, |_, made| Resp::number(Status::Ok, made))
     }
 
-    /// Reserve names and stream ids locally, ask the SN to create its streams,
-    /// then replicate all new DN rows in one Raft action. A batch request remains
-    /// one action regardless of how many objects it contains.
+    /// Replicate pending names first, create the streams on SN, then replicate ready.
+    /// The SN call is always outside the global lock.
     fn record(
         &self,
         process: &Process,
         wanted: Vec<Wanted>,
+        flags: AppendFlags,
         say: impl FnOnce(&DN, u64) -> Resp,
     ) -> Resp {
+        if wanted.is_empty() {
+            return say(self, 0);
+        }
         let created = TimeSec::now();
-
-        // Whoever inserts the name owns it; a concurrent request finds the
-        // reservation and does not create a second stream.
-        let mut mine = Vec::with_capacity(wanted.len());
-        let streams = {
-            let _state = self.global_lock.read();
-            for one in &wanted {
-                let mut shard = self.shards[shard_of(&one.name)].lock().expect("objects");
-                if !shard.contains_key(one.name.as_str()) {
-                    let id = ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32);
-                    shard.insert(
-                        Box::from(one.name.as_str()),
-                        Object {
-                            deletion: Flags::default(),
-                            id,
-                            framing: one.framing,
-                            streams: Vec::new(),
-                            extending: false,
-                            waiting: Vec::new(),
-                            keyed: one.keyed,
-                            created,
-                        },
-                    );
-                    mine.push((one.clone(), id));
-                }
-            }
-            if mine.is_empty() {
-                return say(self, 0);
-            }
-            match self.reserve_streams(mine.len()) {
+        // A pending action survives a failed or interrupted SN call. A repeated
+        // create can finish that exact declaration because CreateStream is idempotent.
+        let candidate = if let Some(rows) = self.pending_for(&wanted) {
+            rows
+        } else {
+            let sn = match process.pick(ServiceKind::Sn) {
+                Ok(sn) => sn.to_string(),
+                Err(error) => return Resp::error(Status::Internal, error.to_string()),
+            };
+            let sn_number =
+                SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
+            let first_object =
+                match claim_ids(&self.next_object, wanted.len(), ObjectId::NONE.number(), "object")
+                {
+                    Ok(first) => first,
+                    Err(error) => return Resp::error(Status::Internal, error.to_string()),
+                };
+            let streams = match self.allocate_stream_ids(wanted.len()) {
                 Ok(streams) => streams,
-                Err(error) => {
-                    let names: Vec<_> = mine.iter().map(|(one, _)| one.name.clone()).collect();
-                    let failed = self.give_back(&names, Status::Internal, error.to_string());
-                    self.wake(&names, Some(&failed));
-                    return failed;
-                }
+                Err(error) => return Resp::error(Status::Internal, error.to_string()),
+            };
+            let rows: Vec<_> = wanted
+                .iter()
+                .zip(streams)
+                .enumerate()
+                .map(|(offset, (one, stream))| DnCreateRow {
+                    name: one.name.clone(),
+                    id: ObjectId::new((first_object + offset as u64) as u32),
+                    keyed: one.keyed,
+                    framing: one.framing,
+                    created,
+                    stream,
+                    sn: sn_number,
+                })
+                .collect();
+            let action = match dn_action(&DnCreateCmd { rows: rows.clone(), flags }) {
+                Ok(action) => action,
+                Err(error) => return Resp::error(Status::Internal, error.to_string()),
+            };
+            let ticket = match self.queue_client(action) {
+                Ok(ticket) => ticket,
+                Err(error) => return Resp::error(Status::Internal, error.to_string()),
+            };
+            let index = match ticket.wait() {
+                Ok(index) => index,
+                Err(error) => return Resp::error(Status::Internal, error.to_string()),
+            };
+            if let Err(error) = self.wait_applied(index) {
+                logw!("DN create action did not finish", "error {error}");
+                return Resp::error(Status::Internal, error.to_string());
             }
+            if let Some(answer) = self
+                .create_rejects
+                .lock()
+                .expect("create rejects")
+                .take(ObjectId::new(first_object as u32))
+            {
+                return answer;
+            }
+            rows
         };
 
-        // Keep one reserved stream identity for each object name. Stream IDs may
-        // eventually be recycled, so a batch is an explicit list, never a range.
-        let count = mine.len() as u64;
-        let sn = match process.pick(ServiceKind::Sn) {
-            Ok(sn) => sn.to_string(),
-            Err(e) => return self.fail_record(&mine, Status::Internal, e.to_string()),
+        // A name collision makes the initial Raft action a no-op for the whole
+        // batch. Resolve the stream owner from the persisted row: an exact stream
+        // identity collision reuses the original stream and its SN.
+        let Some(rows) = self.pending_rows(&candidate) else {
+            return say(self, 0);
         };
-        let names: Vec<StreamName> = streams
-            .iter()
-            .map(|stream| StreamName { range: self.mine, stream: *stream, created })
-            .collect();
-        let ask = create_streams(&names);
-
-        let sn_number =
-            SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
-        let answer = match process.call(&sn, &ask) {
-            Ok(answer) => answer,
-            Err(error) => return self.fail_record(&mine, Status::Internal, error.to_string()),
-        };
-        if answer.status != Status::Ok {
-            return self.fail_record(
-                &mine,
-                answer.status,
-                format!("SN{sn_number} would not make {count} streams"),
-            );
+        let mut by_sn = HashMap::<SnId, Vec<StreamName>>::new();
+        for row in &rows {
+            by_sn.entry(row.sn).or_default().push(StreamName {
+                range: self.mine,
+                stream: row.stream,
+                created: row.created,
+            });
+        }
+        for (sn_id, names) in by_sn {
+            let Some(sn) = process
+                .cluster
+                .services
+                .iter()
+                .find(|entry| entry.kind == ServiceKind::Sn && entry.number() == sn_id.number())
+                .map(|entry| entry.identity.as_str())
+            else {
+                return Resp::error(Status::Internal, format!("unknown SN {sn_id}"));
+            };
+            let answer = match process.call(sn, &create_streams(&names)) {
+                Ok(answer) => answer,
+                Err(error) => return Resp::error(Status::Internal, error.to_string()),
+            };
+            if answer.status != Status::Ok {
+                return Resp::error(
+                    answer.status,
+                    format!("SN{sn_id} would not make {} streams", names.len()),
+                );
+            }
         }
 
-        let rows = mine
-            .iter()
-            .zip(streams)
-            .map(|((one, id), stream)| DnCreateRow {
-                name: one.name.clone(),
-                id: *id,
-                keyed: one.keyed,
-                framing: one.framing,
-                created,
-                stream,
-                sn: sn_number,
-            })
-            .collect();
-        let action = match dn_action(&DnCreateCmd { rows }) {
+        let ready = DnCreateReadyCmd {
+            rows: rows
+                .iter()
+                .map(|row| DnReadyRow {
+                    name: row.name.clone(),
+                    id: row.id,
+                    stream: row.stream,
+                    created: row.created,
+                    sn: row.sn,
+                })
+                .collect(),
+        };
+        let action = match dn_ready_action(&ready) {
             Ok(action) => action,
-            Err(error) => return self.fail_record(&mine, Status::Internal, error.to_string()),
+            Err(error) => return Resp::error(Status::Internal, error.to_string()),
         };
         let ticket = match self.queue_client(action) {
             Ok(ticket) => ticket,
-            Err(error) => return self.fail_record(&mine, Status::Internal, error.to_string()),
+            Err(error) => return Resp::error(Status::Internal, error.to_string()),
         };
         let index = match ticket.wait() {
             Ok(index) => index,
-            Err(error) => return self.fail_record(&mine, Status::Internal, error.to_string()),
+            Err(error) => return Resp::error(Status::Internal, error.to_string()),
         };
         if let Err(error) = self.wait_applied(index) {
-            // Once committed, the action may still apply after a wait error. Leave
-            // its reservations in place rather than making its ids available again.
-            logw!("DN create action did not finish", "error {error}");
             return Resp::error(Status::Internal, error.to_string());
         }
-
         let _state = self.global_lock.read();
-        let names: Vec<_> = mine.iter().map(|(one, _)| one.name.clone()).collect();
-        self.wake(&names, None);
-        say(self, count)
+        say(self, rows.len() as u64)
     }
 
-    fn fail_record(&self, mine: &[(Wanted, ObjectId)], status: Status, why: String) -> Resp {
-        let names: Vec<_> = mine.iter().map(|(one, _)| one.name.clone()).collect();
+    fn pending_for(&self, wanted: &[Wanted]) -> Option<Vec<DnCreateRow>> {
+        if wanted.is_empty() {
+            return None;
+        }
         let _state = self.global_lock.read();
-        let failed = self.give_back(&names, status, why);
-        self.wake(&names, Some(&failed));
-        failed
+        let objects = self.object_table.read().ok()?;
+        let streams = self.stream_table.read().ok()?;
+        let mut seen = std::collections::HashSet::new();
+        let mut rows = Vec::with_capacity(wanted.len());
+        for one in wanted {
+            if !seen.insert(one.name.as_str()) {
+                return None;
+            }
+            let object = objects.get(one.name.as_str())?;
+            if !object.creating
+                || object.keyed != one.keyed
+                || object.framing != one.framing
+                || object.streams.len() != 1
+            {
+                return None;
+            }
+            let stream_id = object.streams[0];
+            let stream = streams.get(stream_id.get() as usize)?;
+            if stream.id != stream_id
+                || stream.created != object.created
+                || stream.deletion.soft_deleted()
+                || stream.deletion.deleted()
+            {
+                return None;
+            }
+            rows.push(DnCreateRow {
+                name: one.name.clone(),
+                id: object.id,
+                keyed: object.keyed,
+                framing: object.framing,
+                created: object.created,
+                stream: stream_id,
+                sn: stream.sn,
+            });
+        }
+        Some(rows)
+    }
+
+    fn pending_rows(&self, expected: &[DnCreateRow]) -> Option<Vec<DnCreateRow>> {
+        let _state = self.global_lock.read();
+        let objects = self.object_table.read().ok()?;
+        let streams = self.stream_table.read().ok()?;
+        let mut rows = Vec::with_capacity(expected.len());
+        for row in expected {
+            let object = objects.get(row.name.as_str())?;
+            if !object.creating
+                || object.id != row.id
+                || object.created != row.created
+                || object.keyed != row.keyed
+                || object.framing != row.framing
+                || object.streams.as_slice() != [row.stream]
+            {
+                return None;
+            }
+            let stream = streams.get(row.stream.get() as usize)?;
+            if stream.id != row.stream
+                || stream.created != row.created
+                || stream.deletion.soft_deleted()
+                || stream.deletion.deleted()
+            {
+                return None;
+            }
+            let mut row = row.clone();
+            row.sn = stream.sn;
+            rows.push(row);
+        }
+        Some(rows)
     }
 
     /// `(name, sealed stream, records)`: that stream is full, so give the object
@@ -1829,9 +1971,14 @@ impl DN {
         // deadlock rather than a slow path.
         let mut carry = Some(reply);
         let next = {
-            let mut shard = self.shards[shard_of(&name)].lock().expect("objects");
-            match shard.get_mut(name.as_str()) {
+            let mut objects = self.object_table.write().expect("objects");
+            match objects.get_mut(name.as_str()) {
                 None => Next::Say(Resp::error(Status::NotFound, format!("no object {name}"))),
+                Some(object) if object.creating => {
+                    object.waiting.push(carry.take().expect("a reply"));
+                    self.parked.fetch_add(1, Ordering::Relaxed);
+                    Next::Wait
+                }
                 Some(object) if !object.deletion.readable(false) => {
                     Next::Say(bad("object is deleted"))
                 }
@@ -1926,8 +2073,8 @@ impl DN {
                 return reply.send(failed);
             }
             {
-                let mut shard = dn.shards[shard_of(&name)].lock().expect("objects");
-                if let Some(object) = shard.get_mut(name.as_str()) {
+                let mut objects = dn.object_table.write().expect("objects");
+                if let Some(object) = objects.get_mut(name.as_str()) {
                     object.streams.push(dn.install_stream(Stream::new(stream, sn_number, created)));
                     object.extending = false;
                 }
@@ -1948,7 +2095,7 @@ impl DN {
     /// An extension that could not be made: stop claiming one is in flight, or
     /// everything waiting behind it waits for ever.
     fn gave_up(&self, name: &str, status: Status, why: String) -> Resp {
-        if let Some(object) = self.shards[shard_of(name)].lock().expect("objects").get_mut(name) {
+        if let Some(object) = self.object_table.write().expect("objects").get_mut(name) {
             object.extending = false;
         }
         Resp::error(status, why)
@@ -1957,8 +2104,7 @@ impl DN {
     /// Release names taken for objects that could not be given a stream.
     fn give_back(&self, names: &[String], status: Status, why: String) -> Resp {
         for name in names {
-            if let Some(object) =
-                self.shards[shard_of(name)].lock().expect("objects").remove(name.as_str())
+            if let Some(object) = self.object_table.write().expect("objects").remove(name.as_str())
             {
                 self.release_streams(&object.streams);
             }
@@ -2012,56 +2158,66 @@ impl DN {
         };
         let name = name.as_str();
         let limit = self.config.info_entries;
-        // Under one lock: describe, or park. Deciding to wait and then waiting must be
-        // one step, or the work can finish in between and wake nobody.
+        // Most lookups only read the object table. If it is between streams, take
+        // the write lock and recheck before parking, so a completion cannot wake
+        // nobody in the gap.
         let mut carry = Some(reply);
-        let described = {
-            let mut shard = self.shards[shard_of(name)].lock().expect("objects");
-            match shard.get_mut(name) {
+        let describe = |object: &Object| -> Option<Result<Answering, Resp>> {
+            // ⚠️ **The check goes here and nowhere else**, because the DN owns the path
+            // table and is the only tier that can see a path point somewhere new. A read
+            // answers with blocks and an append with a receipt; neither says which object
+            // it was about, so without this a caller is answered about a different one and
+            // cannot tell (§17.36).
+            if !want.expect.holds(object.named(self.mine)) {
+                return Some(Err(Resp::error(
+                    Status::Replaced,
+                    format!("{name} is {} and not {}", object.named(self.mine), want.expect.0),
+                )));
+            }
+            if object.deletion.soft_deleted() && !object.deletion.deleted() && !include {
+                return Some(Err(bad(
+                    "object is soft-deleted; reading requires read-soft-deleted",
+                )));
+            }
+            if object.deletion.deleted()
+                || object.streams.iter().any(|id| {
+                    self.stream_table.read().unwrap()[id.get() as usize].deletion.deleted()
+                })
+            {
+                return Some(Err(Resp::error(Status::NotFound, "object is deleted")));
+            }
+            match describe_at(
+                object,
+                &self.stream_table.read().expect("streams"),
+                self.mine,
+                self.dn,
+                record,
+                &want,
+                limit,
+            ) {
+                Some(answering) => Some(Ok(answering)),
+                None if object.between_streams() => None,
                 None => Some(Err(Resp::error(Status::NotFound, format!("no object {name}")))),
-                // ⚠️ **The check goes here and nowhere else**, because the DN owns the path
-                // table and is the only tier that can see a path point somewhere new. A read
-                // answers with blocks and an append with a receipt; neither says which object
-                // it was about, so without this a caller is answered about a different one and
-                // cannot tell (§17.36).
-                Some(object) if !want.expect.holds(object.named(self.mine)) => {
-                    Some(Err(Resp::error(
-                        Status::Replaced,
-                        format!("{name} is {} and not {}", object.named(self.mine), want.expect.0),
-                    )))
-                }
-                Some(object)
-                    if object.deletion.soft_deleted() && !object.deletion.deleted() && !include =>
-                {
-                    Some(Err(bad("object is soft-deleted; reading requires read-soft-deleted")))
-                }
-                Some(object)
-                    if object.deletion.deleted()
-                        || object.streams.iter().any(|id| {
-                            self.stream_table.read().unwrap()[id.get() as usize].deletion.deleted()
-                        }) =>
-                {
-                    Some(Err(Resp::error(Status::NotFound, "object is deleted")))
-                }
-                Some(object) => match describe_at(
-                    object,
-                    &self.stream_table.read().expect("streams"),
-                    self.mine,
-                    self.dn,
-                    record,
-                    &want,
-                    limit,
-                ) {
-                    Some(answering) => Some(Ok(answering)),
-                    None if object.between_streams() => {
+            }
+        };
+        let mut described = match self.object_table.read().expect("objects").get(name) {
+            Some(object) => describe(object),
+            None => Some(Err(Resp::error(Status::NotFound, format!("no object {name}")))),
+        };
+        if described.is_none() {
+            let mut objects = self.object_table.write().expect("objects");
+            described = match objects.get_mut(name) {
+                Some(object) => match describe(object) {
+                    None => {
                         object.waiting.push(carry.take().expect("a reply"));
                         self.parked.fetch_add(1, Ordering::Relaxed);
                         None
                     }
-                    None => Some(Err(Resp::error(Status::NotFound, format!("no object {name}")))),
+                    answered => answered,
                 },
-            }
-        };
+                None => Some(Err(Resp::error(Status::NotFound, format!("no object {name}")))),
+            };
+        }
         let (Some(described), Some(reply)) = (described, carry) else { return };
         match described {
             Err(refused) => reply.send(refused),
@@ -2147,15 +2303,15 @@ impl DN {
     }
 
     /// What the SNs said a stream has come to, kept against the next question about it
-    /// (§17.25.1). Takes the name's shard lock, so nothing may hold it.
+    /// (§17.25.1). Takes the object-table lock, so nothing may hold it.
     fn remember(&self, name: &str, runs: &[Option<ExtentReply>]) {
         if runs.is_empty() {
             return;
         }
-        let mut shard = self.shards[shard_of(name)].lock().expect("objects");
+        let objects = self.object_table.read().expect("objects");
         // Gone while the SNs answered: a deleted object is not a lost update worth caring
         // about, since the streams it named are going away too.
-        let Some(object) = shard.get_mut(name) else { return };
+        let Some(object) = objects.get(name) else { return };
         let mut table = self.stream_table.write().expect("streams");
         for id in &object.streams {
             let held = &mut table[id.get() as usize];
@@ -2171,8 +2327,8 @@ impl DN {
     fn wake(&self, names: &[String], failed: Option<&Resp>) {
         for name in names {
             let (waiters, args) = {
-                let mut shard = self.shards[shard_of(name)].lock().expect("objects");
-                match shard.get_mut(name.as_str()) {
+                let mut objects = self.object_table.write().expect("objects");
+                match objects.get_mut(name.as_str()) {
                     Some(object) => (
                         std::mem::take(&mut object.waiting),
                         object.args(
@@ -2387,10 +2543,10 @@ impl DN {
 
     /// One name's worth of a batch answer, and what it costs in entries.
     ///
-    /// ⚠️ **Takes the name's shard lock** — see `look`.
+    /// ⚠️ **Takes the object-table read lock** — see `look`.
     fn piece(&self, name: &str, want: &Want, room: u64) -> Option<Piece> {
-        let shard = self.shards[shard_of(name)].lock().expect("objects");
-        let object = shard.get(name)?;
+        let objects = self.object_table.read().expect("objects");
+        let object = objects.get(name)?;
         if !object.deletion.readable(false) {
             return None;
         }
@@ -2416,16 +2572,16 @@ impl DN {
     /// What an object is: id, stream, the SN holding it, the second it was made,
     /// its flavour, and its framing as a kind and a width.
     ///
-    /// ⚠️ **Takes the name's shard lock**, so a caller already holding one deadlocks
-    /// against itself. Anything working under a shard lock builds its own answer
+    /// ⚠️ **Takes the object-table read lock**, so a caller already holding it
+    /// deadlocks against itself. Anything working under a write lock builds its answer
     /// from the object it already has.
     fn look(&self, name: &str) -> Option<Vec<Arg>> {
         self.describe(name, None)
     }
 
-    /// ⚠️ **Takes the name's shard lock** — see `look`.
+    /// ⚠️ **Takes the object-table read lock** — see `look`.
     fn describe(&self, name: &str, record: Option<ORoff>) -> Option<Vec<Arg>> {
-        self.shards[shard_of(name)].lock().expect("objects").get(name)?.args(
+        self.object_table.read().expect("objects").get(name)?.args(
             &self.stream_table.read().expect("streams"),
             self.mine,
             self.dn,
@@ -2434,11 +2590,42 @@ impl DN {
     }
 }
 
+/// Apply an object's persistent deletion policy to a later delete request.
+fn deletion_policy(deletion: Delete, purge_only: bool) -> Delete {
+    if purge_only {
+        Delete {
+            target: deletion.target,
+            retention: Some(common::time::TimeIntSec64::MIN),
+            hard: true,
+        }
+    } else {
+        deletion
+    }
+}
+
+/// Duplicate names are a malformed command, independent of the current object table.
+/// Presence policies are decided by the replicated apply while it holds the state lock.
+fn validate_create_names(wanted: &[Wanted]) -> Result<(), Resp> {
+    let mut names = std::collections::HashSet::with_capacity(wanted.len());
+    for one in wanted {
+        if !names.insert(one.name.as_str()) {
+            return Err(bad("create request repeats an object name"));
+        }
+    }
+    Ok(())
+}
+
 impl DN {
-    /// Apply a whole object-creation request after every corresponding SN stream
-    /// exists. Validate and reserve first so a malformed or conflicting batch
-    /// cannot leave a prefix of its rows visible.
-    fn apply_create(&self, cmd: DnCreateCmd) -> common::Result<()> {
+    /// Declare a batch as pending. ObjectInfo cannot expose these rows until the
+    /// matching ready action follows successful stream creation at the SN.
+    fn apply_create(&self, cmd: DnCreateCmd) -> common::Result<Option<CreateReject>> {
+        #[derive(Clone, Copy)]
+        enum Choice {
+            New,
+            Same,
+            Keep,
+        }
+
         if cmd.rows.is_empty() {
             return Err(common::Error::new("empty DN create action"));
         }
@@ -2446,9 +2633,10 @@ impl DN {
         let mut names = std::collections::HashSet::new();
         let mut object_ids = std::collections::HashSet::new();
         let mut stream_ids = std::collections::HashSet::new();
-        let mut complete = Vec::with_capacity(cmd.rows.len());
-        let mut add_per_shard = [0usize; SHARDS];
+        let mut choices = Vec::with_capacity(cmd.rows.len());
+        let mut add_objects = 0usize;
         let mut needed_streams = 0usize;
+        let objects = self.object_table.read().expect("objects");
         for row in &cmd.rows {
             if row.id.is_none() || row.stream.is_none() || row.sn.is_none() {
                 return Err(common::Error::new("DN create action has a sentinel id"));
@@ -2459,94 +2647,102 @@ impl DN {
             {
                 return Err(common::Error::new("DN create action repeats an identity"));
             }
-            let shard_at = shard_of(&row.name);
-            let present = self.shards[shard_at].lock().expect("objects");
-            let done = match present.get(row.name.as_str()) {
+            let choice = match objects.get(row.name.as_str()) {
                 None => {
-                    add_per_shard[shard_at] += 1;
-                    false
+                    if cmd.flags.require_exists() {
+                        return Ok(Some(CreateReject {
+                            status: Status::NotFound,
+                            message: format!("required object {} does not exist", row.name),
+                        }));
+                    }
+                    add_objects += 1;
+                    Choice::New
                 }
                 Some(object)
                     if object.id == row.id
                         && object.created == row.created
                         && object.keyed == row.keyed
+                        && object.purge_only == cmd.flags.purge_only()
                         && object.framing == row.framing
-                        && object.streams.is_empty() =>
+                        && object.streams.as_slice() == [row.stream] =>
                 {
-                    false
+                    Choice::Same
                 }
-                Some(object)
-                    if object.id == row.id
-                        && object.created == row.created
-                        && object.keyed == row.keyed
-                        && object.framing == row.framing
-                        && object.streams.len() == 1
-                        && object.streams[0] == row.stream =>
-                {
-                    true
+                Some(_object) if cmd.flags.require_new() => {
+                    return Ok(Some(CreateReject {
+                        status: Status::BadRequest,
+                        message: format!("object {} already exists", row.name),
+                    }));
                 }
+                Some(object) if cmd.flags.overwrite() && object.deletion.soft_deleted() => {
+                    Choice::New
+                }
+                Some(_) if !cmd.flags.overwrite() => Choice::Keep,
                 Some(_) => {
-                    return Err(common::Error::new(format!(
-                        "DN create action conflicts with existing object {}",
-                        row.name
-                    )));
+                    return Ok(Some(CreateReject {
+                        status: Status::BadRequest,
+                        message: format!("could not overwrite object {}", row.name),
+                    }));
                 }
             };
-            drop(present);
-            complete.push(done);
-            let slot = usize::try_from(row.stream.get())
-                .map_err(|_| common::Error::new("stream id does not fit this machine"))?;
-            needed_streams = needed_streams.max(
-                slot.checked_add(1)
-                    .ok_or_else(|| common::Error::new("stream table size overflow"))?,
-            );
-        }
-
-        for (at, count) in add_per_shard.into_iter().enumerate() {
-            if count != 0 {
-                self.shards[at]
-                    .lock()
-                    .expect("objects")
-                    .try_reserve(count)
-                    .map_err(|error| common::Error::new(format!("reserve DN objects: {error}")))?;
+            choices.push(choice);
+            if !matches!(choice, Choice::Keep) {
+                let slot = usize::try_from(row.stream.get())
+                    .map_err(|_| common::Error::new("stream id does not fit this machine"))?;
+                needed_streams = needed_streams.max(
+                    slot.checked_add(1)
+                        .ok_or_else(|| common::Error::new("stream table size overflow"))?,
+                );
             }
         }
+        drop(objects);
+
+        self.object_table
+            .write()
+            .expect("objects")
+            .try_reserve(add_objects)
+            .map_err(|error| common::Error::new(format!("reserve DN objects: {error}")))?;
         {
             let mut table = self.stream_table.write().expect("streams");
-            if needed_streams > table.len() {
-                let extra = needed_streams - table.len();
+            let extra = needed_streams.saturating_sub(table.len());
+            if extra != 0 {
                 table
                     .try_reserve(extra)
                     .map_err(|error| common::Error::new(format!("reserve DN streams: {error}")))?;
             }
-            for (row, done) in cmd.rows.iter().zip(&complete) {
+            for (row, choice) in cmd.rows.iter().zip(&choices) {
+                if matches!(choice, Choice::Keep) {
+                    continue;
+                }
                 let slot = row.stream.get() as usize;
                 if slot < table.len() {
                     let held = &table[slot];
                     let matches =
                         held.id == row.stream && held.created == row.created && held.sn == row.sn;
-                    let conflict =
-                        if *done { !matches } else { !held.deletion.retired() && !matches };
+                    let conflict = if matches!(choice, Choice::Same) {
+                        !matches
+                    } else {
+                        !held.deletion.retired() && !matches
+                    };
                     if conflict {
                         return Err(common::Error::new(format!(
                             "DN create action conflicts with stream {}",
                             row.stream
                         )));
                     }
-                } else if *done {
+                } else if matches!(choice, Choice::Same) {
                     return Err(common::Error::new("completed object has no stream slot"));
                 }
             }
         }
 
         let mut added = 0u64;
-        for (row, done) in cmd.rows.into_iter().zip(complete) {
-            if done {
+        let mut objects = self.object_table.write().expect("objects");
+        let mut table = self.stream_table.write().expect("streams");
+        for (row, choice) in cmd.rows.into_iter().zip(choices) {
+            if !matches!(choice, Choice::New) {
                 continue;
             }
-            let shard_at = shard_of(&row.name);
-            let mut shard = self.shards[shard_at].lock().expect("objects");
-            let mut table = self.stream_table.write().expect("streams");
             let slot = row.stream.get() as usize;
             while table.len() <= slot {
                 let id = StreamId::new(table.len() as u32);
@@ -2556,31 +2752,74 @@ impl DN {
             }
             if table[slot].deletion.retired() {
                 table[slot] = Stream::new(row.stream, row.sn, row.created);
+                table[slot].deletion = Flags::live();
             }
-            if let Some(object) = shard.get_mut(row.name.as_str()) {
-                object.streams.push(row.stream);
-                object.extending = false;
-            } else {
-                shard.insert(
-                    row.name.clone().into_boxed_str(),
-                    Object {
-                        deletion: Flags::default(),
-                        id: row.id,
-                        framing: row.framing,
-                        streams: vec![row.stream],
-                        extending: false,
-                        waiting: Vec::new(),
-                        keyed: row.keyed,
-                        created: row.created,
-                    },
-                );
-            }
+            objects.insert(
+                row.name.clone().into_boxed_str(),
+                Object {
+                    deletion: Flags::live(),
+                    purge_only: cmd.flags.purge_only(),
+                    id: row.id,
+                    framing: row.framing,
+                    streams: vec![row.stream],
+                    creating: true,
+                    extending: false,
+                    waiting: Vec::new(),
+                    keyed: row.keyed,
+                    created: row.created,
+                },
+            );
             self.retired_objects.lock().expect("retired objects").remove(row.name.as_str());
             self.next_object.fetch_max(row.id.get() as u64 + 1, Ordering::Relaxed);
+            self.next_stream.fetch_max(row.stream.get() as u64 + 1, Ordering::Relaxed);
             added += 1;
         }
         self.objects.fetch_add(added, Ordering::Relaxed);
-        Ok(())
+        self.streams.fetch_add(added, Ordering::Relaxed);
+        Ok(None)
+    }
+
+    /// Make the batch visible after SN creation. Validate every row before the first
+    /// state change; replaying an already-applied ready action is harmless.
+    fn apply_ready(&self, cmd: DnCreateReadyCmd) -> common::Result<Vec<String>> {
+        if cmd.rows.is_empty() {
+            return Err(common::Error::new("empty DN ready action"));
+        }
+        let mut names = std::collections::HashSet::new();
+        let mut objects = self.object_table.write().expect("objects");
+        let streams = self.stream_table.read().expect("streams");
+        for row in &cmd.rows {
+            if !names.insert(row.name.as_str()) {
+                return Err(common::Error::new("DN ready action repeats a name"));
+            }
+            let object = objects.get(row.name.as_str()).ok_or_else(|| {
+                common::Error::new(format!("pending object {} is missing", row.name))
+            })?;
+            if object.id != row.id
+                || object.created != row.created
+                || object.streams.as_slice() != [row.stream]
+            {
+                return Err(common::Error::new(format!("DN ready action mismatches {}", row.name)));
+            }
+            let stream = streams
+                .get(row.stream.get() as usize)
+                .ok_or_else(|| common::Error::new(format!("stream {} is missing", row.stream)))?;
+            if stream.id != row.stream || stream.created != row.created || stream.sn != row.sn {
+                return Err(common::Error::new(format!(
+                    "DN ready action mismatches stream {}",
+                    row.stream
+                )));
+            }
+        }
+        let mut ready = Vec::with_capacity(cmd.rows.len());
+        for row in cmd.rows {
+            let object = objects.get_mut(row.name.as_str()).expect("validated object");
+            if object.creating {
+                object.creating = false;
+                ready.push(row.name);
+            }
+        }
+        Ok(ready)
     }
 
     fn reserve_stream(&self) -> common::Result<StreamId> {
@@ -2590,21 +2829,36 @@ impl DN {
             .ok_or_else(|| common::Error::new("no stream was reserved"))
     }
 
+    fn allocate_stream_ids(&self, count: usize) -> common::Result<Vec<StreamId>> {
+        self.reserve_streams(count)
+    }
+
     fn reserve_streams(&self, count: usize) -> common::Result<Vec<StreamId>> {
-        let mut table = self.stream_table.write().expect("streams");
-        let first = table.len();
+        let first = claim_ids(&self.next_stream, count, StreamId::NONE.number(), "stream")?;
         let end = first
-            .checked_add(count)
-            .filter(|end| *end as u64 <= StreamId::NONE.number())
-            .ok_or_else(|| common::Error::new("stream table is full"))?;
-        table.try_reserve(count).map_err(|e| common::Error::new(e.to_string()))?;
+            .checked_add(count as u64)
+            .ok_or_else(|| common::Error::new("stream table size overflow"))?;
+        let mut table = self.stream_table.write().expect("streams");
+        let needed = usize::try_from(end)
+            .map_err(|_| common::Error::new("stream table size does not fit this machine"))?;
+        let extra = needed.saturating_sub(table.len());
+        if extra != 0 {
+            table.try_reserve(extra).map_err(|e| common::Error::new(e.to_string()))?;
+        }
         let mut ids = Vec::new();
         ids.try_reserve(count).map_err(|e| common::Error::new(e.to_string()))?;
-        for n in first..end {
-            let mut stream = Stream::new(StreamId::new(n as u32), SnId::NONE, TimeSec::EPOCH);
+        while table.len() < needed {
+            let id = StreamId::new(table.len() as u32);
+            let mut stream = Stream::new(id, SnId::NONE, TimeSec::EPOCH);
             stream.deletion = Flags::vacant();
             table.push(stream);
-            ids.push(StreamId::new(n as u32));
+        }
+        for n in first..end {
+            let id = StreamId::new(n as u32);
+            if !table[id.get() as usize].deletion.retired() {
+                return Err(common::Error::new(format!("stream slot {id} is already in use")));
+            }
+            ids.push(id);
         }
         Ok(ids)
     }
@@ -2689,15 +2943,17 @@ impl DN {
             gc_thread: Mutex::new(None),
             deleting: Mutex::new(()),
             retired_objects: Mutex::new(std::collections::HashSet::new()),
+            create_rejects: Mutex::new(CreateRejects::default()),
             dn,
             mine,
-            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            object_table: RwLock::new(HashMap::new()),
             parked: AtomicU64::new(0),
             objects: AtomicU64::new(0),
             streams: AtomicU64::new(0),
             // ⚠️ From zero, because the sentinel is at the top of the range now: slot 0 of an
             // arena is a real object, and starting at one would waste it (§17.37.2).
             next_object: AtomicU64::new(0),
+            next_stream: AtomicU64::new(0),
             stream_table: RwLock::new(Vec::new()),
             object_extras: Mutex::new(Extras::default()),
             stream_extras: Mutex::new(Extras::default()),
@@ -2854,6 +3110,21 @@ struct DnCreateRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DnCreateCmd {
     rows: Vec<DnCreateRow>,
+    flags: AppendFlags,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DnReadyRow {
+    name: String,
+    id: ObjectId,
+    stream: StreamId,
+    created: TimeSec,
+    sn: SnId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DnCreateReadyCmd {
+    rows: Vec<DnReadyRow>,
 }
 
 impl Wire for DnCreateCmd {
@@ -2873,6 +3144,7 @@ impl Wire for DnCreateCmd {
                     w.sn_id(row.sn);
                 });
             }
+            self.flags.write(w);
         });
     }
 
@@ -2893,13 +3165,70 @@ impl Wire for DnCreateCmd {
                     })
                 })?);
             }
-            Ok(DnCreateCmd { rows })
+            let flags = AppendFlags::read(r)?;
+            Ok(DnCreateCmd { rows, flags })
+        })
+    }
+}
+
+impl Wire for DnCreateReadyCmd {
+    fn write(&self, w: &mut StructWriter) {
+        w.nested(Op::DnCreateReady, |w| {
+            w.number_u64(self.rows.len() as u64);
+            for row in &self.rows {
+                w.nested(Op::RaftPair, |w| {
+                    w.text(&row.name);
+                    w.number_u32(row.id.get());
+                    w.stream_id(row.stream);
+                    w.time_sec(row.created);
+                    w.sn_id(row.sn);
+                });
+            }
+        });
+    }
+
+    fn read(r: &mut common::StructReader<'_>) -> common::Result<Self> {
+        r.nested(Op::DnCreateReady, "DN create-ready action", |r| {
+            let count = r.number_u64()?;
+            let mut rows = common::checked_vec(count, r.remaining())?;
+            for _ in 0..count {
+                rows.push(r.nested(Op::RaftPair, "DN ready row", |r| {
+                    Ok(DnReadyRow {
+                        name: r.text()?,
+                        id: ObjectId::new(r.number_u32()?),
+                        stream: r.stream_id()?,
+                        created: r.time_sec()?,
+                        sn: r.sn_id()?,
+                    })
+                })?);
+            }
+            Ok(DnCreateReadyCmd { rows })
         })
     }
 }
 
 fn dn_action(cmd: &DnCreateCmd) -> common::Result<raft::Action> {
     Ok(raft::Action::new(Op::DnCreate, raft::codec::encode(cmd)?))
+}
+
+fn dn_ready_action(cmd: &DnCreateReadyCmd) -> common::Result<raft::Action> {
+    Ok(raft::Action::new(Op::DnCreateReady, raft::codec::encode(cmd)?))
+}
+
+fn claim_ids(next: &AtomicU64, count: usize, limit: u64, kind: &str) -> common::Result<u64> {
+    let count =
+        u64::try_from(count).map_err(|_| common::Error::new(format!("too many {kind}s")))?;
+    let mut first = next.load(Ordering::Relaxed);
+    loop {
+        let end = first
+            .checked_add(count)
+            .filter(|end| *end <= limit)
+            .ok_or_else(|| common::Error::new(format!("{kind} table is full")))?;
+        match next.compare_exchange_weak(first, end, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(first),
+            Err(actual) => first = actual,
+        }
+    }
 }
 
 /// Decode the rollover request using the same ID and record widths as its writer.
@@ -2929,30 +3258,51 @@ fn extension(request: &Req) -> common::Result<(String, StreamId, SRoff)> {
 
 impl Host for DN {
     type Application = DNState;
-    type Done = ();
+    type Done = String;
 
     fn apply_client(
         &self,
         _state: &mut DNState,
-        _context: raft::execution::Context<'_>,
+        context: raft::execution::Context<'_>,
         action: &raft::Action,
-        _done: &mut Vec<Self::Done>,
+        done: &mut Vec<Self::Done>,
     ) -> common::Result<()> {
         match action.op {
-            Op::DnCreate => self.apply_create(raft::codec::decode(&action.fields)?),
+            Op::DnCreate => {
+                let cmd: DnCreateCmd = raft::codec::decode(&action.fields)?;
+                let id = cmd
+                    .rows
+                    .first()
+                    .ok_or_else(|| common::Error::new("empty DN create action"))?
+                    .id;
+                let reject = self.apply_create(cmd)?;
+                self.create_rejects
+                    .lock()
+                    .map_err(|_| common::Error::new("create rejects poisoned"))?
+                    .record(context.index, id, reject);
+                Ok(())
+            }
+            Op::DnCreateReady => {
+                done.extend(self.apply_ready(raft::codec::decode(&action.fields)?)?);
+                Ok(())
+            }
             _ => Err(common::Error::new(format!("DN does not apply {}", action.op))),
         }
     }
 
+    fn complete_apply(&self, names: Vec<Self::Done>) {
+        self.wake(&names, None);
+    }
+
     fn reset_metadata(&self, _state: &mut DNState) {
-        for shard in &self.shards {
-            shard.lock().expect("objects").clear();
-        }
+        self.object_table.write().expect("objects").clear();
         self.stream_table.write().expect("streams").clear();
         *self.object_extras.lock().expect("object extras") = Extras::default();
         *self.stream_extras.lock().expect("stream extras") = SharedExtras::default();
         self.retired_objects.lock().expect("retired objects").clear();
+        *self.create_rejects.lock().expect("create rejects") = CreateRejects::default();
         self.next_object.store(0, Ordering::Relaxed);
+        self.next_stream.store(0, Ordering::Relaxed);
         self.objects.store(0, Ordering::Relaxed);
         self.streams.store(0, Ordering::Relaxed);
         self.parked.store(0, Ordering::Relaxed);
@@ -3013,6 +3363,24 @@ fn main() {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn purge_only_is_applied_when_a_later_delete_arrives() {
+        let requested = Delete {
+            target: Target::Object("/x".into()),
+            retention: Some(common::time::TimeIntSec64::new(30)),
+            hard: false,
+        };
+        assert_eq!(deletion_policy(requested.clone(), false), requested);
+        assert_eq!(
+            deletion_policy(requested, true),
+            Delete {
+                target: Target::Object("/x".into()),
+                retention: Some(common::time::TimeIntSec64::MIN),
+                hard: true,
+            }
+        );
+    }
+
+    #[test]
     fn create_batch_is_one_replayable_action() {
         let cmd = DnCreateCmd {
             rows: vec![
@@ -3035,6 +3403,7 @@ mod tests {
                     sn: SnId::new(2),
                 },
             ],
+            flags: AppendFlags::PURGE_ONLY,
         };
         let action = dn_action(&cmd).unwrap();
         assert_eq!(action.op, Op::DnCreate);
@@ -3042,9 +3411,11 @@ mod tests {
         assert_eq!(read, cmd);
 
         let dn = DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST);
-        dn.apply_create(read.clone()).unwrap();
-        dn.apply_create(read).unwrap();
+        assert!(dn.apply_create(read.clone()).unwrap().is_none());
+        assert!(dn.apply_create(read).unwrap().is_none());
         assert_eq!(dn.objects.load(Ordering::Relaxed), 2);
+        assert!(dn.object_table.read().unwrap()["/one"].purge_only);
+        assert!(dn.object_table.read().unwrap()["/two"].purge_only);
         let table = dn.stream_table.read().unwrap();
         assert_eq!(table.len(), 7);
         assert_eq!(table[4].id, StreamId::new(4));
@@ -3052,11 +3423,110 @@ mod tests {
         assert_eq!(table[6].id, StreamId::new(6));
         drop(table);
         for (name, id, stream) in [("/one", 3, 4), ("/two", 5, 6)] {
-            let shard = dn.shards[shard_of(name)].lock().unwrap();
-            let object = shard.get(name).unwrap();
+            let objects = dn.object_table.read().unwrap();
+            let object = objects.get(name).unwrap();
             assert_eq!(object.id, ObjectId::new(id));
             assert_eq!(object.streams, [StreamId::new(stream)]);
         }
+    }
+
+    #[test]
+    fn create_policy_rejection_rolls_back_the_whole_batch() {
+        let dn = DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST);
+        let existing = DnCreateRow {
+            name: "/same".into(),
+            id: ObjectId::new(0),
+            keyed: false,
+            framing: Framing::Bytes,
+            created: TimeSec::new(500),
+            stream: StreamId::new(0),
+            sn: SnId::new(1),
+        };
+        let initial = DnCreateCmd { rows: vec![existing.clone()], flags: AppendFlags::default() };
+        assert!(dn.apply_create(initial).unwrap().is_none());
+
+        let require_new = DnCreateCmd {
+            rows: vec![
+                DnCreateRow { id: ObjectId::new(1), stream: StreamId::new(1), ..existing.clone() },
+                DnCreateRow {
+                    name: "/new".into(),
+                    id: ObjectId::new(2),
+                    keyed: false,
+                    framing: Framing::Bytes,
+                    created: TimeSec::new(500),
+                    stream: StreamId::new(2),
+                    sn: SnId::new(1),
+                },
+            ],
+            flags: AppendFlags::REQUIRE_NEW,
+        };
+        let reject = dn.apply_create(require_new).unwrap().unwrap();
+        assert_eq!(reject.status, Status::BadRequest);
+        assert_eq!(dn.objects.load(Ordering::Relaxed), 1);
+        assert!(!dn.object_table.read().unwrap().contains_key("/new"));
+        assert_eq!(dn.stream_table.read().unwrap().len(), 1);
+
+        let require_exists = DnCreateCmd {
+            rows: vec![
+                DnCreateRow { id: ObjectId::new(3), stream: StreamId::new(3), ..existing },
+                DnCreateRow {
+                    name: "/missing".into(),
+                    id: ObjectId::new(4),
+                    keyed: false,
+                    framing: Framing::Bytes,
+                    created: TimeSec::new(500),
+                    stream: StreamId::new(4),
+                    sn: SnId::new(1),
+                },
+            ],
+            flags: AppendFlags::REQUIRE_EXISTS,
+        };
+        let reject = dn.apply_create(require_exists).unwrap().unwrap();
+        assert_eq!(reject.status, Status::NotFound);
+        assert_eq!(dn.objects.load(Ordering::Relaxed), 1);
+        assert!(!dn.object_table.read().unwrap().contains_key("/missing"));
+        assert_eq!(dn.stream_table.read().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_rejected_create_action_reports_failure_without_stopping_apply() {
+        let dn = DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST);
+        let existing = DnCreateRow {
+            name: "/same".into(),
+            id: ObjectId::new(0),
+            keyed: false,
+            framing: Framing::Bytes,
+            created: TimeSec::new(500),
+            stream: StreamId::new(0),
+            sn: SnId::new(1),
+        };
+        assert!(
+            dn.apply_create(DnCreateCmd {
+                rows: vec![existing.clone()],
+                flags: AppendFlags::default()
+            })
+            .unwrap()
+            .is_none()
+        );
+
+        let cmd = DnCreateCmd {
+            rows: vec![DnCreateRow { id: ObjectId::new(1), stream: StreamId::new(1), ..existing }],
+            flags: AppendFlags::REQUIRE_NEW,
+        };
+        let id = cmd.rows[0].id;
+        let action = dn_action(&cmd).unwrap();
+        let mut done = Vec::new();
+        let mut state = DNState;
+        dn.apply_client(
+            &mut state,
+            raft::execution::Context { ring: "DN", index: 7, term: 1 },
+            &action,
+            &mut done,
+        )
+        .unwrap();
+        let answer = dn.create_rejects.lock().unwrap().take(id).unwrap();
+        assert_eq!(answer.status, Status::BadRequest);
+        assert_eq!(dn.objects.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -3096,11 +3566,37 @@ mod tests {
                     sn: SnId::new(1),
                 },
             ],
+            flags: AppendFlags::default(),
         })
         .unwrap();
         let index = dn.queue_client(action).unwrap().wait().unwrap();
         dn.wait_applied(index).unwrap();
         assert_eq!(dn.objects.load(Ordering::Relaxed), 2);
+        assert!(
+            dn.look("/raft/one").is_none(),
+            "pending objects stay hidden until SN confirms them"
+        );
+        let action = dn_ready_action(&DnCreateReadyCmd {
+            rows: vec![
+                DnReadyRow {
+                    name: "/raft/one".into(),
+                    id: ObjectId::new(0),
+                    stream: StreamId::new(0),
+                    created: TimeSec::new(800),
+                    sn: SnId::new(1),
+                },
+                DnReadyRow {
+                    name: "/raft/two".into(),
+                    id: ObjectId::new(1),
+                    stream: StreamId::new(1),
+                    created: TimeSec::new(800),
+                    sn: SnId::new(1),
+                },
+            ],
+        })
+        .unwrap();
+        let index = dn.queue_client(action).unwrap().wait().unwrap();
+        dn.wait_applied(index).unwrap();
         assert!(dn.look("/raft/one").is_some());
         assert!(dn.look("/raft/two").is_some());
         let status = dn.raft_status();
@@ -3163,7 +3659,7 @@ mod tests {
         dn.retain_streams(&[StreamId::FIRST]).unwrap();
         let mut object = grown();
         object.streams = vec![StreamId::FIRST, StreamId::FIRST];
-        dn.shards[shard_of("/retry")].lock().unwrap().insert("/retry".into(), object);
+        dn.object_table.write().unwrap().insert("/retry".into(), object);
         dn.objects.store(1, Ordering::Relaxed);
         let process = testing::process();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3215,7 +3711,7 @@ mod tests {
             assert_eq!(counts(&dn, &table[0]).0, 0);
             assert_eq!(counts(&dn, &table[0]).1, 2);
         }
-        assert!(dn.shards[shard_of("/retry")].lock().unwrap().contains_key("/retry"));
+        assert!(dn.object_table.read().unwrap().contains_key("/retry"));
         assert_eq!(dn.delete_object(&process, &soft).status, Status::Ok);
         assert_eq!(counts(&dn, &dn.stream_table.read().unwrap()[0]).1, 2);
         let hard = Delete { target: Target::Object("/retry".into()), retention: None, hard: true }
@@ -3223,7 +3719,7 @@ mod tests {
             .unwrap();
         assert_eq!(dn.delete_object(&process, &hard).status, Status::Ok);
         assert_eq!(dn.delete_object(&process, &hard).status, Status::Ok);
-        assert!(!dn.shards[shard_of("/retry")].lock().unwrap().contains_key("/retry"));
+        assert!(!dn.object_table.read().unwrap().contains_key("/retry"));
         let table = dn.stream_table.read().unwrap();
         assert_eq!(counts(&dn, &table[0]).1, 0);
         assert!(table[0].deletion.retired());
@@ -3298,7 +3794,7 @@ mod tests {
         assert_eq!(second.logical(&table), OLoff::new(224));
         drop(table);
         // A failed concat gives back every repeated reference it acquired.
-        dn.shards[shard_of("/failed")].lock().unwrap().insert(Box::from("/failed"), second);
+        dn.object_table.write().unwrap().insert(Box::from("/failed"), second);
         dn.fail_concat("/failed", Resp::error(Status::Internal, "test"));
         assert_eq!(counts(&dn, &dn.stream_table.read().unwrap()[0]).1, 1);
     }
@@ -3352,6 +3848,7 @@ mod tests {
             .collect();
         let object = Object {
             deletion: Flags::default(),
+            purge_only: false,
             id: ObjectId::FIRST,
             framing: Framing::Lf,
             extending: false,
@@ -3359,6 +3856,7 @@ mod tests {
             keyed: false,
             created: TimeSec::new(100),
             streams: vec![StreamId::new(0), StreamId::new(1)],
+            creating: false,
         };
         let extents: OEoff = object.cached_extents(&table);
         let logical: OLoff = object.logical(&table);
@@ -3398,13 +3896,15 @@ mod tests {
     #[test]
     fn locate_stream_refuses_a_replaced_object() {
         let dn = Arc::new(DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST));
-        dn.shards[shard_of("/x")].lock().unwrap().insert(
+        dn.object_table.write().unwrap().insert(
             Box::from("/x"),
             Object {
                 deletion: Flags::default(),
+                purge_only: false,
                 id: ObjectId::new(2),
                 framing: Framing::Lf,
                 streams: vec![install(&dn, held(0, 0, None))],
+                creating: false,
                 extending: false,
                 waiting: Vec::new(),
                 keyed: false,
@@ -3438,18 +3938,20 @@ mod tests {
         let dn = Arc::new(DN::new(testing::dn_config(), DnId::new(0), RangeId::new(0)));
         let made = TimeSec::new(1_000_000);
         let name_of = |dn: &DN| {
-            let shard = dn.shards[shard_of("/p")].lock().unwrap();
-            let object = shard.get("/p").expect("an object");
+            let objects = dn.object_table.read().unwrap();
+            let object = objects.get("/p").expect("an object");
             ObjectName { range: dn.mine, object: object.id, created: object.created }
         };
         let put = |dn: &DN| {
-            dn.shards[shard_of("/p")].lock().unwrap().insert(
+            dn.object_table.write().unwrap().insert(
                 Box::from("/p"),
                 Object {
                     deletion: Flags::default(),
+                    purge_only: false,
                     id: ObjectId::new(dn.next_object.fetch_add(1, Ordering::Relaxed) as u32),
                     framing: Framing::Lf,
                     streams: Vec::new(),
+                    creating: false,
                     extending: false,
                     waiting: Vec::new(),
                     keyed: false,
@@ -3512,13 +4014,15 @@ mod tests {
     /// An object as `record` leaves it before the SN has answered: the name is
     /// taken and the stream is not named.
     fn half_made(dn: &DN, name: &str) {
-        dn.shards[shard_of(name)].lock().unwrap().insert(
+        dn.object_table.write().unwrap().insert(
             Box::from(name),
             Object {
                 deletion: Flags::default(),
+                purge_only: false,
                 id: ObjectId::new(1),
                 framing: Framing::Lf,
                 streams: Vec::new(),
+                creating: false,
                 extending: false,
                 waiting: Vec::new(),
                 keyed: false,
@@ -3536,18 +4040,14 @@ mod tests {
         half_made(&dn, "/half");
         assert!(dn.look("/half").is_none(), "nothing to say about it yet");
         let waits = |name: &str| {
-            dn.shards[shard_of(name)]
-                .lock()
-                .unwrap()
-                .get(name)
-                .is_some_and(|object| object.between_streams())
+            dn.object_table.read().unwrap().get(name).is_some_and(|object| object.between_streams())
         };
         assert!(waits("/half"), "but the name is taken, so a lookup waits");
         assert!(!waits("/nothing"), "unlike a name nobody has");
 
         // Once the stream is named it describes normally.
-        dn.shards[shard_of("/half")]
-            .lock()
+        dn.object_table
+            .write()
             .unwrap()
             .get_mut("/half")
             .unwrap()
@@ -3571,15 +4071,17 @@ mod tests {
         let mine = |dn: &DN| {
             let mut taken = Vec::new();
             let name = "/same".to_string();
-            let mut shard = dn.shards[shard_of(&name)].lock().unwrap();
-            if !shard.contains_key(name.as_str()) {
-                shard.insert(
+            let mut objects = dn.object_table.write().unwrap();
+            if !objects.contains_key(name.as_str()) {
+                objects.insert(
                     Box::from(name.as_str()),
                     Object {
                         deletion: Flags::default(),
+                        purge_only: false,
                         id: ObjectId::new(dn.next_object.fetch_add(1, Ordering::Relaxed) as u32),
                         framing: Framing::Lf,
                         streams: Vec::new(),
+                        creating: false,
                         extending: false,
                         waiting: Vec::new(),
                         keyed: false,
@@ -3602,9 +4104,11 @@ mod tests {
             vec![held(0, 0, Some(0)), held(1, 0, Some(10)), held(2, 0, Some(5)), held(3, 0, None)];
         let mut object = Object {
             deletion: Flags::default(),
+            purge_only: false,
             id: ObjectId::new(1),
             framing: Framing::Lf,
             streams: Vec::new(),
+            creating: false,
             extending: false,
             waiting: Vec::new(),
             keyed: false,
@@ -3632,9 +4136,11 @@ mod tests {
     fn grown() -> Object {
         let mut object = Object {
             deletion: Flags::default(),
+            purge_only: false,
             id: ObjectId::new(1),
             framing: Framing::Lf,
             streams: Vec::new(),
+            creating: false,
             extending: false,
             waiting: Vec::new(),
             keyed: false,
@@ -4104,13 +4610,15 @@ mod tests {
         let dn = Arc::new(DN::new(testing::dn_config(), DnId::new(0), RangeId::new(0)));
         for n in 0..count {
             let name = format!("/n{n}");
-            dn.shards[shard_of(&name)].lock().unwrap().insert(
+            dn.object_table.write().unwrap().insert(
                 Box::from(name.as_str()),
                 Object {
                     deletion: Flags::default(),
+                    purge_only: false,
                     id: ObjectId::new(n as u32 + 1),
                     framing: Framing::Lf,
                     streams: vec![install(&dn, held(n as u32 + 1, 0, None))],
+                    creating: false,
                     extending: false,
                     waiting: Vec::new(),
                     keyed: false,

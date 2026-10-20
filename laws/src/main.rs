@@ -17,7 +17,9 @@ use common::config::Compress;
 use common::config::{ClusterConfig, Messaging, ServiceKind};
 use common::framing::Framing;
 use common::ids::{ExtentId, ObjectId, RangeId, StreamId};
-use common::info::{Batch, Described, Expecting, ExtentRow, ObjectName, Shape, StreamRow, UNKNOWN};
+use common::info::{
+    AppendFlags, Batch, Described, Expecting, ExtentRow, ObjectName, Shape, StreamRow, UNKNOWN,
+};
 use common::offset::{ELoff, ERoff, OLoff, ORoff, SCoff, SLoff, SRoff};
 use common::placement::{self, Expansion};
 
@@ -299,6 +301,8 @@ enum Cmd {
         /// Delete the object this many seconds from now.
         #[arg(long)]
         expiry: Option<u64>,
+        #[command(flatten)]
+        flags: MutFlags,
     },
     /// Hard-delete an already soft-deleted object whose retention has expired.
     Delete { path: String },
@@ -431,9 +435,8 @@ enum Cmd {
         /// answering about something else (§17.36).
         #[arg(long)]
         expect: Option<String>,
-        /// Force the object closed after this append becomes durable.
-        #[arg(long)]
-        seal: bool,
+        #[command(flatten)]
+        flags: MutFlags,
         #[command(flatten)]
         body: Body,
     },
@@ -446,6 +449,8 @@ enum Cmd {
         framing: String,
         #[arg(long)]
         file: PathBuf,
+        #[command(flatten)]
+        flags: MutFlags,
     },
     /// Insert a record into a keyed object.
     Insert {
@@ -539,6 +544,44 @@ enum Cmd {
         #[arg(long)]
         to: u64,
     },
+}
+
+/// Flags shared by create and append operations.
+#[derive(clap::Args, Default)]
+struct MutFlags {
+    #[arg(long)]
+    require_exists: bool,
+    #[arg(long)]
+    require_new: bool,
+    #[arg(long)]
+    overwrite: bool,
+    /// Keep the object permanently purge-only: delete it immediately when requested.
+    #[arg(long)]
+    purge_only: bool,
+    #[arg(long)]
+    seal: bool,
+}
+
+impl MutFlags {
+    fn value(&self) -> Result<AppendFlags> {
+        let mut flags = AppendFlags::NONE;
+        if self.require_exists {
+            flags |= AppendFlags::REQUIRE_EXISTS;
+        }
+        if self.require_new {
+            flags |= AppendFlags::REQUIRE_NEW;
+        }
+        if self.overwrite {
+            flags |= AppendFlags::OVERWRITE;
+        }
+        if self.purge_only {
+            flags |= AppendFlags::PURGE_ONLY;
+        }
+        if self.seal {
+            flags |= AppendFlags::SEAL;
+        }
+        AppendFlags::from_bits(flags.bits())
+    }
 }
 
 /// Where a record is, which is a record number or a key but never both.
@@ -893,17 +936,6 @@ fn run(cli: Cli) -> Result<()> {
             let target = resolve(&cluster, &cli, serves(cmd))?;
             let answer = open(&target, timeout, &cluster.messaging)?.call(&request)?;
             match (cmd, request.op()) {
-                (Cmd::Append { path, seal: true, .. }, Op::AppendRecord) => {
-                    receipt(&target, &answer)?;
-                    if answer.status == Status::Ok {
-                        let mut payload = common::StructWriter::new();
-                        payload.text(path);
-                        let closed = Req::new(Op::SealObject).structure(payload);
-                        let answer = open(&target, timeout, &cluster.messaging)?.call(&closed)?;
-                        report(&target, &answer)?;
-                    }
-                    Ok(())
-                }
                 (_, Op::AppendRecord) => receipt(&target, &answer),
                 // The client asked for a record and gets the block holding it, so it
                 // needs its own question back to find the record in it.
@@ -1265,7 +1297,7 @@ fn create_one_extent(
         framing: "lf".to_string(),
         crc: false,
         expect: None,
-        seal: false,
+        flags: MutFlags::default(),
         body: Body { data: Some("benchmark".to_string()), file: None },
     };
     let answer = conn.call(&build(&append)?)?;
@@ -2350,7 +2382,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
             Req::new(Op::Stat).structure(payload)
         }
 
-        Cmd::Create { path, flavor, framing, media_class, expiry } => {
+        Cmd::Create { path, flavor, framing, media_class, expiry, flags } => {
             let (kind, width) = Framing::parse(framing)?.wire();
             let mut payload = common::StructWriter::new();
             payload.text(path);
@@ -2363,6 +2395,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
             if let Some(seconds) = expiry {
                 payload.number_u64(*seconds);
             }
+            flags.value()?.write(&mut payload);
             Req::new(Op::CreateObject).structure(payload)
         }
         Cmd::SoftDelete { path, retention_secs, delete } => common::deletion::Delete {
@@ -2409,7 +2442,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
             Req::new(Op::ConcatObjects).structure(payload)
         }
 
-        Cmd::Append { path, framing, crc, body, expect, .. } => {
+        Cmd::Append { path, framing, crc, body, expect, flags } => {
             let framing = Framing::parse(framing)?;
             let (kind, width) = framing.wire();
             let block = frame(framing, &body.bytes()?)?;
@@ -2435,6 +2468,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
                 payload.number_u64(if *crc { piece_crc } else { 0 });
                 payload.bytes(&stored);
             }
+            flags.value()?.write(&mut payload);
             Req::new(Op::AppendRecord).structure(payload)
         }
         Cmd::Seal { path } => {
@@ -2442,7 +2476,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
             payload.text(path);
             Req::new(Op::SealObject).structure(payload)
         }
-        Cmd::AppendBlock { path, framing, file } => {
+        Cmd::AppendBlock { path, framing, file, flags } => {
             let framing = Framing::parse(framing)?;
             let block = std::fs::read(file)
                 .map_err(|e| Error::new(format!("reading append block {}: {e}", file.display())))?;
@@ -2461,6 +2495,7 @@ fn build(cmd: &Cmd) -> Result<Req> {
                 payload.number_u64(0);
                 payload.bytes(&stored);
             }
+            flags.value()?.write(&mut payload);
             Req::new(Op::AppendRecord).structure(payload)
         }
         Cmd::Insert { path, key, body } => {
