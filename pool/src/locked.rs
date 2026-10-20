@@ -128,7 +128,7 @@ impl<T: LockedItem, const A: usize, const L: usize> LockedPool<T, A, L> {
     }
 
     #[inline]
-    fn link(&mut self, index: u32) -> u32 {
+    fn link(&self, index: u32) -> u32 {
         // SAFETY: all issued links are initialized; callers hold exclusive access.
         unsafe { self.link_ptr(index).read() }
     }
@@ -182,6 +182,78 @@ impl<T: LockedItem, const A: usize, const L: usize> LockedPool<T, A, L> {
         let index = self.issue_fresh()?;
         self.prepare_alloc(index);
         Ok(index)
+    }
+
+    /// Whether `index` is available for an exact reservation. A not-yet-issued
+    /// index is available if it is within the pool's limit; an issued index has
+    /// to be on its free list already. Deleted indexes become reservable only
+    /// after `reclaim` moves them to the free list.
+    pub fn can_reserve_index(&self, index: u32) -> bool {
+        if index >= self.max_blocks {
+            return false;
+        }
+        if index >= self.next {
+            return true;
+        }
+        let bucket = index as usize & (BUCKETS - 1);
+        let mut at = self.buckets[bucket].free;
+        while at != T::LINK_NONE {
+            if at == index {
+                return true;
+            }
+            at = self.link(at);
+        }
+        false
+    }
+
+    /// Reserve one exact index. This is for replicated metadata whose durable
+    /// ID must be the same slot on every member. Any skipped new indexes are
+    /// initialized and added to their free lists. An issued index can be
+    /// reserved only after it is on a free list.
+    pub fn reserve_index(&mut self, index: u32) -> Result<()> {
+        if !self.can_reserve_index(index) {
+            return Err(Error::new("pool index is not available for reservation"));
+        }
+
+        while self.next < index {
+            let fresh = self.issue_fresh()?;
+            self.push_free(fresh);
+        }
+        if self.next == index {
+            self.issue_fresh()?;
+        } else if !self.remove_free(index) {
+            return Err(Error::new("pool index is no longer on its free list"));
+        }
+        self.prepare_alloc(index);
+        Ok(())
+    }
+
+    fn push_free(&mut self, index: u32) {
+        let bucket = index as usize & (BUCKETS - 1);
+        let head = self.buckets[bucket].free;
+        self.set_link(index, head);
+        self.buckets[bucket].free = index;
+    }
+
+    fn remove_free(&mut self, index: u32) -> bool {
+        let bucket = index as usize & (BUCKETS - 1);
+        let mut previous = T::LINK_NONE;
+        let mut at = self.buckets[bucket].free;
+        while at != T::LINK_NONE {
+            let next = self.link(at);
+            if at == index {
+                if previous == T::LINK_NONE {
+                    self.buckets[bucket].free = next;
+                } else {
+                    self.set_link(previous, next);
+                }
+                self.set_link(index, T::LINK_NONE);
+                return true;
+            }
+            previous = at;
+            at = next;
+        }
+        false
     }
 
     fn prepare_alloc(&mut self, index: u32) {
@@ -335,5 +407,28 @@ mod tests {
         unsafe { pool.retire_index(first) };
         pool.reclaim();
         assert_eq!(pool.alloc().unwrap(), 0);
+    }
+
+    #[test]
+    fn exact_reservation_fills_gaps_and_reuses_reclaimed_indexes() {
+        let mut pool = TestPool::new(8, 0).unwrap();
+        assert!(pool.can_reserve_index(5));
+        pool.reserve_index(5).unwrap();
+        assert_eq!(pool.issued_blocks(), 6);
+        assert!(!pool.can_reserve_index(5));
+        for index in 0..5 {
+            assert!(pool.can_reserve_index(index));
+        }
+
+        pool.reserve_index(2).unwrap();
+        assert!(!pool.can_reserve_index(2));
+        assert!(pool.reserve_index(2).is_err());
+        unsafe { pool.retire_index(2) };
+        assert!(!pool.can_reserve_index(2));
+        pool.reclaim();
+        assert!(pool.can_reserve_index(2));
+        pool.reserve_index(2).unwrap();
+        assert!(!pool.can_reserve_index(2));
+        assert_eq!(pool.issued_blocks(), 6);
     }
 }

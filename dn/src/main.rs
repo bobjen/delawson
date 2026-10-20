@@ -7,7 +7,8 @@
 //! `(RangeId, StreamId)`.
 //!
 //! ⚠️ **The hash table by name is a stand-in for a B-tree** with a read and a
-//! write lock. Nothing is recycled yet: deleted array entries remain tombstones.
+//! write lock. Stream slots use StreamId as their stable index and are reclaimed
+//! by the Raft exclusive-lock pass after their last reference is deleted.
 //!
 //! A create waits on an SN, and waits without holding a worker: the names are
 //! taken, the streams are asked for, and the client's `Reply` travels with that
@@ -34,7 +35,7 @@ use common::{Arg, Op, Req, Resp, Status, StructWriter, structure};
 use raft::codec::Wire;
 use raft::runtime::{Host, Settings as RaftSettings};
 use std::collections::{HashMap, VecDeque};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 #[cfg(test)]
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -293,8 +294,8 @@ enum Next {
 ///
 /// Stored once per range, rather than once per object reference. The reference count
 /// is atomic; ordinary metadata is protected by the range's stream table lock.
+#[repr(C)]
 struct Stream {
-    deletion: Flags,
     /// ⚠️ **`u32`, and safe for the reason an extent id is** (§17.29.2): a stable reference
     /// to a stream is `(RangeId, StreamId, CreateSec)` (Asserted, Bob, 2026-08-20), so the
     /// id alone was never the name. It has only to be unique among the streams **one range
@@ -304,7 +305,9 @@ struct Stream {
     /// precisely because a range moves between DNs — so a DN-scoped id would stop meaning
     /// what it meant the first time its range moved. `dn` stands in for `RangeId` until
     /// ranges exist (#109).
+    /// This word also carries the free-list link while the slot is not live.
     id: StreamId,
+    deletion: Flags,
     /// Records in it once sealed, and **`SRoff::NONE` while it is the one being appended to**.
     ///
     /// ⚠️ **This one does not go stale, unlike the sizes below.** §4.5's exact record count
@@ -341,6 +344,19 @@ struct StreamSnapshot {
 }
 
 impl Stream {
+    fn blank() -> Self {
+        Self {
+            id: StreamId::NONE,
+            deletion: Flags::vacant(),
+            records: SRoff::NONE,
+            created: TimeSec::EPOCH,
+            logical: SLoff::NONE,
+            compressed: SCoff::NONE,
+            sn: SnId::NONE,
+            extents: ExtentId::NONE,
+        }
+    }
+
     fn snapshot(&self) -> StreamSnapshot {
         StreamSnapshot {
             id: self.id,
@@ -354,8 +370,8 @@ impl Stream {
     /// A stream just handed out: nothing has come to anything yet.
     fn new(id: StreamId, sn: SnId, created: TimeSec) -> Stream {
         Stream {
-            deletion: Flags::default(),
             id,
+            deletion: Flags::default(),
             records: SRoff::NONE,
             created,
             logical: SLoff::NONE,
@@ -391,6 +407,116 @@ impl Stream {
             && (self.compressed.is_none() || seen > self.compressed)
         {
             self.compressed = seen;
+        }
+    }
+}
+
+// SAFETY: init gives fresh pool storage a fully initialized vacant Stream.
+unsafe impl pool::PoolItem for Stream {
+    unsafe fn init(slot: *mut Self) {
+        // SAFETY: the pool provides aligned, fresh storage for one Stream.
+        unsafe { slot.write(Stream::blank()) };
+    }
+}
+
+// SAFETY: `id` is the pool link while a slot is free and the StreamId while live;
+// allocation resets it before the slot is handed back to DN.
+unsafe impl pool::LockedItem for Stream {
+    const LINK_NONE: u32 = StreamId::NONE.get();
+
+    unsafe fn on_alloc(slot: *mut Self) {
+        // SAFETY: the pool provides an initialized slot with exclusive ownership.
+        // The caller replaces the complete Stream before publishing this slot.
+        unsafe {
+            (*slot).id = StreamId::NONE;
+            (*slot).deletion = Flags::default();
+        }
+    }
+}
+
+type StreamPool = pool::LockedPool<
+    Stream,
+    { std::mem::align_of::<Stream>() },
+    { std::mem::offset_of!(Stream, id) },
+>;
+
+/// Per-range stream slots. A StreamId is the slot index on every Raft member;
+/// only a vacant or reclaimed slot can be reserved for a create action.
+struct StreamTable {
+    pool: StreamPool,
+    /// High-water index visible to StreamId lookups. The pool itself starts
+    /// with one free slot even while this table is empty.
+    len: usize,
+}
+
+impl StreamTable {
+    fn new() -> pool::Result<Self> {
+        Ok(Self {
+            // StreamId::NONE is the sentinel, so all lower u32 indexes are valid.
+            pool: StreamPool::new(StreamId::NONE.get(), 0)?,
+            len: 0,
+        })
+    }
+
+    fn can_reserve(&self, id: StreamId) -> bool {
+        !id.is_none() && self.pool.can_reserve_index(id.get())
+    }
+
+    fn reserve(&mut self, id: StreamId) -> pool::Result<()> {
+        self.pool.reserve_index(id.get())?;
+        self.len = self.len.max(id.get() as usize + 1);
+        Ok(())
+    }
+
+    fn install(&mut self, stream: Stream) -> pool::Result<()> {
+        let id = stream.id;
+        self.reserve(id)?;
+        self[id.get() as usize] = stream;
+        Ok(())
+    }
+
+    fn retire(&mut self, id: StreamId) {
+        let index = id.get() as usize;
+        assert!(index < self.len, "retired DN stream index was never issued");
+        assert!(self[index].deletion.retired(), "retired DN stream is still live");
+        // SAFETY: the final reference to this stream has been reclaimed, and
+        // callers hold the stream-table write lock. The global lock prevents
+        // the exclusive reclamation pass from racing this insertion.
+        unsafe { self.pool.retire_index(id.get()) };
+    }
+
+    fn reclaim(&mut self) {
+        self.pool.reclaim();
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new().expect("rebuilding DN stream pool");
+    }
+}
+
+impl Deref for StreamTable {
+    type Target = [Stream];
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: the pool's stable mapping has initialized every slot in this
+        // published prefix, and len never exceeds its issued prefix.
+        unsafe { std::slice::from_raw_parts(self.pool.base_ptr().as_ptr(), self.len) }
+    }
+}
+
+impl DerefMut for StreamTable {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: callers have exclusive access to StreamTable and len covers
+        // only initialized slots in the stable pool mapping.
+        unsafe { std::slice::from_raw_parts_mut(self.pool.base_ptr().as_ptr(), self.len) }
+    }
+}
+
+impl Drop for StreamTable {
+    fn drop(&mut self) {
+        for index in 0..self.pool.issued_blocks() {
+            // PoolItem::init initialized every issued slot, including free ones.
+            unsafe { std::ptr::drop_in_place(self.pool.base_ptr().as_ptr().add(index as usize)) };
         }
     }
 }
@@ -780,10 +906,18 @@ struct BatchCountGather {
     failed: Option<Resp>,
 }
 
-struct DNState;
+struct DNState {
+    stream_table: Arc<RwLock<StreamTable>>,
+}
 
 impl raft::execution::Application for DNState {
-    fn reset(&mut self) {}
+    fn reset(&mut self) {
+        self.stream_table.write().expect("streams").reset();
+    }
+
+    fn reclaim(&mut self) {
+        self.stream_table.write().expect("streams").reclaim();
+    }
 }
 
 struct DN {
@@ -809,7 +943,7 @@ struct DN {
     next_stream: AtomicU64,
     /// The current DN serves one range (`mine`). StreamId indexes this range's table.
     /// Lock the object table before this table; never hold either across a network call.
-    stream_table: RwLock<Vec<Stream>>,
+    stream_table: Arc<RwLock<StreamTable>>,
     // Sparse, range-scoped metadata. Lock owner before extras, never the reverse.
     object_extras: Mutex<Extras<(ObjectId, TimeSec)>>,
     stream_extras: Mutex<SharedExtras<(StreamId, TimeSec)>>,
@@ -1144,14 +1278,17 @@ impl DN {
                     Delete { target: Target::Stream(child.1), retention: None, hard: true },
                 )?;
                 let mut table = self.stream_table.write().unwrap();
-                let stream = &mut table[id.get() as usize];
-                let key = (stream.id, stream.created);
-                assert!(self.stream_extras.lock().unwrap().reclaim(
-                    &key,
-                    &mut stream.deletion,
-                    TimeSec::now()
-                ));
-                // Keep only an unrecycled index tombstone.
+                let reclaimed = {
+                    let stream = &mut table[id.get() as usize];
+                    let key = (stream.id, stream.created);
+                    self.stream_extras.lock().unwrap().reclaim(
+                        &key,
+                        &mut stream.deletion,
+                        TimeSec::now(),
+                    )
+                };
+                assert!(reclaimed);
+                table.retire(id);
             }
         }
         if deletion.hard {
@@ -1607,8 +1744,8 @@ impl DN {
         let mut objects = self.object_table.write().expect("objects");
         let Some(object) = objects.get_mut(name) else { return };
         object.streams.push(self.install_stream(Stream {
-            deletion: Flags::default(),
             id: stream,
+            deletion: Flags::default(),
             records: SRoff::NONE,
             created: object.created,
             logical,
@@ -2558,7 +2695,6 @@ impl DN {
         let mut stream_ids = std::collections::HashSet::new();
         let mut choices = Vec::with_capacity(cmd.rows.len());
         let mut add_objects = 0usize;
-        let mut needed_streams = 0usize;
         let objects = self.object_table.read().expect("objects");
         for row in &cmd.rows {
             if row.id.is_none() || row.stream.is_none() || row.sn.is_none() {
@@ -2609,14 +2745,6 @@ impl DN {
                 }
             };
             choices.push(choice);
-            if !matches!(choice, Choice::Keep) {
-                let slot = usize::try_from(row.stream.get())
-                    .map_err(|_| common::Error::new("stream id does not fit this machine"))?;
-                needed_streams = needed_streams.max(
-                    slot.checked_add(1)
-                        .ok_or_else(|| common::Error::new("stream table size overflow"))?,
-                );
-            }
         }
         drop(objects);
 
@@ -2626,13 +2754,7 @@ impl DN {
             .try_reserve(add_objects)
             .map_err(|error| common::Error::new(format!("reserve DN objects: {error}")))?;
         {
-            let mut table = self.stream_table.write().expect("streams");
-            let extra = needed_streams.saturating_sub(table.len());
-            if extra != 0 {
-                table
-                    .try_reserve(extra)
-                    .map_err(|error| common::Error::new(format!("reserve DN streams: {error}")))?;
-            }
+            let table = self.stream_table.read().expect("streams");
             for (row, choice) in cmd.rows.iter().zip(&choices) {
                 if matches!(choice, Choice::Keep) {
                     continue;
@@ -2656,6 +2778,17 @@ impl DN {
                 } else if matches!(choice, Choice::Same) {
                     return Err(common::Error::new("completed object has no stream slot"));
                 }
+                let same_live = slot < table.len()
+                    && table[slot].id == row.stream
+                    && table[slot].created == row.created
+                    && table[slot].sn == row.sn
+                    && !table[slot].deletion.retired();
+                if matches!(choice, Choice::New) && !same_live && !table.can_reserve(row.stream) {
+                    return Err(common::Error::new(format!(
+                        "DN create action cannot reserve stream {}",
+                        row.stream
+                    )));
+                }
             }
         }
 
@@ -2667,15 +2800,15 @@ impl DN {
                 continue;
             }
             let slot = row.stream.get() as usize;
-            while table.len() <= slot {
-                let id = StreamId::new(table.len() as u32);
-                let mut vacant = Stream::new(id, SnId::NONE, TimeSec::EPOCH);
-                vacant.deletion = Flags::vacant();
-                table.push(vacant);
-            }
-            if table[slot].deletion.retired() {
-                table[slot] = Stream::new(row.stream, row.sn, row.created);
-                table[slot].deletion = Flags::live();
+            let same_live = slot < table.len()
+                && table[slot].id == row.stream
+                && table[slot].created == row.created
+                && table[slot].sn == row.sn
+                && !table[slot].deletion.retired();
+            if !same_live {
+                let mut stream = Stream::new(row.stream, row.sn, row.created);
+                stream.deletion = Flags::live();
+                table.install(stream).expect("prechecked DN stream slot");
             }
             objects.insert(
                 row.name.clone().into_boxed_str(),
@@ -2717,27 +2850,10 @@ impl DN {
         let end = first
             .checked_add(count as u64)
             .ok_or_else(|| common::Error::new("stream table size overflow"))?;
-        let mut table = self.stream_table.write().expect("streams");
-        let needed = usize::try_from(end)
-            .map_err(|_| common::Error::new("stream table size does not fit this machine"))?;
-        let extra = needed.saturating_sub(table.len());
-        if extra != 0 {
-            table.try_reserve(extra).map_err(|e| common::Error::new(e.to_string()))?;
-        }
         let mut ids = Vec::new();
         ids.try_reserve(count).map_err(|e| common::Error::new(e.to_string()))?;
-        while table.len() < needed {
-            let id = StreamId::new(table.len() as u32);
-            let mut stream = Stream::new(id, SnId::NONE, TimeSec::EPOCH);
-            stream.deletion = Flags::vacant();
-            table.push(stream);
-        }
         for n in first..end {
-            let id = StreamId::new(n as u32);
-            if !table[id.get() as usize].deletion.retired() {
-                return Err(common::Error::new(format!("stream slot {id} is already in use")));
-            }
-            ids.push(id);
+            ids.push(StreamId::new(n as u32));
         }
         Ok(ids)
     }
@@ -2745,8 +2861,8 @@ impl DN {
     fn install_stream(&self, stream: Stream) -> StreamId {
         let id = stream.id;
         let mut table = self.stream_table.write().expect("streams");
-        assert!(table[id.get() as usize].deletion.retired());
-        table[id.get() as usize] = stream;
+        assert!(table.can_reserve(id), "stream index is not available");
+        table.install(stream).expect("prechecked DN stream index");
         id
     }
 
@@ -2815,8 +2931,17 @@ impl DN {
             snapshot_interval_secs: u64::MAX,
             allow_stale_reads: config.knobs.allow_stale_reads,
         };
+        let stream_table = Arc::new(RwLock::new(
+            StreamTable::new()
+                .map_err(|error| common::Error::new(format!("create DN stream pool: {error}")))?,
+        ));
         let dn_node = DN {
-            common: raft::runtime::Runtime::with_state(runtime, node, options, DNState),
+            common: raft::runtime::Runtime::with_state(
+                runtime,
+                node,
+                options,
+                DNState { stream_table: Arc::clone(&stream_table) },
+            ),
             config,
             gc_stop: AtomicBool::new(true),
             gc_thread: Mutex::new(None),
@@ -2833,7 +2958,7 @@ impl DN {
             // arena is a real object, and starting at one would waste it (§17.37.2).
             next_object: AtomicU64::new(0),
             next_stream: AtomicU64::new(0),
-            stream_table: RwLock::new(Vec::new()),
+            stream_table,
             object_extras: Mutex::new(Extras::default()),
             stream_extras: Mutex::new(Extras::default()),
             #[cfg(test)]
@@ -3112,9 +3237,9 @@ impl Host for DN {
         }
     }
 
-    fn reset_metadata(&self, _state: &mut DNState) {
+    fn reset_metadata(&self, state: &mut DNState) {
+        raft::execution::Application::reset(state);
         self.object_table.write().expect("objects").clear();
-        self.stream_table.write().expect("streams").clear();
         *self.object_extras.lock().expect("object extras") = Extras::default();
         *self.stream_extras.lock().expect("stream extras") = SharedExtras::default();
         self.retired_objects.lock().expect("retired objects").clear();
@@ -3334,7 +3459,7 @@ mod tests {
         let id = cmd.rows[0].id;
         let action = dn_action(&cmd).unwrap();
         let mut done = Vec::new();
-        let mut state = DNState;
+        let mut state = DNState { stream_table: Arc::clone(&dn.stream_table) };
         dn.apply_client(
             &mut state,
             raft::execution::Context { ring: "DN", index: 7, term: 1 },
@@ -3794,6 +3919,25 @@ mod tests {
         assert_eq!(size_of::<StreamId>(), 4);
         assert_eq!(size_of::<Stream>(), 56);
         assert_eq!(size_of::<AtomicU32>(), 4);
+    }
+
+    #[test]
+    fn stream_pool_uses_stream_id_as_slot_and_reclaims_after_gc() {
+        let mut table = StreamTable::new().unwrap();
+        let id = StreamId::new(5);
+        table.install(Stream::new(id, SnId::new(2), TimeSec::new(10))).unwrap();
+        assert_eq!(table.len(), 6);
+        assert_eq!(table[id.get() as usize].id, id);
+        assert!(table[0].deletion.retired(), "skipped IDs start vacant");
+
+        table[id.get() as usize].deletion = Flags::vacant();
+        table.retire(id);
+        assert!(!table.can_reserve(id), "deleted slots wait for the global GC pass");
+        table.reclaim();
+        assert!(table.can_reserve(id));
+        table.install(Stream::new(id, SnId::new(3), TimeSec::new(11))).unwrap();
+        assert_eq!(table[id.get() as usize].sn, SnId::new(3));
+        assert_eq!(table[id.get() as usize].created, TimeSec::new(11));
     }
 
     use super::*;

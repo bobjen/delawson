@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 delawson-common.workspace = true
 delawson-raft.workspace = true
+delawson-pool.workspace = true
 parking_lot.workspace = true
 
 [dev-dependencies]

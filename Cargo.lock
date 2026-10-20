@@ -244,6 +244,7 @@ name = "delawson-dn"
 version = "0.0.1"
 dependencies = [
  "delawson-common",
+ "delawson-pool",
  "delawson-raft",
  "parking_lot",
  "tempfile",
