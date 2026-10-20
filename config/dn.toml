@@ -13,6 +13,21 @@ info_entries = 10000
 # Maximum number of sealed source objects in one concatenate request.
 max_concat_sources = 1024
 
+# Raft consensus for this DN. With no members listed, this process is a singleton.
+# To replicate the DN group, configure the same ring and member map on every member.
+[raft]
+# Number of recent shared entries retained by each member is 2^log2_entries.
+log2_entries = 16
+# ring = "DN0"
+# [raft.member_indexes]
+# DN0 = 0
+# DN1 = 1
+# DN2 = 2
+# [raft.members]
+# DN0 = "127.0.0.1:9600"
+# DN1 = "127.0.0.1:9601"
+# DN2 = "127.0.0.1:9602"
+
 # Threads answering requests off the read loop. Zero means one per core.
 [knobs]
 # Opt in to primary reads after quorum lease expiry (may return stale data).

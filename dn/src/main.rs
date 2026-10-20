@@ -32,8 +32,10 @@ use common::routing;
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::{Arg, Op, Req, Resp, Status, StructWriter, structure};
-use parking_lot::RwLock as GlobalRwLock;
+use raft::codec::Wire;
+use raft::runtime::{Host, Settings as RaftSettings};
 use std::collections::HashMap;
+use std::ops::Deref;
 #[cfg(test)]
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,6 +44,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const SERVES: &[Op] = &[
+    Op::Raft,
     Op::CreateObject,
     Op::BatchCreate,
     Op::ObjectInfo,
@@ -756,10 +759,15 @@ struct BatchCountGather {
     failed: Option<Resp>,
 }
 
+struct DNState;
+
+impl raft::execution::Application for DNState {
+    fn reset(&mut self) {}
+}
+
 struct DN {
+    common: raft::runtime::Runtime<DNState>,
     config: DNConfig,
-    /// Shared by request and reply processing; future Raft applies take it exclusively.
-    global_lock: GlobalRwLock<()>,
     gc_stop: AtomicBool,
     gc_thread: Mutex<Option<JoinHandle<()>>>,
     deleting: Mutex<()>,
@@ -782,6 +790,16 @@ struct DN {
     // Sparse, range-scoped metadata. Lock owner before extras, never the reverse.
     object_extras: Mutex<Extras<(ObjectId, TimeSec)>>,
     stream_extras: Mutex<SharedExtras<(StreamId, TimeSec)>>,
+    #[cfg(test)]
+    _test_dir: Option<tempfile::TempDir>,
+}
+
+impl Deref for DN {
+    type Target = raft::runtime::Runtime<DNState>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
 }
 
 fn shard_of(name: &str) -> usize {
@@ -797,11 +815,17 @@ fn shard_of(name: &str) -> usize {
 
 impl Service for DN {
     fn start(self: &Arc<Self>) -> common::Result<()> {
-        self.start_gc()
+        self.start_gc()?;
+        if let Err(error) = self.start_raft() {
+            let _ = self.stop_gc();
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn stop(&self, _process: &Process) -> common::Result<()> {
-        self.stop_gc()
+        self.stop_gc()?;
+        self.stop_raft()
     }
 
     fn serves(&self) -> &'static [Op] {
@@ -815,6 +839,9 @@ impl Service for DN {
     /// A create is answered once its streams exist, which is another process's
     /// business; a lookup is answered here.
     fn defers(&self, op: Op) -> bool {
+        if op == Op::Raft {
+            return true;
+        }
         // A lookup can park behind a create, so its answer need not come from the
         // thread that read it either.
         matches!(
@@ -847,13 +874,20 @@ impl Service for DN {
     }
 
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
+        if request.op() == Op::Raft {
+            return reply.send(self.raft_rpc(process, &request));
+        }
+        if matches!(request.op(), Op::CreateObject | Op::BatchCreate) {
+            if let Some(answer) = self.forward(&request) {
+                return reply.send(answer);
+            }
+            return reply.send(self.create_request(process, &request));
+        }
         let _state = self.global_lock.read();
         match request.op() {
             Op::SoftDeleteObject | Op::DeleteObject => {
                 reply.send(self.delete_object(process, &request))
             }
-            Op::CreateObject => self.create(process, &request, reply),
-            Op::BatchCreate => self.create_many(process, &request, reply),
             Op::ObjectInfo => self.info(process, &request, None, reply),
             Op::LocateStream => {
                 let (mut payload, rest) =
@@ -907,6 +941,7 @@ impl Service for DN {
             format!("extra_streams {}", self.streams.load(Ordering::Relaxed)),
             format!("waiting_for_a_stream {}", self.parked.load(Ordering::Relaxed)),
             format!("self_hosted {}", self.config.self_hosted),
+            self.raft_status(),
         ]
     }
 }
@@ -1555,46 +1590,54 @@ impl DN {
     }
 
     /// `(name, keyed, framing kind, framing width)`, and one stream to go with it.
-    fn create(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Reply) {
+    fn create_request(&self, process: &Process, request: &Req) -> Resp {
+        match request.op() {
+            Op::CreateObject => self.create_one(process, request),
+            Op::BatchCreate => self.create_many(process, request),
+            _ => Resp::error(Status::BadRequest, "not a create request"),
+        }
+    }
+
+    fn create_one(&self, process: &Process, request: &Req) -> Resp {
         // Only the first few arguments are the object; a create may carry more —
         // media class, an expiry — that nothing here reads yet.
         let (mut payload, rest) =
             match structure(&request.args(), Op::CreateObject, "a create-object request") {
                 Ok(value) => value,
                 Err(e) => {
-                    return reply.send(Resp::error(Status::BadRequest, e.to_string()));
+                    return Resp::error(Status::BadRequest, e.to_string());
                 }
             };
         let wanted = match Wanted::read(&mut payload) {
             Ok(wanted) => wanted,
-            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         // These fields are currently accepted for the CLI's create options but are not
         // interpreted by the DN yet. Keep them inside the command payload so the parser
         // still validates the complete value.
         if let Err(e) = payload.text() {
-            return reply.send(Resp::error(Status::BadRequest, e.to_string()));
+            return Resp::error(Status::BadRequest, e.to_string());
         }
         let has_expiry = match payload.flag() {
             Ok(has_expiry) => has_expiry,
-            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         if has_expiry {
             if let Err(e) = payload.number_u64() {
-                return reply.send(Resp::error(Status::BadRequest, e.to_string()));
+                return Resp::error(Status::BadRequest, e.to_string());
             }
         }
         if let Err(e) = payload.done() {
-            return reply.send(Resp::error(Status::BadRequest, e.to_string()));
+            return Resp::error(Status::BadRequest, e.to_string());
         }
         if !rest.is_empty() {
-            return reply.send(Resp::error(
+            return Resp::error(
                 Status::BadRequest,
                 "a create-object request has trailing arguments",
-            ));
+            );
         }
         let name = wanted.name.clone();
-        self.record(process, vec![wanted], reply, move |dn, made| {
+        self.record(process, vec![wanted], move |dn, made| {
             if made == 0 {
                 return Resp::error(Status::BadRequest, format!("{name} exists already"));
             }
@@ -1604,107 +1647,103 @@ impl DN {
                 Some(args) => Resp::from_args(Status::Ok, args).id(0),
                 None => Resp::error(Status::Internal, format!("{name} went missing")),
             }
-        });
+        })
     }
 
     /// A run of `(name, keyed)` pairs, which costs one stream request and one
     /// answer however many objects it holds.
-    fn create_many(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Reply) {
+    fn create_many(&self, process: &Process, request: &Req) -> Resp {
         let (mut payload, rest) =
             match structure(&request.args(), Op::BatchCreate, "a batch-create request") {
                 Ok(value) => value,
                 Err(e) => {
-                    return reply.send(Resp::error(Status::BadRequest, e.to_string()));
+                    return Resp::error(Status::BadRequest, e.to_string());
                 }
             };
         let count = match payload.number_u64() {
             Ok(count) => count as usize,
-            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         let mut wanted = match payload.checked_vec(count) {
             Ok(wanted) => wanted,
-            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
         };
         for _ in 0..count {
             match Wanted::read(&mut payload) {
                 Ok(one) => wanted.push(one),
                 Err(e) => {
-                    return reply.send(Resp::error(Status::BadRequest, e.to_string()));
+                    return Resp::error(Status::BadRequest, e.to_string());
                 }
             }
         }
         if let Err(e) = payload.done() {
-            return reply.send(Resp::error(Status::BadRequest, e.to_string()));
+            return Resp::error(Status::BadRequest, e.to_string());
         }
         if !rest.is_empty() {
-            return reply.send(Resp::error(
+            return Resp::error(
                 Status::BadRequest,
                 "a batch-create request has trailing arguments",
-            ));
+            );
         }
-        self.record(process, wanted, reply, |_, made| Resp::number(Status::Ok, made));
+        self.record(process, wanted, |_, made| Resp::number(Status::Ok, made))
     }
 
-    /// Take the names first, then name a stream for each one taken, then fill
-    /// them in. In that order because a create that loses a race must not leave a
-    /// stream behind — nothing deletes streams yet, so a leak here is permanent.
-    ///
-    /// The filling in happens when the SN answers, on whichever thread that
-    /// arrives, so nothing here waits.
+    /// Reserve names and stream ids locally, ask the SN to create its streams,
+    /// then replicate all new DN rows in one Raft action. A batch request remains
+    /// one action regardless of how many objects it contains.
     fn record(
-        self: &Arc<Self>,
-        process: &Arc<Process>,
+        &self,
+        process: &Process,
         wanted: Vec<Wanted>,
-        mut reply: Reply,
-        say: impl FnOnce(&DN, u64) -> Resp + Send + 'static,
-    ) {
+        say: impl FnOnce(&DN, u64) -> Resp,
+    ) -> Resp {
         let created = TimeSec::now();
 
-        // Whoever inserts the name owns the object; anyone else finds it there.
+        // Whoever inserts the name owns it; a concurrent request finds the
+        // reservation and does not create a second stream.
         let mut mine = Vec::with_capacity(wanted.len());
-        for one in &wanted {
-            let mut shard = self.shards[shard_of(&one.name)].lock().expect("objects");
-            if !shard.contains_key(one.name.as_str()) {
-                let id = ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32);
-                shard.insert(
-                    Box::from(one.name.as_str()),
-                    Object {
-                        deletion: Flags::default(),
-                        id,
-                        framing: one.framing,
-                        streams: Vec::new(),
-                        extending: false,
-                        waiting: Vec::new(),
-                        keyed: one.keyed,
-                        created,
-                    },
-                );
-                mine.push(one.name.clone());
+        let streams = {
+            let _state = self.global_lock.read();
+            for one in &wanted {
+                let mut shard = self.shards[shard_of(&one.name)].lock().expect("objects");
+                if !shard.contains_key(one.name.as_str()) {
+                    let id = ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32);
+                    shard.insert(
+                        Box::from(one.name.as_str()),
+                        Object {
+                            deletion: Flags::default(),
+                            id,
+                            framing: one.framing,
+                            streams: Vec::new(),
+                            extending: false,
+                            waiting: Vec::new(),
+                            keyed: one.keyed,
+                            created,
+                        },
+                    );
+                    mine.push((one.clone(), id));
+                }
             }
-        }
-        if mine.is_empty() {
-            return reply.send(say(self, 0));
-        }
+            if mine.is_empty() {
+                return say(self, 0);
+            }
+            match self.reserve_streams(mine.len()) {
+                Ok(streams) => streams,
+                Err(error) => {
+                    let names: Vec<_> = mine.iter().map(|(one, _)| one.name.clone()).collect();
+                    let failed = self.give_back(&names, Status::Internal, error.to_string());
+                    self.wake(&names, Some(&failed));
+                    return failed;
+                }
+            }
+        };
 
         // Keep one reserved stream identity for each object name. Stream IDs may
         // eventually be recycled, so a batch is an explicit list, never a range.
-        let named_first = mine[0].clone();
         let count = mine.len() as u64;
-        let streams = match self.reserve_streams(mine.len()) {
-            Ok(ids) => ids,
-            Err(e) => {
-                let failed = self.give_back(&mine, Status::Internal, e.to_string());
-                self.wake(&mine, Some(&failed));
-                return reply.send(failed);
-            }
-        };
         let sn = match process.pick(ServiceKind::Sn) {
             Ok(sn) => sn.to_string(),
-            Err(e) => {
-                let failed = self.give_back(&mine, Status::Internal, e.to_string());
-                self.wake(&mine, Some(&failed));
-                return reply.send(failed);
-            }
+            Err(e) => return self.fail_record(&mine, Status::Internal, e.to_string()),
         };
         let names: Vec<StreamName> = streams
             .iter()
@@ -1712,33 +1751,64 @@ impl DN {
             .collect();
         let ask = create_streams(&names);
 
-        let dn = Arc::clone(self);
         let sn_number =
             SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
-        let named = sn.clone();
-        let asked = process.ask(&sn, &ask, move |answer| {
-            let _state = dn.global_lock.read();
-            if answer.status != Status::Ok {
-                let why = format!("{named} would not make {count} streams");
-                let failed = dn.give_back(&mine, answer.status, why);
-                dn.wake(&mine, Some(&failed));
-                return reply.send(failed);
-            }
-            for (name, stream) in mine.iter().zip(streams) {
-                let mut shard = dn.shards[shard_of(name)].lock().expect("objects");
-                if let Some(object) = shard.get_mut(name.as_str()) {
-                    let made = object.created;
-                    object.streams.push(dn.install_stream(Stream::new(stream, sn_number, made)));
-                }
-            }
-            dn.objects.fetch_add(count, Ordering::Relaxed);
-            dn.wake(&mine, None);
-            reply.about(format_args!("{named_first} count {count} streams on {named}"));
-            reply.send(say(&dn, count));
-        });
-        if let Err(e) = asked {
-            logw!("could not reach an SN", "sn {sn},{e}");
+        let answer = match process.call(&sn, &ask) {
+            Ok(answer) => answer,
+            Err(error) => return self.fail_record(&mine, Status::Internal, error.to_string()),
+        };
+        if answer.status != Status::Ok {
+            return self.fail_record(
+                &mine,
+                answer.status,
+                format!("SN{sn_number} would not make {count} streams"),
+            );
         }
+
+        let rows = mine
+            .iter()
+            .zip(streams)
+            .map(|((one, id), stream)| DnCreateRow {
+                name: one.name.clone(),
+                id: *id,
+                keyed: one.keyed,
+                framing: one.framing,
+                created,
+                stream,
+                sn: sn_number,
+            })
+            .collect();
+        let action = match dn_action(&DnCreateCmd { rows }) {
+            Ok(action) => action,
+            Err(error) => return self.fail_record(&mine, Status::Internal, error.to_string()),
+        };
+        let ticket = match self.queue_client(action) {
+            Ok(ticket) => ticket,
+            Err(error) => return self.fail_record(&mine, Status::Internal, error.to_string()),
+        };
+        let index = match ticket.wait() {
+            Ok(index) => index,
+            Err(error) => return self.fail_record(&mine, Status::Internal, error.to_string()),
+        };
+        if let Err(error) = self.wait_applied(index) {
+            // Once committed, the action may still apply after a wait error. Leave
+            // its reservations in place rather than making its ids available again.
+            logw!("DN create action did not finish", "error {error}");
+            return Resp::error(Status::Internal, error.to_string());
+        }
+
+        let _state = self.global_lock.read();
+        let names: Vec<_> = mine.iter().map(|(one, _)| one.name.clone()).collect();
+        self.wake(&names, None);
+        say(self, count)
+    }
+
+    fn fail_record(&self, mine: &[(Wanted, ObjectId)], status: Status, why: String) -> Resp {
+        let names: Vec<_> = mine.iter().map(|(one, _)| one.name.clone()).collect();
+        let _state = self.global_lock.read();
+        let failed = self.give_back(&names, status, why);
+        self.wake(&names, Some(&failed));
+        failed
     }
 
     /// `(name, sealed stream, records)`: that stream is full, so give the object
@@ -2365,6 +2435,154 @@ impl DN {
 }
 
 impl DN {
+    /// Apply a whole object-creation request after every corresponding SN stream
+    /// exists. Validate and reserve first so a malformed or conflicting batch
+    /// cannot leave a prefix of its rows visible.
+    fn apply_create(&self, cmd: DnCreateCmd) -> common::Result<()> {
+        if cmd.rows.is_empty() {
+            return Err(common::Error::new("empty DN create action"));
+        }
+
+        let mut names = std::collections::HashSet::new();
+        let mut object_ids = std::collections::HashSet::new();
+        let mut stream_ids = std::collections::HashSet::new();
+        let mut complete = Vec::with_capacity(cmd.rows.len());
+        let mut add_per_shard = [0usize; SHARDS];
+        let mut needed_streams = 0usize;
+        for row in &cmd.rows {
+            if row.id.is_none() || row.stream.is_none() || row.sn.is_none() {
+                return Err(common::Error::new("DN create action has a sentinel id"));
+            }
+            if !names.insert(row.name.as_str())
+                || !object_ids.insert(row.id)
+                || !stream_ids.insert(row.stream)
+            {
+                return Err(common::Error::new("DN create action repeats an identity"));
+            }
+            let shard_at = shard_of(&row.name);
+            let present = self.shards[shard_at].lock().expect("objects");
+            let done = match present.get(row.name.as_str()) {
+                None => {
+                    add_per_shard[shard_at] += 1;
+                    false
+                }
+                Some(object)
+                    if object.id == row.id
+                        && object.created == row.created
+                        && object.keyed == row.keyed
+                        && object.framing == row.framing
+                        && object.streams.is_empty() =>
+                {
+                    false
+                }
+                Some(object)
+                    if object.id == row.id
+                        && object.created == row.created
+                        && object.keyed == row.keyed
+                        && object.framing == row.framing
+                        && object.streams.len() == 1
+                        && object.streams[0] == row.stream =>
+                {
+                    true
+                }
+                Some(_) => {
+                    return Err(common::Error::new(format!(
+                        "DN create action conflicts with existing object {}",
+                        row.name
+                    )));
+                }
+            };
+            drop(present);
+            complete.push(done);
+            let slot = usize::try_from(row.stream.get())
+                .map_err(|_| common::Error::new("stream id does not fit this machine"))?;
+            needed_streams = needed_streams.max(
+                slot.checked_add(1)
+                    .ok_or_else(|| common::Error::new("stream table size overflow"))?,
+            );
+        }
+
+        for (at, count) in add_per_shard.into_iter().enumerate() {
+            if count != 0 {
+                self.shards[at]
+                    .lock()
+                    .expect("objects")
+                    .try_reserve(count)
+                    .map_err(|error| common::Error::new(format!("reserve DN objects: {error}")))?;
+            }
+        }
+        {
+            let mut table = self.stream_table.write().expect("streams");
+            if needed_streams > table.len() {
+                let extra = needed_streams - table.len();
+                table
+                    .try_reserve(extra)
+                    .map_err(|error| common::Error::new(format!("reserve DN streams: {error}")))?;
+            }
+            for (row, done) in cmd.rows.iter().zip(&complete) {
+                let slot = row.stream.get() as usize;
+                if slot < table.len() {
+                    let held = &table[slot];
+                    let matches =
+                        held.id == row.stream && held.created == row.created && held.sn == row.sn;
+                    let conflict =
+                        if *done { !matches } else { !held.deletion.retired() && !matches };
+                    if conflict {
+                        return Err(common::Error::new(format!(
+                            "DN create action conflicts with stream {}",
+                            row.stream
+                        )));
+                    }
+                } else if *done {
+                    return Err(common::Error::new("completed object has no stream slot"));
+                }
+            }
+        }
+
+        let mut added = 0u64;
+        for (row, done) in cmd.rows.into_iter().zip(complete) {
+            if done {
+                continue;
+            }
+            let shard_at = shard_of(&row.name);
+            let mut shard = self.shards[shard_at].lock().expect("objects");
+            let mut table = self.stream_table.write().expect("streams");
+            let slot = row.stream.get() as usize;
+            while table.len() <= slot {
+                let id = StreamId::new(table.len() as u32);
+                let mut vacant = Stream::new(id, SnId::NONE, TimeSec::EPOCH);
+                vacant.deletion = Flags::vacant();
+                table.push(vacant);
+            }
+            if table[slot].deletion.retired() {
+                table[slot] = Stream::new(row.stream, row.sn, row.created);
+            }
+            if let Some(object) = shard.get_mut(row.name.as_str()) {
+                object.streams.push(row.stream);
+                object.extending = false;
+            } else {
+                shard.insert(
+                    row.name.clone().into_boxed_str(),
+                    Object {
+                        deletion: Flags::default(),
+                        id: row.id,
+                        framing: row.framing,
+                        streams: vec![row.stream],
+                        extending: false,
+                        waiting: Vec::new(),
+                        keyed: row.keyed,
+                        created: row.created,
+                    },
+                );
+            }
+            self.retired_objects.lock().expect("retired objects").remove(row.name.as_str());
+            self.next_object.fetch_max(row.id.get() as u64 + 1, Ordering::Relaxed);
+            added += 1;
+        }
+        self.objects.fetch_add(added, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn reserve_stream(&self) -> common::Result<StreamId> {
         self.reserve_streams(1)?
             .into_iter()
@@ -2428,10 +2646,45 @@ impl DN {
         }
     }
 
-    fn new(config: DNConfig, dn: DnId, mine: RangeId) -> DN {
-        DN {
+    fn with_runtime(
+        config: DNConfig,
+        dn: DnId,
+        mine: RangeId,
+        path: &std::path::Path,
+        runtime: RaftSettings,
+    ) -> common::Result<DN> {
+        runtime.validate(&config.raft)?;
+        let mut initial = raft::State::initial(
+            runtime.ring.clone(),
+            if runtime.identities.is_empty() {
+                Default::default()
+            } else {
+                runtime.members.clone()
+            },
+            runtime.identities.clone(),
+        )?;
+        initial.ignore_ring_identity = runtime.ignore_ring_identity;
+        let journal = raft::journal::Journal::open(path, initial, 3, &runtime.name)?;
+        let id =
+            journal.state.membership().slot(&journal.identity.current).unwrap_or(raft::UNASSIGNED);
+        let mut node = raft::Node::new_with_log2(id, journal, config.raft.log2_entries)?;
+        node.merge_history_scn()?;
+        node.identity = Some(node.journal.identity.current.clone());
+        node.lease = raft::lease::Lease::configured(&config.raft);
+        if node.state().membership().members().len() == 1
+            && node.state().membership().members().contains(&id)
+        {
+            node.campaign()?;
+        }
+        let options = raft::runtime::Options {
+            raft: config.raft.clone(),
+            snapshot_min_log_bytes: u64::MAX,
+            snapshot_interval_secs: u64::MAX,
+            allow_stale_reads: config.knobs.allow_stale_reads,
+        };
+        let dn_node = DN {
+            common: raft::runtime::Runtime::with_state(runtime, node, options, DNState),
             config,
-            global_lock: GlobalRwLock::new(()),
             gc_stop: AtomicBool::new(true),
             gc_thread: Mutex::new(None),
             deleting: Mutex::new(()),
@@ -2448,7 +2701,35 @@ impl DN {
             stream_table: RwLock::new(Vec::new()),
             object_extras: Mutex::new(Extras::default()),
             stream_extras: Mutex::new(Extras::default()),
+            #[cfg(test)]
+            _test_dir: None,
+        };
+        dn_node.ready.store(true, Ordering::SeqCst);
+        let commit = dn_node.on_raft(|host, node| {
+            host.refresh_application(node)?;
+            Ok(node.state().commit)
+        })?;
+        while dn_node.applied() < commit {
+            dn_node.execute_pending()?;
         }
+        Ok(dn_node)
+    }
+
+    #[cfg(test)]
+    fn new(config: DNConfig, dn: DnId, mine: RangeId) -> DN {
+        let settings = RaftSettings::testing(&config.raft);
+        let directory = tempfile::tempdir().expect("create DN test directory");
+        raft::journal::provision_test_founder(
+            directory.path(),
+            &settings.ring,
+            &settings.name,
+            settings.identities[&0].identity.clone(),
+        )
+        .expect("provision DN test journal");
+        let mut dn = Self::with_runtime(config, dn, mine, directory.path(), settings)
+            .expect("construct DN test Raft runtime");
+        dn._test_dir = Some(directory);
+        dn
     }
 }
 
@@ -2557,6 +2838,70 @@ struct Piece {
     args: Vec<Arg>,
 }
 
+/// One object and its initial stream. A batch create carries a vector of these in
+/// one Raft action, so stream ids and object rows become visible together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DnCreateRow {
+    name: String,
+    id: ObjectId,
+    keyed: bool,
+    framing: Framing,
+    created: TimeSec,
+    stream: StreamId,
+    sn: SnId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DnCreateCmd {
+    rows: Vec<DnCreateRow>,
+}
+
+impl Wire for DnCreateCmd {
+    fn write(&self, w: &mut StructWriter) {
+        w.nested(Op::DnCreate, |w| {
+            w.number_u64(self.rows.len() as u64);
+            for row in &self.rows {
+                w.nested(Op::RaftPair, |w| {
+                    w.text(&row.name);
+                    w.number_u32(row.id.get());
+                    w.flag(row.keyed);
+                    let (kind, width) = row.framing.wire();
+                    w.number_u8(kind);
+                    w.number_u32(width);
+                    w.time_sec(row.created);
+                    w.stream_id(row.stream);
+                    w.sn_id(row.sn);
+                });
+            }
+        });
+    }
+
+    fn read(r: &mut common::StructReader<'_>) -> common::Result<Self> {
+        r.nested(Op::DnCreate, "DN create action", |r| {
+            let count = r.number_u64()?;
+            let mut rows = common::checked_vec(count, r.remaining())?;
+            for _ in 0..count {
+                rows.push(r.nested(Op::RaftPair, "DN object and stream", |r| {
+                    Ok(DnCreateRow {
+                        name: r.text()?,
+                        id: ObjectId::new(r.number_u32()?),
+                        keyed: r.flag()?,
+                        framing: Framing::of_wire(r.number_u8()?, r.number_u32()?)?,
+                        created: r.time_sec()?,
+                        stream: r.stream_id()?,
+                        sn: r.sn_id()?,
+                    })
+                })?);
+            }
+            Ok(DnCreateCmd { rows })
+        })
+    }
+}
+
+fn dn_action(cmd: &DnCreateCmd) -> common::Result<raft::Action> {
+    Ok(raft::Action::new(Op::DnCreate, raft::codec::encode(cmd)?))
+}
+
 /// Decode the rollover request using the same ID and record widths as its writer.
 fn create_streams(names: &[StreamName]) -> Req {
     let mut payload = StructWriter::new();
@@ -2582,10 +2927,82 @@ fn extension(request: &Req) -> common::Result<(String, StreamId, SRoff)> {
     Ok((name, sealed, records))
 }
 
+impl Host for DN {
+    type Application = DNState;
+    type Done = ();
+
+    fn apply_client(
+        &self,
+        _state: &mut DNState,
+        _context: raft::execution::Context<'_>,
+        action: &raft::Action,
+        _done: &mut Vec<Self::Done>,
+    ) -> common::Result<()> {
+        match action.op {
+            Op::DnCreate => self.apply_create(raft::codec::decode(&action.fields)?),
+            _ => Err(common::Error::new(format!("DN does not apply {}", action.op))),
+        }
+    }
+
+    fn reset_metadata(&self, _state: &mut DNState) {
+        for shard in &self.shards {
+            shard.lock().expect("objects").clear();
+        }
+        self.stream_table.write().expect("streams").clear();
+        *self.object_extras.lock().expect("object extras") = Extras::default();
+        *self.stream_extras.lock().expect("stream extras") = SharedExtras::default();
+        self.retired_objects.lock().expect("retired objects").clear();
+        self.next_object.store(0, Ordering::Relaxed);
+        self.objects.store(0, Ordering::Relaxed);
+        self.streams.store(0, Ordering::Relaxed);
+        self.parked.store(0, Ordering::Relaxed);
+    }
+
+    fn prepare_primary(&self, _node: &mut raft::Node) -> common::Result<()> {
+        Ok(())
+    }
+
+    fn checkpoint_actions(
+        &self,
+        state: &raft::State,
+        _application: &Self::Application,
+    ) -> common::Result<Vec<raft::Entry>> {
+        Ok(state.capture().application)
+    }
+
+    fn peer_message(&self) -> Option<raft::Action> {
+        None
+    }
+
+    fn receive_client(&self, _process: &Process, _action: raft::Action) -> common::Result<Resp> {
+        Err(common::Error::new("DN has no Raft client actions yet"))
+    }
+
+    fn dispatch_forwarded(&self, process: &Process, request: &Req) -> Resp {
+        self.create_request(process, request)
+    }
+
+    fn forwardable(&self, op: Op) -> bool {
+        matches!(op, Op::CreateObject | Op::BatchCreate)
+    }
+
+    fn registered_endpoint(&self, _name: &str) -> Option<std::net::SocketAddr> {
+        None
+    }
+}
+
 fn main() {
     let result = server::main(|process| {
+        let config = DNConfig::load(&process.config.service_config)?;
+        let runtime = RaftSettings::for_process(process, &config.raft)?;
         let dn = DnId::new(process.entry.number());
-        Ok(DN::new(DNConfig::load(&process.config.service_config)?, dn, routing::range_of_dn(dn)))
+        DN::with_runtime(
+            config,
+            dn,
+            routing::range_of_dn(dn),
+            &process.config.data_dir.join("raft"),
+            runtime,
+        )
     });
     if let Err(e) = result {
         eprintln!("dn: {e}");
@@ -2595,6 +3012,102 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn create_batch_is_one_replayable_action() {
+        let cmd = DnCreateCmd {
+            rows: vec![
+                DnCreateRow {
+                    name: "/one".into(),
+                    id: ObjectId::new(3),
+                    keyed: false,
+                    framing: Framing::Bytes,
+                    created: TimeSec::new(500),
+                    stream: StreamId::new(4),
+                    sn: SnId::new(2),
+                },
+                DnCreateRow {
+                    name: "/two".into(),
+                    id: ObjectId::new(5),
+                    keyed: true,
+                    framing: Framing::Fixed(12),
+                    created: TimeSec::new(500),
+                    stream: StreamId::new(6),
+                    sn: SnId::new(2),
+                },
+            ],
+        };
+        let action = dn_action(&cmd).unwrap();
+        assert_eq!(action.op, Op::DnCreate);
+        let read: DnCreateCmd = raft::codec::decode(&action.fields).unwrap();
+        assert_eq!(read, cmd);
+
+        let dn = DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST);
+        dn.apply_create(read.clone()).unwrap();
+        dn.apply_create(read).unwrap();
+        assert_eq!(dn.objects.load(Ordering::Relaxed), 2);
+        let table = dn.stream_table.read().unwrap();
+        assert_eq!(table.len(), 7);
+        assert_eq!(table[4].id, StreamId::new(4));
+        assert_eq!(table[4].sn, SnId::new(2));
+        assert_eq!(table[6].id, StreamId::new(6));
+        drop(table);
+        for (name, id, stream) in [("/one", 3, 4), ("/two", 5, 6)] {
+            let shard = dn.shards[shard_of(name)].lock().unwrap();
+            let object = shard.get(name).unwrap();
+            assert_eq!(object.id, ObjectId::new(id));
+            assert_eq!(object.streams, [StreamId::new(stream)]);
+        }
+    }
+
+    #[test]
+    fn single_member_raft_applies_one_batch_create_action() {
+        let dn =
+            std::sync::Arc::new(DN::new(common::testing::dn_config(), DnId::FIRST, RangeId::FIRST));
+        dn.start_raft().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline {
+            let (role, commit) =
+                dn.on_raft(|_, node| Ok((node.role, node.state().commit))).unwrap();
+            if role == raft::Role::Leader && commit != 0 && dn.applied() >= commit {
+                ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let action = dn_action(&DnCreateCmd {
+            rows: vec![
+                DnCreateRow {
+                    name: "/raft/one".into(),
+                    id: ObjectId::new(0),
+                    keyed: false,
+                    framing: Framing::Bytes,
+                    created: TimeSec::new(800),
+                    stream: StreamId::new(0),
+                    sn: SnId::new(1),
+                },
+                DnCreateRow {
+                    name: "/raft/two".into(),
+                    id: ObjectId::new(1),
+                    keyed: true,
+                    framing: Framing::Lf,
+                    created: TimeSec::new(800),
+                    stream: StreamId::new(1),
+                    sn: SnId::new(1),
+                },
+            ],
+        })
+        .unwrap();
+        let index = dn.queue_client(action).unwrap().wait().unwrap();
+        dn.wait_applied(index).unwrap();
+        assert_eq!(dn.objects.load(Ordering::Relaxed), 2);
+        assert!(dn.look("/raft/one").is_some());
+        assert!(dn.look("/raft/two").is_some());
+        let status = dn.raft_status();
+        dn.stop_raft().unwrap();
+        assert!(ready, "single-member DN Raft did not apply its no-op entry: {status}");
+    }
+
     fn counts(dn: &DN, stream: &Stream) -> (u32, u32) {
         dn.stream_extras.lock().unwrap().counts(&(stream.id, stream.created), stream.deletion)
     }

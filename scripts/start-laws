@@ -143,6 +143,7 @@ fi
 
 started=()
 registrar_ready=no
+declare -A addresses=()
 while read -r identity kind domain _; do
     # A ready file means the listener is up, not that Raft can register peers.
     # Start/unlock all KS members first so a replicated ring can form a quorum.
@@ -178,7 +179,7 @@ while read -r identity kind domain _; do
     mkdir -p "$dir/data"
     cp "$cluster" "$dir/cluster.toml"
     cp "$service_config" "$dir/$kind.toml"
-    if [[ $kind == ks || $kind == sn ]]; then
+    if [[ $kind == ks || $kind == sn || $kind == dn ]]; then
         if [[ $creating_rings == true ]]; then
             if [[ $kind == ks ]]; then
                 "$root/scripts/member-identity" "$cluster" "$identity" "$dir/data/master-keys" "$kind"
@@ -233,6 +234,7 @@ PYIDENTITY
         fi
     done
     echo "started $identity ($kind, $profile) on $listen as pid $pid"
+    addresses[$identity]=$listen
     if [[ $kind == ks ]]; then
         "$laws" --config "$cluster" --at "$listen" --to "$identity" unlock "${unlock_args[@]}"
     fi
@@ -247,6 +249,25 @@ done < <("$laws" --config "$cluster" services)
 mapfile -t sn_ids < <("$laws" --config "$cluster" services | awk '$2 == "sn" { print $1 }')
 mapfile -t en_ids < <("$laws" --config "$cluster" services | awk '$2 == "en" { print $1 }')
 mapfile -t dn_ids < <("$laws" --config "$cluster" services | awk '$2 == "dn" { print $1 }')
+
+# DNs propose object and stream-definition actions, so do not report startup as
+# complete until every DN ring has a healthy known leader as well as the KS ring.
+for identity in "${dn_ids[@]}"; do
+    deadline=$((SECONDS + ready_wait))
+    while true; do
+        state=$("$laws" --config "$cluster" --at "${addresses[$identity]}" --to "$identity" status 2>&1) || state=""
+        if [[ $state =~ raft_leader[[:space:]]+[0-9]+ && $state == *"raft_failed false"* ]]; then
+            break
+        fi
+        if ((SECONDS >= deadline)); then
+            echo "start-laws: $identity has no healthy Raft leader after ${ready_wait}s" >&2
+            echo "$state" >&2
+            exit 1
+        fi
+        sleep 0.02
+    done
+done
+
 for source in "${dn_ids[@]}"; do
     source_number=${source//[^0-9]/}
     destinations=()

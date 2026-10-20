@@ -43,13 +43,13 @@ laws=./target/release/laws
 cluster="$output/run/cluster-effective.toml"
 raft_nodes=()
 while read -r identity kind _; do
-    if [[ $kind == ks || $kind == sn ]]; then
+    if [[ $kind == ks || $kind == sn || $kind == dn ]]; then
         raft_nodes+=("$identity")
     fi
 done < <("$laws" --config "$cluster" services)
 
-# start-laws gates on the KS registrar; wait here for every KS member and SN
-# ring to report a known, healthy leader before the benchmark starts.
+# start-laws gates on the KS registrar and every DN ring; wait here for every
+# KS, SN, and DN member to report a known, healthy leader before benchmarking.
 deadline=$((SECONDS + 60))
 while true; do
     missing=()
@@ -94,9 +94,10 @@ temporary run directories still use the same configured TCP ports. Do not run
 this while another development cluster is using those ports.
 
 `start-laws` waits for the registrar to report a healthy known Raft leader after
-starting/unlocking the KS members and before starting DNs. The benchmark runner
-then checks every KS member and every SN for a healthy known leader before
-population. Preserve both gates: a ready file only proves the listener is up.
+starting/unlocking the KS members and before starting DNs. It then waits for
+every DN ring to report a healthy known leader before returning. The benchmark
+runner checks every KS, SN, and DN member before population. Preserve all gates:
+a ready file only proves the listener is up.
 Older launchers without the KS gate can fail DN0 registration with `Raft has no
 known Raft leader`; check historical launchers before running. If startup fails,
 allow cleanup to finish before another attempt. Never interpret failed startup

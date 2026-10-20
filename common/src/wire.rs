@@ -317,6 +317,7 @@ ops! {
     SnSealStream = 142, "sn-seal-stream-action";
     SnDelete = 143, "sn-delete-action";
     SnDeleteDone = 144, "sn-delete-done-action";
+    DnCreate = 145, "dn-create-action";
 }
 
 impl std::fmt::Display for Op {

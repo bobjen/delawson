@@ -1703,32 +1703,6 @@ impl SN {
         Ok(index)
     }
 
-    fn stop_raft(&self) -> Result<()> {
-        self.snapshot_stopping.store(true, Ordering::SeqCst);
-        self.wake_execution();
-        loop {
-            let handles = std::mem::take(
-                &mut *self
-                    .raft_workers
-                    .lock()
-                    .map_err(|_| Error::new("Raft worker lock poisoned"))?,
-            );
-            if handles.is_empty() {
-                break;
-            }
-            for handle in &handles {
-                handle.thread().unpark();
-            }
-            for handle in handles {
-                handle.join().map_err(|_| Error::new("Raft worker panicked"))?;
-            }
-        }
-        if let Some(fence) = self.io_fence.get() {
-            fence.wait_all()?;
-        }
-        Ok(())
-    }
-
     fn start_gc(self: &Arc<Self>) -> Result<()> {
         let mut slot = self.gc_thread.lock().expect("GC thread");
         if slot.is_some() {

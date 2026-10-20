@@ -832,6 +832,9 @@ impl KsConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DNConfig {
+    /// Raft membership and timing for this DN's metadata group.
+    #[serde(default)]
+    pub raft: RaftConfig,
     pub knobs: Knobs,
     /// Object metadata is itself DeLawson keyed objects, reached through a root
     /// held outside the object hierarchy. Nothing reads this yet; it is here so
