@@ -243,7 +243,10 @@ impl Levelled {
     }
 }
 
+#[repr(C)]
 struct Object {
+    /// Used by LockedPool while this slot is free or deleted.
+    link: u32,
     deletion: Flags,
     /// Permanently skip the soft-delete interval when this object is deleted.
     purge_only: bool,
@@ -521,7 +524,184 @@ impl Drop for StreamTable {
     }
 }
 
+// SAFETY: fresh slots get a complete, droppable placeholder Object.
+unsafe impl pool::PoolItem for Object {
+    unsafe fn init(slot: *mut Self) {
+        // SAFETY: the pool supplies aligned, fresh storage for one Object.
+        unsafe { slot.write(Object::blank()) };
+    }
+}
+
+// SAFETY: Object::link is only a pool-list link while the slot is not live.
+unsafe impl pool::LockedItem for Object {
+    const LINK_NONE: u32 = ObjectId::NONE.get();
+
+    unsafe fn on_alloc(slot: *mut Self) {
+        // SAFETY: the pool returns an initialized, exclusively owned slot.
+        unsafe { (*slot).link = Self::LINK_NONE };
+    }
+}
+
+type ObjectPool = pool::LockedPool<
+    Object,
+    { std::mem::align_of::<Object>() },
+    { std::mem::offset_of!(Object, link) },
+>;
+
+/// Path lookup stays in a HashMap; object values live in stable pool slots.
+struct ObjectTable {
+    by_name: HashMap<Box<str>, u32>,
+    pool: ObjectPool,
+}
+
+impl ObjectTable {
+    fn new() -> pool::Result<Self> {
+        Ok(Self { by_name: HashMap::new(), pool: ObjectPool::new(ObjectId::NONE.get(), 0)? })
+    }
+
+    fn item(&self, index: u32) -> &Object {
+        assert!(index < self.pool.issued_blocks(), "DN object slot was never issued");
+        // SAFETY: every issued pool slot is initialized and remains at this address.
+        unsafe { &*self.pool.base_ptr().as_ptr().add(index as usize) }
+    }
+
+    fn item_mut(&mut self, index: u32) -> &mut Object {
+        assert!(index < self.pool.issued_blocks(), "DN object slot was never issued");
+        // SAFETY: callers hold exclusive access to ObjectTable and the slot is issued.
+        unsafe { &mut *self.pool.base_ptr().as_ptr().add(index as usize) }
+    }
+
+    fn get(&self, name: &str) -> Option<&Object> {
+        self.by_name.get(name).map(|index| self.item(*index))
+    }
+
+    fn get_mut(&mut self, name: &str) -> Option<&mut Object> {
+        let index = *self.by_name.get(name)?;
+        Some(self.item_mut(index))
+    }
+
+    fn contains_key(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+    }
+
+    fn index_of(&self, name: &str) -> Option<u32> {
+        self.by_name.get(name).copied()
+    }
+
+    fn try_reserve(&mut self, additional: usize) -> Result<(), std::collections::TryReserveError> {
+        self.by_name.try_reserve(additional)
+    }
+
+    fn alloc(&mut self) -> pool::Result<u32> {
+        self.pool.alloc()
+    }
+
+    fn alloc_many(&mut self, count: usize) -> pool::Result<Vec<u32>> {
+        let mut slots = Vec::with_capacity(count);
+        for _ in 0..count {
+            match self.pool.alloc() {
+                Ok(index) => slots.push(index),
+                Err(error) => {
+                    for index in slots {
+                        // SAFETY: these blank slots were just allocated here and
+                        // are not reachable through by_name.
+                        unsafe { self.pool.retire_index(index) };
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(slots)
+    }
+
+    fn retire_blank(&mut self, index: u32) {
+        assert_eq!(self.item(index).link, ObjectId::NONE.get());
+        // SAFETY: this blank slot is exclusively owned and not in by_name.
+        unsafe { self.pool.retire_index(index) };
+    }
+
+    #[cfg(test)]
+    fn insert(&mut self, name: Box<str>, object: Object) -> Option<Object> {
+        if self.index_of(&name).is_some() {
+            return self.insert_at(name, None, object);
+        }
+        let index = self.pool.alloc().expect("DN object pool exhausted");
+        self.insert_at(name, Some(index), object)
+    }
+
+    fn insert_at(&mut self, name: Box<str>, slot: Option<u32>, object: Object) -> Option<Object> {
+        if let Some(index) = self.index_of(&name) {
+            assert!(slot.is_none(), "a reserved slot was supplied for an existing object");
+            return Some(std::mem::replace(self.item_mut(index), object));
+        }
+
+        let index = slot.expect("a new object needs an allocated pool slot");
+        let blank = std::mem::replace(self.item_mut(index), object);
+        debug_assert_eq!(blank.link, ObjectId::NONE.get());
+        self.by_name.insert(name, index);
+        drop(blank);
+        None
+    }
+
+    fn remove(&mut self, name: &str) -> Option<Object> {
+        let index = self.by_name.remove(name)?;
+        let object = std::mem::replace(self.item_mut(index), Object::blank());
+        // Clear the owned fields before the pool overwrites the link word.
+        unsafe { self.pool.retire_index(index) };
+        Some(object)
+    }
+
+    fn clear(&mut self) {
+        let pool = &mut self.pool;
+        for (_, index) in self.by_name.drain() {
+            // SAFETY: the index came from the map and is an initialized pool slot.
+            let ptr = unsafe { pool.base_ptr().as_ptr().add(index as usize) };
+            // Drop the live value after replacing it with a valid placeholder.
+            let object = unsafe { std::mem::replace(&mut *ptr, Object::blank()) };
+            drop(object);
+            // SAFETY: the slot is now blank, unindexed, and exclusively owned.
+            unsafe { pool.retire_index(index) };
+        }
+    }
+
+    fn reclaim(&mut self) {
+        self.pool.reclaim();
+    }
+}
+
+impl Drop for ObjectTable {
+    fn drop(&mut self) {
+        for index in 0..self.pool.issued_blocks() {
+            // PoolItem::init initialized every issued slot, including free slots.
+            unsafe { std::ptr::drop_in_place(self.pool.base_ptr().as_ptr().add(index as usize)) };
+        }
+    }
+}
+
+impl std::ops::Index<&str> for ObjectTable {
+    type Output = Object;
+
+    fn index(&self, name: &str) -> &Self::Output {
+        self.get(name).expect("no object with that name")
+    }
+}
+
 impl Object {
+    fn blank() -> Self {
+        Self {
+            link: ObjectId::NONE.get(),
+            deletion: Flags::vacant(),
+            purge_only: false,
+            id: ObjectId::NONE,
+            framing: Framing::Bytes,
+            streams: Vec::new(),
+            extending: false,
+            waiting: Vec::new(),
+            keyed: false,
+            created: TimeSec::EPOCH,
+        }
+    }
+
     /// Each stream with the object-local number of its first record — the running total of
     /// the records in the streams before it.
     ///
@@ -907,15 +1087,19 @@ struct BatchCountGather {
 }
 
 struct DNState {
+    object_table: Arc<RwLock<ObjectTable>>,
     stream_table: Arc<RwLock<StreamTable>>,
 }
 
 impl raft::execution::Application for DNState {
     fn reset(&mut self) {
+        self.object_table.write().expect("objects").clear();
         self.stream_table.write().expect("streams").reset();
     }
 
     fn reclaim(&mut self) {
+        // Raft calls this immediately before releasing the global X-lock.
+        self.object_table.write().expect("objects").reclaim();
         self.stream_table.write().expect("streams").reclaim();
     }
 }
@@ -932,7 +1116,7 @@ struct DN {
     dn: DnId,
     /// The RangeId managed by this DN (#109, `routing::range_of_dn`).
     mine: RangeId,
-    object_table: RwLock<HashMap<Box<str>, Object>>,
+    object_table: Arc<RwLock<ObjectTable>>,
     /// How many requests are waiting for an object to have a stream, for `status`.
     parked: AtomicU64,
     objects: AtomicU64,
@@ -1560,9 +1744,20 @@ impl DN {
                         format!("{destination} exists already"),
                     ));
                 }
-                objects.insert(
+                let slot = match objects.alloc() {
+                    Ok(slot) => slot,
+                    Err(error) => {
+                        return reply.send(Resp::error(
+                            Status::Internal,
+                            format!("allocate DN object slot: {error}"),
+                        ));
+                    }
+                };
+                objects.insert_at(
                     destination.clone().into_boxed_str(),
+                    Some(slot),
                     Object {
+                        link: ObjectId::NONE.get(),
                         deletion: Flags::default(),
                         purge_only: false,
                         id: ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32),
@@ -1637,10 +1832,21 @@ impl DN {
                     format!("{destination} exists already"),
                 ));
             }
+            let slot = match objects.alloc() {
+                Ok(slot) => slot,
+                Err(error) => {
+                    return reply.send(Resp::error(
+                        Status::Internal,
+                        format!("allocate DN object slot: {error}"),
+                    ));
+                }
+            };
             if let Err(e) = self.retain_streams(&copied) {
+                objects.retire_blank(slot);
                 return reply.send(Resp::error(Status::BadRequest, e.to_string()));
             }
             let object = Object {
+                link: ObjectId::NONE.get(),
                 deletion: Flags::default(),
                 purge_only: false,
                 id: ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32),
@@ -1651,7 +1857,7 @@ impl DN {
                 keyed: keyed.expect("at least two sources"),
                 created,
             };
-            objects.insert(destination.clone().into_boxed_str(), object);
+            objects.insert_at(destination.clone().into_boxed_str(), Some(slot), object);
         }
 
         let stream_name = StreamName { range: self.mine, stream, created };
@@ -2794,6 +3000,10 @@ impl DN {
 
         let mut added = 0u64;
         let mut objects = self.object_table.write().expect("objects");
+        let mut object_slots = objects
+            .alloc_many(add_objects)
+            .map_err(|error| common::Error::new(format!("allocate DN object slots: {error}")))?
+            .into_iter();
         let mut table = self.stream_table.write().expect("streams");
         for (row, choice) in cmd.rows.into_iter().zip(choices) {
             if !matches!(choice, Choice::New) {
@@ -2810,9 +3020,16 @@ impl DN {
                 stream.deletion = Flags::live();
                 table.install(stream).expect("prechecked DN stream slot");
             }
-            objects.insert(
+            let object_slot = if objects.contains_key(row.name.as_str()) {
+                None
+            } else {
+                Some(object_slots.next().expect("preallocated DN object slot"))
+            };
+            objects.insert_at(
                 row.name.clone().into_boxed_str(),
+                object_slot,
                 Object {
+                    link: ObjectId::NONE.get(),
                     deletion: Flags::live(),
                     purge_only: cmd.flags.purge_only(),
                     id: row.id,
@@ -2829,6 +3046,7 @@ impl DN {
             self.next_stream.fetch_max(row.stream.get() as u64 + 1, Ordering::Relaxed);
             added += 1;
         }
+        debug_assert!(object_slots.next().is_none());
         self.objects.fetch_add(added, Ordering::Relaxed);
         self.streams.fetch_add(added, Ordering::Relaxed);
         Ok(None)
@@ -2935,12 +3153,19 @@ impl DN {
             StreamTable::new()
                 .map_err(|error| common::Error::new(format!("create DN stream pool: {error}")))?,
         ));
+        let object_table = Arc::new(RwLock::new(
+            ObjectTable::new()
+                .map_err(|error| common::Error::new(format!("create DN object pool: {error}")))?,
+        ));
         let dn_node = DN {
             common: raft::runtime::Runtime::with_state(
                 runtime,
                 node,
                 options,
-                DNState { stream_table: Arc::clone(&stream_table) },
+                DNState {
+                    object_table: Arc::clone(&object_table),
+                    stream_table: Arc::clone(&stream_table),
+                },
             ),
             config,
             gc_stop: AtomicBool::new(true),
@@ -2950,7 +3175,7 @@ impl DN {
             create_rejects: Mutex::new(CreateRejects::default()),
             dn,
             mine,
-            object_table: RwLock::new(HashMap::new()),
+            object_table,
             parked: AtomicU64::new(0),
             objects: AtomicU64::new(0),
             streams: AtomicU64::new(0),
@@ -3239,7 +3464,6 @@ impl Host for DN {
 
     fn reset_metadata(&self, state: &mut DNState) {
         raft::execution::Application::reset(state);
-        self.object_table.write().expect("objects").clear();
         *self.object_extras.lock().expect("object extras") = Extras::default();
         *self.stream_extras.lock().expect("stream extras") = SharedExtras::default();
         self.retired_objects.lock().expect("retired objects").clear();
@@ -3459,7 +3683,10 @@ mod tests {
         let id = cmd.rows[0].id;
         let action = dn_action(&cmd).unwrap();
         let mut done = Vec::new();
-        let mut state = DNState { stream_table: Arc::clone(&dn.stream_table) };
+        let mut state = DNState {
+            object_table: Arc::clone(&dn.object_table),
+            stream_table: Arc::clone(&dn.stream_table),
+        };
         dn.apply_client(
             &mut state,
             raft::execution::Context { ring: "DN", index: 7, term: 1 },
@@ -3765,6 +3992,7 @@ mod tests {
             })
             .collect();
         let object = Object {
+            link: ObjectId::NONE.get(),
             deletion: Flags::default(),
             purge_only: false,
             id: ObjectId::FIRST,
@@ -3816,6 +4044,7 @@ mod tests {
         dn.object_table.write().unwrap().insert(
             Box::from("/x"),
             Object {
+                link: ObjectId::NONE.get(),
                 deletion: Flags::default(),
                 purge_only: false,
                 id: ObjectId::new(2),
@@ -3862,6 +4091,7 @@ mod tests {
             dn.object_table.write().unwrap().insert(
                 Box::from("/p"),
                 Object {
+                    link: ObjectId::NONE.get(),
                     deletion: Flags::default(),
                     purge_only: false,
                     id: ObjectId::new(dn.next_object.fetch_add(1, Ordering::Relaxed) as u32),
@@ -3945,12 +4175,42 @@ mod tests {
     use common::range::Start;
     use common::testing;
 
+    #[test]
+    fn object_pool_reclaims_under_raft_x_lock() {
+        let dn = DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST);
+        let (first, second) = {
+            let mut objects = dn.object_table.write().unwrap();
+            objects.insert(Box::from("/first"), Object::blank());
+            let first = objects.index_of("/first").unwrap();
+            drop(objects.remove("/first").unwrap());
+            objects.insert(Box::from("/second"), Object::blank());
+            let second = objects.index_of("/second").unwrap();
+            assert_ne!(first, second, "deleted slots wait for Raft reclamation");
+            (first, second)
+        };
+
+        {
+            let _x = dn.global_lock.write();
+            let mut state = DNState {
+                object_table: Arc::clone(&dn.object_table),
+                stream_table: Arc::clone(&dn.stream_table),
+            };
+            raft::execution::Application::reclaim(&mut state);
+        }
+
+        let mut objects = dn.object_table.write().unwrap();
+        objects.insert(Box::from("/third"), Object::blank());
+        assert_eq!(objects.index_of("/third"), Some(first));
+        assert_ne!(first, second);
+    }
+
     /// A temporary object whose stream list has not been attached yet, as can
     /// occur while a concat destination is being built.
     fn half_made(dn: &DN, name: &str) {
         dn.object_table.write().unwrap().insert(
             Box::from(name),
             Object {
+                link: ObjectId::NONE.get(),
                 deletion: Flags::default(),
                 purge_only: false,
                 id: ObjectId::new(1),
@@ -4049,6 +4309,7 @@ mod tests {
         let table =
             vec![held(0, 0, Some(0)), held(1, 0, Some(10)), held(2, 0, Some(5)), held(3, 0, None)];
         let mut object = Object {
+            link: ObjectId::NONE.get(),
             deletion: Flags::default(),
             purge_only: false,
             id: ObjectId::new(1),
@@ -4080,6 +4341,7 @@ mod tests {
     /// An object with three streams, two sealed and one still growing.
     fn grown() -> Object {
         let mut object = Object {
+            link: ObjectId::NONE.get(),
             deletion: Flags::default(),
             purge_only: false,
             id: ObjectId::new(1),
@@ -4575,6 +4837,7 @@ mod tests {
             dn.object_table.write().unwrap().insert(
                 Box::from(name.as_str()),
                 Object {
+                    link: ObjectId::NONE.get(),
                     deletion: Flags::default(),
                     purge_only: false,
                     id: ObjectId::new(n as u32 + 1),
