@@ -6,9 +6,9 @@
 //! what a create costs. DN owns the `StreamId`; the SN it picks records
 //! `(RangeId, StreamId)`.
 //!
-//! ⚠️ **The hash table by name is a stand-in for a B-tree** with a read and a
-//! write lock. Stream slots use StreamId as their stable index and are reclaimed
-//! by the Raft exclusive-lock pass after their last reference is deleted.
+//! ⚠️ **The linear hash by name is a stand-in for a B-tree.** Object and stream
+//! metadata are protected by the Raft global lock; stream slots use StreamId as
+//! their stable index and are reclaimed by the exclusive-lock pass after deletion.
 //!
 //! A create waits on an SN, and waits without holding a worker: the names are
 //! taken, the streams are asked for, and the client's `Reply` travels with that
@@ -32,14 +32,18 @@ use common::routing;
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::{Arg, Op, Req, Resp, Status, StructWriter, structure};
+#[cfg(test)]
+use parking_lot::{
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard,
+};
 use raft::codec::Wire;
 use raft::runtime::{Host, Settings as RaftSettings};
 use std::collections::{HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
 #[cfg(test)]
 use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -71,8 +75,10 @@ const SERVES: &[Op] = &[
 /// though the stream itself does not need to know the object's total.
 const OPEN_STREAM_RECORD_LIMIT: u64 = 3 * (1u64 << 62);
 const CREATE_REJECT_KEEP: u64 = 1 << 16;
+const APPEND_IN_PROGRESS: u8 = 0x1;
 
 type ExtentReply = (ExtentRun, Vec<ExtentRow>);
+type ConcatTotals = Vec<(String, StreamName, Totals)>;
 
 /// One original stream-row request. The index is a reply slot, not a stream identity.
 #[derive(Debug, Clone)]
@@ -164,8 +170,8 @@ fn detailed(
                 // not the DN's to say (§6.3), and a sealed stream may hold nothing.
                 records: held.records,
                 created: held.created,
-                // What the DN last learned. Exact once the stream is sealed, a point in
-                // time before that, and UNKNOWN until any SN has been asked (§17.25.1).
+                // Cached totals are exact once sealed and otherwise a point in time.
+                // ObjectInfo reads SN totals for its reply without changing this cache.
                 totals: visible_totals(object.framing, held.totals(), held.records),
                 given: ExtentId::FIRST,
             });
@@ -247,6 +253,7 @@ impl Levelled {
 struct Object {
     /// Used by LockedPool while this slot is free or deleted.
     link: u32,
+    name: Box<str>,
     deletion: Flags,
     /// Permanently skip the soft-delete interval when this object is deleted.
     purge_only: bool,
@@ -264,19 +271,119 @@ struct Object {
     /// A stream fills, so an object grows more of them; the last is the one appends
     /// go to and the record ranges say which holds what.
     streams: Vec<StreamId>,
-    /// An extension is being asked of an SN, so anything else that wants one waits
-    /// rather than asking for a second.
-    extending: bool,
-    /// Requests waiting for this object to have a stream they can use: the first
-    /// stream while it is being made, or the next one while it is being asked for.
-    ///
-    /// ⚠️ **They live here, under the object-table lock, and not in a table of their
-    /// own.** Deciding to wait and then waiting have to be one step: with a lock
-    /// released in between, the work can finish and wake nobody, and the waiter is
-    /// left holding a `Reply` that nothing will ever answer.
-    waiting: Vec<Reply>,
+    /// Transient flags, separate from persisted flags in deletion. Most objects
+    /// only have this zeroed byte; append coordination uses bit 0x1.
+    localflags: AtomicU8,
     keyed: bool,
     created: TimeSec,
+}
+
+/// One extension's waiters and completion result, independent of the DN state lock.
+struct ObjectEvent {
+    state: Mutex<ObjectEventState>,
+}
+
+struct ObjectEventState {
+    answer: Option<Resp>,
+    waiters: Vec<(Reply, bool)>,
+}
+
+impl ObjectEvent {
+    fn new() -> Self {
+        Self { state: Mutex::new(ObjectEventState { answer: None, waiters: Vec::new() }) }
+    }
+
+    /// Queue while pending, or immediately replay the result if the event already fired.
+    fn subscribe(&self, reply: Reply, counted: bool) -> bool {
+        let answer = {
+            let mut state = self.state.lock().expect("object event");
+            if let Some(answer) = &state.answer {
+                Some(answer.clone())
+            } else {
+                state.waiters.push((reply, counted));
+                return true;
+            }
+        };
+        reply.send(answer.expect("completed object event"));
+        false
+    }
+
+    /// Fire once, deliver outside the event mutex, and return counted waiters.
+    fn fire(&self, answer: Resp) -> usize {
+        let (waiters, counted) = {
+            let mut state = self.state.lock().expect("object event");
+            if state.answer.is_some() {
+                return 0;
+            }
+            state.answer = Some(answer.clone());
+            let waiters = std::mem::take(&mut state.waiters);
+            let counted = waiters.iter().filter(|(_, counted)| *counted).count();
+            (waiters, counted)
+        };
+        for (reply, _) in waiters {
+            reply.send(answer.clone());
+        }
+        counted
+    }
+}
+
+type PendingKey = (ObjectId, TimeSec);
+const PENDING_SHARDS: usize = 64;
+
+/// Sparse, process-local events for objects being extended. The object carries
+/// only an atomic hint; the event and its waiters exist here only while pending.
+struct PendingEvents {
+    shards: [Mutex<Vec<(PendingKey, Arc<ObjectEvent>)>>; PENDING_SHARDS],
+}
+
+impl PendingEvents {
+    fn new() -> Self {
+        Self { shards: std::array::from_fn(|_| Mutex::new(Vec::new())) }
+    }
+
+    fn shard(key: PendingKey) -> usize {
+        key.0.get() as usize & (PENDING_SHARDS - 1)
+    }
+
+    fn get(&self, key: PendingKey) -> Option<Arc<ObjectEvent>> {
+        self.shards[Self::shard(key)]
+            .lock()
+            .expect("pending events")
+            .iter()
+            .find(|(at, _)| *at == key)
+            .map(|(_, event)| Arc::clone(event))
+    }
+
+    /// Mark first, then publish the event. Callers hold the global X lock while
+    /// changing object metadata, so readers cannot observe the short setup window.
+    fn start(&self, key: PendingKey, localflags: &AtomicU8) -> Arc<ObjectEvent> {
+        let mut shard = self.shards[Self::shard(key)].lock().expect("pending events");
+        assert_eq!(
+            localflags.load(Ordering::Relaxed) & APPEND_IN_PROGRESS,
+            0,
+            "object is already pending"
+        );
+        assert!(!shard.iter().any(|(at, _)| *at == key), "pending event already exists");
+        localflags.fetch_or(APPEND_IN_PROGRESS, Ordering::Release);
+        let event = Arc::new(ObjectEvent::new());
+        shard.push((key, Arc::clone(&event)));
+        event
+    }
+
+    /// Remove the event first, then clear the fast-path hint.
+    fn finish(&self, key: PendingKey, localflags: &AtomicU8) -> Option<Arc<ObjectEvent>> {
+        let mut shard = self.shards[Self::shard(key)].lock().expect("pending events");
+        let at = shard.iter().position(|(at, _)| *at == key)?;
+        let (_, event) = shard.swap_remove(at);
+        localflags.fetch_and(!APPEND_IN_PROGRESS, Ordering::Release);
+        Some(event)
+    }
+
+    fn clear(&self) {
+        for shard in &self.shards {
+            shard.lock().expect("pending events").clear();
+        }
+    }
 }
 
 /// What an `extend-object` request turned out to be: the one doing the work, one
@@ -296,7 +403,7 @@ enum Next {
 /// that sum is known (§17.33.1).
 ///
 /// Stored once per range, rather than once per object reference. The reference count
-/// is atomic; ordinary metadata is protected by the range's stream table lock.
+/// is atomic; ordinary metadata is protected by the Raft global lock.
 #[repr(C)]
 struct Stream {
     /// ⚠️ **`u32`, and safe for the reason an extent id is** (§17.29.2): a stable reference
@@ -324,10 +431,9 @@ struct Stream {
     created: TimeSec,
     /// Bytes the writer wrote and bytes stored, summed over the stream's extents.
     ///
-    /// ⚠️ **Exact for a sealed stream, as-of for a growing one, `SLoff::NONE` / `SCoff::NONE` until an SN has
-    /// been asked** (Asserted, Bob, 2026-08-20). A sealed stream cannot change, so one
-    /// refresh is right for ever; a growing one is only ever a point in time, and that is
-    /// good enough for the listing these exist for.
+    /// ⚠️ **Exact for a sealed stream, as-of for a growing one, and unknown until refreshed
+    /// by GC or sealing.** A sealed stream cannot change, so one refresh is right for ever;
+    /// a growing one is only ever a point in time, and that is good enough for the listing.
     logical: SLoff,
     compressed: SCoff,
     sn: SnId,
@@ -387,30 +493,6 @@ impl Stream {
     /// What this stream has come to, in the shape the wire carries.
     fn totals(&self) -> Totals {
         Totals { extents: self.extents, logical: self.logical, compressed: self.compressed }
-    }
-
-    /// What an SN said the stream has come to. ⚠️ **Only ever moves forward**: an answer
-    /// that crossed a newer one in flight must not walk the numbers back, and a sealed
-    /// stream's totals are final whatever arrives afterwards.
-    fn learned(&mut self, totals: Totals) {
-        if totals.extents != ExtentId::NONE
-            && let seen = totals.extents
-            && (self.extents.is_none() || seen.get() > self.extents.get())
-        {
-            self.extents = seen;
-        }
-        if totals.logical != SLoff::NONE
-            && let seen = totals.logical
-            && (self.logical.is_none() || seen > self.logical)
-        {
-            self.logical = seen;
-        }
-        if totals.compressed != SCoff::NONE
-            && let seen = totals.compressed
-            && (self.compressed.is_none() || seen > self.compressed)
-        {
-            self.compressed = seen;
-        }
     }
 }
 
@@ -483,8 +565,7 @@ impl StreamTable {
         assert!(index < self.len, "retired DN stream index was never issued");
         assert!(self[index].deletion.retired(), "retired DN stream is still live");
         // SAFETY: the final reference to this stream has been reclaimed, and
-        // callers hold the stream-table write lock. The global lock prevents
-        // the exclusive reclamation pass from racing this insertion.
+        // callers hold the global write lock, so reclamation cannot race this insertion.
         unsafe { self.pool.retire_index(id.get()) };
     }
 
@@ -542,139 +623,117 @@ unsafe impl pool::LockedItem for Object {
     }
 }
 
-type ObjectPool = pool::LockedPool<
+impl pool::LinearEntry for Object {
+    type Key = str;
+
+    fn key(&self) -> &Self::Key {
+        &self.name
+    }
+
+    fn hash(key: &Self::Key) -> u64 {
+        spookyhash::hash64(key.as_bytes(), 0)
+    }
+
+    fn next(&self) -> u32 {
+        self.link
+    }
+
+    fn set_next(&mut self, next: u32) {
+        self.link = next;
+    }
+
+    unsafe fn next_ptr(&mut self) -> *mut u32 {
+        std::ptr::addr_of_mut!(self.link)
+    }
+
+    fn init(&mut self, key: &Self::Key, value: Self) {
+        debug_assert_eq!(value.name.as_ref(), key);
+        *self = value;
+    }
+
+    fn clear(&mut self) {
+        *self = Self::blank();
+    }
+
+    fn take(&mut self) -> Self {
+        std::mem::replace(self, Self::blank())
+    }
+}
+
+type ObjectHash = pool::LinearHash<
+    'static,
     Object,
     { std::mem::align_of::<Object>() },
     { std::mem::offset_of!(Object, link) },
 >;
 
-/// Path lookup stays in a HashMap; object values live in stable pool slots.
+/// Temporary object-path lookup; a B-tree over directories and objects is planned.
 struct ObjectTable {
-    by_name: HashMap<Box<str>, u32>,
-    pool: ObjectPool,
+    hash: ObjectHash,
 }
 
 impl ObjectTable {
-    fn new() -> pool::Result<Self> {
-        Ok(Self { by_name: HashMap::new(), pool: ObjectPool::new(ObjectId::NONE.get(), 0)? })
-    }
-
-    fn item(&self, index: u32) -> &Object {
-        assert!(index < self.pool.issued_blocks(), "DN object slot was never issued");
-        // SAFETY: every issued pool slot is initialized and remains at this address.
-        unsafe { &*self.pool.base_ptr().as_ptr().add(index as usize) }
-    }
-
-    fn item_mut(&mut self, index: u32) -> &mut Object {
-        assert!(index < self.pool.issued_blocks(), "DN object slot was never issued");
-        // SAFETY: callers hold exclusive access to ObjectTable and the slot is issued.
-        unsafe { &mut *self.pool.base_ptr().as_ptr().add(index as usize) }
+    fn new() -> common::Result<Self> {
+        let chunks = common::message_pool()?;
+        let hash = ObjectHash::new(chunks, ObjectId::NONE.get())
+            .map_err(|error| common::Error::new(format!("create DN object hash: {error}")))?;
+        Ok(Self { hash })
     }
 
     fn get(&self, name: &str) -> Option<&Object> {
-        self.by_name.get(name).map(|index| self.item(*index))
+        self.hash.get(name)
     }
 
     fn get_mut(&mut self, name: &str) -> Option<&mut Object> {
-        let index = *self.by_name.get(name)?;
-        Some(self.item_mut(index))
+        self.hash.get_mut(name)
     }
 
     fn contains_key(&self, name: &str) -> bool {
-        self.by_name.contains_key(name)
-    }
-
-    fn index_of(&self, name: &str) -> Option<u32> {
-        self.by_name.get(name).copied()
-    }
-
-    fn try_reserve(&mut self, additional: usize) -> Result<(), std::collections::TryReserveError> {
-        self.by_name.try_reserve(additional)
-    }
-
-    fn alloc(&mut self) -> pool::Result<u32> {
-        self.pool.alloc()
-    }
-
-    fn alloc_many(&mut self, count: usize) -> pool::Result<Vec<u32>> {
-        let mut slots = Vec::with_capacity(count);
-        for _ in 0..count {
-            match self.pool.alloc() {
-                Ok(index) => slots.push(index),
-                Err(error) => {
-                    for index in slots {
-                        // SAFETY: these blank slots were just allocated here and
-                        // are not reachable through by_name.
-                        unsafe { self.pool.retire_index(index) };
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        Ok(slots)
-    }
-
-    fn retire_blank(&mut self, index: u32) {
-        assert_eq!(self.item(index).link, ObjectId::NONE.get());
-        // SAFETY: this blank slot is exclusively owned and not in by_name.
-        unsafe { self.pool.retire_index(index) };
+        self.hash.contains_key(name)
     }
 
     #[cfg(test)]
-    fn insert(&mut self, name: Box<str>, object: Object) -> Option<Object> {
-        if self.index_of(&name).is_some() {
-            return self.insert_at(name, None, object);
-        }
-        let index = self.pool.alloc().expect("DN object pool exhausted");
-        self.insert_at(name, Some(index), object)
+    fn index_of(&self, name: &str) -> Option<u32> {
+        self.hash.index_of(name)
     }
 
-    fn insert_at(&mut self, name: Box<str>, slot: Option<u32>, object: Object) -> Option<Object> {
-        if let Some(index) = self.index_of(&name) {
-            assert!(slot.is_none(), "a reserved slot was supplied for an existing object");
-            return Some(std::mem::replace(self.item_mut(index), object));
-        }
+    fn try_reserve(&mut self, additional: usize) -> pool::Result<()> {
+        self.hash.try_reserve(additional)
+    }
 
-        let index = slot.expect("a new object needs an allocated pool slot");
-        let blank = std::mem::replace(self.item_mut(index), object);
-        debug_assert_eq!(blank.link, ObjectId::NONE.get());
-        self.by_name.insert(name, index);
-        drop(blank);
+    #[cfg(test)]
+    fn insert(&mut self, name: Box<str>, mut object: Object) -> Option<Object> {
+        if let Some(old) = self.hash.get_mut(&name) {
+            object.name = name;
+            return Some(std::mem::replace(old, object));
+        }
+        object.name = name.clone();
+        let (_, inserted) = self.hash.find_or_create(&name, |_| object).expect("insert DN object");
+        assert!(inserted, "DN object appeared during exclusive insertion");
         None
     }
 
+    fn insert_value(&mut self, name: &str, mut object: Object) -> pool::Result<Option<Object>> {
+        if let Some(old) = self.hash.get_mut(name) {
+            object.name = name.into();
+            return Ok(Some(std::mem::replace(old, object)));
+        }
+        object.name = name.into();
+        let (_, inserted) = self.hash.find_or_create(name, |_| object)?;
+        debug_assert!(inserted, "DN object appeared during exclusive insertion");
+        Ok(None)
+    }
+
     fn remove(&mut self, name: &str) -> Option<Object> {
-        let index = self.by_name.remove(name)?;
-        let object = std::mem::replace(self.item_mut(index), Object::blank());
-        // Clear the owned fields before the pool overwrites the link word.
-        unsafe { self.pool.retire_index(index) };
-        Some(object)
+        self.hash.remove_entry(name)
     }
 
     fn clear(&mut self) {
-        let pool = &mut self.pool;
-        for (_, index) in self.by_name.drain() {
-            // SAFETY: the index came from the map and is an initialized pool slot.
-            let ptr = unsafe { pool.base_ptr().as_ptr().add(index as usize) };
-            // Drop the live value after replacing it with a valid placeholder.
-            let object = unsafe { std::mem::replace(&mut *ptr, Object::blank()) };
-            drop(object);
-            // SAFETY: the slot is now blank, unindexed, and exclusively owned.
-            unsafe { pool.retire_index(index) };
-        }
+        self.hash.clear();
     }
 
     fn reclaim(&mut self) {
-        self.pool.reclaim();
-    }
-}
-
-impl Drop for ObjectTable {
-    fn drop(&mut self) {
-        for index in 0..self.pool.issued_blocks() {
-            // PoolItem::init initialized every issued slot, including free slots.
-            unsafe { std::ptr::drop_in_place(self.pool.base_ptr().as_ptr().add(index as usize)) };
-        }
+        self.hash.reclaim();
     }
 }
 
@@ -690,16 +749,24 @@ impl Object {
     fn blank() -> Self {
         Self {
             link: ObjectId::NONE.get(),
+            name: Box::default(),
             deletion: Flags::vacant(),
             purge_only: false,
             id: ObjectId::NONE,
             framing: Framing::Bytes,
             streams: Vec::new(),
-            extending: false,
-            waiting: Vec::new(),
+            localflags: AtomicU8::new(0),
             keyed: false,
             created: TimeSec::EPOCH,
         }
+    }
+
+    fn pending_key(&self) -> PendingKey {
+        (self.id, self.created)
+    }
+
+    fn append_in_progress(&self) -> bool {
+        self.localflags.load(Ordering::Acquire) & APPEND_IN_PROGRESS != 0
     }
 
     /// Each stream with the object-local number of its first record — the running total of
@@ -726,7 +793,7 @@ impl Object {
     /// Nothing here can be appended to or read yet: it has no stream, or the next
     /// one is being asked for. Waiting is better than a transient missing-stream answer.
     fn between_streams(&self) -> bool {
-        self.streams.is_empty() || self.extending
+        self.streams.is_empty() || self.append_in_progress()
     }
 
     /// What this object is, at one of its streams: the last for an append, or the one
@@ -861,7 +928,7 @@ impl Object {
 /// ⚠️ **Refusals are kept and the whole answer fails**, rather than being dropped so that the answer
 /// silently lacks extents the caller asked for. §17's rule: a well-formed request for something that
 /// did not work says so.
-fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, asked: &[ExtentAsk], answer: Resp) {
+fn arrived(gather: &Arc<Mutex<Gather>>, asked: &[ExtentAsk], answer: Resp) {
     let answer = pending_stream_answer(answer, asked);
     let ready = {
         let mut held = gather.lock().expect("gather");
@@ -885,13 +952,8 @@ fn arrived(dn: &Arc<DN>, gather: &Arc<Mutex<Gather>>, asked: &[ExtentAsk], answe
         return reply.send(failed);
     }
     let runs = std::mem::take(&mut held.runs);
-    // ⚠️ **Write back what the SNs said before answering.** This is the only path by which a
-    // stream's cached sizes ever stop being UNKNOWN (§17.25.1), so skipping it would leave
-    // every listing blank while the numbers sat in a response on their way out the door.
-    // A sealed stream's totals are final, so once written they are right for ever; a growing
-    // one's are a point in time, which is what `Stream::learned` refusing to go backwards is
-    // for — two answers can cross in flight.
-    dn.remember(&held.name, &runs);
+    // SN totals are used to assemble this answer, but ObjectInfo must not mutate DN's
+    // cached stream metadata. GC or stream sealing owns those updates.
     let levelled = Levelled {
         shape: held.shape.clone(),
         head: std::mem::take(&mut held.head),
@@ -1071,10 +1133,6 @@ struct Gather {
     shape: Shape,
     hide_rows: bool,
     instances: bool,
-    /// The object the asks were about, so what the SNs said can be written back to the
-    /// streams' cached sizes (§17.25.1). Only the name: the object itself must not be held
-    /// across a round trip, since it can change while the SNs are answering.
-    name: String,
     limit: u64,
 }
 
@@ -1087,20 +1145,20 @@ struct BatchCountGather {
 }
 
 struct DNState {
-    object_table: Arc<RwLock<ObjectTable>>,
-    stream_table: Arc<RwLock<StreamTable>>,
+    object_table: ObjectTable,
+    stream_table: StreamTable,
 }
 
 impl raft::execution::Application for DNState {
     fn reset(&mut self) {
-        self.object_table.write().expect("objects").clear();
-        self.stream_table.write().expect("streams").reset();
+        self.object_table.clear();
+        self.stream_table.reset();
     }
 
     fn reclaim(&mut self) {
         // Raft calls this immediately before releasing the global X-lock.
-        self.object_table.write().expect("objects").reclaim();
-        self.stream_table.write().expect("streams").reclaim();
+        self.object_table.reclaim();
+        self.stream_table.reclaim();
     }
 }
 
@@ -1112,11 +1170,11 @@ struct DN {
     deleting: Mutex<()>,
     retired_objects: Mutex<std::collections::HashSet<String>>,
     create_rejects: Mutex<CreateRejects>,
+    pending_events: PendingEvents,
     /// This DN's own identity.
     dn: DnId,
     /// The RangeId managed by this DN (#109, `routing::range_of_dn`).
     mine: RangeId,
-    object_table: Arc<RwLock<ObjectTable>>,
     /// How many requests are waiting for an object to have a stream, for `status`.
     parked: AtomicU64,
     objects: AtomicU64,
@@ -1126,8 +1184,6 @@ struct DN {
     next_object: AtomicU64,
     next_stream: AtomicU64,
     /// The current DN serves one range (`mine`). StreamId indexes this range's table.
-    /// Lock the object table before this table; never hold either across a network call.
-    stream_table: Arc<RwLock<StreamTable>>,
     // Sparse, range-scoped metadata. Lock owner before extras, never the reverse.
     object_extras: Mutex<Extras<(ObjectId, TimeSec)>>,
     stream_extras: Mutex<SharedExtras<(StreamId, TimeSec)>>,
@@ -1246,7 +1302,6 @@ impl Service for DN {
             }
             return reply.send(self.create_request(process, &request));
         }
-        let _state = self.global_lock.read();
         match request.op() {
             Op::SoftDeleteObject | Op::DeleteObject => {
                 reply.send(self.delete_object(process, &request))
@@ -1291,7 +1346,7 @@ impl Service for DN {
                 self.info(process, &request, Some(record), reply)
             }
             Op::ExtendObject => self.extend(process, &request, reply),
-            Op::ConcatObjects => self.concat_objects(process, &request, reply),
+            Op::ConcatObjects => self.concat_objects(process, &request, reply, Vec::new()),
             Op::SealObject => self.seal_object(&request, reply),
             Op::BatchInfo => self.begin_info_many(process, &request, reply),
             _ => reply.send(server::unbuilt(process, SERVES, &request)),
@@ -1310,6 +1365,38 @@ impl Service for DN {
 }
 
 impl DN {
+    fn state_read(&self) -> parking_lot::RwLockReadGuard<'_, DNState> {
+        self.common.global_lock.read()
+    }
+
+    fn state_write(&self) -> parking_lot::RwLockWriteGuard<'_, DNState> {
+        self.common.global_lock.write()
+    }
+
+    #[cfg(test)]
+    fn objects(&self) -> MappedRwLockReadGuard<'_, ObjectTable> {
+        RwLockReadGuard::map(self.common.global_lock.read(), |state: &DNState| &state.object_table)
+    }
+
+    #[cfg(test)]
+    fn objects_mut(&self) -> MappedRwLockWriteGuard<'_, ObjectTable> {
+        RwLockWriteGuard::map(self.common.global_lock.write(), |state: &mut DNState| {
+            &mut state.object_table
+        })
+    }
+
+    #[cfg(test)]
+    fn streams(&self) -> MappedRwLockReadGuard<'_, StreamTable> {
+        RwLockReadGuard::map(self.common.global_lock.read(), |state: &DNState| &state.stream_table)
+    }
+
+    #[cfg(test)]
+    fn streams_mut(&self) -> MappedRwLockWriteGuard<'_, StreamTable> {
+        RwLockWriteGuard::map(self.common.global_lock.write(), |state: &mut DNState| {
+            &mut state.stream_table
+        })
+    }
+
     fn start_gc(self: &Arc<Self>) -> common::Result<()> {
         let mut slot = self.gc_thread.lock().expect("GC thread");
         if slot.is_some() {
@@ -1367,15 +1454,16 @@ impl DN {
         let now = TimeSec::now();
         let maximum = process.cluster.max_soft_delete_retention_secs;
         let (ids, deletion) = {
-            let mut objects = self.object_table.write().expect("objects");
-            let Some(object) = objects.get_mut(path.as_str()) else {
+            let mut state = self.state_write();
+            let DNState { object_table, stream_table } = &mut *state;
+            let Some(object) = object_table.get_mut(path.as_str()) else {
                 return if self.retired_objects.lock().unwrap().contains(path) {
                     Ok(())
                 } else {
                     Err(Resp::error(Status::NotFound, "no object"))
                 };
             };
-            if object.extending || object.streams.is_empty() {
+            if object.append_in_progress() || object.streams.is_empty() {
                 return Err(bad("object extension is in progress; retry deletion"));
             }
             // `purge_only` is an object's persistent deletion policy. On its first
@@ -1397,10 +1485,9 @@ impl DN {
                 .map_err(bad)?;
             let interval = extras.remaining(&key, now).map_err(bad)?;
             drop(extras);
-            let mut table = self.stream_table.write().expect("streams");
             let mut stream_extras = self.stream_extras.lock().expect("stream extras");
             for id in &object.streams {
-                let stream = &mut table[id.get() as usize];
+                let stream = &mut stream_table[id.get() as usize];
                 let key = (stream.id, stream.created);
                 if first {
                     stream_extras
@@ -1431,8 +1518,8 @@ impl DN {
                 continue;
             }
             let child = {
-                let mut table = self.stream_table.write().expect("streams");
-                let stream = &mut table[id.get() as usize];
+                let mut state = self.state_write();
+                let stream = &mut state.stream_table[id.get() as usize];
                 if !stream.deletion.soft_deleted() || stream.deletion.retired() {
                     continue;
                 }
@@ -1461,9 +1548,9 @@ impl DN {
                     &format!("SN{}", child.0),
                     Delete { target: Target::Stream(child.1), retention: None, hard: true },
                 )?;
-                let mut table = self.stream_table.write().unwrap();
+                let mut state = self.state_write();
                 let reclaimed = {
-                    let stream = &mut table[id.get() as usize];
+                    let stream = &mut state.stream_table[id.get() as usize];
                     let key = (stream.id, stream.created);
                     self.stream_extras.lock().unwrap().reclaim(
                         &key,
@@ -1472,19 +1559,19 @@ impl DN {
                     )
                 };
                 assert!(reclaimed);
-                table.retire(id);
+                state.stream_table.retire(id);
             }
         }
         if deletion.hard {
-            let mut objects = self.object_table.write().unwrap();
-            let object = objects.get_mut(path.as_str()).expect("deleting object");
+            let mut state = self.state_write();
+            let object = state.object_table.get_mut(path.as_str()).expect("deleting object");
             let key = (object.id, object.created);
             assert!(self.object_extras.lock().unwrap().reclaim(
                 &key,
                 &mut object.deletion,
                 TimeSec::now()
             ));
-            objects.remove(path.as_str());
+            state.object_table.remove(path.as_str());
             self.retired_objects.lock().unwrap().insert(path.clone());
             self.objects.fetch_sub(1, Ordering::Relaxed);
         }
@@ -1513,17 +1600,18 @@ impl DN {
             return reply
                 .send(Resp::error(Status::BadRequest, "seal-object has trailing arguments"));
         }
-        let mut objects = self.object_table.write().expect("objects");
-        let Some(object) = objects.get_mut(name.as_str()) else {
+        let mut state = self.state_write();
+        let DNState { object_table, stream_table } = &mut *state;
+        let Some(object) = object_table.get_mut(name.as_str()) else {
             return reply.send(Resp::error(Status::NotFound, format!("no object {name}")));
         };
         if !object.deletion.readable(false) {
             return reply.send(bad("object is deleted"));
         }
-        let mut table = self.stream_table.write().expect("streams");
-        let Some(last) = object.streams.last().map(|id| &mut table[id.get() as usize]) else {
+        let Some(last_id) = object.streams.last().copied() else {
             return reply.send(Resp::error(Status::BadRequest, "object has no stream"));
         };
+        let last = &mut stream_table[last_id.get() as usize];
         if last.id != stream {
             return reply
                 .send(Resp::error(Status::BadRequest, "seal-object named a non-tail stream"));
@@ -1534,8 +1622,9 @@ impl DN {
             return reply
                 .send(Resp::error(Status::BadRequest, "seal-object record count disagrees"));
         }
-        drop(table);
-        match object.args(&self.stream_table.read().expect("streams"), self.mine, self.dn, None) {
+        let answer = object.args(stream_table, self.mine, self.dn, None);
+        drop(state);
+        match answer {
             Some(args) => reply.send(Resp::from_args(Status::Ok, args).id(0)),
             None => reply.send(Resp::error(Status::Internal, "sealed object has no description")),
         }
@@ -1543,7 +1632,13 @@ impl DN {
     /// Make a new object from sealed source objects. Source stream rows are copied
     /// by reference; the new object gets one fresh, empty stream at the end so it
     /// is immediately appendable but is not sealed.
-    fn concat_objects(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Reply) {
+    fn concat_objects(
+        self: &Arc<Self>,
+        process: &Arc<Process>,
+        request: &Req,
+        reply: Reply,
+        known: ConcatTotals,
+    ) {
         let _serial = self.deleting.lock().expect("deletion");
         let retry = request.clone();
         let (mut payload, rest) =
@@ -1617,14 +1712,14 @@ impl DN {
                     "concat destination must differ from its sources",
                 ));
             }
-            let objects = self.object_table.read().expect("objects");
-            let Some(object) = objects.get(source.as_str()) else {
+            let state = self.state_read();
+            let Some(object) = state.object_table.get(source.as_str()) else {
                 return reply.send(Resp::error(Status::NotFound, format!("no object {source}")));
             };
             if !object.deletion.readable(false) {
                 return reply.send(bad("object is deleted"));
             }
-            let table = self.stream_table.read().expect("streams");
+            let table = &state.stream_table;
             if object.streams.is_empty()
                 || object.streams.iter().any(|id| table[id.get() as usize].records.is_none())
             {
@@ -1654,15 +1749,33 @@ impl DN {
                 keyed = Some(object.keyed);
             }
             if source_number < single_streams.len() && object.streams.len() == 1 {
-                single_streams[source_number] =
-                    Some(table[object.streams[0].get() as usize].snapshot());
+                let stream = &table[object.streams[0].get() as usize];
+                let mut snapshot = stream.snapshot();
+                if let Some((_, _, totals)) = known.iter().find(|(path, name, _)| {
+                    path == source
+                        && name.range == self.mine
+                        && name.stream == stream.id
+                        && name.created == stream.created
+                }) {
+                    snapshot.extents = totals.extents;
+                    snapshot.logical = totals.logical;
+                    snapshot.compressed = totals.compressed;
+                }
+                single_streams[source_number] = Some(snapshot);
             }
             for id in &object.streams {
                 let stream = &table[id.get() as usize];
+                let already_refreshed = known.iter().any(|(path, name, _)| {
+                    path == source
+                        && name.range == self.mine
+                        && name.stream == stream.id
+                        && name.created == stream.created
+                });
                 if stream.records.is_some()
                     && (stream.extents.is_none()
                         || stream.logical.is_none()
                         || stream.compressed.is_none())
+                    && !already_refreshed
                     && !refreshed.contains(&(source.clone(), stream.id))
                 {
                     refreshed.push((source.clone(), stream.id));
@@ -1685,9 +1798,10 @@ impl DN {
                 Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
             };
             copied.extend(object.streams.iter().copied());
+            drop(state);
         }
         if !refresh.is_empty() {
-            return self.refresh_concat(process, retry, reply, refresh, 0);
+            return self.refresh_concat(process, retry, reply, refresh, 0, known);
         }
         if records.number() >= OPEN_STREAM_RECORD_LIMIT {
             return reply.send(Resp::error(
@@ -1736,40 +1850,40 @@ impl DN {
                 Err(e) => return reply.send(Resp::error(Status::Internal, e.to_string())),
             };
             let created = TimeSec::now();
-            {
-                let mut objects = self.object_table.write().expect("objects");
-                if objects.contains_key(destination.as_str()) {
+            let event = {
+                let mut state = self.state_write();
+                if state.object_table.contains_key(destination.as_str()) {
                     return reply.send(Resp::error(
                         Status::BadRequest,
                         format!("{destination} exists already"),
                     ));
                 }
-                let slot = match objects.alloc() {
-                    Ok(slot) => slot,
-                    Err(error) => {
-                        return reply.send(Resp::error(
-                            Status::Internal,
-                            format!("allocate DN object slot: {error}"),
-                        ));
-                    }
+                if let Err(error) = state.object_table.try_reserve(1) {
+                    return reply.send(Resp::error(
+                        Status::Internal,
+                        format!("reserve DN object slot: {error}"),
+                    ));
+                }
+                let object = Object {
+                    link: ObjectId::NONE.get(),
+                    name: Box::default(),
+                    deletion: Flags::default(),
+                    purge_only: false,
+                    id: ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32),
+                    framing: framing.expect("at least two sources"),
+                    streams: Vec::new(),
+                    localflags: AtomicU8::new(0),
+                    keyed: keyed.expect("at least two sources"),
+                    created,
                 };
-                objects.insert_at(
-                    destination.clone().into_boxed_str(),
-                    Some(slot),
-                    Object {
-                        link: ObjectId::NONE.get(),
-                        deletion: Flags::default(),
-                        purge_only: false,
-                        id: ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32),
-                        framing: framing.expect("at least two sources"),
-                        streams: Vec::new(),
-                        extending: true,
-                        waiting: vec![reply],
-                        keyed: keyed.expect("at least two sources"),
-                        created,
-                    },
-                );
-            }
+                let event = self.pending_events.start(object.pending_key(), &object.localflags);
+                state
+                    .object_table
+                    .insert_value(&destination, object)
+                    .expect("reserved object slot and hash capacity");
+                event
+            };
+            assert!(event.subscribe(reply, false));
 
             let destination_stream = StreamName { range: self.mine, stream, created };
             let left_stream =
@@ -1789,7 +1903,6 @@ impl DN {
             let destination_name = destination.clone();
             let named = sn.clone();
             if let Err(e) = process.ask(&sn, &ask, move |answer| {
-                let _state = dn.global_lock.read();
                 if answer.status != Status::Ok {
                     return dn.fail_concat(
                         &destination_name,
@@ -1824,41 +1937,43 @@ impl DN {
             Err(e) => return reply.send(Resp::error(Status::Internal, e.to_string())),
         };
         let created = TimeSec::now();
-        {
-            let mut objects = self.object_table.write().expect("objects");
-            if objects.contains_key(destination.as_str()) {
+        let event = {
+            let mut state = self.state_write();
+            if state.object_table.contains_key(destination.as_str()) {
                 return reply.send(Resp::error(
                     Status::BadRequest,
                     format!("{destination} exists already"),
                 ));
             }
-            let slot = match objects.alloc() {
-                Ok(slot) => slot,
-                Err(error) => {
-                    return reply.send(Resp::error(
-                        Status::Internal,
-                        format!("allocate DN object slot: {error}"),
-                    ));
-                }
-            };
-            if let Err(e) = self.retain_streams(&copied) {
-                objects.retire_blank(slot);
-                return reply.send(Resp::error(Status::BadRequest, e.to_string()));
+            if let Err(error) = state.object_table.try_reserve(1) {
+                return reply.send(Resp::error(
+                    Status::Internal,
+                    format!("reserve DN object slot: {error}"),
+                ));
+            }
+            if let Err(error) = self.retain_streams_in(&mut state, &copied) {
+                return reply.send(Resp::error(Status::BadRequest, error.to_string()));
             }
             let object = Object {
                 link: ObjectId::NONE.get(),
+                name: Box::default(),
                 deletion: Flags::default(),
                 purge_only: false,
                 id: ObjectId::new(self.next_object.fetch_add(1, Ordering::Relaxed) as u32),
                 framing: framing.expect("at least two sources"),
                 streams: copied,
-                extending: true,
-                waiting: vec![reply],
+                localflags: AtomicU8::new(0),
                 keyed: keyed.expect("at least two sources"),
                 created,
             };
-            objects.insert_at(destination.clone().into_boxed_str(), Some(slot), object);
-        }
+            let event = self.pending_events.start(object.pending_key(), &object.localflags);
+            state
+                .object_table
+                .insert_value(&destination, object)
+                .expect("reserved object slot and hash capacity");
+            event
+        };
+        assert!(event.subscribe(reply, false));
 
         let stream_name = StreamName { range: self.mine, stream, created };
         let ask = create_streams(std::slice::from_ref(&stream_name));
@@ -1866,7 +1981,6 @@ impl DN {
         let named = sn.clone();
         let destination_name = destination.clone();
         if let Err(e) = process.ask(&sn, &ask, move |answer| {
-            let _state = dn.global_lock.read();
             if answer.status != Status::Ok {
                 return dn.fail_concat(
                     &destination_name,
@@ -1888,9 +2002,10 @@ impl DN {
         reply: Reply,
         refresh: Vec<(String, SnId, StreamName)>,
         at: usize,
+        mut known: ConcatTotals,
     ) {
         let Some((object, sn, stream)) = refresh.get(at).cloned() else {
-            return self.concat_objects(process, &request, reply);
+            return self.concat_objects(process, &request, reply, known);
         };
         let mut payload = StructWriter::new();
         common::info::Listing { limit: 0, instances: true, at: vec![(stream, SRoff::ZERO)] }
@@ -1902,14 +2017,12 @@ impl DN {
         let next = Arc::clone(&onward);
         let named = identity.clone();
         let asked = onward.ask(&identity, &ask, move |answer| {
-            let _state = dn.global_lock.read();
             if answer.status != Status::Ok {
                 return reply.send(answer);
             }
-            let runs = match ExtentRun::all_of_args(answer.args()) {
+            let totals = match ExtentRun::all_of_args(answer.args()) {
                 Ok(mut runs) if runs.len() == 1 && runs[0].0.stream == stream.stream => {
-                    let (run, rows) = runs.pop().expect("one run");
-                    vec![Some((run, rows))]
+                    runs.pop().expect("one run").0.totals
                 }
                 _ => {
                     return reply.send(Resp::error(
@@ -1918,8 +2031,8 @@ impl DN {
                     ));
                 }
             };
-            dn.remember(&object, &runs);
-            dn.refresh_concat(&next, request, reply, refresh, at + 1);
+            known.push((object, stream, totals));
+            dn.refresh_concat(&next, request, reply, refresh, at + 1, known);
         });
         if let Err(e) = asked {
             logw!("could not reach an SN", "sn {identity},{e}");
@@ -1928,13 +2041,29 @@ impl DN {
 
     /// Complete the asynchronous stream creation behind an object concat.
     fn finish_concat(&self, name: &str, stream: StreamId, sn: SnId) {
-        let mut objects = self.object_table.write().expect("objects");
-        let Some(object) = objects.get_mut(name) else { return };
-        object.streams.push(self.install_stream(Stream::new(stream, sn, object.created)));
-        object.extending = false;
-        self.objects.fetch_add(1, Ordering::Relaxed);
-        drop(objects);
-        self.wake(&[name.to_string()], None);
+        let (event, answer) = {
+            let mut state = self.state_write();
+            let DNState { object_table, stream_table } = &mut *state;
+            let Some(created) = object_table.get(name).map(|object| object.created) else {
+                return;
+            };
+            stream_table
+                .install(Stream::new(stream, sn, created))
+                .expect("prechecked DN stream slot");
+            let object = object_table.get_mut(name).expect("object checked above");
+            object.streams.push(stream);
+            let event = self
+                .pending_events
+                .finish(object.pending_key(), &object.localflags)
+                .expect("pending concat event");
+            let answer = match object.args(stream_table, self.mine, self.dn, None) {
+                Some(args) => Resp::from_args(Status::Ok, args).id(0),
+                None => Resp::error(Status::Internal, format!("{name} has no stream")),
+            };
+            self.objects.fetch_add(1, Ordering::Relaxed);
+            (event, answer)
+        };
+        self.wake(event, answer);
     }
 
     /// Complete an object concat whose two source streams were combined by their SN.
@@ -1947,39 +2076,57 @@ impl DN {
         logical: SLoff,
         compressed: SCoff,
     ) {
-        let mut objects = self.object_table.write().expect("objects");
-        let Some(object) = objects.get_mut(name) else { return };
-        object.streams.push(self.install_stream(Stream {
-            id: stream,
-            deletion: Flags::default(),
-            records: SRoff::NONE,
-            created: object.created,
-            logical,
-            compressed,
-            sn,
-            extents,
-        }));
-        object.extending = false;
-        self.objects.fetch_add(1, Ordering::Relaxed);
-        drop(objects);
-        self.wake(&[name.to_string()], None);
+        let (event, answer) = {
+            let mut state = self.state_write();
+            let DNState { object_table, stream_table } = &mut *state;
+            let Some(created) = object_table.get(name).map(|object| object.created) else {
+                return;
+            };
+            stream_table
+                .install(Stream {
+                    id: stream,
+                    deletion: Flags::default(),
+                    records: SRoff::NONE,
+                    created,
+                    logical,
+                    compressed,
+                    sn,
+                    extents,
+                })
+                .expect("prechecked DN stream slot");
+            let object = object_table.get_mut(name).expect("object checked above");
+            object.streams.push(stream);
+            let event = self
+                .pending_events
+                .finish(object.pending_key(), &object.localflags)
+                .expect("pending concat event");
+            let answer = match object.args(stream_table, self.mine, self.dn, None) {
+                Some(args) => Resp::from_args(Status::Ok, args).id(0),
+                None => Resp::error(Status::Internal, format!("{name} has no stream")),
+            };
+            self.objects.fetch_add(1, Ordering::Relaxed);
+            (event, answer)
+        };
+        self.wake(event, answer);
     }
 
     /// Remove a concat object that could not obtain its final stream and answer all
     /// readers that were parked behind its creation.
     fn fail_concat(&self, name: &str, failure: Resp) {
-        let waiters = self
-            .object_table
-            .write()
-            .expect("objects")
-            .remove(name)
-            .map(|object| {
-                self.release_streams(&object.streams);
-                object.waiting
-            })
-            .unwrap_or_default();
-        for waiter in waiters {
-            waiter.send(failure.clone());
+        let event = {
+            let mut state = self.state_write();
+            match state.object_table.remove(name) {
+                Some(object) => {
+                    let event =
+                        self.pending_events.finish(object.pending_key(), &object.localflags);
+                    self.release_streams_in(&mut state, &object.streams);
+                    event
+                }
+                None => None,
+            }
+        };
+        if let Some(event) = event {
+            self.wake(event, failure);
         }
     }
 
@@ -2186,7 +2333,6 @@ impl DN {
                 return answer;
             }
         }
-        let _state = self.global_lock.read();
         say(self, made)
     }
 
@@ -2195,15 +2341,14 @@ impl DN {
         wanted: &[Wanted],
         planned: &[DnCreateRow],
     ) -> common::Result<(HashMap<SnId, Vec<StreamName>>, u64)> {
-        let _state = self.global_lock.read();
-        let objects = self.object_table.read().expect("objects");
-        let streams = self.stream_table.read().expect("streams");
+        let state = self.state_read();
         let planned: HashMap<_, _> =
             planned.iter().map(|row| (row.name.as_str(), row.id)).collect();
         let mut by_sn = HashMap::<SnId, Vec<StreamName>>::new();
         let mut made = 0;
         for one in wanted {
-            let object = objects
+            let object = state
+                .object_table
                 .get(one.name.as_str())
                 .ok_or_else(|| common::Error::new(format!("{} vanished after create", one.name)))?;
             if planned.get(one.name.as_str()) == Some(&object.id) {
@@ -2213,7 +2358,8 @@ impl DN {
                 continue;
             }
             for id in &object.streams {
-                let stream = streams
+                let stream = state
+                    .stream_table
                     .get(id.get() as usize)
                     .filter(|stream| stream.id == *id)
                     .ok_or_else(|| common::Error::new(format!("stream {id} is missing in DN")))?;
@@ -2239,14 +2385,38 @@ impl DN {
             Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
         };
 
-        // ⚠️ One lock, and everything decided inside it. An earlier version released
-        // the lock before parking — so the extension could finish in the gap and wake
-        // nobody — and called a method that takes the same lock again, which is a
-        // deadlock rather than a slow path.
+        // A request that finds an extension in flight can subscribe to its object event
+        // without the global write lock. Replaying a fired event closes the handoff race.
+        let pending = {
+            let state = self.state_read();
+            match state.object_table.get(name.as_str()) {
+                None => Some(Err(Resp::error(Status::NotFound, format!("no object {name}")))),
+                Some(object) if !object.deletion.readable(false) => {
+                    Some(Err(bad("object is deleted")))
+                }
+                Some(object) if object.append_in_progress() => Some(Ok(self
+                    .pending_events
+                    .get(object.pending_key())
+                    .expect("pending object has an event"))),
+                _ => None,
+            }
+        };
+        if let Some(pending) = pending {
+            match pending {
+                Ok(event) => self.park_event(event, reply, true),
+                Err(answer) => reply.send(answer),
+            }
+            return;
+        }
+
+        // Recheck while mutating: a different request may have started an extension
+        // after the shared-lock lookup above.
         let mut carry = Some(reply);
+        let mut pending_event = None;
         let next = {
-            let mut objects = self.object_table.write().expect("objects");
-            match objects.get_mut(name.as_str()) {
+            let mut state = self.state_write();
+            let DNState { object_table, stream_table } = &mut *state;
+            match object_table.get_mut(name.as_str()) {
                 None => Next::Say(Resp::error(Status::NotFound, format!("no object {name}"))),
                 Some(object) if !object.deletion.readable(false) => {
                     Next::Say(bad("object is deleted"))
@@ -2256,37 +2426,33 @@ impl DN {
                     // the list; the rest are late and have nothing to record.
                     let ours = object.streams.last().is_some_and(|last| *last == sealed);
                     if let Some(last) = object.streams.last_mut().filter(|_| ours) {
-                        self.stream_table.write().expect("streams")[last.get() as usize].records =
-                            records;
+                        stream_table[last.get() as usize].records = records;
                     }
-                    if object.extending {
-                        object.waiting.push(carry.take().expect("a reply"));
-                        self.parked.fetch_add(1, Ordering::Relaxed);
+                    if object.append_in_progress() {
+                        pending_event = Some(
+                            self.pending_events
+                                .get(object.pending_key())
+                                .expect("pending object has an event"),
+                        );
                         Next::Wait
                     } else if ours {
                         // The sealed stream's count was just recorded above, so the object's
                         // total is known and is where the next stream starts. Reserve enough
                         // headroom for the one open stream that is about to be added.
-                        let first_record =
-                            object.records(&self.stream_table.read().expect("streams"));
+                        let first_record = object.records(stream_table);
                         if first_record.number() >= OPEN_STREAM_RECORD_LIMIT {
                             Next::Say(Resp::error(
                                 Status::BadRequest,
                                 "append would exceed the object record limit",
                             ))
                         } else {
-                            object.extending = true;
+                            self.pending_events.start(object.pending_key(), &object.localflags);
                             Next::Ours(first_record)
                         }
                     } else {
                         // Somebody else extended past it already, so whatever is last
                         // now is the answer.
-                        match object.args(
-                            &self.stream_table.read().expect("streams"),
-                            self.mine,
-                            self.dn,
-                            None,
-                        ) {
+                        match object.args(stream_table, self.mine, self.dn, None) {
                             Some(args) => Next::Say(Resp::from_args(Status::Ok, args).id(0)),
                             None => Next::Say(Resp::error(
                                 Status::Internal,
@@ -2298,8 +2464,13 @@ impl DN {
             }
         };
 
+        if let Some(event) = pending_event {
+            self.park_event(event, carry.take().expect("a reply"), true);
+            return;
+        }
+
         match (next, carry) {
-            (Next::Wait, _) => {}
+            (Next::Wait, _) => unreachable!("pending event was handled above"),
             (Next::Say(answer), Some(reply)) => reply.send(answer),
             (Next::Ours(first_record), Some(reply)) => {
                 self.next_stream_for(process, name, first_record, reply)
@@ -2334,26 +2505,36 @@ impl DN {
         let named = sn.clone();
         reply.about(format_args!("{name} stream {stream} on {named} from record {first_record}"));
         let asked = process.ask(&sn, &ask, move |answer| {
-            let _state = dn.global_lock.read();
             if answer.status != Status::Ok {
                 let why = format!("{named} would not make a stream");
                 let failed = dn.gave_up(&name, answer.status, why);
-                dn.wake(std::slice::from_ref(&name), Some(&failed));
                 return reply.send(failed);
             }
-            {
-                let mut objects = dn.object_table.write().expect("objects");
-                if let Some(object) = objects.get_mut(name.as_str()) {
-                    object.streams.push(dn.install_stream(Stream::new(stream, sn_number, created)));
-                    object.extending = false;
+            let (event, answer) = {
+                let mut state = dn.state_write();
+                let DNState { object_table, stream_table } = &mut *state;
+                if let Some(object) = object_table.get_mut(name.as_str()) {
+                    stream_table
+                        .install(Stream::new(stream, sn_number, created))
+                        .expect("prechecked DN stream slot");
+                    object.streams.push(stream);
+                    let event = dn
+                        .pending_events
+                        .finish(object.pending_key(), &object.localflags)
+                        .expect("pending extension event");
+                    let answer = match object.args(stream_table, dn.mine, dn.dn, None) {
+                        Some(args) => Resp::from_args(Status::Ok, args).id(0),
+                        None => Resp::error(Status::Internal, format!("{name} has no stream")),
+                    };
+                    (Some(event), answer)
+                } else {
+                    (None, Resp::error(Status::Internal, format!("{name} has no stream")))
                 }
-            }
-            dn.streams.fetch_add(1, Ordering::Relaxed);
-            let answer = match dn.describe(&name, None) {
-                Some(args) => Resp::from_args(Status::Ok, args).id(0),
-                None => Resp::error(Status::Internal, format!("{name} has no stream")),
             };
-            dn.wake(std::slice::from_ref(&name), None);
+            dn.streams.fetch_add(1, Ordering::Relaxed);
+            if let Some(event) = event {
+                dn.wake(event, answer.clone());
+            }
             reply.send(answer);
         });
         if let Err(e) = asked {
@@ -2364,21 +2545,17 @@ impl DN {
     /// An extension that could not be made: stop claiming one is in flight, or
     /// everything waiting behind it waits for ever.
     fn gave_up(&self, name: &str, status: Status, why: String) -> Resp {
-        if let Some(object) = self.object_table.write().expect("objects").get_mut(name) {
-            object.extending = false;
+        let event = {
+            let mut state = self.state_write();
+            state.object_table.get_mut(name).and_then(|object| {
+                self.pending_events.finish(object.pending_key(), &object.localflags)
+            })
+        };
+        let failed = Resp::error(status, why);
+        if let Some(event) = event {
+            self.wake(event, failed.clone());
         }
-        Resp::error(status, why)
-    }
-
-    /// Release names taken for objects that could not be given a stream.
-    fn give_back(&self, names: &[String], status: Status, why: String) -> Resp {
-        for name in names {
-            if let Some(object) = self.object_table.write().expect("objects").remove(name.as_str())
-            {
-                self.release_streams(&object.streams);
-            }
-        }
-        Resp::error(status, why)
+        failed
     }
 
     fn info(
@@ -2427,74 +2604,77 @@ impl DN {
         };
         let name = name.as_str();
         let limit = self.config.info_entries;
-        // Most lookups only read the object table. If it is between streams, take
-        // the write lock and recheck before parking, so a completion cannot wake
-        // nobody in the gap.
-        let mut carry = Some(reply);
-        let describe = |object: &Object| -> Option<Result<Answering, Resp>> {
-            // ⚠️ **The check goes here and nowhere else**, because the DN owns the path
-            // table and is the only tier that can see a path point somewhere new. A read
-            // answers with blocks and an append with a receipt; neither says which object
-            // it was about, so without this a caller is answered about a different one and
-            // cannot tell (§17.36).
-            if !want.expect.holds(object.named(self.mine)) {
-                return Some(Err(Resp::error(
-                    Status::Replaced,
-                    format!("{name} is {} and not {}", object.named(self.mine), want.expect.0),
-                )));
-            }
-            if object.deletion.soft_deleted() && !object.deletion.deleted() && !include {
-                return Some(Err(bad(
-                    "object is soft-deleted; reading requires read-soft-deleted",
-                )));
-            }
-            if object.deletion.deleted()
-                || object.streams.iter().any(|id| {
-                    self.stream_table.read().unwrap()[id.get() as usize].deletion.deleted()
-                })
-            {
-                return Some(Err(Resp::error(Status::NotFound, "object is deleted")));
-            }
-            match describe_at(
-                object,
-                &self.stream_table.read().expect("streams"),
-                self.mine,
-                self.dn,
-                record,
-                &want,
-                limit,
-            ) {
-                Some(answering) => Some(Ok(answering)),
-                None if object.between_streams() => None,
-                None => Some(Err(Resp::error(Status::NotFound, format!("no object {name}")))),
-            }
-        };
-        let mut described = match self.object_table.read().expect("objects").get(name) {
-            Some(object) => describe(object),
-            None => Some(Err(Resp::error(Status::NotFound, format!("no object {name}")))),
-        };
-        if described.is_none() {
-            let mut objects = self.object_table.write().expect("objects");
-            described = match objects.get_mut(name) {
-                Some(object) => match describe(object) {
-                    None => {
-                        object.waiting.push(carry.take().expect("a reply"));
-                        self.parked.fetch_add(1, Ordering::Relaxed);
-                        None
-                    }
-                    answered => answered,
-                },
-                None => Some(Err(Resp::error(Status::NotFound, format!("no object {name}")))),
+        // The object keeps only a transient atomic hint. The global read lock protects
+        // the object while its event is found; subscription happens after that lock is
+        // dropped, and can replay if completion wins the handoff.
+        let describe =
+            |object: &Object, streams: &StreamTable| -> Option<Result<Answering, Resp>> {
+                // ⚠️ **The check goes here and nowhere else**, because the DN owns the path
+                // table and is the only tier that can see a path point somewhere new. A read
+                // answers with blocks and an append with a receipt; neither says which object
+                // it was about, so without this a caller is answered about a different one and
+                // cannot tell (§17.36).
+                if !want.expect.holds(object.named(self.mine)) {
+                    return Some(Err(Resp::error(
+                        Status::Replaced,
+                        format!("{name} is {} and not {}", object.named(self.mine), want.expect.0),
+                    )));
+                }
+                if object.deletion.soft_deleted() && !object.deletion.deleted() && !include {
+                    return Some(Err(bad(
+                        "object is soft-deleted; reading requires read-soft-deleted",
+                    )));
+                }
+                if object.deletion.deleted()
+                    || object.streams.iter().any(|id| streams[id.get() as usize].deletion.deleted())
+                {
+                    return Some(Err(Resp::error(Status::NotFound, "object is deleted")));
+                }
+                match describe_at(object, streams, self.mine, self.dn, record, &want, limit) {
+                    Some(answering) => Some(Ok(answering)),
+                    None if object.between_streams() => None,
+                    None => Some(Err(Resp::error(Status::NotFound, format!("no object {name}")))),
+                }
             };
+        let (described, event) = {
+            let state = self.state_read();
+            match state.object_table.get(name) {
+                Some(object) => match describe(object, &state.stream_table) {
+                    None => {
+                        let event = if object.append_in_progress() {
+                            Some(
+                                self.pending_events
+                                    .get(object.pending_key())
+                                    .expect("pending object has an event"),
+                            )
+                        } else {
+                            None
+                        };
+                        (None, event)
+                    }
+                    answered => (answered, None),
+                },
+                None => {
+                    (Some(Err(Resp::error(Status::NotFound, format!("no object {name}")))), None)
+                }
+            }
+        };
+        if let Some(event) = event {
+            self.park_event(event, reply, true);
+            return;
         }
-        let (Some(described), Some(reply)) = (described, carry) else { return };
+        let Some(described) = described else {
+            return reply.send(Resp::error(
+                Status::Internal,
+                format!("{name} is pending without an object event"),
+            ));
+        };
         match described {
             Err(refused) => reply.send(refused),
             Ok(Answering::Plain(args)) => reply.send(Resp::from_args(Status::Ok, args).id(0)),
             // Extents were asked for, so the SNs holding those streams have to be asked.
             Ok(Answering::Levelled(levelled)) if want.wants(Detail::Extents) => self.spread(
                 process,
-                name,
                 levelled,
                 want.from.object_record().expect("validated record start"),
                 limit.min(if want.limit == 0 { limit } else { want.limit }),
@@ -2517,7 +2697,6 @@ impl DN {
     fn spread(
         self: &Arc<Self>,
         process: &Arc<Process>,
-        name: &str,
         levelled: Levelled,
         from: ORoff,
         limit: u64,
@@ -2545,24 +2724,19 @@ impl DN {
             shape: levelled.shape,
             hide_rows: levelled.hide_rows,
             instances: levelled.instances,
-            name: name.to_string(),
             limit,
         }));
 
-        let dn = Arc::clone(self);
         for (sn, at) in by_sn {
             let identity = format!("SN{sn}");
             let ask = with_read_soft_deleted(ask_extents(&at, room, levelled.instances), include);
             let waiting = Arc::clone(&gather);
             let named = identity.clone();
-            let mine = Arc::clone(&dn);
-            if let Err(e) = process.ask(&identity, &ask, move |answer| {
-                let _state = mine.global_lock.read();
-                arrived(&mine, &waiting, &at, answer)
-            }) {
+            if let Err(e) =
+                process.ask(&identity, &ask, move |answer| arrived(&waiting, &at, answer))
+            {
                 logw!("could not reach an SN", "sn {named},{e}");
                 arrived(
-                    self,
                     &gather,
                     &[],
                     Resp::error(Status::Internal, format!("could not reach {named}")),
@@ -2571,53 +2745,21 @@ impl DN {
         }
     }
 
-    /// What the SNs said a stream has come to, kept against the next question about it
-    /// (§17.25.1). Takes the object-table lock, so nothing may hold it.
-    fn remember(&self, name: &str, runs: &[Option<ExtentReply>]) {
-        if runs.is_empty() {
-            return;
+    /// Queue a waiter and keep the status gauge correct if completion races registration.
+    fn park_event(&self, event: Arc<ObjectEvent>, reply: Reply, counted: bool) {
+        if counted {
+            self.parked.fetch_add(1, Ordering::Relaxed);
         }
-        let objects = self.object_table.read().expect("objects");
-        // Gone while the SNs answered: a deleted object is not a lost update worth caring
-        // about, since the streams it named are going away too.
-        let Some(object) = objects.get(name) else { return };
-        let mut table = self.stream_table.write().expect("streams");
-        for id in &object.streams {
-            let held = &mut table[id.get() as usize];
-            if let Some((run, _)) = runs.iter().flatten().find(|(run, _)| run.stream == held.id) {
-                held.learned(run.totals);
-            }
+        if !event.subscribe(reply, counted) && counted {
+            self.parked.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
-    /// Answer requests parked while an object's stream list was being extended.
-    fn wake(&self, names: &[String], failed: Option<&Resp>) {
-        for name in names {
-            let (waiters, args) = {
-                let mut objects = self.object_table.write().expect("objects");
-                match objects.get_mut(name.as_str()) {
-                    Some(object) => (
-                        std::mem::take(&mut object.waiting),
-                        object.args(
-                            &self.stream_table.read().expect("streams"),
-                            self.mine,
-                            self.dn,
-                            None,
-                        ),
-                    ),
-                    None => (Vec::new(), None),
-                }
-            };
-            self.parked.fetch_sub(waiters.len() as u64, Ordering::Relaxed);
-            for reply in waiters {
-                reply.send(match (failed, &args) {
-                    (None, Some(args)) => Resp::from_args(Status::Ok, args.clone()).id(0),
-                    (Some(failed), _) => failed.clone(),
-                    (None, None) => {
-                        Resp::error(Status::Internal, format!("{name} was made and then lost"))
-                    }
-                });
-            }
+    /// Fire an object's completion event without taking the global state lock.
+    fn wake(&self, event: Arc<ObjectEvent>, answer: Resp) {
+        let counted = event.fire(answer);
+        if counted != 0 {
+            self.parked.fetch_sub(counted as u64, Ordering::Relaxed);
         }
     }
 
@@ -2810,28 +2952,24 @@ impl DN {
 
     /// One name's worth of a batch answer, and what it costs in entries.
     ///
-    /// ⚠️ **Takes the object-table read lock** — see `look`.
+    /// ⚠️ **Takes the global read lock** — see `look`.
     fn piece(&self, name: &str, want: &Want, room: u64) -> Option<Piece> {
-        let objects = self.object_table.read().expect("objects");
-        let object = objects.get(name)?;
+        let state = self.state_read();
+        let object = state.object_table.get(name)?;
         if !object.deletion.readable(false) {
             return None;
         }
         if want.detail == 0 {
-            return object
-                .args(&self.stream_table.read().expect("streams"), self.mine, self.dn, None)
-                .map(|args| Piece { entries: 1, whole: true, args });
+            return object.args(&state.stream_table, self.mine, self.dn, None).map(|args| Piece {
+                entries: 1,
+                whole: true,
+                args,
+            });
         }
         // Room is what the limit has left, and an object costs at least its own entry, so a name
         // reached with no room to spare still gets its row and no streams.
-        let levelled = detailed(
-            object,
-            &self.stream_table.read().expect("streams"),
-            self.mine,
-            self.dn,
-            want,
-            room.max(1),
-        )?;
+        let levelled =
+            detailed(object, &state.stream_table, self.mine, self.dn, want, room.max(1))?;
         let (entries, whole) = (levelled.shape.entries, !levelled.shape.more());
         Some(Piece { entries, whole, args: levelled.args() })
     }
@@ -2839,21 +2977,17 @@ impl DN {
     /// What an object is: id, stream, the SN holding it, the second it was made,
     /// its flavour, and its framing as a kind and a width.
     ///
-    /// ⚠️ **Takes the object-table read lock**, so a caller already holding it
+    /// ⚠️ **Takes the global read lock**, so a caller already holding it
     /// deadlocks against itself. Anything working under a write lock builds its answer
     /// from the object it already has.
     fn look(&self, name: &str) -> Option<Vec<Arg>> {
         self.describe(name, None)
     }
 
-    /// ⚠️ **Takes the object-table read lock** — see `look`.
+    /// ⚠️ **Takes the global read lock** — see `look`.
     fn describe(&self, name: &str, record: Option<ORoff>) -> Option<Vec<Arg>> {
-        self.object_table.read().expect("objects").get(name)?.args(
-            &self.stream_table.read().expect("streams"),
-            self.mine,
-            self.dn,
-            record,
-        )
+        let state = self.state_read();
+        state.object_table.get(name)?.args(&state.stream_table, self.mine, self.dn, record)
     }
 }
 
@@ -2884,7 +3018,17 @@ fn validate_create_names(wanted: &[Wanted]) -> Result<(), Resp> {
 
 impl DN {
     /// Declare objects and their initial streams together in DN's committed state.
+    #[cfg(test)]
     fn apply_create(&self, cmd: DnCreateCmd) -> common::Result<Option<CreateReject>> {
+        let mut state = self.state_write();
+        self.apply_create_state(&mut state, cmd)
+    }
+
+    fn apply_create_state(
+        &self,
+        state: &mut DNState,
+        cmd: DnCreateCmd,
+    ) -> common::Result<Option<CreateReject>> {
         #[derive(Clone, Copy)]
         enum Choice {
             New,
@@ -2901,7 +3045,7 @@ impl DN {
         let mut stream_ids = std::collections::HashSet::new();
         let mut choices = Vec::with_capacity(cmd.rows.len());
         let mut add_objects = 0usize;
-        let objects = self.object_table.read().expect("objects");
+        let objects = &state.object_table;
         for row in &cmd.rows {
             if row.id.is_none() || row.stream.is_none() || row.sn.is_none() {
                 return Err(common::Error::new("DN create action has a sentinel id"));
@@ -2952,59 +3096,49 @@ impl DN {
             };
             choices.push(choice);
         }
-        drop(objects);
-
-        self.object_table
-            .write()
-            .expect("objects")
+        state
+            .object_table
             .try_reserve(add_objects)
             .map_err(|error| common::Error::new(format!("reserve DN objects: {error}")))?;
-        {
-            let table = self.stream_table.read().expect("streams");
-            for (row, choice) in cmd.rows.iter().zip(&choices) {
-                if matches!(choice, Choice::Keep) {
-                    continue;
-                }
-                let slot = row.stream.get() as usize;
-                if slot < table.len() {
-                    let held = &table[slot];
-                    let matches =
-                        held.id == row.stream && held.created == row.created && held.sn == row.sn;
-                    let conflict = if matches!(choice, Choice::Same) {
-                        !matches
-                    } else {
-                        !held.deletion.retired() && !matches
-                    };
-                    if conflict {
-                        return Err(common::Error::new(format!(
-                            "DN create action conflicts with stream {}",
-                            row.stream
-                        )));
-                    }
-                } else if matches!(choice, Choice::Same) {
-                    return Err(common::Error::new("completed object has no stream slot"));
-                }
-                let same_live = slot < table.len()
-                    && table[slot].id == row.stream
-                    && table[slot].created == row.created
-                    && table[slot].sn == row.sn
-                    && !table[slot].deletion.retired();
-                if matches!(choice, Choice::New) && !same_live && !table.can_reserve(row.stream) {
+        let table = &state.stream_table;
+        for (row, choice) in cmd.rows.iter().zip(&choices) {
+            if matches!(choice, Choice::Keep) {
+                continue;
+            }
+            let slot = row.stream.get() as usize;
+            if slot < table.len() {
+                let held = &table[slot];
+                let matches =
+                    held.id == row.stream && held.created == row.created && held.sn == row.sn;
+                let conflict = if matches!(choice, Choice::Same) {
+                    !matches
+                } else {
+                    !held.deletion.retired() && !matches
+                };
+                if conflict {
                     return Err(common::Error::new(format!(
-                        "DN create action cannot reserve stream {}",
+                        "DN create action conflicts with stream {}",
                         row.stream
                     )));
                 }
+            } else if matches!(choice, Choice::Same) {
+                return Err(common::Error::new("completed object has no stream slot"));
+            }
+            let same_live = slot < table.len()
+                && table[slot].id == row.stream
+                && table[slot].created == row.created
+                && table[slot].sn == row.sn
+                && !table[slot].deletion.retired();
+            if matches!(choice, Choice::New) && !same_live && !table.can_reserve(row.stream) {
+                return Err(common::Error::new(format!(
+                    "DN create action cannot reserve stream {}",
+                    row.stream
+                )));
             }
         }
 
         let mut added = 0u64;
-        let mut objects = self.object_table.write().expect("objects");
-        let mut object_slots = objects
-            .alloc_many(add_objects)
-            .map_err(|error| common::Error::new(format!("allocate DN object slots: {error}")))?
-            .into_iter();
-        let mut table = self.stream_table.write().expect("streams");
+        let table = &mut state.stream_table;
         for (row, choice) in cmd.rows.into_iter().zip(choices) {
             if !matches!(choice, Choice::New) {
                 continue;
@@ -3020,33 +3154,31 @@ impl DN {
                 stream.deletion = Flags::live();
                 table.install(stream).expect("prechecked DN stream slot");
             }
-            let object_slot = if objects.contains_key(row.name.as_str()) {
-                None
-            } else {
-                Some(object_slots.next().expect("preallocated DN object slot"))
-            };
-            objects.insert_at(
-                row.name.clone().into_boxed_str(),
-                object_slot,
-                Object {
-                    link: ObjectId::NONE.get(),
-                    deletion: Flags::live(),
-                    purge_only: cmd.flags.purge_only(),
-                    id: row.id,
-                    framing: row.framing,
-                    streams: vec![row.stream],
-                    extending: false,
-                    waiting: Vec::new(),
-                    keyed: row.keyed,
-                    created: row.created,
-                },
-            );
+            state
+                .object_table
+                .insert_value(
+                    &row.name,
+                    Object {
+                        link: ObjectId::NONE.get(),
+                        name: Box::default(),
+                        deletion: Flags::live(),
+                        purge_only: cmd.flags.purge_only(),
+                        id: row.id,
+                        framing: row.framing,
+                        streams: vec![row.stream],
+                        localflags: AtomicU8::new(0),
+                        keyed: row.keyed,
+                        created: row.created,
+                    },
+                )
+                .map_err(|error| {
+                    common::Error::new(format!("insert DN object {}: {error}", row.name))
+                })?;
             self.retired_objects.lock().expect("retired objects").remove(row.name.as_str());
             self.next_object.fetch_max(row.id.get() as u64 + 1, Ordering::Relaxed);
             self.next_stream.fetch_max(row.stream.get() as u64 + 1, Ordering::Relaxed);
             added += 1;
         }
-        debug_assert!(object_slots.next().is_none());
         self.objects.fetch_add(added, Ordering::Relaxed);
         self.streams.fetch_add(added, Ordering::Relaxed);
         Ok(None)
@@ -3076,16 +3208,8 @@ impl DN {
         Ok(ids)
     }
 
-    fn install_stream(&self, stream: Stream) -> StreamId {
-        let id = stream.id;
-        let mut table = self.stream_table.write().expect("streams");
-        assert!(table.can_reserve(id), "stream index is not available");
-        table.install(stream).expect("prechecked DN stream index");
-        id
-    }
-
-    fn retain_streams(&self, ids: &[StreamId]) -> common::Result<()> {
-        let mut table = self.stream_table.write().expect("streams");
+    fn retain_streams_in(&self, state: &mut DNState, ids: &[StreamId]) -> common::Result<()> {
+        let table = &mut state.stream_table;
         let mut extras = self.stream_extras.lock().expect("stream extras");
         for (i, id) in ids.iter().enumerate() {
             let stream = &mut table[id.get() as usize];
@@ -3102,8 +3226,23 @@ impl DN {
         Ok(())
     }
 
-    fn release_streams(&self, ids: &[StreamId]) {
-        let mut table = self.stream_table.write().expect("streams");
+    #[cfg(test)]
+    fn retain_streams(&self, ids: &[StreamId]) -> common::Result<()> {
+        let mut state = self.state_write();
+        self.retain_streams_in(&mut state, ids)
+    }
+
+    #[cfg(test)]
+    fn install_stream(&self, stream: Stream) -> StreamId {
+        let id = stream.id;
+        let mut state = self.state_write();
+        assert!(state.stream_table.can_reserve(id), "stream index is not available");
+        state.stream_table.install(stream).expect("prechecked DN stream index");
+        id
+    }
+
+    fn release_streams_in(&self, state: &mut DNState, ids: &[StreamId]) {
+        let table = &mut state.stream_table;
         let mut extras = self.stream_extras.lock().expect("stream extras");
         for id in ids {
             let stream = &mut table[id.get() as usize];
@@ -3149,23 +3288,15 @@ impl DN {
             snapshot_interval_secs: u64::MAX,
             allow_stale_reads: config.knobs.allow_stale_reads,
         };
-        let stream_table = Arc::new(RwLock::new(
-            StreamTable::new()
-                .map_err(|error| common::Error::new(format!("create DN stream pool: {error}")))?,
-        ));
-        let object_table = Arc::new(RwLock::new(
-            ObjectTable::new()
-                .map_err(|error| common::Error::new(format!("create DN object pool: {error}")))?,
-        ));
+        let stream_table = StreamTable::new()
+            .map_err(|error| common::Error::new(format!("create DN stream pool: {error}")))?;
+        let object_table = ObjectTable::new()?;
         let dn_node = DN {
             common: raft::runtime::Runtime::with_state(
                 runtime,
                 node,
                 options,
-                DNState {
-                    object_table: Arc::clone(&object_table),
-                    stream_table: Arc::clone(&stream_table),
-                },
+                DNState { object_table, stream_table },
             ),
             config,
             gc_stop: AtomicBool::new(true),
@@ -3173,9 +3304,9 @@ impl DN {
             deleting: Mutex::new(()),
             retired_objects: Mutex::new(std::collections::HashSet::new()),
             create_rejects: Mutex::new(CreateRejects::default()),
+            pending_events: PendingEvents::new(),
             dn,
             mine,
-            object_table,
             parked: AtomicU64::new(0),
             objects: AtomicU64::new(0),
             streams: AtomicU64::new(0),
@@ -3183,7 +3314,6 @@ impl DN {
             // arena is a real object, and starting at one would waste it (§17.37.2).
             next_object: AtomicU64::new(0),
             next_stream: AtomicU64::new(0),
-            stream_table,
             object_extras: Mutex::new(Extras::default()),
             stream_extras: Mutex::new(Extras::default()),
             #[cfg(test)]
@@ -3438,7 +3568,7 @@ impl Host for DN {
 
     fn apply_client(
         &self,
-        _state: &mut DNState,
+        state: &mut DNState,
         context: raft::execution::Context<'_>,
         action: &raft::Action,
         _done: &mut Vec<Self::Done>,
@@ -3451,7 +3581,7 @@ impl Host for DN {
                     .first()
                     .ok_or_else(|| common::Error::new("empty DN create action"))?
                     .id;
-                let reject = self.apply_create(cmd)?;
+                let reject = self.apply_create_state(state, cmd)?;
                 self.create_rejects
                     .lock()
                     .map_err(|_| common::Error::new("create rejects poisoned"))?
@@ -3464,6 +3594,7 @@ impl Host for DN {
 
     fn reset_metadata(&self, state: &mut DNState) {
         raft::execution::Application::reset(state);
+        self.pending_events.clear();
         *self.object_extras.lock().expect("object extras") = Extras::default();
         *self.stream_extras.lock().expect("stream extras") = SharedExtras::default();
         self.retired_objects.lock().expect("retired objects").clear();
@@ -3581,16 +3712,16 @@ mod tests {
         assert!(dn.apply_create(read.clone()).unwrap().is_none());
         assert!(dn.apply_create(read).unwrap().is_none());
         assert_eq!(dn.objects.load(Ordering::Relaxed), 2);
-        assert!(dn.object_table.read().unwrap()["/one"].purge_only);
-        assert!(dn.object_table.read().unwrap()["/two"].purge_only);
-        let table = dn.stream_table.read().unwrap();
+        assert!(dn.objects()["/one"].purge_only);
+        assert!(dn.objects()["/two"].purge_only);
+        let table = dn.streams();
         assert_eq!(table.len(), 7);
         assert_eq!(table[4].id, StreamId::new(4));
         assert_eq!(table[4].sn, SnId::new(2));
         assert_eq!(table[6].id, StreamId::new(6));
         drop(table);
         for (name, id, stream) in [("/one", 3, 4), ("/two", 5, 6)] {
-            let objects = dn.object_table.read().unwrap();
+            let objects = dn.objects();
             let object = objects.get(name).unwrap();
             assert_eq!(object.id, ObjectId::new(id));
             assert_eq!(object.streams, [StreamId::new(stream)]);
@@ -3630,8 +3761,8 @@ mod tests {
         let reject = dn.apply_create(require_new).unwrap().unwrap();
         assert_eq!(reject.status, Status::BadRequest);
         assert_eq!(dn.objects.load(Ordering::Relaxed), 1);
-        assert!(!dn.object_table.read().unwrap().contains_key("/new"));
-        assert_eq!(dn.stream_table.read().unwrap().len(), 1);
+        assert!(!dn.objects().contains_key("/new"));
+        assert_eq!(dn.streams().len(), 1);
 
         let require_exists = DnCreateCmd {
             rows: vec![
@@ -3651,8 +3782,8 @@ mod tests {
         let reject = dn.apply_create(require_exists).unwrap().unwrap();
         assert_eq!(reject.status, Status::NotFound);
         assert_eq!(dn.objects.load(Ordering::Relaxed), 1);
-        assert!(!dn.object_table.read().unwrap().contains_key("/missing"));
-        assert_eq!(dn.stream_table.read().unwrap().len(), 1);
+        assert!(!dn.objects().contains_key("/missing"));
+        assert_eq!(dn.streams().len(), 1);
     }
 
     #[test]
@@ -3683,17 +3814,16 @@ mod tests {
         let id = cmd.rows[0].id;
         let action = dn_action(&cmd).unwrap();
         let mut done = Vec::new();
-        let mut state = DNState {
-            object_table: Arc::clone(&dn.object_table),
-            stream_table: Arc::clone(&dn.stream_table),
-        };
-        dn.apply_client(
-            &mut state,
-            raft::execution::Context { ring: "DN", index: 7, term: 1 },
-            &action,
-            &mut done,
-        )
-        .unwrap();
+        {
+            let mut state = dn.state_write();
+            dn.apply_client(
+                &mut state,
+                raft::execution::Context { ring: "DN", index: 7, term: 1 },
+                &action,
+                &mut done,
+            )
+            .unwrap();
+        }
         let answer = dn.create_rejects.lock().unwrap().take(id).unwrap();
         assert_eq!(answer.status, Status::BadRequest);
         assert_eq!(dn.objects.load(Ordering::Relaxed), 1);
@@ -3804,7 +3934,7 @@ mod tests {
         dn.retain_streams(&[StreamId::FIRST]).unwrap();
         let mut object = grown();
         object.streams = vec![StreamId::FIRST, StreamId::FIRST];
-        dn.object_table.write().unwrap().insert("/retry".into(), object);
+        dn.objects_mut().insert("/retry".into(), object);
         dn.objects.store(1, Ordering::Relaxed);
         let process = testing::process();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3852,20 +3982,20 @@ mod tests {
         .unwrap();
         assert_eq!(dn.delete_object(&process, &soft).status, Status::Internal);
         {
-            let table = dn.stream_table.read().unwrap();
+            let table = dn.streams();
             assert_eq!(counts(&dn, &table[0]).0, 0);
             assert_eq!(counts(&dn, &table[0]).1, 2);
         }
-        assert!(dn.object_table.read().unwrap().contains_key("/retry"));
+        assert!(dn.objects().contains_key("/retry"));
         assert_eq!(dn.delete_object(&process, &soft).status, Status::Ok);
-        assert_eq!(counts(&dn, &dn.stream_table.read().unwrap()[0]).1, 2);
+        assert_eq!(counts(&dn, &dn.streams()[0]).1, 2);
         let hard = Delete { target: Target::Object("/retry".into()), retention: None, hard: true }
             .request()
             .unwrap();
         assert_eq!(dn.delete_object(&process, &hard).status, Status::Ok);
         assert_eq!(dn.delete_object(&process, &hard).status, Status::Ok);
-        assert!(!dn.object_table.read().unwrap().contains_key("/retry"));
-        let table = dn.stream_table.read().unwrap();
+        assert!(!dn.objects().contains_key("/retry"));
+        let table = dn.streams();
         assert_eq!(counts(&dn, &table[0]).1, 0);
         assert!(table[0].deletion.retired());
         peer.join().unwrap();
@@ -3921,27 +4051,25 @@ mod tests {
         dn.install_stream(held(id.get(), 0, Some(12)));
         dn.retain_streams(&[id, id]).unwrap();
         {
-            let mut table = dn.stream_table.write().unwrap();
+            let mut table = dn.streams_mut();
             assert_eq!(table.len(), 1);
             assert_eq!(counts(&dn, &table[0]).1, 3);
-            table[0].learned(Totals {
-                extents: ExtentId::new(2),
-                logical: SLoff::new(100),
-                compressed: SCoff::new(80),
-            });
+            table[0].extents = ExtentId::new(2);
+            table[0].logical = SLoff::new(100);
+            table[0].compressed = SCoff::new(80);
         }
         let mut first = grown();
         first.streams = vec![id];
         let mut second = grown();
         second.streams = vec![id, id];
-        let table = dn.stream_table.read().unwrap();
+        let table = dn.streams();
         assert_eq!(first.logical(&table), OLoff::new(112));
         assert_eq!(second.logical(&table), OLoff::new(224));
         drop(table);
         // A failed concat gives back every repeated reference it acquired.
-        dn.object_table.write().unwrap().insert(Box::from("/failed"), second);
+        dn.objects_mut().insert(Box::from("/failed"), second);
         dn.fail_concat("/failed", Resp::error(Status::Internal, "test"));
-        assert_eq!(counts(&dn, &dn.stream_table.read().unwrap()[0]).1, 1);
+        assert_eq!(counts(&dn, &dn.streams()[0]).1, 1);
     }
 
     #[test]
@@ -3979,7 +4107,7 @@ mod tests {
             .hard
             .store(u32::MAX, Ordering::Relaxed);
         assert!(dn.retain_streams(&[StreamId::new(0), StreamId::new(1)]).is_err());
-        assert_eq!(counts(&dn, &dn.stream_table.read().unwrap()[0]).1, 1);
+        assert_eq!(counts(&dn, &dn.streams()[0]).1, 1);
     }
     #[test]
     fn object_summaries_sum_streams_in_object_spaces() {
@@ -3993,12 +4121,12 @@ mod tests {
             .collect();
         let object = Object {
             link: ObjectId::NONE.get(),
+            name: Box::default(),
             deletion: Flags::default(),
             purge_only: false,
             id: ObjectId::FIRST,
             framing: Framing::Lf,
-            extending: false,
-            waiting: Vec::new(),
+            localflags: AtomicU8::new(0),
             keyed: false,
             created: TimeSec::new(100),
             streams: vec![StreamId::new(0), StreamId::new(1)],
@@ -4041,17 +4169,18 @@ mod tests {
     #[test]
     fn locate_stream_refuses_a_replaced_object() {
         let dn = Arc::new(DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST));
-        dn.object_table.write().unwrap().insert(
+        let stream = install(&dn, held(0, 0, None));
+        dn.objects_mut().insert(
             Box::from("/x"),
             Object {
                 link: ObjectId::NONE.get(),
+                name: Box::default(),
                 deletion: Flags::default(),
                 purge_only: false,
                 id: ObjectId::new(2),
                 framing: Framing::Lf,
-                streams: vec![install(&dn, held(0, 0, None))],
-                extending: false,
-                waiting: Vec::new(),
+                streams: vec![stream],
+                localflags: AtomicU8::new(0),
                 keyed: false,
                 created: TimeSec::new(100),
             },
@@ -4083,22 +4212,22 @@ mod tests {
         let dn = Arc::new(DN::new(testing::dn_config(), DnId::new(0), RangeId::new(0)));
         let made = TimeSec::new(1_000_000);
         let name_of = |dn: &DN| {
-            let objects = dn.object_table.read().unwrap();
+            let objects = dn.objects();
             let object = objects.get("/p").expect("an object");
             ObjectName { range: dn.mine, object: object.id, created: object.created }
         };
         let put = |dn: &DN| {
-            dn.object_table.write().unwrap().insert(
+            dn.objects_mut().insert(
                 Box::from("/p"),
                 Object {
                     link: ObjectId::NONE.get(),
+                    name: Box::default(),
                     deletion: Flags::default(),
                     purge_only: false,
                     id: ObjectId::new(dn.next_object.fetch_add(1, Ordering::Relaxed) as u32),
                     framing: Framing::Lf,
                     streams: Vec::new(),
-                    extending: false,
-                    waiting: Vec::new(),
+                    localflags: AtomicU8::new(0),
                     keyed: false,
                     created: made,
                 },
@@ -4131,7 +4260,7 @@ mod tests {
 
     fn install(dn: &DN, stream: Stream) -> StreamId {
         let id = stream.id;
-        let len = dn.stream_table.read().unwrap().len();
+        let len = dn.streams().len();
         if len <= id.get() as usize {
             dn.reserve_streams(id.get() as usize + 1 - len).unwrap();
         }
@@ -4176,10 +4305,46 @@ mod tests {
     use common::testing;
 
     #[test]
+    fn pending_event_table_sets_and_clears_object_hint() {
+        let events = PendingEvents::new();
+        let localflags = AtomicU8::new(0);
+        let key = (ObjectId::FIRST, TimeSec::new(10));
+        assert!(events.get(key).is_none());
+
+        let started = events.start(key, &localflags);
+        assert_ne!(localflags.load(Ordering::Acquire) & APPEND_IN_PROGRESS, 0);
+        let found = events.get(key).expect("event is discoverable while pending");
+        assert!(Arc::ptr_eq(&started, &found));
+
+        let finished = events.finish(key, &localflags).expect("event is removed at completion");
+        assert!(Arc::ptr_eq(&started, &finished));
+        assert_eq!(localflags.load(Ordering::Acquire) & APPEND_IN_PROGRESS, 0);
+        assert!(events.get(key).is_none());
+    }
+
+    #[test]
+    fn object_event_queues_and_replays_completion() {
+        let event = Arc::new(ObjectEvent::new());
+        let (first_wire, mut first_reader) = testing::link();
+        let first = Reply::new_test(Arc::new(common::server::Out::direct(first_wire)));
+        assert!(event.subscribe(first, true));
+
+        let answer = Resp::error(Status::BadRequest, "finished");
+        assert_eq!(event.fire(answer.clone()), 1);
+        assert_eq!(first_reader.response().unwrap().status, Status::BadRequest);
+        assert_eq!(event.fire(answer), 0);
+
+        let (late_wire, mut late_reader) = testing::link();
+        let late = Reply::new_test(Arc::new(common::server::Out::direct(late_wire)));
+        assert!(!event.subscribe(late, true));
+        assert_eq!(late_reader.response().unwrap().status, Status::BadRequest);
+    }
+
+    #[test]
     fn object_pool_reclaims_under_raft_x_lock() {
         let dn = DN::new(testing::dn_config(), DnId::FIRST, RangeId::FIRST);
         let (first, second) = {
-            let mut objects = dn.object_table.write().unwrap();
+            let mut objects = dn.objects_mut();
             objects.insert(Box::from("/first"), Object::blank());
             let first = objects.index_of("/first").unwrap();
             drop(objects.remove("/first").unwrap());
@@ -4189,16 +4354,11 @@ mod tests {
             (first, second)
         };
 
-        {
-            let _x = dn.global_lock.write();
-            let mut state = DNState {
-                object_table: Arc::clone(&dn.object_table),
-                stream_table: Arc::clone(&dn.stream_table),
-            };
-            raft::execution::Application::reclaim(&mut state);
-        }
+        let mut state = dn.state_write();
+        raft::execution::Application::reclaim(&mut *state);
+        drop(state);
 
-        let mut objects = dn.object_table.write().unwrap();
+        let mut objects = dn.objects_mut();
         objects.insert(Box::from("/third"), Object::blank());
         assert_eq!(objects.index_of("/third"), Some(first));
         assert_ne!(first, second);
@@ -4207,17 +4367,17 @@ mod tests {
     /// A temporary object whose stream list has not been attached yet, as can
     /// occur while a concat destination is being built.
     fn half_made(dn: &DN, name: &str) {
-        dn.object_table.write().unwrap().insert(
+        dn.objects_mut().insert(
             Box::from(name),
             Object {
                 link: ObjectId::NONE.get(),
+                name: Box::default(),
                 deletion: Flags::default(),
                 purge_only: false,
                 id: ObjectId::new(1),
                 framing: Framing::Lf,
                 streams: Vec::new(),
-                extending: false,
-                waiting: Vec::new(),
+                localflags: AtomicU8::new(0),
                 keyed: false,
                 created: TimeSec::new(1_000_000),
             },
@@ -4230,20 +4390,14 @@ mod tests {
         let dn = DN::new(testing::dn_config(), DnId::new(0), RangeId::new(0));
         half_made(&dn, "/half");
         assert!(dn.look("/half").is_none(), "nothing to say about it yet");
-        let waits = |name: &str| {
-            dn.object_table.read().unwrap().get(name).is_some_and(|object| object.between_streams())
-        };
+        let waits =
+            |name: &str| dn.objects().get(name).is_some_and(|object| object.between_streams());
         assert!(waits("/half"), "but the name is taken, so a lookup waits");
         assert!(!waits("/nothing"), "unlike a name nobody has");
 
         // Once the stream is named it describes normally.
-        dn.object_table
-            .write()
-            .unwrap()
-            .get_mut("/half")
-            .unwrap()
-            .streams
-            .push(install(&dn, held(7, 0, None)));
+        let stream = install(&dn, held(7, 0, None));
+        dn.objects_mut().get_mut("/half").unwrap().streams.push(stream);
         let args = dn.look("/half").expect("an object");
         // ⚠️ Read through the shape rather than by index: the stream is a whole name now
         // (#109), so its id is no longer argument one, and an index would have gone on
@@ -4290,8 +4444,8 @@ mod tests {
             .is_none()
         );
         assert_eq!(dn.objects.load(Ordering::Relaxed), 1);
-        assert_eq!(dn.stream_table.read().unwrap().len(), 1);
-        assert_eq!(dn.object_table.read().unwrap()["/same"].id, original.id);
+        assert_eq!(dn.streams().len(), 1);
+        assert_eq!(dn.objects()["/same"].id, original.id);
 
         let wanted = [Wanted { name: "/same".into(), keyed: false, framing: Framing::Lf }];
         let (by_sn, made) = dn.create_targets(&wanted, &[candidate]).unwrap();
@@ -4310,13 +4464,13 @@ mod tests {
             vec![held(0, 0, Some(0)), held(1, 0, Some(10)), held(2, 0, Some(5)), held(3, 0, None)];
         let mut object = Object {
             link: ObjectId::NONE.get(),
+            name: Box::default(),
             deletion: Flags::default(),
             purge_only: false,
             id: ObjectId::new(1),
             framing: Framing::Lf,
             streams: Vec::new(),
-            extending: false,
-            waiting: Vec::new(),
+            localflags: AtomicU8::new(0),
             keyed: false,
             created: TimeSec::new(1_000_000),
         };
@@ -4342,13 +4496,13 @@ mod tests {
     fn grown() -> Object {
         let mut object = Object {
             link: ObjectId::NONE.get(),
+            name: Box::default(),
             deletion: Flags::default(),
             purge_only: false,
             id: ObjectId::new(1),
             framing: Framing::Lf,
             streams: Vec::new(),
-            extending: false,
-            waiting: Vec::new(),
+            localflags: AtomicU8::new(0),
             keyed: false,
             created: TimeSec::new(1_000_000),
         };
@@ -4834,17 +4988,18 @@ mod tests {
         let dn = Arc::new(DN::new(testing::dn_config(), DnId::new(0), RangeId::new(0)));
         for n in 0..count {
             let name = format!("/n{n}");
-            dn.object_table.write().unwrap().insert(
+            let stream = install(&dn, held(n as u32 + 1, 0, None));
+            dn.objects_mut().insert(
                 Box::from(name.as_str()),
                 Object {
                     link: ObjectId::NONE.get(),
+                    name: Box::default(),
                     deletion: Flags::default(),
                     purge_only: false,
                     id: ObjectId::new(n as u32 + 1),
                     framing: Framing::Lf,
-                    streams: vec![install(&dn, held(n as u32 + 1, 0, None))],
-                    extending: false,
-                    waiting: Vec::new(),
+                    streams: vec![stream],
+                    localflags: AtomicU8::new(0),
                     keyed: false,
                     created: TimeSec::new(1_000_000),
                 },

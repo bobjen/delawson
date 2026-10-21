@@ -217,8 +217,8 @@ fn stream_hash(name: &StreamName) -> u64 {
 impl pool::LinearEntry for Stream {
     type Key = StreamName;
 
-    fn key(&self) -> Self::Key {
-        self.name
+    fn key(&self) -> &Self::Key {
+        &self.name
     }
 
     fn hash(key: &Self::Key) -> u64 {
@@ -237,12 +237,16 @@ impl pool::LinearEntry for Stream {
         std::ptr::addr_of_mut!(self.link)
     }
 
-    fn init(&mut self, key: Self::Key, value: Self) {
-        self.set(key, value);
+    fn init(&mut self, key: &Self::Key, value: Self) {
+        self.set(*key, value);
     }
 
     fn clear(&mut self) {
         Stream::clear(self);
+    }
+
+    fn take(&mut self) -> Self {
+        std::mem::replace(self, Stream::blank())
     }
 }
 
@@ -1175,7 +1179,7 @@ fn apply_sn_slot(
                     return Err(Error::new("stream identity has been retired"));
                 }
                 let (stream, inserted) = match stream_map
-                    .find_or_create(name, |name| Stream::new(name.created, cmd.creator))
+                    .find_or_create(&name, |name| Stream::new(name.created, cmd.creator))
                 {
                     Ok(result) => result,
                     Err(error) => {
@@ -1235,7 +1239,7 @@ fn apply_sn_slot(
             let inserted = !map.contains_key(&cmd.destination);
             if inserted {
                 let (_, created) = map
-                    .find_or_create(cmd.destination, |name| Stream::new(name.created, cmd.creator))
+                    .find_or_create(&cmd.destination, |name| Stream::new(name.created, cmd.creator))
                     .map_err(|error| Error::new(format!("insert SN stream: {error}")))?;
                 assert!(created, "SN concat destination appeared under the exclusive lock");
             }
@@ -3344,7 +3348,7 @@ mod tests {
     }
 
     fn put_stream(table: &mut StreamTable, name: StreamName, stream: Stream) {
-        let (_, inserted) = table.find_or_create(name, |_| stream).unwrap();
+        let (_, inserted) = table.find_or_create(&name, |_| stream).unwrap();
         assert!(inserted);
     }
 

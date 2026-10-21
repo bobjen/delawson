@@ -247,6 +247,7 @@ dependencies = [
  "delawson-pool",
  "delawson-raft",
  "parking_lot",
+ "spookyhash",
  "tempfile",
 ]
 

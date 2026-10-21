@@ -331,9 +331,9 @@ impl<'a> HashDir<'a> {
 
 /// Behavior `LinearHash` needs from its fixed-size entries.
 pub trait LinearEntry: LockedItem {
-    type Key: Copy + Ord;
+    type Key: Ord + ?Sized;
 
-    fn key(&self) -> Self::Key;
+    fn key(&self) -> &Self::Key;
     /// Return the same stable hash for every value with this key.
     fn hash(key: &Self::Key) -> u64;
     fn next(&self) -> u32;
@@ -347,10 +347,13 @@ pub trait LinearEntry: LockedItem {
 
     /// Initialize a new slot with `value` under `key`.
     /// After this call, `key()` must return `key`; the pool restores the link.
-    fn init(&mut self, key: Self::Key, value: Self);
+    fn init(&mut self, key: &Self::Key, value: Self);
 
     /// Drop per-entry resources and return this initialized slot to its blank state.
     fn clear(&mut self);
+
+    /// Move the entry out and leave an initialized blank value in its slot.
+    fn take(&mut self) -> Self;
 }
 
 /// Fixed-size entries indexed by a compact, incrementally resized hash table.
@@ -364,6 +367,7 @@ pub struct LinearHash<'a, T: LinearEntry, const ALIGN: usize, const LINK: usize>
     hash: HashDir<'a>,
     len: u64,
     max_items: u32,
+    reserved: Vec<u32>,
 }
 
 // SAFETY: slots are stable and all access is serialized by the caller's lock.
@@ -394,7 +398,7 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearHash<'a, T, A, L>
         let hash = HashDir::with_buckets(chunks, max_buckets, u64::from(initial_buckets))?;
         let slots = LockedPool::new(max_items, 0)?;
         let base = slots.base_ptr();
-        Ok(Self { slots, base, hash, len: 0, max_items })
+        Ok(Self { slots, base, hash, len: 0, max_items, reserved: Vec::new() })
     }
 
     pub fn len(&self) -> u64 {
@@ -473,17 +477,50 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearHash<'a, T, A, L>
         self.get(key).is_some()
     }
 
+    /// Slot index for a present key.
+    pub fn index_of(&self, key: &T::Key) -> Option<u32> {
+        let (_, _, index, ordering) = self.seek(key, T::hash(key));
+        (ordering == Some(Ordering::Equal)).then_some(index)
+    }
+
+    /// Ensure the next `additional` insertions can take slots and grow the
+    /// directory before the caller starts a batch mutation.
+    pub fn try_reserve(&mut self, additional: usize) -> Result<()> {
+        let additional = u64::try_from(additional)
+            .map_err(|_| Error::new("linear hash reservation is too large"))?;
+        let live_after = self
+            .len
+            .checked_add(additional)
+            .filter(|count| *count <= u64::from(self.max_items))
+            .ok_or_else(|| Error::new("linear pool reached its item limit"))?;
+
+        let have = self.reserved.len();
+        let need = usize::try_from(additional)
+            .map_err(|_| Error::new("linear hash reservation is too large"))?
+            .saturating_sub(have);
+        self.reserved
+            .try_reserve(need)
+            .map_err(|error| Error::new(format!("linear hash slot list: {error}")))?;
+        while live_after > self.hash.bucket_count() * 2 {
+            self.grow()?;
+        }
+        for _ in 0..need {
+            self.reserved.push(self.slots.alloc()?);
+        }
+        Ok(())
+    }
+
     /// Return the existing entry, or initialize and insert one if it is absent.
     /// The factory is statically dispatched and called only for a missing key.
     #[inline]
     pub fn find_or_create(
         &mut self,
-        key: T::Key,
-        create: impl FnOnce(T::Key) -> T,
+        key: &T::Key,
+        create: impl FnOnce(&T::Key) -> T,
     ) -> Result<(&mut T, bool)> {
         let hash = T::hash(&key);
         let bucket = self.hash.bucket(hash);
-        let (link, next, ordering) = self.seek_link(&key, bucket)?;
+        let (link, next, ordering) = self.seek_link(key, bucket)?;
         if ordering == Some(Ordering::Equal) {
             return Ok((self.slot_mut(next), false));
         }
@@ -495,7 +532,12 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearHash<'a, T, A, L>
         }
         let grows = final_len > self.hash.bucket_count() * 2;
         let value = create(key);
-        let index = self.slots.alloc()?;
+        let from_reserve = !self.reserved.is_empty();
+        let index = if from_reserve {
+            self.reserved.pop().expect("checked reserved slots")
+        } else {
+            self.slots.alloc()?
+        };
         self.slot_mut(index).init(key, value);
         debug_assert!(self.slot(index).key() == key);
         // SAFETY: `next_ptr` is the initialized slot's link; `link` points to
@@ -509,13 +551,17 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearHash<'a, T, A, L>
             // original chain. A failed append leaves the old table intact.
             if let Err(error) = self.grow() {
                 let (rollback, found, _) =
-                    self.seek_link(&key, bucket).expect("rollback bucket remains in range");
+                    self.seek_link(key, bucket).expect("rollback bucket remains in range");
                 debug_assert_eq!(found, index);
                 // SAFETY: rollback points at this entry in its current chain.
                 unsafe { *rollback = next };
                 self.slot_mut(index).clear();
-                // SAFETY: this unique entry was unlinked above.
-                unsafe { self.slots.retire_index(index) };
+                if from_reserve {
+                    self.reserved.push(index);
+                } else {
+                    // SAFETY: this unique entry was unlinked above.
+                    unsafe { self.slots.retire_index(index) };
+                }
                 return Err(error);
             }
         }
@@ -524,9 +570,13 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearHash<'a, T, A, L>
     }
 
     pub fn remove(&mut self, key: &T::Key) -> bool {
+        self.remove_entry(key).is_some()
+    }
+
+    pub fn remove_entry(&mut self, key: &T::Key) -> Option<T> {
         let (bucket, previous, index, ordering) = self.seek(key, T::hash(key));
         if ordering != Some(Ordering::Equal) {
-            return false;
+            return None;
         }
         let next = self.slot(index).next();
         if previous == T::LINK_NONE {
@@ -534,14 +584,14 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearHash<'a, T, A, L>
         } else {
             self.slot_mut(previous).set_next(next);
         }
-        self.slot_mut(index).clear();
+        let removed = self.slot_mut(index).take();
         // SAFETY: this unique live entry was removed from its chain above.
         unsafe { self.slots.retire_index(index) };
         self.len -= 1;
         while self.hash.bucket_count() >= BUCKET_GROUP * 2 && self.hash.bucket_count() > self.len {
             self.shrink();
         }
-        true
+        Some(removed)
     }
 
     pub fn clear(&mut self) {
@@ -794,8 +844,8 @@ mod tests {
     impl LinearEntry for Entry {
         type Key = u32;
 
-        fn key(&self) -> Self::Key {
-            self.key
+        fn key(&self) -> &Self::Key {
+            &self.key
         }
 
         fn hash(key: &Self::Key) -> u64 {
@@ -814,8 +864,8 @@ mod tests {
             std::ptr::addr_of_mut!(self.next)
         }
 
-        fn init(&mut self, key: Self::Key, value: Self) {
-            self.key = key;
+        fn init(&mut self, key: &Self::Key, value: Self) {
+            self.key = *key;
             self.valid = value.valid;
         }
 
@@ -823,6 +873,10 @@ mod tests {
             self.next = Self::LINK_NONE;
             self.key = 0;
             self.valid = false;
+        }
+
+        fn take(&mut self) -> Self {
+            std::mem::replace(self, entry(0))
         }
     }
 
@@ -962,7 +1016,7 @@ mod tests {
     }
 
     fn add(table: &mut LinearHash<'_, Entry, 4, 0>, key: u32, value: Entry) {
-        let (_, inserted) = table.find_or_create(key, |_| value).unwrap();
+        let (_, inserted) = table.find_or_create(&key, |_| value).unwrap();
         assert!(inserted);
     }
 
@@ -1021,7 +1075,7 @@ mod tests {
         for key in 0..max_items {
             add(&mut table, key, entry(key));
         }
-        assert!(table.find_or_create(max_items, entry).is_err());
+        assert!(table.find_or_create(&max_items, |key| entry(*key)).is_err());
         assert_eq!(table.len(), u64::from(max_items));
         assert_eq!(table.hash.bucket_count(), BUCKET_GROUP * 3);
         assert!(table.get(&(max_items - 1)).unwrap().valid);
@@ -1039,7 +1093,7 @@ mod tests {
             add(&mut table, key, entry(key));
         }
 
-        assert!(table.find_or_create(full_len, entry).is_err());
+        assert!(table.find_or_create(&full_len, |key| entry(*key)).is_err());
         assert_eq!(table.len(), u64::from(full_len));
         assert_eq!(table.hash.bucket_count(), u64::from(initial_buckets));
         assert!(table.get(&(full_len - 1)).unwrap().valid);
@@ -1051,11 +1105,11 @@ mod tests {
     fn find_or_create_keeps_the_existing_entry() {
         let chunks = ChunkPool::new(8, 1).unwrap();
         let mut table = LinearHash::<Entry, 4, 0>::new(&chunks, 8).unwrap();
-        let (first, inserted) = table.find_or_create(7, entry).unwrap();
+        let (first, inserted) = table.find_or_create(&7, |key| entry(*key)).unwrap();
         assert!(inserted);
         first.valid = false;
 
-        let (existing, inserted) = table.find_or_create(7, |_| panic!("factory ran")).unwrap();
+        let (existing, inserted) = table.find_or_create(&7, |_| panic!("factory ran")).unwrap();
         assert!(!inserted);
         assert!(!existing.valid);
         assert_eq!(table.len(), 1);
