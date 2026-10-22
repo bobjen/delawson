@@ -1,26 +1,61 @@
-//! Ordered disk work. Waiting for a fence is only allowed outside raft-main.
+//! Parallel disk work with prefix-ordered completion. Waiting for a fence is
+//! only allowed outside raft-main.
 use common::{Error, Result};
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
+const WORKERS: usize = 4;
 type Job = Box<dyn FnOnce() -> Result<()> + Send>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// Positional journal writes may run alongside one another.
+    Parallel,
+    /// Identity updates wait for the prior prefix, but do not stop later writes.
+    Identity,
+    /// File replacement and recovery work waits for and blocks all other work.
+    Ordered,
+}
+
+struct Task {
+    ticket: u64,
+    kind: Kind,
+    job: Job,
+}
+
 #[derive(Default)]
 struct Progress {
     submitted: u64,
     completed: u64,
+    finished: BTreeSet<u64>,
     failed: Option<String>,
+    tasks: VecDeque<Task>,
+    running: usize,
+    ordered_active: bool,
+    shutdown: bool,
 }
+
+struct Shared {
+    progress: Mutex<Progress>,
+    wake: Condvar,
+    wake_owner: Box<dyn Fn() + Send + Sync>,
+}
+
 #[derive(Clone)]
 pub struct Fence {
-    shared: Arc<(Mutex<Progress>, Condvar)>,
+    shared: Arc<Shared>,
     ticket: u64,
 }
 impl Fence {
     pub fn wait(&self) -> Result<()> {
-        let (lock, wake) = &*self.shared;
-        let mut progress = lock.lock().map_err(|_| Error::new("journal completion poisoned"))?;
+        let mut progress =
+            self.shared.progress.lock().map_err(|_| Error::new("journal completion poisoned"))?;
         while progress.completed < self.ticket && progress.failed.is_none() {
-            progress =
-                wake.wait(progress).map_err(|_| Error::new("journal completion poisoned"))?;
+            progress = self
+                .shared
+                .wake
+                .wait(progress)
+                .map_err(|_| Error::new("journal completion poisoned"))?;
         }
         if let Some(error) = &progress.failed {
             return Err(Error::new(error));
@@ -28,19 +63,24 @@ impl Fence {
         Ok(())
     }
     pub fn wait_all(&self) -> Result<()> {
-        let ticket =
-            self.shared.0.lock().map_err(|_| Error::new("journal completion poisoned"))?.submitted;
+        let ticket = self
+            .shared
+            .progress
+            .lock()
+            .map_err(|_| Error::new("journal completion poisoned"))?
+            .submitted;
         Self { shared: self.shared.clone(), ticket }.wait()
     }
     pub fn completed(&self) -> Result<u64> {
         let progress =
-            self.shared.0.lock().map_err(|_| Error::new("journal completion poisoned"))?;
+            self.shared.progress.lock().map_err(|_| Error::new("journal completion poisoned"))?;
         if let Some(error) = &progress.failed {
             return Err(Error::new(error));
         }
         Ok(progress.completed)
     }
 }
+
 pub struct Read<T>(mpsc::Receiver<Result<T>>);
 impl<T> Read<T> {
     pub fn wait(self) -> Result<T> {
@@ -52,52 +92,69 @@ impl<T> Read<T> {
         Self(receive)
     }
 }
+
 pub struct Queue {
-    sender: mpsc::Sender<(u64, Job)>,
-    fence: Fence,
+    shared: Arc<Shared>,
+    _workers: Vec<std::thread::JoinHandle<()>>,
 }
 impl Queue {
-    pub fn new(wake_owner: impl Fn() + Send + 'static) -> Result<Self> {
-        let (sender, receive) = mpsc::channel::<(u64, Job)>();
-        let fence = Fence {
-            shared: Arc::new((Mutex::new(Progress::default()), Condvar::new())),
-            ticket: 0,
-        };
-        let shared = fence.shared.clone();
-        std::thread::Builder::new().name("raft-io".into()).spawn(move || {
-            for (ticket, job) in receive {
-                let failed = shared.0.lock().unwrap().failed.is_some();
-                if failed {
-                    continue;
+    pub fn new(wake_owner: impl Fn() + Send + Sync + 'static) -> Result<Self> {
+        let shared = Arc::new(Shared {
+            progress: Mutex::new(Progress::default()),
+            wake: Condvar::new(),
+            wake_owner: Box::new(wake_owner),
+        });
+        let mut workers = Vec::with_capacity(WORKERS);
+        for at in 0..WORKERS {
+            let thread_shared = shared.clone();
+            match std::thread::Builder::new()
+                .name(format!("raft-io-{at}"))
+                .spawn(move || worker(thread_shared))
+            {
+                Ok(thread) => workers.push(thread),
+                Err(error) => {
+                    shared.progress.lock().unwrap().shutdown = true;
+                    shared.wake.notify_all();
+                    return Err(error.into());
                 }
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
-                    .unwrap_or_else(|_| Err(Error::new("journal I/O worker panicked")));
-                let mut progress = shared.0.lock().unwrap();
-                match result {
-                    Ok(()) => progress.completed = ticket,
-                    Err(error) => progress.failed = Some(error.to_string()),
-                }
-                drop(progress);
-                shared.1.notify_all();
-                wake_owner();
             }
-        })?;
-        Ok(Self { sender, fence })
+        }
+        Ok(Self { shared, _workers: workers })
     }
     pub fn submit(&mut self, job: impl FnOnce() -> Result<()> + Send + 'static) -> Result<u64> {
-        self.fence.completed()?;
+        self.submit_kind(Kind::Parallel, job)
+    }
+    pub fn submit_identity(
+        &mut self,
+        job: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<u64> {
+        self.submit_kind(Kind::Identity, job)
+    }
+    pub fn submit_ordered(
+        &mut self,
+        job: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<u64> {
+        self.submit_kind(Kind::Ordered, job)
+    }
+    pub fn submit_kind(
+        &mut self,
+        kind: Kind,
+        job: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<u64> {
+        let mut progress =
+            self.shared.progress.lock().map_err(|_| Error::new("journal completion poisoned"))?;
+        if let Some(error) = &progress.failed {
+            return Err(Error::new(error));
+        }
+        if progress.shutdown {
+            return Err(Error::new("journal I/O queue stopped"));
+        }
         let ticket =
-            self.fence.ticket.checked_add(1).ok_or_else(|| Error::new("I/O ticket overflow"))?;
-        self.sender
-            .send((ticket, Box::new(job)))
-            .map_err(|_| Error::new("journal I/O worker stopped"))?;
-        self.fence
-            .shared
-            .0
-            .lock()
-            .map_err(|_| Error::new("journal completion poisoned"))?
-            .submitted = ticket;
-        self.fence.ticket = ticket;
+            progress.submitted.checked_add(1).ok_or_else(|| Error::new("I/O ticket overflow"))?;
+        progress.submitted = ticket;
+        progress.tasks.push_back(Task { ticket, kind, job: Box::new(job) });
+        drop(progress);
+        self.shared.wake.notify_all();
         Ok(ticket)
     }
     pub fn read<T: Send + 'static>(
@@ -105,23 +162,112 @@ impl Queue {
         job: impl FnOnce() -> Result<T> + Send + 'static,
     ) -> Result<Read<T>> {
         let (send, receive) = mpsc::channel();
-        self.submit(move || {
+        self.submit_ordered(move || {
             let _ = send.send(job());
             Ok(())
         })?;
         Ok(Read(receive))
     }
     pub fn ticket(&self) -> u64 {
-        self.fence.ticket
+        self.shared.progress.lock().unwrap().submitted
     }
     pub fn fence(&self) -> Fence {
-        self.fence.clone()
+        let ticket = self.shared.progress.lock().unwrap().submitted;
+        Fence { shared: self.shared.clone(), ticket }
     }
+}
+impl Drop for Queue {
+    fn drop(&mut self) {
+        if let Ok(mut progress) = self.shared.progress.lock() {
+            progress.shutdown = true;
+        }
+        self.shared.wake.notify_all();
+    }
+}
+
+fn worker(shared: Arc<Shared>) {
+    loop {
+        let task = {
+            let mut progress = shared.progress.lock().unwrap();
+            loop {
+                if progress.failed.is_some() {
+                    return;
+                }
+                if let Some(at) = next_task(&progress) {
+                    let task = progress.tasks.remove(at).unwrap();
+                    progress.running += 1;
+                    if task.kind == Kind::Ordered {
+                        progress.ordered_active = true;
+                    }
+                    break task;
+                }
+                if progress.shutdown && progress.tasks.is_empty() && progress.running == 0 {
+                    return;
+                }
+                progress = shared.wake.wait(progress).unwrap();
+            }
+        };
+        let ticket = task.ticket;
+        let ordered = task.kind == Kind::Ordered;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task.job))
+            .unwrap_or_else(|_| Err(Error::new("journal I/O worker panicked")));
+        let mut progress = shared.progress.lock().unwrap();
+        progress.running -= 1;
+        if ordered {
+            progress.ordered_active = false;
+        }
+        match result {
+            Ok(()) => {
+                progress.finished.insert(ticket);
+                while let Some(next) = progress.completed.checked_add(1) {
+                    if !progress.finished.remove(&next) {
+                        break;
+                    }
+                    progress.completed = next;
+                }
+            }
+            Err(error) => {
+                if progress.failed.is_none() {
+                    progress.failed = Some(error.to_string());
+                }
+                progress.tasks.clear();
+            }
+        }
+        drop(progress);
+        shared.wake.notify_all();
+        (shared.wake_owner)();
+    }
+}
+
+fn next_task(progress: &Progress) -> Option<usize> {
+    if progress.ordered_active || progress.running >= WORKERS {
+        return None;
+    }
+    for (at, task) in progress.tasks.iter().enumerate() {
+        match task.kind {
+            Kind::Parallel => return Some(at),
+            Kind::Identity => {
+                if progress.completed >= task.ticket - 1 {
+                    return Some(at);
+                }
+            }
+            Kind::Ordered => {
+                if progress.completed >= task.ticket - 1 && progress.running == 0 {
+                    return Some(at);
+                }
+                // An ordered operation is a barrier even while it is waiting.
+                return None;
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     #[test]
     fn completion_wakes_a_sleeping_owner_without_waiting_for_its_timer() {
         let owner = Arc::new(crate::owner::Owner::new(()));
@@ -129,7 +275,7 @@ mod tests {
         let stopping = stop.clone();
         let (ticked, ticks) = mpsc::channel();
         let thread = owner
-            .start_with_interval(std::time::Duration::from_secs(60), move |_| {
+            .start_with_interval(Duration::from_secs(60), move |_| {
                 let _ = ticked.send(());
                 !stopping.load(std::sync::atomic::Ordering::SeqCst)
             })
@@ -139,7 +285,7 @@ mod tests {
         let mut io = Queue::new(move || waking.wake()).unwrap();
         io.submit(|| Ok(())).unwrap();
         // This is a liveness check, not a latency benchmark. The timer is a minute away.
-        let woke = ticks.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        let woke = ticks.recv_timeout(Duration::from_secs(5)).is_ok();
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         owner.wake();
         thread.join().unwrap();
@@ -147,41 +293,84 @@ mod tests {
     }
 
     #[test]
-    fn delayed_io_does_not_block_owner_and_failure_fences_successors() {
-        let owner = Arc::new(crate::owner::Owner::new(0));
-        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stopped = stopping.clone();
-        let thread =
-            owner.start(move |_| !stopped.load(std::sync::atomic::Ordering::SeqCst)).unwrap();
+    fn identity_waits_for_prefix_but_does_not_block_later_writes() {
         let mut io = Queue::new(|| {}).unwrap();
-        let (release, wait) = mpsc::channel();
+        let (release_first, wait_first) = mpsc::channel();
+        let (first_started, first_seen) = mpsc::channel();
         io.submit(move || {
-            wait.recv().unwrap();
+            first_started.send(()).unwrap();
+            wait_first.recv().unwrap();
             Ok(())
         })
         .unwrap();
-        let fence = io.fence();
-        let (finished, completion) = mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            finished.send(fence.wait()).unwrap();
-        });
-        let result = owner
-            .call(|value| {
-                *value += 1;
-                Ok(*value)
-            })
-            .unwrap();
-        assert_eq!(result, 1);
-        assert!(completion.try_recv().is_err());
-        release.send(()).unwrap();
-        completion.recv().unwrap().unwrap();
-        waiter.join().unwrap();
+        first_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (release_identity, wait_identity) = mpsc::channel();
+        let (identity_started, identity_seen) = mpsc::channel();
+        io.submit_identity(move || {
+            identity_started.send(()).unwrap();
+            wait_identity.recv().unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        let (later_started, later_seen) = mpsc::channel();
+        io.submit(move || {
+            later_started.send(()).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        later_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(identity_seen.try_recv().is_err());
+
+        release_first.send(()).unwrap();
+        identity_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        release_identity.send(()).unwrap();
+        io.fence().wait().unwrap();
+    }
+
+    #[test]
+    fn ordered_work_is_a_barrier_for_later_writes() {
+        let mut io = Queue::new(|| {}).unwrap();
+        let (release_first, wait_first) = mpsc::channel();
+        let (first_started, first_seen) = mpsc::channel();
+        io.submit(move || {
+            first_started.send(()).unwrap();
+            wait_first.recv().unwrap();
+            Ok(())
+        })
+        .unwrap();
+        first_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (release_ordered, wait_ordered) = mpsc::channel();
+        let (ordered_started, ordered_seen) = mpsc::channel();
+        io.submit_ordered(move || {
+            ordered_started.send(()).unwrap();
+            wait_ordered.recv().unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let (later_started, later_seen) = mpsc::channel();
+        io.submit(move || {
+            later_started.send(()).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert!(later_seen.recv_timeout(Duration::from_millis(50)).is_err());
+
+        release_first.send(()).unwrap();
+        ordered_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(later_seen.try_recv().is_err());
+        release_ordered.send(()).unwrap();
+        later_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        io.fence().wait().unwrap();
+    }
+
+    #[test]
+    fn failed_io_fences_successors() {
+        let mut io = Queue::new(|| {}).unwrap();
         io.submit(|| Err(Error::new("injected disk failure"))).unwrap();
-        let failed = io.fence().wait().is_err();
-        assert!(failed);
+        assert!(io.fence().wait().is_err());
         assert!(io.submit(|| Ok(())).is_err());
-        stopping.store(true, std::sync::atomic::Ordering::SeqCst);
-        owner.wake();
-        thread.join().unwrap();
     }
 }

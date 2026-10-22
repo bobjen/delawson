@@ -8,8 +8,10 @@ use common::{Context, Error, Result};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{IoSlice, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
+#[cfg(test)]
+use std::io::IoSlice;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -99,14 +101,50 @@ impl JournalFrame {
             Self::Shared(frame) => frame.length,
         }
     }
+    #[cfg(test)]
     fn write_to(&self, out: &mut impl Write) -> std::io::Result<()> {
         match self {
             Self::Flat(bytes) => out.write_all(bytes),
             Self::Shared(frame) => frame.write_to(out),
         }
     }
+    fn write_at(&self, file: &File, mut offset: u64) -> std::io::Result<()> {
+        match self {
+            Self::Flat(bytes) => write_all_at(file, bytes, &mut offset),
+            Self::Shared(frame) => frame.write_at(file, offset),
+        }
+    }
+}
+fn write_all_at(file: &File, mut bytes: &[u8], offset: &mut u64) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let written = file.write_at(bytes, *offset)?;
+        if written == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "journal write"));
+        }
+        *offset = (*offset)
+            .checked_add(written as u64)
+            .ok_or_else(|| std::io::Error::other("journal offset overflow"))?;
+        bytes = &bytes[written..];
+    }
+    Ok(())
 }
 impl SharedFrame {
+    fn write_at(&self, file: &File, mut offset: u64) -> std::io::Result<()> {
+        write_all_at(file, &self.head, &mut offset)?;
+        for entry in &self.entries {
+            let mut at = 0;
+            while at < entry.bytes.len() {
+                let chunk = entry.bytes.chunk(at);
+                if chunk.is_empty() {
+                    return Err(std::io::Error::other("empty Raft entry buffer segment"));
+                }
+                write_all_at(file, chunk, &mut offset)?;
+                at += chunk.len();
+            }
+        }
+        write_all_at(file, &self.tail, &mut offset)
+    }
+    #[cfg(test)]
     fn write_to(&self, out: &mut impl Write) -> std::io::Result<()> {
         let mut pieces = Vec::new();
         pieces.push(self.head.as_slice());
@@ -291,8 +329,20 @@ struct RecoveryPlan {
 }
 
 struct Disk {
-    ownership: File,
-    file: File,
+    ownership: Mutex<File>,
+    file: Mutex<Arc<File>>,
+}
+impl Disk {
+    fn current_file(&self) -> Result<Arc<File>> {
+        self.file.lock().map(|file| file.clone()).map_err(|_| Error::new("journal file poisoned"))
+    }
+    fn replace_file(&self, file: File) -> Result<()> {
+        *self.file.lock().map_err(|_| Error::new("journal file poisoned"))? = Arc::new(file);
+        Ok(())
+    }
+    fn lock_ownership(&self) -> Result<std::sync::MutexGuard<'_, File>> {
+        self.ownership.lock().map_err(|_| Error::new("journal identity poisoned"))
+    }
 }
 
 pub struct Journal {
@@ -300,11 +350,12 @@ pub struct Journal {
     pub state: State,
     directory: PathBuf,
     bootstrap_pending: bool,
-    disk: Arc<Mutex<Disk>>,
+    disk: Arc<Disk>,
     io: Option<crate::io::Queue>,
     durable: State,
     pending_io: VecDeque<(u64, DurableChange)>,
     current_start: u64,
+    current_bytes: u64,
     sequence: u64,
     change_sequence: u64,
     snapshot_sequence: u64,
@@ -540,20 +591,22 @@ impl Journal {
         if local != before {
             append_identity(&mut ownership, &local)?;
         }
+        let active = active.ok_or_else(|| Error::new(format!("no active journal for {member}")))?;
+        let current_bytes = active.metadata()?.len();
         let mut result = Self {
             identity: local,
             durable: state.clone(),
             state,
             directory: directory.into(),
             bootstrap_pending,
-            disk: Arc::new(Mutex::new(Disk {
-                ownership,
-                file: active
-                    .ok_or_else(|| Error::new(format!("no active journal for {member}")))?,
-            })),
+            disk: Arc::new(Disk {
+                ownership: Mutex::new(ownership),
+                file: Mutex::new(Arc::new(active)),
+            }),
             io: None,
             pending_io: VecDeque::new(),
             current_start,
+            current_bytes,
             sequence,
             change_sequence: sequence,
             snapshot_sequence,
@@ -566,7 +619,7 @@ impl Journal {
         result.prune()?;
         Ok(result)
     }
-    pub fn start_io(&mut self, wake: impl Fn() + Send + 'static) -> Result<()> {
+    pub fn start_io(&mut self, wake: impl Fn() + Send + Sync + 'static) -> Result<()> {
         if self.io.is_some() {
             return Err(Error::new("journal I/O already started"));
         }
@@ -600,6 +653,7 @@ impl Journal {
     fn apply_durable(&mut self, change: DurableChange) -> Result<()> {
         match change {
             DurableChange::Records(records) => {
+                mark_records(records.as_slice(), true);
                 for record in records.iter() {
                     self.durable.apply_durable(record)?;
                 }
@@ -629,15 +683,17 @@ impl Journal {
     }
     fn perform(
         &mut self,
-        job: impl FnOnce(&mut Disk) -> Result<()> + Send + 'static,
+        kind: crate::io::Kind,
+        job: impl FnOnce(&Disk) -> Result<()> + Send + 'static,
     ) -> Result<()> {
         self.poll_io()?;
         let disk = self.disk.clone();
-        let task = move || {
-            let mut disk = disk.lock().map_err(|_| Error::new("journal disk poisoned"))?;
-            job(&mut disk)
+        let task = move || job(&disk);
+        let result = if let Some(io) = &mut self.io {
+            io.submit_kind(kind, task).map(|_| ())
+        } else {
+            task()
         };
-        let result = if let Some(io) = &mut self.io { io.submit(task).map(|_| ()) } else { task() };
         if result.is_err() {
             self.failed = true;
         }
@@ -646,17 +702,21 @@ impl Journal {
     fn append_frame(
         &mut self,
         frame: JournalFrame,
+        offset: u64,
         records: Arc<Vec<Record>>,
         identity: Option<LocalIdentity>,
     ) -> Result<()> {
-        self.perform(move |disk| {
-            frame.write_to(&mut disk.file)?;
+        let kind =
+            if identity.is_some() { crate::io::Kind::Identity } else { crate::io::Kind::Parallel };
+        self.perform(kind, move |disk| {
+            let file = disk.current_file()?;
+            frame.write_at(&file, offset)?;
             mark_records(&records, false);
-            disk.file.sync_all()?;
+            file.sync_all()?;
             if let Some(identity) = identity {
-                append_identity(&mut disk.ownership, &identity)?;
+                let mut ownership = disk.lock_ownership()?;
+                append_identity(&mut ownership, &identity)?;
             }
-            mark_records(&records, true);
             Ok(())
         })
     }
@@ -693,7 +753,7 @@ impl Journal {
         let name = named(&directory, "journal", copied.after + 1);
         let mut bytes = encode(copied)?;
         bytes.extend(scn_footer(copied.largest_scn()));
-        self.perform(move |_| {
+        self.perform(crate::io::Kind::Parallel, move |_| {
             std::fs::create_dir_all(&directory)?;
             sync_directory(&root)?;
             publish(&name, &bytes)
@@ -714,7 +774,10 @@ impl Journal {
         }
         self.identity.repairing = true;
         let identity = self.identity.clone();
-        self.perform(move |disk| append_identity(&mut disk.ownership, &identity))
+        self.perform(crate::io::Kind::Identity, move |disk| {
+            let mut ownership = disk.lock_ownership()?;
+            append_identity(&mut ownership, &identity)
+        })
     }
     pub fn repair_history(
         &mut self,
@@ -753,7 +816,7 @@ impl Journal {
         let second = checkpoint.second;
         let bytes = checkpoint.bytes()?;
         let snapshot_bytes = bytes.len() as u64;
-        self.perform(move |disk| {
+        self.perform(crate::io::Kind::Ordered, move |disk| {
             let name = format!("repair-{}.bin", common::ring::MemberIdentity::generate()?);
             publish(&directory.join(&name), &bytes)?;
             let mut files: Vec<_> = numbered(&directory, "snapshot")?
@@ -765,11 +828,16 @@ impl Journal {
             identity.recovery =
                 Some(RecoveryPlan { archive: format!("rejected-{name}"), checkpoint: name, files });
             // The durable plan makes interrupted copying/renames restartable.
-            append_identity(&mut disk.ownership, &identity)?;
-            finish_recovery(&directory, &mut disk.ownership, &mut identity)?;
-            disk.file = OpenOptions::new().read(true).append(true).open(directory.join(CURRENT))?;
+            let mut ownership = disk.lock_ownership()?;
+            append_identity(&mut ownership, &identity)?;
+            finish_recovery(&directory, &mut ownership, &mut identity)?;
+            drop(ownership);
+            disk.replace_file(
+                OpenOptions::new().read(true).write(true).open(directory.join(CURRENT))?,
+            )?;
             identity.repairing = false;
-            append_identity(&mut disk.ownership, &identity)
+            let mut ownership = disk.lock_ownership()?;
+            append_identity(&mut ownership, &identity)
         })?;
         self.state = state;
         self.identity = accepted_identity;
@@ -781,6 +849,7 @@ impl Journal {
         self.snapshot_second = second;
         self.snapshot_bytes = snapshot_bytes;
         self.log_bytes = HEADER;
+        self.current_bytes = HEADER;
         self.track_change(DurableChange::Replace(self.state.clone()))?;
         Ok(())
     }
@@ -789,7 +858,7 @@ impl Journal {
     }
     pub fn finish_bootstrap(&mut self) -> Result<()> {
         let directory = self.directory.clone();
-        self.perform(move |_| {
+        self.perform(crate::io::Kind::Ordered, move |_| {
             std::fs::remove_file(directory.join("need-bootstrap"))?;
             sync_directory(&directory)
         })?;
@@ -844,10 +913,16 @@ impl Journal {
             identity = Some(updated);
         }
         let write_identity = identity.clone();
-        if let Err(error) = self.append_frame(frame, durable_records.clone(), write_identity) {
+        let offset = self.current_bytes;
+        let next_offset =
+            offset.checked_add(frame_len).ok_or_else(|| Error::new("journal offset overflow"))?;
+        if let Err(error) =
+            self.append_frame(frame, offset, durable_records.clone(), write_identity)
+        {
             undo.rollback(&mut self.state);
             return Err(error);
         }
+        self.current_bytes = next_offset;
         self.sequence = sequence;
         self.change_sequence = sequence;
         self.log_bytes += frame_len;
@@ -979,24 +1054,28 @@ impl Journal {
         }
         let directory = self.directory.clone();
         let current_start = self.current_start;
+        let current_bytes = self.current_bytes;
         let bytes = [journal_header_after(&self.state, start), carried.to_vec()].concat();
         let footer = scn_footer(self.state.largest_scn());
         let member = self.identity.process.clone();
-        self.perform(move |disk| {
+        self.perform(crate::io::Kind::Ordered, move |disk| {
             let current = directory.join(CURRENT);
             let closed = named(&directory, "journal", current_start);
             if closed.try_exists()? {
                 return Err(Error::new(format!("closed {member} journal already exists")));
             }
-            disk.file.write_all(&footer)?;
-            disk.file.sync_all()?;
+            let mut offset = current_bytes;
+            let file = disk.current_file()?;
+            write_all_at(&file, &footer, &mut offset)?;
+            file.sync_all()?;
             std::fs::rename(&current, closed)?;
             sync_directory(&directory)?;
             publish(&current, &bytes)?;
-            disk.file = OpenOptions::new().read(true).append(true).open(current)?;
+            disk.replace_file(OpenOptions::new().read(true).write(true).open(current)?)?;
             Ok(())
         })?;
         self.current_start = start;
+        self.current_bytes = HEADER + carried.len() as u64;
         self.log_bytes += HEADER + SCN_FOOTER;
         Ok(())
     }
@@ -1036,7 +1115,7 @@ impl Journal {
     fn prune(&mut self) -> Result<()> {
         let directory = self.directory.clone();
         let retain = self.retain;
-        self.perform(move |_| {
+        self.perform(crate::io::Kind::Ordered, move |_| {
             let snapshots = numbered(&directory, "snapshot")?;
             let remove = snapshots.len().saturating_sub(retain);
             let Some((oldest, _)) = snapshots.get(remove) else {
@@ -1056,7 +1135,8 @@ impl Journal {
     }
     #[cfg(any(test, feature = "testing"))]
     pub fn fail_writes(&mut self) {
-        self.disk.lock().unwrap().file = File::open(self.directory.join("identity")).unwrap();
+        *self.disk.file.lock().unwrap() =
+            Arc::new(File::open(self.directory.join("identity")).unwrap());
     }
 }
 pub(crate) struct History {
@@ -1823,7 +1903,6 @@ mod tests {
         assert_eq!(journal.state.last(), 1);
         assert_eq!(journal.durable_state().last(), 0);
         assert_eq!(journal.durable_state().term, 0);
-        assert!(!journal.state.log[0].is_written());
         assert!(!journal.state.log[0].is_durable());
         release.send(()).unwrap();
         journal.fence().unwrap().wait().unwrap();
@@ -1884,8 +1963,8 @@ mod tests {
             .unwrap();
         journal.snapshot(10).unwrap();
         {
-            let mut disk = journal.disk.lock().unwrap();
-            append_identity(&mut disk.ownership, &journal.identity).unwrap();
+            let mut ownership = journal.disk.lock_ownership().unwrap();
+            append_identity(&mut ownership, &journal.identity).unwrap();
         }
         let old = journal.identity.current.clone();
         journal.require_history_repair().unwrap();
