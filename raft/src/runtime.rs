@@ -11,11 +11,15 @@ use common::{Context, logi, logn};
 use common::{Error, Result};
 use common::{MessagePayload, Op, Req, Resp, Status, structure};
 use parking_lot::{Condvar, Mutex as ParkMutex, RwLock, RwLockReadGuard};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+fn take_callback<T>(slot: &Mutex<Option<T>>) -> Option<T> {
+    slot.lock().expect("callback").take()
+}
 
 pub struct Options {
     pub raft: RaftConfig,
@@ -66,7 +70,18 @@ impl ApplyWatch {
 }
 struct ClientProposal {
     action: Action,
-    reply: std::sync::mpsc::SyncSender<Result<u64>>,
+    reply: Box<dyn FnOnce(Result<u64>) + Send>,
+}
+type AppliedDone = Box<dyn FnOnce(Result<()>) + Send>;
+struct AppliedWaiter {
+    index: u64,
+    deadline: Instant,
+    done: AppliedDone,
+}
+#[derive(Default)]
+struct AppliedWaiters {
+    waiting: Vec<AppliedWaiter>,
+    ready: VecDeque<(AppliedDone, Result<()>)>,
 }
 pub struct ClientTicket(std::sync::mpsc::Receiver<Result<u64>>);
 impl ClientTicket {
@@ -195,6 +210,7 @@ pub struct Runtime<S> {
     client_proposals: Mutex<Vec<ClientProposal>>,
     client_changed: std::sync::Condvar,
     client_last_send: Mutex<Option<Instant>>,
+    applied_waiters: Mutex<AppliedWaiters>,
     pub raft_workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     peer_threads: Mutex<BTreeMap<MemberId, std::thread::Thread>>,
     pub global_lock: RwLock<S>,
@@ -270,6 +286,7 @@ impl<S> Runtime<S> {
             client_proposals: Mutex::new(Vec::new()),
             client_changed: std::sync::Condvar::new(),
             client_last_send: Mutex::new(None),
+            applied_waiters: Mutex::new(AppliedWaiters::default()),
             raft_workers: Mutex::new(vec![]),
             peer_threads: Mutex::new(BTreeMap::new()),
             global_lock: RwLock::new(initial),
@@ -290,6 +307,9 @@ impl<S> Runtime<S> {
     pub fn applied(&self) -> u64 {
         self.apply_watch.applied.load(Ordering::Acquire)
     }
+    fn wake_application(&self) {
+        let _ = self.execution_wake.try_send(());
+    }
     fn wake_peers(&self) {
         if let Ok(peers) = self.peer_threads.lock() {
             for thread in peers.values() {
@@ -307,29 +327,92 @@ impl<S> Runtime<S> {
     /// Queue one leader action; proposals join until the time or size cutoff.
     pub fn queue_client(&self, action: Action) -> Result<ClientTicket> {
         let (reply, receive) = std::sync::mpsc::sync_channel(1);
+        self.queue_client_async(action, move |result| {
+            let _ = reply.send(result);
+        });
+        Ok(ClientTicket(receive))
+    }
+    /// Queue a leader action and call back when it has an index, without waiting
+    /// on the Raft owner thread.
+    pub fn queue_client_async(
+        &self,
+        action: Action,
+        reply: impl FnOnce(Result<u64>) + Send + 'static,
+    ) {
         if self.host.get().is_none() {
             let result =
                 self.journal.initial_call(|node| node.propose(Command::Client(vec![action])));
-            let _ = reply.send(result);
-            return Ok(ClientTicket(receive));
+            reply(result);
+            return;
         }
-        let wake = {
-            let mut pending = self
-                .client_proposals
-                .lock()
-                .map_err(|_| Error::new("client proposal queue poisoned"))?;
-            if self.snapshot_stopping.load(Ordering::SeqCst) {
-                return Err(Error::new("Raft runtime is stopping"));
+        let mut pending = match self.client_proposals.lock() {
+            Ok(pending) => pending,
+            Err(_) => {
+                reply(Err(Error::new("client proposal queue poisoned")));
+                return;
             }
-            let wake = pending.is_empty();
-            pending.push(ClientProposal { action, reply });
-            wake
         };
+        if self.snapshot_stopping.load(Ordering::SeqCst) {
+            drop(pending);
+            reply(Err(Error::new("Raft runtime is stopping")));
+            return;
+        }
+        let wake = pending.is_empty();
+        pending.push(ClientProposal { action, reply: Box::new(reply) });
+        drop(pending);
         self.client_changed.notify_one();
         if wake {
             self.journal.wake();
         }
-        Ok(ClientTicket(receive))
+    }
+    /// Resume `done` on the application thread after this index is applied.
+    pub fn when_applied(&self, index: u64, done: impl FnOnce(Result<()>) + Send + 'static) {
+        let mut waiters = self.applied_waiters.lock().expect("applied callbacks");
+        waiters.waiting.push(AppliedWaiter {
+            index,
+            deadline: Instant::now() + Duration::from_secs(60),
+            done: Box::new(done),
+        });
+        drop(waiters);
+        self.wake_application();
+    }
+    fn collect_applied(&self, failure: Option<&str>, expire: bool) {
+        let applied = self.applied();
+        let now = Instant::now();
+        let mut waiters = self.applied_waiters.lock().expect("applied callbacks");
+        let mut at = 0;
+        while at < waiters.waiting.len() {
+            let waiter = &waiters.waiting[at];
+            let result = if let Some(error) = failure {
+                Some(Err(Error::new(error)))
+            } else if applied >= waiter.index {
+                Some(Ok(()))
+            } else if expire && now >= waiter.deadline {
+                Some(Err(Error::new("Raft quorum timeout; request outcome may be unknown")))
+            } else {
+                None
+            };
+            if let Some(result) = result {
+                let waiter = waiters.waiting.swap_remove(at);
+                waiters.ready.push_back((waiter.done, result));
+            } else {
+                at += 1;
+            }
+        }
+        let ready = !waiters.ready.is_empty();
+        drop(waiters);
+        if ready {
+            self.wake_application();
+        }
+    }
+    fn run_applied(&self) {
+        let ready = {
+            let mut waiters = self.applied_waiters.lock().expect("applied callbacks");
+            std::mem::take(&mut waiters.ready)
+        };
+        for (done, result) in ready {
+            done(result);
+        }
     }
     pub fn propose_client(&self, action: Action) -> Result<u64> {
         self.queue_client(action)?.wait()
@@ -391,7 +474,7 @@ impl<S> Runtime<S> {
                     .lock()
                     .map_err(|_| Error::new("client send time poisoned"))? = Some(Instant::now());
                 for reply in replies {
-                    let _ = reply.send(Ok(index));
+                    reply(Ok(index));
                 }
             }
             Err(error) => {
@@ -404,7 +487,7 @@ impl<S> Runtime<S> {
                     message
                 );
                 for reply in replies {
-                    let _ = reply.send(Err(Error::new(message.clone())));
+                    reply(Err(Error::new(message.clone())));
                 }
             }
         }
@@ -425,7 +508,7 @@ impl<S> Runtime<S> {
             .map(|mut queue| std::mem::take(&mut *queue))
             .unwrap_or_default();
         for proposal in pending {
-            let _ = proposal.reply.send(Err(Error::new(message)));
+            (proposal.reply)(Err(Error::new(message)));
         }
     }
 }
@@ -785,6 +868,14 @@ pub trait Host:
     fn peer_message(&self) -> Option<crate::Action>;
     fn receive_client(&self, process: &Process, action: crate::Action) -> Result<Resp>;
     fn dispatch_forwarded(&self, process: &Process, request: &Req) -> Resp;
+    fn dispatch_forwarded_async(
+        &self,
+        process: Arc<Process>,
+        request: Req,
+        done: Box<dyn FnOnce(Resp) + Send + 'static>,
+    ) {
+        done(self.dispatch_forwarded(&process, &request));
+    }
     fn forwardable(&self, op: Op) -> bool;
     fn registered_endpoint(&self, name: &str) -> Option<std::net::SocketAddr>;
 
@@ -833,6 +924,48 @@ pub trait Host:
             node.journal.poll_io()?;
             f(&host, node)
         })
+    }
+    /// Queue a consensus-owner query and dispatch its result after releasing the owner
+    /// thread. Request workers use this instead of waiting for raft-main.
+    fn on_raft_callback<R: Send + 'static>(
+        self: &Arc<Self>,
+        f: impl FnOnce(&Self, &mut Node) -> Result<R> + Send + 'static,
+        done: impl FnOnce(Result<R>) + Send + 'static,
+    ) {
+        let done: Arc<Mutex<Option<Box<dyn FnOnce(Result<R>) + Send>>>> =
+            Arc::new(Mutex::new(Some(Box::new(done))));
+        let finish = |done: &Arc<Mutex<Option<Box<dyn FnOnce(Result<R>) + Send>>>>,
+                      result: Result<R>| {
+            let done = done.lock().expect("Raft callback").take();
+            if let Some(done) = done {
+                done(result);
+            }
+        };
+        if self.host.get().is_none() {
+            let result = self.journal.initial_call(|node| f(self, node));
+            finish(&done, result);
+            return;
+        }
+        let host = self
+            .host
+            .get()
+            .and_then(|weak| weak.upgrade())
+            .and_then(|host| host.downcast::<Self>().ok());
+        let Some(host) = host else {
+            finish(&done, Err(Error::new("Raft host has not started")));
+            return;
+        };
+        let callback = Arc::clone(&done);
+        let result = self.journal.call_async(
+            move |node| {
+                node.journal.poll_io()?;
+                f(&host, node)
+            },
+            move |result| finish(&callback, result),
+        );
+        if let Err(error) = result {
+            finish(&done, Err(error));
+        }
     }
     fn accept_founders(&self, founders: Membership) -> Result<()> {
         founders.validate()?;
@@ -1500,6 +1633,9 @@ pub trait Host:
         if changed {
             self.apply_watch.signal();
         }
+        let failure = result.as_ref().err().map(ToString::to_string);
+        self.collect_applied(failure.as_deref(), true);
+        self.run_applied();
         result
     }
     fn execute_pending_work(&self) -> Result<()> {
@@ -1833,6 +1969,14 @@ pub trait Host:
             .call_timeout(&request, Duration::from_millis(timeout))
     }
     fn raft_request(&self, target: Option<MemberId>, message: Message) -> Result<Req> {
+        self.on_raft_async(move |host, node| host.raft_request_for_node(node, target, message))
+    }
+    fn raft_request_for_node(
+        &self,
+        node: &Node,
+        target: Option<MemberId>,
+        message: Message,
+    ) -> Result<Req> {
         let applying = Some(
             self.placement
                 .lock()
@@ -1840,16 +1984,12 @@ pub trait Host:
                 .selected
                 .clone(),
         );
-        let (member, retirement) = self.on_raft_async(|_, node| {
-            Ok((
-                if node.id == UNASSIGNED {
-                    Sender::Applicant(node.journal.identity.current.clone())
-                } else {
-                    Sender::Slot(node.id)
-                },
-                node.journal.pending_replacement(),
-            ))
-        })?;
+        let member = if node.id == UNASSIGNED {
+            Sender::Applicant(node.journal.identity.current.clone())
+        } else {
+            Sender::Slot(node.id)
+        };
+        let retirement = node.journal.pending_replacement();
         Ok(Req::new(Op::Raft).text(&self.runtime.name).bytes(crate::codec::encode_message(
             &Packet {
                 member,
@@ -1881,6 +2021,14 @@ pub trait Host:
     ) -> Result<Arc<common::peer::Peer>> {
         let name = self.peer_name(peer)?;
         let request = self.raft_request(Some(peer), message)?;
+        self.ask_named(&name, &request, then)
+    }
+    fn ask_named(
+        &self,
+        name: &str,
+        request: &Req,
+        then: impl FnOnce(Resp) + Send + 'static,
+    ) -> Result<Arc<common::peer::Peer>> {
         let connection = self
             .transport
             .as_ref()
@@ -1925,6 +2073,218 @@ pub trait Host:
             )
             .unwrap_or_else(error),
         )
+    }
+    /// Forward a client request without holding its server worker for the response.
+    /// The local-leader check and outgoing request construction do not wait for a
+    /// journal fence; remote replies arrive through the peer reader callback.
+    fn forward_async(
+        self: &Arc<Self>,
+        process: Arc<Process>,
+        request: &Req,
+        done: impl FnOnce(Option<Resp>) + Send + 'static,
+    ) {
+        enum Plan {
+            Local,
+            Remote { name: String, request: Req },
+        }
+        let request = request.clone();
+        let runtime = Arc::clone(self);
+        let done: Arc<Mutex<Option<Box<dyn FnOnce(Option<Resp>) + Send>>>> =
+            Arc::new(Mutex::new(Some(Box::new(done))));
+        let callback = Arc::clone(&done);
+        let process_for_result = Arc::clone(&process);
+        self.on_raft_callback(
+            move |host, node| {
+                if node.role == Role::Leader {
+                    return Ok(Plan::Local);
+                }
+                let id = node
+                    .leader
+                    .filter(|id| node.state().membership().members().contains(id))
+                    .ok_or_else(|| Error::new("Raft has no known Raft leader"))?;
+                let [arg] = request.args() else {
+                    return Err(Error::new("expected structured Raft request"));
+                };
+                if arg.is_group() {
+                    return Err(Error::new("expected structured Raft request"));
+                }
+                let name = node
+                    .state()
+                    .membership()
+                    .identities
+                    .get(&id)
+                    .or_else(|| node.state().contacts.get(&id))
+                    .map(|member| member.process.clone())
+                    .or_else(|| host.runtime.founders.get(&id).cloned())
+                    .ok_or_else(|| Error::new("unknown member index"))?;
+                let message = Message::Forward {
+                    op: request.op().code(),
+                    payload: arg.bytes().clone().into(),
+                    depth: arg.depth,
+                };
+                let outbound = host.raft_request_for_node(node, Some(id), message)?;
+                Ok(Plan::Remote { name, request: outbound })
+            },
+            move |result| {
+                let runtime = Arc::clone(&runtime);
+                let done = Arc::clone(&callback);
+                process_for_result.run(move || match result {
+                    Ok(Plan::Local) => {
+                        if let Some(done) = take_callback(&done) {
+                            done(None);
+                        }
+                    }
+                    Ok(Plan::Remote { name, request }) => {
+                        let callback = Arc::clone(&done);
+                        let result = runtime.ask_named(&name, &request, move |answer| {
+                            if let Some(done) = take_callback(&callback) {
+                                done(Some(answer));
+                            }
+                        });
+                        if let Err(error) = result {
+                            if let Some(done) = take_callback(&done) {
+                                done(Some(Resp::error(Status::Internal, error.to_string())));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(done) = take_callback(&done) {
+                            done(Some(Resp::error(Status::Internal, error.to_string())));
+                        }
+                    }
+                });
+            },
+        );
+    }
+    /// Answer a Raft RPC, allowing a forwarded client request to continue without
+    /// keeping the server worker while the leader applies it.
+    fn raft_rpc_async(
+        self: &Arc<Self>,
+        process: Arc<Process>,
+        request: Req,
+        done: impl FnOnce(Resp) + Send + 'static,
+    ) {
+        let (sender, bytes) = match raft_request_payload(&request) {
+            Ok((sender, bytes)) => (sender, bytes),
+            Err(error) => return done(Resp::error(Status::Internal, error.to_string())),
+        };
+        let packet = match crate::codec::decode_message::<Packet>(&bytes) {
+            Ok(packet) => packet,
+            Err(error) => return done(Resp::error(Status::Internal, error.to_string())),
+        };
+        let wait_for_journal = !matches!(&packet.message, Message::Forward { .. });
+        let packet_sender = sender.clone();
+        let done: Arc<Mutex<Option<Box<dyn FnOnce(Resp) + Send>>>> =
+            Arc::new(Mutex::new(Some(Box::new(done))));
+        let reply = Arc::clone(&done);
+        let runtime = Arc::clone(self);
+        self.on_raft_callback(
+            move |host, node| {
+                let mut deferred = None;
+                let response = host.raft_packet(node, &packet_sender, packet, &mut deferred);
+                let fence = wait_for_journal.then(|| node.journal.fence()).flatten();
+                Ok((response, deferred, fence))
+            },
+            move |result| {
+                let process = Arc::clone(&process);
+                let runtime = Arc::clone(&runtime);
+                let reply = Arc::clone(&reply);
+                let continue_rpc =
+                    move |durable: Result<()>, result: Result<(Result<Resp>, Option<Deferred>)>| {
+                        let process = Arc::clone(&process);
+                        let runtime = Arc::clone(&runtime);
+                        let reply = Arc::clone(&reply);
+                        let worker = Arc::clone(&process);
+                        worker.run(move || {
+                            let answer = match durable {
+                                Err(error) => Err(error),
+                                Ok(()) => result,
+                            };
+                            let answer = match answer {
+                                Err(error) => {
+                                    logn!(
+                                        "Raft RPC rejected",
+                                        "sender {},reason {}",
+                                        sender,
+                                        error
+                                    );
+                                    Some(Resp::error(Status::Internal, error.to_string()))
+                                }
+                                Ok((response, deferred)) => match response {
+                                    Err(error) => {
+                                        Some(Resp::error(Status::Internal, error.to_string()))
+                                    }
+                                    Ok(response) => match deferred {
+                                        Some(Deferred::Message(Message::Forward {
+                                            op,
+                                            payload,
+                                            depth,
+                                        })) => match Op::from_code(op) {
+                                            Ok(op) => {
+                                                let forward_reply = Arc::clone(&reply);
+                                                runtime.dispatch_forwarded_async(
+                                                    Arc::clone(&process),
+                                                    Req {
+                                                        id: 0,
+                                                        payload: Arg::new(
+                                                            op,
+                                                            payload.into(),
+                                                            depth,
+                                                        ),
+                                                    },
+                                                    Box::new(move |answer| {
+                                                        if let Some(done) =
+                                                            take_callback(&forward_reply)
+                                                        {
+                                                            done(answer);
+                                                        }
+                                                    }),
+                                                );
+                                                None
+                                            }
+                                            Err(error) => Some(Resp::error(
+                                                Status::Internal,
+                                                error.to_string(),
+                                            )),
+                                        },
+                                        Some(Deferred::Message(Message::Client(action))) => Some(
+                                            runtime
+                                                .receive_client(&process, action)
+                                                .unwrap_or_else(|error| {
+                                                    Resp::error(Status::Internal, error.to_string())
+                                                }),
+                                        ),
+                                        Some(Deferred::Read(read)) => Some(
+                                            read.wait().map(Resp::bytes).unwrap_or_else(|error| {
+                                                Resp::error(Status::Internal, error.to_string())
+                                            }),
+                                        ),
+                                        None => Some(response),
+                                        _ => Some(Resp::error(
+                                            Status::Internal,
+                                            "invalid deferred Raft work",
+                                        )),
+                                    },
+                                },
+                            };
+                            if let Some(answer) = answer {
+                                if let Some(reply) = take_callback(&reply) {
+                                    reply(answer);
+                                }
+                            }
+                        });
+                    };
+                match result {
+                    Ok((response, deferred, Some(fence))) => {
+                        fence.then(move |durable| continue_rpc(durable, Ok((response, deferred))));
+                    }
+                    Ok((response, deferred, None)) => {
+                        continue_rpc(Ok(()), Ok((response, deferred)));
+                    }
+                    Err(error) => continue_rpc(Ok(()), Err(error)),
+                }
+            },
+        );
     }
     fn raft_rpc(&self, process: &Process, request: &Req) -> Resp {
         let result = (|| -> Result<Resp> {
@@ -2449,10 +2809,12 @@ pub trait Host:
             };
             if host.snapshot_stopping.load(Ordering::SeqCst) {
                 host.fail_client_proposals("Raft runtime is stopping");
+                host.collect_applied(Some("Raft runtime is stopping"), false);
                 return false;
             }
             let result = (|| -> Result<()> {
                 if node.journal.failed {
+                    host.collect_applied(Some("Raft journal failed"), false);
                     return Ok(());
                 }
                 let before =
@@ -2503,6 +2865,14 @@ pub trait Host:
                 host.prepare_primary(node)?;
                 host.flush_client_proposals(node)?;
                 host.refresh_application(node)?;
+                if node.role != Role::Leader {
+                    host.collect_applied(
+                        Some("Raft leadership changed; request outcome may be unknown"),
+                        false,
+                    );
+                } else {
+                    host.collect_applied(None, true);
+                }
                 if before
                     != (node.role, node.state().term, node.state().last(), node.state().commit)
                 {

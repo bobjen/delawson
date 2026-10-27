@@ -27,7 +27,7 @@ use common::{Arg, Op, Req, Resp, Status, StructReader, StructWriter, structure};
 use common::{Error, Result};
 use pool::Pool;
 use raft::runtime::{Host, Settings as RaftSettings};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::align_of;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
@@ -569,6 +569,19 @@ struct PendingDelete {
     tasks: Vec<DeleteTask>,
 }
 
+#[derive(Clone)]
+struct DeleteWaiter {
+    process: Arc<Process>,
+    deletion: Delete,
+    done: Respond,
+}
+
+#[derive(Default)]
+struct DeleteQueue {
+    active: HashSet<StreamName>,
+    waiting: HashMap<StreamName, VecDeque<DeleteWaiter>>,
+}
+
 type ExtentActionKey = (u16, Vec<u8>);
 
 fn extent_action_key(action: &raft::Action) -> ExtentActionKey {
@@ -963,14 +976,14 @@ impl SNState {
 }
 
 enum OpenWaiter {
-    Reply(Reply),
+    Callback { workers: server::WorkerQueue, done: Respond },
     Forward(SyncSender<Resp>),
 }
 
 impl OpenWaiter {
     fn send(self, response: Resp) {
         match self {
-            Self::Reply(reply) => reply.send(response),
+            Self::Callback { workers, done } => workers.run(move || done.send(response)),
             Self::Forward(sender) => {
                 let _ = sender.send(response);
             }
@@ -981,6 +994,22 @@ impl OpenWaiter {
 struct OpenDone {
     waiters: Vec<OpenWaiter>,
     extent: Option<(ExtentData, SRoff)>,
+}
+
+#[derive(Clone)]
+struct Respond(Arc<Mutex<Option<Box<dyn FnOnce(Resp) + Send + 'static>>>>);
+
+impl Respond {
+    fn new(done: impl FnOnce(Resp) + Send + 'static) -> Self {
+        Self(Arc::new(Mutex::new(Some(Box::new(done)))))
+    }
+
+    fn send(&self, response: Resp) {
+        let done = self.0.lock().expect("response callback").take();
+        if let Some(done) = done {
+            done(response);
+        }
+    }
 }
 
 struct OpenNode {
@@ -1529,6 +1558,7 @@ struct SN {
     common: raft::runtime::Runtime<SNState>,
     config: SNConfig,
     deleting: Mutex<()>,
+    delete_queue: Mutex<DeleteQueue>,
     /// Primary-owned pool slots keyed by the exact serialized action that uses them.
     pending_extents: Mutex<HashMap<ExtentActionKey, ExtentId>>,
     /// Maximum sealed extents one stream may hold, including extent references made by
@@ -1593,12 +1623,44 @@ impl Service for SN {
     }
 
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
-        if request.op() == Op::OpenExtent {
-            if let Some(answer) = self.forward(&request) {
-                reply.send(answer);
-            } else {
-                self.open_to(process, &request, OpenWaiter::Reply(reply));
-            }
+        if request.op() == Op::Raft {
+            self.raft_rpc_async(Arc::clone(process), request, move |answer| reply.send(answer));
+        } else if matches!(
+            request.op(),
+            Op::SoftDeleteStream
+                | Op::DeleteStream
+                | Op::OpenExtent
+                | Op::CreateStream
+                | Op::ConcatStreams
+                | Op::SealStream
+                | Op::SealExtent
+        ) {
+            let sn = Arc::clone(self);
+            let onward = Arc::clone(process);
+            let local = request.clone();
+            self.forward_async(Arc::clone(process), &request, move |answer| match answer {
+                Some(answer) => reply.send(answer),
+                None => {
+                    let done = Respond::new(move |answer| reply.send(answer));
+                    match local.op() {
+                        Op::OpenExtent => sn.open_to(
+                            &onward,
+                            &local,
+                            OpenWaiter::Callback { workers: onward.worker_queue(), done },
+                        ),
+                        Op::CreateStream => sn.create_async(onward.worker_queue(), &local, done),
+                        Op::SoftDeleteStream | Op::DeleteStream => {
+                            sn.delete_stream_async(&onward, &local, done)
+                        }
+                        Op::ConcatStreams => {
+                            sn.concat_streams_async(onward.worker_queue(), &local, done)
+                        }
+                        Op::SealStream => sn.seal_stream_async(onward.worker_queue(), &local, done),
+                        Op::SealExtent => sn.seal_async(&onward, &local, done),
+                        _ => unreachable!(),
+                    }
+                }
+            });
         } else {
             reply.send(self.answer(process, &request));
         }
@@ -1626,6 +1688,10 @@ impl Service for SN {
 }
 
 impl SN {
+    fn service_arc(&self) -> Option<Arc<Self>> {
+        self.common.host.get()?.upgrade()?.downcast::<SN>().ok()
+    }
+
     fn answer_local(&self, process: &Process, request: &Req) -> Resp {
         match request.op() {
             Op::Raft => self.raft_rpc(process, request),
@@ -1653,6 +1719,21 @@ impl SN {
         let index = self.propose_action(action)?;
         self.wait_applied(index)?;
         Ok(index)
+    }
+
+    fn submit_action(
+        self: &Arc<Self>,
+        workers: server::WorkerQueue,
+        action: raft::Action,
+        done: impl FnOnce(Result<()>) + Send + 'static,
+    ) {
+        let sn = Arc::clone(self);
+        self.common.queue_client_async(action, move |proposal| match proposal {
+            Ok(index) => sn.common.when_applied(index, move |result| {
+                workers.run(move || done(result));
+            }),
+            Err(error) => workers.run(move || done(Err(error))),
+        });
     }
 
     fn remember_ext(&self, action: &raft::Action, id: ExtentId) -> Result<()> {
@@ -1707,6 +1788,33 @@ impl SN {
         Ok(index)
     }
 
+    fn submit_ext_action(
+        self: &Arc<Self>,
+        workers: server::WorkerQueue,
+        action: raft::Action,
+        id: ExtentId,
+        done: impl FnOnce(Result<()>) + Send + 'static,
+    ) {
+        let key = extent_action_key(&action);
+        if let Err(error) = self.remember_ext(&action, id) {
+            self.release_extent_id(id);
+            workers.run(move || done(Err(error)));
+            return;
+        }
+        let sn = Arc::clone(self);
+        self.common.queue_client_async(action, move |proposal| match proposal {
+            Ok(index) => sn.common.when_applied(index, move |result| {
+                workers.run(move || done(result));
+            }),
+            Err(error) => {
+                workers.run(move || {
+                    sn.cancel_ext_action(&key);
+                    done(Err(error));
+                });
+            }
+        });
+    }
+
     fn start_gc(self: &Arc<Self>) -> Result<()> {
         let mut slot = self.gc_thread.lock().expect("GC thread");
         if slot.is_some() {
@@ -1744,6 +1852,209 @@ impl SN {
             worker.join().map_err(|_| Error::new("SN GC thread panicked"))?;
         }
         Ok(())
+    }
+
+    fn delete_stream_async(self: &Arc<Self>, process: &Arc<Process>, request: &Req, done: Respond) {
+        let deletion =
+            match Delete::of_with_limit(request, process.cluster.max_soft_delete_retention_secs) {
+                Ok(deletion) => deletion,
+                Err(error) => return done.send(bad(error)),
+            };
+        let Target::Stream(name) = deletion.target else {
+            return done.send(bad("expected a stream"));
+        };
+        let waiter = DeleteWaiter { process: Arc::clone(process), deletion, done };
+        let first = {
+            let mut queue = self.delete_queue.lock().expect("delete queue");
+            if queue.active.insert(name) {
+                true
+            } else {
+                queue.waiting.entry(name).or_default().push_back(waiter.clone());
+                false
+            }
+        };
+        if first {
+            self.run_delete(name, waiter);
+        }
+    }
+
+    fn run_delete(self: &Arc<Self>, name: StreamName, waiter: DeleteWaiter) {
+        let DeleteWaiter { process, deletion, done } = waiter;
+        let pending = self.global_lock.read().pending_deletes.get(&name).cloned();
+        if let Some(pending) = pending {
+            let sn = Arc::clone(self);
+            let next = DeleteWaiter { process: Arc::clone(&process), deletion, done: done.clone() };
+            self.finish_delete_async(
+                process,
+                name,
+                pending,
+                Respond::new(move |answer| {
+                    if answer.status == Status::Ok {
+                        sn.run_delete(name, next);
+                    } else {
+                        sn.finish_delete_job(name, done, answer);
+                    }
+                }),
+            );
+            return;
+        }
+
+        let now = TimeSec::now();
+        {
+            let state = self.global_lock.read();
+            if state.retired_streams.contains(&name) {
+                return self.finish_delete_job(name, done, Resp::ok());
+            }
+            let Some(stream) = state.stream_map.get(&name) else {
+                return self.finish_delete_job(
+                    name,
+                    done,
+                    Resp::error(Status::NotFound, "no stream"),
+                );
+            };
+            if stream.deletion.retired() {
+                return self.finish_delete_job(name, done, Resp::ok());
+            }
+            if let Err(error) = check_delete(&state, name, deletion.retention, deletion.hard, now) {
+                return self.finish_delete_job(name, done, bad(error));
+            }
+        }
+
+        let cmd = DeleteCmd {
+            name,
+            retention: deletion.retention.map(TimeIntSec64::get),
+            hard: deletion.hard,
+            now,
+            maximum: process.cluster.max_soft_delete_retention_secs.get(),
+        };
+        let action = match sn_action(Op::SnDelete, &cmd) {
+            Ok(action) => action,
+            Err(error) => {
+                return self.finish_delete_job(
+                    name,
+                    done,
+                    Resp::error(Status::Internal, error.to_string()),
+                );
+            }
+        };
+        let sn = Arc::clone(self);
+        let workers = process.worker_queue();
+        self.submit_action(workers, action, move |applied| {
+            if let Err(error) = applied {
+                return sn.finish_delete_job(
+                    name,
+                    done,
+                    Resp::error(Status::Internal, error.to_string()),
+                );
+            }
+            let pending = sn.global_lock.read().pending_deletes.get(&name).cloned();
+            let Some(pending) = pending else {
+                return sn.finish_delete_job(
+                    name,
+                    done,
+                    Resp::error(Status::Internal, "Raft applied deletion without an outbox"),
+                );
+            };
+            let completed_sn = Arc::clone(&sn);
+            sn.finish_delete_async(
+                process,
+                name,
+                pending,
+                Respond::new(move |answer| completed_sn.finish_delete_job(name, done, answer)),
+            );
+        });
+    }
+
+    fn finish_delete_job(self: &Arc<Self>, name: StreamName, done: Respond, answer: Resp) {
+        done.send(answer);
+        let next = {
+            let mut queue = self.delete_queue.lock().expect("delete queue");
+            let next = queue.waiting.get_mut(&name).and_then(VecDeque::pop_front);
+            if queue.waiting.get(&name).is_some_and(VecDeque::is_empty) {
+                queue.waiting.remove(&name);
+            }
+            if next.is_none() {
+                queue.active.remove(&name);
+            }
+            next
+        };
+        if let Some(next) = next {
+            self.run_delete(name, next);
+        }
+    }
+
+    fn finish_delete_async(
+        self: &Arc<Self>,
+        process: Arc<Process>,
+        name: StreamName,
+        pending: PendingDelete,
+        done: Respond,
+    ) {
+        let mut requests = Vec::new();
+        for task in pending.tasks {
+            for disk in task.disks {
+                let (en, disk) = self.disk_at(disk);
+                let target = Target::Instance {
+                    en,
+                    disk,
+                    sn: self.mine,
+                    extent: task.id,
+                    created: task.created,
+                };
+                let soft =
+                    Delete { target: target.clone(), retention: Some(task.interval), hard: false };
+                match soft.request() {
+                    Ok(request) => requests.push((format!("EN{en}"), request)),
+                    Err(error) => return done.send(bad(error)),
+                }
+                if task.hard {
+                    match (Delete { target, retention: None, hard: true }).request() {
+                        Ok(request) => requests.push((format!("EN{en}"), request)),
+                        Err(error) => return done.send(bad(error)),
+                    }
+                }
+            }
+        }
+        self.delete_request_next(process, name, requests, 0, done);
+    }
+
+    fn delete_request_next(
+        self: &Arc<Self>,
+        process: Arc<Process>,
+        name: StreamName,
+        requests: Vec<(String, Req)>,
+        at: usize,
+        done: Respond,
+    ) {
+        let Some((identity, request)) = requests.get(at).cloned() else {
+            let action =
+                match sn_action(Op::SnDeleteDone, &DeleteDoneCmd { name, now: TimeSec::now() }) {
+                    Ok(action) => action,
+                    Err(error) => {
+                        return done.send(Resp::error(Status::Internal, error.to_string()));
+                    }
+                };
+            let workers = process.worker_queue();
+            self.submit_action(workers, action, move |result| match result {
+                Ok(()) => done.send(Resp::ok()),
+                Err(error) => done.send(Resp::error(Status::Internal, error.to_string())),
+            });
+            return;
+        };
+        let sn = Arc::clone(self);
+        let next_process = Arc::clone(&process);
+        let failed = done.clone();
+        if let Err(error) = process.ask(&identity, &request, move |answer| {
+            let continuation_process = Arc::clone(&next_process);
+            continuation_process.run(move || {
+                if answer.status != Status::Ok {
+                    return done.send(answer);
+                }
+                sn.delete_request_next(next_process, name, requests, at + 1, done);
+            });
+        }) {
+            failed.send(Resp::error(Status::Internal, error.to_string()));
+        }
     }
 
     fn delete_stream(&self, process: &Process, request: &Req) -> Resp {
@@ -1927,6 +2238,7 @@ impl SN {
             common: raft::runtime::Runtime::with_state(runtime, node, options, state),
             config,
             deleting: Mutex::new(()),
+            delete_queue: Mutex::new(DeleteQueue::default()),
             pending_extents: Mutex::new(HashMap::new()),
             per_stream,
             mine,
@@ -2050,10 +2362,118 @@ impl SN {
         }
     }
 
+    /// Create streams without holding a server worker across Raft persistence or
+    /// application. The completion callback runs after the action is applied.
+    fn create_async(self: &Arc<Self>, workers: server::WorkerQueue, request: &Req, reply: Respond) {
+        let (mut payload, rest) =
+            match structure(&request.args(), Op::CreateStream, "a create-stream request") {
+                Ok(value) => value,
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            };
+        if !rest.is_empty() {
+            return reply.send(Resp::error(
+                Status::BadRequest,
+                "a create-stream request has trailing arguments",
+            ));
+        }
+        let count = match payload.number_u64() {
+            Ok(value) => value,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        let names = match read_names(&mut payload, count) {
+            Ok(names) => names,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        if let Err(e) = payload.done() {
+            return reply.send(Resp::error(Status::BadRequest, e.to_string()));
+        }
+        if names.is_empty() {
+            return reply.send(Resp::ok());
+        }
+
+        let serial = self.deleting.lock().expect("deletion");
+        {
+            let state = self.global_lock.read();
+            let mut missing = false;
+            for name in &names {
+                if state.retired_streams.contains(name) {
+                    return reply.send(bad("stream identity has been retired"));
+                }
+                match state.stream_map.get(name) {
+                    Some(stream) if !stream.deletion.readable(false) => {
+                        return reply.send(bad("stream is deleted"));
+                    }
+                    Some(_) => {}
+                    None => missing = true,
+                }
+            }
+            if !missing {
+                return reply.send(Resp::ok());
+            }
+        }
+        let action = match sn_action(Op::SnCreate, &CreateCmd { names, creator: self.mine }) {
+            Ok(action) => action,
+            Err(error) => return reply.send(Resp::error(Status::Internal, error.to_string())),
+        };
+        let sn = Arc::clone(self);
+        self.common.queue_client_async(action, move |proposal| match proposal {
+            Ok(index) => sn.common.when_applied(index, move |applied| {
+                workers.run(move || match applied {
+                    Ok(()) => reply.send(Resp::ok()),
+                    Err(error) => {
+                        common::logn!("SN create did not apply", "index {},error {}", index, error);
+                        reply.send(Resp::error(Status::Internal, error.to_string()));
+                    }
+                });
+            }),
+            Err(error) => {
+                workers.run(move || {
+                    common::logn!("SN create proposal failed", "error {}", error);
+                    reply.send(Resp::error(Status::Internal, error.to_string()));
+                });
+            }
+        });
+        drop(serial);
+    }
+
     /// Copy two sealed streams' extent references into an already-created destination
     /// stream. The destination remains open, so a caller can append after the copied
     /// data. Extents themselves are immutable references here; no EN data is copied.
     fn concat_streams(&self, request: &Req) -> Resp {
+        self.concat_streams_with(request, |action| match self.commit_action(action) {
+            Ok(_) => Resp::ok(),
+            Err(error) => Resp::error(Status::Internal, error.to_string()),
+        })
+    }
+
+    fn concat_streams_async(
+        self: &Arc<Self>,
+        workers: server::WorkerQueue,
+        request: &Req,
+        reply: Respond,
+    ) {
+        let sn = Arc::clone(self);
+        let mut reply = Some(reply);
+        let mut queued = false;
+        let answer = self.concat_streams_with(request, |action| {
+            queued = true;
+            let reply = reply.take().expect("concat reply");
+            sn.submit_action(workers, action, move |result| match result {
+                Ok(()) => reply.send(Resp::ok()),
+                Err(error) => reply.send(Resp::error(Status::Internal, error.to_string())),
+            });
+            Resp::ok()
+        });
+        if !queued {
+            reply.expect("unanswered concat reply").send(answer);
+        }
+    }
+
+    fn concat_streams_with(
+        &self,
+        request: &Req,
+        finish: impl FnOnce(raft::Action) -> Resp,
+    ) -> Resp {
         let (mut payload, rest) =
             match structure(&request.args(), Op::ConcatStreams, "a concat-streams request") {
                 Ok(value) => value,
@@ -2215,10 +2635,7 @@ impl SN {
             Ok(action) => action,
             Err(error) => return Resp::error(Status::Internal, error.to_string()),
         };
-        match self.commit_action(action) {
-            Ok(_) => Resp::ok(),
-            Err(error) => Resp::error(Status::Internal, error.to_string()),
-        }
+        finish(action)
     }
 
     /// A stream's name, and back comes the extent to append to.
@@ -2235,6 +2652,7 @@ impl SN {
     }
 
     fn open_to(&self, process: &Process, request: &Req, waiter: OpenWaiter) {
+        let workers = process.worker_queue();
         let (mut payload, rest) =
             match structure(&request.args(), Op::OpenExtent, "an open-extent request") {
                 Ok(value) => value,
@@ -2367,7 +2785,14 @@ impl SN {
                 return;
             }
         };
-        if let Err(error) = self.commit_ext_action(action, id) {
+        if let Some(sn) = self.service_arc() {
+            let on_done = Arc::clone(&sn);
+            sn.submit_ext_action(workers, action, id, move |result| {
+                if let Err(error) = result {
+                    on_done.fail_open(name, Resp::error(Status::Internal, error.to_string()));
+                }
+            });
+        } else if let Err(error) = self.commit_ext_action(action, id) {
             self.fail_open(name, Resp::error(Status::Internal, error.to_string()));
         }
     }
@@ -2632,6 +3057,49 @@ impl SN {
     }
 
     fn seal(&self, process: &Process, request: &Req) -> Resp {
+        self.seal_with(process, request, |action, next_id, name, first, next_error| {
+            let result = match next_id {
+                Some(id) => self.commit_ext_action(action, id),
+                None => self.commit_action(action),
+            };
+            if let Err(error) = result {
+                return Resp::error(Status::Internal, error.to_string());
+            }
+            self.seal_result(name, first, next_error)
+        })
+    }
+
+    fn seal_async(self: &Arc<Self>, process: &Process, request: &Req, reply: Respond) {
+        let sn = Arc::clone(self);
+        let workers = process.worker_queue();
+        let mut reply = Some(reply);
+        let mut queued = false;
+        let answer =
+            self.seal_with(process, request, |action, next_id, name, first, next_error| {
+                queued = true;
+                let reply = reply.take().expect("seal-extent reply");
+                let result_sn = Arc::clone(&sn);
+                let done = move |result: Result<()>| match result {
+                    Ok(()) => reply.send(result_sn.seal_result(name, first, next_error)),
+                    Err(error) => reply.send(Resp::error(Status::Internal, error.to_string())),
+                };
+                match next_id {
+                    Some(id) => sn.submit_ext_action(workers, action, id, done),
+                    None => sn.submit_action(workers, action, done),
+                }
+                Resp::ok()
+            });
+        if !queued {
+            reply.expect("unanswered seal-extent reply").send(answer);
+        }
+    }
+
+    fn seal_with(
+        &self,
+        process: &Process,
+        request: &Req,
+        finish: impl FnOnce(raft::Action, Option<ExtentId>, StreamName, SRoff, Option<String>) -> Resp,
+    ) -> Resp {
         let (mut payload, rest) =
             match structure(&request.args(), Op::SealExtent, "a seal-extent request") {
                 Ok(value) => value,
@@ -2724,14 +3192,10 @@ impl SN {
                 return Resp::error(Status::Internal, error.to_string());
             }
         };
-        let result = match next_id {
-            Some(id) => self.commit_ext_action(action, id),
-            None => self.commit_action(action),
-        };
-        if let Err(error) = result {
-            return Resp::error(Status::Internal, error.to_string());
-        }
+        finish(action, next_id, name, first, next_error)
+    }
 
+    fn seal_result(&self, name: StreamName, first: SRoff, next_error: Option<String>) -> Resp {
         let state = self.global_lock.read();
         let Some(stream) = state.stream_map.get(&name) else {
             return Resp::error(Status::Internal, "Raft removed stream while sealing extent");
@@ -2775,6 +3239,49 @@ impl SN {
     }
 
     fn seal_stream(&self, request: &Req) -> Resp {
+        self.seal_stream_with(request, |action, name| {
+            if let Err(error) = self.commit_action(action) {
+                return Resp::error(Status::Internal, error.to_string());
+            }
+            Resp::number(
+                Status::Ok,
+                self.global_lock.read().stream_map[&name].sealed_records.number(),
+            )
+        })
+    }
+
+    fn seal_stream_async(
+        self: &Arc<Self>,
+        workers: server::WorkerQueue,
+        request: &Req,
+        reply: Respond,
+    ) {
+        let sn = Arc::clone(self);
+        let mut reply = Some(reply);
+        let mut queued = false;
+        let answer = self.seal_stream_with(request, |action, name| {
+            queued = true;
+            let reply = reply.take().expect("seal-stream reply");
+            let result_sn = Arc::clone(&sn);
+            sn.submit_action(workers, action, move |result| match result {
+                Ok(()) => reply.send(Resp::number(
+                    Status::Ok,
+                    result_sn.global_lock.read().stream_map[&name].sealed_records.number(),
+                )),
+                Err(error) => reply.send(Resp::error(Status::Internal, error.to_string())),
+            });
+            Resp::ok()
+        });
+        if !queued {
+            reply.expect("unanswered seal-stream reply").send(answer);
+        }
+    }
+
+    fn seal_stream_with(
+        &self,
+        request: &Req,
+        finish: impl FnOnce(raft::Action, StreamName) -> Resp,
+    ) -> Resp {
         let (mut payload, rest) =
             match structure(&request.args(), Op::SealStream, "a seal-stream request") {
                 Ok(value) => value,
@@ -2807,10 +3314,7 @@ impl SN {
             Ok(action) => action,
             Err(error) => return Resp::error(Status::Internal, error.to_string()),
         };
-        if let Err(error) = self.commit_action(action) {
-            return Resp::error(Status::Internal, error.to_string());
-        }
-        Resp::number(Status::Ok, self.global_lock.read().stream_map[&name].sealed_records.number())
+        finish(action, name)
     }
 
     /// Seal the stream's open extent and name the next one, both under the shared
@@ -3021,6 +3525,33 @@ impl Host for SN {
 
     fn dispatch_forwarded(&self, process: &Process, request: &Req) -> Resp {
         self.answer_local(process, request)
+    }
+
+    fn dispatch_forwarded_async(
+        &self,
+        process: Arc<Process>,
+        request: Req,
+        done: Box<dyn FnOnce(Resp) + Send + 'static>,
+    ) {
+        let Some(sn) = self.service_arc() else {
+            return done(Resp::error(Status::Internal, "SN Raft host stopped"));
+        };
+        let done = Respond::new(done);
+        match request.op() {
+            Op::CreateStream => sn.create_async(process.worker_queue(), &request, done),
+            Op::SoftDeleteStream | Op::DeleteStream => {
+                sn.delete_stream_async(&process, &request, done)
+            }
+            Op::OpenExtent => sn.open_to(
+                &process,
+                &request,
+                OpenWaiter::Callback { workers: process.worker_queue(), done },
+            ),
+            Op::ConcatStreams => sn.concat_streams_async(process.worker_queue(), &request, done),
+            Op::SealStream => sn.seal_stream_async(process.worker_queue(), &request, done),
+            Op::SealExtent => sn.seal_async(&process, &request, done),
+            _ => done.send(sn.answer_local(&process, &request)),
+        }
     }
 
     fn forwardable(&self, op: Op) -> bool {

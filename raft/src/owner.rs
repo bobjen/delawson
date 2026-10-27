@@ -34,6 +34,26 @@ impl<T: Send + 'static> Owner<T> {
             self.initial.lock().map_err(|_| Error::new("Raft initialization poisoned"))?;
         f(initial.as_mut().ok_or_else(|| Error::new("Raft loop starting"))?)
     }
+    /// Queue work for the owner and report its result without making the caller wait.
+    pub fn call_async<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut T) -> Result<R> + Send + 'static,
+        done: impl FnOnce(Result<R>) + Send + 'static,
+    ) -> Result<()> {
+        if let Some(sender) = self.sender.get() {
+            sender
+                .send(Some(Box::new(move |state| done(f(state)))))
+                .map_err(|_| Error::new("Raft loop stopped"))?;
+            return Ok(());
+        }
+        let result = {
+            let mut initial =
+                self.initial.lock().map_err(|_| Error::new("Raft initialization poisoned"))?;
+            f(initial.as_mut().ok_or_else(|| Error::new("Raft loop starting"))?)
+        };
+        done(result);
+        Ok(())
+    }
     pub fn wake(&self) {
         if let Some(sender) = self.sender.get() {
             let _ = sender.send(None);

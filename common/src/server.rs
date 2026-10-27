@@ -87,6 +87,7 @@ pub struct Process {
     pub(crate) answered: AtomicU64,
     /// Connections that have moved from writing directly to a batching sender.
     pub(crate) senders: AtomicU64,
+    pub(crate) workers: OnceLock<WorkerQueue>,
 }
 
 /// What a machine type adds to the common lifecycle. A new type needs `serves`
@@ -230,7 +231,18 @@ impl Process {
             stopping: AtomicBool::new(false),
             answered: AtomicU64::new(0),
             senders: AtomicU64::new(0),
+            workers: OnceLock::new(),
         })
+    }
+
+    /// Queue dependent work on this process's request workers.
+    pub fn run(&self, job: impl FnOnce() + Send + 'static) {
+        self.worker_queue().run(job);
+    }
+
+    /// A cloneable handle for queueing a continuation after this request returns.
+    pub fn worker_queue(&self) -> WorkerQueue {
+        self.workers.get().cloned().unwrap_or_default()
     }
 
     pub fn identity(&self) -> &str {
@@ -414,6 +426,21 @@ struct Pool {
     jobs: Sender<Job>,
 }
 
+#[derive(Clone, Default)]
+pub struct WorkerQueue {
+    pool: std::sync::Weak<Pool>,
+}
+
+impl WorkerQueue {
+    pub fn run(&self, job: impl FnOnce() + Send + 'static) {
+        if let Some(pool) = self.pool.upgrade() {
+            pool.run(job);
+        } else {
+            job();
+        }
+    }
+}
+
 type Job = Box<dyn FnOnce() + Send>;
 
 impl Pool {
@@ -495,6 +522,10 @@ pub fn serve(process: Arc<Process>, service: Arc<impl Service>) -> Result<()> {
     let address = listener.local_addr()?;
     let workers = if service.workers() == 0 { cores() } else { service.workers() };
     let pool = Arc::new(Pool::new(workers));
+    process
+        .workers
+        .set(WorkerQueue { pool: Arc::downgrade(&pool) })
+        .map_err(|_| Error::new("process worker pool already started"))?;
     logn!("listening", "address {address} workers {workers}");
 
     // KS cannot register with itself, and needs no one's permission to serve.

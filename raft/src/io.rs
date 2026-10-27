@@ -55,6 +55,11 @@ struct PendingSync {
     ticket: u64,
     request: SyncRequest,
 }
+type FenceCallback = Box<dyn FnOnce(Result<()>) + Send + 'static>;
+struct FenceWaiter {
+    ticket: u64,
+    done: FenceCallback,
+}
 
 #[derive(Default)]
 struct Progress {
@@ -64,6 +69,7 @@ struct Progress {
     failed: Option<String>,
     tasks: VecDeque<Task>,
     syncs: VecDeque<PendingSync>,
+    fence_waiters: Vec<FenceWaiter>,
     running: usize,
     ordered_active: bool,
     shutdown: bool,
@@ -113,6 +119,50 @@ impl Fence {
         }
         Ok(progress.completed)
     }
+    /// Run `done` when this prefix is durable, without tying up a waiting thread.
+    pub fn then(self, done: impl FnOnce(Result<()>) + Send + 'static) {
+        let mut done: Option<FenceCallback> = Some(Box::new(done));
+        let ready = {
+            let mut progress = self.shared.progress.lock().expect("journal completion");
+            if let Some(error) = &progress.failed {
+                Some((done.take().expect("fence callback"), Err(Error::new(error))))
+            } else if progress.completed >= self.ticket {
+                Some((done.take().expect("fence callback"), Ok(())))
+            } else {
+                progress.fence_waiters.push(FenceWaiter {
+                    ticket: self.ticket,
+                    done: done.take().expect("fence callback"),
+                });
+                None
+            }
+        };
+        if let Some((done, result)) = ready {
+            run_fence_callback(done, result);
+        }
+    }
+}
+
+fn run_fence_callback(done: FenceCallback, result: Result<()>) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| done(result)));
+}
+
+fn take_fence_callbacks(progress: &mut Progress) -> Vec<(FenceCallback, Result<()>)> {
+    let failure = progress.failed.clone();
+    let mut ready = Vec::new();
+    let mut at = 0;
+    while at < progress.fence_waiters.len() {
+        let waiter = &progress.fence_waiters[at];
+        if let Some(error) = &failure {
+            let waiter = progress.fence_waiters.swap_remove(at);
+            ready.push((waiter.done, Err(Error::new(error))));
+        } else if waiter.ticket <= progress.completed {
+            let waiter = progress.fence_waiters.swap_remove(at);
+            ready.push((waiter.done, Ok(())));
+        } else {
+            at += 1;
+        }
+    }
+    ready
 }
 
 pub struct Read<T>(mpsc::Receiver<Result<T>>);
@@ -306,7 +356,11 @@ fn worker(shared: Arc<Shared>) {
                 progress.syncs.clear();
             }
         }
+        let callbacks = take_fence_callbacks(&mut progress);
         drop(progress);
+        for (done, result) in callbacks {
+            run_fence_callback(done, result);
+        }
         shared.wake.notify_all();
         (shared.wake_owner)();
     }
@@ -359,13 +413,19 @@ fn sync_worker(shared: Arc<Shared>) {
             }
             Ok(())
         });
-        if let Err(error) = result {
+        let callbacks = {
             let mut progress = shared.progress.lock().unwrap();
-            if progress.failed.is_none() {
-                progress.failed = Some(error.to_string());
+            if let Err(error) = result {
+                if progress.failed.is_none() {
+                    progress.failed = Some(error.to_string());
+                }
+                progress.tasks.clear();
+                progress.syncs.clear();
             }
-            progress.tasks.clear();
-            progress.syncs.clear();
+            take_fence_callbacks(&mut progress)
+        };
+        for (done, result) in callbacks {
+            run_fence_callback(done, result);
         }
         shared.wake.notify_all();
         (shared.wake_owner)();

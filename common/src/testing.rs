@@ -216,5 +216,6 @@ pub fn process() -> Arc<Process> {
         stopping: std::sync::atomic::AtomicBool::new(false),
         answered: std::sync::atomic::AtomicU64::new(0),
         senders: std::sync::atomic::AtomicU64::new(0),
+        workers: std::sync::OnceLock::new(),
     })
 }

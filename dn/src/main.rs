@@ -1144,6 +1144,22 @@ struct BatchCountGather {
     failed: Option<Resp>,
 }
 
+#[derive(Clone)]
+struct Respond(Arc<Mutex<Option<Box<dyn FnOnce(Resp) + Send + 'static>>>>);
+
+impl Respond {
+    fn new(done: impl FnOnce(Resp) + Send + 'static) -> Self {
+        Self(Arc::new(Mutex::new(Some(Box::new(done)))))
+    }
+
+    fn send(&self, response: Resp) {
+        let done = self.0.lock().expect("response callback").take();
+        if let Some(done) = done {
+            done(response);
+        }
+    }
+}
+
 struct DNState {
     object_table: ObjectTable,
     stream_table: StreamTable,
@@ -1294,13 +1310,21 @@ impl Service for DN {
 
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
         if request.op() == Op::Raft {
-            return reply.send(self.raft_rpc(process, &request));
+            return self
+                .raft_rpc_async(Arc::clone(process), request, move |answer| reply.send(answer));
         }
         if matches!(request.op(), Op::CreateObject | Op::BatchCreate) {
-            if let Some(answer) = self.forward(&request) {
-                return reply.send(answer);
-            }
-            return reply.send(self.create_request(process, &request));
+            let dn = Arc::clone(self);
+            let onward = Arc::clone(process);
+            let local = request.clone();
+            return self.forward_async(Arc::clone(process), &request, move |answer| match answer {
+                Some(answer) => reply.send(answer),
+                None => dn.create_request_async(
+                    &onward,
+                    &local,
+                    Respond::new(move |answer| reply.send(answer)),
+                ),
+            });
         }
         match request.op() {
             Op::SoftDeleteObject | Op::DeleteObject => {
@@ -1365,6 +1389,10 @@ impl Service for DN {
 }
 
 impl DN {
+    fn service_arc(&self) -> Option<Arc<Self>> {
+        self.common.host.get()?.upgrade()?.downcast::<DN>().ok()
+    }
+
     fn state_read(&self) -> parking_lot::RwLockReadGuard<'_, DNState> {
         self.common.global_lock.read()
     }
@@ -2136,6 +2164,246 @@ impl DN {
             Op::CreateObject => self.create_one(process, request),
             Op::BatchCreate => self.create_many(process, request),
             _ => Resp::error(Status::BadRequest, "not a create request"),
+        }
+    }
+
+    fn create_request_async(
+        self: &Arc<Self>,
+        process: &Arc<Process>,
+        request: &Req,
+        reply: Respond,
+    ) {
+        match request.op() {
+            Op::CreateObject => self.create_one_async(process, request, reply),
+            Op::BatchCreate => self.create_many_async(process, request, reply),
+            _ => reply.send(Resp::error(Status::BadRequest, "not a create request")),
+        }
+    }
+
+    fn create_one_async(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Respond) {
+        let (mut payload, rest) =
+            match structure(&request.args(), Op::CreateObject, "a create-object request") {
+                Ok(value) => value,
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            };
+        let wanted = match Wanted::read(&mut payload) {
+            Ok(wanted) => wanted,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        if let Err(e) = payload.text() {
+            return reply.send(Resp::error(Status::BadRequest, e.to_string()));
+        }
+        let has_expiry = match payload.flag() {
+            Ok(value) => value,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        if has_expiry {
+            if let Err(e) = payload.number_u64() {
+                return reply.send(Resp::error(Status::BadRequest, e.to_string()));
+            }
+        }
+        let flags = match AppendFlags::read(&mut payload) {
+            Ok(flags) => flags,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        if let Err(e) = payload.done() {
+            return reply.send(Resp::error(Status::BadRequest, e.to_string()));
+        }
+        if !rest.is_empty() {
+            return reply.send(Resp::error(
+                Status::BadRequest,
+                "a create-object request has trailing arguments",
+            ));
+        }
+        if let Err(answer) = validate_create_names(std::slice::from_ref(&wanted)) {
+            return reply.send(answer);
+        }
+        let name = wanted.name.clone();
+        self.record_async(
+            process,
+            vec![wanted],
+            flags,
+            Box::new(move |dn, _made| match dn.look(&name) {
+                Some(args) => Resp::from_args(Status::Ok, args).id(0),
+                None => Resp::error(Status::Internal, format!("{name} went missing")),
+            }),
+            reply,
+        );
+    }
+
+    fn create_many_async(self: &Arc<Self>, process: &Arc<Process>, request: &Req, reply: Respond) {
+        let (mut payload, rest) =
+            match structure(&request.args(), Op::BatchCreate, "a batch-create request") {
+                Ok(value) => value,
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            };
+        let count = match payload.number_u64() {
+            Ok(count) => count as usize,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        let mut wanted = match payload.checked_vec(count) {
+            Ok(wanted) => wanted,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        for _ in 0..count {
+            match Wanted::read(&mut payload) {
+                Ok(one) => wanted.push(one),
+                Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+            }
+        }
+        let flags = match AppendFlags::read(&mut payload) {
+            Ok(flags) => flags,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        if let Err(e) = payload.done() {
+            return reply.send(Resp::error(Status::BadRequest, e.to_string()));
+        }
+        if !rest.is_empty() {
+            return reply.send(Resp::error(
+                Status::BadRequest,
+                "a batch-create request has trailing arguments",
+            ));
+        }
+        if let Err(answer) = validate_create_names(&wanted) {
+            return reply.send(answer);
+        }
+        self.record_async(
+            process,
+            wanted,
+            flags,
+            Box::new(|_, made| Resp::number(Status::Ok, made)),
+            reply,
+        );
+    }
+
+    fn record_async(
+        self: &Arc<Self>,
+        process: &Arc<Process>,
+        wanted: Vec<Wanted>,
+        flags: AppendFlags,
+        say: Box<dyn FnOnce(&DN, u64) -> Resp + Send>,
+        reply: Respond,
+    ) {
+        if wanted.is_empty() {
+            return reply.send(say(self, 0));
+        }
+        let created = TimeSec::now();
+        let sn = match process.pick(ServiceKind::Sn) {
+            Ok(sn) => sn.to_string(),
+            Err(error) => return reply.send(Resp::error(Status::Internal, error.to_string())),
+        };
+        let sn_number =
+            SnId::new(process.cluster.service(&sn).map(|entry| entry.number()).unwrap_or(0));
+        let first_object =
+            match claim_ids(&self.next_object, wanted.len(), ObjectId::NONE.number(), "object") {
+                Ok(first) => first,
+                Err(error) => return reply.send(Resp::error(Status::Internal, error.to_string())),
+            };
+        let streams = match self.allocate_stream_ids(wanted.len()) {
+            Ok(streams) => streams,
+            Err(error) => return reply.send(Resp::error(Status::Internal, error.to_string())),
+        };
+        let rows: Vec<_> = wanted
+            .iter()
+            .zip(streams)
+            .enumerate()
+            .map(|(offset, (one, stream))| DnCreateRow {
+                name: one.name.clone(),
+                id: ObjectId::new((first_object + offset as u64) as u32),
+                keyed: one.keyed,
+                framing: one.framing,
+                created,
+                stream,
+                sn: sn_number,
+            })
+            .collect();
+        let action = match dn_action(&DnCreateCmd { rows: rows.clone(), flags }) {
+            Ok(action) => action,
+            Err(error) => return reply.send(Resp::error(Status::Internal, error.to_string())),
+        };
+        let dn = Arc::clone(self);
+        let process = Arc::clone(process);
+        let workers = process.worker_queue();
+        self.queue_client_async(action, move |proposal| match proposal {
+            Ok(index) => {
+                let applied_dn = Arc::clone(&dn);
+                dn.when_applied(index, move |applied| {
+                    workers.run(move || match applied {
+                        Err(error) => {
+                            logw!("DN create action did not finish", "error {error}");
+                            reply.send(Resp::error(Status::Internal, error.to_string()));
+                        }
+                        Ok(()) => {
+                            if let Some(answer) = applied_dn
+                                .create_rejects
+                                .lock()
+                                .expect("create rejects")
+                                .take(ObjectId::new(first_object as u32))
+                            {
+                                return reply.send(answer);
+                            }
+                            let (by_sn, made) = match applied_dn.create_targets(&wanted, &rows) {
+                                Ok(targets) => targets,
+                                Err(error) => {
+                                    return reply
+                                        .send(Resp::error(Status::Internal, error.to_string()));
+                                }
+                            };
+                            applied_dn.create_streams_next(
+                                process,
+                                by_sn.into_iter().collect(),
+                                0,
+                                made,
+                                say,
+                                reply,
+                            );
+                        }
+                    });
+                });
+            }
+            Err(error) => {
+                workers.run(move || reply.send(Resp::error(Status::Internal, error.to_string())))
+            }
+        });
+    }
+
+    fn create_streams_next(
+        self: &Arc<Self>,
+        process: Arc<Process>,
+        by_sn: Vec<(SnId, Vec<StreamName>)>,
+        at: usize,
+        made: u64,
+        say: Box<dyn FnOnce(&DN, u64) -> Resp + Send>,
+        reply: Respond,
+    ) {
+        let Some((sn_id, names)) = by_sn.get(at) else {
+            return reply.send(say(self, made));
+        };
+        let Some(identity) = process
+            .cluster
+            .services
+            .iter()
+            .find(|entry| entry.kind == ServiceKind::Sn && entry.number() == sn_id.number())
+            .map(|entry| entry.identity.clone())
+        else {
+            return reply.send(Resp::error(Status::Internal, format!("unknown SN {sn_id}")));
+        };
+        let request = create_streams(names);
+        let dn = Arc::clone(self);
+        let next_process = Arc::clone(&process);
+        let next_by_sn = by_sn;
+        let retry_reply = reply.clone();
+        if let Err(error) = process.ask(&identity, &request, move |answer| {
+            let continuation_process = Arc::clone(&next_process);
+            continuation_process.run(move || {
+                if answer.status != Status::Ok {
+                    reply.send(answer);
+                    return;
+                }
+                dn.create_streams_next(next_process, next_by_sn, at + 1, made, say, reply);
+            });
+        }) {
+            retry_reply.send(Resp::error(Status::Internal, error.to_string()));
         }
     }
 
@@ -3628,6 +3896,18 @@ impl Host for DN {
 
     fn dispatch_forwarded(&self, process: &Process, request: &Req) -> Resp {
         self.create_request(process, request)
+    }
+
+    fn dispatch_forwarded_async(
+        &self,
+        process: Arc<Process>,
+        request: Req,
+        done: Box<dyn FnOnce(Resp) + Send + 'static>,
+    ) {
+        let Some(dn) = self.service_arc() else {
+            return done(Resp::error(Status::Internal, "DN Raft host stopped"));
+        };
+        dn.create_request_async(&process, &request, Respond::new(done));
     }
 
     fn forwardable(&self, op: Op) -> bool {
