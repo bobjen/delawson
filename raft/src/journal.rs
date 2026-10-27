@@ -13,7 +13,9 @@ use std::io::IoSlice;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const MAGIC: &[u8; 8] = b"DLAWKR06";
 const CURRENT: &str = "current.log";
@@ -331,6 +333,45 @@ struct RecoveryPlan {
 struct Disk {
     ownership: Mutex<File>,
     file: Mutex<Arc<File>>,
+    process: String,
+    ring: String,
+    timing: IoTiming,
+}
+#[derive(Default)]
+struct IoTiming {
+    frames: AtomicU64,
+    write_ns: AtomicU64,
+    sync_ns: AtomicU64,
+    syncs: AtomicU64,
+}
+impl IoTiming {
+    fn record(&self, write_ns: u64, sync_ns: u64, batch_at: usize, process: &str, ring: &str) {
+        let write_total = self.write_ns.fetch_add(write_ns, Ordering::Relaxed) + write_ns;
+        let sync_total = if batch_at == 0 {
+            self.sync_ns.fetch_add(sync_ns, Ordering::Relaxed) + sync_ns
+        } else {
+            self.sync_ns.load(Ordering::Relaxed)
+        };
+        let syncs = if batch_at == 0 {
+            self.syncs.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            self.syncs.load(Ordering::Relaxed)
+        };
+        let frames = self.frames.fetch_add(1, Ordering::Relaxed) + 1;
+        if frames % 1000 == 0 {
+            common::logi!(
+                "Raft journal I/O timing",
+                "process {},ring {},frames {},syncs {},write_all_avg_us {:.1},sync_all_avg_us {:.1},frames_per_sync {:.2}",
+                process,
+                ring,
+                frames,
+                syncs,
+                write_total as f64 / frames as f64 / 1000.0,
+                sync_total as f64 / syncs.max(1) as f64 / 1000.0,
+                frames as f64 / syncs.max(1) as f64
+            );
+        }
+    }
 }
 impl Disk {
     fn current_file(&self) -> Result<Arc<File>> {
@@ -592,6 +633,8 @@ impl Journal {
             append_identity(&mut ownership, &local)?;
         }
         let active = active.ok_or_else(|| Error::new(format!("no active journal for {member}")))?;
+        let disk_process = local.process.clone();
+        let disk_ring = local.ring.clone();
         let current_bytes = active.metadata()?.len();
         let mut result = Self {
             identity: local,
@@ -602,6 +645,9 @@ impl Journal {
             disk: Arc::new(Disk {
                 ownership: Mutex::new(ownership),
                 file: Mutex::new(Arc::new(active)),
+                process: disk_process,
+                ring: disk_ring,
+                timing: IoTiming::default(),
             }),
             io: None,
             pending_io: VecDeque::new(),
@@ -699,6 +745,24 @@ impl Journal {
         }
         result
     }
+    fn perform_sync(
+        &mut self,
+        kind: crate::io::Kind,
+        job: impl FnOnce(Arc<Disk>) -> Result<crate::io::SyncRequest> + Send + 'static,
+    ) -> Result<()> {
+        self.poll_io()?;
+        let disk = self.disk.clone();
+        let task = move || job(disk);
+        let result = if let Some(io) = &mut self.io {
+            io.submit_sync_kind(kind, task).map(|_| ())
+        } else {
+            task().and_then(crate::io::SyncRequest::run)
+        };
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
     fn append_frame(
         &mut self,
         frame: JournalFrame,
@@ -708,16 +772,21 @@ impl Journal {
     ) -> Result<()> {
         let kind =
             if identity.is_some() { crate::io::Kind::Identity } else { crate::io::Kind::Parallel };
-        self.perform(kind, move |disk| {
+        self.perform_sync(kind, move |disk| {
             let file = disk.current_file()?;
+            let write_start = Instant::now();
             frame.write_at(&file, offset)?;
+            let write_ns = write_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             mark_records(&records, false);
-            file.sync_all()?;
-            if let Some(identity) = identity {
-                let mut ownership = disk.lock_ownership()?;
-                append_identity(&mut ownership, &identity)?;
-            }
-            Ok(())
+            let disk = disk.clone();
+            Ok(crate::io::SyncRequest::new(file, move |sync_ns, batch_at| {
+                disk.timing.record(write_ns, sync_ns, batch_at, &disk.process, &disk.ring);
+                if let Some(identity) = identity {
+                    let mut ownership = disk.lock_ownership()?;
+                    append_identity(&mut ownership, &identity)?;
+                }
+                Ok(())
+            }))
         })
     }
     fn history(&self) -> History {

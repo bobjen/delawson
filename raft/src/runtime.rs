@@ -7,7 +7,7 @@ use common::Arg;
 use common::config::{Messaging, RaftConfig};
 use common::server::{self, Process};
 use common::time::TimeSec;
-use common::{Context, logn};
+use common::{Context, logi, logn};
 use common::{Error, Result};
 use common::{MessagePayload, Op, Req, Resp, Status, structure};
 use parking_lot::{Condvar, Mutex as ParkMutex, RwLock, RwLockReadGuard};
@@ -25,6 +25,10 @@ pub struct Options {
 }
 const CLIENT_BATCH: usize = 128;
 const CLIENT_INTERVAL: Duration = Duration::ZERO;
+const CLIENT_BYTES: usize = 64 * 1024;
+// Fixed framing for an encoded Raft Entry containing a Client action list.
+const CLIENT_ENTRY_BYTES: usize = 39;
+const CLIENT_ACTION_BYTES: usize = 6;
 // Applied progress wakes waiters; this only rechecks leadership and failures.
 const APPLY_TICK: Duration = Duration::from_millis(100);
 struct ApplyWatch {
@@ -189,6 +193,7 @@ pub struct Runtime<S> {
     pub readiness_requests: Mutex<BTreeSet<MemberId>>,
     pub proposing: Mutex<()>,
     client_proposals: Mutex<Vec<ClientProposal>>,
+    client_changed: std::sync::Condvar,
     client_last_send: Mutex<Option<Instant>>,
     pub raft_workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     peer_threads: Mutex<BTreeMap<MemberId, std::thread::Thread>>,
@@ -263,6 +268,7 @@ impl<S> Runtime<S> {
             readiness_requests: Mutex::new(BTreeSet::new()),
             proposing: Mutex::new(()),
             client_proposals: Mutex::new(Vec::new()),
+            client_changed: std::sync::Condvar::new(),
             client_last_send: Mutex::new(None),
             raft_workers: Mutex::new(vec![]),
             peer_threads: Mutex::new(BTreeMap::new()),
@@ -298,8 +304,7 @@ impl<S> Runtime<S> {
     pub fn metadata_applied(&self) -> u64 {
         self.metadata_applied.load(Ordering::Acquire)
     }
-    /// Queue one action for the leader. The first queued action wakes raft-main;
-    /// actions gathered before the next 10 ms send slot share one log entry.
+    /// Queue one leader action; proposals join until the time or size cutoff.
     pub fn queue_client(&self, action: Action) -> Result<ClientTicket> {
         let (reply, receive) = std::sync::mpsc::sync_channel(1);
         if self.host.get().is_none() {
@@ -320,6 +325,7 @@ impl<S> Runtime<S> {
             pending.push(ClientProposal { action, reply });
             wake
         };
+        self.client_changed.notify_one();
         if wake {
             self.journal.wake();
         }
@@ -329,31 +335,37 @@ impl<S> Runtime<S> {
         self.queue_client(action)?.wait()
     }
     fn flush_client_proposals(&self, node: &mut Node) -> Result<()> {
-        if self
+        let mut queue = self
             .client_proposals
             .lock()
-            .map_err(|_| Error::new("client proposal queue poisoned"))?
-            .is_empty()
-        {
-            return Ok(());
-        }
-        if !node.has_entry_room() {
-            return Ok(());
-        }
-        let delay = client_delay(
-            *self.client_last_send.lock().map_err(|_| Error::new("client send time poisoned"))?,
-            Instant::now(),
-        );
-        if !delay.is_zero() {
-            std::thread::sleep(delay);
-        }
-        let pending = {
-            let mut queue = self
-                .client_proposals
+            .map_err(|_| Error::new("client proposal queue poisoned"))?;
+        let trigger = loop {
+            if queue.is_empty() || !node.has_entry_room() {
+                return Ok(());
+            }
+            let (_, bytes) = client_batch_shape(&queue, CLIENT_BATCH, CLIENT_BYTES);
+            let size_due = bytes > CLIENT_BYTES;
+            let last_send = *self
+                .client_last_send
                 .lock()
-                .map_err(|_| Error::new("client proposal queue poisoned"))?;
-            take_client_batch(&mut queue)
+                .map_err(|_| Error::new("client send time poisoned"))?;
+            let delay = if size_due {
+                Duration::ZERO
+            } else {
+                client_delay(last_send, Instant::now(), CLIENT_INTERVAL)
+            };
+            if delay.is_zero() {
+                break if size_due { "size" } else { "time" };
+            }
+            queue = self
+                .client_changed
+                .wait_timeout(queue, delay)
+                .map_err(|_| Error::new("client proposal queue poisoned"))?
+                .0;
         };
+        let (_, bytes) = client_batch_shape(&queue, CLIENT_BATCH, CLIENT_BYTES);
+        let pending = take_client_batch(&mut queue, CLIENT_BATCH, CLIENT_BYTES);
+        drop(queue);
         if pending.is_empty() {
             return Ok(());
         }
@@ -363,6 +375,14 @@ impl<S> Runtime<S> {
             actions.push(proposal.action);
             replies.push(proposal.reply);
         }
+        logi!(
+            "Raft client batch",
+            "member {},count {},bytes {},trigger {}",
+            node.id,
+            actions.len(),
+            bytes,
+            trigger
+        );
         let result = node.propose(Command::Client(actions));
         match result {
             Ok(index) => {
@@ -409,13 +429,34 @@ impl<S> Runtime<S> {
         }
     }
 }
-fn take_client_batch(queue: &mut Vec<ClientProposal>) -> Vec<ClientProposal> {
-    let count = queue.len().min(CLIENT_BATCH);
+fn client_batch_shape(
+    queue: &[ClientProposal],
+    max_count: usize,
+    max_bytes: usize,
+) -> (usize, usize) {
+    let mut count = 0;
+    let mut bytes = CLIENT_ENTRY_BYTES;
+    for proposal in queue.iter().take(max_count) {
+        bytes =
+            bytes.saturating_add(CLIENT_ACTION_BYTES).saturating_add(proposal.action.fields.len());
+        count += 1;
+        if bytes > max_bytes {
+            break;
+        }
+    }
+    (count, bytes)
+}
+fn take_client_batch(
+    queue: &mut Vec<ClientProposal>,
+    max_count: usize,
+    max_bytes: usize,
+) -> Vec<ClientProposal> {
+    let (count, _) = client_batch_shape(queue, max_count, max_bytes);
     queue.drain(..count).collect()
 }
-fn client_delay(last_send: Option<Instant>, now: Instant) -> Duration {
+fn client_delay(last_send: Option<Instant>, now: Instant, interval: Duration) -> Duration {
     last_send
-        .map(|last_send| (last_send + CLIENT_INTERVAL).saturating_duration_since(now))
+        .map(|last_send| (last_send + interval).saturating_duration_since(now))
         .unwrap_or_default()
 }
 
@@ -3057,12 +3098,12 @@ mod tests {
             queue.push(ClientProposal { action, reply });
         }
 
-        let first = take_client_batch(&mut queue);
+        let first = take_client_batch(&mut queue, CLIENT_BATCH, CLIENT_BYTES);
         assert_eq!(first.len(), CLIENT_BATCH);
         for (proposal, action) in first.iter().zip(&expected) {
             assert_eq!(&proposal.action, action);
         }
-        let last = take_client_batch(&mut queue);
+        let last = take_client_batch(&mut queue, CLIENT_BATCH, CLIENT_BYTES);
         assert_eq!(last.len(), 2);
         for (proposal, action) in last.iter().zip(&expected[CLIENT_BATCH..]) {
             assert_eq!(&proposal.action, action);
@@ -3070,11 +3111,39 @@ mod tests {
         assert!(queue.is_empty());
     }
     #[test]
-    fn client_batch_has_no_wait_when_interval_is_zero() {
+    fn client_batch_waits_until_the_time_cutoff() {
         let now = Instant::now();
-        assert_eq!(client_delay(None, now), Duration::ZERO);
-        assert_eq!(client_delay(Some(now - CLIENT_INTERVAL), now), Duration::ZERO);
-        assert_eq!(client_delay(Some(now), now), Duration::ZERO);
+        let interval = Duration::from_millis(1);
+        assert_eq!(client_delay(None, now, interval), Duration::ZERO);
+        assert_eq!(client_delay(Some(now), now, interval), interval);
+        assert_eq!(client_delay(Some(now - interval), now, interval), Duration::ZERO);
+    }
+    #[test]
+    fn client_batch_stops_after_its_size_cutoff() {
+        let mut queue = Vec::new();
+        for fields in [vec![1; 4], vec![2; 8], vec![3; 1]] {
+            let (reply, _receive) = std::sync::mpsc::sync_channel(1);
+            queue.push(ClientProposal { action: Action::new(Op::Ping, fields), reply });
+        }
+        let limit = CLIENT_ENTRY_BYTES + CLIENT_ACTION_BYTES + 4 + 6;
+        let (count, bytes) = client_batch_shape(&queue, 10, limit);
+        assert_eq!(count, 2);
+        assert!(bytes > limit);
+
+        let actions = queue.iter().take(count).map(|p| p.action.clone()).collect();
+        let encoded = crate::codec::encode(&Entry {
+            scn: common::scn::Scn::new(1),
+            index: 1,
+            term: 1,
+            command: Command::Client(actions),
+            entry_buf: None,
+        })
+        .unwrap();
+        assert_eq!(bytes, encoded.len());
+
+        let batch = take_client_batch(&mut queue, 10, limit);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(queue.len(), 1);
     }
     #[test]
     fn retired_and_inactive_peers_do_not_receive_client_setup() {

@@ -2,10 +2,38 @@
 //! only allowed outside raft-main.
 use common::{Error, Result};
 use std::collections::{BTreeSet, VecDeque};
+use std::fs::File;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::time::Instant;
 
 const WORKERS: usize = 4;
-type Job = Box<dyn FnOnce() -> Result<()> + Send>;
+type Job = Box<dyn FnOnce() -> Result<Work> + Send>;
+
+type AfterSync = Box<dyn FnOnce(u64, usize) -> Result<()> + Send>;
+
+pub struct SyncRequest {
+    file: Arc<File>,
+    after: AfterSync,
+}
+impl SyncRequest {
+    pub fn new(
+        file: Arc<File>,
+        after: impl FnOnce(u64, usize) -> Result<()> + Send + 'static,
+    ) -> Self {
+        Self { file, after: Box::new(after) }
+    }
+    pub(crate) fn run(self) -> Result<()> {
+        let start = Instant::now();
+        self.file.sync_all()?;
+        let sync_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        (self.after)(sync_ns, 0)
+    }
+}
+
+enum Work {
+    Complete,
+    Sync(SyncRequest),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -23,6 +51,11 @@ struct Task {
     job: Job,
 }
 
+struct PendingSync {
+    ticket: u64,
+    request: SyncRequest,
+}
+
 #[derive(Default)]
 struct Progress {
     submitted: u64,
@@ -30,6 +63,7 @@ struct Progress {
     finished: BTreeSet<u64>,
     failed: Option<String>,
     tasks: VecDeque<Task>,
+    syncs: VecDeque<PendingSync>,
     running: usize,
     ordered_active: bool,
     shutdown: bool,
@@ -119,6 +153,18 @@ impl Queue {
                 }
             }
         }
+        let thread_shared = shared.clone();
+        match std::thread::Builder::new()
+            .name("raft-sync".into())
+            .spawn(move || sync_worker(thread_shared))
+        {
+            Ok(thread) => workers.push(thread),
+            Err(error) => {
+                shared.progress.lock().unwrap().shutdown = true;
+                shared.wake.notify_all();
+                return Err(error.into());
+            }
+        }
         Ok(Self { shared, _workers: workers })
     }
     pub fn submit(&mut self, job: impl FnOnce() -> Result<()> + Send + 'static) -> Result<u64> {
@@ -152,7 +198,36 @@ impl Queue {
         let ticket =
             progress.submitted.checked_add(1).ok_or_else(|| Error::new("I/O ticket overflow"))?;
         progress.submitted = ticket;
-        progress.tasks.push_back(Task { ticket, kind, job: Box::new(job) });
+        progress.tasks.push_back(Task {
+            ticket,
+            kind,
+            job: Box::new(move || job().map(|()| Work::Complete)),
+        });
+        drop(progress);
+        self.shared.wake.notify_all();
+        Ok(ticket)
+    }
+    pub fn submit_sync_kind(
+        &mut self,
+        kind: Kind,
+        job: impl FnOnce() -> Result<SyncRequest> + Send + 'static,
+    ) -> Result<u64> {
+        let mut progress =
+            self.shared.progress.lock().map_err(|_| Error::new("journal completion poisoned"))?;
+        if let Some(error) = &progress.failed {
+            return Err(Error::new(error));
+        }
+        if progress.shutdown {
+            return Err(Error::new("journal I/O queue stopped"));
+        }
+        let ticket =
+            progress.submitted.checked_add(1).ok_or_else(|| Error::new("I/O ticket overflow"))?;
+        progress.submitted = ticket;
+        progress.tasks.push_back(Task {
+            ticket,
+            kind,
+            job: Box::new(move || job().map(Work::Sync)),
+        });
         drop(progress);
         self.shared.wake.notify_all();
         Ok(ticket)
@@ -217,13 +292,10 @@ fn worker(shared: Arc<Shared>) {
             progress.ordered_active = false;
         }
         match result {
-            Ok(()) => {
-                progress.finished.insert(ticket);
-                while let Some(next) = progress.completed.checked_add(1) {
-                    if !progress.finished.remove(&next) {
-                        break;
-                    }
-                    progress.completed = next;
+            Ok(Work::Complete) => finish_ticket(&mut progress, ticket),
+            Ok(Work::Sync(request)) => {
+                if progress.failed.is_none() {
+                    progress.syncs.push_back(PendingSync { ticket, request });
                 }
             }
             Err(error) => {
@@ -231,11 +303,82 @@ fn worker(shared: Arc<Shared>) {
                     progress.failed = Some(error.to_string());
                 }
                 progress.tasks.clear();
+                progress.syncs.clear();
             }
         }
         drop(progress);
         shared.wake.notify_all();
         (shared.wake_owner)();
+    }
+}
+
+fn sync_worker(shared: Arc<Shared>) {
+    loop {
+        let (file, batch) = {
+            let mut progress = shared.progress.lock().unwrap();
+            loop {
+                if progress.failed.is_some() {
+                    return;
+                }
+                if let Some(first) = progress.syncs.pop_front() {
+                    let file = first.request.file.clone();
+                    let mut batch = vec![first];
+                    let mut remaining = VecDeque::new();
+                    while let Some(next) = progress.syncs.pop_front() {
+                        if Arc::ptr_eq(&file, &next.request.file) {
+                            batch.push(next);
+                        } else {
+                            remaining.push_back(next);
+                        }
+                    }
+                    progress.syncs = remaining;
+                    break (file, batch);
+                }
+                if progress.shutdown && progress.tasks.is_empty() && progress.running == 0 {
+                    return;
+                }
+                progress = shared.wake.wait(progress).unwrap();
+            }
+        };
+
+        let start = Instant::now();
+        let result = file.sync_all().map_err(Error::from);
+        let sync_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let count = batch.len();
+        let result = result.and_then(|()| {
+            let mut finished = Vec::with_capacity(count);
+            for (at, pending) in batch.into_iter().enumerate() {
+                let after = pending.request.after;
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| after(sync_ns, at)))
+                    .unwrap_or_else(|_| Err(Error::new("journal sync worker panicked")))?;
+                finished.push(pending.ticket);
+            }
+            let mut progress = shared.progress.lock().unwrap();
+            for ticket in finished {
+                finish_ticket(&mut progress, ticket);
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            let mut progress = shared.progress.lock().unwrap();
+            if progress.failed.is_none() {
+                progress.failed = Some(error.to_string());
+            }
+            progress.tasks.clear();
+            progress.syncs.clear();
+        }
+        shared.wake.notify_all();
+        (shared.wake_owner)();
+    }
+}
+
+fn finish_ticket(progress: &mut Progress, ticket: u64) {
+    progress.finished.insert(ticket);
+    while let Some(next) = progress.completed.checked_add(1) {
+        if !progress.finished.remove(&next) {
+            break;
+        }
+        progress.completed = next;
     }
 }
 
