@@ -78,6 +78,7 @@ struct Progress {
 struct Shared {
     progress: Mutex<Progress>,
     wake: Condvar,
+    sync_wake: Condvar,
     wake_owner: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -186,6 +187,7 @@ impl Queue {
         let shared = Arc::new(Shared {
             progress: Mutex::new(Progress::default()),
             wake: Condvar::new(),
+            sync_wake: Condvar::new(),
             wake_owner: Box::new(wake_owner),
         });
         let mut workers = Vec::with_capacity(WORKERS);
@@ -199,6 +201,7 @@ impl Queue {
                 Err(error) => {
                     shared.progress.lock().unwrap().shutdown = true;
                     shared.wake.notify_all();
+                    shared.sync_wake.notify_all();
                     return Err(error.into());
                 }
             }
@@ -212,6 +215,7 @@ impl Queue {
             Err(error) => {
                 shared.progress.lock().unwrap().shutdown = true;
                 shared.wake.notify_all();
+                shared.sync_wake.notify_all();
                 return Err(error.into());
             }
         }
@@ -307,6 +311,7 @@ impl Drop for Queue {
             progress.shutdown = true;
         }
         self.shared.wake.notify_all();
+        self.shared.sync_wake.notify_all();
     }
 }
 
@@ -338,6 +343,7 @@ fn worker(shared: Arc<Shared>) {
             .unwrap_or_else(|_| Err(Error::new("journal I/O worker panicked")));
         let mut progress = shared.progress.lock().unwrap();
         progress.running -= 1;
+        let mut wake_sync = false;
         if ordered {
             progress.ordered_active = false;
         }
@@ -345,6 +351,7 @@ fn worker(shared: Arc<Shared>) {
             Ok(Work::Complete) => finish_ticket(&mut progress, ticket),
             Ok(Work::Sync(request)) => {
                 if progress.failed.is_none() {
+                    wake_sync = progress.syncs.is_empty();
                     progress.syncs.push_back(PendingSync { ticket, request });
                 }
             }
@@ -354,14 +361,21 @@ fn worker(shared: Arc<Shared>) {
                 }
                 progress.tasks.clear();
                 progress.syncs.clear();
+                wake_sync = true;
             }
         }
+        wake_sync |= progress.shutdown
+            && progress.tasks.is_empty()
+            && progress.running == 0;
         let callbacks = take_fence_callbacks(&mut progress);
         drop(progress);
         for (done, result) in callbacks {
             run_fence_callback(done, result);
         }
         shared.wake.notify_all();
+        if wake_sync {
+            shared.sync_wake.notify_one();
+        }
         (shared.wake_owner)();
     }
 }
@@ -391,7 +405,7 @@ fn sync_worker(shared: Arc<Shared>) {
                 if progress.shutdown && progress.tasks.is_empty() && progress.running == 0 {
                     return;
                 }
-                progress = shared.wake.wait(progress).unwrap();
+                progress = shared.sync_wake.wait(progress).unwrap();
             }
         };
 
