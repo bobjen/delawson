@@ -253,6 +253,7 @@ impl Wire for crate::Entry {
 fn read_entry_command(r: &mut StructReader<'_>) -> Result<crate::Command> {
     r.nested_any(|op, r| match op {
         Op::RaftCommandNoop => Ok(crate::Command::Noop),
+        Op::RaftPrimary => Ok(crate::Command::Primary(Wire::read(r)?)),
         Op::RaftCommandClient => r.nested(Op::RaftList, "list", |r| {
             let count = r.number_u64()?;
             if count > (r.remaining() / 6) as u64 {

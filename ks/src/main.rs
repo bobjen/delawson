@@ -2,6 +2,8 @@
 use raft::runtime::Host;
 use raft::{journal, lease};
 mod runtime;
+#[allow(dead_code)] // Standalone codec; the runtime is not switched over yet.
+mod checkpoint;
 
 use common::config::KsConfig;
 use common::crypto;

@@ -15,6 +15,7 @@ delawson-raft.workspace = true
 delawson-common.workspace = true
 parking_lot.workspace = true
 aegis = "0.9.15"
+sha2 = "0.10.8"
 
 [dev-dependencies]
 delawson-raft = { workspace = true, features = ["testing"] }

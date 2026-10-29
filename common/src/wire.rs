@@ -318,6 +318,17 @@ ops! {
     SnDelete = 143, "sn-delete-action";
     SnDeleteDone = 144, "sn-delete-done-action";
     DnCreate = 145, "dn-create-action";
+    CheckpointEnd = 146, "checkpoint-end";
+    RaftPrimary = 147, "raft-primary";
+    KsCkFooter = 148, "ks-checkpoint-footer";
+    KsCkMark = 149, "ks-checkpoint-mark";
+    KsCkRange = 150, "ks-checkpoint-range";
+    KsCkPeers = 151, "ks-checkpoint-peers";
+    KsCkKeys = 152, "ks-checkpoint-keys";
+    KsCkSeal = 153, "ks-checkpoint-sealed";
+    KsCkEpoch = 154, "ks-checkpoint-epoch";
+    KsCkPeer = 155, "ks-checkpoint-peer";
+    KsCkKeyChunk = 156, "ks-checkpoint-key-chunk";
 }
 
 impl std::fmt::Display for Op {

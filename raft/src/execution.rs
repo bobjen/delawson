@@ -305,7 +305,10 @@ fn execute_with_lock<S: Application, T>(
                     }
                     cursor.decoded = None;
                 }
-                Command::Noop | Command::Members(_) | Command::CheckpointStart(_) => {}
+                Command::Noop
+                | Command::Primary(_)
+                | Command::Members(_)
+                | Command::CheckpointStart(_) => {}
             }
             if !restoring {
                 cursor.applied = entry.index;

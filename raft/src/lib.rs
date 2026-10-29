@@ -1,5 +1,6 @@
 //! Shared consensus, persistence, and application scheduling for ring services.
 pub mod application;
+pub mod checkpoint;
 pub mod codec;
 pub mod execution;
 pub mod journal;

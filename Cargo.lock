@@ -273,6 +273,7 @@ dependencies = [
  "delawson-common",
  "delawson-raft",
  "parking_lot",
+ "sha2",
  "tempfile",
 ]
 

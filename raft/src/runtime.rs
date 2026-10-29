@@ -3463,9 +3463,8 @@ mod tests {
         for number in 0..(CLIENT_BATCH + 2) {
             let fields = if number == 5 { vec![number as u8; 4096] } else { vec![number as u8] };
             let action = Action::new(Op::Ping, fields);
-            let (reply, _receive) = std::sync::mpsc::sync_channel(1);
             expected.push(action.clone());
-            queue.push(ClientProposal { action, reply });
+            queue.push(ClientProposal { action, reply: Box::new(|_| {}) });
         }
 
         let first = take_client_batch(&mut queue, CLIENT_BATCH, CLIENT_BYTES);
@@ -3492,8 +3491,10 @@ mod tests {
     fn client_batch_stops_after_its_size_cutoff() {
         let mut queue = Vec::new();
         for fields in [vec![1; 4], vec![2; 8], vec![3; 1]] {
-            let (reply, _receive) = std::sync::mpsc::sync_channel(1);
-            queue.push(ClientProposal { action: Action::new(Op::Ping, fields), reply });
+            queue.push(ClientProposal {
+                action: Action::new(Op::Ping, fields),
+                reply: Box::new(|_| {}),
+            });
         }
         let limit = CLIENT_ENTRY_BYTES + CLIENT_ACTION_BYTES + 4 + 6;
         let (count, bytes) = client_batch_shape(&queue, 10, limit);

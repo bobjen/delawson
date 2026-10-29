@@ -3,7 +3,7 @@ use crate::journal::Journal;
 use common::scn::Scn;
 use common::{Error, MessageBytes, Result};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Index;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -182,6 +182,8 @@ impl Retirement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Noop,
+    /// First entry of a term, identifying the elected primary.
+    Primary(MemberId),
     /// Opaque client actions. Only the owning service dispatches these tags.
     Client(Vec<crate::Action>),
     Members(Membership),
@@ -511,6 +513,8 @@ pub struct Snapshot {
     pub ring: String,
     pub index: u64,
     pub term: u64,
+    /// Primary associated with the term at this snapshot boundary.
+    pub primary: Option<MemberId>,
     pub membership: Membership,
     /// Committed client actions preserve their original index and term.
     pub application: Vec<Entry>,
@@ -657,6 +661,7 @@ impl State {
                 ring,
                 index: 0,
                 term: 0,
+                primary: None,
                 membership,
                 application: vec![],
                 checkpoint_start: None,
@@ -762,6 +767,7 @@ impl State {
                 Command::CheckpointStart(member) => {
                     snapshot.checkpoint_start = Some((e.index, member.clone()))
                 }
+                Command::Primary(member) => snapshot.primary = Some(*member),
                 Command::Noop => {}
             }
             snapshot.index = e.index;
@@ -1195,6 +1201,7 @@ struct EntryRing {
     first: u64,
     len: usize,
     previous: (u64, Scn),
+    primaries: VecDeque<(u64, MemberId)>,
 }
 impl EntryRing {
     fn from_state(state: &State, log2: u8) -> Result<Self> {
@@ -1204,8 +1211,14 @@ impl EntryRing {
         let mut slots = Vec::new();
         slots.try_reserve_exact(size).map_err(|_| Error::new("unable to reserve retained log"))?;
         slots.resize_with(size, || None);
-        let mut retained =
-            Self { slots, mask: size - 1, first: 0, len: 0, previous: (0, Scn::new(0)) };
+        let mut retained = Self {
+            slots,
+            mask: size - 1,
+            first: 0,
+            len: 0,
+            previous: (0, Scn::new(0)),
+            primaries: VecDeque::new(),
+        };
         retained.reset(state)?;
         Ok(retained)
     }
@@ -1249,7 +1262,40 @@ impl EntryRing {
         self.first = first;
         self.len = count;
         self.previous = previous;
+        self.primaries.clear();
+        if let Some(primary) = state.snapshot.primary {
+            self.add_primary(state.snapshot.term, primary)?;
+        }
+        let through = first + count as u64;
+        for entry in state.log.iter().take_while(|entry| entry.index < through) {
+            if let Command::Primary(primary) = entry.command {
+                self.add_primary(entry.term, primary)?;
+            }
+        }
         Ok(())
+    }
+    fn add_primary(&mut self, term: u64, primary: MemberId) -> Result<()> {
+        while self.primaries.back().is_some_and(|(t, _)| *t > term) {
+            self.primaries.pop_back();
+        }
+        if let Some((t, member)) = self.primaries.back() {
+            if *t == term {
+                return if *member == primary {
+                    Ok(())
+                } else {
+                    Err(Error::new("conflicting primary for term"))
+                };
+            }
+        }
+        let oldest = self.get(self.first).map_or(term, |entry| entry.term);
+        while self.primaries.front().is_some_and(|(t, _)| *t < oldest) {
+            self.primaries.pop_front();
+        }
+        self.primaries.push_back((term, primary));
+        Ok(())
+    }
+    fn primary_for(&self, term: u64) -> Option<MemberId> {
+        self.primaries.iter().find_map(|(t, member)| (*t == term).then_some(*member))
     }
     fn end(&self) -> u64 {
         self.first + self.len as u64
@@ -1300,6 +1346,9 @@ impl EntryRing {
     fn push(&mut self, entry: Arc<Entry>) -> Result<()> {
         if self.len == self.slots.len() || entry.index != self.end() {
             return Err(Error::new("retained log is full or nonsequential"));
+        }
+        if let Command::Primary(primary) = entry.command {
+            self.add_primary(entry.term, primary)?;
         }
         let at = entry.index as usize & self.mask;
         self.slots[at] = Some(entry);
@@ -1505,6 +1554,9 @@ impl<S: Storage> Node<S> {
     }
     pub fn shared_entry(&self, index: u64) -> Option<Arc<Entry>> {
         self.shared_entry_in(self.state(), index)
+    }
+    pub fn primary_for(&self, term: u64) -> Option<MemberId> {
+        self.retained.primary_for(term)
     }
     pub fn entry_capacity(&self) -> usize {
         self.retained.slots.len()
@@ -1868,6 +1920,14 @@ impl<S: Storage> Node<S> {
         if !self.write_authority()? {
             return Err(Error::new("Raft primary lease expired; retry after quorum heartbeat"));
         }
+        if self.state().term_at(self.state().last()) != Some(self.state().term) {
+            self.advance()?;
+            if self.role != Role::Leader
+                || self.state().term_at(self.state().last()) != Some(self.state().term)
+            {
+                return Err(Error::new("Raft primary entry is not ready"));
+            }
+        }
         if !self.has_entry_room() {
             return Err(Error::new("Raft retained history is full; waiting for apply"));
         }
@@ -1905,7 +1965,7 @@ impl<S: Storage> Node<S> {
                     scn,
                     index,
                     term: self.state().term,
-                    command: Command::Noop,
+                    command: Command::Primary(self.id),
                     entry_buf: None,
                 }],
             }])?;
@@ -2493,6 +2553,56 @@ pub mod tests {
         node.identity = Some(retired.member.identity.clone());
         node.clock = Some(std::time::Duration::ZERO);
         node
+    }
+    #[test]
+    fn retained_primary_survives_marker_eviction_and_rebuild() {
+        let mut state = State::initial("01".repeat(64), members(1), names()).unwrap();
+        state.apply(&Record::Hard { term: 1, vote: None, vote_scn: None }).unwrap();
+        let entries = (1..=3)
+            .map(|index| Entry {
+                scn: Scn::new(index),
+                index,
+                term: 1,
+                command: if index == 1 { Command::Primary(0) } else { Command::Noop },
+                entry_buf: None,
+            })
+            .collect();
+        state.apply(&Record::Entries { from: 1, entries }).unwrap();
+        state.apply(&Record::Commit(3)).unwrap();
+        let mut ring = EntryRing::from_state(&state, 1).unwrap();
+        assert_eq!(ring.first, 2);
+        assert_eq!(ring.primary_for(1), Some(0));
+        ring.evict();
+        ring.evict();
+        assert_eq!(ring.primary_for(1), Some(0));
+        ring.push(Arc::new(Entry {
+            scn: Scn::new(4),
+            index: 4,
+            term: 2,
+            command: Command::Primary(1),
+            entry_buf: None,
+        }))
+        .unwrap();
+        assert_eq!(ring.primary_for(1), None);
+        assert_eq!(ring.primary_for(2), Some(1));
+    }
+    #[test]
+    fn election_entry_records_primary_and_replicates() {
+        let mut nodes = cluster(3);
+        nodes[0].campaign().unwrap();
+        pair(&mut nodes, 0, 1);
+        pair(&mut nodes, 0, 1);
+        let entry = &nodes[0].state().log[0];
+        assert_eq!(entry.command, Command::Primary(0));
+        assert_eq!(nodes[1].state().log[0].command, Command::Primary(0));
+        let bytes = crate::codec::encode(entry).unwrap();
+        let decoded: Entry = crate::codec::decode(&bytes).unwrap();
+        assert_eq!(decoded.command, Command::Primary(0));
+        let snapshot = nodes[0].state().capture();
+        assert_eq!(snapshot.primary, Some(0));
+        let bytes = crate::codec::encode(&snapshot).unwrap();
+        let decoded: Snapshot = crate::codec::decode(&bytes).unwrap();
+        assert_eq!(decoded.primary, Some(0));
     }
     #[test]
     fn creator_scns_survive_replication_and_advance_the_next_primary() {
@@ -3899,7 +4009,7 @@ crate::wire_struct!(Membership, RaftMembership, {identities,old,new,retired});
 
 crate::wire_struct!(Retirement, RaftRetirement, {previous,old,next,member});
 
-crate::wire_struct!(Snapshot, RaftSnapshot, {ring,index,term,scn,membership,application,checkpoint_start});
+crate::wire_struct!(Snapshot, RaftSnapshot, {ring,index,term,scn,primary,membership,application,checkpoint_start});
 
 crate::wire_struct!(Answer, RaftAnswer, {term,success,matched});
 
@@ -3907,6 +4017,9 @@ impl crate::codec::Wire for Command {
     fn write(&self, w: &mut common::StructWriter) {
         match self {
             Self::Noop => w.nested(common::Op::RaftCommandNoop, |_| {}),
+            Self::Primary(value) => w.nested(common::Op::RaftPrimary, |w| {
+                value.write(w);
+            }),
             Self::Client(value) => w.nested(common::Op::RaftCommandClient, |w| {
                 value.write(w);
             }),
@@ -3922,6 +4035,7 @@ impl crate::codec::Wire for Command {
         use crate::codec::Wire;
         r.nested_any(|op, r| match op {
             common::Op::RaftCommandNoop => Ok(Self::Noop),
+            common::Op::RaftPrimary => Ok(Self::Primary(Wire::read(r)?)),
             common::Op::RaftCommandClient => Ok(Self::Client(Wire::read(r)?)),
             common::Op::RaftCommandMembers => Ok(Self::Members(Wire::read(r)?)),
             common::Op::RaftCommandCheckpointStart => Ok(Self::CheckpointStart(Wire::read(r)?)),
