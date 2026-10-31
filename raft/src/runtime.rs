@@ -2753,12 +2753,14 @@ pub trait Host:
                     new: None,
                 };
                 target.validate()?;
-                let index = node.propose(Command::Members(Membership {
+                let after = Membership {
                     retired: old.retired.clone(),
                     identities,
-                    old: old.old,
+                    old: old.old.clone(),
                     new: Some(members),
-                }))?;
+                };
+                let index =
+                    node.propose(Command::Members(crate::MemberChange { before: old, after }))?;
                 Ok((index, target))
             })?;
             let deadline = Instant::now()

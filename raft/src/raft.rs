@@ -32,6 +32,13 @@ pub struct Membership {
     pub new: Option<Members>,
     pub retired: BTreeMap<MemberId, Retirement>,
 }
+
+/// A configuration change, including the state needed to undo it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberChange {
+    pub before: Membership,
+    pub after: Membership,
+}
 impl Membership {
     pub fn members(&self) -> Members {
         let mut result = self.old.clone();
@@ -186,7 +193,7 @@ pub enum Command {
     Primary(MemberId),
     /// Opaque client actions. Only the owning service dispatches these tags.
     Client(Vec<crate::Action>),
-    Members(Membership),
+    Members(MemberChange),
     CheckpointStart(MemberId),
 }
 /// A single entry's encoded bytes, shared by journal I/O and apply work.
@@ -620,9 +627,10 @@ impl State {
                 return Err(Error::new("invalid persisted Raft log"));
             }
             if let Command::Members(m) = &entry.command {
-                m.validate()?;
-                m.extends(membership)?;
-                membership = m;
+                m.before.validate()?;
+                m.after.validate()?;
+                m.after.extends(membership)?;
+                membership = &m.after;
             }
             previous = entry.index;
             term = entry.term;
@@ -722,7 +730,7 @@ impl State {
             .log
             .member_at(None)
             .and_then(|e| match &e.command {
-                Command::Members(m) => Some(m.clone()),
+                Command::Members(m) => Some(m.after.clone()),
                 _ => None,
             })
             .unwrap_or_else(|| self.snapshot.membership.clone());
@@ -744,7 +752,7 @@ impl State {
         self.log
             .member_at(Some(self.commit))
             .and_then(|e| match &e.command {
-                Command::Members(m) => Some(m.clone()),
+                Command::Members(m) => Some(m.after.clone()),
                 _ => None,
             })
             .unwrap_or_else(|| self.snapshot.membership.clone())
@@ -763,7 +771,7 @@ impl State {
         for e in self.log.iter().take_while(|e| e.index <= self.commit) {
             match &e.command {
                 Command::Client(_) => snapshot.application.push(e.clone()),
-                Command::Members(m) => snapshot.membership = m.clone(),
+                Command::Members(m) => snapshot.membership = m.after.clone(),
                 Command::CheckpointStart(member) => {
                     snapshot.checkpoint_start = Some((e.index, member.clone()))
                 }
@@ -972,7 +980,8 @@ impl State {
                         return Err(Error::new("invalid Raft entry position or term"));
                     }
                     if let Command::Members(m) = &e.command {
-                        m.validate()?;
+                        m.before.validate()?;
+                        m.after.validate()?;
                     }
                     expected =
                         expected.checked_add(1).ok_or_else(|| Error::new("Raft index overflow"))?;
@@ -1730,7 +1739,8 @@ impl<S: Storage> Node<S> {
         }
         let new = old.replacements(&old.old);
         if new != old.old {
-            self.propose(Command::Members(Membership { new: Some(new), ..old }))?;
+            let after = Membership { new: Some(new), ..old.clone() };
+            self.propose(Command::Members(MemberChange { before: old, after }))?;
         }
         Ok(())
     }
@@ -2000,12 +2010,13 @@ impl<S: Storage> Node<S> {
             let new =
                 committed.new.clone().ok_or_else(|| Error::new("missing joint configuration"))?;
             if self.has_entry_room() {
-                self.propose(Command::Members(Membership {
+                let after = Membership {
                     retired: membership.retired.clone(),
                     identities: membership.identities.clone(),
                     old: new,
                     new: None,
-                }))?;
+                };
+                self.propose(Command::Members(MemberChange { before: committed, after }))?;
             }
         }
         let current = self.state().membership();
@@ -2463,7 +2474,10 @@ pub mod tests {
                 index,
                 term: 1,
                 command: match index {
-                    2 | 4 => Command::Members(membership.clone()),
+                    2 | 4 => Command::Members(MemberChange {
+                        before: membership.clone(),
+                        after: membership.clone(),
+                    }),
                     3 | 5 => Command::CheckpointStart(index),
                     _ => Command::Noop,
                 },
@@ -2482,13 +2496,55 @@ pub mod tests {
         assert_eq!(log.checkpoint_at(None), None);
 
         let mut second = log[0].clone();
-        second.command = Command::Members(membership);
+        second.command =
+            Command::Members(MemberChange { before: membership.clone(), after: membership });
         log.set(0, second);
         assert_eq!(log.member_at(None).unwrap().index, 1);
         let mut second = log[0].clone();
         second.command = Command::Noop;
         log.set(0, second);
         assert_eq!(log.member_at(None), None);
+    }
+    #[test]
+    fn membership_entries_keep_undo_state() {
+        let mut state = State::initial("01".repeat(64), members(3), names()).unwrap();
+        state.apply(&Record::Hard { term: 1, vote: None, vote_scn: None }).unwrap();
+        let initial = state.membership();
+        let mut joint = initial.clone();
+        joint.new = Some(BTreeSet::from([0, 2]));
+        let mut final_members = joint.clone();
+        final_members.old = joint.new.clone().unwrap();
+        final_members.new = None;
+        let changes = [
+            MemberChange { before: initial.clone(), after: joint.clone() },
+            MemberChange { before: joint.clone(), after: final_members.clone() },
+        ];
+        for (i, change) in changes.iter().enumerate() {
+            let index = i as u64 + 1;
+            let entry = Entry {
+                scn: Scn::new(index),
+                index,
+                term: 1,
+                command: Command::Members(change.clone()),
+                entry_buf: None,
+            };
+            let bytes = crate::codec::encode(&entry).unwrap();
+            let decoded: Entry = crate::codec::decode(&bytes).unwrap();
+            assert_eq!(decoded.command, entry.command);
+            let payload: common::MessagePayload = common::MessageBytes::from(bytes).into();
+            let decoded: Entry = crate::codec::decode_message(&payload).unwrap();
+            assert_eq!(decoded.command, entry.command);
+            state.apply(&Record::Entries { from: index, entries: vec![decoded] }).unwrap();
+        }
+        assert_eq!(state.membership(), final_members);
+        let mut roster = state.membership();
+        for entry in state.log.iter().rev() {
+            if let Command::Members(change) = &entry.command {
+                assert_eq!(roster, change.after);
+                roster = change.before.clone();
+            }
+        }
+        assert_eq!(roster, initial);
     }
     #[test]
     fn journal_batch_rolls_back_after_an_invalid_record() {
@@ -3220,7 +3276,10 @@ pub mod tests {
                     scn: common::scn::Scn::new(1),
                     index: 1,
                     term: 1,
-                    command: Command::Members(retired.clone()),
+                    command: Command::Members(MemberChange {
+                        before: original.membership(),
+                        after: retired.clone(),
+                    }),
                     entry_buf: None,
                 }],
             })
@@ -3237,7 +3296,10 @@ pub mod tests {
                 scn: common::scn::Scn::new(2),
                 index: 2,
                 term: 1,
-                command: Command::Members(rebound),
+                command: Command::Members(MemberChange {
+                    before: original.membership(),
+                    after: rebound,
+                }),
                 entry_buf: None,
             }],
         };
@@ -3558,12 +3620,16 @@ pub mod tests {
         pair(&mut nodes, 0, 1);
         let mut new = members(3);
         new.remove(&0);
+        let before = nodes[0].state().membership();
         nodes[0]
-            .propose(Command::Members(Membership {
-                retired: BTreeMap::new(),
-                identities: names(),
-                old: members(3),
-                new: Some(new.clone()),
+            .propose(Command::Members(MemberChange {
+                before,
+                after: Membership {
+                    retired: BTreeMap::new(),
+                    identities: names(),
+                    old: members(3),
+                    new: Some(new.clone()),
+                },
             }))
             .unwrap();
         for _ in 0..8 {
@@ -3812,12 +3878,16 @@ pub mod tests {
         pair(&mut nodes, 0, 1);
         pair(&mut nodes, 0, 1);
         let new = BTreeSet::from([0, 2]);
+        let before = nodes[0].state().membership();
         nodes[0]
-            .propose(Command::Members(Membership {
-                retired: BTreeMap::new(),
-                identities: names(),
-                old: members(3),
-                new: Some(new.clone()),
+            .propose(Command::Members(MemberChange {
+                before,
+                after: Membership {
+                    retired: BTreeMap::new(),
+                    identities: names(),
+                    old: members(3),
+                    new: Some(new.clone()),
+                },
             }))
             .unwrap();
         pair(&mut nodes, 0, 1);
@@ -4024,7 +4094,8 @@ impl crate::codec::Wire for Command {
                 value.write(w);
             }),
             Self::Members(value) => w.nested(common::Op::RaftCommandMembers, |w| {
-                value.write(w);
+                value.before.write(w);
+                value.after.write(w);
             }),
             Self::CheckpointStart(value) => w.nested(common::Op::RaftCommandCheckpointStart, |w| {
                 value.write(w);
@@ -4037,7 +4108,9 @@ impl crate::codec::Wire for Command {
             common::Op::RaftCommandNoop => Ok(Self::Noop),
             common::Op::RaftPrimary => Ok(Self::Primary(Wire::read(r)?)),
             common::Op::RaftCommandClient => Ok(Self::Client(Wire::read(r)?)),
-            common::Op::RaftCommandMembers => Ok(Self::Members(Wire::read(r)?)),
+            common::Op::RaftCommandMembers => {
+                Ok(Self::Members(MemberChange { before: Wire::read(r)?, after: Wire::read(r)? }))
+            }
             common::Op::RaftCommandCheckpointStart => Ok(Self::CheckpointStart(Wire::read(r)?)),
             _ => Err(common::Error::new("unexpected Command tag")),
         })

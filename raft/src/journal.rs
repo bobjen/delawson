@@ -2433,7 +2433,10 @@ mod tests {
                     scn: common::scn::Scn::new(1),
                     index: 1,
                     term: 1,
-                    command: Command::Members(membership),
+                    command: Command::Members(crate::MemberChange {
+                        before: recovered.state.membership(),
+                        after: membership,
+                    }),
                     entry_buf: None,
                 }],
             }])

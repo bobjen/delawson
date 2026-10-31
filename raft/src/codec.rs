@@ -264,7 +264,10 @@ fn read_entry_command(r: &mut StructReader<'_>) -> Result<crate::Command> {
             }
             Ok(crate::Command::Client(Vec::new()))
         }),
-        Op::RaftCommandMembers => Ok(crate::Command::Members(Wire::read(r)?)),
+        Op::RaftCommandMembers => Ok(crate::Command::Members(crate::MemberChange {
+            before: Wire::read(r)?,
+            after: Wire::read(r)?,
+        })),
         Op::RaftCommandCheckpointStart => Ok(crate::Command::CheckpointStart(Wire::read(r)?)),
         _ => Err(Error::new("unexpected Command tag")),
     })
