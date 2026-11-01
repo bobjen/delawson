@@ -329,6 +329,7 @@ ops! {
     KsCkEpoch = 154, "ks-checkpoint-epoch";
     KsCkPeer = 155, "ks-checkpoint-peer";
     KsCkKeyChunk = 156, "ks-checkpoint-key-chunk";
+    RaftRecordMaxScn = 157, "raft-record-max-scn";
 }
 
 impl std::fmt::Display for Op {

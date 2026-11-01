@@ -18,7 +18,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const MAGIC: &[u8; 8] = b"DLAWKR06";
-const CURRENT: &str = "current.log";
 const HEADER: u64 = 8 + 128 + 16 + 24;
 fn journal_header(ring: &str, start: u64) -> Vec<u8> {
     [MAGIC.as_slice(), ring.as_bytes(), &start.to_le_bytes(), &(!start).to_le_bytes(), &[0; 24]]
@@ -245,9 +244,10 @@ fn parse_scn_footer(bytes: &[u8]) -> Result<Option<Scn>> {
     }
     Ok((present == 1).then_some(Scn::new(value)))
 }
-/// Fast high-water lookup for a snapshot or CLOSED journal. current.log has no
-/// footer during normal operation and must be replayed. This validates the footer;
-/// callers must still validate the file's ring, contents and history before use.
+/// Fast high-water lookup for a snapshot or closed journal. The identity-selected
+/// latest journal has no footer during normal operation and must be replayed.
+/// This validates the footer; callers must still validate the file's ring,
+/// contents and history before use.
 pub fn file_scn(path: &Path) -> Result<Option<Scn>> {
     let mut file = File::open(path)?;
     file.seek(SeekFrom::End(-(SCN_FOOTER as i64)))?;
@@ -317,6 +317,8 @@ pub struct LocalIdentity {
     /// Kept until membership no longer needs their state-loss responses.
     pub retired: Vec<common::ring::MemberIdentity>,
     pub slot: Option<MemberId>,
+    /// Starting sequence of the last journal file created for this member.
+    latest_journal: u64,
     membership: Option<Membership>,
     founders: Option<Membership>,
     initialized: bool,
@@ -395,8 +397,8 @@ pub struct Journal {
     io: Option<crate::io::Queue>,
     durable: State,
     pending_io: VecDeque<(u64, DurableChange)>,
-    current_start: u64,
-    current_bytes: u64,
+    active_start: u64,
+    active_bytes: u64,
     sequence: u64,
     change_sequence: u64,
     snapshot_sequence: u64,
@@ -477,9 +479,7 @@ impl Journal {
         let saved_identity = read_identity(&mut ownership)?;
         let identity_missing = saved_identity.is_none();
         let snapshots = numbered(directory, "snapshot")?;
-        let segments = numbered(directory, "journal")?;
-        let current = directory.join(CURRENT);
-        let current_exists = current.try_exists()?;
+        let journals = numbered(directory, "journal")?;
         let mut local: LocalIdentity = if saved_identity.is_none() {
             let current = common::ring::MemberIdentity::generate()?;
             let local = LocalIdentity {
@@ -489,6 +489,7 @@ impl Journal {
                 current,
                 retired: vec![],
                 slot: None,
+                latest_journal: 0,
                 membership: None,
                 founders: None,
                 initialized: false,
@@ -529,13 +530,9 @@ impl Journal {
         let (mut state, mut sequence, second, snapshot_bytes) = if let Some(value) = chosen {
             value
         } else {
-            let first_journal = segments.first().map(|(sequence, _)| *sequence).or_else(|| {
-                File::open(&current).ok().and_then(|mut file| {
-                    check_journal_header(&mut file, &initial.ring, ignore).ok()
-                })
-            });
+            let first_journal = journals.first().map(|(sequence, _)| *sequence);
             if first_journal != Some(1)
-                && (local.initialized || !snapshots.is_empty() || !segments.is_empty())
+                && (local.initialized || !snapshots.is_empty() || !journals.is_empty())
             {
                 prepare_recovery(directory, &mut ownership, &mut local, initial.clone())?;
                 drop(ownership);
@@ -547,8 +544,11 @@ impl Journal {
                 state: initial.clone(),
             };
             let bytes = checkpoint.bytes()?;
-            if !current_exists {
-                publish(&current, &journal_header_after(&initial, 1))?;
+            if journals.is_empty() && local.latest_journal == 0 {
+                let first = named(directory, "journal", 1);
+                publish(&first, &journal_header_after(&initial, 1))?;
+                local.latest_journal = 1;
+                append_identity(&mut ownership, &local)?;
             }
             publish(&named(directory, "snapshot", 0), &bytes)?;
             (initial.clone(), 0, checkpoint.second, bytes.len() as u64)
@@ -556,7 +556,7 @@ impl Journal {
         // Files cannot establish ownership of a voting identity. Keep their committed
         // data only, then begin a fresh slotless applicant's local journal.
         if (identity_missing || !local.initialized)
-            && (!snapshots.is_empty() || !segments.is_empty() || current_exists)
+            && (!snapshots.is_empty() || !journals.is_empty())
         {
             prepare_recovery(directory, &mut ownership, &mut local, state)?;
             drop(ownership);
@@ -566,27 +566,26 @@ impl Journal {
         state.check_ring(&state.snapshot)?;
         state.validate()?;
         let snapshot_sequence = sequence;
-        let current_exists = current.try_exists()?;
-        let mut lost = !current_exists;
-        let current_start = if current_exists {
-            match check_journal_header(&mut File::open(&current)?, &state.ring, ignore) {
-                Ok(start) if start > snapshot_sequence => start,
+        let active_start = local.latest_journal;
+        let active_path = named(directory, "journal", active_start);
+        let active_exists = active_start != 0 && active_path.try_exists()?;
+        let mut all_journals = numbered(directory, "journal")?;
+        let last_start = all_journals.last().map(|(start, _)| *start);
+        let mut lost = !active_exists || last_start != Some(active_start);
+        if active_exists {
+            match check_journal_header(&mut File::open(&active_path)?, &state.ring, ignore) {
+                Ok(start) if start == active_start && start > snapshot_sequence => {}
                 _ => {
-                    quarantine(&current, "invalid current journal header or position")?;
+                    quarantine(&active_path, "invalid latest journal header or position")?;
                     lost = true;
-                    u64::MAX
+                    all_journals = numbered(directory, "journal")?;
                 }
             }
-        } else {
-            u64::MAX
-        };
-        let mut segments: Vec<_> = numbered(directory, "journal")?
-            .into_iter()
-            .filter(|(seq, _)| *seq > snapshot_sequence)
-            .collect();
-        if current.try_exists()? {
-            segments.push((current_start, current.clone()));
         }
+        let segments: Vec<_> = all_journals
+            .into_iter()
+            .filter(|(seq, _)| *seq > snapshot_sequence && *seq <= active_start)
+            .collect();
         let mut active = None;
         let mut log_bytes = 0;
         for (start, path) in &segments {
@@ -596,12 +595,12 @@ impl Journal {
                 lost = true;
                 break;
             }
-            let replay =
-                replay_segment(path, *start, &mut state, &mut sequence, path == &current, ignore);
+            let is_active = *start == active_start;
+            let replay = replay_segment(path, *start, &mut state, &mut sequence, is_active, ignore);
             match replay {
                 Ok((file, size)) => {
                     log_bytes += size;
-                    if path == &current {
+                    if is_active {
                         active = Some(file);
                     }
                 }
@@ -635,7 +634,7 @@ impl Journal {
         let active = active.ok_or_else(|| Error::new(format!("no active journal for {member}")))?;
         let disk_process = local.process.clone();
         let disk_ring = local.ring.clone();
-        let current_bytes = active.metadata()?.len();
+        let active_bytes = active.metadata()?.len();
         let mut result = Self {
             identity: local,
             durable: state.clone(),
@@ -651,8 +650,8 @@ impl Journal {
             }),
             io: None,
             pending_io: VecDeque::new(),
-            current_start,
-            current_bytes,
+            active_start,
+            active_bytes,
             sequence,
             change_sequence: sequence,
             snapshot_sequence,
@@ -793,7 +792,7 @@ impl Journal {
         History {
             state: self.state.clone(),
             directory: self.directory.clone(),
-            current_start: self.current_start,
+            active_start: self.active_start,
         }
     }
     pub(crate) fn read_history<R: Send + 'static>(
@@ -876,7 +875,8 @@ impl Journal {
         let directory = self.directory.clone();
         let mut identity = self.identity.clone();
         retire_identity(&mut identity, &mut state)?;
-        let accepted_identity = identity.clone();
+        let mut accepted_identity = identity.clone();
+        accepted_identity.latest_journal = 1;
         let checkpoint = Checkpoint {
             sequence: 0,
             second: common::time::TimeSec::now().number(),
@@ -888,12 +888,11 @@ impl Journal {
         self.perform(crate::io::Kind::Ordered, move |disk| {
             let name = format!("repair-{}.bin", common::ring::MemberIdentity::generate()?);
             publish(&directory.join(&name), &bytes)?;
-            let mut files: Vec<_> = numbered(&directory, "snapshot")?
+            let files: Vec<_> = numbered(&directory, "snapshot")?
                 .into_iter()
                 .chain(numbered(&directory, "journal")?)
                 .map(|(_, path)| path.file_name().unwrap().to_string_lossy().into_owned())
                 .collect();
-            files.push(CURRENT.into());
             identity.recovery =
                 Some(RecoveryPlan { archive: format!("rejected-{name}"), checkpoint: name, files });
             // The durable plan makes interrupted copying/renames restartable.
@@ -902,7 +901,7 @@ impl Journal {
             finish_recovery(&directory, &mut ownership, &mut identity)?;
             drop(ownership);
             disk.replace_file(
-                OpenOptions::new().read(true).write(true).open(directory.join(CURRENT))?,
+                OpenOptions::new().read(true).write(true).open(named(&directory, "journal", 1))?,
             )?;
             identity.repairing = false;
             let mut ownership = disk.lock_ownership()?;
@@ -912,13 +911,13 @@ impl Journal {
         self.identity = accepted_identity;
         self.identity.repairing = false;
         self.sequence = 0;
-        self.current_start = 1;
+        self.active_start = 1;
         self.change_sequence = 0;
         self.snapshot_sequence = 0;
         self.snapshot_second = second;
         self.snapshot_bytes = snapshot_bytes;
         self.log_bytes = HEADER;
-        self.current_bytes = HEADER;
+        self.active_bytes = HEADER;
         self.track_change(DurableChange::Replace(self.state.clone()))?;
         Ok(())
     }
@@ -958,6 +957,16 @@ impl Journal {
                 }
             }
         }
+        if let Some(from) = held.iter().find_map(|record| match record {
+            Record::Entries { from, entries }
+                if !entries.is_empty() && *from <= self.state.last() =>
+            {
+                Some(*from)
+            }
+            _ => None,
+        }) {
+            return self.replace_suffix(held, from);
+        }
         let sequence =
             self.sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
         let batch = Batch { sequence, records: held };
@@ -982,7 +991,7 @@ impl Journal {
             identity = Some(updated);
         }
         let write_identity = identity.clone();
-        let offset = self.current_bytes;
+        let offset = self.active_bytes;
         let next_offset =
             offset.checked_add(frame_len).ok_or_else(|| Error::new("journal offset overflow"))?;
         if let Err(error) =
@@ -991,7 +1000,7 @@ impl Journal {
             undo.rollback(&mut self.state);
             return Err(error);
         }
-        self.current_bytes = next_offset;
+        self.active_bytes = next_offset;
         self.sequence = sequence;
         self.change_sequence = sequence;
         self.log_bytes += frame_len;
@@ -999,6 +1008,120 @@ impl Journal {
             self.identity = identity;
         }
         self.track_change(DurableChange::Records(durable_records))?;
+        Ok(())
+    }
+    fn replace_suffix(&mut self, records: Vec<Record>, from: u64) -> Result<()> {
+        let directory = self.directory.clone();
+        let oldest = numbered(&directory, "snapshot")?
+            .first()
+            .map(|(sequence, _)| *sequence)
+            .ok_or_else(|| Error::new("missing checkpoint for journal suffix rewrite"))?;
+        let undo = self.state.apply_journal_batch(&records)?;
+        let maximum = self.state.largest_scn();
+        let watermark = maximum.map(Record::MaxScn).into_iter().collect::<Vec<_>>();
+        let watermark_undo = match self.state.apply_journal_batch(&watermark) {
+            Ok(undo) => undo,
+            Err(error) => {
+                undo.rollback(&mut self.state);
+                return Err(error);
+            }
+        };
+        let mut durable = records.clone();
+        durable.extend(watermark.iter().cloned());
+        let durable = Arc::new(durable);
+        let mut identity = None;
+        if durable.iter().any(|record| matches!(record, Record::Bootstrap(_) | Record::Install(_))
+            || matches!(record, Record::Entries { entries, .. } if entries.iter().any(|e| matches!(e.command, crate::raft::Command::Members(_))))) {
+            let mut updated = self.identity.clone();
+            let membership = self.state.membership();
+            let slot = membership.slot(&self.identity.current);
+            let accepted = slot.is_some_and(|id| membership.members().contains(&id))
+                && self.identity.pending.as_ref().is_none_or(|r| !membership.members().contains(&r.previous));
+            updated.slot = slot.or(updated.slot);
+            updated.membership = Some(membership);
+            updated.founders = self.state.founders.clone();
+            if accepted { updated.pending = None; }
+            identity = Some(updated);
+        }
+
+        let first = match self.sequence.checked_add(1) {
+            Some(sequence) => sequence,
+            None => {
+                watermark_undo.rollback(&mut self.state);
+                undo.rollback(&mut self.state);
+                return Err(Error::new("journal sequence overflow"));
+            }
+        };
+        let mut batches = vec![Batch { sequence: first, records }];
+        if let Some(record) = watermark.into_iter().next() {
+            let sequence = match first.checked_add(1) {
+                Some(sequence) => sequence,
+                None => {
+                    watermark_undo.rollback(&mut self.state);
+                    undo.rollback(&mut self.state);
+                    return Err(Error::new("journal sequence overflow"));
+                }
+            };
+            batches.push(Batch { sequence, records: vec![record] });
+        }
+        let ring = self.state.ring.clone();
+        let ignore = self.state.ignore_ring_identity;
+        let latest = self.snapshot_sequence;
+        let active_start = self.active_start;
+        let old_sequence = self.sequence;
+        let stats = Arc::new(Mutex::new(None));
+        let write_stats = stats.clone();
+        let rollback_identity = self.identity.clone();
+        let write_identity = identity.clone().unwrap_or_else(|| self.identity.clone());
+        let durable_write = durable.clone();
+        let result = self.perform(crate::io::Kind::Ordered, move |disk| {
+            let (active_bytes, log_bytes, final_sequence, active_start, identity) =
+                rewrite_journals(
+                    &directory,
+                    &ring,
+                    ignore,
+                    oldest,
+                    latest,
+                    active_start,
+                    old_sequence,
+                    from,
+                    batches,
+                    rollback_identity,
+                    write_identity,
+                    disk,
+                )?;
+            mark_records(durable_write.as_slice(), false);
+            *write_stats.lock().map_err(|_| Error::new("journal rewrite stats poisoned"))? =
+                Some((active_bytes, log_bytes, final_sequence, active_start, identity));
+            Ok(())
+        });
+        if let Err(error) = result {
+            watermark_undo.rollback(&mut self.state);
+            undo.rollback(&mut self.state);
+            return Err(error);
+        }
+        self.track_change(DurableChange::Records(durable.clone()))?;
+        if let Some(io) = &self.io {
+            if let Err(error) = io.fence().wait().and_then(|()| self.poll_io()) {
+                self.failed = true;
+                watermark_undo.rollback(&mut self.state);
+                undo.rollback(&mut self.state);
+                return Err(error);
+            }
+        }
+        let saved = stats.lock().map_err(|_| Error::new("journal rewrite stats poisoned"))?.clone();
+        let Some((active_bytes, log_bytes, sequence, active_start, identity)) = saved else {
+            self.failed = true;
+            watermark_undo.rollback(&mut self.state);
+            undo.rollback(&mut self.state);
+            return Err(Error::new("journal suffix rewrite did not complete"));
+        };
+        self.active_bytes = active_bytes;
+        self.active_start = active_start;
+        self.log_bytes = log_bytes;
+        self.sequence = sequence;
+        self.change_sequence = sequence;
+        self.identity = identity;
         Ok(())
     }
     pub fn snapshot_due(&self, min_bytes: u64, seconds: u64, now: u64) -> bool {
@@ -1114,37 +1237,47 @@ impl Journal {
         let mark = self.begin_checkpoint(&state, &snapshot)?;
         self.prepare_checkpoint(now, state, mark)
     }
-    /// Close the old segment before creating its successor. A crash in the gap
-    /// deliberately leaves current.log missing, detecting possible voting-state loss.
+    /// Close the old segment before creating its successor. Identity points at
+    /// the latest complete file; an unrecorded successor is detected at open.
     fn rotate(&mut self, start: u64, carried: &[u8]) -> Result<()> {
-        if start == self.current_start {
+        if start == self.active_start {
             // Retrying a snapshot without intervening writes needs no new segment.
             return Ok(());
         }
         let directory = self.directory.clone();
-        let current_start = self.current_start;
-        let current_bytes = self.current_bytes;
+        let active_bytes = self.active_bytes;
         let bytes = [journal_header_after(&self.state, start), carried.to_vec()].concat();
         let footer = scn_footer(self.state.largest_scn());
-        let member = self.identity.process.clone();
+        let mut identity = self.identity.clone();
+        identity.latest_journal = start;
+        let saved_identity = identity.clone();
         self.perform(crate::io::Kind::Ordered, move |disk| {
-            let current = directory.join(CURRENT);
-            let closed = named(&directory, "journal", current_start);
-            if closed.try_exists()? {
-                return Err(Error::new(format!("closed {member} journal already exists")));
+            let next = named(&directory, "journal", start);
+            if next.try_exists()? {
+                return Err(Error::new("next journal file already exists"));
             }
-            let mut offset = current_bytes;
+            let mut offset = active_bytes;
             let file = disk.current_file()?;
             write_all_at(&file, &footer, &mut offset)?;
             file.sync_all()?;
-            std::fs::rename(&current, closed)?;
+            let mut next_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&next)?;
+            next_file.write_all(&bytes)?;
+            next_file.sync_all()?;
             sync_directory(&directory)?;
-            publish(&current, &bytes)?;
-            disk.replace_file(OpenOptions::new().read(true).write(true).open(current)?)?;
+            let mut ownership = disk.lock_ownership()?;
+            append_identity(&mut ownership, &identity)?;
+            drop(ownership);
+            disk.replace_file(next_file)?;
             Ok(())
         })?;
-        self.current_start = start;
-        self.current_bytes = HEADER + carried.len() as u64;
+        self.identity = saved_identity;
+        self.active_start = start;
+        self.active_bytes = HEADER + carried.len() as u64;
         self.log_bytes += HEADER + SCN_FOOTER;
         Ok(())
     }
@@ -1211,7 +1344,7 @@ impl Journal {
 pub(crate) struct History {
     state: State,
     directory: PathBuf,
-    current_start: u64,
+    active_start: u64,
 }
 impl History {
     // Replays retained files with the same sequence and predecessor checks as restart.
@@ -1234,11 +1367,10 @@ impl History {
             let Some((mut restored, mut sequence, _, _)) = base else {
                 return Ok(None);
             };
-            let mut files: Vec<_> = numbered(&self.directory, "journal")?
+            let files: Vec<_> = numbered(&self.directory, "journal")?
                 .into_iter()
-                .filter(|(start, _)| *start > sequence)
+                .filter(|(start, _)| *start > sequence && *start <= self.active_start)
                 .collect();
-            files.push((self.current_start, self.directory.join(CURRENT)));
             for (start, path) in files {
                 if start != sequence + 1 {
                     return Ok(None);
@@ -1252,7 +1384,7 @@ impl History {
                     start,
                     &mut restored,
                     &mut sequence,
-                    false,
+                    start == self.active_start,
                     state.ignore_ring_identity,
                     Some(&mut proof),
                 )?;
@@ -1347,6 +1479,268 @@ fn read_checkpoint(
     checkpoint.state.validate()?;
     Ok((checkpoint.state, sequence, checkpoint.second, bytes.len() as u64))
 }
+/// A closed-segment footer retains the SCN high-water after entries are removed.
+fn apply_scn_footer(state: &mut State, maximum: Option<Scn>) -> Result<()> {
+    match (state.largest_scn(), maximum) {
+        (Some(found), Some(maximum)) if found.compare(maximum).is_gt() => {
+            Err(Error::new("journal SCN footer is below its contents"))
+        }
+        (Some(_), None) => Err(Error::new("journal SCN footer omits its high-water mark")),
+        (_, Some(maximum)) => state.apply(&Record::MaxScn(maximum)),
+        (None, None) => Ok(()),
+    }
+}
+fn keep_before(entries: Vec<crate::raft::Entry>, from: u64) -> Vec<crate::raft::Entry> {
+    entries.into_iter().take_while(|entry| entry.index < from).collect()
+}
+fn filter_suffix(record: Record, from: u64) -> Option<Record> {
+    match record {
+        Record::Entries { entries, .. } => {
+            let entries = keep_before(entries, from);
+            let first = entries.first()?.index;
+            Some(Record::Entries { from: first, entries })
+        }
+        Record::Carry { entries, commit } => {
+            Some(Record::Carry { entries: keep_before(entries, from), commit })
+        }
+        record => Some(record),
+    }
+}
+/// Rewrite the affected suffix into the first segment that contains it. The
+/// identity pointer moves back before later segment files are removed.
+fn rewrite_journals(
+    directory: &Path,
+    ring: &str,
+    ignore: bool,
+    oldest_snapshot: u64,
+    latest_snapshot: u64,
+    active_start: u64,
+    old_sequence: u64,
+    from: u64,
+    appended: Vec<Batch>,
+    mut identity: LocalIdentity,
+    disk: &Disk,
+) -> Result<(u64, u64, u64, u64, LocalIdentity)> {
+    let checkpoint = named(directory, "snapshot", oldest_snapshot);
+    let (mut state, _, _, _) = read_checkpoint(&checkpoint, oldest_snapshot, ring, ignore)?;
+    let files: Vec<_> = numbered(directory, "journal")?
+        .into_iter()
+        .filter(|(start, _)| *start > oldest_snapshot && *start <= active_start)
+        .collect();
+    if files.last().is_none_or(|(start, _)| *start != active_start) {
+        return Err(Error::new("identity latest journal is missing during suffix rewrite"));
+    }
+    let target_at = suffix_segment(&files, latest_snapshot, active_start, ring, ignore, from)?
+        .ok_or_else(|| Error::new("replacement suffix is missing from journal files"))?;
+    let mut next =
+        oldest_snapshot.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
+    let mut log_bytes = 0u64;
+    let mut sequence = oldest_snapshot;
+    for (start, path) in files.iter().take(target_at) {
+        if *start != next {
+            return Err(Error::new("journal sequence gap during suffix rewrite"));
+        }
+        let (_, size) = replay_segment(path, *start, &mut state, &mut sequence, false, ignore)?;
+        next = sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
+        if *start > latest_snapshot {
+            log_bytes = log_bytes
+                .checked_add(size)
+                .ok_or_else(|| Error::new("journal byte count overflow"))?;
+        }
+    }
+    let (target_start, target_path) = &files[target_at];
+    if *target_start != next {
+        return Err(Error::new("journal sequence gap at suffix rewrite target"));
+    }
+    let temporary =
+        target_path.with_extension(format!("{}.tmp", common::shamir::hex(&random_bytes()?)));
+    let result = (|| -> Result<(u64, u64, u64)> {
+        let mut output =
+            OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+        output.write_all(&journal_header_after(&state, *target_start))?;
+        let mut out_at = HEADER;
+        for (start, path) in files.iter().skip(target_at) {
+            if *start != next {
+                return Err(Error::new("journal sequence gap during suffix rewrite"));
+            }
+            let is_active = *start == active_start;
+            let mut input = OpenOptions::new().read(true).open(path)?;
+            let (found_start, _, _, _) = read_journal_header(&mut input, ring, ignore)?;
+            if found_start != *start {
+                return Err(Error::new("journal filename/header sequence mismatch during rewrite"));
+            }
+            let (size, footer) = journal_body(&mut input, is_active)?;
+            input.seek(SeekFrom::Start(HEADER))?;
+            let mut in_at = HEADER;
+            while in_at < size {
+                let remaining = size - in_at;
+                if remaining < 16 {
+                    return Err(Error::new("partial journal frame during suffix rewrite"));
+                }
+                let mut lengths = [0; 16];
+                input.read_exact(&mut lengths)?;
+                let length = u64::from_le_bytes(lengths[..8].try_into().unwrap());
+                let inverse = u64::from_le_bytes(lengths[8..].try_into().unwrap());
+                if inverse != !length || length < 32 || length > LIMIT as u64 {
+                    return Err(Error::new("corrupt journal frame during suffix rewrite"));
+                }
+                if remaining < 16 + length {
+                    return Err(Error::new("partial journal frame during suffix rewrite"));
+                }
+                let mut bytes = vec![0; length as usize];
+                input.read_exact(&mut bytes)?;
+                let old: Batch = decode(&bytes)?;
+                if old.sequence
+                    != sequence
+                        .checked_add(1)
+                        .ok_or_else(|| Error::new("journal sequence overflow"))?
+                {
+                    return Err(Error::new("journal sequence gap during suffix rewrite"));
+                }
+                sequence = old.sequence;
+                let mut rewritten = Batch { sequence, records: vec![] };
+                for record in old.records {
+                    if let Some(record) = filter_suffix(record, from) {
+                        rewritten.records.push(record);
+                    }
+                }
+                for record in &rewritten.records {
+                    state.apply(record)?;
+                }
+                state.validate()?;
+                let encoded = frame(&rewritten)?;
+                output.write_all(&encoded)?;
+                out_at += encoded.len() as u64;
+                in_at += 16 + length;
+            }
+            if let Some(maximum) = footer {
+                apply_scn_footer(&mut state, maximum)?;
+            }
+            next =
+                sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
+        }
+        if sequence != old_sequence {
+            return Err(Error::new("journal sequence changed during suffix rewrite"));
+        }
+        for batch in &appended {
+            if batch.sequence
+                != sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?
+            {
+                return Err(Error::new("replacement journal sequence is not contiguous"));
+            }
+            for record in &batch.records {
+                state.apply(record)?;
+            }
+            state.validate()?;
+            let encoded = journal_frame(batch)?;
+            encoded.write_at(&output, out_at)?;
+            out_at += encoded.len() as u64;
+            sequence = batch.sequence;
+        }
+        output.sync_all()?;
+        drop(output);
+        std::fs::rename(&temporary, target_path)?;
+        sync_directory(directory)?;
+
+        identity.latest_journal = *target_start;
+        let mut ownership = disk.lock_ownership()?;
+        append_identity(&mut ownership, &identity)?;
+        drop(ownership);
+
+        for (start, path) in numbered(directory, "journal")? {
+            if start > *target_start {
+                std::fs::remove_file(path)?;
+            }
+        }
+        sync_directory(directory)?;
+        disk.replace_file(OpenOptions::new().read(true).write(true).open(target_path)?)?;
+        if *target_start > latest_snapshot
+            || files.iter().skip(target_at + 1).any(|(start, _)| *start > latest_snapshot)
+        {
+            log_bytes = log_bytes
+                .checked_add(out_at)
+                .ok_or_else(|| Error::new("journal byte count overflow"))?;
+        }
+        state.validate()?;
+        Ok((out_at, log_bytes, sequence))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    let (active_bytes, log_bytes, final_sequence) = result?;
+    Ok((active_bytes, log_bytes, final_sequence, *target_start, identity))
+}
+
+fn suffix_segment(
+    files: &[(u64, PathBuf)],
+    after: u64,
+    active_start: u64,
+    ring: &str,
+    ignore: bool,
+    from: u64,
+) -> Result<Option<usize>> {
+    for (at, (start, path)) in files.iter().enumerate() {
+        if *start <= after {
+            continue;
+        }
+        let mut input = OpenOptions::new().read(true).open(path)?;
+        let (found_start, _, _, _) = read_journal_header(&mut input, ring, ignore)?;
+        if found_start != *start {
+            return Err(Error::new("journal filename/header sequence mismatch during suffix scan"));
+        }
+        let (size, _) = journal_body(&mut input, *start == active_start)?;
+        input.seek(SeekFrom::Start(HEADER))?;
+        let mut offset = HEADER;
+        while offset < size {
+            let remaining = size - offset;
+            if remaining < 16 {
+                return Err(Error::new("partial journal frame during suffix scan"));
+            }
+            let mut lengths = [0; 16];
+            input.read_exact(&mut lengths)?;
+            let length = u64::from_le_bytes(lengths[..8].try_into().unwrap());
+            let inverse = u64::from_le_bytes(lengths[8..].try_into().unwrap());
+            if inverse != !length || length < 32 || length > LIMIT as u64 || remaining < 16 + length
+            {
+                return Err(Error::new("corrupt journal frame during suffix scan"));
+            }
+            let mut bytes = vec![0; length as usize];
+            input.read_exact(&mut bytes)?;
+            let batch: Batch = decode(&bytes)?;
+            if batch.records.iter().any(|record| match record {
+                Record::Entries { entries, .. } | Record::Carry { entries, .. } => {
+                    entries.iter().any(|entry| entry.index >= from)
+                }
+                _ => false,
+            }) {
+                return Ok(Some(at));
+            }
+            offset += 16 + length;
+        }
+    }
+    Ok(None)
+}
+
+fn journal_body(file: &mut File, active: bool) -> Result<(u64, Option<Option<Scn>>)> {
+    let physical = file.metadata()?.len();
+    if physical < HEADER + SCN_FOOTER {
+        if active {
+            return Ok((physical, None));
+        }
+        return Err(Error::new("short closed journal SCN footer"));
+    }
+    file.seek(SeekFrom::End(-(SCN_FOOTER as i64)))?;
+    let mut bytes = [0; SCN_FOOTER as usize];
+    file.read_exact(&mut bytes)?;
+    if &bytes[..8] == SCN_MAGIC {
+        let maximum = parse_scn_footer(&bytes)?;
+        Ok((physical - SCN_FOOTER, Some(maximum)))
+    } else if active {
+        Ok((physical, None))
+    } else {
+        Err(Error::new("missing closed journal SCN footer"))
+    }
+}
 fn replay_segment(
     path: &Path,
     start: u64,
@@ -1380,19 +1774,18 @@ fn replay_segment_checked(
         return Err(Error::new("journal predecessor index/term mismatch"));
     }
     let physical_size = file.metadata()?.len();
-    let current = path.file_name().is_some_and(|name| name == CURRENT);
     let footer = if physical_size >= HEADER + SCN_FOOTER {
         file.seek(SeekFrom::End(-(SCN_FOOTER as i64)))?;
         let mut bytes = [0; SCN_FOOTER as usize];
         file.read_exact(&mut bytes)?;
         if &bytes[..8] == SCN_MAGIC {
             Some(parse_scn_footer(&bytes)?)
-        } else if current {
+        } else if active {
             None
         } else {
             return Err(Error::new("missing closed journal SCN footer"));
         }
-    } else if current {
+    } else if active {
         None
     } else {
         return Err(Error::new("short closed journal SCN footer"));
@@ -1410,7 +1803,7 @@ fn replay_segment_checked(
         }
         let mut lengths = [0; 16];
         file.read_exact(&mut lengths)?;
-        if current && remaining < SCN_FOOTER && &lengths[..8] == SCN_MAGIC {
+        if active && remaining < SCN_FOOTER && &lengths[..8] == SCN_MAGIC {
             break;
         }
         let length = u64::from_le_bytes(lengths[..8].try_into().unwrap());
@@ -1482,9 +1875,7 @@ fn replay_segment_checked(
         return Err(Error::new("missing carried journal predecessor"));
     }
     if let Some(maximum) = footer {
-        if state.largest_scn() != maximum {
-            return Err(Error::new("journal SCN footer mismatch"));
-        }
+        apply_scn_footer(state, maximum)?;
     }
     if active {
         file.set_len(offset)?;
@@ -1582,14 +1973,11 @@ fn prepare_recovery(
     let checkpoint =
         Checkpoint { sequence: 0, second: common::time::TimeSec::now().number(), state };
     publish(&directory.join(&checkpoint_name), &checkpoint.bytes()?)?;
-    let mut files: Vec<String> = numbered(directory, "snapshot")?
+    let files: Vec<String> = numbered(directory, "snapshot")?
         .into_iter()
         .chain(numbered(directory, "journal")?)
         .map(|(_, path)| path.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
-    if directory.join(CURRENT).try_exists()? {
-        files.push(CURRENT.into());
-    }
     local.recovery = Some(RecoveryPlan {
         archive: format!("retired-{current}"),
         checkpoint: checkpoint_name,
@@ -1618,7 +2006,9 @@ fn finish_recovery(
     }
     sync_directory(&archive)?;
     sync_directory(directory)?;
-    publish(&directory.join(CURRENT), &journal_header_after(&checkpoint.state, 1))?;
+    publish(&named(directory, "journal", 1), &journal_header_after(&checkpoint.state, 1))?;
+    local.latest_journal = 1;
+    append_identity(ownership, local)?;
     publish(&named(directory, "snapshot", 0), &bytes)?;
     local.initialized = true;
     local.recovery = None;
@@ -2036,6 +2426,7 @@ mod tests {
             append_identity(&mut ownership, &journal.identity).unwrap();
         }
         let old = journal.identity.current.clone();
+        let old_journal = journal.active_start;
         journal.require_history_repair().unwrap();
         drop(journal);
         let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
@@ -2055,7 +2446,9 @@ mod tests {
             .map(|e| e.unwrap().path())
             .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("rejected-"))
             .unwrap();
-        assert!(archive.join(CURRENT).is_file());
+        assert!(
+            archive.join(named(dir.path(), "journal", old_journal).file_name().unwrap()).is_file()
+        );
         assert_ne!(old, new);
         assert_eq!(retirement.previous, 0);
         assert_eq!(retirement.next, INCARNATION);
@@ -2101,7 +2494,7 @@ mod tests {
                 }])
                 .unwrap();
             let identity = journal.identity.current.clone();
-            let path = dir.path().join(CURRENT);
+            let path = named(dir.path(), "journal", journal.active_start);
             let size = std::fs::metadata(&path).unwrap().len();
             drop(journal);
             let mut file = OpenOptions::new().append(true).open(&path).unwrap();
@@ -2348,7 +2741,7 @@ mod tests {
         assert_eq!(dest.state.term, 3);
         assert_eq!(dest.state.commit, 2);
         assert!(named(&target.path().join("copied-journals"), "journal", 1).exists());
-        assert!(!target.path().join("copied-journals/current.log").exists());
+        assert_eq!(numbered(&target.path().join("copied-journals"), "journal").unwrap().len(), 1);
         drop(dest);
         let restarted = Journal::open(target.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(restarted.state.vote, Some(1));
@@ -2363,6 +2756,7 @@ mod tests {
             current: common::ring::MemberIdentity::try_from("02".repeat(64)).unwrap(),
             retired: vec![common::ring::MemberIdentity::try_from("03".repeat(64)).unwrap()],
             slot: None,
+            latest_journal: 0,
             membership: None,
             founders: None,
             initialized: false,
@@ -2406,8 +2800,9 @@ mod tests {
                 }])
                 .unwrap();
         }
+        let active_start = journal.active_start;
         drop(journal);
-        let path = dir.path().join(CURRENT);
+        let path = named(dir.path(), "journal", active_start);
         let bytes = std::fs::read(&path).unwrap();
         let frame_end = |offset: usize| {
             offset + 16 + u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize
@@ -2484,15 +2879,21 @@ mod tests {
         local.recovery = Some(RecoveryPlan {
             archive: "retired-test".into(),
             checkpoint: "recovery-test.bin".into(),
-            files: vec![CURRENT.into(), "snapshot-00000000000000000000.bin".into()],
+            files: vec![
+                "journal-00000000000000000001.log".into(),
+                "snapshot-00000000000000000000.bin".into(),
+            ],
         });
         let mut file =
             OpenOptions::new().read(true).write(true).open(dir.path().join("identity")).unwrap();
         append_identity(&mut file, &local).unwrap();
         drop(file);
         std::fs::create_dir(dir.path().join("retired-test")).unwrap();
-        std::fs::rename(dir.path().join(CURRENT), dir.path().join("retired-test").join(CURRENT))
-            .unwrap();
+        std::fs::rename(
+            named(dir.path(), "journal", 1),
+            dir.path().join("retired-test/journal-00000000000000000001.log"),
+        )
+        .unwrap();
         let recovered = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(recovered.identity.current, new);
         assert_eq!(recovered.identity.retired.len(), 1);
@@ -2502,7 +2903,7 @@ mod tests {
 
     #[test]
     #[ignore = "filesystem integration; run explicitly with --ignored"]
-    fn rotation_preserves_old_bytes_and_recovers_empty_current_start() {
+    fn rotation_preserves_old_bytes_and_recovers_empty_active_start() {
         let dir = tempfile::tempdir().unwrap();
         let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         journal
@@ -2512,21 +2913,21 @@ mod tests {
                 vote_scn: Some(common::scn::Scn::new(0)),
             }])
             .unwrap();
-        let old = std::fs::read(dir.path().join(CURRENT)).unwrap();
+        let old = std::fs::read(named(dir.path(), "journal", journal.active_start)).unwrap();
         let pending = journal.prepare_snapshot(10).unwrap().unwrap();
         let closed = std::fs::read(named(dir.path(), "journal", 1)).unwrap();
-        let current = std::fs::read(dir.path().join(CURRENT)).unwrap();
+        let current = std::fs::read(named(dir.path(), "journal", journal.active_start)).unwrap();
         assert_eq!(old, closed[..closed.len() - SCN_FOOTER as usize]);
         assert_eq!(parse_scn_footer(&closed[old.len()..]).unwrap(), None);
         assert_eq!(current, journal_header(&initial().ring, 2));
-        // A retry before publication should reuse the empty current file.
+        // A retry before publication should reuse the empty active file.
         journal.prepare_snapshot(11).unwrap().unwrap();
-        assert_eq!(numbered(dir.path(), "journal").unwrap().len(), 1);
+        assert_eq!(numbered(dir.path(), "journal").unwrap().len(), 2);
         pending.write().unwrap();
         journal.finish_snapshot(&pending).unwrap();
         drop(journal);
         let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
-        assert_eq!(journal.current_start, 2);
+        assert_eq!(journal.active_start, 2);
         journal
             .write(&[Record::Hard {
                 term: 2,
@@ -2540,12 +2941,12 @@ mod tests {
         let recovered = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert!(second_closed);
         assert_eq!(recovered.state.term, 2);
-        assert_eq!(recovered.current_start, 3);
+        assert_eq!(recovered.active_start, 3);
     }
 
     #[test]
     #[ignore = "filesystem integration; run explicitly with --ignored"]
-    fn missing_current_or_rotation_gap_never_resumes_an_old_journal() {
+    fn missing_latest_or_rotation_gap_never_resumes_an_old_journal() {
         for rename in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
@@ -2564,17 +2965,20 @@ mod tests {
                     vote_scn: Some(common::scn::Scn::new(0)),
                 }])
                 .unwrap();
-            let start = journal.current_start;
+            let start = journal.active_start;
             drop(journal);
             if rename {
-                std::fs::rename(dir.path().join(CURRENT), named(dir.path(), "journal", start))
-                    .unwrap();
+                std::fs::rename(
+                    named(dir.path(), "journal", start),
+                    named(dir.path(), "journal", start + 1),
+                )
+                .unwrap();
             } else {
-                std::fs::remove_file(dir.path().join(CURRENT)).unwrap();
+                std::fs::remove_file(named(dir.path(), "journal", start)).unwrap();
             }
             let recovered = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
             assert_eq!(recovered.identity.retired.len(), 1);
-            assert!(dir.path().join(CURRENT).exists());
+            assert!(named(dir.path(), "journal", recovered.active_start).exists());
             let replacement = recovered.identity.current.clone();
             drop(recovered);
             let restarted = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
@@ -2756,9 +3160,10 @@ mod tests {
                 }])
                 .unwrap();
             journal.snapshot(10).unwrap();
+            let active_start = journal.active_start;
             drop(journal);
             let path = if kind == "journal" {
-                dir.path().join(CURRENT)
+                named(dir.path(), "journal", active_start)
             } else {
                 numbered(dir.path(), "snapshot").unwrap().last().unwrap().1.clone()
             };
@@ -2960,14 +3365,16 @@ mod tests {
                 vote_scn: Some(common::scn::Scn::new(0)),
             }])
             .unwrap();
+        let active_start = journal.active_start;
         drop(journal);
-        let frame = std::fs::read(source.path().join(CURRENT)).unwrap();
+        let source_active = named(source.path(), "journal", active_start);
+        let frame = std::fs::read(&source_active).unwrap();
         for count in HEADER as usize..frame.len() {
             let dir = tempfile::tempdir().unwrap();
             for name in ["identity", "snapshot-00000000000000000000.bin"] {
                 std::fs::copy(source.path().join(name), dir.path().join(name)).unwrap();
             }
-            let path = dir.path().join(CURRENT);
+            let path = named(dir.path(), "journal", 1);
             std::fs::write(&path, &frame[..count]).unwrap();
             let result = Journal::open(dir.path(), initial(), 3, "member-0");
             assert!(result.is_ok(), "partial length {count}");
@@ -2976,10 +3383,10 @@ mod tests {
         }
         let mut bad = frame.clone();
         bad[HEADER as usize + 20] ^= 1;
-        std::fs::write(source.path().join(CURRENT), bad).unwrap();
+        std::fs::write(&source_active, bad).unwrap();
         let result = Journal::open(source.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(result.identity.retired.len(), 1);
-        assert!(source.path().join("current.log.corrupt-0").exists());
+        assert!(source.path().join("journal-00000000000000000001.log.corrupt-0").exists());
     }
     #[test]
     #[ignore = "filesystem integration; run explicitly with --ignored"]
@@ -3010,7 +3417,6 @@ mod tests {
                     std::fs::copy(&path, restore.path().join(path.file_name().unwrap())).unwrap();
                 }
             }
-            std::fs::copy(dir.path().join(CURRENT), restore.path().join(CURRENT)).unwrap();
             let restored = Journal::open(restore.path(), initial(), 3, "member-0").unwrap();
             assert_eq!(restored.state.capture(), expected);
         }
@@ -3121,16 +3527,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut journal = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         journal.write(&[Record::Hard { term: 1, vote: None, vote_scn: None }]).unwrap();
+        let active_start = journal.active_start;
         drop(journal);
         let wrong_member = Journal::open(dir.path(), initial(), 3, "member-1");
         assert!(wrong_member.is_err());
-        let path = dir.path().join(CURRENT);
+        let path = named(dir.path(), "journal", active_start);
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[1] ^= 1;
         std::fs::write(path, bytes).unwrap();
         let recovered = Journal::open(dir.path(), initial(), 3, "member-0").unwrap();
         assert_eq!(recovered.identity.retired.len(), 1);
-        assert!(dir.path().join("current.log.corrupt-0").exists());
+        assert!(dir.path().join("journal-00000000000000000001.log.corrupt-0").exists());
     }
 }
 
@@ -3157,6 +3564,7 @@ pub fn provision_test_founder(
             current,
             retired: vec![],
             slot: None,
+            latest_journal: 0,
             membership: None,
             founders: None,
             initialized: false,
@@ -3174,6 +3582,6 @@ crate::wire_struct!(Checkpoint, RaftCheckpoint, {sequence,second,state});
 
 crate::wire_struct!(CommittedJournal, RaftCommittedJournal, {ring,after,previous_term,previous_scn,entries});
 
-crate::wire_struct!(LocalIdentity, RaftLocalIdentity, {ring,process,current,retired,slot,membership,founders,initialized,pending,recovery,repairing});
+crate::wire_struct!(LocalIdentity, RaftLocalIdentity, {ring,process,current,retired,slot,latest_journal,membership,founders,initialized,pending,recovery,repairing});
 
 crate::wire_struct!(RecoveryPlan, RaftRecoveryPlan, {archive,checkpoint,files});

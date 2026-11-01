@@ -19412,27 +19412,26 @@ before tuning the production defaults. Billing exports are a separate policy.
 
 ## 17.50 Numbered KS files, journal rotation and pruning
 
-The directory contains `identity`, `snapshot-<sequence>.bin`, closed journals
-`journal-<first-sequence>.log`, and the active journal `current.log`. Numbered
-filenames use zero-padded 20-digit decimal sequences. The local identity file
-binds the store to its ring and member; its exclusive file lock prevents concurrent
-opens and survives rotation. There is no backward compatibility requirement yet: earlier formats are
-unsupported, with no compatibility reader or migration path.
+The directory contains `identity`, `snapshot-<sequence>.bin`, and numbered
+`journal-<first-sequence>.log` files. Every journal starts with its final name;
+the identity record stores the starting sequence of the latest journal. Numbered
+filenames use zero-padded 20-digit decimal sequences. The identity file binds the
+store to its ring and member; its exclusive file lock prevents concurrent opens
+and survives rotation. Earlier formats are unsupported, with no migration path.
 
-Rotation runs under the journal mutex: sync the old file, rename `current.log` to
-its numbered name using the starting sequence retained in RAM, sync the directory,
-then durably publish the successor as `current.log`. The new header stores the
-starting sequence so an empty active file can be named correctly after restart.
-A snapshot retry with no intervening writes reuses the empty active journal.
-Any rotation I/O failure fences further journal writes. A crash between rename
-and publication leaves the fixed name missing. Recovery treats a missing active
-journal in an existing store, or a missing batch/segment in its required replay
-suffix, as voting-state loss. It retires that identity before creating its
-replacement; an older numbered file is never promoted to current.log.
+Rotation runs under the journal mutex: sync the old file, create and sync the
+successor under its final numbered name, sync the directory, then append the new
+latest-journal sequence to `identity`. The new header stores its starting sequence
+so an empty journal is named correctly after restart. A snapshot retry with no
+intervening writes reuses the empty active journal. Any rotation I/O failure
+fences further journal writes. Recovery checks that the greatest numbered
+journal matches the latest sequence in `identity`; a missing, earlier, or later
+file means voting-state loss. It retires that identity before creating its
+replacement. Files are never renamed just to mark one as active.
 
 A snapshot at physical sequence 100 is followed by a journal starting at 101. If that snapshot
 never appears, recovery starts with an earlier snapshot and reads every later
-journal, including 101, and finally `current.log`. Header and filename starting
+journal, including 101, through the file named in `identity`. Header and filename starting
 sequences must agree; sequence continuity is checked. Temporary files are ignored.
 Unparseable frames, inconsistent header positions, and wrong-ring files are
 unusable recovery sources. Rename such a file with a `.corrupt-N` suffix and sync
@@ -19448,7 +19447,8 @@ retained closed journals can serve ranges no longer held in RAM. Peer transfers
 contain entries only, never hard term/vote records, and are bounded by the source's
 commit index and the primary-advertised recovery point. Persist them under
 `copied-journals/journal-<first-index>.log`, then journal their entries and commit
-marker locally under the new identity. These copied files are never `current.log`.
+marker locally under the new identity. These copied files are outside the local
+journal sequence and do not update the latest-journal identity.
 Only the primary supplies entries beyond the committed recovery point. Existing
 checkpoint transfer is the fallback when the needed journal range is unavailable.
 Malformed or wrong-ring peer responses are rejected and the next source tried.
@@ -19513,11 +19513,12 @@ format marker, presence flag, maximum SCN and complement, and SHA-256 of those
 footer fields. The maximum uses wrapping SCN comparison, including replaced
 suffixes remembered by the store. Recovery validates it against decoded history
 and merges the restored maximum once, rather than merging every replayed entry.
-Bulk checkpoint/journal imports likewise merge their maximum once. `current.log`
-has no footer while accepting writes: rotation appends and syncs the footer before
-renaming the file. A restart before that rename strips a complete or partial
-footer and resumes the current journal. The open journal's maximum is accumulated
-during replay. SCN collisions remain possible; matching SCNs do not prove that
+Bulk checkpoint/journal imports likewise merge their maximum once. The
+identity-selected latest journal has no footer while accepting writes: rotation
+appends and syncs the footer to the old journal before creating its successor.
+A restart before identity advances strips a complete or partial footer from the
+identity-selected journal. Its maximum is accumulated during replay. SCN
+collisions remain possible; matching SCNs do not prove that
 payloads are identical, and a detected committed-history conflict triggers the retirement and rebuild
 protocol below (#127).
 
@@ -19585,7 +19586,8 @@ Recovery keeps the last verified committed prefix, stops at a journal gap, and
 clears the lost identity's vote. Before moving files it durably appends a fresh
 random identity, the old-to-new pair, and a recovery plan to the local identity
 file. Existing snapshots/journals are moved into `retired-<new-identity>/`; a
-checksummed recovery checkpoint initializes a fresh snapshot zero and current.log.
+checksummed recovery checkpoint initializes a fresh snapshot zero and a named
+first journal, then records that journal in `identity`.
 Restart during this sequence resumes the recorded plan and identity, never chooses
 another replacement. The archived files and recovery checkpoint are retained for
 investigation; normal snapshot pruning does not remove these recovery archives.
@@ -19639,7 +19641,7 @@ Replacing history is state loss, just like a corrupt journal: generate a new
 random identity, durably retire the old identity in its slot, and respond
 "I lost state" under the existing replacement protocol. A durable recovery plan
 archives the rejected journals/checkpoints without deleting them, writes a new
-initial snapshot/current journal, and resumes safely after an interrupted copy.
+initial snapshot and named first journal, then resumes safely after an interrupted copy.
 The replacement copies committed journals from secondaries first (primary
 fallback) and obtains subsequent entries from the primary. Admission of the new
 identity ends the old retirement replies and campaign penalty as usual.

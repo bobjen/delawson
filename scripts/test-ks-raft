@@ -170,17 +170,19 @@ def main():
                 assert int(status(cold)['master_keys']) == 0
                 print('PASS: replicated registrations; changed-port discovery with obsolete seeds; locked restart; primary failover; routing retained by cold member; registration does not grant a voting slot.')
                 return
-            # Losing current.log retires one identity and implicitly requests replacement.
+            # Corrupting the identity-selected latest journal requests replacement.
             replacing = next(id for id in members if id != primary)
             old_identity = status(replacing)['raft_member_id']
             old_slot = int(status(replacing)['raft_member_slot'])
             old_incarnation = int(status(replacing)['raft_member_incarnation'])
             stop(replacing)
-            (work/replacing/'data/master-keys/current.log').write_bytes(b'not a journal')
+            jdir = work/replacing/'data/master-keys'
+            last_journal = max(jdir.glob('journal-*.log'), key=lambda path: int(path.stem.split('-')[-1]))
+            last_journal.write_bytes(b'not a journal')
 
             start(replacing)
             until(lambda: status(replacing).get('raft_lost_state') == 'false')
-            assert list((work/replacing/'data/master-keys').glob('current.log.corrupt-*'))
+            assert list(jdir.glob('journal-*.log.corrupt-*'))
             assert status(replacing)['raft_member_id'] != old_identity
             assert int(status(replacing)['raft_member_slot']) == old_slot
             assert int(status(replacing)['raft_member_incarnation']) == old_incarnation + 1
@@ -193,7 +195,9 @@ def main():
             prior_ids = {id: status(id)['raft_member_id'] for id in retiring}
             for id in list(children): stop(id)
             for id in retiring:
-                (work/id/'data/master-keys/current.log').unlink(missing_ok=True)
+                jdir = work/id/'data/master-keys'
+                last_journal = max(jdir.glob('journal-*.log'), key=lambda path: int(path.stem.split('-')[-1]))
+                last_journal.unlink(missing_ok=True)
             for id in members: start(id)
             def recovered_ring():
                 # Demoted primaries intentionally exit. Supply the supervisor

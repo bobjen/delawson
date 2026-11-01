@@ -374,13 +374,13 @@ FILE` proposes a joint-consensus transition using a JSON list of routing labels.
 must be admitted KS processes. Automatic ring maintenance and client bootstrap
 failover remain future work; `--to` and `--at` select a member explicitly.
 
-Recovery starts from the newest snapshot, replays later numbered journals, then
-replays `current.log`, the fixed name of the active journal.
-Filenames use a physical journal batch sequence, distinct from the Raft log index.
-Bootstrap creates snapshot zero. Rotation renames `current.log` to its numbered
-name, syncs the directory, then creates and durably publishes a new `current.log`.
-The header records its starting sequence, including when it is empty. A missing
-active journal or a gap in the required replay suffix retires the local identity.
+Recovery starts from the newest snapshot and replays numbered journals through
+the latest journal named in `identity`. Filenames use a physical journal batch
+sequence, distinct from the Raft log index. Bootstrap creates snapshot zero.
+Rotation creates the successor under its final numbered name, syncs it, then
+records its starting sequence in `identity`. The header records that same sequence,
+including when the file is empty. The greatest journal filename must match the
+identity record; a missing, earlier, or later file retires the local identity.
 Recovery archives the old files, preserves the verified committed prefix, and
 starts a fresh random identity in the same logical slot with a new incarnation.
 Retirement is durable before the new member can send messages; interrupted
@@ -388,11 +388,12 @@ recovery resumes the same identity. Unparseable or wrong-ring files are renamed
 with a `.corrupt-N` suffix and preserved. Recovery retries older local checkpoints;
 checkpoint fallback alone does not retire the identity. Corrupt journals trigger
 retirement and peer catch-up. Committed journal ranges are fetched from secondaries
-first, then the primary, and saved in `copied-journals/journal-<index>.log`, never
-as `current.log`. The primary supplies the uncommitted suffix. Missing identity
+first, then the primary, and saved in `copied-journals/journal-<index>.log`.
+The primary supplies the uncommitted suffix. Missing identity
 starts a new slotless applicant, without inferring ownership from recovered data.
 Rotation precedes snapshot publication and carries any uncommitted suffix into
-the new journal. An incomplete final active frame can be discarded. Earlier pre-Raft formats are
+the new journal. An incomplete final frame in the identity-selected journal can
+be discarded. Earlier pre-Raft formats are
 refused without migration.
 
 A pending replacement sends an old-to-new retirement pair along with its campaigns.

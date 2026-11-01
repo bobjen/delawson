@@ -866,6 +866,7 @@ impl State {
                 vote_scn: self.vote_scn,
                 max_scn: self.max_scn,
             },
+            Record::MaxScn(_) => StateChange::MaxScn(self.max_scn),
             Record::Entries { from, .. } if *from == self.last().saturating_add(1) => {
                 StateChange::EntryAppend { len: self.log.len(), max_scn: self.max_scn }
             }
@@ -967,6 +968,7 @@ impl State {
                     self.observe_scn(*scn);
                 }
             }
+            Record::MaxScn(scn) => self.observe_scn(*scn),
             Record::Entries { from, entries } => {
                 if *from <= self.commit
                     || *from <= self.snapshot.index
@@ -1049,6 +1051,7 @@ enum StateChange {
         vote_scn: Option<Scn>,
         max_scn: Option<Scn>,
     },
+    MaxScn(Option<Scn>),
     EntryAppend {
         len: usize,
         max_scn: Option<Scn>,
@@ -1095,6 +1098,7 @@ impl StateChange {
                 state.vote_scn = vote_scn;
                 state.max_scn = max_scn;
             }
+            Self::MaxScn(max_scn) => state.max_scn = max_scn,
             Self::EntryAppend { len, max_scn } => {
                 state.log.truncate(len);
                 state.max_scn = max_scn;
@@ -1127,9 +1131,21 @@ pub enum Record {
     Contacts(MemberNames),
     Retired(Retirement),
     Bootstrap(Membership),
-    Carry { entries: Vec<Entry>, commit: u64 },
-    Hard { term: u64, vote: Option<MemberId>, vote_scn: Option<Scn> },
-    Entries { from: u64, entries: Vec<Entry> },
+    Carry {
+        entries: Vec<Entry>,
+        commit: u64,
+    },
+    Hard {
+        term: u64,
+        vote: Option<MemberId>,
+        vote_scn: Option<Scn>,
+    },
+    /// Keep an observed SCN after its entry was removed from a replaced suffix.
+    MaxScn(Scn),
+    Entries {
+        from: u64,
+        entries: Vec<Entry>,
+    },
     Commit(u64),
     Install(Snapshot),
 }
@@ -2288,7 +2304,12 @@ impl<S: Storage> Node<S> {
                         return Ok(answer);
                     }
                     let new_count = entries.len() - start;
-                    let accepted = self.entry_room(new_count)?;
+                    let free = self.entry_room(new_count)?;
+                    // A replacement removes the retained suffix before its new
+                    // entries are indexed, so those slots are available too.
+                    let from = entries[start].index.max(self.retained.first);
+                    let replaced = self.retained.end().saturating_sub(from) as usize;
+                    let accepted = new_count.min(free.saturating_add(replaced));
                     if accepted > 0 {
                         records.push(Record::Entries {
                             from: entries[start].index,
@@ -3190,6 +3211,36 @@ pub mod tests {
             assert_eq!(follower.retained.get(2).unwrap().index, 2);
             assert_eq!(follower.retained.get(3).unwrap().index, 3);
         }
+    }
+    #[test]
+    fn replacement_reuses_full_uncommitted_ring() {
+        let base = node(1, members(2));
+        let mut follower = Node::new_with_log2(base.id, base.journal, 1).unwrap();
+        let entries = |scn: u64| {
+            (1..=2)
+                .map(|index| Entry {
+                    scn: Scn::new(scn + index),
+                    index,
+                    term: 1,
+                    command: Command::Noop,
+                    entry_buf: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let request = |scn| Rpc::Append {
+            term: 1,
+            previous: 0,
+            previous_term: 0,
+            previous_scn: Scn::new(0),
+            entries: entries(scn),
+            commit: 0,
+        };
+        assert_eq!(follower.receive(&0, &request(0)).unwrap().matched, 2);
+        let answer = follower.receive(&0, &request(10)).unwrap();
+        assert!(answer.success);
+        assert_eq!(answer.matched, 2);
+        assert_eq!(follower.state().scn_at(1), Some(Scn::new(11)));
+        assert_eq!(follower.state().scn_at(2), Some(Scn::new(12)));
     }
     #[cfg(test)]
     fn exchange(a: &mut TestNode, b: &mut TestNode) {
@@ -4138,6 +4189,9 @@ impl crate::codec::Wire for Record {
                 vote.write(w);
                 vote_scn.write(w);
             }),
+            Self::MaxScn(value) => w.nested(common::Op::RaftRecordMaxScn, |w| {
+                value.write(w);
+            }),
             Self::Entries { from, entries } => w.nested(common::Op::RaftRecordEntries, |w| {
                 from.write(w);
                 entries.write(w);
@@ -4164,6 +4218,7 @@ impl crate::codec::Wire for Record {
                 vote: Wire::read(r)?,
                 vote_scn: Wire::read(r)?,
             }),
+            common::Op::RaftRecordMaxScn => Ok(Self::MaxScn(Wire::read(r)?)),
             common::Op::RaftRecordEntries => {
                 Ok(Self::Entries { from: Wire::read(r)?, entries: Wire::read(r)? })
             }
