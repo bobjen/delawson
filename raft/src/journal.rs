@@ -406,6 +406,8 @@ pub struct Journal {
     snapshot_bytes: u64,
     log_bytes: u64,
     retain: usize,
+    replay_history: Option<crate::raft::RecordHistory>,
+    record_updates: VecDeque<Arc<Vec<Record>>>,
     pub failed: bool,
 }
 enum DurableChange {
@@ -451,8 +453,21 @@ impl crate::raft::Storage for Journal {
     fn write(&mut self, records: &[Record]) -> Result<()> {
         Journal::write(self, records)
     }
-    fn write_owned(&mut self, records: Vec<Record>) -> Result<()> {
+    fn write_owned(&mut self, records: Vec<Record>) -> Result<Arc<Vec<Record>>> {
         Journal::write_owned(self, records)
+    }
+    fn take_records(&mut self, log2_entries: u8) -> Result<crate::raft::RecordHistory> {
+        let Some(mut history) = self.replay_history.take() else {
+            return crate::raft::RecordHistory::from_state(&self.state, log2_entries);
+        };
+        let capacity = 1usize
+            .checked_shl(u32::from(log2_entries))
+            .ok_or_else(|| Error::new("invalid retained log size"))?;
+        history.set_capacity(capacity, &self.state)?;
+        Ok(history)
+    }
+    fn take_aux_records(&mut self) -> Vec<Arc<Vec<Record>>> {
+        self.record_updates.drain(..).collect()
     }
     fn pending_replacement(&self) -> Option<Retirement> {
         self.identity.pending.clone()
@@ -566,6 +581,9 @@ impl Journal {
         state.check_ring(&state.snapshot)?;
         state.validate()?;
         let snapshot_sequence = sequence;
+        let record_base = (state.snapshot.index, (state.snapshot.term, state.snapshot.scn));
+        let mut record_history =
+            crate::raft::RecordHistory::new(record_base, crate::raft::RECORD_HISTORY_ENTRIES)?;
         let active_start = local.latest_journal;
         let active_path = named(directory, "journal", active_start);
         let active_exists = active_start != 0 && active_path.try_exists()?;
@@ -596,7 +614,15 @@ impl Journal {
                 break;
             }
             let is_active = *start == active_start;
-            let replay = replay_segment(path, *start, &mut state, &mut sequence, is_active, ignore);
+            let replay = replay_segment_with_records(
+                path,
+                *start,
+                &mut state,
+                &mut sequence,
+                is_active,
+                ignore,
+                &mut record_history,
+            );
             match replay {
                 Ok((file, size)) => {
                     log_bytes += size;
@@ -659,6 +685,8 @@ impl Journal {
             snapshot_bytes,
             log_bytes,
             retain,
+            replay_history: Some(record_history),
+            record_updates: VecDeque::new(),
             failed: false,
         };
         result.prune()?;
@@ -826,13 +854,15 @@ impl Journal {
             sync_directory(&root)?;
             publish(&name, &bytes)
         })?;
-        self.write(&[
+        let records = self.write_owned(vec![
             Record::Entries {
                 from: copied.after + 1,
                 entries: copied.entries.iter().map(|entry| (**entry).clone()).collect(),
             },
             Record::Commit(copied.entries.last().unwrap().index),
-        ])
+        ])?;
+        self.record_updates.push_back(records);
+        Ok(())
     }
     /// Fence voting durably before attempting a history replacement. This does
     /// not discard files until a verified replacement checkpoint is available.
@@ -934,9 +964,9 @@ impl Journal {
         Ok(())
     }
     pub fn write(&mut self, records: &[Record]) -> Result<()> {
-        self.write_owned(records.to_vec())
+        self.write_owned(records.to_vec()).map(|_| ())
     }
-    pub fn write_owned(&mut self, mut held: Vec<Record>) -> Result<()> {
+    pub fn write_owned(&mut self, mut held: Vec<Record>) -> Result<Arc<Vec<Record>>> {
         if self.failed {
             return Err(Error::new(format!(
                 "{} journal fenced after I/O failure; restart required",
@@ -944,7 +974,7 @@ impl Journal {
             )));
         }
         if held.is_empty() {
-            return Ok(());
+            return Ok(Arc::new(Vec::new()));
         }
         // Keep one immutable serialization per entry for state, apply, and journal I/O.
         for record in &mut held {
@@ -1007,10 +1037,10 @@ impl Journal {
         if let Some(identity) = identity {
             self.identity = identity;
         }
-        self.track_change(DurableChange::Records(durable_records))?;
-        Ok(())
+        self.track_change(DurableChange::Records(Arc::clone(&durable_records)))?;
+        Ok(durable_records)
     }
-    fn replace_suffix(&mut self, records: Vec<Record>, from: u64) -> Result<()> {
+    fn replace_suffix(&mut self, records: Vec<Record>, from: u64) -> Result<Arc<Vec<Record>>> {
         let directory = self.directory.clone();
         let oldest = numbered(&directory, "snapshot")?
             .first()
@@ -1071,7 +1101,6 @@ impl Journal {
         let old_sequence = self.sequence;
         let stats = Arc::new(Mutex::new(None));
         let write_stats = stats.clone();
-        let rollback_identity = self.identity.clone();
         let write_identity = identity.clone().unwrap_or_else(|| self.identity.clone());
         let durable_write = durable.clone();
         let result = self.perform(crate::io::Kind::Ordered, move |disk| {
@@ -1086,7 +1115,6 @@ impl Journal {
                     old_sequence,
                     from,
                     batches,
-                    rollback_identity,
                     write_identity,
                     disk,
                 )?;
@@ -1100,7 +1128,7 @@ impl Journal {
             undo.rollback(&mut self.state);
             return Err(error);
         }
-        self.track_change(DurableChange::Records(durable.clone()))?;
+        self.track_change(DurableChange::Records(Arc::clone(&durable)))?;
         if let Some(io) = &self.io {
             if let Err(error) = io.fence().wait().and_then(|()| self.poll_io()) {
                 self.failed = true;
@@ -1122,7 +1150,7 @@ impl Journal {
         self.sequence = sequence;
         self.change_sequence = sequence;
         self.identity = identity;
-        Ok(())
+        Ok(durable)
     }
     pub fn snapshot_due(&self, min_bytes: u64, seconds: u64, now: u64) -> bool {
         self.change_sequence > self.snapshot_sequence
@@ -1163,18 +1191,18 @@ impl Journal {
         }
         let suffix: Vec<_> =
             state.log.iter().filter(|entry| entry.index > snapshot.index).cloned().collect();
-        let carried = if suffix.is_empty() {
-            vec![]
+        let carry =
+            (!suffix.is_empty()).then(|| Record::Carry { entries: suffix, commit: state.commit });
+        let carried = if let Some(record) = &carry {
+            frame(&Batch { sequence: start, records: vec![record.clone()] })?
         } else {
-            frame(&Batch {
-                sequence: start,
-                records: vec![Record::Carry { entries: suffix, commit: state.commit }],
-            })?
+            vec![]
         };
         self.rotate(start, &carried)?;
         if !carried.is_empty() {
             self.sequence = start;
             self.log_bytes += carried.len() as u64;
+            self.record_updates.push_back(Arc::new(vec![carry.unwrap()]));
         }
         Ok(mark)
     }
@@ -1387,6 +1415,7 @@ impl History {
                     start == self.active_start,
                     state.ignore_ring_identity,
                     Some(&mut proof),
+                    None,
                 )?;
                 found = proof.1;
             }
@@ -1749,7 +1778,18 @@ fn replay_segment(
     active: bool,
     ignore: bool,
 ) -> Result<(File, u64)> {
-    replay_segment_checked(path, start, state, sequence, active, ignore, None)
+    replay_segment_checked(path, start, state, sequence, active, ignore, None, None)
+}
+fn replay_segment_with_records(
+    path: &Path,
+    start: u64,
+    state: &mut State,
+    sequence: &mut u64,
+    active: bool,
+    ignore: bool,
+    history: &mut crate::raft::RecordHistory,
+) -> Result<(File, u64)> {
+    replay_segment_checked(path, start, state, sequence, active, ignore, None, Some(history))
 }
 fn replay_segment_checked(
     path: &Path,
@@ -1759,6 +1799,7 @@ fn replay_segment_checked(
     active: bool,
     ignore: bool,
     mut proof: Option<&mut (u64, Option<(u64, Scn)>)>,
+    mut history: Option<&mut crate::raft::RecordHistory>,
 ) -> Result<(File, u64)> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let (found_start, previous, previous_term, previous_scn) =
@@ -1869,6 +1910,9 @@ fn replay_segment_checked(
         }
         *state = next;
         *sequence = batch.sequence;
+        if let Some(history) = history.as_deref_mut() {
+            history.push_batch(Arc::new(batch.records), state)?;
+        }
         offset += 16 + length;
     }
     if !boundary {

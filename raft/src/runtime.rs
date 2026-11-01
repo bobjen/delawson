@@ -1533,8 +1533,7 @@ pub trait Host:
                             if let Some(scn) = snapshot.largest_scn() {
                                 node.merge_scn(scn)?;
                             }
-                            node.journal.write(&[install])?;
-                            node.reset_retained()?;
+                            node.persist(vec![install])?;
                             node.refresh_slot();
                         }
                         logn!(

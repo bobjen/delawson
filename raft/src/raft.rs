@@ -1211,91 +1211,301 @@ pub trait Storage {
         self.state()
     }
     fn write(&mut self, records: &[Record]) -> Result<()>;
-    fn write_owned(&mut self, records: Vec<Record>) -> Result<()> {
-        self.write(&records)
+    fn write_owned(&mut self, records: Vec<Record>) -> Result<Arc<Vec<Record>>> {
+        self.write(&records)?;
+        Ok(Arc::new(records))
+    }
+    fn take_records(&mut self, log2_entries: u8) -> Result<RecordHistory> {
+        RecordHistory::from_state(self.state(), log2_entries)
+    }
+    fn take_aux_records(&mut self) -> Vec<Arc<Vec<Record>>> {
+        Vec::new()
     }
     fn pending_replacement(&self) -> Option<Retirement> {
         None
     }
 }
 
-/// A bounded shared-entry index kept by every replica.
-struct EntryRing {
-    slots: Vec<Option<Arc<Entry>>>,
-    mask: usize,
+/// Records retained in memory, in journal order, with their post-record entry index.
+pub(crate) const RECORD_HISTORY_ENTRIES: usize = 1 << 16;
+pub struct RecordHistory {
+    queue: RecordQueue,
+}
+impl RecordHistory {
+    pub(crate) fn new(base: (u64, (u64, Scn)), capacity: usize) -> Result<Self> {
+        let mut queue = RecordQueue::new(base, 0)?;
+        queue.capacity = capacity;
+        Ok(Self { queue })
+    }
+    pub(crate) fn from_state(state: &State, log2: u8) -> Result<Self> {
+        let capacity = 1usize
+            .checked_shl(u32::from(log2))
+            .ok_or_else(|| Error::new("invalid retained log size"))?;
+        let mut history =
+            Self::new((state.snapshot.index, (state.snapshot.term, state.snapshot.scn)), capacity)?;
+        let entries = state.log.iter().cloned().collect::<Vec<_>>();
+        if !entries.is_empty() {
+            history.queue.push_batch(Arc::new(vec![Record::Entries {
+                from: state.snapshot.index.saturating_add(1),
+                entries,
+            }]))?;
+        }
+        history.queue.trim_to_capacity(state)?;
+        history.queue.seed_primaries(state)?;
+        Ok(history)
+    }
+    pub(crate) fn push_batch(&mut self, batch: Arc<Vec<Record>>, state: &State) -> Result<()> {
+        self.queue.push_batch(batch)?;
+        self.queue.trim_to_capacity(state)
+    }
+    pub(crate) fn set_capacity(&mut self, capacity: usize, state: &State) -> Result<()> {
+        self.queue.capacity = capacity;
+        self.queue.trim_to_capacity(state)
+    }
+}
+struct QueuedRecord {
+    entry: u64,
+    batch: Arc<Vec<Record>>,
+    at: usize,
+}
+impl QueuedRecord {
+    fn record(&self) -> &Record {
+        &self.batch[self.at]
+    }
+}
+
+/// A bounded chronological record queue. Entry lookup uses a lower-bound search
+/// over each record's post-record entry index, then scans the matching batch.
+struct RecordQueue {
+    records: VecDeque<QueuedRecord>,
+    capacity: usize,
     first: u64,
     len: usize,
+    end: u64,
     previous: (u64, Scn),
     primaries: VecDeque<(u64, MemberId)>,
 }
-impl EntryRing {
+impl RecordQueue {
     fn from_state(state: &State, log2: u8) -> Result<Self> {
+        Self::from_history(RecordHistory::from_state(state, log2)?, state, log2)
+    }
+    fn from_history(history: RecordHistory, state: &State, log2: u8) -> Result<Self> {
         let size = 1usize
             .checked_shl(u32::from(log2))
             .ok_or_else(|| Error::new("invalid retained log size"))?;
-        let mut slots = Vec::new();
-        slots.try_reserve_exact(size).map_err(|_| Error::new("unable to reserve retained log"))?;
-        slots.resize_with(size, || None);
-        let mut retained = Self {
-            slots,
-            mask: size - 1,
-            first: 0,
-            len: 0,
-            previous: (0, Scn::new(0)),
-            primaries: VecDeque::new(),
-        };
-        retained.reset(state)?;
+        let mut retained = history.queue;
+        retained.capacity = size;
+        if retained.records.capacity() < size {
+            retained
+                .records
+                .try_reserve(size.saturating_sub(retained.records.len()))
+                .map_err(|_| Error::new("unable to reserve retained journal records"))?;
+        }
+        if retained.end != state.last().saturating_add(1) {
+            return Err(Error::new("retained journal records do not match state"));
+        }
+        retained.trim_to_capacity(state)?;
+        retained.seed_primaries(state)?;
         Ok(retained)
     }
-    fn reset(&mut self, state: &State) -> Result<()> {
-        let count = state.log.len().min(self.slots.len());
-        let first = state
-            .last()
-            .checked_sub(count as u64)
-            .and_then(|index| index.checked_add(1))
-            .ok_or_else(|| Error::new("retained log index overflow"))?;
-        self.reset_from(state, first)
+    fn new(base: (u64, (u64, Scn)), capacity: usize) -> Result<Self> {
+        let first = base.0.saturating_add(1);
+        let mut records = VecDeque::new();
+        records
+            .try_reserve(capacity)
+            .map_err(|_| Error::new("unable to reserve retained journal records"))?;
+        Ok(Self {
+            records,
+            capacity,
+            first,
+            len: 0,
+            end: first,
+            previous: base.1,
+            primaries: VecDeque::new(),
+        })
     }
     fn reset_from(&mut self, state: &State, requested: u64) -> Result<()> {
-        for slot in &mut self.slots {
-            *slot = None;
-        }
         let first = requested
             .max(state.snapshot.index.saturating_add(1))
+            .max(state.last().saturating_sub(self.capacity as u64 - 1).max(1))
             .min(state.last().saturating_add(1));
-        let count = if first > state.last() {
-            0
-        } else {
-            usize::try_from(state.last() - first + 1).unwrap_or(usize::MAX).min(self.slots.len())
-        };
         let previous_index = first - 1;
         let previous = state
             .history_at(previous_index)
             .ok_or_else(|| Error::new("missing retained log predecessor"))?;
-        for index in first..first + count as u64 {
+        let mut entries = Vec::new();
+        for index in first..=state.last() {
             let position = index
                 .checked_sub(state.snapshot.index)
                 .and_then(|value| value.checked_sub(1))
                 .and_then(|value| usize::try_from(value).ok())
                 .ok_or_else(|| Error::new("invalid retained log position"))?;
-            let entry = state
-                .log
-                .shared(position)
-                .ok_or_else(|| Error::new("missing retained log entry"))?;
-            self.slots[index as usize & self.mask] = Some(entry);
+            let entry =
+                state.log.get(position).ok_or_else(|| Error::new("missing retained log entry"))?;
+            entries.push(entry.clone());
         }
+        self.records.clear();
         self.first = first;
-        self.len = count;
+        self.len = 0;
+        self.end = first;
         self.previous = previous;
         self.primaries.clear();
-        if let Some(primary) = state.snapshot.primary {
+        let batch = Arc::new(vec![Record::Entries { from: first, entries }]);
+        self.push_batch(batch)?;
+        if first == state.snapshot.index.saturating_add(1)
+            && let Some(primary) = state.snapshot.primary
+        {
             self.add_primary(state.snapshot.term, primary)?;
         }
-        let through = first + count as u64;
-        for entry in state.log.iter().take_while(|entry| entry.index < through) {
+        self.seed_primaries(state)?;
+        Ok(())
+    }
+    fn reset_history(&mut self, history: RecordHistory, state: &State) -> Result<()> {
+        let mut retained = history.queue;
+        retained.capacity = self.capacity;
+        retained.trim_to_capacity(state)?;
+        retained.seed_primaries(state)?;
+        *self = retained;
+        Ok(())
+    }
+    fn seed_primaries(&mut self, state: &State) -> Result<()> {
+        let oldest = self.entry(self.first).map_or(self.previous.0, |entry| entry.term);
+        if state.snapshot.term >= oldest {
+            if let Some(primary) = state.snapshot.primary {
+                self.add_primary(state.snapshot.term, primary)?;
+            }
+        }
+        let end = self.end;
+        for entry in state.log.iter().filter(|entry| entry.index < end && entry.term >= oldest) {
             if let Command::Primary(primary) = entry.command {
                 self.add_primary(entry.term, primary)?;
             }
+        }
+        Ok(())
+    }
+    fn trim_to_capacity(&mut self, state: &State) -> Result<()> {
+        let first = state.last().saturating_sub(self.capacity as u64 - 1).max(1);
+        if first > self.first {
+            self.trim_before(first)?;
+        }
+        Ok(())
+    }
+    fn fill_state(&mut self, state: &State) -> Result<()> {
+        if self.end > state.last() {
+            return Ok(());
+        }
+        let from = self.end;
+        let mut entries = Vec::new();
+        for index in from..=state.last() {
+            let position = index
+                .checked_sub(state.snapshot.index)
+                .and_then(|value| value.checked_sub(1))
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| Error::new("invalid retained log position"))?;
+            entries.push(
+                state
+                    .log
+                    .get(position)
+                    .ok_or_else(|| Error::new("missing retained log entry"))?
+                    .clone(),
+            );
+        }
+        self.push_batch(Arc::new(vec![Record::Entries { from, entries }]))
+    }
+    fn push_batch(&mut self, batch: Arc<Vec<Record>>) -> Result<()> {
+        for at in 0..batch.len() {
+            let record = &batch[at];
+            match record {
+                Record::Entries { from, entries } if !entries.is_empty() => {
+                    if *from < self.end {
+                        self.truncate(*from)?;
+                    }
+                    if *from != self.end {
+                        return Err(Error::new("nonsequential retained entry record"));
+                    }
+                    for entry in entries {
+                        if entry.index != self.end {
+                            return Err(Error::new("nonsequential retained entry index"));
+                        }
+                        if let Command::Primary(primary) = entry.command {
+                            self.add_primary(entry.term, primary)?;
+                        }
+                        self.len += 1;
+                        self.end += 1;
+                    }
+                }
+                Record::Carry { entries, .. } if !entries.is_empty() => {
+                    for entry in entries {
+                        if entry.index < self.end {
+                            continue;
+                        }
+                        if entry.index != self.end {
+                            return Err(Error::new("nonsequential carried entry index"));
+                        }
+                        if let Command::Primary(primary) = entry.command {
+                            self.add_primary(entry.term, primary)?;
+                        }
+                        self.len += 1;
+                        self.end += 1;
+                    }
+                }
+                Record::Install(snapshot) => {
+                    self.records.clear();
+                    self.first = snapshot.index.saturating_add(1);
+                    self.end = self.first;
+                    self.len = 0;
+                    self.previous = (snapshot.term, snapshot.scn);
+                    self.primaries.clear();
+                    if let Some(primary) = snapshot.primary {
+                        self.primaries.push_back((snapshot.term, primary));
+                    }
+                }
+                _ => {}
+            }
+            let index = match record {
+                Record::Entries { entries, .. } => entries.last().map_or(self.end - 1, |e| e.index),
+                Record::Carry { entries, .. } => entries.last().map_or(self.end - 1, |e| e.index),
+                Record::Install(snapshot) => snapshot.index,
+                _ => self.end - 1,
+            };
+            self.records.push_back(QueuedRecord { entry: index, batch: Arc::clone(&batch), at });
+        }
+        Ok(())
+    }
+    fn rebuild_primaries(&mut self) -> Result<()> {
+        let last_term = if self.len == 0 {
+            self.previous.0
+        } else {
+            self.entry(self.end - 1).map_or(self.previous.0, |entry| entry.term)
+        };
+        let primaries = self
+            .primaries
+            .iter()
+            .copied()
+            .filter(|(term, _)| *term <= last_term)
+            .collect::<VecDeque<_>>();
+        let mut found = Vec::new();
+        for queued in &self.records {
+            match queued.record() {
+                Record::Entries { entries: values, .. } | Record::Carry { entries: values, .. } => {
+                    found.extend(values.iter().filter_map(|entry| match entry.command {
+                        Command::Primary(primary) if entry.index >= self.first => {
+                            Some((entry.term, primary))
+                        }
+                        _ => None,
+                    }));
+                }
+                Record::Install(snapshot) if snapshot.index.saturating_add(1) == self.first => {
+                    if let Some(primary) = snapshot.primary {
+                        found.push((snapshot.term, primary));
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.primaries = primaries;
+        for (term, primary) in found {
+            self.add_primary(term, primary)?;
         }
         Ok(())
     }
@@ -1312,7 +1522,7 @@ impl EntryRing {
                 };
             }
         }
-        let oldest = self.get(self.first).map_or(term, |entry| entry.term);
+        let oldest = self.entry(self.first).map_or(term, |entry| entry.term);
         while self.primaries.front().is_some_and(|(t, _)| *t < oldest) {
             self.primaries.pop_front();
         }
@@ -1322,75 +1532,129 @@ impl EntryRing {
     fn primary_for(&self, term: u64) -> Option<MemberId> {
         self.primaries.iter().find_map(|(t, member)| (*t == term).then_some(*member))
     }
-    fn end(&self) -> u64 {
-        self.first + self.len as u64
-    }
     fn evict(&mut self) {
         debug_assert!(self.len > 0);
-        let at = self.first as usize & self.mask;
-        let entry = self.slots[at].take().expect("retained log head");
-        debug_assert_eq!(entry.index, self.first);
-        self.previous = (entry.term, entry.scn);
+        let (term, scn) = {
+            let entry = self.entry(self.first).expect("retained journal entry");
+            (entry.term, entry.scn)
+        };
+        self.previous = (term, scn);
         self.first += 1;
         self.len -= 1;
+        while self.records.front().is_some_and(|record| record.entry < self.first) {
+            self.records.pop_front();
+        }
+        if let Some(oldest_term) = self.entry(self.first).map(|entry| entry.term) {
+            while self.primaries.front().is_some_and(|(term, _)| *term < oldest_term) {
+                self.primaries.pop_front();
+            }
+        }
     }
     fn make_room(&mut self, count: usize, through: u64) -> usize {
-        let wanted = count.min(self.slots.len());
-        while self.len + wanted > self.slots.len() && self.len > 0 && self.first <= through {
+        let wanted = count.min(self.capacity);
+        while self.len + wanted > self.capacity && self.len > 0 && self.first <= through {
             self.evict();
         }
-        self.slots.len().saturating_sub(self.len).min(count)
+        self.capacity.saturating_sub(self.len).min(count)
     }
-    fn fill(&mut self, state: &State) -> Result<()> {
-        while self.len < self.slots.len() && self.end() <= state.last() {
-            let index = self.end();
-            let position = index
-                .checked_sub(state.snapshot.index)
-                .and_then(|value| value.checked_sub(1))
-                .and_then(|value| usize::try_from(value).ok())
-                .ok_or_else(|| Error::new("invalid retained log position"))?;
-            let entry = state
-                .log
-                .shared(position)
-                .ok_or_else(|| Error::new("missing retained log entry"))?;
-            self.push(entry)?;
+    fn truncate(&mut self, from: u64) -> Result<()> {
+        if from >= self.end {
+            return Ok(());
+        }
+        if from < self.first {
+            return Err(Error::new("retained record truncation precedes its window"));
+        }
+        let mut kept = VecDeque::new();
+        for queued in self.records.drain(..) {
+            if queued.entry < from {
+                kept.push_back(queued);
+                continue;
+            }
+            let prefix = match queued.record() {
+                Record::Entries { from: start, entries } => {
+                    let before = entries
+                        .iter()
+                        .take_while(|entry| entry.index < from)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    (!before.is_empty()).then(|| Record::Entries { from: *start, entries: before })
+                }
+                Record::Carry { entries, commit } => {
+                    let before = entries
+                        .iter()
+                        .take_while(|entry| entry.index < from)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    (!before.is_empty()).then(|| Record::Carry { entries: before, commit: *commit })
+                }
+                _ => None,
+            };
+            if let Some(record) = prefix {
+                let batch = Arc::new(vec![record]);
+                kept.push_back(QueuedRecord { entry: from - 1, batch, at: 0 });
+            }
+            break;
+        }
+        self.records = kept;
+        self.end = from;
+        self.len = (self.end - self.first) as usize;
+        self.rebuild_primaries()
+    }
+    fn trim_before(&mut self, first: u64) -> Result<()> {
+        let first = first.max(self.first).min(self.end);
+        if first == self.first {
+            return Ok(());
+        }
+        let (term, scn) = {
+            let previous = self
+                .entry(first - 1)
+                .ok_or_else(|| Error::new("missing retained journal predecessor"))?;
+            (previous.term, previous.scn)
+        };
+        self.previous = (term, scn);
+        self.first = first;
+        self.len = (self.end - first) as usize;
+        while self.records.front().is_some_and(|record| record.entry < self.first) {
+            self.records.pop_front();
+        }
+        if let Some(oldest_term) = self.entry(self.first).map(|entry| entry.term) {
+            while self.primaries.front().is_some_and(|(term, _)| *term < oldest_term) {
+                self.primaries.pop_front();
+            }
         }
         Ok(())
     }
-    fn truncate(&mut self, from: u64) {
-        if from >= self.end() {
-            return;
-        }
-        debug_assert!(from >= self.first);
-        while self.end() > from {
-            let at = (self.end() - 1) as usize & self.mask;
-            self.slots[at] = None;
-            self.len -= 1;
-        }
+    fn end(&self) -> u64 {
+        self.end
     }
-    fn push(&mut self, entry: Arc<Entry>) -> Result<()> {
-        if self.len == self.slots.len() || entry.index != self.end() {
-            return Err(Error::new("retained log is full or nonsequential"));
-        }
-        if let Command::Primary(primary) = entry.command {
-            self.add_primary(entry.term, primary)?;
-        }
-        let at = entry.index as usize & self.mask;
-        self.slots[at] = Some(entry);
-        self.len += 1;
-        Ok(())
+    fn record_at(&self, index: u64) -> usize {
+        self.records.partition_point(|record| record.entry < index)
     }
-    fn get(&self, index: u64) -> Option<&Arc<Entry>> {
-        if index < self.first || index >= self.end() {
+    fn entry(&self, index: u64) -> Option<&Entry> {
+        if index < self.first || index >= self.end {
             return None;
         }
-        self.slots[index as usize & self.mask].as_ref()
+        for queued in self.records.iter().skip(self.record_at(index)) {
+            let entry = match queued.record() {
+                Record::Entries { entries, .. } | Record::Carry { entries, .. } => {
+                    entries.iter().find(|entry| entry.index == index)
+                }
+                _ => None,
+            };
+            if entry.is_some() {
+                return entry;
+            }
+            if queued.entry > index {
+                break;
+            }
+        }
+        None
     }
     fn tip(&self, index: u64) -> Option<(u64, Scn)> {
         if index.checked_add(1) == Some(self.first) {
             Some(self.previous)
         } else {
-            self.get(index).map(|entry| (entry.term, entry.scn))
+            self.entry(index).map(|entry| (entry.term, entry.scn))
         }
     }
     fn suffix(
@@ -1406,8 +1670,9 @@ impl EntryRing {
         }
         let (previous_term, previous_scn) = self.tip(after)?;
         let end = last.min(after.checked_add(128)?);
-        let entries =
-            (after + 1..=end).map(|index| self.get(index).cloned()).collect::<Option<Vec<_>>>()?;
+        let entries = (after + 1..=end)
+            .map(|index| self.entry(index).cloned().map(Arc::new))
+            .collect::<Option<Vec<_>>>()?;
         Some(crate::journal::CommittedJournal {
             ring: ring.to_owned(),
             after,
@@ -1434,7 +1699,7 @@ pub struct Node<S: Storage = Journal> {
     pub contact: u64,
     pub leader_contact: Option<std::time::Instant>,
     pub lease: crate::lease::Lease,
-    retained: EntryRing,
+    retained: RecordQueue,
     applied: Option<Arc<AtomicU64>>,
     applying_state: bool,
     #[cfg(any(test, feature = "testing"))]
@@ -1448,11 +1713,12 @@ impl<S: Storage> Node<S> {
     pub fn new(id: MemberId, journal: S) -> Self {
         Self::new_with_log2(id, journal, 16).expect("default retained log size is valid")
     }
-    pub fn new_with_log2(id: MemberId, journal: S, log2_entries: u8) -> Result<Self> {
+    pub fn new_with_log2(id: MemberId, mut journal: S, log2_entries: u8) -> Result<Self> {
         if !(1..=27).contains(&log2_entries) {
             return Err(Error::new("Raft log2_entries must be between 1 and 27"));
         }
-        let retained = EntryRing::from_state(journal.state(), log2_entries)?;
+        let history = journal.take_records(log2_entries)?;
+        let retained = RecordQueue::from_history(history, journal.state(), log2_entries)?;
         Ok(Self {
             #[cfg(any(test, feature = "testing"))]
             scn_clock: journal.state().largest_scn().unwrap_or(Scn::new(0)),
@@ -1490,21 +1756,24 @@ impl<S: Storage> Node<S> {
         self.reset_retained_for_mode()
     }
     fn reset_retained_for_mode(&mut self) -> Result<()> {
+        self.absorb_aux_records()?;
         let active = self.role == Role::Leader || self.applying_state;
         let applied = self.applied.as_ref().map_or(0, |value| value.load(Ordering::Acquire));
         let state = self.journal.state();
         if active {
-            self.retained.reset_from(state, applied.saturating_add(1))
+            self.retained.trim_before(applied.saturating_add(1))
         } else {
-            self.retained.reset(state)
+            let first = state.last().saturating_sub(self.retained.capacity as u64 - 1).max(1);
+            self.retained.trim_before(first)
         }
     }
     pub(crate) fn reset_retained(&mut self) -> Result<()> {
         self.reset_retained_for_mode()
     }
     pub fn refresh_retained(&mut self) -> Result<()> {
+        self.absorb_aux_records()?;
         if self.retained.first <= self.journal.state().snapshot.index {
-            self.reset_retained_for_mode()?;
+            self.retained.trim_before(self.journal.state().snapshot.index.saturating_add(1))?;
         }
         let state = self.journal.state();
         let active = self.role == Role::Leader || self.applying_state;
@@ -1512,24 +1781,38 @@ impl<S: Storage> Node<S> {
             let tail = state.log.len().checked_sub(1).and_then(|at| state.log.shared(at));
             let matches = self.retained.end() == state.last().saturating_add(1)
                 && tail.is_none_or(|entry| {
-                    self.retained
-                        .get(entry.index)
-                        .is_some_and(|retained| Arc::ptr_eq(retained, &entry))
+                    self.retained.entry(entry.index).is_some_and(|retained| {
+                        retained.index == entry.index
+                            && retained.term == entry.term
+                            && retained.scn == entry.scn
+                    })
                 });
             if !matches {
-                self.retained.reset(state)?;
+                let first = state.last().saturating_sub(self.retained.capacity as u64 - 1).max(1);
+                self.retained.reset_from(state, first)?;
             }
             return Ok(());
         }
         let through = self.evict_through();
         let retained = &mut self.retained;
-        while retained.len == retained.slots.len()
-            && retained.end() <= state.last()
+        while retained.len == retained.capacity
             && retained.first <= through
+            && retained.end() <= state.last()
         {
             retained.evict();
         }
-        retained.fill(state)?;
+        if retained.end() <= state.last() {
+            retained.fill_state(state)?;
+        }
+        Ok(())
+    }
+    fn absorb_aux_records(&mut self) -> Result<()> {
+        let batches = self.journal.take_aux_records();
+        let state = self.journal.state();
+        for batch in batches {
+            self.retained.push_batch(batch)?;
+            self.retained.trim_to_capacity(state)?;
+        }
         Ok(())
     }
     /// Drop entries only through the state boundary this replica has completed.
@@ -1542,14 +1825,13 @@ impl<S: Storage> Node<S> {
         if self.role != Role::Leader && !self.applying_state {
             return Ok(self.retained.make_room(count, through));
         }
-        let wanted = count.min(self.retained.slots.len());
+        let wanted = count.min(self.retained.capacity);
         loop {
-            let free = self.retained.slots.len() - self.retained.len;
+            let free = self.retained.capacity - self.retained.len;
             if free >= wanted || self.retained.first > through {
                 return Ok(free.min(count));
             }
             self.retained.evict();
-            self.retained.fill(self.journal.state())?;
         }
     }
     fn evict_through(&self) -> u64 {
@@ -1571,11 +1853,7 @@ impl<S: Storage> Node<S> {
         if entry.index != index {
             return None;
         }
-        self.retained
-            .get(index)
-            .filter(|retained| Arc::ptr_eq(retained, entry))
-            .cloned()
-            .or_else(|| Some(Arc::clone(entry)))
+        Some(Arc::clone(entry))
     }
     pub fn shared_entry(&self, index: u64) -> Option<Arc<Entry>> {
         self.shared_entry_in(self.state(), index)
@@ -1584,7 +1862,7 @@ impl<S: Storage> Node<S> {
         self.retained.primary_for(term)
     }
     pub fn entry_capacity(&self) -> usize {
-        self.retained.slots.len()
+        self.retained.capacity
     }
     pub fn state(&self) -> &State {
         self.journal.state()
@@ -1641,7 +1919,8 @@ impl<S: Storage> Node<S> {
             common::scn::try_next()
         }
     }
-    fn persist(&mut self, records: Vec<Record>) -> Result<()> {
+    pub(crate) fn persist(&mut self, records: Vec<Record>) -> Result<()> {
+        self.absorb_aux_records()?;
         let membership_changed = records.iter().any(|record| match record {
             Record::Bootstrap(_)
             | Record::Install(_)
@@ -1667,34 +1946,35 @@ impl<S: Storage> Node<S> {
             }
         }
         let previous_commit = self.state().commit;
-        self.journal.write_owned(records)?;
+        let queued_batch = self.journal.write_owned(records)?;
         let snapshot_index = self.journal.state().snapshot.index;
-        if installed
-            || self.retained.first <= snapshot_index
-            || self.retained.end() <= snapshot_index
-        {
-            self.reset_retained_for_mode()?;
+        if installed {
+            self.retained.push_batch(queued_batch)?;
         } else {
-            let mut reset = false;
-            {
-                let state = self.journal.state();
-                for from in changed_from {
-                    if from < self.retained.end() {
-                        if from < self.retained.first {
-                            reset = true;
-                            break;
-                        }
-                        self.retained.truncate(from);
-                    }
+            let changed = changed_from.into_iter().filter(|from| *from < self.retained.end()).min();
+            if let Some(from) = changed {
+                if from < self.retained.first {
+                    let state = self.journal.state();
+                    let previous_index = from.saturating_sub(1);
+                    let previous = state
+                        .history_at(previous_index)
+                        .ok_or_else(|| Error::new("missing replacement predecessor"))?;
+                    let mut history =
+                        RecordHistory::new((previous_index, previous), self.retained.capacity)?;
+                    history.push_batch(queued_batch, state)?;
+                    self.retained.reset_history(history, state)?;
+                } else {
+                    self.retained.truncate(from)?;
+                    self.retained.push_batch(queued_batch)?;
                 }
-                if !reset {
-                    self.retained.fill(state)?;
-                }
-            }
-            if reset {
-                self.reset_retained_for_mode()?;
+            } else {
+                self.retained.push_batch(queued_batch)?;
             }
         }
+        if self.retained.first <= snapshot_index {
+            self.retained.trim_before(snapshot_index.saturating_add(1))?;
+        }
+        self.retained.trim_to_capacity(self.journal.state())?;
         for (index, term, scn) in accepted {
             common::logn!(
                 "Raft entry accepted",
@@ -2646,19 +2926,22 @@ pub mod tests {
             .collect();
         state.apply(&Record::Entries { from: 1, entries }).unwrap();
         state.apply(&Record::Commit(3)).unwrap();
-        let mut ring = EntryRing::from_state(&state, 1).unwrap();
+        let mut ring = RecordQueue::from_state(&state, 1).unwrap();
         assert_eq!(ring.first, 2);
         assert_eq!(ring.primary_for(1), Some(0));
         ring.evict();
         ring.evict();
         assert_eq!(ring.primary_for(1), Some(0));
-        ring.push(Arc::new(Entry {
-            scn: Scn::new(4),
-            index: 4,
-            term: 2,
-            command: Command::Primary(1),
-            entry_buf: None,
-        }))
+        ring.push_batch(Arc::new(vec![Record::Entries {
+            from: 4,
+            entries: vec![Entry {
+                scn: Scn::new(4),
+                index: 4,
+                term: 2,
+                command: Command::Primary(1),
+                entry_buf: None,
+            }],
+        }]))
         .unwrap();
         assert_eq!(ring.primary_for(1), None);
         assert_eq!(ring.primary_for(2), Some(1));
@@ -3121,8 +3404,8 @@ pub mod tests {
         primary.campaign().unwrap();
         assert_eq!(primary.state().commit, 1);
 
-        let original = primary.retained.get(1).unwrap().clone();
-        assert!(Arc::ptr_eq(&original, &primary.state().log.shared(0).expect("state entry")));
+        let original = primary.retained.entry(1).unwrap().clone();
+        assert_eq!(original.index, primary.state().log[0].index);
         assert_eq!(primary.propose(Command::Noop).unwrap(), 2);
         assert!(primary.propose(Command::Noop).is_err());
 
@@ -3131,10 +3414,7 @@ pub mod tests {
         assert_eq!(primary.retained_tip(1), Some((original.term, original.scn)));
         let suffix = primary.retained_suffix(1, 3).unwrap();
         assert_eq!(suffix.entries.iter().map(|entry| entry.index).collect::<Vec<_>>(), [2, 3]);
-        assert!(Arc::ptr_eq(
-            &suffix.entries[0],
-            &primary.state().log.shared(1).expect("state entry")
-        ));
+        assert_eq!(suffix.entries[0].index, primary.state().log[1].index);
         let wire = crate::codec::encode(&suffix).unwrap();
         let decoded: crate::journal::CommittedJournal = crate::codec::decode(&wire).unwrap();
         assert_eq!(decoded.entries[0].index, 2);
@@ -3208,8 +3488,8 @@ pub mod tests {
                 assert_eq!(answer.matched, 3, "cold replica reclaims through commit");
             }
             assert_eq!(follower.retained.first, 2);
-            assert_eq!(follower.retained.get(2).unwrap().index, 2);
-            assert_eq!(follower.retained.get(3).unwrap().index, 3);
+            assert_eq!(follower.retained.entry(2).unwrap().index, 2);
+            assert_eq!(follower.retained.entry(3).unwrap().index, 3);
         }
     }
     #[test]
