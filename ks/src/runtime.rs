@@ -10,7 +10,7 @@ pub fn needs_request_worker(request: &Req) -> bool {
     request.op() == Op::Register || raft::runtime::needs_request_worker(request)
 }
 /// Public routing projection, retained even when this member is locked/cold.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Registrations {
     pub peers: BTreeMap<String, Peer>,
 }
@@ -51,14 +51,6 @@ pub(super) fn apply_state(
     action: &raft::Action,
 ) -> Result<()> {
     apply_action(&mut state.keys, key, context, action)
-}
-fn has_keys(state: &State) -> bool {
-    state
-        .snapshot
-        .application
-        .iter()
-        .chain(state.log.iter().filter(|e| e.index <= state.commit))
-        .any(|e| e.client_actions().is_ok_and(|actions| actions.iter().any(|a| a.op == Op::KsKey)))
 }
 struct KeyFields {
     key: [u8; 32],
@@ -123,14 +115,36 @@ pub fn decode_history(state: &State, key: &[u8; 32]) -> Result<(KeyHistory, u64)
     apply_history(state, key, &mut history, &applied)?;
     Ok((history, applied.load(Ordering::Acquire)))
 }
+pub fn decode_history_from(
+    state: &State,
+    key: &[u8; 32],
+    mut history: KeyHistory,
+    start: u64,
+) -> Result<(KeyHistory, u64)> {
+    if start > state.commit || (start != 0 && start < state.snapshot.index) {
+        return Err(Error::new("invalid KS checkpoint application index"));
+    }
+    let applied = AtomicU64::new(start);
+    apply_history_from(state, key, &mut history, &applied, start)?;
+    Ok((history, applied.load(Ordering::Acquire)))
+}
 fn apply_history(
     state: &State,
     key: &[u8; 32],
     history: &mut KeyHistory,
     applied: &AtomicU64,
 ) -> Result<()> {
+    apply_history_from(state, key, history, applied, 0)
+}
+fn apply_history_from(
+    state: &State,
+    key: &[u8; 32],
+    history: &mut KeyHistory,
+    applied: &AtomicU64,
+    start: u64,
+) -> Result<()> {
     let global = parking_lot::RwLock::new(std::mem::take(history));
-    let progress = Mutex::new(raft::execution::Cursor::default());
+    let progress = Mutex::new(raft::execution::Cursor::new(state.generation, start));
     let result = raft::execution::execute(
         &global,
         &progress,
@@ -223,10 +237,14 @@ impl Ks {
         Ok(())
     }
     pub fn initial_key(&self, node: &mut Node) -> Result<()> {
-        if node.role != Role::Leader
-            || node.state().last() != node.state().commit
-            || has_keys(node.state())
-        {
+        if node.role != Role::Leader || node.state().last() != node.state().commit {
+            return Ok(());
+        }
+        let application_has_key = match self.global_lock.try_read() {
+            Some(application) => !application.keys.epochs.is_empty(),
+            None => return Ok(()),
+        };
+        if application_has_key {
             return Ok(());
         }
         let Some(key) = *self.unlock_key.lock().map_err(|_| Error::new("unlock lock poisoned"))?
@@ -241,8 +259,12 @@ impl Ks {
         Ok(())
     }
     pub fn propose_key(&self, epoch: MasterEpoch) -> Result<u64> {
+        let _proposal = self.proposing.lock().map_err(|_| Error::new("proposal lock poisoned"))?;
+        let commit = self.on_raft(|_, node| Ok(node.state().commit))?;
+        self.wait_applied(commit)?;
+        let last_since = self.global_lock.read().keys.epochs.last().map(|last| last.since);
         let index = self.on_raft(move |host, node| {
-            if node.state().last() != node.state().commit {
+            if node.state().last() != node.state().commit || node.state().commit != commit {
                 return Err(Error::new(
                     "KS has an outstanding Raft proposal; retry after it commits",
                 ));
@@ -252,8 +274,7 @@ impl Ks {
                 .lock()
                 .map_err(|_| Error::new("unlock lock poisoned"))?
                 .ok_or_else(|| Error::new("KS is locked"))?;
-            let (history, _) = decode_history(node.state(), &key)?;
-            if history.epochs.last().is_some_and(|last| last.since >= epoch.since) {
+            if last_since.is_some_and(|since| since >= epoch.since) {
                 return Err(Error::new(
                     "new key activation must be later than the last recorded activation",
                 ));
@@ -307,8 +328,33 @@ impl Host for Ks {
             .ok_or_else(|| Error::new("KS locked"))?;
         apply_state(state, &key, context, action)
     }
-    fn checkpoint_actions(&self, state: &State, _history: &KsState) -> Result<Vec<Entry>> {
-        Ok(state.capture().application)
+    fn checkpoint_actions(&self, _state: &State, _history: &KsState) -> Result<Vec<Entry>> {
+        // KS state is serialized in its checkpoint; journal retention lives in Raft.
+        Ok(Vec::new())
+    }
+    fn can_checkpoint(&self, state: &State) -> bool {
+        // A compact KS checkpoint cannot be sent as a generic Raft snapshot.
+        state.snapshot.index == 0 && self.checkpoint.is_none()
+    }
+    fn checkpoint_writer<'a>(
+        &self,
+        state: &State,
+        snapshot: &raft::Snapshot,
+        application: &'a KsState,
+        mark: raft::journal::CheckpointMark,
+        now: u64,
+    ) -> Result<Option<raft::journal::CheckpointWriter<'a>>> {
+        let key = self
+            .unlock_key
+            .lock()
+            .map_err(|_| Error::new("unlock lock poisoned"))?
+            .ok_or_else(|| Error::new("KS locked during checkpoint"))?;
+        let mark = checkpoint::Mark::capture(state, snapshot, mark.sequence(), now)?;
+        let verifier = self.unlock_verifier;
+        let random = super::random_master_key()?;
+        Ok(Some(Box::new(move |file| {
+            checkpoint::write(file, &mark, application, verifier, &key, random)
+        })))
     }
     fn prepare_primary(&self, node: &mut Node) -> Result<()> {
         self.initial_key(node)
@@ -399,7 +445,7 @@ mod tests {
         });
         state.commit = 1;
         let (before_commit, _) = routes(&state);
-        let key_present = has_keys(&state);
+        let key_present = !before_commit.keys.epochs.is_empty();
         assert_eq!(before_commit.registrations.peers["KS0-member1"], peer(9001));
         assert!(!key_present); // A registration must not suppress initial-key creation.
         let snapshot = state.capture();
@@ -429,7 +475,6 @@ mod tests {
         let (unlocked, _) = decode_history(&state, &key).unwrap();
         assert_eq!(locked.registrations.peers["KS0-member1"], peer(9002));
         assert_eq!(unlocked.epochs[0].key, epoch.key);
-        assert!(has_keys(&state));
     }
     #[test]
     fn registration_decoder_rejects_malformed_actions() {

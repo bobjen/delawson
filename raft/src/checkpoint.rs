@@ -1,6 +1,101 @@
 //! Fixed checkpoint footer and its variable-sized footer.
+use crate::raft::{MemberId, MemberNames, Membership, Retirement};
+use common::scn::Scn;
 use common::{Error, Op, Result};
+use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
+
+/// Raft's portion of a service checkpoint's variable footer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RaftStatus {
+    pub ring: String,
+    pub index: u64,
+    pub term: u64,
+    pub scn: Scn,
+    pub primary: Option<MemberId>,
+    pub membership: Membership,
+    pub checkpoint_start: Option<(u64, MemberId)>,
+    pub hard_term: u64,
+    pub vote: Option<MemberId>,
+    pub vote_scn: Option<Scn>,
+    pub founders: Option<Membership>,
+    pub contacts: MemberNames,
+    pub retirements: BTreeMap<MemberId, Retirement>,
+    pub max_scn: Option<Scn>,
+}
+crate::wire_struct!(RaftStatus, RaftCkStatus, {
+    ring,index,term,scn,primary,membership,checkpoint_start,hard_term,vote,vote_scn,founders,contacts,retirements,max_scn
+});
+
+impl RaftStatus {
+    pub fn capture(state: &crate::State, snapshot: &crate::Snapshot) -> Result<Self> {
+        let status = Self {
+            ring: snapshot.ring.clone(),
+            index: snapshot.index,
+            term: snapshot.term,
+            scn: snapshot.scn,
+            primary: snapshot.primary,
+            membership: snapshot.membership.clone(),
+            checkpoint_start: snapshot.checkpoint_start,
+            hard_term: state.term,
+            vote: state.vote,
+            vote_scn: state.vote_scn,
+            founders: state.founders.clone(),
+            contacts: state.contacts.clone(),
+            retirements: state.retirements.clone(),
+            max_scn: state.max_scn,
+        };
+        status.validate()?;
+        Ok(status)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let snapshot = self.snapshot();
+        snapshot.validate()?;
+        if let Some(founders) = &self.founders {
+            founders.validate()?;
+        } else if self.index != 0 {
+            return Err(Error::new("checkpoint missing founders"));
+        }
+        for (id, retirement) in &self.retirements {
+            retirement.validate()?;
+            if *id != retirement.previous {
+                return Err(Error::new("invalid checkpoint retirement"));
+            }
+        }
+        if self.index == 0 && self.primary.is_some() {
+            return Err(Error::new("primary at empty checkpoint"));
+        }
+        if self.primary.is_some_and(|id| !self.membership.identities.contains_key(&id)) {
+            return Err(Error::new("unknown checkpoint primary"));
+        }
+        if self.index != 0 && self.max_scn.is_none_or(|max| max.compare(self.scn).is_lt()) {
+            return Err(Error::new("checkpoint SCN exceeds high-water"));
+        }
+        if self.hard_term < self.term
+            || self.vote.is_some() != self.vote_scn.is_some()
+            || self
+                .vote_scn
+                .is_some_and(|scn| self.max_scn.is_none_or(|max| scn.compare(max).is_gt()))
+        {
+            return Err(Error::new("invalid checkpoint hard state"));
+        }
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> crate::Snapshot {
+        crate::Snapshot {
+            scn: self.scn,
+            ring: self.ring.clone(),
+            index: self.index,
+            term: self.term,
+            primary: self.primary,
+            membership: self.membership.clone(),
+            application: vec![],
+            checkpoint_start: self.checkpoint_start,
+        }
+    }
+}
 
 const TAIL: u64 = 64 * 1024;
 const END_SIZE: u64 = 20;

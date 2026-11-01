@@ -80,6 +80,10 @@ pub(crate) fn checkpoint_install(
 }
 const LIMIT: usize = 64 * 1024 * 1024;
 
+/// Load a service-specific checkpoint into the common Raft state and boundary.
+pub type CheckpointReader = fn(&Path, u64, &str, bool) -> Result<(State, u64, u64, u64)>;
+pub type CheckpointWriter<'a> = Box<dyn FnOnce(&mut File) -> Result<()> + Send + 'a>;
+
 struct Frame {
     sequence: u64,
     records: Vec<Record>,
@@ -194,6 +198,11 @@ struct Checkpoint {
 pub struct CheckpointMark {
     sequence: u64,
     log_bytes: u64,
+}
+impl CheckpointMark {
+    pub fn sequence(self) -> u64 {
+        self.sequence
+    }
 }
 
 impl Checkpoint {
@@ -392,6 +401,7 @@ pub struct Journal {
     pub identity: LocalIdentity,
     pub state: State,
     directory: PathBuf,
+    checkpoint_reader: CheckpointReader,
     bootstrap_pending: bool,
     disk: Arc<Disk>,
     io: Option<crate::io::Queue>,
@@ -475,6 +485,15 @@ impl crate::raft::Storage for Journal {
 }
 impl Journal {
     pub fn open(directory: &Path, initial: State, retain: usize, member: &str) -> Result<Self> {
+        Self::open_with_reader(directory, initial, retain, member, read_checkpoint)
+    }
+    pub fn open_with_reader(
+        directory: &Path,
+        initial: State,
+        retain: usize,
+        member: &str,
+        checkpoint_reader: CheckpointReader,
+    ) -> Result<Self> {
         let ignore = initial.ignore_ring_identity;
         if retain == 0 {
             return Err(Error::new("snapshot_retain must be positive"));
@@ -534,7 +553,7 @@ impl Journal {
         }
         let mut chosen = None;
         for (seq, path) in snapshots.iter().rev() {
-            match read_checkpoint(path, *seq, &initial.ring, ignore) {
+            match checkpoint_reader(path, *seq, &initial.ring, ignore) {
                 Ok(value) => {
                     chosen = Some(value);
                     break;
@@ -666,6 +685,7 @@ impl Journal {
             durable: state.clone(),
             state,
             directory: directory.into(),
+            checkpoint_reader,
             bootstrap_pending,
             disk: Arc::new(Disk {
                 ownership: Mutex::new(ownership),
@@ -691,6 +711,12 @@ impl Journal {
         };
         result.prune()?;
         Ok(result)
+    }
+    pub fn checkpoint_sequence(&self) -> u64 {
+        self.snapshot_sequence
+    }
+    pub fn checkpoint_path(&self) -> PathBuf {
+        named(&self.directory, "snapshot", self.snapshot_sequence)
     }
     pub fn start_io(&mut self, wake: impl Fn() + Send + Sync + 'static) -> Result<()> {
         if self.io.is_some() {
@@ -821,6 +847,7 @@ impl Journal {
             state: self.state.clone(),
             directory: self.directory.clone(),
             active_start: self.active_start,
+            checkpoint_reader: self.checkpoint_reader,
         }
     }
     pub(crate) fn read_history<R: Send + 'static>(
@@ -1103,10 +1130,12 @@ impl Journal {
         let write_stats = stats.clone();
         let write_identity = identity.clone().unwrap_or_else(|| self.identity.clone());
         let durable_write = durable.clone();
+        let checkpoint_reader = self.checkpoint_reader;
         let result = self.perform(crate::io::Kind::Ordered, move |disk| {
             let (active_bytes, log_bytes, final_sequence, active_start, identity) =
                 rewrite_journals(
                     &directory,
+                    checkpoint_reader,
                     &ring,
                     ignore,
                     oldest,
@@ -1373,6 +1402,7 @@ pub(crate) struct History {
     state: State,
     directory: PathBuf,
     active_start: u64,
+    checkpoint_reader: CheckpointReader,
 }
 impl History {
     // Replays retained files with the same sequence and predecessor checks as restart.
@@ -1383,9 +1413,12 @@ impl History {
             // Retained closed journals can outlive their in-memory entries.
             let mut base = None;
             for (sequence, path) in numbered(&self.directory, "snapshot")?.into_iter().rev() {
-                if let Ok(value) =
-                    read_checkpoint(&path, sequence, &state.ring, state.ignore_ring_identity)
-                {
+                if let Ok(value) = (self.checkpoint_reader)(
+                    &path,
+                    sequence,
+                    &state.ring,
+                    state.ignore_ring_identity,
+                ) {
                     if value.0.snapshot.index <= after {
                         base = Some(value);
                         break;
@@ -1484,7 +1517,7 @@ fn quarantine(path: &Path, reason: &str) -> Result<()> {
     eprintln!("preserved corrupt Raft file {}: {reason}", destination.display());
     Ok(())
 }
-fn read_checkpoint(
+pub fn read_checkpoint(
     path: &Path,
     sequence: u64,
     ring: &str,
@@ -1539,6 +1572,7 @@ fn filter_suffix(record: Record, from: u64) -> Option<Record> {
 /// identity pointer moves back before later segment files are removed.
 fn rewrite_journals(
     directory: &Path,
+    checkpoint_reader: CheckpointReader,
     ring: &str,
     ignore: bool,
     oldest_snapshot: u64,
@@ -1551,7 +1585,7 @@ fn rewrite_journals(
     disk: &Disk,
 ) -> Result<(u64, u64, u64, u64, LocalIdentity)> {
     let checkpoint = named(directory, "snapshot", oldest_snapshot);
-    let (mut state, _, _, _) = read_checkpoint(&checkpoint, oldest_snapshot, ring, ignore)?;
+    let (mut state, _, _, _) = checkpoint_reader(&checkpoint, oldest_snapshot, ring, ignore)?;
     let files: Vec<_> = numbered(directory, "journal")?
         .into_iter()
         .filter(|(start, _)| *start > oldest_snapshot && *start <= active_start)
@@ -2079,6 +2113,15 @@ impl PendingSnapshot {
         self.written_bytes.store(bytes.len() as u64, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
+    pub fn write_with(
+        &self,
+        cancelled: impl Fn() -> bool,
+        writer: CheckpointWriter<'_>,
+    ) -> Result<()> {
+        let length = publish_custom(&self.path, writer, cancelled)?;
+        self.written_bytes.store(length, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
 }
 fn serialize_contiguous(frame: &Frame) -> Result<Vec<u8>> {
     let bytes = encode(frame)?;
@@ -2259,6 +2302,37 @@ fn publish_cancellable(path: &Path, bytes: &[u8], cancelled: impl Fn() -> bool) 
         check()?;
         std::fs::rename(&temporary, path)?;
         sync_directory(path.parent().unwrap_or(Path::new(".")))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+fn publish_custom(
+    path: &Path,
+    writer: CheckpointWriter<'_>,
+    cancelled: impl Fn() -> bool,
+) -> Result<u64> {
+    let check = || {
+        if cancelled() {
+            Err(Error::new("checkpoint cancelled after election victory"))
+        } else {
+            Ok(())
+        }
+    };
+    let temporary = path.with_extension(format!("{}.tmp", common::shamir::hex(&random_bytes()?)));
+    let result = (|| -> Result<u64> {
+        let mut file =
+            OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+        check()?;
+        writer(&mut file)?;
+        check()?;
+        let length = file.metadata()?.len();
+        file.sync_all()?;
+        check()?;
+        std::fs::rename(&temporary, path)?;
+        sync_directory(path.parent().unwrap_or(Path::new(".")))?;
+        Ok(length)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(temporary);

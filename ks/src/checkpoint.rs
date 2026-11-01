@@ -1,66 +1,100 @@
-//! Standalone KS checkpoint codec; not yet used by the running service.
+//! KS application checkpoint codec.
 use super::{KeyHistory, KsState, MasterEpoch, Peer, TimeSec};
 use common::scn::Scn;
 use common::{Error, Op, Result};
 use raft::codec;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 #[derive(Clone)]
 pub(super) struct Mark {
-    pub ring: String,
+    pub raft: raft::checkpoint::RaftStatus,
     pub sequence: u64,
     pub second: u64,
-    pub index: u64,
-    pub term: u64,
-    pub scn: Scn,
-    pub primary: Option<raft::MemberId>,
-    pub membership: raft::Membership,
-    pub founders: Option<raft::Membership>,
-    pub contacts: raft::MemberNames,
-    pub retirements: BTreeMap<raft::MemberId, raft::Retirement>,
-    pub checkpoint_start: Option<(u64, raft::MemberId)>,
-    pub max_scn: Option<Scn>,
 }
-raft::wire_struct!(Mark, KsCkMark, {ring,sequence,second,index,term,scn,primary,membership,founders,contacts,retirements,checkpoint_start,max_scn});
 
 impl Mark {
     fn validate(&self) -> Result<()> {
-        common::ring::RingIdentity::try_from(self.ring.clone())?;
-        let snapshot = raft::Snapshot {
-            ring: self.ring.clone(),
-            index: self.index,
-            term: self.term,
-            scn: self.scn,
-            primary: self.primary,
-            membership: self.membership.clone(),
-            application: vec![],
-            checkpoint_start: self.checkpoint_start,
-        };
-        snapshot.validate()?;
-        if let Some(founders) = &self.founders {
-            founders.validate()?;
-        } else if self.index != 0 {
-            return Err(Error::new("checkpoint missing founders"));
-        }
-        for (id, retirement) in &self.retirements {
-            retirement.validate()?;
-            if *id != retirement.previous {
-                return Err(Error::new("invalid checkpoint retirement"));
-            }
-        }
-        if self.index == 0 && self.primary.is_some() {
-            return Err(Error::new("primary at empty checkpoint"));
-        }
-        if self.primary.is_some_and(|id| !self.membership.identities.contains_key(&id)) {
-            return Err(Error::new("unknown checkpoint primary"));
-        }
-        if self.index != 0 && self.max_scn.is_none_or(|max| max.compare(self.scn).is_lt()) {
-            return Err(Error::new("checkpoint SCN exceeds high-water"));
-        }
-        Ok(())
+        self.raft.validate()
     }
+
+    pub(super) fn capture(
+        state: &raft::State,
+        snapshot: &raft::Snapshot,
+        sequence: u64,
+        second: u64,
+    ) -> Result<Self> {
+        let mark = Self {
+            raft: raft::checkpoint::RaftStatus::capture(state, snapshot)?,
+            sequence,
+            second,
+        };
+        mark.validate()?;
+        Ok(mark)
+    }
+}
+
+/// Read a KS checkpoint into Raft state, or use the generic format for older files.
+pub(super) fn read_raft(
+    path: &Path,
+    sequence: u64,
+    ring: &str,
+    ignore: bool,
+) -> Result<(raft::State, u64, u64, u64)> {
+    let mut file = File::open(path)?;
+    let is_ks =
+        raft::checkpoint::read_footer(&mut file).is_ok_and(|footer| footer.op == Op::KsCkFooter);
+    if !is_ks {
+        return raft::journal::read_checkpoint(path, sequence, ring, ignore);
+    }
+    let public = read_public(&mut file)?;
+    let mark = public.mark;
+    let status = mark.raft;
+    if mark.sequence != sequence || (!ignore && status.ring != ring) {
+        return Err(Error::new("KS checkpoint ring or sequence mismatch"));
+    }
+    let second = mark.second;
+    let mut state = raft::State::initial(
+        status.ring.clone(),
+        status.membership.old.clone(),
+        status.membership.identities.clone(),
+    )?;
+    let snapshot = status.snapshot();
+    state.generation = 0;
+    state.max_scn = status.max_scn;
+    state.founders = status.founders;
+    state.contacts = status.contacts;
+    state.retirements = status.retirements;
+    state.term = status.hard_term;
+    state.vote = status.vote;
+    state.vote_scn = status.vote_scn;
+    state.snapshot = snapshot;
+    state.commit = state.snapshot.index;
+    state.ignore_ring_identity = ignore;
+    if ignore {
+        state.ring = ring.to_owned();
+        state.snapshot.ring = ring.to_owned();
+    }
+    state.check_ring(&state.snapshot)?;
+    state.validate()?;
+    let length = file.metadata()?.len();
+    Ok((state, sequence, second, length))
+}
+
+pub(super) fn read_public_path(path: &Path) -> Result<Option<Public>> {
+    let mut file = File::open(path)?;
+    let footer = match raft::checkpoint::read_footer(&mut file) {
+        Ok(footer) => footer,
+        Err(_) => return Ok(None),
+    };
+    if footer.op != Op::KsCkFooter {
+        return Ok(None);
+    }
+    file.rewind()?;
+    read_public(&mut file).map(Some)
 }
 
 #[derive(Clone, Copy)]
@@ -70,12 +104,14 @@ struct Range {
 }
 raft::wire_struct!(Range, KsCkRange, {start,len});
 struct KsFooter {
-    mark: Mark,
+    raft: raft::checkpoint::RaftStatus,
+    sequence: u64,
+    second: u64,
     verifier: Option<[u8; 32]>,
     peers: Range,
     keys: Range,
 }
-raft::wire_struct!(KsFooter, KsCkFooter, {mark,verifier,peers,keys});
+raft::wire_struct!(KsFooter, KsCkFooter, {raft,sequence,second,verifier,peers,keys});
 struct PeerRow {
     identity: String,
     kind: String,
@@ -140,7 +176,9 @@ pub(super) struct Public {
 
 fn associated(mark: &Mark, verifier: &Option<[u8; 32]>, peers: &[u8; 32]) -> Result<Vec<u8>> {
     let mut ad = b"DLAW-KS-CHECKPOINT-1".to_vec();
-    ad.extend(encode_piece(mark)?);
+    ad.extend(encode_piece(&mark.raft)?);
+    ad.extend_from_slice(&mark.sequence.to_le_bytes());
+    ad.extend_from_slice(&mark.second.to_le_bytes());
     ad.extend(encode_piece(verifier)?);
     ad.extend_from_slice(peers);
     Ok(ad)
@@ -264,9 +302,9 @@ pub(super) const KEY_GROUP: usize = 32 * 1024;
 fn key_nonce(mark: &Mark, random: &[u8; 32], index: u64) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"DLAW-KS-CHECKPOINT-NONCE-1");
-    hash.update(mark.term.to_le_bytes());
-    hash.update(mark.index.to_le_bytes());
-    hash.update(mark.scn.number().to_le_bytes());
+    hash.update(mark.raft.term.to_le_bytes());
+    hash.update(mark.raft.index.to_le_bytes());
+    hash.update(mark.raft.scn.number().to_le_bytes());
     hash.update(random);
     hash.update(index.to_le_bytes());
     hash.finalize().into()
@@ -378,7 +416,14 @@ fn write_with(
     let key_len = write_keys(&mut output, &state.keys, key, mark, random, &ad, group)?;
     let peers = Range { start: 0, len: peer_len };
     let keys = Range { start: end(peers)?, len: key_len };
-    let footer = encode_piece(&KsFooter { mark: mark.clone(), verifier, peers, keys })?;
+    let footer = encode_piece(&KsFooter {
+        raft: mark.raft.clone(),
+        sequence: mark.sequence,
+        second: mark.second,
+        verifier,
+        peers,
+        keys,
+    })?;
     raft::checkpoint::write_footer(&mut output, Op::KsCkFooter, &footer)?;
     output.flush()?;
     Ok(())
@@ -392,7 +437,8 @@ pub(super) fn read_public(file: &mut (impl Read + Seek)) -> Result<Public> {
     }
     let variable_start = footer.start;
     let footer: KsFooter = decode_piece(&footer.bytes)?;
-    footer.mark.validate()?;
+    let mark = Mark { raft: footer.raft, sequence: footer.sequence, second: footer.second };
+    mark.validate()?;
     if footer.peers.start != 0
         || end(footer.peers)? != footer.keys.start
         || end(footer.keys)? != variable_start
@@ -400,8 +446,8 @@ pub(super) fn read_public(file: &mut (impl Read + Seek)) -> Result<Public> {
         return Err(Error::new("invalid KS checkpoint ranges"));
     }
     let (peers, peer_hash) = read_peers(file, footer.peers)?;
-    let ad = associated(&footer.mark, &footer.verifier, &peer_hash)?;
-    Ok(Public { mark: footer.mark, verifier: footer.verifier, peers, keys: footer.keys, ad })
+    let ad = associated(&mark, &footer.verifier, &peer_hash)?;
+    Ok(Public { mark, verifier: footer.verifier, peers, keys: footer.keys, ad })
 }
 
 /// Authenticate and decode the master-key piece.
@@ -490,19 +536,24 @@ mod tests {
         )
         .unwrap();
         let mark = Mark {
-            ring,
+            raft: raft::checkpoint::RaftStatus {
+                ring,
+                index: 3,
+                term: 2,
+                scn: Scn::new(42),
+                hard_term: 2,
+                vote: Some(0),
+                vote_scn: Some(Scn::new(43)),
+                primary: Some(0),
+                membership: state.snapshot.membership.clone(),
+                founders: state.founders.clone(),
+                contacts: state.contacts.clone(),
+                retirements: state.retirements.clone(),
+                checkpoint_start: None,
+                max_scn: Some(Scn::new(43)),
+            },
             sequence: 5,
             second: 100,
-            index: 3,
-            term: 2,
-            scn: Scn::new(42),
-            primary: Some(0),
-            membership: state.snapshot.membership.clone(),
-            founders: state.founders.clone(),
-            contacts: state.contacts.clone(),
-            retirements: state.retirements.clone(),
-            checkpoint_start: None,
-            max_scn: Some(Scn::new(43)),
         };
         let mut state = KsState::default();
         state.keys.epochs.push(MasterEpoch { since: TimeSec::new(10), key: [11; 32] });
@@ -528,13 +579,13 @@ mod tests {
         let original = key_nonce(&mark, &random, 0);
         assert_eq!(original, key_nonce(&mark, &random, 0));
         let mut changed = mark.clone();
-        changed.term += 1;
+        changed.raft.term += 1;
         assert_ne!(original, key_nonce(&changed, &random, 0));
         changed = mark.clone();
-        changed.index += 1;
+        changed.raft.index += 1;
         assert_ne!(original, key_nonce(&changed, &random, 0));
         changed = mark.clone();
-        changed.scn = Scn::new(changed.scn.number() + 1);
+        changed.raft.scn = Scn::new(changed.raft.scn.number() + 1);
         assert_ne!(original, key_nonce(&changed, &random, 0));
         assert_ne!(original, key_nonce(&mark, &[8; 32], 0));
         assert_ne!(original, key_nonce(&mark, &random, 1));
@@ -548,23 +599,23 @@ mod tests {
         let mut file = Cursor::new(Vec::new());
         write(&mut file, &mark, &state, verifier, &key, [7; 32]).unwrap();
         let public = read_public(&mut file).unwrap();
-        assert_eq!(public.mark.ring, mark.ring);
+        assert_eq!(public.mark.raft.ring, mark.raft.ring);
         assert_eq!(
             (
                 public.mark.sequence,
                 public.mark.second,
-                public.mark.index,
-                public.mark.term,
-                public.mark.scn
+                public.mark.raft.index,
+                public.mark.raft.term,
+                public.mark.raft.scn
             ),
             (5, 100, 3, 2, Scn::new(42))
         );
-        assert_eq!(public.mark.primary, Some(0));
-        assert_eq!(public.mark.membership, mark.membership);
-        assert_eq!(public.mark.founders, mark.founders);
-        assert_eq!(public.mark.contacts, mark.contacts);
-        assert_eq!(public.mark.retirements, mark.retirements);
-        assert_eq!(public.mark.max_scn, mark.max_scn);
+        assert_eq!(public.mark.raft.primary, Some(0));
+        assert_eq!(public.mark.raft.membership, mark.raft.membership);
+        assert_eq!(public.mark.raft.founders, mark.raft.founders);
+        assert_eq!(public.mark.raft.contacts, mark.raft.contacts);
+        assert_eq!(public.mark.raft.retirements, mark.raft.retirements);
+        assert_eq!(public.mark.raft.max_scn, mark.raft.max_scn);
         assert_eq!(public.verifier, verifier);
         assert_eq!(public.peers, state.registrations.peers);
         let keys = read_keys(&mut file, &public, &key).unwrap();
@@ -574,6 +625,30 @@ mod tests {
             assert_eq!(actual.key, expected.key);
         }
         assert!(read_keys(&mut file, &public, &[38; 32]).is_err());
+    }
+
+    #[test]
+    fn checkpoint_loads_into_raft_state() {
+        let (mark, state) = sample();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let key = [37; 32];
+        let mut file = File::create(path.path()).unwrap();
+        write(&mut file, &mark, &state, None, &key, [7; 32]).unwrap();
+        drop(file);
+
+        let (restored, sequence, second, length) =
+            read_raft(path.path(), mark.sequence, &mark.raft.ring, false).unwrap();
+        assert_eq!((sequence, second), (mark.sequence, mark.second));
+        assert_eq!(length, std::fs::metadata(path.path()).unwrap().len());
+        assert_eq!(restored.snapshot.index, mark.raft.index);
+        assert_eq!(restored.snapshot.term, mark.raft.term);
+        assert_eq!(restored.snapshot.scn, mark.raft.scn);
+        assert_eq!(restored.snapshot.membership, mark.raft.membership);
+        assert_eq!(restored.term, mark.raft.hard_term);
+        assert_eq!(restored.vote, mark.raft.vote);
+        assert_eq!(restored.vote_scn, mark.raft.vote_scn);
+        assert_eq!(restored.commit, mark.raft.index);
+        assert!(restored.snapshot.application.is_empty());
     }
 
     #[test]

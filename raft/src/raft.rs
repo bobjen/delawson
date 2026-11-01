@@ -1772,9 +1772,6 @@ impl<S: Storage> Node<S> {
     }
     pub fn refresh_retained(&mut self) -> Result<()> {
         self.absorb_aux_records()?;
-        if self.retained.first <= self.journal.state().snapshot.index {
-            self.retained.trim_before(self.journal.state().snapshot.index.saturating_add(1))?;
-        }
         let state = self.journal.state();
         let active = self.role == Role::Leader || self.applying_state;
         if !active {
@@ -1947,7 +1944,6 @@ impl<S: Storage> Node<S> {
         }
         let previous_commit = self.state().commit;
         let queued_batch = self.journal.write_owned(records)?;
-        let snapshot_index = self.journal.state().snapshot.index;
         if installed {
             self.retained.push_batch(queued_batch)?;
         } else {
@@ -1970,9 +1966,6 @@ impl<S: Storage> Node<S> {
             } else {
                 self.retained.push_batch(queued_batch)?;
             }
-        }
-        if self.retained.first <= snapshot_index {
-            self.retained.trim_before(snapshot_index.saturating_add(1))?;
         }
         self.retained.trim_to_capacity(self.journal.state())?;
         for (index, term, scn) in accepted {

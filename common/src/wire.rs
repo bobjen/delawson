@@ -321,7 +321,6 @@ ops! {
     CheckpointEnd = 146, "checkpoint-end";
     RaftPrimary = 147, "raft-primary";
     KsCkFooter = 148, "ks-checkpoint-footer";
-    KsCkMark = 149, "ks-checkpoint-mark";
     KsCkRange = 150, "ks-checkpoint-range";
     KsCkPeers = 151, "ks-checkpoint-peers";
     KsCkKeys = 152, "ks-checkpoint-keys";
@@ -330,6 +329,7 @@ ops! {
     KsCkPeer = 155, "ks-checkpoint-peer";
     KsCkKeyChunk = 156, "ks-checkpoint-key-chunk";
     RaftRecordMaxScn = 157, "raft-record-max-scn";
+    RaftCkStatus = 158, "raft-checkpoint-status";
 }
 
 impl std::fmt::Display for Op {

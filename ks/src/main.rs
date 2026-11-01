@@ -1,9 +1,8 @@
 //! KS: process registry and encrypted, journaled master-key epochs.
 use raft::runtime::Host;
 use raft::{journal, lease};
-mod runtime;
-#[allow(dead_code)] // Standalone codec; the runtime is not switched over yet.
 mod checkpoint;
+mod runtime;
 
 use common::config::KsConfig;
 use common::crypto;
@@ -16,6 +15,7 @@ use common::{Op, Req, Resp, SnKey, Status, structure};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -47,7 +47,7 @@ impl raft::execution::Application for KeyHistory {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct KsState {
     keys: KeyHistory,
     registrations: runtime::Registrations,
@@ -63,6 +63,7 @@ struct Ks {
     config: KsConfig,
     unlock_verifier: Option<[u8; 32]>,
     unlock_key: Mutex<Option<[u8; 32]>>,
+    checkpoint: Option<(PathBuf, checkpoint::Public)>,
     gc_stop: AtomicBool,
     gc_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -331,7 +332,22 @@ impl Ks {
             runtime.identities.clone(),
         )?;
         initial.ignore_ring_identity = runtime.ignore_ring_identity;
-        let journal = journal::Journal::open(path, initial, config.snapshot_retain, &runtime.name)?;
+        let journal = journal::Journal::open_with_reader(
+            path,
+            initial,
+            config.snapshot_retain,
+            &runtime.name,
+            checkpoint::read_raft,
+        )?;
+        let checkpoint_path = journal.checkpoint_path();
+        let checkpoint = if journal.checkpoint_sequence() == 0 {
+            None
+        } else {
+            checkpoint::read_public_path(&checkpoint_path)?.map(|public| (checkpoint_path, public))
+        };
+        let seed = checkpoint
+            .as_ref()
+            .map(|(_, public)| (journal.state.generation, public.mark.raft.index));
         let id =
             journal.state.membership().slot(&journal.identity.current).unwrap_or(raft::UNASSIGNED);
         let mut node = raft::Node::new_with_log2(id, journal, config.raft.log2_entries)?;
@@ -350,13 +366,22 @@ impl Ks {
             snapshot_interval_secs: config.snapshot_interval_secs,
             allow_stale_reads: config.knobs.allow_stale_reads,
         };
+        let mut application = KsState::default();
+        if let Some((_, public)) = &checkpoint {
+            application.registrations.peers.clone_from(&public.peers);
+        }
+        let common = raft::runtime::Runtime::with_state(runtime, node, options, application);
+        if let Some((generation, index)) = seed {
+            common.seed_metadata(generation, index)?;
+        }
         let ks = Ks {
             config,
             unlock_verifier,
             unlock_key: Mutex::new(None),
+            checkpoint,
             gc_stop: AtomicBool::new(true),
             gc_thread: Mutex::new(None),
-            common: raft::runtime::Runtime::new(runtime, node, options),
+            common,
         };
         // Routing must be recovered before transport starts, even while locked.
         let commit = ks.on_raft(|host, node| {
@@ -385,8 +410,19 @@ impl Ks {
             ))
         })?;
         // Decryption and application locking happen outside the consensus loop.
-        let (history, applied) =
-            if apply { runtime::decode_history(&state, &key)? } else { (KeyHistory::default(), 0) };
+        let (history, applied) = if let Some((path, public)) = &self.checkpoint {
+            let mut file = File::open(path)?;
+            let base = checkpoint::read_keys(&mut file, public, &key)?;
+            if apply {
+                runtime::decode_history_from(&state, &key, base, state.snapshot.index)?
+            } else {
+                (base, state.snapshot.index)
+            }
+        } else if apply {
+            runtime::decode_history(&state, &key)?
+        } else {
+            (KeyHistory::default(), 0)
+        };
         *self.unlock_key.lock().map_err(|_| common::Error::new("unlock lock poisoned"))? =
             Some(key);
         self.global_lock.write().keys = history;
@@ -821,5 +857,104 @@ mod persistence_tests {
         };
         ks.stop_snapshot_worker().unwrap();
         assert!(count > 1);
+    }
+
+    #[test]
+    fn ks_checkpoint_replays_the_journal_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = config();
+        settings.snapshot_interval_secs = 3600;
+        settings.snapshot_min_log_bytes = 1 << 30;
+        let ks = std::sync::Arc::new(Ks::new(settings, dir.path()).unwrap());
+        ks.unlock(&unlock(&[42; 32])).unwrap();
+        ks.checkpoint_requested.store(true, Ordering::SeqCst);
+        ks.start().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let (checkpoint_path, checkpoint_sequence, checkpoint_index) = loop {
+            let found = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .find_map(|path| {
+                    checkpoint::read_public_path(&path)
+                        .ok()
+                        .flatten()
+                        .map(|public| (path, public.mark.sequence, public.mark.raft.index))
+                });
+            if let Some(found) = found {
+                break found;
+            }
+            assert!(std::time::Instant::now() < deadline, "KS checkpoint was not written");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(checkpoint_sequence > 0);
+        assert!(checkpoint_index > 0);
+        let retained = ks
+            .on_raft(move |_, node| {
+                Ok(node.retained_suffix(0, checkpoint_index).map(|journal| journal.entries.len()))
+            })
+            .unwrap();
+        assert!(retained.is_some_and(|count| count > 0));
+
+        let peer = Peer {
+            identity: "EN0".into(),
+            kind: common::config::ServiceKind::En,
+            address: "127.0.0.1:9001".parse().unwrap(),
+            domain: vec!["dc0".into()],
+            media_class: None,
+            ring_identity: None,
+        };
+        ks.propose_registration(peer.clone()).unwrap();
+        let (commit, snapshot_index, snapshot_actions) = ks
+            .on_raft(|_, node| {
+                Ok((
+                    node.state().commit,
+                    node.state().snapshot.index,
+                    node.state().snapshot.application.len(),
+                ))
+            })
+            .unwrap();
+        assert!(commit > checkpoint_index);
+        assert_eq!(snapshot_index, checkpoint_index);
+        assert_eq!(snapshot_actions, 0);
+
+        ks.stop_snapshot_worker().unwrap();
+        ks.stop_gc().unwrap();
+        drop(ks);
+
+        let recovered = Ks::new(config(), dir.path()).unwrap();
+        assert_eq!(recovered.global_lock.read().registrations.peers.get("EN0"), Some(&peer));
+        let public = checkpoint::read_public_path(&checkpoint_path).unwrap().unwrap();
+        assert_eq!(public.mark.sequence, checkpoint_sequence);
+        recovered.unlock(&unlock(&[42; 32])).unwrap();
+        let base_since = {
+            let history = recovered.global_lock.read();
+            assert_eq!(history.keys.epochs.len(), 1);
+            history.keys.epochs[0].since
+        };
+        let before = recovered.on_raft(|_, node| Ok(node.state().last())).unwrap();
+        let invalid = MasterEpoch {
+            key: [99; 32],
+            since: TimeSec::new(base_since.number().saturating_sub(1)),
+        };
+        assert!(recovered.propose_key(invalid).is_err());
+        assert_eq!(recovered.on_raft(|_, node| Ok(node.state().last())).unwrap(), before);
+
+        let epoch = recovered.choose_key().unwrap();
+        recovered.propose_key(epoch.clone()).unwrap();
+        {
+            let history = recovered.global_lock.read();
+            assert_eq!(history.keys.epochs.len(), 2);
+            assert_eq!(history.keys.epochs[1].key, epoch.key);
+        }
+        drop(recovered);
+
+        let restored = Ks::new(config(), dir.path()).unwrap();
+        restored.unlock(&unlock(&[42; 32])).unwrap();
+        assert!(restored.on_raft(|_, node| Ok(node.state().commit)).unwrap() > checkpoint_index);
+        let history = restored.global_lock.read();
+        assert_eq!(history.keys.epochs.len(), 2);
+        assert_eq!(history.keys.epochs[1].key, epoch.key);
     }
 }

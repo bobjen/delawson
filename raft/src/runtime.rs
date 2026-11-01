@@ -324,6 +324,14 @@ impl<S> Runtime<S> {
     pub fn metadata_applied(&self) -> u64 {
         self.metadata_applied.load(Ordering::Acquire)
     }
+    /// Seed metadata already restored from an application checkpoint.
+    pub fn seed_metadata(&self, generation: u64, applied: u64) -> Result<()> {
+        *self.metadata_execution.lock().map_err(|_| Error::new("metadata execution poisoned"))? =
+            crate::execution::Cursor::new(generation, applied);
+        self.metadata_applied.store(applied, Ordering::Release);
+        self.metadata_generation.store(generation, Ordering::SeqCst);
+        Ok(())
+    }
     /// Queue one leader action; proposals join until the time or size cutoff.
     pub fn queue_client(&self, action: Action) -> Result<ClientTicket> {
         let (reply, receive) = std::sync::mpsc::sync_channel(1);
@@ -865,6 +873,23 @@ pub trait Host:
         state: &State,
         application: &Self::Application,
     ) -> Result<Vec<Entry>>;
+    /// Refuse peer copies when a compact service checkpoint cannot be represented
+    /// by the in-memory Raft snapshot format.
+    fn can_checkpoint(&self, _state: &State) -> bool {
+        true
+    }
+    /// Stream an application-specific checkpoint into the journal's atomic file publish.
+    /// Returning `None` uses the generic Raft checkpoint encoding.
+    fn checkpoint_writer<'a>(
+        &self,
+        _state: &State,
+        _snapshot: &raft::Snapshot,
+        _application: &'a Self::Application,
+        _mark: journal::CheckpointMark,
+        _now: u64,
+    ) -> Result<Option<journal::CheckpointWriter<'a>>> {
+        Ok(None)
+    }
     fn peer_message(&self) -> Option<crate::Action>;
     fn receive_client(&self, process: &Process, action: crate::Action) -> Result<Resp>;
     fn dispatch_forwarded(&self, process: &Process, request: &Req) -> Resp;
@@ -1119,6 +1144,9 @@ pub trait Host:
             || node.journal.failed
         {
             return Err(Error::new("primary does not serve checkpoints"));
+        }
+        if !self.can_checkpoint(node.state()) {
+            return Ok(None);
         }
         if after != u64::MAX && node.state().snapshot.index <= after {
             if node.role != Role::Leader
@@ -1433,6 +1461,7 @@ pub trait Host:
                 logn!("Raft checkpoint started", "index {},term {}", state.commit, state.term);
                 let checkpoint_index = state.commit;
                 snapshot.application = self.checkpoint_actions(&state, &history)?;
+                let writer = self.checkpoint_writer(&state, &snapshot, &history, mark, now)?;
                 state.snapshot = snapshot;
                 state.log.retain(|entry| entry.index > state.snapshot.index);
                 let pending = self.on_raft(move |host, node| {
@@ -1441,12 +1470,20 @@ pub trait Host:
                     }
                     node.journal.prepare_checkpoint(now, state, mark)
                 })?;
+                let mut writer = writer;
                 if let Some(pending) = pending {
-                    pending.write_cancellable(|| self.cancel_snapshot.load(Ordering::SeqCst))?;
+                    let cancelled = || self.cancel_snapshot.load(Ordering::SeqCst);
+                    match writer.take() {
+                        Some(writer) => pending.write_with(cancelled, writer)?,
+                        None => pending.write_cancellable(cancelled)?,
+                    }
+                    drop(writer);
                     drop(history);
                     self.on_raft(move |_, node| node.journal.finish_snapshot(&pending))?;
                     self.checkpoint_requested.store(false, Ordering::SeqCst);
                     logn!("Raft checkpoint completed", "index {}", checkpoint_index);
+                } else {
+                    drop(writer);
                 }
                 Ok(())
             }
