@@ -80,22 +80,22 @@ pub(crate) fn checkpoint_install(
 }
 const LIMIT: usize = 64 * 1024 * 1024;
 
-struct Batch {
+struct Frame {
     sequence: u64,
     records: Vec<Record>,
 }
 
-enum JournalFrame {
+enum SerializedFrame {
     Flat(Vec<u8>),
-    Shared(SharedFrame),
+    Shared(SharedSerialized),
 }
-struct SharedFrame {
+struct SharedSerialized {
     head: Vec<u8>,
     entries: Vec<Arc<crate::raft::EntryBuf>>,
     tail: Vec<u8>,
     length: usize,
 }
-impl JournalFrame {
+impl SerializedFrame {
     fn len(&self) -> usize {
         match self {
             Self::Flat(bytes) => bytes.len(),
@@ -129,7 +129,7 @@ fn write_all_at(file: &File, mut bytes: &[u8], offset: &mut u64) -> std::io::Res
     }
     Ok(())
 }
-impl SharedFrame {
+impl SharedSerialized {
     fn write_at(&self, file: &File, mut offset: u64) -> std::io::Result<()> {
         write_all_at(file, &self.head, &mut offset)?;
         for entry in &self.entries {
@@ -792,7 +792,7 @@ impl Journal {
     }
     fn append_frame(
         &mut self,
-        frame: JournalFrame,
+        serialized: SerializedFrame,
         offset: u64,
         records: Arc<Vec<Record>>,
         identity: Option<LocalIdentity>,
@@ -802,7 +802,7 @@ impl Journal {
         self.perform_sync(kind, move |disk| {
             let file = disk.current_file()?;
             let write_start = Instant::now();
-            frame.write_at(&file, offset)?;
+            serialized.write_at(&file, offset)?;
             let write_ns = write_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             mark_records(&records, false);
             let disk = disk.clone();
@@ -999,10 +999,10 @@ impl Journal {
         }
         let sequence =
             self.sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?;
-        let batch = Batch { sequence, records: held };
-        let frame = journal_frame(&batch)?;
-        let frame_len = frame.len() as u64;
-        let durable_records = Arc::new(batch.records);
+        let frame = Frame { sequence, records: held };
+        let serialized = serialize_frame(&frame)?;
+        let frame_len = serialized.len() as u64;
+        let durable_records = Arc::new(frame.records);
         // Apply against the live state with a small undo log. The entry log is
         // copy-on-write, so this retains only the prior log root and new entries.
         let undo = self.state.apply_journal_batch(durable_records.as_slice())?;
@@ -1025,7 +1025,7 @@ impl Journal {
         let next_offset =
             offset.checked_add(frame_len).ok_or_else(|| Error::new("journal offset overflow"))?;
         if let Err(error) =
-            self.append_frame(frame, offset, durable_records.clone(), write_identity)
+            self.append_frame(serialized, offset, durable_records.clone(), write_identity)
         {
             undo.rollback(&mut self.state);
             return Err(error);
@@ -1082,7 +1082,7 @@ impl Journal {
                 return Err(Error::new("journal sequence overflow"));
             }
         };
-        let mut batches = vec![Batch { sequence: first, records }];
+        let mut frames = vec![Frame { sequence: first, records }];
         if let Some(record) = watermark.into_iter().next() {
             let sequence = match first.checked_add(1) {
                 Some(sequence) => sequence,
@@ -1092,7 +1092,7 @@ impl Journal {
                     return Err(Error::new("journal sequence overflow"));
                 }
             };
-            batches.push(Batch { sequence, records: vec![record] });
+            frames.push(Frame { sequence, records: vec![record] });
         }
         let ring = self.state.ring.clone();
         let ignore = self.state.ignore_ring_identity;
@@ -1114,7 +1114,7 @@ impl Journal {
                     active_start,
                     old_sequence,
                     from,
-                    batches,
+                    frames,
                     write_identity,
                     disk,
                 )?;
@@ -1194,7 +1194,7 @@ impl Journal {
         let carry =
             (!suffix.is_empty()).then(|| Record::Carry { entries: suffix, commit: state.commit });
         let carried = if let Some(record) = &carry {
-            frame(&Batch { sequence: start, records: vec![record.clone()] })?
+            serialize_contiguous(&Frame { sequence: start, records: vec![record.clone()] })?
         } else {
             vec![]
         };
@@ -1546,7 +1546,7 @@ fn rewrite_journals(
     active_start: u64,
     old_sequence: u64,
     from: u64,
-    appended: Vec<Batch>,
+    appended: Vec<Frame>,
     mut identity: LocalIdentity,
     disk: &Disk,
 ) -> Result<(u64, u64, u64, u64, LocalIdentity)> {
@@ -1618,7 +1618,7 @@ fn rewrite_journals(
                 }
                 let mut bytes = vec![0; length as usize];
                 input.read_exact(&mut bytes)?;
-                let old: Batch = decode(&bytes)?;
+                let old: Frame = decode(&bytes)?;
                 if old.sequence
                     != sequence
                         .checked_add(1)
@@ -1627,7 +1627,7 @@ fn rewrite_journals(
                     return Err(Error::new("journal sequence gap during suffix rewrite"));
                 }
                 sequence = old.sequence;
-                let mut rewritten = Batch { sequence, records: vec![] };
+                let mut rewritten = Frame { sequence, records: vec![] };
                 for record in old.records {
                     if let Some(record) = filter_suffix(record, from) {
                         rewritten.records.push(record);
@@ -1637,7 +1637,7 @@ fn rewrite_journals(
                     state.apply(record)?;
                 }
                 state.validate()?;
-                let encoded = frame(&rewritten)?;
+                let encoded = serialize_contiguous(&rewritten)?;
                 output.write_all(&encoded)?;
                 out_at += encoded.len() as u64;
                 in_at += 16 + length;
@@ -1651,20 +1651,20 @@ fn rewrite_journals(
         if sequence != old_sequence {
             return Err(Error::new("journal sequence changed during suffix rewrite"));
         }
-        for batch in &appended {
-            if batch.sequence
+        for frame in &appended {
+            if frame.sequence
                 != sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?
             {
                 return Err(Error::new("replacement journal sequence is not contiguous"));
             }
-            for record in &batch.records {
+            for record in &frame.records {
                 state.apply(record)?;
             }
             state.validate()?;
-            let encoded = journal_frame(batch)?;
+            let encoded = serialize_frame(frame)?;
             encoded.write_at(&output, out_at)?;
             out_at += encoded.len() as u64;
-            sequence = batch.sequence;
+            sequence = frame.sequence;
         }
         output.sync_all()?;
         drop(output);
@@ -1735,8 +1735,8 @@ fn suffix_segment(
             }
             let mut bytes = vec![0; length as usize];
             input.read_exact(&mut bytes)?;
-            let batch: Batch = decode(&bytes)?;
-            if batch.records.iter().any(|record| match record {
+            let frame: Frame = decode(&bytes)?;
+            if frame.records.iter().any(|record| match record {
                 Record::Entries { entries, .. } | Record::Carry { entries, .. } => {
                     entries.iter().any(|entry| entry.index >= from)
                 }
@@ -1860,15 +1860,15 @@ fn replay_segment_checked(
         }
         let mut bytes = vec![0; length as usize];
         file.read_exact(&mut bytes)?;
-        let batch: Batch = decode(&bytes)?;
-        if batch.sequence
+        let frame: Frame = decode(&bytes)?;
+        if frame.sequence
             != sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?
         {
             return Err(Error::new("journal sequence gap"));
         }
         let mut next = state.clone();
         if !boundary {
-            match batch.records.as_slice() {
+            match frame.records.as_slice() {
                 [Record::Carry { entries, commit }]
                     if *commit >= state.snapshot.index
                         && *commit <= previous
@@ -1878,7 +1878,7 @@ fn replay_segment_checked(
                 _ => return Err(Error::new("journal carried predecessor mismatch")),
             }
         }
-        for record in &batch.records {
+        for record in &frame.records {
             if let Some((index, found)) = proof.as_deref_mut() {
                 // An Install can replace history we cannot link. Never carry a proof
                 // from that abandoned prefix through an unrelated checkpoint.
@@ -1909,9 +1909,9 @@ fn replay_segment_checked(
             boundary = true;
         }
         *state = next;
-        *sequence = batch.sequence;
+        *sequence = frame.sequence;
         if let Some(history) = history.as_deref_mut() {
-            history.push_batch(Arc::new(batch.records), state)?;
+            history.push_batch(Arc::new(frame.records), state)?;
         }
         offset += 16 + length;
     }
@@ -2080,19 +2080,19 @@ impl PendingSnapshot {
         Ok(())
     }
 }
-fn frame(batch: &Batch) -> Result<Vec<u8>> {
-    let bytes = encode(batch)?;
+fn serialize_contiguous(frame: &Frame) -> Result<Vec<u8>> {
+    let bytes = encode(frame)?;
     let length = bytes.len() as u64;
     Ok([length.to_le_bytes().as_slice(), (!length).to_le_bytes().as_slice(), &bytes].concat())
 }
-fn journal_frame(batch: &Batch) -> Result<JournalFrame> {
-    if let Some(frame) = shared_frame(batch)? {
-        return Ok(JournalFrame::Shared(frame));
+fn serialize_frame(frame: &Frame) -> Result<SerializedFrame> {
+    if let Some(shared) = shared_serialized(frame)? {
+        return Ok(SerializedFrame::Shared(shared));
     }
-    Ok(JournalFrame::Flat(frame(batch)?))
+    Ok(SerializedFrame::Flat(serialize_contiguous(frame)?))
 }
-fn shared_frame(batch: &Batch) -> Result<Option<SharedFrame>> {
-    let (from, entries, commit) = match batch.records.as_slice() {
+fn shared_serialized(frame: &Frame) -> Result<Option<SharedSerialized>> {
+    let (from, entries, commit) = match frame.records.as_slice() {
         [Record::Entries { from, entries }] => (*from, entries, None),
         [Record::Entries { from, entries }, Record::Commit(commit)] => {
             (*from, entries, Some(*commit))
@@ -2116,14 +2116,14 @@ fn shared_frame(batch: &Batch) -> Result<Option<SharedFrame>> {
         return Err(Error::new("Raft encoding exceeds recursion limit"));
     }
 
-    // This prefix is the normal tagged Batch/Record/Entries-list path up to its
+    // This prefix is the normal tagged Frame/Record/Entries-list path up to its
     // first entry. Entry bytes are separate shared pieces in the journal frame.
     let mut prefix = Vec::with_capacity(64);
     prefix.push(depth);
-    put_u16(&mut prefix, common::Op::RaftBatch.code());
-    put_u64(&mut prefix, batch.sequence);
+    put_u16(&mut prefix, common::Op::RaftFrame.code());
+    put_u64(&mut prefix, frame.sequence);
     put_u16(&mut prefix, common::Op::RaftList.code());
-    put_u64(&mut prefix, batch.records.len() as u64);
+    put_u64(&mut prefix, frame.records.len() as u64);
     put_u16(&mut prefix, common::Op::RaftRecordEntries.code());
     put_u64(&mut prefix, from);
     put_u16(&mut prefix, common::Op::RaftList.code());
@@ -2169,7 +2169,7 @@ fn shared_frame(batch: &Batch) -> Result<Option<SharedFrame>> {
     head.extend(length.to_le_bytes());
     head.extend((!length).to_le_bytes());
     head.extend(prefix);
-    Ok(Some(SharedFrame { head, entries, tail, length: 16 + body_len }))
+    Ok(Some(SharedSerialized { head, entries, tail, length: 16 + body_len }))
 }
 fn put_u16(bytes: &mut Vec<u8>, value: u16) {
     bytes.extend(value.to_le_bytes());
@@ -2286,7 +2286,7 @@ mod tests {
         entry.entry_buf = Some(codec::entry_buffer(&entry).unwrap());
         let shared = entry.entry_buf.as_ref().unwrap();
         assert!(shared.bytes.is_segmented());
-        let batch = Batch {
+        let frame = Frame {
             sequence: 7,
             records: vec![
                 Record::Entries { from: 1, entries: vec![entry.clone()] },
@@ -2295,10 +2295,10 @@ mod tests {
         };
 
         let mut actual = Vec::new();
-        journal_frame(&batch).unwrap().write_to(&mut actual).unwrap();
-        assert_eq!(actual, frame(&batch).unwrap());
-        let decoded: Batch = decode(&actual[16..]).unwrap();
-        match (&decoded.records[..], &batch.records[..]) {
+        serialize_frame(&frame).unwrap().write_to(&mut actual).unwrap();
+        assert_eq!(actual, serialize_contiguous(&frame).unwrap());
+        let decoded: Frame = decode(&actual[16..]).unwrap();
+        match (&decoded.records[..], &frame.records[..]) {
             (
                 [Record::Entries { entries: left, .. }, Record::Commit(left_commit)],
                 [Record::Entries { entries: right, .. }, Record::Commit(right_commit)],
@@ -2323,13 +2323,13 @@ mod tests {
             entry_buf: None,
         };
         second.entry_buf = Some(codec::entry_buffer(&second).unwrap());
-        let batch = Batch {
+        let frame = Frame {
             sequence: 8,
             records: vec![Record::Entries { from: 1, entries: vec![entry, second] }],
         };
         let mut actual = Vec::new();
-        journal_frame(&batch).unwrap().write_to(&mut actual).unwrap();
-        assert_eq!(actual, frame(&batch).unwrap());
+        serialize_frame(&frame).unwrap().write_to(&mut actual).unwrap();
+        assert_eq!(actual, serialize_contiguous(&frame).unwrap());
     }
 
     #[test]
@@ -3620,7 +3620,7 @@ pub fn provision_test_founder(
     sync_directory(directory)
 }
 
-crate::wire_struct!(Batch, RaftBatch, {sequence,records});
+crate::wire_struct!(Frame, RaftFrame, {sequence,records});
 
 crate::wire_struct!(Checkpoint, RaftCheckpoint, {sequence,second,state});
 

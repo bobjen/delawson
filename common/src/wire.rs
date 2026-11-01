@@ -269,7 +269,7 @@ ops! {
     RaftEntry = 95, "raftentry";
     RaftSnapshot = 96, "raftsnapshot";
     RaftAnswer = 97, "raftanswer";
-    RaftBatch = 98, "raftbatch";
+    RaftFrame = 98, "raftframe";
     RaftCheckpoint = 99, "raftcheckpoint";
     RaftCommittedJournal = 100, "raftcommittedjournal";
     RaftLocalIdentity = 101, "raftlocalidentity";
