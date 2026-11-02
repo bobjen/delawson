@@ -333,6 +333,17 @@ pub struct CommittedJournal {
     pub previous_scn: Scn,
     pub entries: Vec<Arc<crate::raft::Entry>>,
 }
+
+/// A verified persisted checkpoint offered to another member. File contents are
+/// fetched in bounded chunks so large service checkpoints are not one RPC frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointInfo {
+    pub index: u64,
+    pub term: u64,
+    pub scn: Scn,
+    pub bytes: u64,
+}
+
 impl CommittedJournal {
     pub fn largest_scn(&self) -> Option<Scn> {
         self.entries
@@ -394,6 +405,8 @@ pub struct LocalIdentity {
     initialized: bool,
     pending: Option<Retirement>,
     recovery: Option<RecoveryPlan>,
+    /// A copied checkpoint still needs its committed suffix from the primary.
+    peer_catchup: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RecoveryPlan {
@@ -588,8 +601,8 @@ impl Journal {
         let bootstrap_pending = directory.join("need-bootstrap").try_exists()?;
         let saved_identity = read_identity(&mut ownership)?;
         let identity_missing = saved_identity.is_none();
-        let snapshots = numbered(directory, "snapshot")?;
-        let journals = numbered(directory, "journal")?;
+        let mut snapshots = numbered(directory, "snapshot")?;
+        let mut journals = numbered(directory, "journal")?;
         let mut local: LocalIdentity = if saved_identity.is_none() {
             let current = common::ring::MemberIdentity::generate()?;
             let local = LocalIdentity {
@@ -607,6 +620,7 @@ impl Journal {
                 initialized: false,
                 pending: None,
                 recovery: None,
+                peer_catchup: false,
             };
             append_identity(&mut ownership, &local)?;
             sync_directory(directory)?;
@@ -624,6 +638,18 @@ impl Journal {
             }
             local
         };
+        if directory.join("peer-checkpoint.pending").try_exists()? {
+            finish_peer_file(
+                directory,
+                &mut ownership,
+                &mut local,
+                checkpoint_reader,
+                &initial.ring,
+                ignore,
+            )?;
+            snapshots = numbered(directory, "snapshot")?;
+            journals = numbered(directory, "journal")?;
+        }
         if local.recovery.is_some() {
             finish_recovery(directory, &mut ownership, &mut local)?;
             drop(ownership);
@@ -692,8 +718,7 @@ impl Journal {
         lost |= all_journals.iter().any(|(start, _)| *start == 0);
         if active_exists {
             match read_journal_header(&mut File::open(&active_path)?, &state.ring, ignore) {
-                Ok((start, _, _, _, pos))
-                    if start == active_start && pos == active_pos => {}
+                Ok((start, _, _, _, pos)) if start == active_start && pos == active_pos => {}
                 _ => {
                     quarantine(&active_path, "invalid latest journal header or position")?;
                     lost = true;
@@ -812,6 +837,47 @@ impl Journal {
     }
     pub fn checkpoint_path(&self) -> PathBuf {
         named(&self.directory, "snapshot", self.snapshot_index)
+    }
+    pub fn peer_stage_path(&self) -> PathBuf {
+        self.directory.join("peer-checkpoint.partial")
+    }
+    /// Validate a fully copied checkpoint and durably arrange its installation
+    /// on the next process start. The live Raft state is never replaced in place.
+    pub fn stage_peer_ckpt(&mut self, info: CheckpointInfo) -> Result<()> {
+        let path = self.peer_stage_path();
+        let ring = self.state.ring.clone();
+        let ignore = self.state.ignore_ring_identity;
+        let (state, _, _, bytes) = (self.checkpoint_reader)(&path, info.index, &ring, ignore)?;
+        if bytes != info.bytes
+            || state.snapshot.index != info.index
+            || state.snapshot.term != info.term
+            || state.snapshot.scn != info.scn
+        {
+            return Err(Error::new("copied checkpoint footer does not match its proof"));
+        }
+        if !self.identity.initialized {
+            return Err(Error::new("cannot install a peer checkpoint for an uninitialized member"));
+        }
+        let manifest = codec::encode(&info)?;
+        let manifest_path = self.directory.join("peer-checkpoint.pending");
+        self.perform(crate::io::Kind::Ordered, move |_| publish(&manifest_path, &manifest))
+    }
+    pub fn needs_peer_catchup(&self) -> bool {
+        self.identity.peer_catchup
+    }
+    pub fn finish_peer_catchup(&mut self) -> Result<()> {
+        if !self.identity.peer_catchup {
+            return Ok(());
+        }
+        let mut identity = self.identity.clone();
+        identity.peer_catchup = false;
+        let write_identity = identity.clone();
+        self.perform(crate::io::Kind::Identity, move |disk| {
+            let mut ownership = disk.lock_ownership()?;
+            append_identity(&mut ownership, &write_identity)
+        })?;
+        self.identity = identity;
+        Ok(())
     }
     pub fn start_io(&mut self, wake: impl Fn() + Send + Sync + 'static) -> Result<()> {
         if self.io.is_some() {
@@ -1684,6 +1750,49 @@ impl History {
         }
         Ok(self.retained_history(index)?.and_then(|(_, term)| term))
     }
+    pub fn checkpoint_info(&self, after: u64) -> Result<Option<CheckpointInfo>> {
+        for (entry, path) in numbered(&self.directory, "snapshot")?.into_iter().rev() {
+            let Ok((state, _, _, bytes)) = (self.checkpoint_reader)(
+                &path,
+                entry,
+                &self.state.ring,
+                self.state.ignore_ring_identity,
+            ) else {
+                continue;
+            };
+            let index = state.snapshot.index;
+            if after != u64::MAX && index <= after {
+                continue;
+            }
+            return Ok(Some(CheckpointInfo {
+                index,
+                term: state.snapshot.term,
+                scn: state.snapshot.scn,
+                bytes,
+            }));
+        }
+        Ok(None)
+    }
+    pub fn checkpoint_chunk(&self, index: u64, offset: u64, length: u64) -> Result<Vec<u8>> {
+        const CHUNK: u64 = 4 * 1024 * 1024;
+        if length == 0 || length > CHUNK {
+            return Err(Error::new("invalid checkpoint chunk size"));
+        }
+        let path = numbered(&self.directory, "snapshot")?
+            .into_iter()
+            .find_map(|(entry, path)| (entry == index).then_some(path))
+            .ok_or_else(|| Error::new("requested checkpoint is no longer retained"))?;
+        let mut file = File::open(path)?;
+        let size = file.metadata()?.len();
+        if offset.checked_add(u64::from(length)).is_none_or(|end| end > size) {
+            return Err(Error::new("checkpoint chunk is outside the file"));
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes =
+            vec![0; usize::try_from(length).map_err(|_| Error::new("checkpoint chunk too large"))?];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
     pub fn committed_suffix(&self, after: u64, through: u64) -> Result<Option<CommittedJournal>> {
         let Some((state, _)) = self.retained_history(after)? else { return Ok(None) };
         if after < state.snapshot.index || after >= state.commit.min(through) {
@@ -1749,6 +1858,81 @@ pub fn read_checkpoint(
     checkpoint.state.check_ring(&checkpoint.state.snapshot)?;
     checkpoint.state.validate()?;
     Ok((checkpoint.state, checkpoint.sequence, checkpoint.second, bytes.len() as u64))
+}
+
+fn archive_peer_file(path: &Path, index: u64) -> Result<()> {
+    let name = path.file_name().ok_or_else(|| Error::new("history file has no name"))?;
+    let mut suffix = 0u64;
+    let destination = loop {
+        let candidate =
+            path.with_file_name(format!("{}.peer-{index}-{suffix}", name.to_string_lossy()));
+        if !candidate.try_exists()? {
+            break candidate;
+        }
+        suffix = suffix.checked_add(1).ok_or_else(|| Error::new("peer archive names exhausted"))?;
+    };
+    std::fs::rename(path, destination)?;
+    Ok(())
+}
+
+fn finish_peer_file(
+    directory: &Path,
+    ownership: &mut File,
+    local: &mut LocalIdentity,
+    checkpoint_reader: CheckpointReader,
+    ring: &str,
+    ignore: bool,
+) -> Result<()> {
+    let manifest_path = directory.join("peer-checkpoint.pending");
+    let info: CheckpointInfo = codec::decode(&std::fs::read(&manifest_path)?)?;
+    let partial = directory.join("peer-checkpoint.partial");
+    let final_path = named(directory, "snapshot", info.index);
+    let source = if partial.try_exists()? {
+        partial.clone()
+    } else if final_path.try_exists()? {
+        final_path.clone()
+    } else {
+        return Err(Error::new("pending peer checkpoint file is missing"));
+    };
+    let (mut state, _, _, bytes) = checkpoint_reader(&source, info.index, ring, ignore)?;
+    if bytes != info.bytes
+        || state.snapshot.index != info.index
+        || state.snapshot.term != info.term
+        || state.snapshot.scn != info.scn
+    {
+        return Err(Error::new("pending peer checkpoint no longer matches its proof"));
+    }
+    // A damaged/divergent member must not reuse its old voting identity. Keep
+    // the normal peer-copy path's identity unchanged.
+    if local.repairing {
+        retire_identity(local, &mut state)?;
+    }
+
+    // A verified checkpoint replaces the receiver's local history. Keep the old
+    // files under names restart will not select, so an interrupted install can be
+    // repeated from the durable manifest.
+    for (_, path) in numbered(directory, "journal")? {
+        archive_peer_file(&path, info.index)?;
+    }
+    for (_, path) in numbered(directory, "snapshot")? {
+        if path != source {
+            archive_peer_file(&path, info.index)?;
+        }
+    }
+    if source == partial {
+        std::fs::rename(&partial, &final_path)?;
+    }
+    sync_directory(directory)?;
+
+    local.latest_journal = 0;
+    local.latest_entry = info.index;
+    local.latest_record = 0;
+    local.peer_catchup = true;
+    local.repairing = false;
+    local.recovery = None;
+    append_identity(ownership, local)?;
+    std::fs::remove_file(manifest_path)?;
+    sync_directory(directory)
 }
 /// A closed-segment footer retains the SCN high-water after entries are removed.
 fn apply_scn_footer(state: &mut State, maximum: Option<Scn>) -> Result<()> {
@@ -1912,7 +2096,9 @@ fn rewrite_journals(
                     continue;
                 }
                 if old.sequence
-                    != sequence.checked_add(1).ok_or_else(|| Error::new("journal sequence overflow"))?
+                    != sequence
+                        .checked_add(1)
+                        .ok_or_else(|| Error::new("journal sequence overflow"))?
                 {
                     return Err(Error::new("journal sequence gap during suffix rewrite"));
                 }
@@ -1939,7 +2125,7 @@ fn rewrite_journals(
             }
             if applied_tail {
                 if let Some(maximum) = footer {
-                apply_scn_footer(&mut state, maximum)?;
+                    apply_scn_footer(&mut state, maximum)?;
                 }
             }
             next =
@@ -2042,11 +2228,11 @@ fn suffix_segment(
             let frame: Frame = decode(&bytes)?;
             if frame.sequence > after
                 && frame.records.iter().any(|record| match record {
-                Record::Entries { entries, .. } | Record::Carry { entries, .. } => {
-                    entries.iter().any(|entry| entry.index >= from)
-                }
-                _ => false,
-            })
+                    Record::Entries { entries, .. } | Record::Carry { entries, .. } => {
+                        entries.iter().any(|entry| entry.index >= from)
+                    }
+                    _ => false,
+                })
             {
                 return Ok(Some(at));
             }
@@ -3303,6 +3489,7 @@ mod tests {
             initialized: false,
             pending: None,
             recovery: None,
+            peer_catchup: false,
         };
         let mut bytes = encode(&local).unwrap();
         let restored: LocalIdentity = decode(&bytes).unwrap();
@@ -3675,7 +3862,8 @@ mod tests {
         std::fs::write(&path, Checkpoint { sequence: 7, second: 9, state }.bytes().unwrap())
             .unwrap();
 
-        let (state, _, _, _) = read_checkpoint(&path, 7, &ring, true).unwrap();
+        let (state, sequence, _, _) = read_checkpoint(&path, 1, &ring, true).unwrap();
+        assert_eq!(sequence, 7);
         assert_eq!(state.ring, ring);
         assert_eq!(state.snapshot.ring, ring);
         assert_eq!(state.snapshot.index, 1);
@@ -3684,6 +3872,58 @@ mod tests {
         assert_eq!(state.term, 1);
         assert_eq!(state.vote, Some(0));
         assert_eq!(state.commit, 1);
+    }
+
+    #[test]
+    fn copied_checkpoint_is_installed_on_restart_and_requests_primary_suffix() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let source = Journal::open(source_dir.path(), initial(), 3, "member-0").unwrap();
+        let mut state = source.state.clone();
+        state.apply(&Record::Hard { term: 1, vote: None, vote_scn: None }).unwrap();
+        state
+            .apply(&Record::Entries {
+                from: 1,
+                entries: vec![Entry {
+                    scn: Scn::new(9),
+                    index: 1,
+                    term: 1,
+                    command: Command::Noop,
+                    entry_buf: None,
+                }],
+            })
+            .unwrap();
+        state.apply(&Record::Commit(1)).unwrap();
+        state.snapshot = state.capture();
+        state.log.clear();
+        let bytes = Checkpoint { sequence: 1, second: 2, state }.bytes().unwrap();
+        publish(&named(source_dir.path(), "snapshot", 1), &bytes).unwrap();
+        let info = source.history().checkpoint_info(0).unwrap().unwrap();
+        assert_eq!(info.index, 1);
+        assert_eq!(info.bytes, bytes.len() as u64);
+        let first = source.history().checkpoint_chunk(info.index, 0, info.bytes.min(17)).unwrap();
+        assert_eq!(&first, &bytes[..first.len()]);
+
+        let mut target = Journal::open(target_dir.path(), initial(), 3, "member-0").unwrap();
+        target.identity.initialized = true;
+        let identity = target.identity.clone();
+        append_identity(&mut target.disk.lock_ownership().unwrap(), &identity).unwrap();
+        std::fs::write(target.peer_stage_path(), &bytes).unwrap();
+        target.stage_peer_ckpt(info).unwrap();
+        drop(target);
+
+        let recovered = Journal::open(target_dir.path(), initial(), 3, "member-0").unwrap();
+        assert_eq!(recovered.state.snapshot.index, 1);
+        assert_eq!(recovered.state.commit, 1);
+        assert!(recovered.needs_peer_catchup());
+        assert!(named(target_dir.path(), "snapshot", 1).exists());
+        assert!(!named(target_dir.path(), "snapshot", 0).exists());
+        assert!(!target_dir.path().join("peer-checkpoint.pending").exists());
+
+        drop(recovered);
+        let mut recovered = Journal::open(target_dir.path(), initial(), 3, "member-0").unwrap();
+        recovered.finish_peer_catchup().unwrap();
+        assert!(!recovered.needs_peer_catchup());
     }
     #[test]
     fn journal_header_requires_expected_ring_even_for_empty_journals() {
@@ -4134,6 +4374,7 @@ pub fn provision_test_founder(
             initialized: false,
             pending: None,
             recovery: None,
+            peer_catchup: false,
         },
     )?;
     file.sync_all()?;
@@ -4146,6 +4387,8 @@ crate::wire_struct!(Checkpoint, RaftCheckpoint, {sequence,second,state});
 
 crate::wire_struct!(CommittedJournal, RaftCommittedJournal, {ring,after,previous_term,previous_scn,entries});
 
-crate::wire_struct!(LocalIdentity, RaftLocalIdentity, {ring,process,current,retired,slot,latest_journal,latest_entry,latest_record,membership,founders,initialized,pending,recovery,repairing});
+crate::wire_struct!(CheckpointInfo, RaftCheckpointFile, {index,term,scn,bytes});
+
+crate::wire_struct!(LocalIdentity, RaftLocalIdentity, {ring,process,current,retired,slot,latest_journal,latest_entry,latest_record,membership,founders,initialized,pending,recovery,repairing,peer_catchup});
 
 crate::wire_struct!(RecoveryPlan, RaftRecoveryPlan, {archive,checkpoint,files});

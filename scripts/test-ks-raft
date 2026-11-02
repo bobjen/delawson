@@ -57,6 +57,7 @@ def journal_order(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--registrations-only', action='store_true', help='test endpoint persistence without destructive state-loss recovery')
+    parser.add_argument('--peer-copy-only', action='store_true', help='test recovered-member checkpoint and journal catch-up')
     parser.add_argument('--keep', action='store_true', help='keep the temporary cluster directory for inspection')
     args = parser.parse_args()
     temp_dir = KeepDir if args.keep else tempfile.TemporaryDirectory
@@ -115,22 +116,22 @@ def main():
             text = command(id, 'status')
             return dict(line.split(' ', 1) for line in text.splitlines() if ' ' in line)
         def leader(exclude=()):
-            found = [id for id in children if id not in exclude and children[id].poll() is None and status(id).get('raft_role') == 'Leader']
+            found = [id for id in list(children) if id not in exclude and children[id].poll() is None and status(id).get('raft_role') == 'Leader']
             return found[0] if len(found) == 1 else None
         try:
             for id in members: start(id)
             primary = until(leader)
-            assert all(status(id).get('unlocked') == 'false' for id in children)
+            assert all(status(id).get('unlocked') == 'false' for id in list(children))
             # Elections and commitment of a term's no-op work while every KS is locked.
-            until(lambda: all(int(status(id)['raft_commit']) > 0 for id in children))
+            until(lambda: all(int(status(id)['raft_commit']) > 0 for id in list(children)))
             command(primary, 'unlock', '--key-file', ceremony/'unlock-key')
-            until(lambda: all(status(id).get('unlocked') == 'true' and int(status(id)['master_keys']) == 1 for id in children))
+            until(lambda: all(status(id).get('unlocked') == 'true' and int(status(id)['master_keys']) == 1 for id in list(children)))
             creation = str(int(time.time()))
             expected = command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation)
             follower = next(id for id in children if id != primary)
             assert command(follower, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
             command(primary, 'rotate-master-key')
-            until(lambda: all(int(status(id)['master_keys']) == 2 for id in children))
+            until(lambda: all(int(status(id)['master_keys']) == 2 for id in list(children)))
             time.sleep(1.1)
             creation = str(int(time.time()))
             expected = command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation)
@@ -170,10 +171,10 @@ def main():
             stop(survivor)
             for id in members: start(id)
             primary = until(leader)
-            assert all(status(id).get('unlocked') == 'false' for id in children)
-            until(lambda: all(int(status(id)['registered']) >= 2 for id in children))
+            assert all(status(id).get('unlocked') == 'false' for id in list(children))
+            until(lambda: all(int(status(id)['registered']) >= 2 for id in list(children)))
             command(primary, 'unlock', '--key-file', ceremony/'unlock-key')
-            until(lambda: all(status(id).get('unlocked') == 'true' for id in children))
+            until(lambda: all(status(id).get('unlocked') == 'true' for id in list(children)))
             assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
             if args.registrations_only:
                 # Add a fourth member so one stops applying key state, but must
@@ -186,9 +187,9 @@ def main():
                 membership_file = work/'members.json'
                 membership_file.write_text(json.dumps(list(members)))
                 until(lambda: command(primary, 'raft-members', '--members-file', membership_file) or True)
-                until(lambda: sum(status(id).get('raft_applying') == 'true' for id in children) == 3)
-                until(lambda: all(int(status(id)['registered']) == 3 for id in children))
-                cold = next(id for id in children if status(id).get('raft_applying') == 'false')
+                until(lambda: sum(status(id).get('raft_applying') == 'true' for id in list(children)) == 3)
+                until(lambda: all(int(status(id)['registered']) == 3 for id in list(children)))
+                cold = next(id for id in list(children) if status(id).get('raft_applying') == 'false')
                 assert int(status(cold)['master_keys']) == 0
                 print('PASS: replicated registrations; changed-port discovery with obsolete seeds; locked restart; primary failover; routing retained by cold member; registration does not grant a voting slot.')
                 return
@@ -214,6 +215,13 @@ def main():
             assert until(leader) == primary
             until(lambda: status(replacing).get('unlocked') == 'true')
             assert command(replacing, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
+            if args.peer_copy_only:
+                # The recovered member should have installed another member's
+                # checkpoint file, then persisted its committed primary suffix.
+                assert list(jdir.glob('snapshot-*.bin.peer-*'))
+                assert list((jdir/'copied-journals').glob('journal-*.log'))
+                print('PASS: corrupt member recovered from a peer checkpoint file, restarted, and copied the committed primary journal suffix.')
+                return
             # A retirement majority recovers without an old quorum. Keep snapshots;
             # this exercises recovery, not the deferred divergent-history problem #127.
             retiring = list(members)[:2]
@@ -237,12 +245,12 @@ def main():
                         children.pop(id)
                         start(id)
                 current = leader()
-                if current and all(status(id).get('raft_lost_state') == 'false' for id in children):
+                if current and all(status(id).get('raft_lost_state') == 'false' for id in list(children)):
                     return current
             primary = until(recovered_ring)
             assert all(status(id)['raft_member_id'] != prior_ids[id] for id in retiring)
             command(primary, 'unlock', '--key-file', ceremony/'unlock-key')
-            until(lambda: all(status(id).get('unlocked') == 'true' for id in children))
+            until(lambda: all(status(id).get('unlocked') == 'true' for id in list(children)))
             assert command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected
             # A fresh cold nonvoter copies committed state from a nonprimary peer.
             members['KS0-member3'] = f'127.0.0.1:{port()}'
@@ -260,8 +268,8 @@ def main():
             until(lambda: status('KS0-member3').get('unlocked') == 'true' and int(status('KS0-member3')['raft_commit']) >= int(status(primary)['raft_commit']))
             assert status('KS0-member3')['raft_member_id'] == applicant_id
             assert status('KS0-member3')['raft_member_slot'] == '3'
-            until(lambda: sum(status(id).get('raft_applying') == 'true' for id in children) == 3)
-            cold = next(id for id in children if status(id).get('raft_applying') == 'false')
+            until(lambda: sum(status(id).get('raft_applying') == 'true' for id in list(children)) == 3)
+            cold = next(id for id in list(children) if status(id).get('raft_applying') == 'false')
             assert int(status(cold)['master_keys']) == 0
             until(lambda: len(list((work/cold/'data/master-keys').glob('snapshot-*.bin'))) > 1)
             assert command('KS0-member3', 'sn-master-key', '--sn', '0', '--creation-second', creation) == expected

@@ -370,6 +370,16 @@ impl Host for Ks {
         // KS state is serialized in its checkpoint; journal retention lives in Raft.
         Ok(Vec::new())
     }
+    fn copy_ck_files(&self) -> bool {
+        true
+    }
+    fn request_restart(&self) {
+        if let Ok(process) = self.process.lock()
+            && let Some(process) = process.upgrade()
+        {
+            process.request_stop();
+        }
+    }
     fn can_checkpoint(&self, state: &State) -> bool {
         // A compact KS checkpoint cannot be sent as a generic Raft snapshot.
         state.snapshot.index == 0 && self.checkpoint.is_none()

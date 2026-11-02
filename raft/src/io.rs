@@ -364,9 +364,7 @@ fn worker(shared: Arc<Shared>) {
                 wake_sync = true;
             }
         }
-        wake_sync |= progress.shutdown
-            && progress.tasks.is_empty()
-            && progress.running == 0;
+        wake_sync |= progress.shutdown && progress.tasks.is_empty() && progress.running == 0;
         let callbacks = take_fence_callbacks(&mut progress);
         drop(progress);
         for (done, result) in callbacks {

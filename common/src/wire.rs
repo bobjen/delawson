@@ -330,6 +330,9 @@ ops! {
     KsCkKeyChunk = 156, "ks-checkpoint-key-chunk";
     RaftRecordMaxScn = 157, "raft-record-max-scn";
     RaftCkStatus = 158, "raft-checkpoint-status";
+    RaftCheckpointFile = 159, "raft-checkpoint-file";
+    RaftCkRead = 160, "raft-checkpoint-read";
+    RaftCkFile = 161, "raft-checkpoint-file-request";
 }
 
 impl std::fmt::Display for Op {

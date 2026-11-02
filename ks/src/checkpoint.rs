@@ -637,7 +637,7 @@ mod tests {
         drop(file);
 
         let (restored, sequence, second, length) =
-            read_raft(path.path(), mark.sequence, &mark.raft.ring, false).unwrap();
+            read_raft(path.path(), mark.raft.index, &mark.raft.ring, false).unwrap();
         assert_eq!((sequence, second), (mark.sequence, mark.second));
         assert_eq!(length, std::fs::metadata(path.path()).unwrap().len());
         assert_eq!(restored.snapshot.index, mark.raft.index);

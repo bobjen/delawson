@@ -64,6 +64,7 @@ struct Ks {
     unlock_verifier: Option<[u8; 32]>,
     unlock_key: Mutex<Option<[u8; 32]>>,
     checkpoint: Option<(PathBuf, checkpoint::Public)>,
+    process: Mutex<std::sync::Weak<Process>>,
     gc_stop: AtomicBool,
     gc_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -87,6 +88,15 @@ const SERVES: &[Op] = &[
 ];
 
 impl Service for Ks {
+    fn start_with_process(
+        self: &std::sync::Arc<Self>,
+        process: &std::sync::Arc<Process>,
+    ) -> Result<()> {
+        *self.process.lock().map_err(|_| common::Error::new("KS process lock poisoned"))? =
+            std::sync::Arc::downgrade(process);
+        self.start()
+    }
+
     fn start(self: &std::sync::Arc<Self>) -> Result<()> {
         self.start_gc()?;
         if let Err(error) = self.start_raft() {
@@ -377,6 +387,7 @@ impl Ks {
             unlock_verifier,
             unlock_key: Mutex::new(None),
             checkpoint,
+            process: Mutex::new(std::sync::Weak::new()),
             gc_stop: AtomicBool::new(true),
             gc_thread: Mutex::new(None),
             common,

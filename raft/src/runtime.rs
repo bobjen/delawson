@@ -12,6 +12,8 @@ use common::{Error, Result};
 use common::{MessagePayload, Op, Req, Resp, Status, structure};
 use parking_lot::{Condvar, Mutex as ParkMutex, RwLock, RwLockReadGuard};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -691,6 +693,8 @@ pub enum Message {
     Bootstrap { founders: Membership, membership: Membership },
     Consensus(Rpc),
     Checkpoint { after: u64, primary_fallback: bool },
+    CheckpointFile { after: u64, primary_fallback: bool },
+    CheckpointRead { index: u64, offset: u64, length: u64 },
     Journal { after: u64, through: u64, primary_fallback: bool },
     JournalTip { index: u64, term: u64 },
     CheckpointStart,
@@ -878,6 +882,12 @@ pub trait Host:
     fn can_checkpoint(&self, _state: &State) -> bool {
         true
     }
+    /// Service checkpoint files are installed only on process restart. Services
+    /// without that lifecycle hook keep using the in-memory Raft snapshot copy.
+    fn copy_ck_files(&self) -> bool {
+        false
+    }
+    fn request_restart(&self) {}
     /// Stream an application-specific checkpoint into the journal's atomic file publish.
     /// Returning `None` uses the generic Raft checkpoint encoding.
     fn checkpoint_writer<'a>(
@@ -1223,21 +1233,30 @@ pub trait Host:
     fn copy_committed_journal(&self) -> Result<bool> {
         let plan = self.on_raft(|host, node| {
             let through = host.checkpoint_needed.load(Ordering::SeqCst);
+            let peer_catchup = node.journal.needs_peer_catchup();
             if node.role != Role::Follower
                 || node.repairing
                 || node.journal.failed
-                || through <= node.state().commit
+                || (!peer_catchup && through <= node.state().commit)
             {
                 return Ok(None);
             }
             let Some(leader) = node.leader else {
                 return Ok(None);
             };
-            let peers =
-                recovery_sources(node.state().membership().participants(), node.id, Some(leader));
-            Ok(Some((node.state().commit, through, leader, node.state().term, peers)))
+            // Committed suffixes are canonical at the primary. A secondary may
+            // have a longer local file but must not be used as the source.
+            let peers = vec![(leader, true)];
+            Ok(Some((
+                node.state().commit,
+                if peer_catchup { u64::MAX } else { through },
+                leader,
+                node.state().term,
+                peer_catchup,
+                peers,
+            )))
         })?;
-        let Some((after, through, leader, term, peers)) = plan else {
+        let Some((after, through, leader, term, peer_catchup, peers)) = plan else {
             return Ok(false);
         };
         for (peer, primary_fallback) in peers {
@@ -1261,7 +1280,20 @@ pub trait Host:
             })();
             let copied = match decoded {
                 Ok(Some(copied)) => copied,
-                Ok(None) => continue,
+                Ok(None) => {
+                    if peer_catchup {
+                        self.on_raft(move |_, node| {
+                            if node.role == Role::Follower
+                                && node.leader == Some(leader)
+                                && node.state().term == term
+                            {
+                                node.journal.finish_peer_catchup()?;
+                            }
+                            Ok(())
+                        })?;
+                    }
+                    continue;
+                }
                 Err(error) => {
                     logn!("Raft journal source unusable", "peer {},error {}", peer, error);
                     continue;
@@ -1368,6 +1400,123 @@ pub trait Host:
             }
         }
         Ok(false)
+    }
+    fn copy_peer_ck_file(
+        &self,
+        peer: MemberId,
+        after: u64,
+        primary: MemberId,
+        election_term: u64,
+        primary_fallback: bool,
+    ) -> Result<bool> {
+        const CHUNK: u32 = 4 * 1024 * 1024;
+        let response =
+            match self.send_raft(&peer, Message::CheckpointFile { after, primary_fallback }) {
+                Ok(response) if response.status == Status::Ok => response,
+                _ => return Ok(false),
+            };
+        let info = (|| -> Result<Option<journal::CheckpointInfo>> {
+            let (mut body, rest) =
+                structure(response.args(), Op::BytesResp, "checkpoint file response")?;
+            let info = parse(&body.bytes()?)?;
+            body.done()?;
+            if !rest.is_empty() {
+                return Err(Error::new("trailing checkpoint file response"));
+            }
+            Ok(info)
+        })()?;
+        let Some(info) = info else { return Ok(false) };
+        if (after != u64::MAX && info.index <= after) || info.bytes == 0 {
+            return Ok(false);
+        }
+        let proof = self.primary_history_tip(primary, election_term, info.index)?;
+        if proof != Some((info.term, info.scn)) {
+            logn!(
+                "Raft checkpoint file rejected",
+                "peer {},primary {},index {},term {},proof {:?}",
+                peer,
+                primary,
+                info.index,
+                info.term,
+                proof
+            );
+            return Ok(false);
+        }
+        let can_install = self.on_raft(move |_, node| {
+            Ok(node.role == Role::Follower
+                && !node.journal.failed
+                && node.leader == Some(primary)
+                && node.state().term == election_term
+                && (node.repairing
+                    || (info.index > node.state().snapshot.index
+                        && node.state().history_at(info.index) == Some((info.term, info.scn)))))
+        })?;
+        if !can_install {
+            return Ok(false);
+        }
+        let path = self.on_raft(|_, node| Ok(node.journal.peer_stage_path()))?;
+        let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&path)?;
+        let mut offset = 0u64;
+        while offset < info.bytes {
+            let length = (info.bytes - offset).min(u64::from(CHUNK)) as u32;
+            let response = self.send_raft(
+                &peer,
+                Message::CheckpointRead { index: info.index, offset, length: u64::from(length) },
+            )?;
+            if response.status != Status::Ok {
+                let _ = std::fs::remove_file(&path);
+                return Ok(false);
+            }
+            let bytes = (|| -> Result<Vec<u8>> {
+                let (mut body, rest) =
+                    structure(response.args(), Op::BytesResp, "checkpoint chunk response")?;
+                let bytes = parse(&body.bytes()?)?;
+                body.done()?;
+                if !rest.is_empty() {
+                    return Err(Error::new("trailing checkpoint chunk response"));
+                }
+                Ok(bytes)
+            })()?;
+            if bytes.len() != length as usize {
+                let _ = std::fs::remove_file(&path);
+                return Err(Error::new("checkpoint source returned a short chunk"));
+            }
+            file.write_all(&bytes)?;
+            offset += u64::from(length);
+        }
+        file.sync_all()?;
+        drop(file);
+        let installed = self.on_raft(move |_, node| {
+            if node.role != Role::Follower
+                || node.journal.failed
+                || node.leader != Some(primary)
+                || node.state().term != election_term
+                || (!node.repairing
+                    && (info.index <= node.state().snapshot.index
+                        || node.state().history_at(info.index) != Some((info.term, info.scn))))
+            {
+                return Ok(false);
+            }
+            node.journal.stage_peer_ckpt(info)?;
+            // Stop accepting state changes until the new checkpoint is loaded
+            // by the next process instance.
+            node.repairing = true;
+            Ok(true)
+        })?;
+        if installed {
+            logn!(
+                "Raft peer checkpoint staged",
+                "peer {},index {},term {},bytes {}",
+                peer,
+                info.index,
+                info.term,
+                info.bytes
+            );
+            self.request_restart();
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+        Ok(installed)
     }
     fn checkpoint_work(&self) -> Result<()> {
         let Ok(_task) = self.snapshot_task.try_lock() else {
@@ -1484,6 +1633,19 @@ pub trait Host:
             Some(CheckpointPlan::Copy { after, primary, peers }) => {
                 drop(history);
                 let Some((primary, election_term)) = primary else { return Ok(()) };
+                if self.copy_ck_files() {
+                    for (id, primary_fallback) in &peers {
+                        if self.copy_peer_ck_file(
+                            *id,
+                            after,
+                            primary,
+                            election_term,
+                            *primary_fallback,
+                        )? {
+                            return Ok(());
+                        }
+                    }
+                }
                 for (id, primary_fallback) in peers {
                     let Ok(response) =
                         self.send_raft(&id, Message::Checkpoint { after, primary_fallback })
@@ -2478,6 +2640,8 @@ pub trait Host:
                 && !matches!(
                     packet.message,
                     Message::Checkpoint { .. }
+                        | Message::CheckpointFile { .. }
+                        | Message::CheckpointRead { .. }
                         | Message::Journal { .. }
                         | Message::JournalTip { .. }
                 ))
@@ -2494,6 +2658,8 @@ pub trait Host:
                 packet.message,
                 Message::Consensus(_)
                     | Message::Checkpoint { .. }
+                    | Message::CheckpointFile { .. }
+                    | Message::CheckpointRead { .. }
                     | Message::Journal { .. }
                     | Message::JournalTip { .. }
             ) {
@@ -2583,6 +2749,30 @@ pub trait Host:
             Message::Checkpoint { after, primary_fallback } => {
                 let snapshot = self.checkpoint_from(node, after, primary_fallback)?;
                 Ok(Resp::bytes(crate::codec::encode_message(&snapshot)?))
+            }
+            Message::CheckpointFile { after, primary_fallback } => {
+                if node.role == Role::Stopped
+                    || node.repairing
+                    || node.journal.failed
+                    || (node.role == Role::Leader && !primary_fallback)
+                {
+                    return Err(Error::new("checkpoint file source unavailable"));
+                }
+                let read = node
+                    .journal
+                    .read_history(move |history| binary(&history.checkpoint_info(after)?))?;
+                *deferred = Some(Deferred::Read(read));
+                Ok(Resp::ok())
+            }
+            Message::CheckpointRead { index, offset, length } => {
+                if node.role == Role::Stopped || node.repairing || node.journal.failed {
+                    return Err(Error::new("checkpoint file source unavailable"));
+                }
+                let read = node.journal.read_history(move |history| {
+                    binary(&history.checkpoint_chunk(index, offset, length)?)
+                })?;
+                *deferred = Some(Deferred::Read(read));
+                Ok(Resp::ok())
             }
             Message::Consensus(rpc) => {
                 let was_repairing = node.repairing;
@@ -3373,6 +3563,19 @@ impl crate::codec::Wire for Message {
                     primary_fallback.write(w);
                 })
             }
+            Self::CheckpointFile { after, primary_fallback } => {
+                w.nested(common::Op::RaftCkFile, |w| {
+                    after.write(w);
+                    primary_fallback.write(w);
+                })
+            }
+            Self::CheckpointRead { index, offset, length } => {
+                w.nested(common::Op::RaftCkRead, |w| {
+                    index.write(w);
+                    offset.write(w);
+                    length.write(w);
+                })
+            }
             Self::Journal { after, through, primary_fallback } => {
                 w.nested(common::Op::RaftMessageJournal, |w| {
                     after.write(w);
@@ -3406,6 +3609,14 @@ impl crate::codec::Wire for Message {
             common::Op::RaftMessageCheckpoint => {
                 Ok(Self::Checkpoint { after: Wire::read(r)?, primary_fallback: Wire::read(r)? })
             }
+            common::Op::RaftCkFile => {
+                Ok(Self::CheckpointFile { after: Wire::read(r)?, primary_fallback: Wire::read(r)? })
+            }
+            common::Op::RaftCkRead => Ok(Self::CheckpointRead {
+                index: Wire::read(r)?,
+                offset: Wire::read(r)?,
+                length: Wire::read(r)?,
+            }),
             common::Op::RaftMessageJournal => Ok(Self::Journal {
                 after: Wire::read(r)?,
                 through: Wire::read(r)?,

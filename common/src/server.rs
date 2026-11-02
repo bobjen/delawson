@@ -99,6 +99,12 @@ pub trait Service: Send + Sync + Sized + 'static {
         Ok(())
     }
 
+    /// Start with access to the process lifecycle when a service may need to
+    /// request an orderly restart after installing durable state.
+    fn start_with_process(self: &Arc<Self>, _process: &Arc<Process>) -> Result<()> {
+        self.start()
+    }
+
     /// The operations this machine type is the right place to send. Anything
     /// here that is not built yet answers `unimplemented`; anything else answers
     /// `bad request`, so a misdirected call is distinguishable from an unbuilt
@@ -410,9 +416,13 @@ impl Process {
 
     /// Ask the accept loop to stop. It is blocked in `accept`, so set the flag
     /// and then connect once to wake it.
-    fn stop_soon(&self) {
+    pub fn request_stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         let _ = TcpStream::connect(self.address());
+    }
+
+    fn stop_soon(&self) {
+        self.request_stop();
     }
 
     fn ready_file(&self) -> PathBuf {
@@ -1207,7 +1217,7 @@ pub fn main<S: Service>(build: impl FnOnce(&Process) -> Result<S>) -> Result<()>
     let process = Arc::new(Process::load(Path::new(&path))?);
     crate::scn::initialize(process.cluster.scn)?;
     let service = Arc::new(build(&process)?);
-    service.start()?;
+    service.start_with_process(&process)?;
     serve(process, service)
 }
 
