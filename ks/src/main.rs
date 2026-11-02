@@ -340,14 +340,17 @@ impl Ks {
             checkpoint::read_raft,
         )?;
         let checkpoint_path = journal.checkpoint_path();
-        let checkpoint = if journal.checkpoint_sequence() == 0 {
+        let checkpoint = if journal.checkpoint_sequence() == 0 && !checkpoint_path.exists() {
             None
         } else {
             checkpoint::read_public_path(&checkpoint_path)?.map(|public| (checkpoint_path, public))
         };
-        let seed = checkpoint
-            .as_ref()
-            .map(|(_, public)| (journal.state.generation, public.mark.raft.index));
+        let generation = journal.state.generation;
+        let (seed_index, registrations) = if let Some((_, public)) = &checkpoint {
+            (public.mark.raft.index, runtime::Registrations { peers: public.peers.clone() })
+        } else {
+            (journal.state.snapshot.index, runtime::restore_registrations(&journal.state)?)
+        };
         let id =
             journal.state.membership().slot(&journal.identity.current).unwrap_or(raft::UNASSIGNED);
         let mut node = raft::Node::new_with_log2(id, journal, config.raft.log2_entries)?;
@@ -366,14 +369,9 @@ impl Ks {
             snapshot_interval_secs: config.snapshot_interval_secs,
             allow_stale_reads: config.knobs.allow_stale_reads,
         };
-        let mut application = KsState::default();
-        if let Some((_, public)) = &checkpoint {
-            application.registrations.peers.clone_from(&public.peers);
-        }
+        let application = KsState { keys: KeyHistory::default(), registrations };
         let common = raft::runtime::Runtime::with_state(runtime, node, options, application);
-        if let Some((generation, index)) = seed {
-            common.seed_metadata(generation, index)?;
-        }
+        common.seed_metadata(generation, seed_index)?;
         let ks = Ks {
             config,
             unlock_verifier,

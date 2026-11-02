@@ -40,7 +40,7 @@ impl Mark {
 /// Read a KS checkpoint into Raft state, or use the generic format for older files.
 pub(super) fn read_raft(
     path: &Path,
-    sequence: u64,
+    entry: u64,
     ring: &str,
     ignore: bool,
 ) -> Result<(raft::State, u64, u64, u64)> {
@@ -48,12 +48,12 @@ pub(super) fn read_raft(
     let is_ks =
         raft::checkpoint::read_footer(&mut file).is_ok_and(|footer| footer.op == Op::KsCkFooter);
     if !is_ks {
-        return raft::journal::read_checkpoint(path, sequence, ring, ignore);
+        return raft::journal::read_checkpoint(path, entry, ring, ignore);
     }
     let public = read_public(&mut file)?;
     let mark = public.mark;
     let status = mark.raft;
-    if mark.sequence != sequence || (!ignore && status.ring != ring) {
+    if status.index != entry || (!ignore && status.ring != ring) {
         return Err(Error::new("KS checkpoint ring or sequence mismatch"));
     }
     let second = mark.second;
@@ -81,7 +81,7 @@ pub(super) fn read_raft(
     state.check_ring(&state.snapshot)?;
     state.validate()?;
     let length = file.metadata()?.len();
-    Ok((state, sequence, second, length))
+    Ok((state, mark.sequence, second, length))
 }
 
 pub(super) fn read_public_path(path: &Path) -> Result<Option<Public>> {

@@ -1421,21 +1421,15 @@ pub trait Host:
                         {
                             return Ok(None);
                         }
-                        if applied != node.state().commit {
-                            return Ok(None);
-                        }
                         host.checkpoint_started.store(*index, Ordering::SeqCst);
                     } else {
                         return Ok(node.leader.map(CheckpointPlan::Request));
                     }
                 }
-                if applied != node.state().commit {
-                    return Ok(None);
-                }
                 host.cancel_snapshot.store(false, Ordering::SeqCst);
                 host.producing_snapshot.store(true, Ordering::SeqCst);
                 let state = node.state().clone();
-                let snapshot = state.capture();
+                let snapshot = state.capture_at(applied)?;
                 let mark = node.journal.begin_checkpoint(&state, &snapshot)?;
                 Ok(Some(CheckpointPlan::Produce { state, snapshot, mark }))
             } else {

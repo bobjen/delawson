@@ -44,6 +44,24 @@ pub(super) fn apply_registration(
         _ => Err(Error::new("unknown KS action tag")),
     }
 }
+/// Rebuild routing metadata carried by a generic Raft snapshot.
+pub(super) fn restore_registrations(state: &State) -> Result<Registrations> {
+    let mut registrations = Registrations::default();
+    for entry in &state.snapshot.application {
+        for action in entry.client_actions()?.iter() {
+            apply_registration(
+                &mut registrations,
+                raft::execution::Context {
+                    ring: &state.ring,
+                    index: entry.index,
+                    term: entry.term,
+                },
+                action,
+            )?;
+        }
+    }
+    Ok(registrations)
+}
 pub(super) fn apply_state(
     state: &mut KsState,
     key: &[u8; 32],
@@ -504,6 +522,25 @@ mod tests {
         let worker = needs_request_worker(&peer(9001).request());
         assert!(malformed);
         assert!(worker);
+    }
+    #[test]
+    fn generic_snapshot_restores_registrations() {
+        let mut state =
+            State::initial("01".repeat(64), raft::tests::members(3), raft::tests::names()).unwrap();
+        state.term = 1;
+        state.log.push(Entry {
+            scn: common::scn::Scn::new(1),
+            index: 1,
+            term: 1,
+            command: Command::Client(vec![registration_action(&peer(9001))]),
+            entry_buf: None,
+        });
+        state.commit = 1;
+        let snapshot = state.capture();
+        state.apply(&raft::Record::Install(snapshot)).unwrap();
+
+        let registrations = restore_registrations(&state).unwrap();
+        assert_eq!(registrations.peers.get("KS0-member1"), Some(&peer(9001)));
     }
     #[test]
     fn one_entry_dispatches_multiple_encrypted_key_actions() {

@@ -37,13 +37,34 @@ def until(check, timeout=15):
         time.sleep(.05)
     raise RuntimeError(f'condition timed out: {last}')
 
+class KeepDir:
+    def __init__(self, prefix):
+        self.path = tempfile.mkdtemp(prefix=prefix)
+
+    def __enter__(self):
+        return self.path
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+def journal_order(path):
+    with path.open('rb') as source:
+        header = source.read(152)
+    if len(header) < 152:
+        return -1
+    return int.from_bytes(header[136:144], 'little')
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--registrations-only', action='store_true', help='test endpoint persistence without destructive state-loss recovery')
+    parser.add_argument('--keep', action='store_true', help='keep the temporary cluster directory for inspection')
     args = parser.parse_args()
+    temp_dir = KeepDir if args.keep else tempfile.TemporaryDirectory
     children = {}
-    with tempfile.TemporaryDirectory(prefix='delawson-ks-raft-') as temporary:
+    with temp_dir(prefix='delawson-ks-raft-') as temporary:
         work = Path(temporary)
+        if args.keep:
+            print(f'test files: {work}', flush=True)
         members = {f'KS0-member{i}': f'127.0.0.1:{port()}' for i in range(3)}
         host = work/'host'
         run([ROOT/'scripts/machine-identity', '--output-dir', host, '--software'])
@@ -113,7 +134,8 @@ def main():
             time.sleep(1.1)
             creation = str(int(time.time()))
             expected = command(primary, 'sn-master-key', '--sn', '0', '--creation-second', creation)
-            until(lambda: all(len(list((work/id/'data/master-keys').glob('snapshot-*.bin'))) > 1 for id in children))
+            checkpoint_member = next(id for id in children if id != primary)
+            until(lambda: len(list((work/checkpoint_member/'data/master-keys').glob('snapshot-*.bin'))) > 1)
             # Suspend the primary so another is elected, then resume the stale process.
             # It must terminate itself on demotion, not continue in a newer term.
             old_primary = children[primary]
@@ -177,7 +199,10 @@ def main():
             old_incarnation = int(status(replacing)['raft_member_incarnation'])
             stop(replacing)
             jdir = work/replacing/'data/master-keys'
-            last_journal = max(jdir.glob('journal-*.log'), key=lambda path: int(path.stem.split('-')[-1]))
+            last_journal = max(
+                jdir.glob('journal-*.log'),
+                key=journal_order,
+            )
             last_journal.write_bytes(b'not a journal')
 
             start(replacing)
@@ -196,7 +221,10 @@ def main():
             for id in list(children): stop(id)
             for id in retiring:
                 jdir = work/id/'data/master-keys'
-                last_journal = max(jdir.glob('journal-*.log'), key=lambda path: int(path.stem.split('-')[-1]))
+                last_journal = max(
+                    jdir.glob('journal-*.log'),
+                    key=journal_order,
+                )
                 last_journal.unlink(missing_ok=True)
             for id in members: start(id)
             def recovered_ring():

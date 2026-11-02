@@ -767,8 +767,14 @@ impl State {
             .or_else(|| self.snapshot.checkpoint_start.clone())
     }
     pub fn capture(&self) -> Snapshot {
+        self.capture_at(self.commit).expect("committed Raft snapshot")
+    }
+    pub fn capture_at(&self, index: u64) -> Result<Snapshot> {
+        if index < self.snapshot.index || index > self.commit {
+            return Err(Error::new("snapshot index is outside applied Raft history"));
+        }
         let mut snapshot = self.snapshot.clone();
-        for e in self.log.iter().take_while(|e| e.index <= self.commit) {
+        for e in self.log.iter().take_while(|e| e.index <= index) {
             match &e.command {
                 Command::Client(_) => snapshot.application.push(e.clone()),
                 Command::Members(m) => snapshot.membership = m.after.clone(),
@@ -782,7 +788,11 @@ impl State {
             snapshot.term = e.term;
             snapshot.scn = e.scn;
         }
-        snapshot
+        if snapshot.index != index {
+            return Err(Error::new("snapshot entry is missing from Raft history"));
+        }
+        snapshot.validate()?;
+        Ok(snapshot)
     }
     pub fn apply(&mut self, record: &Record) -> Result<()> {
         self.apply_record(record)?;
@@ -2889,6 +2899,7 @@ pub mod tests {
         state.snapshot = state.capture();
         state.log.clear();
         state.vote = None;
+        state.vote_scn = None;
         state.apply(&Record::Retired(retired.clone())).unwrap();
         let mut node = Node::new(
             retired.next,

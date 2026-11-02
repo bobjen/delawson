@@ -19365,10 +19365,13 @@ alone does not close that cache gap.
 ## 17.49 KS snapshots and recovery positions
 
 Raft log index, committed index, and applied index are distinct. A separate u64
-physical batch sequence orders local journal writes, including term/vote and
-commit records. Snapshot and journal filenames use this physical sequence, not
-the Raft index. Both positions are recorded in recovery state. Overflow is checked;
-wrap-aware ordering remains issue #123.
+physical frame sequence orders local journal writes, including term/vote and
+commit records. Checkpoints are named by their applied Raft entry index;
+journals are named by the `(entry, record)` position of their first frame. The
+record number is local to a member and restarts at zero for each new entry.
+Physical frame sequence remains in the journal header and frame payload for
+continuity checks, and identity records the latest journal's physical sequence
+and start position. Overflow is checked; wrap-aware ordering remains issue #123.
 
 Bootstrap publishes an empty snapshot at sequence and committed index zero, even
 while locked. Every recovery starts from the newest snapshot, then replays all
@@ -19378,13 +19381,14 @@ to establish commitment again for entries whose commitment was not recorded.
 
 Snapshots contain committed key entries and membership plus persistent term/vote
 state. Preparation captures this small opaque KS state and switches journals under
-the journal mutex; writing the captured copy releases that mutex. If the captured
-batch sequence is K and committed index is N, the new journal begins at K+1.
-Any already-journaled uncommitted suffix is carried into that new journal, starting
-at Raft index N+1. Thus replay starts at a journal boundary whether or not the
-snapshot is successfully published. Completion preserves concurrent term changes,
-commit advancement, and new log entries. Only one snapshot write runs at a time.
-This small-state copy is not the future large SN/DN snapshot implementation.
+the journal mutex; writing the captured copy releases that mutex. A checkpoint is
+anchored at an applied entry. Its successor journal starts at `(entry, 0)`,
+overlapping the old history from that entry and carrying the later log suffix, so
+the checkpoint and successor journal can recover without older files. Journal
+files are created with their first real frame rather than as empty placeholders.
+Completion preserves concurrent term changes, commit advancement, and new log
+entries. Only one snapshot write runs at a time. This small-state copy is not the
+future large SN/DN snapshot implementation.
 
 Publication writes a temporary file, syncs it, renames it, and syncs the directory.
 An incomplete final frame in the active journal can be trimmed; a partial closed
@@ -19412,27 +19416,28 @@ before tuning the production defaults. Billing exports are a separate policy.
 
 ## 17.50 Numbered KS files, journal rotation and pruning
 
-The directory contains `identity`, `snapshot-<sequence>.bin`, and numbered
-`journal-<first-sequence>.log` files. Every journal starts with its final name;
-the identity record stores the starting sequence of the latest journal. Numbered
-filenames use zero-padded 20-digit decimal sequences. The identity file binds the
-store to its ring and member; its exclusive file lock prevents concurrent opens
-and survives rotation. Earlier formats are unsupported, with no migration path.
+The directory contains `identity`, `snapshot-<entry>.bin`, and
+`journal-<entry>-<record>.log` files. Both journal coordinates use zero-padded
+20-digit decimal numbers; even checkpoint-boundary journals use the `-0` suffix.
+The identity record stores the physical start sequence and `(entry, record)` of
+the latest journal. The identity file binds the store to its ring and member; its
+exclusive file lock prevents concurrent opens and survives rotation. Earlier
+formats are unsupported, with no migration path.
 
 Rotation runs under the journal mutex: sync the old file, create and sync the
-successor under its final numbered name, sync the directory, then append the new
-latest-journal sequence to `identity`. The new header stores its starting sequence
-so an empty journal is named correctly after restart. A snapshot retry with no
-intervening writes reuses the empty active journal. Any rotation I/O failure
-fences further journal writes. Recovery checks that the greatest numbered
-journal matches the latest sequence in `identity`; a missing, earlier, or later
+successor under its final `(entry, record)` name, sync the directory, then append
+the latest-journal position to `identity`. A new file begins with a real frame;
+recovery does not rely on a header-only file. Any rotation I/O failure fences
+further journal writes. Recovery checks that the latest journal's physical start
+sequence and position match `identity`; a missing, earlier, later, or mismatched
 file means voting-state loss. It retires that identity before creating its
 replacement. Files are never renamed just to mark one as active.
 
-A snapshot at physical sequence 100 is followed by a journal starting at 101. If that snapshot
-never appears, recovery starts with an earlier snapshot and reads every later
-journal, including 101, through the file named in `identity`. Header and filename starting
-sequences must agree; sequence continuity is checked. Temporary files are ignored.
+A snapshot at entry 100 is followed by a journal whose first frame is at
+`journal-00000000000000000100-00000000000000000000.log`. If that snapshot never
+appears, recovery starts with an earlier snapshot and reads later journals
+through the file named in `identity`. Header and filename positions must agree;
+physical frame sequence continuity is checked. Temporary files are ignored.
 Unparseable frames, inconsistent header positions, and wrong-ring files are
 unusable recovery sources. Rename such a file with a `.corrupt-N` suffix and sync
 the directory; preserve its bytes and exclude it from selection and pruning.
