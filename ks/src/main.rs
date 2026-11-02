@@ -544,7 +544,7 @@ impl Ks {
         };
         let mut epoch = self.choose_key()?;
         epoch.since = epoch.since.max(horizon.day_start());
-        self.propose_key(epoch).map(|_| ())
+        self.propose_key_locked(epoch).map(|_| ())
     }
 
     fn rotate_master_key(&self, request: &Req) -> Result<()> {
@@ -557,7 +557,7 @@ impl Ks {
         let _proposal =
             self.proposing.lock().map_err(|_| common::Error::new("proposal lock poisoned"))?;
         let epoch = self.choose_key()?;
-        self.propose_key(epoch).map(|_| ())
+        self.propose_key_locked(epoch).map(|_| ())
     }
 
     /// A registration announces a port; it does not invent an identity. The

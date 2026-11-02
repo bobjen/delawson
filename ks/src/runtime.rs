@@ -100,8 +100,18 @@ fn apply_action(
                 .map_err(|_| Error::new("KS key authentication failed"))?;
             let fields: KeyFields = raft::codec::decode(&plain)?;
             let epoch = MasterEpoch { key: fields.key, since: TimeSec::new(fields.since) };
-            if history.epochs.last().is_some_and(|last| last.since >= epoch.since) {
-                return Err(Error::new("KS key activation order is invalid"));
+            if let Some(previous) = history.epochs.last() {
+                if previous.since >= epoch.since {
+                    logn!(
+                        "KS key activation order invalid",
+                        "index {},term {},previous {},requested {}",
+                        context.index,
+                        context.term,
+                        previous.since.number(),
+                        epoch.since.number()
+                    );
+                    return Err(Error::new("KS key activation order is invalid"));
+                }
             }
             history.epochs.push(epoch);
             Ok(())
@@ -255,11 +265,21 @@ impl Ks {
         let index =
             node.state().last().checked_add(1).ok_or_else(|| Error::new("Raft index overflow"))?;
         let sealed = seal_key(&key, &node.state().ring, index, node.state().term, &epoch)?;
+        logn!(
+            "KS initial key proposed",
+            "term {},index {},since {}",
+            node.state().term,
+            index,
+            epoch.since.number()
+        );
         node.propose(Command::Client(vec![raft::Action::new(Op::KsKey, sealed)]))?;
         Ok(())
     }
     pub fn propose_key(&self, epoch: MasterEpoch) -> Result<u64> {
         let _proposal = self.proposing.lock().map_err(|_| Error::new("proposal lock poisoned"))?;
+        self.propose_key_locked(epoch)
+    }
+    pub(crate) fn propose_key_locked(&self, epoch: MasterEpoch) -> Result<u64> {
         let commit = self.on_raft(|_, node| Ok(node.state().commit))?;
         self.wait_applied(commit)?;
         let last_since = self.global_lock.read().keys.epochs.last().map(|last| last.since);

@@ -2900,7 +2900,9 @@ pub trait Host:
                 }
                 node.advance()?;
                 node.accept_replacements()?;
-                host.prepare_primary(node)?;
+                if before.0 != Role::Leader && node.role == Role::Leader {
+                    host.prepare_primary(node)?;
+                }
                 host.flush_client_proposals(node)?;
                 host.refresh_application(node)?;
                 if node.role != Role::Leader {
