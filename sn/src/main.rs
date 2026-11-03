@@ -4394,6 +4394,124 @@ mod tests {
         assert!(ready, "single-member SN Raft did not apply its no-op entry: {status}");
     }
 
+    #[test]
+    fn sn_checkpoint_recovers_state_and_replays_journal() {
+        let config = testing::sn_config();
+        let runtime = RaftSettings::testing(&config.raft);
+        let directory = tempfile::tempdir().unwrap();
+        raft::journal::provision_test_founder(
+            directory.path(),
+            &runtime.ring,
+            &runtime.name,
+            runtime.identities[&0].identity.clone(),
+        )
+        .unwrap();
+        let disks = default_disks();
+        let mut sn = SN::with_runtime(
+            config.clone(),
+            testing::extents().per_stream,
+            SnId::FIRST,
+            disks.clone(),
+            directory.path(),
+            runtime,
+        )
+        .unwrap();
+        sn.common.options.snapshot_min_log_bytes = u64::MAX;
+        sn.common.options.snapshot_interval_secs = u64::MAX;
+        let sn = Arc::new(sn);
+        sn.start().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let (role, commit) =
+                sn.on_raft(|_, node| Ok((node.role, node.state().commit))).unwrap();
+            if role == raft::Role::Leader && commit != 0 && sn.common.applied() >= commit {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "single-member SN did not become ready");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let first = named(3, 19);
+        add_stream(&sn, first.range.number(), first.stream.get());
+        let process = testing::process();
+        let open_req = Req::new(Op::OpenExtent).structure({
+            let mut payload = StructWriter::new();
+            payload.range_id(first.range);
+            payload.stream_id(first.stream);
+            payload.time_sec(first.created);
+            payload
+        });
+        assert_eq!(sn.open_extent(&process, &open_req).status, Status::Ok);
+        let extent_id = sn.global_lock.read().stream_map[&first].open.unwrap();
+        let seal_req = Req::new(Op::SealExtent).structure({
+            let mut payload = StructWriter::new();
+            payload.range_id(first.range);
+            payload.stream_id(first.stream);
+            payload.time_sec(first.created);
+            payload.extent_id(extent_id);
+            payload.eroff(ERoff::new(7));
+            payload.eloff(ELoff::new(90));
+            payload.ecoff(ECoff::new(90));
+            payload
+        });
+        assert_eq!(sn.seal(&process, &seal_req).status, Status::Ok);
+        let before_checkpoint = sn.on_raft(|_, node| Ok(node.state().commit)).unwrap();
+
+        sn.checkpoint_requested.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let (checkpoint_index, checkpoint_path) = loop {
+            let (index, sequence, path) = sn
+                .on_raft(|_, node| {
+                    Ok((
+                        node.state().snapshot.index,
+                        node.journal.checkpoint_sequence(),
+                        node.journal.checkpoint_path(),
+                    ))
+                })
+                .unwrap();
+            if index >= before_checkpoint && sequence != 0 && path.exists() {
+                break (index, path);
+            }
+            assert!(std::time::Instant::now() < deadline, "SN checkpoint was not written");
+            thread::sleep(Duration::from_millis(10));
+        };
+        let mut file = std::fs::File::open(&checkpoint_path).unwrap();
+        assert_eq!(raft::checkpoint::read_footer(&mut file).unwrap().op, Op::SnCkFooter);
+
+        let later = named(3, 20);
+        add_stream(&sn, later.range.number(), later.stream.get());
+        let after_checkpoint = sn.on_raft(|_, node| Ok(node.state().commit)).unwrap();
+        assert!(after_checkpoint > checkpoint_index);
+
+        sn.stop_gc().unwrap();
+        sn.stop_raft().unwrap();
+        drop(sn);
+
+        let config = testing::sn_config();
+        let recovered = SN::with_runtime(
+            config.clone(),
+            testing::extents().per_stream,
+            SnId::FIRST,
+            Vec::new(),
+            directory.path(),
+            RaftSettings::testing(&config.raft),
+        )
+        .unwrap();
+        let state = recovered.global_lock.read();
+        assert_eq!(recovered.disks.lock().unwrap().as_slice(), disks.as_slice());
+        assert_eq!(state.streams, 2);
+        assert_eq!(state.extents, 2);
+        assert_eq!(state.sealed, 1);
+        let stream = state.stream_map.get(&first).unwrap();
+        assert_eq!(stream.sealed, vec![extent_id]);
+        let extent = &state.extent_table[extent_id.get() as usize];
+        assert!(extent.deletion.is_valid());
+        assert!(extent.sealed);
+        assert!(state.stream_map.get(&later).is_some());
+        assert!(recovered.common.applied() >= after_checkpoint);
+    }
+
     fn add_stream(sn: &SN, range: u64, stream: u32) {
         let made = sn.create(&Req::new(Op::CreateStream).structure({
             let mut payload = StructWriter::new();
