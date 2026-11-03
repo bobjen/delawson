@@ -333,6 +333,19 @@ ops! {
     RaftCheckpointFile = 159, "raft-checkpoint-file";
     RaftCkRead = 160, "raft-checkpoint-read";
     RaftCkFile = 161, "raft-checkpoint-file-request";
+    SnCkFooter = 162, "sn-ck-footer";
+    SnCkRange = 163, "sn-ck-range";
+    SnCkEns = 164, "sn-ck-ens";
+    SnCkEn = 165, "sn-ck-en";
+    SnCkExtents = 166, "sn-ck-extents";
+    SnCkExtent = 167, "sn-ck-extent";
+    SnCkStreams = 168, "sn-ck-streams";
+    SnCkStream = 169, "sn-ck-stream";
+    SnCkRefs = 170, "sn-ck-refs";
+    SnCkRetired = 171, "sn-ck-retired";
+    SnCkPending = 172, "sn-ck-pending";
+    SnCkTask = 173, "sn-ck-task";
+    SnCkExtExtra = 174, "sn-ck-ext-extra";
 }
 
 impl std::fmt::Display for Op {

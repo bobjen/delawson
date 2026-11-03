@@ -409,6 +409,18 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearHash<'a, T, A, L>
         self.len == 0
     }
 
+    /// Visit each live entry once, in bucket and chain order.
+    pub fn for_each(&self, mut visit: impl FnMut(&T)) {
+        for bucket in 0..self.hash.bucket_count() {
+            let mut index = self.hash.head(bucket);
+            while index != T::LINK_NONE {
+                let item = self.slot(index);
+                visit(item);
+                index = item.next();
+            }
+        }
+    }
+
     fn slot(&self, index: u32) -> &T {
         // SAFETY: issued slots remain initialized at stable addresses.
         unsafe { &*self.base.as_ptr().add(index as usize) }

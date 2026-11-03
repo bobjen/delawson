@@ -13,6 +13,8 @@
 //! request handling and Raft apply can synchronize.
 //! Deleted extent slots remain tombstones; recycling them safely is a later step.
 
+mod checkpoint;
+
 use common::config::{SNConfig, ServiceKind};
 use common::deletion::{
     Delete, Extras, Flags, SharedExtras, Target, bad, forward, read_soft_deleted,
@@ -283,6 +285,8 @@ unsafe impl pool::LockedItem for Stream {
 #[derive(Debug)]
 struct Extent {
     deletion: Flags,
+    /// Finalized independently of any stream that references this extent.
+    sealed: bool,
     logical: ELoff,
     compressed: ECoff,
     id: ExtentId,
@@ -295,6 +299,7 @@ impl Extent {
     fn blank() -> Self {
         Self {
             deletion: Flags::default(),
+            sealed: false,
             logical: ELoff::ZERO,
             compressed: ECoff::ZERO,
             id: ExtentId::NONE,
@@ -307,6 +312,7 @@ impl Extent {
     fn snapshot(&self) -> ExtentData {
         ExtentData {
             deletion: self.deletion,
+            sealed: self.sealed,
             logical: self.logical,
             compressed: self.compressed,
             id: self.id,
@@ -319,6 +325,7 @@ impl Extent {
     fn from_data(data: ExtentData) -> Self {
         Self {
             deletion: data.deletion,
+            sealed: data.sealed,
             logical: data.logical,
             compressed: data.compressed,
             id: data.id,
@@ -335,6 +342,7 @@ impl Extent {
 
     fn init(&mut self) {
         self.deletion = Flags::default();
+        self.sealed = false;
     }
 }
 
@@ -491,15 +499,16 @@ impl Drop for ExtentTable {
 #[derive(Clone, Debug)]
 struct ExtentData {
     deletion: Flags,
+    sealed: bool,
     logical: ELoff,
     compressed: ECoff,
     /// The slot index in this SN's extent pool. The full extent name also includes
     /// the SN and creation second, but Raft members must agree on this slot.
     id: ExtentId,
-    /// Records it holds, and **zero until it is sealed**, because until then the count
-    /// grows with every append. `ERoff`, so it cannot be handed to anything counting a
-    /// stream's or an object's records — and 32-bit because an extent seals at 32 MB
-    /// compressed, so even one-byte records do not reach 4.3 × 10^9.
+    /// Final record count once sealed; it can be zero for a sealed empty extent.
+    /// `ERoff`, so it cannot be handed to anything counting a stream's or an object's
+    /// records — and 32-bit because an extent seals at 32 MB compressed, so even
+    /// one-byte records do not reach 4.3 × 10^9.
     records: ERoff,
     /// The second it was made in, which selects its key (§7.3.3).
     created: TimeSec,
@@ -668,6 +677,7 @@ fn read_name(r: &mut StructReader<'_>) -> Result<StreamName> {
 
 fn write_extent(w: &mut StructWriter, extent: &ExtentData) {
     w.number_u8(extent.deletion.bits());
+    w.flag(extent.sealed);
     w.extent_id(extent.id);
     w.eloff(extent.logical);
     w.ecoff(extent.compressed);
@@ -681,6 +691,7 @@ fn write_extent(w: &mut StructWriter, extent: &ExtentData) {
 
 fn read_extent(r: &mut StructReader<'_>) -> Result<ExtentData> {
     let deletion = Flags::from_bits(r.number_u8()?)?;
+    let sealed = r.flag()?;
     let id = r.extent_id()?;
     let logical = r.eloff()?;
     let compressed = r.ecoff()?;
@@ -695,7 +706,7 @@ fn read_extent(r: &mut StructReader<'_>) -> Result<ExtentData> {
     for _ in 0..count {
         disks.push(SnDiskId::new(r.number_u32()?));
     }
-    Ok(ExtentData { deletion, logical, compressed, id, records, created, disks })
+    Ok(ExtentData { deletion, sealed, logical, compressed, id, records, created, disks })
 }
 
 fn write_filled(w: &mut StructWriter, filled: Filled) {
@@ -1242,13 +1253,7 @@ fn apply_sn_slot(
         Op::SnConcat => {
             let cmd: ConcatCmd = raft::codec::decode(&action.fields)?;
             let SNState {
-                stream_map,
-                extent_table,
-                extent_extras,
-                retired_streams,
-                streams,
-                sealed,
-                ..
+                stream_map, extent_table, extent_extras, retired_streams, streams, ..
             } = state;
             if retired_streams.contains(&cmd.destination) {
                 return Err(Error::new("destination stream identity has been retired"));
@@ -1264,6 +1269,14 @@ fn apply_sn_slot(
                 stream.sealed_stream || stream.open.is_some() || !stream.sealed.is_empty()
             }) {
                 return Err(Error::new("concat destination is not empty and open"));
+            }
+            for &id in &cmd.extents {
+                let extent = extent_table
+                    .get(id.get() as usize)
+                    .ok_or_else(|| Error::new("concat names an unknown extent"))?;
+                if !extent.deletion.is_valid() || !extent.sealed {
+                    return Err(Error::new("concat names an invalid or unsealed extent"));
+                }
             }
             let inserted = !map.contains_key(&cmd.destination);
             if inserted {
@@ -1299,13 +1312,15 @@ fn apply_sn_slot(
             if inserted {
                 *streams += 1;
             }
-            *sealed += destination.sealed.len() as u64;
             Ok(())
         }
         Op::SnOpen => {
             let cmd: OpenCmd = raft::codec::decode(&action.fields)?;
             if cmd.extent.id.is_none() {
                 return Err(Error::new("open action has no extent id"));
+            }
+            if cmd.extent.sealed {
+                return Err(Error::new("open action creates an already-sealed extent"));
             }
             let SNState { stream_map, extent_table, extents, .. } = state;
             let held = stream_map
@@ -1342,12 +1357,18 @@ fn apply_sn_slot(
             if !extent_table.is_live(cmd.id) {
                 return Err(Error::new("seal action names an invalid extent slot"));
             }
+            if extent_table[cmd.id.get() as usize].sealed {
+                return Err(Error::new("seal action names an already-sealed extent"));
+            }
             let sealed_records =
                 held.sealed_records.plus(SRoff::from_extent(cmd.came_to.records))?;
             let is_full = held.sealed.len() as u64 + 1 >= cmd.per_stream;
             let next_id = if let Some(next) = cmd.next {
                 if is_full {
                     return Err(Error::new("seal action creates an extent for a full stream"));
+                }
+                if next.sealed {
+                    return Err(Error::new("seal action creates an already-sealed extent"));
                 }
                 let id = next.id;
                 claim_extent_id(extent_table, id, local_id)?;
@@ -1370,6 +1391,7 @@ fn apply_sn_slot(
             data.records = cmd.came_to.records;
             data.logical = cmd.came_to.logical;
             data.compressed = cmd.came_to.compressed;
+            data.sealed = true;
             held.sealed.push(cmd.id);
             *sealed += 1;
             if is_full {
@@ -1393,12 +1415,19 @@ fn apply_sn_slot(
             if held.open != Some(cmd.id) {
                 return Err(Error::new("seal-stream action names a stale extent"));
             }
+            if !extent_table.is_live(cmd.id) {
+                return Err(Error::new("seal-stream action names an invalid extent slot"));
+            }
+            if extent_table[cmd.id.get() as usize].sealed {
+                return Err(Error::new("seal-stream action names an already-sealed extent"));
+            }
             held.sealed_records =
                 held.sealed_records.plus(SRoff::from_extent(cmd.came_to.records))?;
             let data = &mut extent_table[cmd.id.get() as usize];
             data.records = cmd.came_to.records;
             data.logical = cmd.came_to.logical;
             data.compressed = cmd.came_to.compressed;
+            data.sealed = true;
             held.open = None;
             held.sealed.push(cmd.id);
             held.sealed_stream = true;
@@ -1502,6 +1531,7 @@ fn apply_sn_slot(
                 pending_deletes,
                 streams,
                 extents,
+                sealed_streams,
                 ..
             } = state;
             let pending = pending_deletes
@@ -1523,6 +1553,9 @@ fn apply_sn_slot(
                     .get_mut(&pending.name)
                     .ok_or_else(|| Error::new("hard delete completion has no stream"))?;
                 assert!(stream_extras.reclaim(&pending.name, &mut stream.deletion, cmd.now));
+                if stream.sealed_stream {
+                    *sealed_streams -= 1;
+                }
                 map.remove(&pending.name);
                 retired_streams.insert(pending.name);
                 *streams -= 1;
@@ -2215,7 +2248,24 @@ impl SN {
             runtime.identities.clone(),
         )?;
         initial.ignore_ring_identity = runtime.ignore_ring_identity;
-        let journal = raft::journal::Journal::open(path, initial, 3, &runtime.name)?;
+        let journal = raft::journal::Journal::open_with_reader(
+            path,
+            initial,
+            3,
+            &runtime.name,
+            checkpoint::read_raft,
+        )?;
+        let snapshot_path = journal.checkpoint_path();
+        let restored = if journal.checkpoint_sequence() == 0 && !snapshot_path.exists() {
+            None
+        } else {
+            checkpoint::read_state(&snapshot_path, config.max_extents)?
+        };
+        let generation = journal.state.generation;
+        let snapshot_index = journal.state.snapshot.index;
+        if restored.as_ref().is_some_and(|saved| saved.index != snapshot_index) {
+            return Err(Error::new("SN application checkpoint boundary mismatch"));
+        }
         let id =
             journal.state.membership().slot(&journal.identity.current).unwrap_or(raft::UNASSIGNED);
         let mut node = raft::Node::new_with_log2(id, journal, config.raft.log2_entries)?;
@@ -2229,20 +2279,30 @@ impl SN {
         }
         let options = raft::runtime::Options {
             raft: config.raft.clone(),
-            snapshot_min_log_bytes: u64::MAX,
-            snapshot_interval_secs: u64::MAX,
+            snapshot_min_log_bytes: 1024 * 1024,
+            snapshot_interval_secs: 24 * 60 * 60,
             allow_stale_reads: config.knobs.allow_stale_reads,
         };
-        let state = SNState::new(config.max_extents)?;
+        let (state, saved_disks) = match restored {
+            Some(saved) => (saved.state, Some(saved.disks)),
+            None => (SNState::new(config.max_extents)?, None),
+        };
+        let common = raft::runtime::Runtime::with_state(runtime, node, options, state);
+        if saved_disks.is_some() {
+            *common.execution.lock().map_err(|_| Error::new("SN execution cursor poisoned"))? =
+                raft::execution::Cursor::new(generation, snapshot_index);
+            common.application_generation.store(generation, Ordering::SeqCst);
+            common.publish_applied(snapshot_index);
+        }
         let sn = SN {
-            common: raft::runtime::Runtime::with_state(runtime, node, options, state),
+            common,
             config,
             deleting: Mutex::new(()),
             delete_queue: Mutex::new(DeleteQueue::default()),
             pending_extents: Mutex::new(HashMap::new()),
             per_stream,
             mine,
-            disks: Mutex::new(disks),
+            disks: Mutex::new(saved_disks.unwrap_or(disks)),
             gc_stop: AtomicBool::new(true),
             gc_thread: Mutex::new(None),
             streams: AtomicU64::new(0),
@@ -2252,6 +2312,13 @@ impl SN {
             #[cfg(test)]
             _test_dir: None,
         };
+        {
+            let state = sn.global_lock.read();
+            sn.streams.store(state.streams, Ordering::Relaxed);
+            sn.extents.store(state.extents, Ordering::Relaxed);
+            sn.sealed.store(state.sealed, Ordering::Relaxed);
+            sn.sealed_streams.store(state.sealed_streams, Ordering::Relaxed);
+        }
         sn.ready.store(true, Ordering::SeqCst);
         let commit = sn.on_raft(|host, node| {
             host.refresh_application(node)?;
@@ -2770,6 +2837,7 @@ impl SN {
         };
         let extent = ExtentData {
             deletion: Flags::live(),
+            sealed: false,
             logical: ELoff::ZERO,
             compressed: ECoff::ZERO,
             id,
@@ -3156,6 +3224,7 @@ impl SN {
                         next_id = Some(id);
                         next = Some(ExtentData {
                             deletion: Flags::live(),
+                            sealed: false,
                             logical: ELoff::ZERO,
                             compressed: ECoff::ZERO,
                             id,
@@ -3355,6 +3424,7 @@ impl SN {
                 data.records = came_to.records;
                 data.logical = came_to.logical;
                 data.compressed = came_to.compressed;
+                data.sealed = true;
             }
             held.sealed.push(extent);
             *sealed += 1;
@@ -3423,6 +3493,7 @@ impl SN {
         let disks = pick_disks(self.disks.lock().expect("disks").len(), instances)?;
         let extent = ExtentData {
             deletion: Flags::live(),
+            sealed: false,
             id: ExtentId::NONE,
             created: second,
             records: ERoff::ZERO,
@@ -3509,10 +3580,34 @@ impl Host for SN {
 
     fn checkpoint_actions(
         &self,
-        state: &raft::State,
+        _state: &raft::State,
         _application: &Self::Application,
     ) -> Result<Vec<raft::Entry>> {
-        Ok(state.capture().application)
+        Ok(Vec::new())
+    }
+
+    fn can_checkpoint(&self, _state: &raft::State) -> bool {
+        true
+    }
+
+    fn copy_ck_files(&self) -> bool {
+        true
+    }
+
+    fn checkpoint_writer<'a>(
+        &self,
+        state: &raft::State,
+        snapshot: &raft::Snapshot,
+        application: &'a Self::Application,
+        mark: raft::journal::CheckpointMark,
+        now: u64,
+    ) -> Result<Option<raft::journal::CheckpointWriter<'a>>> {
+        let status = raft::checkpoint::RaftStatus::capture(state, snapshot)?;
+        let disks = self.disks.lock().map_err(|_| Error::new("SN disk lock poisoned"))?.clone();
+        let sequence = mark.sequence();
+        Ok(Some(Box::new(move |file| {
+            checkpoint::write(file, &status, application, &disks, sequence, now)
+        })))
     }
 
     fn peer_message(&self) -> Option<raft::Action> {
@@ -3759,6 +3854,7 @@ mod tests {
             .extent_table
             .insert(Extent::from_data(ExtentData {
                 deletion: Flags::live(),
+                sealed: true,
                 id: ExtentId::FIRST,
                 records: ERoff::new(7),
                 created: TimeSec::new(100),
@@ -3798,6 +3894,7 @@ mod tests {
                     .extent_table
                     .insert(Extent::from_data(ExtentData {
                         deletion: Flags::live(),
+                        sealed: false,
                         id: ExtentId::FIRST,
                         records: ERoff::new(7),
                         created: TimeSec::new(100),
@@ -3807,6 +3904,11 @@ mod tests {
                     }))
                     .unwrap(),
             );
+        }
+        {
+            let mut state = sn.global_lock.write();
+            state.extent_table[ids[1].get() as usize].sealed = true;
+            state.extent_table[ids[2].get() as usize].sealed = true;
         }
         let mut stream = Stream::new(TimeSec::new(100), SnId::FIRST);
         stream.sealed = vec![ids[1], ids[2]];
@@ -4113,6 +4215,7 @@ mod tests {
                 name,
                 extent: ExtentData {
                     deletion: Flags::live(),
+                    sealed: false,
                     logical: ELoff::ZERO,
                     compressed: ECoff::ZERO,
                     id,
@@ -4160,6 +4263,7 @@ mod tests {
                 name,
                 extent: ExtentData {
                     deletion,
+                    sealed: false,
                     logical: ELoff::ZERO,
                     compressed: ECoff::ZERO,
                     id,
@@ -4194,6 +4298,7 @@ mod tests {
                 name,
                 extent: ExtentData {
                     deletion: Flags::live(),
+                    sealed: false,
                     logical: ELoff::ZERO,
                     compressed: ECoff::ZERO,
                     id: current,
@@ -4217,6 +4322,7 @@ mod tests {
                 per_stream: 10,
                 next: Some(ExtentData {
                     deletion: Flags::live(),
+                    sealed: false,
                     logical: ELoff::ZERO,
                     compressed: ECoff::ZERO,
                     id: taken,
@@ -4418,6 +4524,7 @@ mod tests {
         }
         let extent = ExtentData {
             deletion: Flags::live(),
+            sealed: false,
             id: ExtentId::FIRST,
             created: MADE,
             records: ERoff::ZERO,

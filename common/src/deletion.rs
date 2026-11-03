@@ -256,6 +256,12 @@ impl<K: Eq + Hash, R: Default> Extras<K, R> {
     pub fn get(&self, key: &K) -> Option<&Extra<R>> {
         self.0.get(key)
     }
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &Extra<R>)> {
+        self.0.iter()
+    }
+    pub fn restore(&mut self, key: K, extra: Extra<R>) -> Option<Extra<R>> {
+        self.0.insert(key, extra)
+    }
     /// First soft-delete notification. Retries do not restart retention.
     /// The caller releases child references only when this returns true.
     pub fn soft_delete(
