@@ -346,6 +346,8 @@ ops! {
     SnCkPending = 172, "sn-ck-pending";
     SnCkTask = 173, "sn-ck-task";
     SnCkExtExtra = 174, "sn-ck-ext-extra";
+    SnCkDiskRef = 175, "sn-ck-disk-ref";
+    SnDiskRef = 176, "sn-disk-ref";
 }
 
 impl std::fmt::Display for Op {

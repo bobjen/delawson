@@ -532,7 +532,7 @@ struct ConcatCmd {
 
 struct OpenCmd {
     name: StreamName,
-    extent: ExtentData,
+    extent: ExtentRef,
 }
 
 struct SealCmd {
@@ -540,7 +540,67 @@ struct SealCmd {
     id: ExtentId,
     came_to: Filled,
     per_stream: u64,
-    next: Option<ExtentData>,
+    next: Option<ExtentRef>,
+}
+
+/// An extent description in a Raft action. Disk indexes are local to each SN member,
+/// so the action carries the persistent `(EN, disk)` identity instead.
+struct ExtentRef {
+    deletion: Flags,
+    sealed: bool,
+    logical: ELoff,
+    compressed: ECoff,
+    id: ExtentId,
+    records: ERoff,
+    created: TimeSec,
+    disks: Vec<(EnId, DiskId)>,
+}
+
+impl ExtentRef {
+    fn from_data(data: ExtentData, roster: &[(EnId, DiskId)]) -> Result<Self> {
+        let mut disks = Vec::with_capacity(data.disks.len());
+        for id in data.disks {
+            disks.push(
+                *roster
+                    .get(id.get() as usize)
+                    .ok_or_else(|| Error::new("SN disk index is outside its roster"))?,
+            );
+        }
+        Ok(Self {
+            deletion: data.deletion,
+            sealed: data.sealed,
+            logical: data.logical,
+            compressed: data.compressed,
+            id: data.id,
+            records: data.records,
+            created: data.created,
+            disks,
+        })
+    }
+
+    fn into_data(self, roster: &[(EnId, DiskId)]) -> Result<ExtentData> {
+        let mut disks = Vec::with_capacity(self.disks.len());
+        for name in self.disks {
+            let at = roster
+                .iter()
+                .position(|&candidate| candidate == name)
+                .ok_or_else(|| Error::new("SN extent action names an unknown EN disk"))?;
+            disks.push(match u32::try_from(at) {
+                Ok(index) if index != u32::MAX => SnDiskId::new(index),
+                _ => return Err(Error::new("SN disk roster is too large")),
+            });
+        }
+        Ok(ExtentData {
+            deletion: self.deletion,
+            sealed: self.sealed,
+            logical: self.logical,
+            compressed: self.compressed,
+            id: self.id,
+            records: self.records,
+            created: self.created,
+            disks,
+        })
+    }
 }
 
 struct SealStreamCmd {
@@ -675,7 +735,7 @@ fn read_name(r: &mut StructReader<'_>) -> Result<StreamName> {
     Ok(StreamName { range: r.range_id()?, stream: r.stream_id()?, created: r.time_sec()? })
 }
 
-fn write_extent(w: &mut StructWriter, extent: &ExtentData) {
+fn write_extent(w: &mut StructWriter, extent: &ExtentRef) {
     w.number_u8(extent.deletion.bits());
     w.flag(extent.sealed);
     w.extent_id(extent.id);
@@ -684,12 +744,15 @@ fn write_extent(w: &mut StructWriter, extent: &ExtentData) {
     w.eroff(extent.records);
     w.time_sec(extent.created);
     w.number_u64(extent.disks.len() as u64);
-    for disk in &extent.disks {
-        w.number_u32(disk.get());
+    for &(en, disk) in &extent.disks {
+        w.nested(Op::SnDiskRef, |w| {
+            w.en_id(en);
+            w.disk_id(disk);
+        });
     }
 }
 
-fn read_extent(r: &mut StructReader<'_>) -> Result<ExtentData> {
+fn read_extent(r: &mut StructReader<'_>) -> Result<ExtentRef> {
     let deletion = Flags::from_bits(r.number_u8()?)?;
     let sealed = r.flag()?;
     let id = r.extent_id()?;
@@ -704,9 +767,11 @@ fn read_extent(r: &mut StructReader<'_>) -> Result<ExtentData> {
     }
     let mut disks = Vec::with_capacity(count);
     for _ in 0..count {
-        disks.push(SnDiskId::new(r.number_u32()?));
+        disks.push(
+            r.nested(Op::SnDiskRef, "SN disk reference", |r| Ok((r.en_id()?, r.disk_id()?)))?,
+        );
     }
-    Ok(ExtentData { deletion, sealed, logical, compressed, id, records, created, disks })
+    Ok(ExtentRef { deletion, sealed, logical, compressed, id, records, created, disks })
 }
 
 fn write_filled(w: &mut StructWriter, filled: Filled) {
@@ -1195,14 +1260,25 @@ fn check_delete(
 
 #[cfg(test)]
 fn apply_sn_action(state: &mut SNState, index: u64, action: &raft::Action) -> Result<()> {
+    apply_sn_action_with_disks(state, index, action, &[])
+}
+
+#[cfg(test)]
+fn apply_sn_action_with_disks(
+    state: &mut SNState,
+    index: u64,
+    action: &raft::Action,
+    disks: &[(EnId, DiskId)],
+) -> Result<()> {
     let mut local_used = false;
-    apply_sn_slot(state, index, action, None, &mut local_used)
+    apply_sn_slot(state, index, action, disks, None, &mut local_used)
 }
 
 fn apply_sn_slot(
     state: &mut SNState,
     _index: u64,
     action: &raft::Action,
+    disks: &[(EnId, DiskId)],
     local_id: Option<ExtentId>,
     local_used: &mut bool,
 ) -> Result<()> {
@@ -1322,6 +1398,7 @@ fn apply_sn_slot(
             if cmd.extent.sealed {
                 return Err(Error::new("open action creates an already-sealed extent"));
             }
+            let extent = cmd.extent.into_data(disks)?;
             let SNState { stream_map, extent_table, extents, .. } = state;
             let held = stream_map
                 .get_mut(&cmd.name)
@@ -1332,9 +1409,9 @@ fn apply_sn_slot(
             if held.open.is_some() {
                 return Ok(());
             }
-            let id = cmd.extent.id;
+            let id = extent.id;
             claim_extent_id(extent_table, id, local_id)?;
-            if let Err(error) = extent_table.insert_reserved(id, Extent::from_data(cmd.extent)) {
+            if let Err(error) = extent_table.insert_reserved(id, Extent::from_data(extent)) {
                 if local_id.is_none() {
                     release_extent_id(extent_table, id);
                 }
@@ -1347,6 +1424,7 @@ fn apply_sn_slot(
         }
         Op::SnSeal => {
             let cmd: SealCmd = raft::codec::decode(&action.fields)?;
+            let next = cmd.next.map(|extent| extent.into_data(disks)).transpose()?;
             let SNState { stream_map, extent_table, extents, sealed, sealed_streams, .. } = state;
             let held = stream_map
                 .get_mut(&cmd.name)
@@ -1363,7 +1441,7 @@ fn apply_sn_slot(
             let sealed_records =
                 held.sealed_records.plus(SRoff::from_extent(cmd.came_to.records))?;
             let is_full = held.sealed.len() as u64 + 1 >= cmd.per_stream;
-            let next_id = if let Some(next) = cmd.next {
+            let next_id = if let Some(next) = next {
                 if is_full {
                     return Err(Error::new("seal action creates an extent for a full stream"));
                 }
@@ -2198,6 +2276,11 @@ impl SN {
         self.disks.lock().expect("disks")[id.get() as usize]
     }
 
+    fn extent_ref(&self, extent: ExtentData) -> Result<ExtentRef> {
+        let disks = self.disks.lock().map_err(|_| Error::new("SN disk lock poisoned"))?;
+        ExtentRef::from_data(extent, &disks)
+    }
+
     fn extent_args(&self, extent: &Extent, first: SRoff) -> Vec<Arg> {
         self.extent_fields_args(extent.id, extent.created, extent.records, &extent.disks, first)
     }
@@ -2248,7 +2331,7 @@ impl SN {
             runtime.identities.clone(),
         )?;
         initial.ignore_ring_identity = runtime.ignore_ring_identity;
-        let journal = raft::journal::Journal::open_with_reader(
+        let mut journal = raft::journal::Journal::open_with_reader(
             path,
             initial,
             3,
@@ -2256,13 +2339,35 @@ impl SN {
             checkpoint::read_raft,
         )?;
         let snapshot_path = journal.checkpoint_path();
-        let restored = if journal.checkpoint_sequence() == 0 && !snapshot_path.exists() {
-            None
-        } else {
-            checkpoint::read_state(&snapshot_path, config.max_extents)?
+        let snapshot_index = journal.state.snapshot.index;
+        let snapshot_sequence = journal.checkpoint_sequence();
+        let has_sn_ckpt = snapshot_path.exists() && checkpoint::is_sn_ckpt(&snapshot_path)?;
+        let restored = match checkpoint::read_state(&snapshot_path, config.max_extents) {
+            Ok(saved) => Some(saved),
+            Err(_) if snapshot_index == 0 && snapshot_sequence == 0 && !has_sn_ckpt => {
+                let empty = SNState::new(config.max_extents)?;
+                let (base, _, _, _) = raft::journal::read_checkpoint(
+                    &snapshot_path,
+                    snapshot_index,
+                    &runtime.ring,
+                    runtime.ignore_ring_identity,
+                )?;
+                let status = raft::checkpoint::RaftStatus::capture(&base, &base.snapshot)?;
+                let second = TimeSec::now().number();
+                let bytes = checkpoint::write_bootstrap(
+                    &snapshot_path,
+                    &status,
+                    &empty,
+                    &disks,
+                    snapshot_sequence,
+                    second,
+                )?;
+                journal.set_boot_ckpt(second, bytes)?;
+                Some(checkpoint::read_state(&snapshot_path, config.max_extents)?)
+            }
+            Err(error) => return Err(error),
         };
         let generation = journal.state.generation;
-        let snapshot_index = journal.state.snapshot.index;
         if restored.as_ref().is_some_and(|saved| saved.index != snapshot_index) {
             return Err(Error::new("SN application checkpoint boundary mismatch"));
         }
@@ -2845,6 +2950,14 @@ impl SN {
             created: TimeSec::now(),
             disks,
         };
+        let extent = match self.extent_ref(extent) {
+            Ok(extent) => extent,
+            Err(error) => {
+                self.release_extent_id(id);
+                self.fail_open(name, Resp::error(Status::Internal, error.to_string()));
+                return;
+            }
+        };
         let action = match sn_action(Op::SnOpen, &OpenCmd { name, extent }) {
             Ok(action) => action,
             Err(error) => {
@@ -3243,6 +3356,15 @@ impl SN {
                 }
             }
         }
+        let next = match next.map(|extent| self.extent_ref(extent)).transpose() {
+            Ok(next) => next,
+            Err(error) => {
+                if let Some(id) = next_id {
+                    self.release_extent_id(id);
+                }
+                return Resp::error(Status::Internal, error.to_string());
+            }
+        };
         let action = match sn_action(
             Op::SnSeal,
             &SealCmd {
@@ -3531,8 +3653,13 @@ impl Host for SN {
         } else {
             None
         };
+        let disks = if matches!(action.op, Op::SnOpen | Op::SnSeal) {
+            self.disks.lock().map_err(|_| Error::new("SN disk lock poisoned"))?.clone()
+        } else {
+            Vec::new()
+        };
         let mut local_used = false;
-        let result = apply_sn_slot(state, context.index, action, local_id, &mut local_used);
+        let result = apply_sn_slot(state, context.index, action, &disks, local_id, &mut local_used);
         if let Some(id) = local_id {
             if result.is_err() || !local_used {
                 release_extent_id(&mut state.extent_table, id);
@@ -3980,6 +4107,10 @@ mod tests {
         Stream::new(MADE, SnId::FIRST)
     }
 
+    fn action_extent(extent: ExtentData) -> ExtentRef {
+        ExtentRef::from_data(extent, &[]).unwrap()
+    }
+
     fn put_stream(table: &mut StreamTable, name: StreamName, stream: Stream) {
         let (_, inserted) = table.find_or_create(&name, |_| stream).unwrap();
         assert!(inserted);
@@ -3989,7 +4120,7 @@ mod tests {
         let action =
             sn_action(Op::SnCreate, &CreateCmd { names: names.to_vec(), creator: SnId::FIRST })?;
         let mut local_used = false;
-        apply_sn_slot(state, 0, &action, None, &mut local_used)
+        apply_sn_slot(state, 0, &action, &[], None, &mut local_used)
     }
 
     #[test]
@@ -4213,7 +4344,7 @@ mod tests {
             Op::SnOpen,
             &OpenCmd {
                 name,
-                extent: ExtentData {
+                extent: action_extent(ExtentData {
                     deletion: Flags::live(),
                     sealed: false,
                     logical: ELoff::ZERO,
@@ -4222,13 +4353,13 @@ mod tests {
                     records: ERoff::ZERO,
                     created: MADE,
                     disks: Vec::new(),
-                },
+                }),
             },
         )
         .unwrap();
 
         let mut used = false;
-        apply_sn_slot(&mut primary, 1, &action, Some(id), &mut used).unwrap();
+        apply_sn_slot(&mut primary, 1, &action, &[], Some(id), &mut used).unwrap();
         apply_sn_action(&mut secondary, 1, &action).unwrap();
 
         assert!(used);
@@ -4240,6 +4371,43 @@ mod tests {
         assert_eq!(secondary.extent_table[id.get() as usize].deletion.bits(), Flags::live().bits());
         assert!(!primary.extent_table.is_free(id).unwrap());
         assert!(!secondary.extent_table.is_free(id).unwrap());
+    }
+
+    #[test]
+    fn extent_action_reindexes_disks() {
+        let name = named(3, 71);
+        let old = [(EnId::new(4), DiskId::new(7)), (EnId::new(9), DiskId::new(2))];
+        let new = [old[1], old[0]];
+        let mut state = SNState::new(8).unwrap();
+        put_stream(&mut state.stream_map, name, empty_stream());
+        let action = sn_action(
+            Op::SnOpen,
+            &OpenCmd {
+                name,
+                extent: ExtentRef::from_data(
+                    ExtentData {
+                        deletion: Flags::live(),
+                        sealed: false,
+                        logical: ELoff::ZERO,
+                        compressed: ECoff::ZERO,
+                        id: ExtentId::FIRST,
+                        records: ERoff::ZERO,
+                        created: MADE,
+                        disks: vec![SnDiskId::new(0), SnDiskId::new(1)],
+                    },
+                    &old,
+                )
+                .unwrap(),
+            },
+        )
+        .unwrap();
+
+        let mut used = false;
+        apply_sn_slot(&mut state, 1, &action, &new, None, &mut used).unwrap();
+        assert_eq!(
+            state.extent_table[ExtentId::FIRST.get() as usize].disks,
+            [SnDiskId::new(1), SnDiskId::new(0)]
+        );
     }
 
     #[test]
@@ -4261,7 +4429,7 @@ mod tests {
             Op::SnOpen,
             &OpenCmd {
                 name,
-                extent: ExtentData {
+                extent: action_extent(ExtentData {
                     deletion,
                     sealed: false,
                     logical: ELoff::ZERO,
@@ -4270,7 +4438,7 @@ mod tests {
                     records: ERoff::ZERO,
                     created: MADE,
                     disks: Vec::new(),
-                },
+                }),
             },
         )
         .unwrap();
@@ -4296,7 +4464,7 @@ mod tests {
             Op::SnOpen,
             &OpenCmd {
                 name,
-                extent: ExtentData {
+                extent: action_extent(ExtentData {
                     deletion: Flags::live(),
                     sealed: false,
                     logical: ELoff::ZERO,
@@ -4305,7 +4473,7 @@ mod tests {
                     records: ERoff::ZERO,
                     created: MADE,
                     disks: Vec::new(),
-                },
+                }),
             },
         )
         .unwrap();
@@ -4320,7 +4488,7 @@ mod tests {
                 id: current,
                 came_to: came(7, 90),
                 per_stream: 10,
-                next: Some(ExtentData {
+                next: Some(action_extent(ExtentData {
                     deletion: Flags::live(),
                     sealed: false,
                     logical: ELoff::ZERO,
@@ -4329,7 +4497,7 @@ mod tests {
                     records: ERoff::ZERO,
                     created: MADE,
                     disks: Vec::new(),
-                }),
+                })),
             },
         )
         .unwrap();
@@ -4395,6 +4563,15 @@ mod tests {
     }
 
     #[test]
+    fn reject_wrong_ckpt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot-1.bin");
+        let mut file = std::fs::File::create(&path).unwrap();
+        raft::checkpoint::write_footer(&mut file, Op::Raft, &[]).unwrap();
+        assert!(checkpoint::read_state(&path, testing::sn_config().max_extents).is_err());
+    }
+
+    #[test]
     fn sn_checkpoint_recovers_state_and_replays_journal() {
         let config = testing::sn_config();
         let runtime = RaftSettings::testing(&config.raft);
@@ -4416,6 +4593,12 @@ mod tests {
             runtime,
         )
         .unwrap();
+        let initial_path = sn.on_raft(|_, node| Ok(node.journal.checkpoint_path())).unwrap();
+        let initial = checkpoint::read_state(&initial_path, config.max_extents).unwrap();
+        assert_eq!(initial.index, 0);
+        assert_eq!(initial.state.streams, 0);
+        assert_eq!(initial.state.extents, 0);
+        assert_eq!(initial.disks, disks);
         sn.common.options.snapshot_min_log_bytes = u64::MAX;
         sn.common.options.snapshot_interval_secs = u64::MAX;
         let sn = Arc::new(sn);
@@ -4566,6 +4749,7 @@ mod tests {
         assert_eq!(stream.sealed.len(), 2);
         assert_eq!(expected.extent_table.len(), 2);
         let history = sn.on_raft(|_, node| Ok(node.state().capture().application)).unwrap();
+        let disks = sn.disks.lock().unwrap().clone();
         drop(expected);
 
         let mut replay = SNState::new(sn.config.max_extents).unwrap();
@@ -4573,7 +4757,7 @@ mod tests {
             if matches!(&entry.command, raft::Command::Client(_)) {
                 let actions = entry.client_actions().unwrap();
                 for action in actions.iter() {
-                    apply_sn_action(&mut replay, entry.index, action).unwrap();
+                    apply_sn_action_with_disks(&mut replay, entry.index, action, &disks).unwrap();
                 }
             }
         }
@@ -4650,6 +4834,7 @@ mod tests {
             compressed: ECoff::ZERO,
             disks: vec![SnDiskId::new(0); testing::extents().instances],
         };
+        let extent = sn.extent_ref(extent).unwrap();
         let action = sn_action(Op::SnOpen, &OpenCmd { name, extent }).unwrap();
         sn.commit_action(action).unwrap();
         let one = got_one.recv_timeout(Duration::from_secs(1)).unwrap();

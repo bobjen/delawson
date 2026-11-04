@@ -7,7 +7,7 @@ use common::offset::{ECoff, ELoff, ERoff, SRoff};
 use common::time::{TimeIntSec32, TimeIntSec64, TimeSec};
 use common::{Error, Op, Result};
 use raft::codec;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -59,10 +59,16 @@ struct ExtentRow {
     compressed: u64,
     records: u64,
     created: u64,
-    disks: Vec<u64>,
+    disks: Vec<DiskRef>,
     extra: Option<ExtExtra>,
 }
 raft::wire_struct!(ExtentRow, SnCkExtent, {id,flags,sealed,logical,compressed,records,created,disks,extra});
+
+struct DiskRef {
+    en: u64,
+    disk: u64,
+}
+raft::wire_struct!(DiskRef, SnCkDiskRef, {en,disk});
 
 struct StreamHead {
     range: u64,
@@ -102,7 +108,7 @@ raft::wire_struct!(PendingHead, SnCkPending, {name,hard,task_count});
 struct TaskRow {
     id: u64,
     created: u64,
-    disks: Vec<u64>,
+    disks: Vec<DiskRef>,
     interval: u64,
     hard: bool,
 }
@@ -193,6 +199,48 @@ fn write_ens(file: &mut (impl Write + Seek), disks: &[(EnId, DiskId)]) -> Result
     range(file, start)
 }
 
+fn disk_refs(ids: &[SnDiskId], roster: &[(EnId, DiskId)]) -> Result<Vec<DiskRef>> {
+    ids.iter()
+        .map(|id| {
+            let (en, disk) = roster
+                .get(id.get() as usize)
+                .ok_or_else(|| Error::new("SN checkpoint disk index is outside its roster"))?;
+            Ok(DiskRef { en: en.get(), disk: u64::from(disk.get()) })
+        })
+        .collect()
+}
+
+fn disk_map(
+    roster: &[(EnId, DiskId)],
+) -> Result<std::collections::HashMap<(EnId, DiskId), SnDiskId>> {
+    if roster.len() > u32::MAX as usize {
+        return Err(Error::new("SN checkpoint EN roster is too large"));
+    }
+    let mut result = std::collections::HashMap::with_capacity(roster.len());
+    for (at, &(en, disk)) in roster.iter().enumerate() {
+        let id = SnDiskId::new(at as u32);
+        if result.insert((en, disk), id).is_some() {
+            return Err(Error::new("duplicate SN checkpoint EN disk"));
+        }
+    }
+    Ok(result)
+}
+
+fn sn_disks(
+    refs: Vec<DiskRef>,
+    roster: &std::collections::HashMap<(EnId, DiskId), SnDiskId>,
+) -> Result<Vec<SnDiskId>> {
+    refs.into_iter()
+        .map(|disk| {
+            let key = (EnId::of_number(disk.en)?, DiskId::of_number(disk.disk)?);
+            roster
+                .get(&key)
+                .copied()
+                .ok_or_else(|| Error::new("SN checkpoint extent names an unknown EN disk"))
+        })
+        .collect()
+}
+
 fn ext_extra(state: &SNState, extent: &Extent) -> Result<Option<ExtExtra>> {
     let extra = state.extent_extras.get(&(extent.id, extent.created));
     if extent.deletion.extra() != extra.is_some() {
@@ -206,7 +254,11 @@ fn ext_extra(state: &SNState, extent: &Extent) -> Result<Option<ExtExtra>> {
     }))
 }
 
-fn write_extents(file: &mut (impl Write + Seek), state: &SNState) -> Result<Range> {
+fn write_extents(
+    file: &mut (impl Write + Seek),
+    state: &SNState,
+    disks: &[(EnId, DiskId)],
+) -> Result<Range> {
     let count = state.extent_table.iter().filter(|extent| extent.deletion.is_valid()).count();
     let start = section_start(file, Op::SnCkExtents, count as u64)?;
     for extent in state.extent_table.iter().filter(|extent| extent.deletion.is_valid()) {
@@ -218,7 +270,7 @@ fn write_extents(file: &mut (impl Write + Seek), state: &SNState) -> Result<Rang
             compressed: extent.compressed.number(),
             records: extent.records.number(),
             created: extent.created.number(),
-            disks: extent.disks.iter().map(|disk| u64::from(disk.get())).collect(),
+            disks: disk_refs(&extent.disks, disks)?,
             extra: ext_extra(state, extent)?,
         };
         write_piece(file, &row)?;
@@ -274,7 +326,11 @@ fn write_retired(file: &mut (impl Write + Seek), state: &SNState) -> Result<Rang
     range(file, start)
 }
 
-fn write_pending(file: &mut (impl Write + Seek), state: &SNState) -> Result<Range> {
+fn write_pending(
+    file: &mut (impl Write + Seek),
+    state: &SNState,
+    disks: &[(EnId, DiskId)],
+) -> Result<Range> {
     let start = section_start(file, Op::SnCkPending, state.pending_deletes.len() as u64)?;
     for pending in state.pending_deletes.values() {
         write_piece(
@@ -291,7 +347,7 @@ fn write_pending(file: &mut (impl Write + Seek), state: &SNState) -> Result<Rang
                 &TaskRow {
                     id: u64::from(task.id.get()),
                     created: task.created.number(),
-                    disks: task.disks.iter().map(|id| u64::from(id.get())).collect(),
+                    disks: disk_refs(&task.disks, disks)?,
                     interval: task.interval.get() as u64,
                     hard: task.hard,
                 },
@@ -315,10 +371,10 @@ pub(super) fn write(
     }
     let mut output = BufWriter::new(file);
     let ens = write_ens(&mut output, disks)?;
-    let extent_rows = write_extents(&mut output, state)?;
+    let extent_rows = write_extents(&mut output, state, disks)?;
     let stream_rows = write_streams(&mut output, state)?;
     let retired = write_retired(&mut output, state)?;
-    let pending = write_pending(&mut output, state)?;
+    let pending = write_pending(&mut output, state, disks)?;
     let footer = encode_piece(&Footer {
         raft: raft_status.clone(),
         sequence,
@@ -334,6 +390,38 @@ pub(super) fn write(
     raft::checkpoint::write_footer(&mut output, Op::SnCkFooter, &footer)?;
     output.flush()?;
     Ok(())
+}
+
+/// Replace Raft's generic empty base snapshot with an empty SN checkpoint.
+pub(super) fn write_bootstrap(
+    path: &Path,
+    raft_status: &raft::checkpoint::RaftStatus,
+    state: &SNState,
+    disks: &[(EnId, DiskId)],
+    sequence: u64,
+    second: u64,
+) -> Result<u64> {
+    let parent =
+        path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = parent.join(format!(".sn-ck-{}-{stamp}.tmp", std::process::id()));
+    let result = (|| {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        write(&mut file, raft_status, state, disks, sequence, second)?;
+        file.sync_all()?;
+        let bytes = file.metadata()?.len();
+        drop(file);
+        std::fs::rename(&temp, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(bytes)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 fn checked_end(range: Range) -> Result<u64> {
@@ -362,7 +450,7 @@ fn read_public(file: &mut (impl Read + Seek)) -> Result<(Footer, u64)> {
     Ok((footer, fixed.start))
 }
 
-/// Read a service checkpoint into Raft state, or use the generic format for old files.
+/// Read an SN checkpoint into Raft state; only the empty bootstrap is generic.
 pub(super) fn read_raft(
     path: &Path,
     entry: u64,
@@ -373,6 +461,9 @@ pub(super) fn read_raft(
     let is_sn =
         raft::checkpoint::read_footer(&mut file).is_ok_and(|footer| footer.op == Op::SnCkFooter);
     if !is_sn {
+        if entry != 0 {
+            return Err(Error::new("SN checkpoint is missing its application footer"));
+        }
         return raft::journal::read_checkpoint(path, entry, ring, ignore);
     }
     let (footer, _) = read_public(&mut file)?;
@@ -466,13 +557,17 @@ fn read_ens(file: &mut File, range: Range) -> Result<Vec<(EnId, DiskId)>> {
     Ok(disks)
 }
 
-fn restore_extent(state: &mut SNState, row: ExtentRow) -> Result<()> {
+fn restore_extent(
+    state: &mut SNState,
+    row: ExtentRow,
+    disks: &std::collections::HashMap<(EnId, DiskId), SnDiskId>,
+) -> Result<()> {
     let id = ExtentId::of_number(row.id)?;
     let flags = Flags::from_bits(row.flags)?;
     if !flags.is_valid() || row.extra.is_some() != flags.extra() {
         return Err(Error::new("invalid SN checkpoint extent flags"));
     }
-    let disks = row.disks.into_iter().map(SnDiskId::of_number).collect::<Result<Vec<_>>>()?;
+    let disks = sn_disks(row.disks, disks)?;
     let extent = ExtentData {
         deletion: flags,
         sealed: row.sealed,
@@ -514,11 +609,16 @@ fn restore_extent(state: &mut SNState, row: ExtentRow) -> Result<()> {
     Ok(())
 }
 
-fn read_extents(file: &mut File, range: Range, state: &mut SNState) -> Result<()> {
+fn read_extents(
+    file: &mut File,
+    range: Range,
+    state: &mut SNState,
+    disks: &std::collections::HashMap<(EnId, DiskId), SnDiskId>,
+) -> Result<()> {
     let mut section = read_section(file, range, Op::SnCkExtents)?;
     for _ in 0..section.count {
         let row: ExtentRow = read_piece(file, &mut section.left)?;
-        restore_extent(state, row)?;
+        restore_extent(state, row, disks)?;
     }
     if section.left != 0 {
         return Err(Error::new("trailing SN checkpoint extent data"));
@@ -602,7 +702,12 @@ fn read_retired(file: &mut File, range: Range, state: &mut SNState) -> Result<()
     Ok(())
 }
 
-fn read_pending(file: &mut File, range: Range, state: &mut SNState) -> Result<()> {
+fn read_pending(
+    file: &mut File,
+    range: Range,
+    state: &mut SNState,
+    disks: &std::collections::HashMap<(EnId, DiskId), SnDiskId>,
+) -> Result<()> {
     let mut section = read_section(file, range, Op::SnCkPending)?;
     for _ in 0..section.count {
         let row: PendingHead = read_piece(file, &mut section.left)?;
@@ -618,7 +723,7 @@ fn read_pending(file: &mut File, range: Range, state: &mut SNState) -> Result<()
             tasks.push(DeleteTask {
                 id: ExtentId::of_number(task.id)?,
                 created: TimeSec::new(task.created),
-                disks: task.disks.into_iter().map(SnDiskId::of_number).collect::<Result<_>>()?,
+                disks: sn_disks(task.disks, disks)?,
                 interval: TimeIntSec64::new(task.interval as i64),
                 hard: task.hard,
             });
@@ -641,19 +746,20 @@ pub(super) struct Restored {
 }
 
 /// Read the application image after Raft has selected this checkpoint.
-pub(super) fn read_state(path: &Path, max_extents: u32) -> Result<Option<Restored>> {
+pub(super) fn read_state(path: &Path, max_extents: u32) -> Result<Restored> {
     let mut file = File::open(path)?;
-    match raft::checkpoint::read_footer(&mut file) {
-        Ok(fixed) if fixed.op == Op::SnCkFooter => {}
-        _ => return Ok(None),
+    let fixed = raft::checkpoint::read_footer(&mut file)?;
+    if fixed.op != Op::SnCkFooter {
+        return Err(Error::new("SN checkpoint is missing its application footer"));
     }
     let (footer, _) = read_public(&mut file)?;
     let disks = read_ens(&mut file, footer.ens)?;
+    let disk_map = disk_map(&disks)?;
     let mut state = SNState::new(max_extents)?;
-    read_extents(&mut file, footer.extent_rows, &mut state)?;
+    read_extents(&mut file, footer.extent_rows, &mut state, &disk_map)?;
     read_streams(&mut file, footer.stream_rows, &mut state)?;
     read_retired(&mut file, footer.retired, &mut state)?;
-    read_pending(&mut file, footer.pending, &mut state)?;
+    read_pending(&mut file, footer.pending, &mut state, &disk_map)?;
     state.sealed = u64::try_from(
         state
             .extent_table
@@ -679,5 +785,29 @@ pub(super) fn read_state(path: &Path, max_extents: u32) -> Result<Option<Restore
     state.sealed_streams = sealed_streams;
     state.streams = footer.streams;
     state.extents = footer.extents;
-    Ok(Some(Restored { state, disks, index: footer.raft.index }))
+    Ok(Restored { state, disks, index: footer.raft.index })
+}
+
+pub(super) fn is_sn_ckpt(path: &Path) -> Result<bool> {
+    let mut file = File::open(path)?;
+    Ok(raft::checkpoint::read_footer(&mut file).is_ok_and(|footer| footer.op == Op::SnCkFooter))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_ref_reindexes() {
+        let old = [(EnId::new(4), DiskId::new(7)), (EnId::new(9), DiskId::new(2))];
+        let refs = disk_refs(&[SnDiskId::new(0), SnDiskId::new(1)], &old).unwrap();
+        assert_eq!(refs[0].en, 4);
+        assert_eq!(refs[0].disk, 7);
+        assert_eq!(refs[1].en, 9);
+        assert_eq!(refs[1].disk, 2);
+
+        let new = [old[1], old[0]];
+        let restored = sn_disks(refs, &disk_map(&new).unwrap()).unwrap();
+        assert_eq!(restored, [SnDiskId::new(1), SnDiskId::new(0)]);
+    }
 }

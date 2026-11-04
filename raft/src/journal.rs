@@ -838,6 +838,15 @@ impl Journal {
     pub fn checkpoint_path(&self) -> PathBuf {
         named(&self.directory, "snapshot", self.snapshot_index)
     }
+    /// Update the size and age of a service's serialized bootstrap checkpoint.
+    pub fn set_boot_ckpt(&mut self, second: u64, bytes: u64) -> Result<()> {
+        if self.snapshot_index != 0 || self.snapshot_sequence != 0 {
+            return Err(Error::new("not the bootstrap checkpoint"));
+        }
+        self.snapshot_second = second;
+        self.snapshot_bytes = bytes;
+        Ok(())
+    }
     pub fn peer_stage_path(&self) -> PathBuf {
         self.directory.join("peer-checkpoint.partial")
     }
