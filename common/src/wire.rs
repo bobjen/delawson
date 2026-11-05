@@ -348,6 +348,20 @@ ops! {
     SnCkExtExtra = 174, "sn-ck-ext-extra";
     SnCkDiskRef = 175, "sn-ck-disk-ref";
     SnDiskRef = 176, "sn-disk-ref";
+    DnCkFooter = 177, "dn-ck-footer";
+    DnCkRange = 178, "dn-ck-range";
+    DnCkStreams = 179, "dn-ck-streams";
+    DnCkStream = 180, "dn-ck-stream";
+    DnCkObjects = 181, "dn-ck-objects";
+    DnCkObject = 182, "dn-ck-object";
+    DnCkObjRefs = 183, "dn-ck-obj-refs";
+    DnCkObjExtra = 184, "dn-ck-obj-extra";
+    DnCkStrExtra = 185, "dn-ck-str-extra";
+    DnCkMeta = 186, "dn-ck-meta";
+    DnCkRefs = 187, "dn-ck-refs";
+    DnCkObjX = 188, "dn-ck-obj-xs";
+    DnCkStrX = 189, "dn-ck-str-xs";
+    DnCkSpan = 190, "dn-ck-span";
 }
 
 impl std::fmt::Display for Op {

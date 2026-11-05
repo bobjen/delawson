@@ -408,6 +408,24 @@ impl ExtentTable {
         self.pool.release(id.get())
     }
 
+    fn finish_restore(&mut self, len: usize) -> Result<()> {
+        let current = self.len();
+        if len < current || len > self.max as usize {
+            return Err(Error::new("invalid restored SN extent table length"));
+        }
+        if len > current {
+            let id = ExtentId::new((len - 1) as u32);
+            self.reserve_id(id)
+                .map_err(|error| Error::new(format!("reserve SN extent table prefix: {error}")))?;
+            self.release_id(id)
+                .map_err(|error| Error::new(format!("release SN extent table tail: {error}")))?;
+        }
+        if self.len() != len {
+            return Err(Error::new("SN extent table length was not restored"));
+        }
+        Ok(())
+    }
+
     fn is_live(&self, id: ExtentId) -> bool {
         let index = id.get() as usize;
         index < self.len() && self[index].deletion.is_valid()
@@ -4311,7 +4329,7 @@ mod tests {
     }
 
     #[test]
-    fn extent_len_includes_free_pool_slots() {
+    fn extent_slots_include_free_pool_slots() {
         let table = ExtentTable::new(512).unwrap();
         for _ in 0..130 {
             table.alloc_id().unwrap();

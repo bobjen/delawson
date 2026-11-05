@@ -1,5 +1,5 @@
 //! SN application checkpoint codec.
-use super::{DeleteTask, Extent, ExtentData, PendingDelete, SNState, Stream};
+use super::{DeleteTask, Extent, ExtentData, MAX_STREAMS, PendingDelete, SNState, Stream};
 use common::deletion::{Extra, Flags, ReferenceCounts};
 use common::ids::{DiskId, EnId, ExtentId, RangeId, SnDiskId, SnId, StreamId};
 use common::info::StreamName;
@@ -27,15 +27,48 @@ struct Footer {
     second: u64,
     streams: u64,
     extents: u64,
+    extent_slots: ExtentId,
     ens: Range,
     extent_rows: Range,
     stream_rows: Range,
     retired: Range,
     pending: Range,
 }
-raft::wire_struct!(Footer, SnCkFooter, {
-    raft,sequence,second,streams,extents,ens,extent_rows,stream_rows,retired,pending
-});
+impl codec::Wire for Footer {
+    fn write(&self, writer: &mut common::StructWriter) {
+        writer.nested(Op::SnCkFooter, |writer| {
+            self.raft.write(writer);
+            self.sequence.write(writer);
+            self.second.write(writer);
+            self.streams.write(writer);
+            self.extents.write(writer);
+            writer.extent_id(self.extent_slots);
+            self.ens.write(writer);
+            self.extent_rows.write(writer);
+            self.stream_rows.write(writer);
+            self.retired.write(writer);
+            self.pending.write(writer);
+        });
+    }
+
+    fn read(reader: &mut common::StructReader<'_>) -> Result<Self> {
+        reader.nested(Op::SnCkFooter, "Footer", |reader| {
+            Ok(Self {
+                raft: codec::Wire::read(reader)?,
+                sequence: codec::Wire::read(reader)?,
+                second: codec::Wire::read(reader)?,
+                streams: codec::Wire::read(reader)?,
+                extents: codec::Wire::read(reader)?,
+                extent_slots: reader.extent_id()?,
+                ens: codec::Wire::read(reader)?,
+                extent_rows: codec::Wire::read(reader)?,
+                stream_rows: codec::Wire::read(reader)?,
+                retired: codec::Wire::read(reader)?,
+                pending: codec::Wire::read(reader)?,
+            })
+        })
+    }
+}
 
 struct EnRow {
     id: u64,
@@ -381,6 +414,7 @@ pub(super) fn write(
         second,
         streams: state.streams,
         extents: state.extents,
+        extent_slots: ExtentId::of_number(state.extent_table.len() as u64)?,
         ens,
         extent_rows,
         stream_rows,
@@ -560,8 +594,12 @@ fn read_ens(file: &mut File, range: Range) -> Result<Vec<(EnId, DiskId)>> {
 fn restore_extent(
     state: &mut SNState,
     row: ExtentRow,
+    table_len: usize,
     disks: &std::collections::HashMap<(EnId, DiskId), SnDiskId>,
 ) -> Result<()> {
+    if row.id >= table_len as u64 {
+        return Err(Error::new("SN checkpoint extent is beyond the table length"));
+    }
     let id = ExtentId::of_number(row.id)?;
     let flags = Flags::from_bits(row.flags)?;
     if !flags.is_valid() || row.extra.is_some() != flags.extra() {
@@ -613,12 +651,13 @@ fn read_extents(
     file: &mut File,
     range: Range,
     state: &mut SNState,
+    table_len: usize,
     disks: &std::collections::HashMap<(EnId, DiskId), SnDiskId>,
 ) -> Result<()> {
     let mut section = read_section(file, range, Op::SnCkExtents)?;
     for _ in 0..section.count {
         let row: ExtentRow = read_piece(file, &mut section.left)?;
-        restore_extent(state, row, disks)?;
+        restore_extent(state, row, table_len, disks)?;
     }
     if section.left != 0 {
         return Err(Error::new("trailing SN checkpoint extent data"));
@@ -756,8 +795,26 @@ pub(super) fn read_state(path: &Path, max_extents: u32) -> Result<Restored> {
     let disks = read_ens(&mut file, footer.ens)?;
     let disk_map = disk_map(&disks)?;
     let mut state = SNState::new(max_extents)?;
-    read_extents(&mut file, footer.extent_rows, &mut state, &disk_map)?;
+    let stream_count = usize::try_from(footer.streams)
+        .map_err(|_| Error::new("SN checkpoint stream table is too large"))?;
+    if footer.streams > u64::from(MAX_STREAMS) {
+        return Err(Error::new("SN checkpoint stream table exceeds its limit"));
+    }
+    state
+        .stream_map
+        .try_reserve(stream_count)
+        .map_err(|error| Error::new(format!("reserve SN checkpoint stream table: {error}")))?;
+    let extent_slots = usize::try_from(footer.extent_slots.get())
+        .map_err(|_| Error::new("SN checkpoint extent table is too large"))?;
+    if extent_slots == 0 || extent_slots > max_extents as usize {
+        return Err(Error::new("SN checkpoint extent table length is out of range"));
+    }
+    read_extents(&mut file, footer.extent_rows, &mut state, extent_slots, &disk_map)?;
+    state.extent_table.finish_restore(extent_slots)?;
     read_streams(&mut file, footer.stream_rows, &mut state)?;
+    if state.stream_map.len() != footer.streams {
+        return Err(Error::new("SN checkpoint stream table length mismatch"));
+    }
     read_retired(&mut file, footer.retired, &mut state)?;
     read_pending(&mut file, footer.pending, &mut state, &disk_map)?;
     state.sealed = u64::try_from(

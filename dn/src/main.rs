@@ -14,6 +14,8 @@
 //! taken, the streams are asked for, and the client's `Reply` travels with that
 //! request to be answered when the SN says the streams exist.
 
+mod checkpoint;
+
 use common::config::{DNConfig, ServiceKind};
 use common::deletion::{
     Delete, Extras, Flags, SharedExtras, Target, bad, forward, read_soft_deleted,
@@ -576,6 +578,25 @@ impl StreamTable {
     fn reset(&mut self) {
         *self = Self::new().expect("rebuilding DN stream pool");
     }
+
+    fn finish_restore(&mut self, len: usize) -> common::Result<()> {
+        if len > StreamId::NONE.get() as usize || self.len > len {
+            return Err(common::Error::new("invalid restored DN stream table length"));
+        }
+        if len != 0 && self.pool.issued_blocks() < len as u32 {
+            let index = len as u32 - 1;
+            self.pool
+                .reserve_index(index)
+                .map_err(|error| common::Error::new(error.to_string()))?;
+            self.len = len;
+            self[index as usize].deletion = Flags::vacant();
+            // Extend the issued range without making the final, unused slot live.
+            unsafe { self.pool.retire_index(index) };
+            self.pool.reclaim();
+        }
+        self.len = len;
+        Ok(())
+    }
 }
 
 impl Deref for StreamTable {
@@ -734,6 +755,14 @@ impl ObjectTable {
 
     fn reclaim(&mut self) {
         self.hash.reclaim();
+    }
+
+    fn len(&self) -> u64 {
+        self.hash.len()
+    }
+
+    fn for_each(&self, visit: impl FnMut(&Object)) {
+        self.hash.for_each(visit);
     }
 }
 
@@ -1163,6 +1192,16 @@ impl Respond {
 struct DNState {
     object_table: ObjectTable,
     stream_table: StreamTable,
+}
+
+impl DNState {
+    fn new() -> common::Result<Self> {
+        Ok(Self {
+            object_table: ObjectTable::new()?,
+            stream_table: StreamTable::new()
+                .map_err(|error| common::Error::new(format!("create DN stream pool: {error}")))?,
+        })
+    }
 }
 
 impl raft::execution::Application for DNState {
@@ -3538,7 +3577,45 @@ impl DN {
             runtime.identities.clone(),
         )?;
         initial.ignore_ring_identity = runtime.ignore_ring_identity;
-        let journal = raft::journal::Journal::open(path, initial, 3, &runtime.name)?;
+        let mut journal = raft::journal::Journal::open_with_reader(
+            path,
+            initial,
+            3,
+            &runtime.name,
+            checkpoint::read_raft,
+        )?;
+        let snapshot_path = journal.checkpoint_path();
+        let snapshot_index = journal.state.snapshot.index;
+        let snapshot_sequence = journal.checkpoint_sequence();
+        let has_dn_ckpt = snapshot_path.exists() && checkpoint::is_dn_ckpt(&snapshot_path)?;
+        let restored = match checkpoint::read_state(&snapshot_path, mine) {
+            Ok(saved) => Some(saved),
+            Err(_) if snapshot_index == 0 && snapshot_sequence == 0 && !has_dn_ckpt => {
+                let empty = DNState::new()?;
+                let (base, _, _, _) = raft::journal::read_checkpoint(
+                    &snapshot_path,
+                    snapshot_index,
+                    &runtime.ring,
+                    runtime.ignore_ring_identity,
+                )?;
+                let status = raft::checkpoint::RaftStatus::capture(&base, &base.snapshot)?;
+                let second = TimeSec::now().number();
+                let bytes = checkpoint::write_bootstrap(
+                    &snapshot_path,
+                    &status,
+                    &empty,
+                    mine,
+                    snapshot_sequence,
+                )?;
+                journal.set_boot_ckpt(second, bytes)?;
+                Some(checkpoint::read_state(&snapshot_path, mine)?)
+            }
+            Err(error) => return Err(error),
+        };
+        let generation = journal.state.generation;
+        if restored.as_ref().is_some_and(|saved| saved.index != snapshot_index) {
+            return Err(common::Error::new("DN application checkpoint boundary mismatch"));
+        }
         let id =
             journal.state.membership().slot(&journal.identity.current).unwrap_or(raft::UNASSIGNED);
         let mut node = raft::Node::new_with_log2(id, journal, config.raft.log2_entries)?;
@@ -3552,20 +3629,30 @@ impl DN {
         }
         let options = raft::runtime::Options {
             raft: config.raft.clone(),
-            snapshot_min_log_bytes: u64::MAX,
-            snapshot_interval_secs: u64::MAX,
+            snapshot_min_log_bytes: 1024 * 1024,
+            snapshot_interval_secs: 24 * 60 * 60,
             allow_stale_reads: config.knobs.allow_stale_reads,
         };
-        let stream_table = StreamTable::new()
-            .map_err(|error| common::Error::new(format!("create DN stream pool: {error}")))?;
-        let object_table = ObjectTable::new()?;
-        let dn_node = DN {
-            common: raft::runtime::Runtime::with_state(
-                runtime,
-                node,
-                options,
-                DNState { object_table, stream_table },
+        let (state, object_extras, stream_extras, next_object, next_stream, seed) = match restored {
+            Some(saved) => (
+                saved.state,
+                saved.object_extras,
+                saved.stream_extras,
+                saved.next_object,
+                saved.next_stream,
+                Some(saved.index),
             ),
+            None => (DNState::new()?, Extras::default(), SharedExtras::default(), 0, 0, None),
+        };
+        let object_count = state.object_table.len();
+        let stream_count = state
+            .stream_table
+            .iter()
+            .enumerate()
+            .filter(|(at, stream)| stream.id.get() as usize == *at)
+            .count() as u64;
+        let dn_node = DN {
+            common: raft::runtime::Runtime::with_state(runtime, node, options, state),
             config,
             gc_stop: AtomicBool::new(true),
             gc_thread: Mutex::new(None),
@@ -3576,17 +3663,27 @@ impl DN {
             dn,
             mine,
             parked: AtomicU64::new(0),
-            objects: AtomicU64::new(0),
-            streams: AtomicU64::new(0),
+            objects: AtomicU64::new(object_count),
+            streams: AtomicU64::new(stream_count),
             // ⚠️ From zero, because the sentinel is at the top of the range now: slot 0 of an
             // arena is a real object, and starting at one would waste it (§17.37.2).
-            next_object: AtomicU64::new(0),
-            next_stream: AtomicU64::new(0),
-            object_extras: Mutex::new(Extras::default()),
-            stream_extras: Mutex::new(Extras::default()),
+            next_object: AtomicU64::new(next_object),
+            next_stream: AtomicU64::new(next_stream),
+            object_extras: Mutex::new(object_extras),
+            stream_extras: Mutex::new(stream_extras),
             #[cfg(test)]
             _test_dir: None,
         };
+        if let Some(index) = seed {
+            *dn_node
+                .common
+                .execution
+                .lock()
+                .map_err(|_| common::Error::new("DN execution cursor poisoned"))? =
+                raft::execution::Cursor::new(generation, index);
+            dn_node.common.application_generation.store(generation, Ordering::SeqCst);
+            dn_node.common.publish_applied(index);
+        }
         dn_node.ready.store(true, Ordering::SeqCst);
         let commit = dn_node.on_raft(|host, node| {
             host.refresh_application(node)?;
@@ -3880,10 +3977,55 @@ impl Host for DN {
 
     fn checkpoint_actions(
         &self,
-        state: &raft::State,
+        _state: &raft::State,
         _application: &Self::Application,
     ) -> common::Result<Vec<raft::Entry>> {
-        Ok(state.capture().application)
+        Ok(Vec::new())
+    }
+
+    fn copy_ck_files(&self) -> bool {
+        true
+    }
+
+    fn checkpoint_writer<'a>(
+        &self,
+        state: &raft::State,
+        snapshot: &raft::Snapshot,
+        application: &'a Self::Application,
+        mark: raft::journal::CheckpointMark,
+        now: u64,
+    ) -> common::Result<Option<raft::journal::CheckpointWriter<'a>>> {
+        let status = raft::checkpoint::RaftStatus::capture(state, snapshot)?;
+        let object_guard = self
+            .object_extras
+            .lock()
+            .map_err(|_| common::Error::new("DN object extras poisoned"))?;
+        let stream_guard = self
+            .stream_extras
+            .lock()
+            .map_err(|_| common::Error::new("DN stream extras poisoned"))?;
+        let (object_extras, stream_extras) =
+            checkpoint::capture_extras(&object_guard, &stream_guard);
+        drop(stream_guard);
+        drop(object_guard);
+        let range = self.mine;
+        let next_object = self.next_object.load(Ordering::Acquire);
+        let next_stream = self.next_stream.load(Ordering::Acquire);
+        let sequence = mark.sequence();
+        Ok(Some(Box::new(move |file| {
+            checkpoint::write(
+                file,
+                &status,
+                application,
+                range,
+                next_object,
+                next_stream,
+                &object_extras,
+                &stream_extras,
+                sequence,
+                now,
+            )
+        })))
     }
 
     fn peer_message(&self) -> Option<raft::Action> {
