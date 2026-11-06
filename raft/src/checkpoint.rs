@@ -5,6 +5,9 @@ use common::{Error, Op, Result};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 
+mod chunks;
+pub use chunks::{ChunkPos, read_chunks, write_chunks};
+
 /// Raft's portion of a service checkpoint's variable footer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RaftStatus {

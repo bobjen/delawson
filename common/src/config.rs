@@ -703,6 +703,8 @@ pub struct RaftConfig {
     pub checkpoint_lease_secs: u64,
     /// Positive, and smaller than cold_election_delay_ms.
     pub checkpoint_election_delay_ms: u64,
+    /// Number of workers for checkpoint table chunks.
+    pub checkpoint_workers: usize,
     pub ring: String,
     /// Bootstrap endpoint hints, refreshed through registration; not persisted as membership.
     pub members: BTreeMap<String, SocketAddr>,
@@ -729,6 +731,7 @@ impl Default for RaftConfig {
             lost_state_election_delay_ms: 200,
             checkpoint_lease_secs: 300,
             checkpoint_election_delay_ms: 500,
+            checkpoint_workers: 16,
             ring: "KS0".into(),
             members: BTreeMap::new(),
             member_indexes: BTreeMap::new(),
@@ -742,6 +745,9 @@ impl Default for RaftConfig {
 
 impl RaftConfig {
     pub fn validate_timing(&self) -> Result<()> {
+        if self.checkpoint_workers == 0 {
+            return Err(Error::new("Raft checkpoint_workers must be positive"));
+        }
         if !(1..=27).contains(&self.log2_entries) {
             return Err(Error::new("Raft log2_entries must be between 1 and 27"));
         }

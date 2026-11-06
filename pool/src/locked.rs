@@ -184,6 +184,102 @@ impl<T: LockedItem, const A: usize, const L: usize> LockedPool<T, A, L> {
         Ok(index)
     }
 
+    /// Allocate a batch of indexes while holding the caller's exclusive lock.
+    /// If the pool runs out partway through, the indexes already taken are
+    /// returned to their free lists.
+    pub fn alloc_many(&mut self, count: usize) -> Result<Vec<u32>> {
+        let count = u32::try_from(count).map_err(|_| Error::new("pool batch is too large"))?;
+        if count > self.max_blocks {
+            return Err(Error::new("pool batch exceeds its capacity"));
+        }
+        let mut indexes = Vec::new();
+        indexes
+            .try_reserve_exact(count as usize)
+            .map_err(|error| Error::new(format!("pool batch allocation: {error}")))?;
+        let mask = BUCKETS - 1;
+        let random = random::thread_u64();
+        let first = (random as usize) & mask;
+        let delta =
+            ((((random >> BUCKETS.trailing_zeros()) as usize) & (BUCKETS / 2 - 1)) << 1) | 1;
+        for _ in 0..count {
+            let mut found = None;
+            for step in 0..BUCKETS {
+                let bucket = first.wrapping_add(step * delta) & mask;
+                if let Some(index) = self.pop(bucket) {
+                    found = Some(index);
+                    break;
+                }
+            }
+            let index = match found {
+                Some(index) => index,
+                None => match self.issue_fresh() {
+                    Ok(index) => index,
+                    Err(error) => {
+                        for index in indexes.drain(..) {
+                            self.push_free(index);
+                        }
+                        return Err(error);
+                    }
+                },
+            };
+            self.prepare_alloc(index);
+            indexes.push(index);
+        }
+        Ok(indexes)
+    }
+
+    /// Initialize the prefix needed for a checkpoint restore and clear all pool
+    /// lists. The new prefix remains unavailable until finish_restore rebuilds
+    /// the free lists from the caller's live-item predicate.
+    pub fn prepare_restore(&mut self, prefix: u32) -> Result<()> {
+        if prefix > self.max_blocks {
+            return Err(Error::new("restored pool prefix exceeds its capacity"));
+        }
+        while self.next < prefix {
+            self.issue_fresh()?;
+        }
+        for bucket in &mut self.buckets {
+            *bucket = Bucket::new(T::LINK_NONE);
+        }
+        Ok(())
+    }
+
+    /// Replace one initialized slot while restoring disjoint chunks.
+    ///
+    /// # Safety
+    /// The caller must ensure this index is written exactly once and no reader,
+    /// pool operation, or drop can access it concurrently.
+    pub unsafe fn restore_slot(&self, index: u32, item: T) -> Result<()> {
+        if index >= self.next {
+            return Err(Error::new("restored pool index was not initialized"));
+        }
+        // SAFETY: the caller guarantees exclusive access to this unique slot.
+        unsafe { self.slot(index).write(item) };
+        Ok(())
+    }
+
+    /// Rebuild free lists after parallel checkpoint writes have completed.
+    pub fn finish_restore(
+        &mut self,
+        prefix: u32,
+        mut live: impl FnMut(u32, *const T) -> bool,
+    ) -> Result<()> {
+        if prefix > self.next {
+            return Err(Error::new("restored pool prefix exceeds initialized slots"));
+        }
+        for bucket in &mut self.buckets {
+            *bucket = Bucket::new(T::LINK_NONE);
+        }
+        for index in 0..self.next {
+            if index < prefix && live(index, self.slot(index).cast_const()) {
+                self.set_link(index, T::LINK_NONE);
+            } else {
+                self.push_free(index);
+            }
+        }
+        Ok(())
+    }
+
     /// Whether `index` is available for an exact reservation. A not-yet-issued
     /// index is available if it is within the pool's limit; an issued index has
     /// to be on its free list already. Deleted indexes become reservable only

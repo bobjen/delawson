@@ -368,6 +368,7 @@ pub struct LinearHash<'a, T: LinearEntry, const ALIGN: usize, const LINK: usize>
     len: u64,
     max_items: u32,
     reserved: Vec<u32>,
+    restore_count: Option<u32>,
 }
 
 // SAFETY: slots are stable and all access is serialized by the caller's lock.
@@ -398,11 +399,108 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearHash<'a, T, A, L>
         let hash = HashDir::with_buckets(chunks, max_buckets, u64::from(initial_buckets))?;
         let slots = LockedPool::new(max_items, 0)?;
         let base = slots.base_ptr();
-        Ok(Self { slots, base, hash, len: 0, max_items, reserved: Vec::new() })
+        Ok(Self { slots, base, hash, len: 0, max_items, reserved: Vec::new(), restore_count: None })
     }
 
     pub fn len(&self) -> u64 {
         self.len
+    }
+
+    /// Number of initialized buckets in the linear-hash directory.
+    pub fn bucket_count(&self) -> u64 {
+        self.hash.bucket_count()
+    }
+
+    /// Visit one complete bucket chain in its key-sorted order.
+    pub fn for_each_bucket(&self, bucket: u64, mut visit: impl FnMut(&T)) {
+        assert!(bucket < self.hash.bucket_count(), "linear-hash bucket is outside the directory");
+        let mut index = self.hash.head(bucket);
+        while index != T::LINK_NONE {
+            let item = self.slot(index);
+            visit(item);
+            index = item.next();
+        }
+    }
+
+    /// Allocate slots for a parallel checkpoint restore. The directory must
+    /// already have been constructed with the saved bucket count.
+    pub fn begin_restore(&mut self, count: usize) -> Result<Vec<u32>> {
+        if self.len != 0 || self.restore_count.is_some() || !self.reserved.is_empty() {
+            return Err(Error::new("linear hash is not empty for checkpoint restore"));
+        }
+        let count =
+            u32::try_from(count).map_err(|_| Error::new("linear-hash restore is too large"))?;
+        if count > self.max_items {
+            return Err(Error::new("linear-hash restore exceeds its item limit"));
+        }
+        let slots = self.slots.alloc_many(count as usize)?;
+        self.restore_count = Some(count);
+        Ok(slots)
+    }
+
+    /// Install one complete bucket chain during a parallel checkpoint restore.
+    /// The callback returns each next slot and value, or `None` at the end.
+    ///
+    /// # Safety
+    /// Each call must use a distinct bucket and distinct slots returned by
+    /// `begin_restore`. No table reads or other mutations may run until all
+    /// calls finish and `finish_restore` succeeds.
+    pub unsafe fn restore_bucket_with(
+        &self,
+        bucket: u64,
+        mut next_item: impl FnMut() -> Result<Option<(u32, T)>>,
+    ) -> Result<u64> {
+        if self.restore_count.is_none() || bucket >= self.hash.bucket_count() {
+            return Err(Error::new("linear-hash restore bucket is not available"));
+        }
+        let head = unsafe { self.hash.heads.base().add(bucket as usize) };
+        // SAFETY: the restore contract gives this call unique ownership of bucket.
+        if unsafe { head.read() } != T::LINK_NONE {
+            return Err(Error::new("linear-hash restore bucket is not empty"));
+        }
+        let mut first = T::LINK_NONE;
+        let mut tail = T::LINK_NONE;
+        let mut count = 0u64;
+        while let Some((index, mut item)) = next_item()? {
+            if index >= self.slots.issued_blocks()
+                || self.hash.bucket(T::hash(item.key())) != bucket
+            {
+                return Err(Error::new("linear-hash restored item has an invalid slot or bucket"));
+            }
+            if tail != T::LINK_NONE && self.slot(tail).key().cmp(item.key()) != Ordering::Less {
+                return Err(Error::new("linear-hash restored bucket is not strictly ordered"));
+            }
+            item.set_next(T::LINK_NONE);
+            let slot = unsafe { self.base.as_ptr().add(index as usize) };
+            // SAFETY: the supplied index is uniquely allocated and initialized.
+            let old = unsafe { slot.replace(item) };
+            drop(old);
+            if tail == T::LINK_NONE {
+                first = index;
+            } else {
+                // SAFETY: this call owns the prior item in this bucket chain.
+                unsafe { (*self.base.as_ptr().add(tail as usize)).set_next(index) };
+            }
+            tail = index;
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| Error::new("linear-hash restore count overflow"))?;
+        }
+        // SAFETY: this call has unique ownership of the bucket head.
+        unsafe { head.write(first) };
+        Ok(count)
+    }
+
+    /// Publish a restored entry count and allow normal insert/remove resizing.
+    pub fn finish_restore(&mut self, count: u64) -> Result<()> {
+        let expected =
+            self.restore_count.take().ok_or_else(|| Error::new("linear hash is not restoring"))?;
+        if count != u64::from(expected) {
+            self.restore_count = Some(expected);
+            return Err(Error::new("linear-hash restored item count mismatch"));
+        }
+        self.len = count;
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -498,6 +596,9 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearHash<'a, T, A, L>
     /// Ensure the next `additional` insertions can take slots and grow the
     /// directory before the caller starts a batch mutation.
     pub fn try_reserve(&mut self, additional: usize) -> Result<()> {
+        if self.restore_count.is_some() {
+            return Err(Error::new("linear hash cannot reserve while restoring"));
+        }
         let additional = u64::try_from(additional)
             .map_err(|_| Error::new("linear hash reservation is too large"))?;
         let live_after = self
@@ -530,6 +631,9 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearHash<'a, T, A, L>
         key: &T::Key,
         create: impl FnOnce(&T::Key) -> T,
     ) -> Result<(&mut T, bool)> {
+        if self.restore_count.is_some() {
+            return Err(Error::new("linear hash cannot insert while restoring"));
+        }
         let hash = T::hash(&key);
         let bucket = self.hash.bucket(hash);
         let (link, next, ordering) = self.seek_link(key, bucket)?;
@@ -586,6 +690,7 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearHash<'a, T, A, L>
     }
 
     pub fn remove_entry(&mut self, key: &T::Key) -> Option<T> {
+        assert!(self.restore_count.is_none(), "linear hash cannot remove while restoring");
         let (bucket, previous, index, ordering) = self.seek(key, T::hash(key));
         if ordering != Some(Ordering::Equal) {
             return None;
@@ -607,6 +712,7 @@ impl<'a, T: LinearEntry, const A: usize, const L: usize> LinearHash<'a, T, A, L>
     }
 
     pub fn clear(&mut self) {
+        assert!(self.restore_count.is_none(), "linear hash cannot clear while restoring");
         for bucket in 0..self.hash.bucket_count() {
             let mut index = self.hash.head(bucket);
             while index != T::LINK_NONE {

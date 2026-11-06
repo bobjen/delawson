@@ -362,6 +362,11 @@ ops! {
     DnCkObjX = 188, "dn-ck-obj-xs";
     DnCkStrX = 189, "dn-ck-str-xs";
     DnCkSpan = 190, "dn-ck-span";
+    CkChunkLoc = 191, "ck-chunk-loc";
+    SnCkExtChunk = 192, "sn-ck-ext-chunk";
+    DnCkStrChunk = 193, "dn-ck-str-chunk";
+    SnCkStrChunk = 194, "sn-ck-str-chunk";
+    DnCkObjChunk = 195, "dn-ck-obj-chunk";
 }
 
 impl std::fmt::Display for Op {

@@ -15,6 +15,8 @@ max_extents = 1073741824
 [raft]
 # Number of recent shared entries retained by each member is 2^log2_entries.
 log2_entries = 16
+# Workers reading and writing checkpoint table chunks.
+checkpoint_workers = 16
 # ring = "SN0"
 # [raft.member_indexes]
 # SN0 = 0

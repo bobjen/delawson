@@ -400,6 +400,29 @@ impl ExtentTable {
         Ok(())
     }
 
+    fn restore(&self, wanted: ExtentId, extent: Extent) -> Result<()> {
+        let index = wanted.get() as usize;
+        if wanted.is_none() || index >= self.len() {
+            return Err(Error::new("checkpoint extent slot is outside the initialized prefix"));
+        }
+        if extent.id != wanted || !extent.deletion.is_valid() {
+            return Err(Error::new("checkpoint extent slot has an invalid extent"));
+        }
+        let block = self.pool.reserve_issued(wanted.get()).map_err(|error| {
+            Error::new(format!("reserve checkpoint extent {}: {error}", wanted.get()))
+        })?;
+        let slot = unsafe { self.base.as_ptr().add(index) };
+        // The bitmap claim gives this worker exclusive ownership of this slot.
+        unsafe {
+            if (*slot).deletion.bits() != 0 {
+                return Err(Error::new("checkpoint extent slot was not vacant"));
+            }
+            *slot = extent;
+        }
+        std::mem::forget(block);
+        Ok(())
+    }
+
     fn len(&self) -> usize {
         self.len.load(Ordering::Acquire)
     }
@@ -1047,9 +1070,13 @@ struct SNState {
 
 impl SNState {
     fn new(max_extents: u32) -> Result<Self> {
+        Self::with_stream_buckets(max_extents, 0)
+    }
+
+    fn with_stream_buckets(max_extents: u32, stream_buckets: u32) -> Result<Self> {
         let chunks = common::message_pool()
             .map_err(|error| Error::new(format!("get segmented-buffer pool: {error}")))?;
-        let stream_map = StreamTable::with_buckets(chunks, MAX_STREAMS, 0)
+        let stream_map = StreamTable::with_buckets(chunks, MAX_STREAMS, stream_buckets)
             .map_err(|error| Error::new(format!("reserve SN stream table: {error}")))?;
         let extent_table = ExtentTable::new(max_extents)
             .map_err(|error| Error::new(format!("reserve SN extent table: {error}")))?;
@@ -2360,7 +2387,12 @@ impl SN {
         let snapshot_index = journal.state.snapshot.index;
         let snapshot_sequence = journal.checkpoint_sequence();
         let has_sn_ckpt = snapshot_path.exists() && checkpoint::is_sn_ckpt(&snapshot_path)?;
-        let restored = match checkpoint::read_state(&snapshot_path, config.max_extents) {
+        let workers = config.raft.checkpoint_workers;
+        let restored = match checkpoint::read_state_with_workers(
+            &snapshot_path,
+            config.max_extents,
+            workers,
+        ) {
             Ok(saved) => Some(saved),
             Err(_) if snapshot_index == 0 && snapshot_sequence == 0 && !has_sn_ckpt => {
                 let empty = SNState::new(config.max_extents)?;
@@ -2379,9 +2411,14 @@ impl SN {
                     &disks,
                     snapshot_sequence,
                     second,
+                    workers,
                 )?;
                 journal.set_boot_ckpt(second, bytes)?;
-                Some(checkpoint::read_state(&snapshot_path, config.max_extents)?)
+                Some(checkpoint::read_state_with_workers(
+                    &snapshot_path,
+                    config.max_extents,
+                    workers,
+                )?)
             }
             Err(error) => return Err(error),
         };
@@ -3750,8 +3787,9 @@ impl Host for SN {
         let status = raft::checkpoint::RaftStatus::capture(state, snapshot)?;
         let disks = self.disks.lock().map_err(|_| Error::new("SN disk lock poisoned"))?.clone();
         let sequence = mark.sequence();
+        let workers = self.config.raft.checkpoint_workers;
         Ok(Some(Box::new(move |file| {
-            checkpoint::write(file, &status, application, &disks, sequence, now)
+            checkpoint::write(file, &status, application, &disks, sequence, now, workers)
         })))
     }
 

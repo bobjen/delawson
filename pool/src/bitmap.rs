@@ -383,6 +383,18 @@ impl<T: PoolItem, const A: usize> Pool<T, A> {
         self.reserve_inner(index, None)
     }
 
+    /// Claim an already initialized slot without extending the issued prefix.
+    /// Callers must ensure no other owner can use the claimed slot.
+    pub fn reserve_issued(&self, index: u32) -> Result<Block<'_, T, A>> {
+        if index >= self.issued_blocks() {
+            return Err(Error::new("block pool index is outside the issued range"));
+        }
+        if !self.take_index(index) {
+            return Err(Error::new("block pool index is already allocated"));
+        }
+        Ok(Block { pool: self, index })
+    }
+
     /// Reserve one exact index, publishing newly initialized slots to `len`
     /// before exposing any gaps as free in the bitmap.
     pub fn reserve_with_len(&mut self, index: u32, len: &AtomicUsize) -> Result<Block<'_, T, A>> {
