@@ -624,7 +624,7 @@ struct SectionRead {
     left: u64,
 }
 
-fn read_section(file: &mut File, range: Range, op: Op) -> Result<SectionRead> {
+fn read_section(file: &mut File, range: Range, op: Op, plain: Option<u64>) -> Result<SectionRead> {
     if range.len < 10 {
         return Err(Error::new("truncated DN checkpoint section"));
     }
@@ -636,10 +636,17 @@ fn read_section(file: &mut File, range: Range, op: Op) -> Result<SectionRead> {
     }
     let count = read_u64(file)?;
     let left = range.len - 10;
-    if count > left / 9 {
+    if count > plain.unwrap_or(left) / 9 {
         return Err(Error::new("DN checkpoint row count exceeds section length"));
     }
     Ok(SectionRead { count, left })
+}
+
+fn plain_chunk_bytes(chunks: &[raft::checkpoint::ChunkPos]) -> Result<u64> {
+    chunks.iter().try_fold(0u64, |sum, chunk| {
+        sum.checked_add(chunk.plain)
+            .ok_or_else(|| Error::new("DN checkpoint plain chunk size overflow"))
+    })
 }
 
 fn read_u64(file: &mut impl Read) -> Result<u64> {
@@ -661,7 +668,7 @@ fn read_piece<T: codec::Wire>(file: &mut impl Read, left: &mut u64) -> Result<T>
 }
 
 fn read_meta(file: &mut File, range: Range) -> Result<RangeMeta> {
-    let mut section = read_section(file, range, Op::DnCkMeta)?;
+    let mut section = read_section(file, range, Op::DnCkMeta, None)?;
     if section.count != 1 {
         return Err(Error::new("DN checkpoint needs one range record"));
     }
@@ -691,11 +698,13 @@ fn check_chunks(
     for chunk in &physical {
         let chunk_end = chunk
             .start
-            .checked_add(chunk.len)
+            .checked_add(chunk.stored)
             .ok_or_else(|| Error::new(format!("DN checkpoint {label} chunk range overflow")))?;
         if chunk.start != at
             || chunk_end > end
-            || chunk.len < 10
+            || chunk.plain < 10
+            || chunk.stored == 0
+            || chunk.stored > chunk.plain
             || chunk.span == 0
             || chunk.items == 0
         {
@@ -733,7 +742,7 @@ fn read_streams(
     len: StreamId,
     workers: usize,
 ) -> Result<()> {
-    let section = read_section(file, range, Op::DnCkStreams)?;
+    let section = read_section(file, range, Op::DnCkStreams, Some(plain_chunk_bytes(chunks)?))?;
     check_chunks(range, chunks, u64::from(len.get()), section.count, "stream")?;
     state.stream_table.prepare_restore(len.get() as usize)?;
     let table = &state.stream_table;
@@ -742,7 +751,7 @@ fn read_streams(
             .first
             .checked_add(chunk.span)
             .ok_or_else(|| Error::new("DN checkpoint stream chunk range overflow"))?;
-        if bytes.len() as u64 != chunk.len {
+        if bytes.len() as u64 != chunk.plain {
             return Err(Error::new("DN checkpoint stream chunk length mismatch"));
         }
         let mut input = Cursor::new(bytes.as_slice());
@@ -755,7 +764,7 @@ fn read_streams(
         if count != chunk.items {
             return Err(Error::new("DN checkpoint stream chunk item count mismatch"));
         }
-        let mut left = chunk.len - 10;
+        let mut left = chunk.plain - 10;
         let mut previous = None;
         for _ in 0..count {
             let row: StreamRow = read_piece(&mut input, &mut left)?;
@@ -867,7 +876,7 @@ fn read_objects(
     state: &mut DNState,
     workers: usize,
 ) -> Result<HashMap<ObjKey, bool>> {
-    let section = read_section(file, range, Op::DnCkObjects)?;
+    let section = read_section(file, range, Op::DnCkObjects, Some(plain_chunk_bytes(chunks)?))?;
     let count = usize::try_from(section.count)
         .map_err(|_| Error::new("DN checkpoint object count is too large"))?;
     let buckets = state.object_table.bucket_count();
@@ -910,7 +919,7 @@ fn read_objects(
             .checked_add(chunk.span)
             .filter(|end| *end <= buckets)
             .ok_or_else(|| Error::new("DN checkpoint object chunk exceeds its table"))?;
-        if bytes.len() as u64 != chunk.len {
+        if bytes.len() as u64 != chunk.plain {
             return Err(Error::new("DN checkpoint object chunk length mismatch"));
         }
         let mut input = Cursor::new(bytes.as_slice());
@@ -923,7 +932,7 @@ fn read_objects(
         if count != chunk.items {
             return Err(Error::new("DN checkpoint object chunk item count mismatch"));
         }
-        let mut left = chunk.len - 10;
+        let mut left = chunk.plain - 10;
         let mut next_slot = *starts
             .get(&chunk.first)
             .ok_or_else(|| Error::new("DN checkpoint object chunk has no slot range"))?;
@@ -1001,7 +1010,7 @@ fn read_object_extras(
     refs: &mut HashMap<ObjKey, bool>,
 ) -> Result<Extras<(ObjectId, TimeSec)>> {
     let mut extras = Extras::default();
-    let mut section = read_section(file, range, Op::DnCkObjX)?;
+    let mut section = read_section(file, range, Op::DnCkObjX, None)?;
     for _ in 0..section.count {
         let row: ObjExtra = read_piece(file, &mut section.left)?;
         let key = (ObjectId::of_number(row.object)?, TimeSec::new(row.created));
@@ -1065,7 +1074,7 @@ fn read_stream_extras(
     if count_overflow {
         return Err(Error::new("DN stream reference count overflow or invalid reference"));
     }
-    let mut section = read_section(file, range, Op::DnCkStrX)?;
+    let mut section = read_section(file, range, Op::DnCkStrX, None)?;
     for _ in 0..section.count {
         let row: StreamExtra = read_piece(file, &mut section.left)?;
         let key = (StreamId::of_number(row.stream)?, TimeSec::new(row.created));

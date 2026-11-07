@@ -224,7 +224,7 @@ fn decode_chunk<T: codec::Wire>(
     let count =
         usize::try_from(count).map_err(|_| Error::new("SN checkpoint chunk is too large"))?;
     let mut left =
-        chunk.len.checked_sub(10).ok_or_else(|| Error::new("truncated SN checkpoint chunk"))?;
+        chunk.plain.checked_sub(10).ok_or_else(|| Error::new("truncated SN checkpoint chunk"))?;
     let mut rows = Vec::new();
     rows.try_reserve_exact(count)
         .map_err(|_| Error::new("SN checkpoint chunk allocation failed"))?;
@@ -247,11 +247,13 @@ fn check_chunks(range: Range, chunks: &[raft::checkpoint::ChunkPos]) -> Result<(
     for chunk in &physical {
         let chunk_end = chunk
             .start
-            .checked_add(chunk.len)
+            .checked_add(chunk.stored)
             .ok_or_else(|| Error::new("SN checkpoint chunk range overflow"))?;
         if chunk.start != at
             || chunk_end > end
-            || chunk.len < 10
+            || chunk.plain < 10
+            || chunk.stored == 0
+            || chunk.stored > chunk.plain
             || chunk.span == 0
             || chunk.items == 0
         {
@@ -1007,7 +1009,7 @@ fn read_streams(
             .checked_add(chunk.span)
             .filter(|end| *end <= table.bucket_count())
             .ok_or_else(|| Error::new("SN checkpoint stream chunk exceeds its hash table"))?;
-        if bytes.len() < 10 || chunk.len < 10 {
+        if bytes.len() < 10 || chunk.plain < 10 {
             return Err(Error::new("truncated SN checkpoint stream chunk"));
         }
         let mut input = Cursor::new(bytes.as_slice());
@@ -1020,7 +1022,7 @@ fn read_streams(
         if count != chunk.items {
             return Err(Error::new("SN checkpoint stream chunk item count mismatch"));
         }
-        let mut left = chunk.len - 10;
+        let mut left = chunk.plain - 10;
         let mut at = *starts
             .get(&chunk.first)
             .ok_or_else(|| Error::new("SN checkpoint stream chunk has no slot range"))?;

@@ -315,6 +315,7 @@ version = "0.0.1"
 dependencies = [
  "delawson-common",
  "libc",
+ "lz4_flex",
  "parking_lot",
  "sha2",
  "tempfile",

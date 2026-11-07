@@ -96,6 +96,11 @@ pub(crate) fn checkpoint_install(
     }
 }
 const LIMIT: usize = 64 * 1024 * 1024;
+// Zero cannot be a valid encoded-frame depth, so this marks compressed frames
+// without confusing frames already written in the old format.
+const FRAME_ZIP_MAGIC: &[u8; 8] = b"\0DJNLZ01";
+const FRAME_ZIP_HEAD: usize = 16;
+const FRAME_ZIP_MIN: usize = 1024;
 
 /// Load a service-specific checkpoint into the common Raft state and boundary.
 pub type CheckpointReader = fn(&Path, u64, &str, bool) -> Result<(State, u64, u64, u64)>;
@@ -164,6 +169,21 @@ impl SerializedFrame {
             Self::Flat(bytes) => bytes.len(),
             Self::Shared(frame) => frame.length,
         }
+    }
+    fn sizes(&self) -> (u64, u64) {
+        let stored = self.len() as u64;
+        let plain = match self {
+            Self::Flat(bytes)
+                if bytes.len() >= 16 + FRAME_ZIP_HEAD
+                    && &bytes[16..24] == FRAME_ZIP_MAGIC
+                    && u64::from_le_bytes(bytes[24..32].try_into().unwrap()) <= LIMIT as u64 =>
+            {
+                16 + u64::from_le_bytes(bytes[24..32].try_into().unwrap())
+            }
+            Self::Flat(bytes) => bytes.len() as u64,
+            Self::Shared(frame) => frame.length as u64,
+        };
+        (plain, stored)
     }
     #[cfg(test)]
     fn write_to(&self, out: &mut impl Write) -> std::io::Result<()> {
@@ -428,10 +448,30 @@ struct IoTiming {
     write_ns: AtomicU64,
     sync_ns: AtomicU64,
     syncs: AtomicU64,
+    plain_bytes: AtomicU64,
+    stored_bytes: AtomicU64,
+    compressed_frames: AtomicU64,
 }
 impl IoTiming {
-    fn record(&self, write_ns: u64, sync_ns: u64, batch_at: usize, process: &str, ring: &str) {
+    fn record(
+        &self,
+        write_ns: u64,
+        sync_ns: u64,
+        batch_at: usize,
+        plain_bytes: u64,
+        stored_bytes: u64,
+        process: &str,
+        ring: &str,
+    ) {
         let write_total = self.write_ns.fetch_add(write_ns, Ordering::Relaxed) + write_ns;
+        let plain_total = self.plain_bytes.fetch_add(plain_bytes, Ordering::Relaxed) + plain_bytes;
+        let stored_total =
+            self.stored_bytes.fetch_add(stored_bytes, Ordering::Relaxed) + stored_bytes;
+        let compressed_frames = if stored_bytes < plain_bytes {
+            self.compressed_frames.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            self.compressed_frames.load(Ordering::Relaxed)
+        };
         let sync_total = if batch_at == 0 {
             self.sync_ns.fetch_add(sync_ns, Ordering::Relaxed) + sync_ns
         } else {
@@ -444,16 +484,22 @@ impl IoTiming {
         };
         let frames = self.frames.fetch_add(1, Ordering::Relaxed) + 1;
         if frames % 1000 == 0 {
+            let saved = plain_total.saturating_sub(stored_total);
             common::logi!(
                 "Raft journal I/O timing",
-                "process {},ring {},frames {},syncs {},write_all_avg_us {:.1},sync_all_avg_us {:.1},frames_per_sync {:.2}",
+                "process {},ring {},frames {},syncs {},write_all_avg_us {:.1},sync_all_avg_us {:.1},frames_per_sync {:.2},plain_bytes {},stored_bytes {},saved_bytes {},saved_pct {:.1},compressed_frames {}",
                 process,
                 ring,
                 frames,
                 syncs,
                 write_total as f64 / frames as f64 / 1000.0,
                 sync_total as f64 / syncs.max(1) as f64 / 1000.0,
-                frames as f64 / syncs.max(1) as f64
+                frames as f64 / syncs.max(1) as f64,
+                plain_total,
+                stored_total,
+                saved,
+                saved as f64 * 100.0 / plain_total.max(1) as f64,
+                compressed_frames
             );
         }
     }
@@ -993,6 +1039,7 @@ impl Journal {
         records: Arc<Vec<Record>>,
         identity: Option<LocalIdentity>,
     ) -> Result<()> {
+        let (plain_bytes, stored_bytes) = serialized.sizes();
         let kind =
             if identity.is_some() { crate::io::Kind::Identity } else { crate::io::Kind::Parallel };
         self.perform_sync(kind, move |disk| {
@@ -1003,7 +1050,15 @@ impl Journal {
             mark_records(&records, false);
             let disk = disk.clone();
             Ok(crate::io::SyncRequest::new(file, move |sync_ns, batch_at| {
-                disk.timing.record(write_ns, sync_ns, batch_at, &disk.process, &disk.ring);
+                disk.timing.record(
+                    write_ns,
+                    sync_ns,
+                    batch_at,
+                    plain_bytes,
+                    stored_bytes,
+                    &disk.process,
+                    &disk.ring,
+                );
                 if let Some(identity) = identity {
                     let mut ownership = disk.lock_ownership()?;
                     append_identity(&mut ownership, &identity)?;
@@ -1413,6 +1468,7 @@ impl Journal {
         self.identity = identity;
         Ok(durable)
     }
+    /// Compare stored journal bytes with the previous checkpoint's stored size.
     pub fn snapshot_due(&self, min_bytes: u64, seconds: u64, now: u64) -> bool {
         self.change_sequence > self.snapshot_sequence
             && (self.log_bytes >= min_bytes.max(self.snapshot_bytes)
@@ -2080,7 +2136,7 @@ fn rewrite_journals(
                 }
                 let mut bytes = vec![0; length as usize];
                 input.read_exact(&mut bytes)?;
-                let old: Frame = decode(&bytes)?;
+                let old = decode_frame(&bytes)?;
                 if old.sequence
                     != scan_sequence
                         .checked_add(1)
@@ -2234,7 +2290,7 @@ fn suffix_segment(
             }
             let mut bytes = vec![0; length as usize];
             input.read_exact(&mut bytes)?;
-            let frame: Frame = decode(&bytes)?;
+            let frame = decode_frame(&bytes)?;
             if frame.sequence > after
                 && frame.records.iter().any(|record| match record {
                     Record::Entries { entries, .. } | Record::Carry { entries, .. } => {
@@ -2379,7 +2435,7 @@ fn replay_segment_checked(
         }
         let mut bytes = vec![0; length as usize];
         file.read_exact(&mut bytes)?;
-        let frame: Frame = decode(&bytes)?;
+        let frame = decode_frame(&bytes)?;
         if frame.sequence
             != scan_sequence
                 .checked_add(1)
@@ -2665,14 +2721,69 @@ impl PendingSnapshot {
 }
 fn serialize_contiguous(frame: &Frame) -> Result<Vec<u8>> {
     let bytes = encode(frame)?;
-    let length = bytes.len() as u64;
-    Ok([length.to_le_bytes().as_slice(), (!length).to_le_bytes().as_slice(), &bytes].concat())
+    serialize_encoded(bytes)
 }
 fn serialize_frame(frame: &Frame) -> Result<SerializedFrame> {
     if let Some(shared) = shared_serialized(frame)? {
+        let mut bytes = Vec::with_capacity(shared.length.saturating_sub(16));
+        bytes.extend_from_slice(&shared.head[16..]);
+        for entry in &shared.entries {
+            let mut at = 0;
+            while at < entry.bytes.len() {
+                let chunk = entry.bytes.chunk(at);
+                if chunk.is_empty() {
+                    return Err(Error::new("empty Raft entry buffer segment"));
+                }
+                bytes.extend_from_slice(chunk);
+                at += chunk.len();
+            }
+        }
+        bytes.extend_from_slice(&shared.tail);
+        let packed = serialize_encoded(bytes)?;
+        if packed.len() < shared.length {
+            return Ok(SerializedFrame::Flat(packed));
+        }
         return Ok(SerializedFrame::Shared(shared));
     }
     Ok(SerializedFrame::Flat(serialize_contiguous(frame)?))
+}
+fn serialize_encoded(mut bytes: Vec<u8>) -> Result<Vec<u8>> {
+    if bytes.len() > LIMIT {
+        return Err(Error::new("Raft persistence frame too large"));
+    }
+    if bytes.len() >= FRAME_ZIP_MIN {
+        let compressed = lz4_flex::compress(&bytes);
+        if FRAME_ZIP_HEAD.checked_add(compressed.len()).is_some_and(|size| size < bytes.len()) {
+            let length = bytes.len() as u64;
+            let mut packed = Vec::with_capacity(FRAME_ZIP_HEAD + compressed.len());
+            packed.extend_from_slice(FRAME_ZIP_MAGIC);
+            packed.extend_from_slice(&length.to_le_bytes());
+            packed.extend_from_slice(&compressed);
+            bytes = packed;
+        }
+    }
+    if bytes.len() > LIMIT {
+        return Err(Error::new("compressed Raft persistence frame too large"));
+    }
+    let length = bytes.len() as u64;
+    Ok([length.to_le_bytes().as_slice(), (!length).to_le_bytes().as_slice(), &bytes].concat())
+}
+fn decode_frame(bytes: &[u8]) -> Result<Frame> {
+    if !bytes.starts_with(FRAME_ZIP_MAGIC) {
+        return decode(bytes);
+    }
+    if bytes.len() < FRAME_ZIP_HEAD {
+        return Err(Error::new("short compressed Raft persistence frame"));
+    }
+    let length = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    if length > LIMIT as u64 {
+        return Err(Error::new("decompressed Raft persistence frame too large"));
+    }
+    let length = usize::try_from(length)
+        .map_err(|_| Error::new("decompressed Raft persistence frame too large"))?;
+    let plain = lz4_flex::decompress(&bytes[FRAME_ZIP_HEAD..], length)
+        .map_err(|error| Error::new(format!("Raft frame decompression failed: {error}")))?;
+    decode(&plain)
 }
 fn shared_serialized(frame: &Frame) -> Result<Option<SharedSerialized>> {
     let (from, entries, commit) = match frame.records.as_slice() {
@@ -2985,7 +3096,7 @@ mod tests {
         let mut actual = Vec::new();
         serialize_frame(&frame).unwrap().write_to(&mut actual).unwrap();
         assert_eq!(actual, serialize_contiguous(&frame).unwrap());
-        let decoded: Frame = decode(&actual[16..]).unwrap();
+        let decoded = decode_frame(&actual[16..]).unwrap();
         match (&decoded.records[..], &frame.records[..]) {
             (
                 [Record::Entries { entries: left, .. }, Record::Commit(left_commit)],

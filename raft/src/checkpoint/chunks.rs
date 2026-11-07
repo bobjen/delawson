@@ -10,12 +10,15 @@ use std::time::Instant;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkPos {
     pub start: u64,
-    pub len: u64,
+    /// Decoded, uncompressed chunk length.
+    pub plain: u64,
+    /// Bytes stored in the checkpoint. Smaller than `plain` when LZ4 helped.
+    pub stored: u64,
     pub first: u64,
     pub span: u64,
     pub items: u64,
 }
-crate::wire_struct!(ChunkPos, CkChunkLoc, {start,len,first,span,items});
+crate::wire_struct!(ChunkPos, CkChunkLoc, {start,plain,stored,first,span,items});
 
 /// Encode chunks on a bounded worker set, reserve each file range after encoding,
 /// then write the bytes positionally. Large bucket ranges split until they fit
@@ -88,26 +91,37 @@ pub fn write_chunks(
                                 todo.push((first, left));
                                 continue;
                             }
-                            let len = u64::try_from(bytes.len())
+                            let plain = u64::try_from(bytes.len())
                                 .map_err(|_| Error::new("checkpoint chunk is too large"))?;
+                            let squeezed = lz4_flex::compress(&bytes);
+                            let stored_bytes = if squeezed.len() < bytes.len() {
+                                squeezed
+                            } else {
+                                bytes
+                            };
+                            let stored = u64::try_from(stored_bytes.len())
+                                .map_err(|_| Error::new("checkpoint chunk is too large"))?;
+                            let saved = plain - stored;
                             let offset = next_offset
                                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                                    old.checked_add(len)
+                                    old.checked_add(stored)
                                 })
                                 .map_err(|_| Error::new("checkpoint file offset overflow"))?;
                             common::logi!(
                                 "Checkpoint chunk ready",
-                                "kind {},worker {},first {},span {},items {},bytes {},offset {},pending {}",
+                                "kind {},worker {},first {},span {},items {},plain {},stored {},saved {},offset {},pending {}",
                                 kind,
                                 worker,
                                 first,
                                 span,
                                 items,
-                                len,
+                                plain,
+                                stored,
+                                saved,
                                 offset,
                                 pending_count.load(Ordering::Relaxed)
                             );
-                            if let Err(error) = write_at_all(file, &bytes, offset) {
+                            if let Err(error) = write_at_all(file, &stored_bytes, offset) {
                                 common::logi!(
                                     "Checkpoint chunk write failed",
                                     "kind {},worker {},first {},span {},offset {},us {},error {}",
@@ -124,13 +138,15 @@ pub fn write_chunks(
                             let left = decrement(pending_count);
                             common::logi!(
                                 "Checkpoint chunk written",
-                                "kind {},worker {},first {},span {},items {},bytes {},offset {},us {},pending {}",
+                                "kind {},worker {},first {},span {},items {},plain {},stored {},saved {},offset {},us {},pending {}",
                                 kind,
                                 worker,
                                 first,
                                 span,
                                 items,
-                                len,
+                                plain,
+                                stored,
+                                saved,
                                 offset,
                                 began.elapsed().as_micros(),
                                 left
@@ -138,7 +154,7 @@ pub fn write_chunks(
                             positions
                                 .lock()
                                 .map_err(|_| Error::new("checkpoint chunk queue poisoned"))?
-                                .push(ChunkPos { start: offset, len, first, span, items });
+                                .push(ChunkPos { start: offset, plain, stored, first, span, items });
                         }
                     }
                     Ok(())
@@ -153,6 +169,27 @@ pub fn write_chunks(
     let mut positions =
         positions.into_inner().map_err(|_| Error::new("checkpoint chunk queue poisoned"))?;
     positions.sort_unstable_by_key(|chunk| chunk.first);
+    let (plain, stored) = positions.iter().try_fold((0u64, 0u64), |(plain, stored), chunk| {
+        let plain = plain
+            .checked_add(chunk.plain)
+            .ok_or_else(|| Error::new("checkpoint plain byte count overflow"))?;
+        let stored = stored
+            .checked_add(chunk.stored)
+            .ok_or_else(|| Error::new("checkpoint stored byte count overflow"))?;
+        Ok::<_, Error>((plain, stored))
+    })?;
+    let saved = plain - stored;
+    let percent = if plain == 0 { 0.0 } else { saved as f64 * 100.0 / plain as f64 };
+    common::logi!(
+        "Checkpoint chunks compressed",
+        "kind {},chunks {},plain {},stored {},saved {},percent {:.1}",
+        kind,
+        positions.len(),
+        plain,
+        stored,
+        saved,
+        percent
+    );
     Ok((positions, next_offset.load(Ordering::Relaxed)))
 }
 
@@ -187,26 +224,45 @@ pub fn read_chunks(
                     let queued = chunks.len().saturating_sub(at + 1);
                     common::logi!(
                         "Checkpoint chunk read",
-                        "kind {},worker {},first {},span {},items {},bytes {},pending {}",
+                        "kind {},worker {},first {},span {},items {},plain {},stored {},pending {}",
                         kind,
                         worker,
                         chunk.first,
                         chunk.span,
                         chunk.items,
-                        chunk.len,
+                        chunk.plain,
+                        chunk.stored,
                         queued
                     );
-                    let len = usize::try_from(chunk.len)
+                    let stored = usize::try_from(chunk.stored)
                         .ok()
-                        .filter(|len| *len <= isize::MAX as usize)
+                        .filter(|stored| *stored <= isize::MAX as usize)
                         .ok_or_else(|| Error::new("checkpoint chunk is too large"))?;
-                    let mut bytes = Vec::new();
-                    bytes
-                        .try_reserve_exact(len)
+                    let plain = usize::try_from(chunk.plain)
+                        .ok()
+                        .filter(|plain| *plain <= isize::MAX as usize)
+                        .ok_or_else(|| Error::new("checkpoint chunk is too large"))?;
+                    if stored == 0 || stored > plain {
+                        return Err(Error::new("invalid checkpoint chunk lengths"));
+                    }
+                    let mut stored_bytes = Vec::new();
+                    stored_bytes
+                        .try_reserve_exact(stored)
                         .map_err(|_| Error::new("checkpoint chunk allocation failed"))?;
-                    bytes.resize(len, 0);
-                    let result = read_at_exact(file, &mut bytes, chunk.start)
-                        .and_then(|()| process(chunk, bytes));
+                    stored_bytes.resize(stored, 0);
+                    let result = read_at_exact(file, &mut stored_bytes, chunk.start).and_then(|()| {
+                        if stored == plain {
+                            process(chunk, stored_bytes)
+                        } else {
+                            let bytes = lz4_flex::decompress(&stored_bytes, plain).map_err(|e| {
+                                Error::new(format!("checkpoint chunk decompression failed: {e}"))
+                            })?;
+                            if bytes.len() != plain {
+                                return Err(Error::new("checkpoint chunk expanded to wrong length"));
+                            }
+                            process(chunk, bytes)
+                        }
+                    });
                     if let Err(error) = result {
                         common::logi!(
                             "Checkpoint chunk read failed",
@@ -222,13 +278,14 @@ pub fn read_chunks(
                     }
                     common::logi!(
                         "Checkpoint chunk loaded",
-                        "kind {},worker {},first {},span {},items {},bytes {},us {},pending {}",
+                        "kind {},worker {},first {},span {},items {},plain {},stored {},us {},pending {}",
                         kind,
                         worker,
                         chunk.first,
                         chunk.span,
                         chunk.items,
-                        chunk.len,
+                        chunk.plain,
+                        chunk.stored,
                         began.elapsed().as_micros(),
                         queued
                     );
@@ -273,4 +330,44 @@ fn read_at_exact(file: &File, mut bytes: &mut [u8], mut offset: u64) -> Result<(
         bytes = &mut bytes[count..];
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_compressed_and_raw_chunks() -> Result<()> {
+        let file = tempfile::tempfile()?;
+        let repeated = vec![0x5a; 4096];
+        let mut state = 0x8d26_7c31u32;
+        let mut random = Vec::with_capacity(4096);
+        for _ in 0..4096 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            random.push(state as u8);
+        }
+        let expected = [repeated, random];
+        let ranges = [(0, 1), (1, 1)];
+        let (chunks, _) = write_chunks(&file, 0, 2, "test", &ranges, 8192, 1, |first, _| {
+            let bytes = expected[first as usize].clone();
+            Ok((1, bytes))
+        })?;
+
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].stored < chunks[0].plain);
+        assert_eq!(chunks[1].stored, chunks[1].plain);
+
+        let actual = Mutex::new(Vec::new());
+        read_chunks(&file, &chunks, 2, "test", |chunk, bytes| {
+            actual.lock().unwrap().push((chunk.first, bytes));
+            Ok(())
+        })?;
+        let mut actual = actual.into_inner().unwrap();
+        actual.sort_unstable_by_key(|(first, _)| *first);
+        assert_eq!(actual[0].1, expected[0]);
+        assert_eq!(actual[1].1, expected[1]);
+        Ok(())
+    }
 }
