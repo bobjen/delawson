@@ -272,7 +272,9 @@ impl<T: LockedItem, const A: usize, const L: usize> LockedPool<T, A, L> {
         }
         for index in 0..self.next {
             if index < prefix && live(index, self.slot(index).cast_const()) {
-                self.set_link(index, T::LINK_NONE);
+                // A live item's inline link field belongs to the item again. It
+                // may be its persistent ID, so preserve the value restored by
+                // the checkpoint writer.
             } else {
                 self.push_free(index);
             }
@@ -526,5 +528,24 @@ mod tests {
         pool.reserve_index(2).unwrap();
         assert!(!pool.can_reserve_index(2));
         assert_eq!(pool.issued_blocks(), 6);
+    }
+
+    #[test]
+    fn restore_preserves_live_link() {
+        let mut pool = TestPool::new(4, 0).unwrap();
+        pool.prepare_restore(2).unwrap();
+        // SAFETY: restore_slot replaces this uniquely owned initialized slot.
+        unsafe {
+            pool.restore_slot(
+                0,
+                TestItem { link: 42, flags: VALID, bytes: [MaybeUninit::uninit(); 8] },
+            )
+        }
+        .unwrap();
+        pool.finish_restore(2, |index, item| index == 0 && unsafe { (*item).flags == VALID })
+            .unwrap();
+
+        assert_eq!(pool.link(0), 42);
+        assert!(pool.can_reserve_index(1));
     }
 }

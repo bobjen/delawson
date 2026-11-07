@@ -416,6 +416,7 @@ fn write_extents(
         file,
         data_start,
         workers,
+        "SN extents",
         &ranges,
         CHUNK_MAX,
         CHUNK_ITEMS as u64,
@@ -548,6 +549,7 @@ fn write_streams(
         file,
         data_start,
         workers,
+        "SN streams",
         &ranges,
         CHUNK_MAX,
         CHUNK_ITEMS as u64,
@@ -881,7 +883,7 @@ fn read_extents(
     }
     let extras = Mutex::new(Vec::new());
     let table = &state.extent_table;
-    raft::checkpoint::read_chunks(&*file, chunks, workers, |chunk, bytes| {
+    raft::checkpoint::read_chunks(&*file, chunks, workers, "SN extents", |chunk, bytes| {
         let chunk_end = chunk
             .first
             .checked_add(chunk.span)
@@ -999,7 +1001,7 @@ fn read_streams(
     let extras = Mutex::new(Vec::new());
     let restored = AtomicU64::new(0);
     let table = &state.stream_map;
-    raft::checkpoint::read_chunks(&*file, chunks, workers, |chunk, bytes| {
+    raft::checkpoint::read_chunks(&*file, chunks, workers, "SN streams", |chunk, bytes| {
         let chunk_end = chunk
             .first
             .checked_add(chunk.span)

@@ -580,22 +580,35 @@ impl StreamTable {
     }
 
     fn finish_restore(&mut self, len: usize) -> common::Result<()> {
-        if len > StreamId::NONE.get() as usize || self.len > len {
+        if len > StreamId::NONE.get() as usize || self.len != len {
             return Err(common::Error::new("invalid restored DN stream table length"));
         }
-        if len != 0 && self.pool.issued_blocks() < len as u32 {
-            let index = len as u32 - 1;
-            self.pool
-                .reserve_index(index)
-                .map_err(|error| common::Error::new(error.to_string()))?;
-            self.len = len;
-            self[index as usize].deletion = Flags::vacant();
-            // Extend the issued range without making the final, unused slot live.
-            unsafe { self.pool.retire_index(index) };
-            self.pool.reclaim();
+        let prefix = u32::try_from(len)
+            .map_err(|_| common::Error::new("restored DN stream table is too large"))?;
+        self.pool
+            .finish_restore(prefix, |index, stream| {
+                // SAFETY: every slot in the restored prefix was initialized before publication.
+                let stream = unsafe { &*stream };
+                stream.id.get() == index && !stream.deletion.retired()
+            })
+            .map_err(|error| common::Error::new(error.to_string()))
+    }
+
+    fn prepare_restore(&mut self, len: usize) -> common::Result<()> {
+        let prefix = u32::try_from(len)
+            .map_err(|_| common::Error::new("restored DN stream table is too large"))?;
+        if len > StreamId::NONE.get() as usize {
+            return Err(common::Error::new("invalid restored DN stream table length"));
         }
+        self.pool.prepare_restore(prefix).map_err(|error| common::Error::new(error.to_string()))?;
         self.len = len;
         Ok(())
+    }
+
+    unsafe fn restore_slot(&self, stream: Stream) -> common::Result<()> {
+        // SAFETY: checkpoint chunks own disjoint IDs and no table reader exists during restore.
+        unsafe { self.pool.restore_slot(stream.id.get(), stream) }
+            .map_err(|error| common::Error::new(error.to_string()))
     }
 }
 
@@ -695,10 +708,39 @@ struct ObjectTable {
 
 impl ObjectTable {
     fn new() -> common::Result<Self> {
+        Self::with_buckets(0)
+    }
+
+    fn with_buckets(buckets: u32) -> common::Result<Self> {
         let chunks = common::message_pool()?;
-        let hash = ObjectHash::new(chunks, ObjectId::NONE.get())
+        let hash = ObjectHash::with_buckets(chunks, ObjectId::NONE.get(), buckets)
             .map_err(|error| common::Error::new(format!("create DN object hash: {error}")))?;
         Ok(Self { hash })
+    }
+
+    fn bucket_count(&self) -> u64 {
+        self.hash.bucket_count()
+    }
+
+    fn for_each_bucket(&self, bucket: u64, visit: impl FnMut(&Object)) {
+        self.hash.for_each_bucket(bucket, visit);
+    }
+
+    fn begin_restore(&mut self, count: usize) -> pool::Result<Vec<u32>> {
+        self.hash.begin_restore(count)
+    }
+
+    unsafe fn restore_bucket_with(
+        &self,
+        bucket: u64,
+        next: impl FnMut() -> pool::Result<Option<(u32, Object)>>,
+    ) -> pool::Result<u64> {
+        // SAFETY: the caller restores disjoint buckets and slots before publishing the table.
+        unsafe { self.hash.restore_bucket_with(bucket, next) }
+    }
+
+    fn finish_restore(&mut self, count: u64) -> pool::Result<()> {
+        self.hash.finish_restore(count)
     }
 
     fn get(&self, name: &str) -> Option<&Object> {
@@ -1198,6 +1240,14 @@ impl DNState {
     fn new() -> common::Result<Self> {
         Ok(Self {
             object_table: ObjectTable::new()?,
+            stream_table: StreamTable::new()
+                .map_err(|error| common::Error::new(format!("create DN stream pool: {error}")))?,
+        })
+    }
+
+    fn with_object_buckets(buckets: u32) -> common::Result<Self> {
+        Ok(Self {
+            object_table: ObjectTable::with_buckets(buckets)?,
             stream_table: StreamTable::new()
                 .map_err(|error| common::Error::new(format!("create DN stream pool: {error}")))?,
         })
@@ -3588,7 +3638,8 @@ impl DN {
         let snapshot_index = journal.state.snapshot.index;
         let snapshot_sequence = journal.checkpoint_sequence();
         let has_dn_ckpt = snapshot_path.exists() && checkpoint::is_dn_ckpt(&snapshot_path)?;
-        let restored = match checkpoint::read_state(&snapshot_path, mine) {
+        let workers = config.raft.checkpoint_workers;
+        let restored = match checkpoint::read_state(&snapshot_path, mine, workers) {
             Ok(saved) => Some(saved),
             Err(_) if snapshot_index == 0 && snapshot_sequence == 0 && !has_dn_ckpt => {
                 let empty = DNState::new()?;
@@ -3606,9 +3657,10 @@ impl DN {
                     &empty,
                     mine,
                     snapshot_sequence,
+                    workers,
                 )?;
                 journal.set_boot_ckpt(second, bytes)?;
-                Some(checkpoint::read_state(&snapshot_path, mine)?)
+                Some(checkpoint::read_state(&snapshot_path, mine, workers)?)
             }
             Err(error) => return Err(error),
         };
@@ -4012,6 +4064,7 @@ impl Host for DN {
         let next_object = self.next_object.load(Ordering::Acquire);
         let next_stream = self.next_stream.load(Ordering::Acquire);
         let sequence = mark.sequence();
+        let workers = self.config.raft.checkpoint_workers;
         Ok(Some(Box::new(move |file| {
             checkpoint::write(
                 file,
@@ -4024,6 +4077,7 @@ impl Host for DN {
                 &stream_extras,
                 sequence,
                 now,
+                workers,
             )
         })))
     }
