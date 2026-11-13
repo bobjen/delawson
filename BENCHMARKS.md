@@ -1760,3 +1760,50 @@ growth by 1 issued fewer additional blocks. This points to the amount of slack
 left by fresh growth as the main difference, rather than the cost of probing
 four buckets before growing. The benchmark was restored to start with zero
 blocks afterward.
+
+
+## ObjectInfo / BatchObjectInfo with SSD-backed Raft persistence, 2026-11-13
+
+Current commit `3f07f06`, release build. Ran the standard 20M-object
+workload from a detached runner under `/var/tmp` on
+`/dev/nvme0n1p2` (NVMe SSD), with 16 clients × depth 16, rich detail flags
+23, create batches of 1,000, then three 5-second trials for each lookup
+workload. Raft journaling and checkpointing were enabled.
+
+For this workload, DN creates the objects and their stream definitions; SN then
+creates the corresponding streams with empty stream lists. No extents are
+created, and EN is not involved. DN and SN write Raft journals and checkpoints
+to SSD. Their metadata is stored in virtual arrays rather than individually
+`malloc`'d objects.
+
+| Workload | Result |
+| --- | ---: |
+| BatchCreate, batch 1,000 | 20M in 28.17 s; 710,062 objects/s |
+| ObjectInfo, batch 1 | 83,808 names/s |
+| BatchObjectInfo, batch 1,000 | 525,641 names/s |
+
+ObjectInfo trials: 83,630, 83,440, and 84,354 names/s (range 83,440–84,354;
+1.1% spread). BatchObjectInfo trials: 519,531, 527,337, and 530,054 names/s
+(range 519,531–530,054; 2.0% spread). All 20M objects were created, and every
+lookup was answered and found. Sample responses were 231 bytes for ObjectInfo
+and 216,053 bytes for BatchObjectInfo, including the four-byte frame; the
+sampled rows contained 1 and 1,000 objects/streams respectively, with no
+extents or instances.
+
+The fresh run directory contained generated persistence files on the SSD:
+12 DN snapshots (641,642,038 bytes) and 12 DN journal files (243,897,658
+bytes); 12 SN snapshots (148,407,339 bytes) and 12 SN journal files
+(106,410,240 bytes); and 3 small KS snapshots plus 3 KS journals. These are
+files remaining after the run, not total bytes written if files were rotated or
+replaced. The detached runner exited 0 after cluster cleanup. Logs and run data:
+`/var/tmp/delawson-object-bench-lanukejp/`.
+
+Repeat, same release commit `3f07f06`, same standard workload, again under `/var/tmp` on `/dev/nvme0n1p2`. Raft journaling and checkpointing were enabled. The detached runner exited 0 after cleanup.
+
+| Workload | First run | Repeat |
+| --- | ---: | ---: |
+| BatchCreate, batch 1,000 | 28.17 s; 710,062 objects/s | 26.86 s; 744,703 objects/s |
+| ObjectInfo, batch 1 (three-trial mean) | 83,808 names/s | 86,651 names/s |
+| BatchObjectInfo, batch 1,000 (three-trial mean) | 525,641 names/s | 534,187 names/s |
+
+Repeat ObjectInfo trials: 86,551, 86,046, and 87,356 names/s (range 86,046–87,356; 1.5% spread). Repeat BatchObjectInfo trials: 536,959, 537,542, and 528,060 names/s (range 528,060–537,542; 1.8% spread). All 20M creates completed and every lookup was answered and found. Across both runs, the six-trial means were 85,230 ObjectInfo names/s and 529,914 BatchObjectInfo names/s. Logs and run data: `/var/tmp/delawson-object-bench-t60796cp/`.
