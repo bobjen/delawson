@@ -1,8 +1,13 @@
 # DeLawson
 
-An open source distributed store, written in Rust. Perhaps for shared AI memory.
-Billing will be by physical storage, proportional to costs. Automatic compression
-and encryption.
+An open source distributed store, designed by Bob Jenkins, written by AI in Rust. 
+Perhaps for shared AI memory. Billing will be by physical storage, proportional 
+to costs. Automatic compression and encryption. Objects can contain up to 2^64 records.
+
+Unfinished. Garbage collection, data/metadata sync, replication, erasure coding,
+user accounts, caching, ring balancing, compute still unimplemented. No hardening 
+done. You can see how I'm doing things, and planning on doing things, but I will 
+keep this single-person development until all the major pieces are in and working.
 
 Named after George DeLawson Lowry (b. 17 January 1880, Hagersville, Ontario;
 d. 1919, Buffalo, New York) — a piano teacher who
@@ -11,13 +16,15 @@ See [his page](https://burtleburtle.net/gene/glowry18800117.html).
 
 ## Status
 
-Early implementation. All five daemons exist — KS, DN, SN, EN, FE — plus the `laws`
+Initial implementation. All five daemons exist — KS, DN, SN, EN, FE — plus the `laws`
 client, the `common` library they share, and a single-box test harness. They have a
-lifecycle, registration, an encrypted and compressed message path, and logging; none
-of them stores anything yet.
+lifecycle, registration, an encrypted and compressed message path, logging. Raft,
+with SSD journals and checkpoints, is implemented. Metadata is in virtual arrays.
+CRUD (well, append not update yet) and concatenate are implemented.
 
 See [DESIGN.md](DESIGN.md) for the architecture, its Open Questions section for
-what is still undecided, and section 17 for what has been built.
+what is still undecided, and section 17 for what has been built. Github issues are
+being used to track bugs I didn't want to address quite yet.
 
 ```sh
 scripts/start-laws              # build debug, start every process in the roster
@@ -35,7 +42,7 @@ laws log-grep "Raft" --path /saved/ks0-member0-0000000.zst
 logs --dir run/DN0/logs --of dn0 grep "an error"   # or read the files directly
 ```
 
-KS holds the only fixed address in a cluster. `start-laws` hands every other process a
+KS0 holds the only fixed address in a cluster. `start-laws` hands every other process a
 port, the process announces it to KS, and everything else is found by name.
 
 Everything sent is encrypted, and compressed, in whole batches rather than per message —
@@ -46,7 +53,7 @@ so a batch of small messages compresses even when nothing in it would on its own
 - **Sequential** — variable-length records, appended only at the end,
   addressed by 64-bit record number.
 - **Keyed** — records ordered by sorted key, insertion permitted in the
-  middle.
+  middle. Not started, will be implemented on top of sequential.
 
 Since it is open source, a storage cluster can run inside a compute cluster, sharing network.
 Indexes are possible, referencing 
@@ -54,7 +61,7 @@ Indexes are possible, referencing
 
 ## The shape of it
 
-A single DeLawson object holds up to 2^64 records. A cluster can have up to 2^32 machines.
+A single DeLawson object holds up to 2^64 records. A cluster can have up to 2^64 machines.
 An object is decomposed through four levels:
 
 ```
@@ -69,17 +76,17 @@ Those levels are split across three node types:
 ```
 DN  Directory Node   directory hierarchy, object metadata, inline tiny objects
 SN  Stream Node      extents per stream, instances per extent, erasure coding
-EN  Extent Node      the bytes on disk
+EN  Extent Node      the bytes on disk, four initial instances of each extent
 ```
 
 Around those sit `FE` (Front End: authorization and coordination), `KS` (Key
-Store: the daily master keys), the `delawson` client (compression, interface,
+Store: the daily master keys), the `laws` client (compression, interface,
 connection to FE), and eventually Compute machines. User code runs only on 
 Compute, and decryption keys never go on machines where user code runs.
 
-The DN tier is self-hosted: directory and object metadata live in DeLawson
+The DN tier will be self-hosted: directory and object metadata live in DeLawson
 keyed objects, reached through a small bootstrap root that is the only state
-stored outside the object hierarchy.
+stored outside the object hierarchy. (Currently it's just another Raft ring.)
 
 ### KS unlock development ceremony
 
