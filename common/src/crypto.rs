@@ -1,4 +1,4 @@
-use crate::ids::{ExtentId, SnId};
+use crate::ids::{DiskId, EnId, ExtentId, SnId};
 use crate::time::TimeSec;
 use crate::{Error, Result};
 use aegis::aegis128x2::Aegis128X2;
@@ -20,6 +20,17 @@ pub fn sn_key(master_key: &[u8; 32], sn_id: SnId, day_start: TimeSec) -> [u8; 32
     info[..8].copy_from_slice(&sn_id.get().to_le_bytes());
     info[8..].copy_from_slice(&day_start.number().to_le_bytes());
     let hk = Hkdf::<Sha256>::new(None, master_key);
+    let mut okm = [0u8; 32];
+    hk.expand(&info, &mut okm).expect("32 bytes is valid for HKDF-SHA256");
+    okm
+}
+
+/// Daily EN key, domain-separated from SN keys and scoped to one EN.
+pub fn en_key(master_key: &[u8; 32], en_id: EnId, epoch: TimeSec) -> [u8; 32] {
+    let mut info = [0u8; 16];
+    info[..8].copy_from_slice(&en_id.get().to_le_bytes());
+    info[8..].copy_from_slice(&epoch.number().to_le_bytes());
+    let hk = Hkdf::<Sha256>::new(Some(b"en-daily-key"), master_key);
     let mut okm = [0u8; 32];
     hk.expand(&info, &mut okm).expect("32 bytes is valid for HKDF-SHA256");
     okm
@@ -58,6 +69,31 @@ pub fn derive_block_secrets(
     let mut nonce = [0u8; 16];
     key.copy_from_slice(&okm[..16]);
     nonce.copy_from_slice(&okm[16..32]);
+    (key, nonce)
+}
+
+/// Derive secrets for one authenticated stage-file batch.
+pub fn derive_stage_secrets(
+    en_daily_key: &[u8; 32],
+    stage_time: TimeSec,
+    en_id: EnId,
+    disk_id: DiskId,
+    stage_id: u16,
+    offset: u32,
+) -> ([u8; 16], [u8; 16]) {
+    let mut info = [0u8; 24];
+    info[..8].copy_from_slice(&stage_time.number().to_le_bytes());
+    info[8..16].copy_from_slice(&en_id.get().to_le_bytes());
+    info[16..18].copy_from_slice(&disk_id.get().to_le_bytes());
+    info[18..20].copy_from_slice(&stage_id.to_le_bytes());
+    info[20..24].copy_from_slice(&offset.to_le_bytes());
+    let hk = Hkdf::<Sha256>::new(Some(b"en-stage-batch"), en_daily_key);
+    let mut okm = [0u8; 32];
+    hk.expand(&info, &mut okm).expect("32 bytes is valid for HKDF-SHA256");
+    let mut key = [0u8; 16];
+    let mut nonce = [0u8; 16];
+    key.copy_from_slice(&okm[..16]);
+    nonce.copy_from_slice(&okm[16..]);
     (key, nonce)
 }
 

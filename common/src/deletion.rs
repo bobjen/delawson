@@ -262,6 +262,10 @@ impl<K: Eq + Hash, R: Default> Extras<K, R> {
     pub fn restore(&mut self, key: K, extra: Extra<R>) -> Option<Extra<R>> {
         self.0.insert(key, extra)
     }
+    /// Remove retained metadata when restoring a later state without EXTRA.
+    pub fn remove(&mut self, key: &K) -> Option<Extra<R>> {
+        self.0.remove(key)
+    }
     /// First soft-delete notification. Retries do not restart retention.
     /// The caller releases child references only when this returns true.
     pub fn soft_delete(

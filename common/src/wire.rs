@@ -367,6 +367,14 @@ ops! {
     DnCkStrChunk = 193, "dn-ck-str-chunk";
     SnCkStrChunk = 194, "sn-ck-str-chunk";
     DnCkObjChunk = 195, "dn-ck-obj-chunk";
+    EnJExtent = 196, "en-journal-extent";
+    EnJAppend = 197, "en-journal-append";
+    EnJDelete = 198, "en-journal-delete";
+    EnJSeal = 199, "en-journal-seal";
+    EnJDurable = 200, "en-journal-durable";
+    WriteDurable = 201, "write-durable";
+    EnMasterKey = 202, "en-master-key";
+    EnKeyResp = 203, "en-key-response";
 }
 
 impl std::fmt::Display for Op {
@@ -1452,6 +1460,49 @@ impl SnKey {
         }
         payload.done()?;
         Ok(SnKey { current, next })
+    }
+}
+
+/// The EN daily key answer. `next` is supplied when a planned key change is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnKey {
+    pub current: [u8; 32],
+    pub next: Option<(TimeSec, [u8; 32])>,
+}
+
+impl EnKey {
+    pub fn write(self) -> Arg {
+        let mut payload = StructWriter::new();
+        payload.bytes(&self.current);
+        payload.flag(self.next.is_some());
+        if let Some((at, key)) = self.next {
+            payload.time_sec(at);
+            payload.bytes(&key);
+        }
+        payload.finish(Op::EnKeyResp)
+    }
+
+    pub fn read(args: &[Arg]) -> Result<EnKey> {
+        let (mut payload, rest) = structure(args, Op::EnKeyResp, "an EN key response")?;
+        let current: [u8; 32] = payload
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::new("EN returned a current key of the wrong size"))?;
+        let next = if payload.flag()? {
+            let at = payload.time_sec()?;
+            let key: [u8; 32] = payload
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::new("EN returned a next key of the wrong size"))?;
+            Some((at, key))
+        } else {
+            None
+        };
+        if !rest.is_empty() {
+            return Err(Error::new("an EN key response has trailing arguments"));
+        }
+        payload.done()?;
+        Ok(EnKey { current, next })
     }
 }
 

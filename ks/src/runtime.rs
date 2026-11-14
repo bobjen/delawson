@@ -434,7 +434,14 @@ impl Host for Ks {
         }
     }
     fn forwardable(&self, op: Op) -> bool {
-        matches!(op, Op::Register | Op::SnMasterKey | Op::RotateMasterKey | Op::RaftMembers)
+        matches!(
+            op,
+            Op::Register
+                | Op::SnMasterKey
+                | Op::EnMasterKey
+                | Op::RotateMasterKey
+                | Op::RaftMembers
+        )
     }
     fn registered_endpoint(&self, name: &str) -> Option<std::net::SocketAddr> {
         self.global_lock.read().registrations.peers.get(name).map(|peer| peer.address)

@@ -648,7 +648,7 @@ fn read_loop<S: Service>(
                 },
                 Op::Register => Peer::from_args(&request.args())
                     .is_ok_and(|peer| auth.permits(input.peer_key(), &peer.identity)),
-                Op::SnMasterKey => process
+                Op::SnMasterKey | Op::EnMasterKey => process
                     .cluster
                     .services_of_kind(ServiceKind::En)
                     .any(|entry| auth.permits(input.peer_key(), &entry.identity)),

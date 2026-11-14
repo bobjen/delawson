@@ -20,6 +20,8 @@
 //! is not evidence about what a durable append costs. What replaces it is a
 //! journal of extent metadata per disk, snapshot and log.
 
+mod journal;
+
 use common::block::Holds;
 use common::config::ENConfig;
 use common::crypto;
@@ -31,7 +33,8 @@ use common::range::{Budget, ExtentCovered, ExtentRange, ExtentStart, Filled, Pie
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::{
-    AppendBlock, AppendPiece, Arg, EnReceipt, Op, Req, Resp, SnKey, Status, StructWriter, structure,
+    AppendBlock, AppendPiece, Arg, EnKey, EnReceipt, Op, Req, Resp, SnKey, Status, StructWriter,
+    structure,
 };
 use common::{Error, Result, logw};
 use std::collections::{BTreeMap, HashMap};
@@ -45,15 +48,17 @@ const SERVES: &[Op] = &[
     Op::WriteAppend,
     Op::ReadExtent,
     Op::ForceSealExtent,
+    Op::WriteDurable,
 ];
 
 /// Cached SN keys, addressed by the exact extent creation second. The exact
 /// time matters because KS may install an emergency key epoch mid-day.
 struct DailyKeyCache {
-    keys: RwLock<BTreeMap<(SnId, TimeSec), CachedSnKey>>,
+    sn_keys: RwLock<BTreeMap<(SnId, TimeSec), CachedKey>>,
+    en_keys: RwLock<BTreeMap<(EnId, TimeSec), CachedKey>>,
 }
 
-struct CachedSnKey {
+struct CachedKey {
     key: [u8; 32],
     /// Exclusive end of the key epoch, or no known end.
     until: Option<TimeSec>,
@@ -61,12 +66,12 @@ struct CachedSnKey {
 
 impl DailyKeyCache {
     fn new() -> Self {
-        Self { keys: RwLock::new(BTreeMap::new()) }
+        Self { sn_keys: RwLock::new(BTreeMap::new()), en_keys: RwLock::new(BTreeMap::new()) }
     }
 
     fn get(&self, process: &Process, sn_id: SnId, ts: TimeSec) -> Result<[u8; 32]> {
         {
-            let keys = self.keys.read().expect("keys");
+            let keys = self.sn_keys.read().expect("SN keys");
             if let Some((_, cached)) = keys.range((sn_id, TimeSec::EPOCH)..=(sn_id, ts)).next_back()
                 && cached.until.is_none_or(|until| ts < until)
             {
@@ -137,10 +142,81 @@ impl DailyKeyCache {
         };
         let until = response.next.map(|(at, _)| at);
         let key = response.current;
-        let mut keys = self.keys.write().expect("keys");
-        keys.insert((sn_id, ts), CachedSnKey { key, until });
+        let mut keys = self.sn_keys.write().expect("SN keys");
+        keys.insert((sn_id, ts), CachedKey { key, until });
         if let Some((at, key)) = response.next {
-            keys.insert((sn_id, at), CachedSnKey { key, until: None });
+            keys.insert((sn_id, at), CachedKey { key, until: None });
+        }
+        Ok(key)
+    }
+
+    fn get_en(&self, process: &Process, en_id: EnId, ts: TimeSec) -> Result<[u8; 32]> {
+        {
+            let keys = self.en_keys.read().expect("EN keys");
+            if let Some((_, cached)) = keys.range((en_id, TimeSec::EPOCH)..=(en_id, ts)).next_back()
+                && cached.until.is_none_or(|until| ts < until)
+            {
+                return Ok(cached.key);
+            }
+        }
+
+        let mut payload = StructWriter::new();
+        payload.en_id(en_id);
+        payload.time_sec(ts);
+        let ask = Req::new(Op::EnMasterKey).structure(payload);
+        let registrar = process.cluster.registrar()?.identity.clone();
+        let key_cell = Arc::new(Mutex::new(None::<EnKey>));
+        let key_cell2 = Arc::clone(&key_cell);
+        let error_cell = Arc::new(Mutex::new(None));
+        let error_cell2 = Arc::clone(&error_cell);
+        let cvar = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let cvar2 = Arc::clone(&cvar);
+
+        process
+            .ask(&registrar, &ask, move |answer| {
+                let mut guard = cvar2.0.lock().expect("cvar");
+                if answer.status == Status::Ok {
+                    match EnKey::read(answer.args()) {
+                        Ok(response) => *key_cell2.lock().expect("key cell") = Some(response),
+                        Err(error) => *error_cell2.lock().expect("error cell") = Some(error),
+                    }
+                } else {
+                    *error_cell2.lock().expect("error cell") =
+                        Some(Error::new(format!("KS returned error: {}", answer.status)));
+                }
+                *guard = true;
+                cvar2.1.notify_one();
+            })
+            .unwrap_or_else(|error| {
+                *error_cell.lock().expect("error cell") = Some(Error::new(error.to_string()));
+                let mut guard = cvar.0.lock().expect("cvar");
+                *guard = true;
+                cvar.1.notify_one();
+            });
+
+        let mut guard = cvar.0.lock().expect("cvar");
+        while !*guard {
+            guard = cvar.1.wait(guard).expect("cvar");
+        }
+        if let Some(error) = error_cell.lock().expect("error cell").take() {
+            return Err(error);
+        }
+        let Some(response) = key_cell.lock().expect("key cell").take() else {
+            #[cfg(test)]
+            {
+                return Ok(crypto::en_key(&crypto::MASTER_KEY, en_id, ts));
+            }
+            #[cfg(not(test))]
+            {
+                return Err(Error::new("KS returned no EN key"));
+            }
+        };
+        let until = response.next.map(|(at, _)| at);
+        let key = response.current;
+        let mut keys = self.en_keys.write().expect("EN keys");
+        keys.insert((en_id, ts), CachedKey { key, until });
+        if let Some((at, key)) = response.next {
+            keys.insert((en_id, at), CachedKey { key, until: None });
         }
         Ok(key)
     }
@@ -220,6 +296,8 @@ struct Append {
     first_record: ERoff,
     /// Metadata in the clear, to avoid expensive decryption during scans.
     holds: Holds,
+    written: bool,
+    quorum: bool,
     /// Independently encrypted blocks in this append. The extent does not index
     /// these yet; reads walk them in order.
     blocks: Vec<Encrypted>,
@@ -229,8 +307,33 @@ struct Encrypted {
     logical: ELoff,
     first_record: ERoff,
     holds: Holds,
-    /// The encrypted bytes (tag + encrypted header + compressed body).
+    crc: u64,
+    framing: Framing,
+    /// Extent-key encrypted body while live in memory. Recovered blocks use stage.
     sealed: Vec<u8>,
+    /// Recovered blocks point into their append's independently encrypted stage range.
+    stage: Option<journal::StageRef>,
+    stage_tag: [u8; 16],
+    stage_ad: Option<Arc<[u8]>>,
+    stage_part: Option<(u32, u32)>,
+}
+
+fn block_ad(
+    logical: ELoff,
+    first_record: ERoff,
+    holds: Holds,
+    crc: u64,
+    framing: Framing,
+) -> Vec<u8> {
+    let mut ad = Vec::with_capacity(33);
+    put_u32(&mut ad, logical.get());
+    put_u32(&mut ad, first_record.get());
+    put_holds(&mut ad, holds);
+    put_u64(&mut ad, crc);
+    let (kind, width) = framing.wire();
+    ad.push(kind);
+    put_u32(&mut ad, width);
+    ad
 }
 
 impl Encrypted {
@@ -252,19 +355,21 @@ impl Encrypted {
             extent_cache.get(daily_cache, process, extent.sn_id, extent.id, extent.created)?;
         let (key, nonce) =
             crypto::derive_block_secrets(&extent_key, logical.number(), first_record.number());
-
-        let (kind, width) = framing.wire();
-        let mut plain = Vec::with_capacity(16 + body.len());
-        plain.extend(crc.to_le_bytes());
-        plain.extend((kind as u32).to_le_bytes());
-        plain.extend(width.to_le_bytes());
-        plain.extend(body);
-
-        let ad = [];
-        let (mut sealed, tag) = crypto::encrypt_block(&key, &nonce, &ad, &plain);
-        sealed.extend(tag);
-
-        Ok(Self { logical, first_record, holds, sealed })
+        let ad = block_ad(logical, first_record, holds, crc, framing);
+        let (mut sealed, tag) = crypto::encrypt_block(&key, &nonce, &ad, body);
+        sealed.extend_from_slice(&tag);
+        Ok(Self {
+            logical,
+            first_record,
+            holds,
+            crc,
+            framing,
+            sealed,
+            stage: None,
+            stage_tag: [0; 16],
+            stage_ad: None,
+            stage_part: None,
+        })
     }
 
     fn decrypt(
@@ -273,36 +378,65 @@ impl Encrypted {
         extent_cache: &ExtentKeyCache,
         process: &Process,
         extent: &Extent,
+        stage: Option<&journal::DiskFiles>,
     ) -> Result<(u64, Framing, Vec<u8>)> {
-        let extent_key =
-            extent_cache.get(daily_cache, process, extent.sn_id, extent.id, extent.created)?;
-        let (key, nonce) = crypto::derive_block_secrets(
-            &extent_key,
-            self.logical.number(),
-            self.first_record.number(),
-        );
-
-        if self.sealed.len() < 16 {
-            return Err(Error::new("stored block too short for tag"));
-        }
-        let (cipher, tag) = self.sealed.split_at(self.sealed.len() - 16);
-        let tag: [u8; 16] = tag.try_into().unwrap();
-        let ad = [];
-        let plain = crypto::decrypt_block(&key, &nonce, &ad, cipher, &tag)?;
-
-        if plain.len() < 16 {
-            return Err(Error::new("decrypted block too short"));
-        }
-        let crc = u64::from_le_bytes(plain[0..8].try_into().unwrap());
-        let kind = u32::from_le_bytes(plain[8..12].try_into().unwrap());
-        let width = u32::from_le_bytes(plain[12..16].try_into().unwrap());
-        let framing = Framing::of_wire(
-            u8::try_from(kind).map_err(|_| Error::new(format!("unknown framing {kind}")))?,
-            width,
-        )?;
-        let body = plain[16..].to_vec();
-
-        Ok((crc, framing, body))
+        let data = if let Some(loc) = self.stage {
+            let stage = stage.ok_or_else(|| Error::new("staging file is unavailable"))?;
+            let (key, nonce) = {
+                let stage_time = stage.stage_time(loc.file)?;
+                let en_key = daily_cache.get_en(process, stage.en_id(), stage_time)?;
+                crypto::derive_stage_secrets(
+                    &en_key,
+                    stage_time,
+                    stage.en_id(),
+                    stage.disk_id(),
+                    loc.file.get(),
+                    loc.offset,
+                )
+            };
+            let cipher = stage.read_stage(loc)?;
+            let ad = self
+                .stage_ad
+                .as_deref()
+                .ok_or_else(|| Error::new("recovered EN append has no stage associated data"))?;
+            let plain = crypto::decrypt_block(&key, &nonce, ad, &cipher, &self.stage_tag)?;
+            if plain.len() < 4 {
+                return Err(Error::new("staged EN append has no body length"));
+            }
+            let body_len = u32::from_le_bytes(plain[..4].try_into().unwrap());
+            if usize::try_from(body_len).ok() != Some(plain.len() - 4) {
+                return Err(Error::new("staged EN append body length mismatch"));
+            }
+            let (rel, len) = self
+                .stage_part
+                .ok_or_else(|| Error::new("recovered EN block has no stage range"))?;
+            let start = 4usize
+                .checked_add(rel as usize)
+                .ok_or_else(|| Error::new("staged EN block offset overflow"))?;
+            let end = start
+                .checked_add(len as usize)
+                .ok_or_else(|| Error::new("staged EN block length overflow"))?;
+            plain
+                .get(start..end)
+                .ok_or_else(|| Error::new("EN block extends past its staged append"))?
+                .to_vec()
+        } else {
+            let extent_key =
+                extent_cache.get(daily_cache, process, extent.sn_id, extent.id, extent.created)?;
+            let (key, nonce) = crypto::derive_block_secrets(
+                &extent_key,
+                self.logical.number(),
+                self.first_record.number(),
+            );
+            if self.sealed.len() < 16 {
+                return Err(Error::new("stored block is shorter than its authentication tag"));
+            }
+            let (cipher, tag) = self.sealed.split_at(self.sealed.len() - 16);
+            let tag: [u8; 16] = tag.try_into().unwrap();
+            let ad = block_ad(self.logical, self.first_record, self.holds, self.crc, self.framing);
+            crypto::decrypt_block(&key, &nonce, &ad, cipher, &tag)?
+        };
+        Ok((self.crc, self.framing, data))
     }
 }
 
@@ -338,9 +472,124 @@ struct Truncated {
     length: ECoff,
 }
 
+fn put_u32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_holds(bytes: &mut Vec<u8>, holds: Holds) {
+    put_u32(bytes, holds.compressed.get());
+    put_u32(bytes, holds.logical.get());
+    put_u32(bytes, holds.records.get());
+}
+
+struct JournalRead<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> JournalRead<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, at: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        let end =
+            self.at.checked_add(len).ok_or_else(|| Error::new("EN journal offset overflow"))?;
+        let bytes = self
+            .bytes
+            .get(self.at..end)
+            .ok_or_else(|| Error::new("truncated EN journal metadata"))?;
+        self.at = end;
+        Ok(bytes)
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn flag(&mut self) -> Result<bool> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(Error::new("invalid flag in EN journal")),
+        }
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn holds(&mut self) -> Result<Holds> {
+        Ok(Holds {
+            compressed: ECoff::new(self.u32()?),
+            logical: ELoff::new(self.u32()?),
+            records: ERoff::new(self.u32()?),
+        })
+    }
+
+    fn done(self) -> Result<()> {
+        if self.at == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(Error::new("trailing bytes in EN journal metadata"))
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExtentState {
+    sn: SnId,
+    id: ExtentId,
+    created: TimeSec,
+    deletion: common::deletion::Flags,
+    sealed: bool,
+    open_record: bool,
+    end: ECoff,
+    logical_end: ELoff,
+    records: ERoff,
+    retain_until: TimeSec,
+}
+
+fn put_extent_state(bytes: &mut Vec<u8>, state: ExtentState) {
+    put_u64(bytes, state.sn.get());
+    put_u32(bytes, state.id.get());
+    put_u64(bytes, state.created.number());
+    bytes.push(state.deletion.bits());
+    bytes.push(u8::from(state.sealed));
+    bytes.push(u8::from(state.open_record));
+    put_u32(bytes, state.end.get());
+    put_u32(bytes, state.logical_end.get());
+    put_u32(bytes, state.records.get());
+    put_u64(bytes, state.retain_until.number());
+}
+
+fn read_extent_state(input: &mut JournalRead<'_>) -> Result<ExtentState> {
+    Ok(ExtentState {
+        sn: SnId::new(input.u64()?),
+        id: ExtentId::new(input.u32()?),
+        created: TimeSec::new(input.u64()?),
+        deletion: common::deletion::Flags::from_bits(input.u8()?)?,
+        sealed: input.flag()?,
+        open_record: input.flag()?,
+        end: ECoff::new(input.u32()?),
+        logical_end: ELoff::new(input.u32()?),
+        records: ERoff::new(input.u32()?),
+        retain_until: TimeSec::new(input.u64()?),
+    })
+}
+
 /// Where an append landed and what it numbered.
 #[derive(Debug, Clone, Copy)]
 struct Landed {
+    #[cfg_attr(not(test), allow(dead_code))]
     offset: ECoff,
     logical: ELoff,
     first_record: ERoff,
@@ -353,6 +602,20 @@ struct Extents {
     extents: Vec<Extent>,
     at: HashMap<(SnId, ExtentId), usize>,
     appends: Vec<Append>,
+    stage: Option<Arc<journal::DiskFiles>>,
+    marks: HashMap<(SnId, ExtentId, TimeSec), Marks>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Mark {
+    logical: ELoff,
+    records: ERoff,
+}
+
+#[derive(Default)]
+struct Marks {
+    written: Mark,
+    durable: Mark,
 }
 
 impl Extents {
@@ -362,7 +625,372 @@ impl Extents {
             extents: Vec::new(),
             at: HashMap::new(),
             appends: Vec::new(),
+            stage: None,
+            marks: HashMap::new(),
         }
+    }
+
+    fn journal_append(
+        &self,
+        daily_cache: &DailyKeyCache,
+        extent_cache: &ExtentKeyCache,
+        process: &Process,
+        sn: SnId,
+        id: ExtentId,
+        landed: Landed,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let place =
+            *self.at.get(&(sn, id)).ok_or_else(|| Error::new("append extent disappeared"))?;
+        let extent = &self.extents[place];
+        let append = self
+            .appends
+            .iter()
+            .rev()
+            .find(|a| {
+                a.extent == place
+                    && a.logical == landed.logical
+                    && a.first_record == landed.first_record
+            })
+            .ok_or_else(|| Error::new("append metadata disappeared"))?;
+        let key = (extent.sn_id, extent.id, extent.created);
+        let retain_until = self.extras.get(&key).map_or(TimeSec::EPOCH, |extra| extra.retain_until);
+
+        let mut metadata = Vec::new();
+        put_extent_state(
+            &mut metadata,
+            ExtentState {
+                sn: extent.sn_id,
+                id: extent.id,
+                created: extent.created,
+                deletion: extent.deletion,
+                sealed: extent.sealed,
+                open_record: extent.open_record,
+                end: extent.end,
+                logical_end: extent.logical_end,
+                records: extent.records,
+                retain_until,
+            },
+        );
+        put_u32(&mut metadata, append.offset.get());
+        put_u32(&mut metadata, append.logical.get());
+        put_u32(&mut metadata, append.first_record.get());
+        put_holds(&mut metadata, append.holds);
+        put_u32(
+            &mut metadata,
+            u32::try_from(append.blocks.len()).map_err(|_| Error::new("too many append blocks"))?,
+        );
+
+        let mut stage = Vec::new();
+        for block in &append.blocks {
+            let (crc, framing, bytes) =
+                block.decrypt(daily_cache, extent_cache, process, extent, self.stage.as_deref())?;
+            let rel = u32::try_from(stage.len())
+                .map_err(|_| Error::new("append stage data exceeds 4 GiB"))?;
+            let len =
+                u32::try_from(bytes.len()).map_err(|_| Error::new("append block exceeds 4 GiB"))?;
+            put_u32(&mut metadata, block.logical.get());
+            put_u32(&mut metadata, block.first_record.get());
+            put_holds(&mut metadata, block.holds);
+            put_u64(&mut metadata, crc);
+            let (kind, width) = framing.wire();
+            metadata.push(kind);
+            put_u32(&mut metadata, width);
+            put_u32(&mut metadata, rel);
+            put_u32(&mut metadata, len);
+            stage.extend_from_slice(&bytes);
+        }
+        Ok((metadata, stage))
+    }
+
+    fn journal_state(&self, sn: SnId, id: ExtentId) -> Result<Vec<u8>> {
+        let place = *self.at.get(&(sn, id)).ok_or_else(|| Error::new("extent disappeared"))?;
+        let extent = &self.extents[place];
+        let key = (extent.sn_id, extent.id, extent.created);
+        let state = ExtentState {
+            sn: extent.sn_id,
+            id: extent.id,
+            created: extent.created,
+            deletion: extent.deletion,
+            sealed: extent.sealed,
+            open_record: extent.open_record,
+            end: extent.end,
+            logical_end: extent.logical_end,
+            records: extent.records,
+            retain_until: self.extras.get(&key).map_or(TimeSec::EPOCH, |extra| extra.retain_until),
+        };
+        let mut metadata = Vec::new();
+        put_extent_state(&mut metadata, state);
+        Ok(metadata)
+    }
+
+    fn apply_state(&mut self, state: ExtentState) -> Result<usize> {
+        let key = (state.sn, state.id, state.created);
+        let place = if let Some(&place) = self.at.get(&(state.sn, state.id)) {
+            if self.extents[place].created != state.created {
+                return Err(Error::new(
+                    "journal repeats an extent ID with a different creation second",
+                ));
+            }
+            place
+        } else {
+            let place = self.extents.len();
+            self.extents.push(Extent {
+                deletion: state.deletion,
+                sn_id: state.sn,
+                id: state.id,
+                created: state.created,
+                sealed: state.sealed,
+                end: state.end,
+                logical_end: state.logical_end,
+                records: state.records,
+                open_record: state.open_record,
+            });
+            self.at.insert((state.sn, state.id), place);
+            place
+        };
+        let extent = &mut self.extents[place];
+        extent.deletion = state.deletion;
+        extent.sealed = state.sealed;
+        extent.end = state.end;
+        extent.logical_end = state.logical_end;
+        extent.records = state.records;
+        extent.open_record = state.open_record;
+        if state.deletion.extra() {
+            self.extras.restore(
+                key,
+                common::deletion::Extra { retain_until: state.retain_until, references: () },
+            );
+        } else {
+            self.extras.remove(&key);
+        }
+        self.marks.entry(key).or_default();
+        Ok(place)
+    }
+
+    fn advance(&self, place: usize, written: bool) -> Result<Mark> {
+        let extent = &self.extents[place];
+        let key = (extent.sn_id, extent.id, extent.created);
+        let mut mark = self
+            .marks
+            .get(&key)
+            .map_or(Mark::default(), |marks| if written { marks.written } else { marks.durable });
+        loop {
+            let Some(append) = self.appends.iter().find(|append| {
+                append.extent == place
+                    && append.logical == mark.logical
+                    && append.first_record == mark.records
+                    && if written { append.written } else { append.quorum }
+            }) else {
+                break;
+            };
+            let next = Mark {
+                logical: append.logical.plus(append.holds.logical)?,
+                records: append.first_record.plus(append.holds.records)?,
+            };
+            if next == mark {
+                return Err(Error::new("EN append does not advance its watermark"));
+            }
+            mark = next;
+        }
+        Ok(mark)
+    }
+
+    fn mark_written(
+        &mut self,
+        sn: SnId,
+        id: ExtentId,
+        created: TimeSec,
+        logical: ELoff,
+        first_record: ERoff,
+    ) -> Result<()> {
+        let place = *self
+            .at
+            .get(&(sn, id))
+            .ok_or_else(|| Error::new("written append extent disappeared"))?;
+        if self.extents[place].created != created {
+            return Err(Error::new("written append has the wrong creation second"));
+        }
+        let append = self
+            .appends
+            .iter_mut()
+            .find(|append| {
+                append.extent == place
+                    && append.logical == logical
+                    && append.first_record == first_record
+            })
+            .ok_or_else(|| Error::new("written append metadata disappeared"))?;
+        append.written = true;
+        let next = self.advance(place, true)?;
+        self.marks.entry((sn, id, created)).or_default().written = next;
+        Ok(())
+    }
+
+    fn mark_quorum(
+        &mut self,
+        sn: SnId,
+        id: ExtentId,
+        created: TimeSec,
+        logical: ELoff,
+        first_record: ERoff,
+    ) -> Result<Option<Mark>> {
+        let place = *self
+            .at
+            .get(&(sn, id))
+            .ok_or_else(|| Error::new("durable append extent disappeared"))?;
+        if self.extents[place].created != created {
+            return Err(Error::new("durable append has the wrong creation second"));
+        }
+        let append = self
+            .appends
+            .iter_mut()
+            .find(|append| {
+                append.extent == place
+                    && append.logical == logical
+                    && append.first_record == first_record
+            })
+            .ok_or_else(|| Error::new("durable append metadata disappeared"))?;
+        append.quorum = true;
+        let old = self.marks.entry((sn, id, created)).or_default().durable;
+        let next = self.advance(place, false)?;
+        self.marks.entry((sn, id, created)).or_default().durable = next;
+        Ok((next > old).then_some(next))
+    }
+
+    fn apply_durable(
+        &mut self,
+        sn: SnId,
+        id: ExtentId,
+        created: TimeSec,
+        mark: Mark,
+    ) -> Result<()> {
+        let current = self.marks.entry((sn, id, created)).or_default();
+        current.durable = current.durable.max(mark);
+        let durable = current.durable;
+        if let Some(&place) = self.at.get(&(sn, id)) {
+            for append in self.appends.iter_mut().filter(|append| append.extent == place) {
+                let end = Mark {
+                    logical: append.logical.plus(append.holds.logical)?,
+                    records: append.first_record.plus(append.holds.records)?,
+                };
+                if end <= durable {
+                    append.quorum = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn encode_durable(sn: SnId, id: ExtentId, created: TimeSec, mark: Mark) -> Vec<u8> {
+        let mut metadata = Vec::new();
+        put_u64(&mut metadata, sn.get());
+        put_u32(&mut metadata, id.get());
+        put_u64(&mut metadata, created.number());
+        put_u32(&mut metadata, mark.logical.get());
+        put_u32(&mut metadata, mark.records.get());
+        metadata
+    }
+
+    fn restore_durable(&mut self, record: journal::Record) -> Result<()> {
+        let mut input = JournalRead::new(&record.metadata);
+        let sn = SnId::new(input.u64()?);
+        let id = ExtentId::new(input.u32()?);
+        let created = TimeSec::new(input.u64()?);
+        let mark = Mark { logical: ELoff::new(input.u32()?), records: ERoff::new(input.u32()?) };
+        input.done()?;
+        common::scn::merge(record.scn)?;
+        self.apply_durable(sn, id, created, mark)?;
+        Ok(())
+    }
+
+    fn restore_state(&mut self, record: journal::Record) -> Result<()> {
+        let mut input = JournalRead::new(&record.metadata);
+        let state = read_extent_state(&mut input)?;
+        input.done()?;
+        common::scn::merge(record.scn)?;
+        let place = self.apply_state(state)?;
+        if record.op == Op::EnJDelete && state.deletion.retired() {
+            self.appends.retain(|append| append.extent != place);
+        }
+        Ok(())
+    }
+
+    fn restore_append(&mut self, record: journal::Record) -> Result<()> {
+        let mut input = JournalRead::new(&record.metadata);
+        let state = read_extent_state(&mut input)?;
+        let offset = ECoff::new(input.u32()?);
+        let logical = ELoff::new(input.u32()?);
+        let first_record = ERoff::new(input.u32()?);
+        let holds = input.holds()?;
+        let count = input.u32()? as usize;
+        let stage_body_len = record
+            .stage
+            .len
+            .checked_sub(4)
+            .ok_or_else(|| Error::new("EN append stage range lacks its length prefix"))?;
+        let stage_ad: Arc<[u8]> = Arc::from(record.metadata.clone());
+        let mut blocks = Vec::with_capacity(count);
+        for _ in 0..count {
+            let logical = ELoff::new(input.u32()?);
+            let first_record = ERoff::new(input.u32()?);
+            let holds = input.holds()?;
+            let crc = input.u64()?;
+            let kind = input.u8()?;
+            let width = input.u32()?;
+            let framing = Framing::of_wire(kind, width)?;
+            let rel = input.u32()?;
+            let len = input.u32()?;
+            let end = u64::from(rel) + u64::from(len);
+            if end > u64::from(stage_body_len) {
+                return Err(Error::new("append block extends past its stage range"));
+            }
+            blocks.push(Encrypted {
+                logical,
+                first_record,
+                holds,
+                crc,
+                framing,
+                sealed: Vec::new(),
+                stage: Some(record.stage),
+                stage_tag: record.stage_tag,
+                stage_ad: Some(Arc::clone(&stage_ad)),
+                stage_part: Some((rel, len)),
+            });
+        }
+        input.done()?;
+        common::scn::merge(record.scn)?;
+        let place = self.apply_state(state)?;
+        if state.deletion.retired() {
+            return Err(Error::new("journal appends to a retired EN extent"));
+        }
+        self.appends.retain(|a| {
+            !(a.extent == place && a.logical == logical && a.first_record == first_record)
+        });
+        self.appends.push(Append {
+            extent: place,
+            offset,
+            logical,
+            first_record,
+            holds,
+            written: record.written,
+            quorum: false,
+            blocks,
+        });
+        let append = self.appends.last().expect("recovered append");
+        let end = Mark {
+            logical: append.logical.plus(append.holds.logical)?,
+            records: append.first_record.plus(append.holds.records)?,
+        };
+        if let Some(mark) = self.marks.get(&(state.sn, state.id, state.created))
+            && end <= mark.durable
+        {
+            self.appends.last_mut().expect("recovered append").quorum = true;
+        }
+        let key = (state.sn, state.id, state.created);
+        let written = self.advance(place, true)?;
+        self.marks.entry(key).or_default().written = written;
+        let durable = self.advance(place, false)?;
+        self.marks.entry(key).or_default().durable = durable;
+        Ok(())
     }
 
     fn delete_instance(
@@ -464,6 +1092,7 @@ impl Extents {
         extent_cache: &ExtentKeyCache,
         process: &Process,
         extent: &Extent,
+        stage: Option<&journal::DiskFiles>,
     ) -> Result<()> {
         let single;
         let pieces = if appending.pieces.is_empty() {
@@ -480,7 +1109,8 @@ impl Extents {
             return Err(Error::new("retry conflicts with existing append"));
         }
         for (old, new) in existing.blocks.iter().zip(pieces) {
-            let (crc, framing, bytes) = old.decrypt(daily_cache, extent_cache, process, extent)?;
+            let (crc, framing, bytes) =
+                old.decrypt(daily_cache, extent_cache, process, extent, stage)?;
             if old.holds != new.holds
                 || crc != new.crc
                 || framing != appending.framing
@@ -499,6 +1129,7 @@ impl Extents {
         process: &Process,
         appending: &AppendBlock,
         cap: ECoff,
+        stage: Option<&journal::DiskFiles>,
     ) -> Result<Took> {
         let logical_size = appending.holds.logical;
         let place = self.place(appending.sn, appending.extent, appending.created)?;
@@ -536,6 +1167,7 @@ impl Extents {
                         extent_cache,
                         process,
                         extent,
+                        stage,
                     )?;
                     return Ok(Took::Landed(Landed {
                         offset: existing.offset,
@@ -615,6 +1247,8 @@ impl Extents {
             logical: logical_offset,
             first_record,
             holds: appending.holds,
+            written: false,
+            quorum: false,
             blocks: encrypted,
         };
         self.appends.push(append);
@@ -628,6 +1262,7 @@ impl Extents {
         extent_cache: &ExtentKeyCache,
         process: &Process,
         appending: &AppendBlock,
+        stage: Option<&journal::DiskFiles>,
     ) -> Result<Written> {
         let logical_size = appending.holds.logical;
         let place = self.place(appending.sn, appending.extent, appending.created)?;
@@ -657,6 +1292,7 @@ impl Extents {
                 extent_cache,
                 process,
                 &self.extents[place],
+                stage,
             )?;
             return Ok(Written::Already);
         }
@@ -723,9 +1359,19 @@ impl Extents {
             logical: logical_offset,
             first_record,
             holds: appending.holds,
+            written: false,
+            quorum: false,
             blocks: encrypted,
         };
         self.appends.push(append);
+        let key = (appending.sn, appending.extent, appending.created);
+        let end = Mark {
+            logical: logical_offset.plus(appending.holds.logical)?,
+            records: first_record.plus(appending.holds.records)?,
+        };
+        if self.marks.get(&key).is_some_and(|marks| end <= marks.durable) {
+            self.appends.last_mut().expect("stored append").quorum = true;
+        }
 
         Ok(Written::Stored)
     }
@@ -820,8 +1466,13 @@ impl Extents {
         let mut pieces: Vec<Piece> = Vec::new();
         'append: for append in &blocks[first..] {
             for block in &append.blocks {
-                let (crc, _framing, plain_bytes) =
-                    block.decrypt(daily_cache, extent_cache, process, extent)?;
+                let (crc, _framing, plain_bytes) = block.decrypt(
+                    daily_cache,
+                    extent_cache,
+                    process,
+                    extent,
+                    self.stage.as_deref(),
+                )?;
                 covered.took(block.holds.records, block.holds.logical, block.holds.compressed);
                 pieces.push(Piece {
                     logical: block.holds.logical,
@@ -883,8 +1534,13 @@ impl Extents {
             if remaining == 0 {
                 break;
             }
-            let (crc, framing, bytes) =
-                block.decrypt(daily_cache, extent_cache, process, &self.extents[place])?;
+            let (crc, framing, bytes) = block.decrypt(
+                daily_cache,
+                extent_cache,
+                process,
+                &self.extents[place],
+                self.stage.as_deref(),
+            )?;
             if framing != Framing::Length {
                 return Err(Error::new("payload seek requires length-framed storage"));
             }
@@ -931,15 +1587,39 @@ impl Extents {
             .iter()
             .flat_map(|append| {
                 append.blocks.iter().flat_map(|block| {
-                    block.decrypt(daily_cache, extent_cache, process, extent).unwrap().2.into_iter()
+                    block
+                        .decrypt(daily_cache, extent_cache, process, extent, self.stage.as_deref())
+                        .unwrap()
+                        .2
+                        .into_iter()
                 })
             })
             .collect()
     }
 }
 
+fn durable_request(
+    en: EnId,
+    disk: DiskId,
+    sn: SnId,
+    extent: ExtentId,
+    created: TimeSec,
+    mark: Mark,
+) -> Req {
+    let mut payload = StructWriter::new();
+    payload.en_id(en);
+    payload.disk_id(disk);
+    payload.sn_id(sn);
+    payload.extent_id(extent);
+    payload.time_sec(created);
+    payload.eloff(mark.logical);
+    payload.eroff(mark.records);
+    Req::new(Op::WriteDurable).structure(payload)
+}
+
 struct Disk {
     held: Mutex<Extents>,
+    storage: RwLock<Option<Arc<journal::DiskFiles>>>,
     waiting: Mutex<Waiting>,
     appends: AtomicU64,
     bytes: AtomicU64,
@@ -954,6 +1634,7 @@ impl Disk {
     fn new(daily_cache: Arc<DailyKeyCache>) -> Disk {
         Disk {
             held: Mutex::new(Extents::new()),
+            storage: RwLock::new(None),
             waiting: Mutex::new(HashMap::new()),
             appends: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
@@ -965,8 +1646,227 @@ impl Disk {
         }
     }
 
-    fn append(
+    fn recover(&self, process: &Arc<Process>, disk: DiskId) -> Result<()> {
+        let en = EnId::new(process.entry.number());
+        let directory = process.config.data_dir.join(format!("disk-{disk}"));
+        let key_process = Arc::clone(process);
+        let daily_cache = Arc::clone(&self.daily_cache);
+        let key_lookup: journal::KeyLookup =
+            Arc::new(move |ts| daily_cache.get_en(&key_process, en, ts));
+        let (storage, records) = journal::DiskFiles::open(&directory, en, disk, key_lookup)?;
+        {
+            let mut held = self.held.lock().expect("extents");
+            held.stage = Some(Arc::clone(&storage));
+            for record in records {
+                match record.op {
+                    Op::EnJAppend => held.restore_append(record)?,
+                    Op::EnJExtent | Op::EnJDelete | Op::EnJSeal => held.restore_state(record)?,
+                    Op::EnJDurable => held.restore_durable(record)?,
+                    op => return Err(Error::new(format!("unsupported EN journal operation {op}"))),
+                }
+            }
+            let appends = held.appends.len() as u64;
+            self.appends.store(appends, Ordering::Relaxed);
+            self.sealed.store(
+                held.extents.iter().filter(|extent| extent.sealed).count() as u64,
+                Ordering::Relaxed,
+            );
+        }
+        *self.storage.write().expect("disk storage") = Some(storage);
+        Ok(())
+    }
+
+    fn persist_record(
         &self,
+        op: Op,
+        event: Option<(Vec<u8>, Vec<u8>)>,
+        done: impl FnOnce(Result<()>) + Send + 'static,
+    ) {
+        let Some(storage) = self.storage.read().expect("disk storage").clone() else {
+            done(Ok(()));
+            return;
+        };
+        let Some((metadata, stage)) = event else {
+            done(Err(Error::new("missing EN journal event")));
+            return;
+        };
+        let scn = match common::scn::next() {
+            Ok(scn) => scn,
+            Err(error) => {
+                done(Err(error));
+                return;
+            }
+        };
+        if let Err(error) = storage.submit(scn, op, metadata, stage, done) {
+            logw!("could not queue EN journal record", "{error}");
+        }
+    }
+
+    fn persist_durable(
+        self: &Arc<Self>,
+        process: &Arc<Process>,
+        peers: Vec<(EnId, DiskId)>,
+        sn: SnId,
+        id: ExtentId,
+        created: TimeSec,
+        mark: Mark,
+    ) {
+        let metadata = Extents::encode_durable(sn, id, created, mark);
+        let process = Arc::clone(process);
+        self.persist_record(Op::EnJDurable, Some((metadata, Vec::new())), move |result| {
+            if let Err(error) = result {
+                logw!("local EN durable marker was not persisted", "{}", error);
+                return;
+            }
+            for (en, disk) in peers {
+                let request = durable_request(en, disk, sn, id, created, mark);
+                let identity = format!("EN{en}");
+                let target = identity.clone();
+                if let Err(error) = process.ask(&identity, &request, move |answer| {
+                    if answer.status != Status::Ok {
+                        logw!("EN durable marker was rejected", "en {target},{}", answer.status);
+                    }
+                }) {
+                    logw!("could not send EN durable marker", "en {identity},{error}");
+                }
+            }
+        });
+    }
+
+    fn durable_wait(&self, sn: SnId, id: ExtentId, created: TimeSec, mark: Mark, reply: Reply) {
+        let metadata = Extents::encode_durable(sn, id, created, mark);
+        self.persist_record(
+            Op::EnJDurable,
+            Some((metadata, Vec::new())),
+            move |result| match result {
+                Ok(()) => reply.send(Resp::ok()),
+                Err(error) => {
+                    logw!("remote EN durable marker was not persisted", "{}", error);
+                    reply.send(Resp::error(Status::Internal, error.to_string()));
+                }
+            },
+        );
+    }
+
+    fn delete_wait(
+        self: &Arc<Self>,
+        sn: SnId,
+        extent: ExtentId,
+        created: TimeSec,
+        retention: Option<common::time::TimeIntSec64>,
+        hard: bool,
+        maximum: common::time::TimeIntSec64,
+        reply: Reply,
+    ) {
+        let storage = self.storage.read().expect("disk storage").clone();
+        let event = {
+            let mut held = self.held.lock().expect("extents");
+            match held.delete_instance(sn, extent, created, retention, hard, maximum) {
+                Err(error) => {
+                    reply.send(bad(error));
+                    return;
+                }
+                Ok(()) if storage.is_some() => match held.journal_state(sn, extent) {
+                    Ok(metadata) => Some((metadata, Vec::new())),
+                    Err(error) => {
+                        reply.send(bad(error));
+                        return;
+                    }
+                },
+                Ok(()) => None,
+            }
+        };
+
+        let disk = Arc::clone(self);
+        self.persist_record(Op::EnJDelete, event, move |result| match result {
+            Ok(()) => {
+                let mut queued = disk.pending_fixed.lock().expect("queue");
+                let keys: Vec<_> = queued
+                    .keys()
+                    .filter(|(s, e, _, _)| *s == sn && *e == extent)
+                    .copied()
+                    .collect();
+                for key in keys {
+                    if let Some((_, waiting)) = queued.remove(&key) {
+                        waiting.send(bad("extent was deleted"));
+                    }
+                }
+                drop(queued);
+                for pending in
+                    disk.waiting.lock().expect("waiting").remove(&(sn, extent)).unwrap_or_default()
+                {
+                    pending.lost();
+                }
+                reply.send(Resp::ok());
+            }
+            Err(error) => {
+                logw!("EN deletion was not durable", "{}", error);
+                reply.send(Resp::error(Status::Internal, error.to_string()));
+            }
+        });
+    }
+
+    fn seal_wait(self: &Arc<Self>, sn: SnId, extent: ExtentId, created: TimeSec, reply: Reply) {
+        let storage = self.storage.read().expect("disk storage").clone();
+        let sealed: Result<(Filled, bool, Option<(Vec<u8>, Vec<u8>)>)> = {
+            let mut held = self.held.lock().expect("extents");
+            let Some(&place) = held.at.get(&(sn, extent)) else {
+                reply.send(bad(format!("no extent {extent} of sn {sn}")));
+                return;
+            };
+            let current = &mut held.extents[place];
+            if current.created != created {
+                reply.send(bad("force-seal extent has the wrong creation second"));
+                return;
+            }
+            if !current.deletion.readable(false) {
+                reply.send(bad("extent is deleted"));
+                return;
+            }
+            let closing = !current.sealed;
+            current.sealed = true;
+            let filled = Filled {
+                records: current.records,
+                logical: current.logical_end,
+                compressed: current.end,
+            };
+            let event = if storage.is_some() {
+                match held.journal_state(sn, extent) {
+                    Ok(metadata) => Some((metadata, Vec::new())),
+                    Err(error) => {
+                        reply.send(bad(error));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            Ok((filled, closing, event))
+        };
+        let (filled, closing, event) = match sealed {
+            Ok(value) => value,
+            Err(error) => {
+                reply.send(bad(error));
+                return;
+            }
+        };
+        let disk = Arc::clone(self);
+        self.persist_record(Op::EnJSeal, event, move |result| match result {
+            Ok(()) => {
+                if closing {
+                    disk.sealed.fetch_add(1, Ordering::Relaxed);
+                }
+                reply.send(Resp::from_args(Status::Ok, filled.args()).id(0));
+            }
+            Err(error) => {
+                logw!("EN seal was not durable", "{}", error);
+                reply.send(Resp::error(Status::Internal, error.to_string()));
+            }
+        });
+    }
+
+    fn append(
+        self: &Arc<Self>,
         process: &Arc<Process>,
         mine: (EnId, DiskId),
         appending: AppendBlock,
@@ -1017,32 +1917,8 @@ impl Disk {
         Ok(())
     }
 
-    fn force_seal(&self, sn: SnId, extent: ExtentId, created: TimeSec) -> Result<Filled> {
-        let mut held = self.held.lock().expect("extents");
-        let place = *held
-            .at
-            .get(&(sn, extent))
-            .ok_or_else(|| Error::new(format!("no extent {extent} of sn {sn}")))?;
-        let current = &mut held.extents[place];
-        if current.created != created {
-            return Err(Error::new("force-seal extent has the wrong creation second"));
-        }
-        if !current.deletion.readable(false) {
-            return Err(Error::new("extent is deleted"));
-        }
-        if !current.sealed {
-            current.sealed = true;
-            self.sealed.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(Filled {
-            records: current.records,
-            logical: current.logical_end,
-            compressed: current.end,
-        })
-    }
-
     fn try_append(
-        &self,
+        self: &Arc<Self>,
         process: &Arc<Process>,
         mine: (EnId, DiskId),
         appending: AppendBlock,
@@ -1057,14 +1933,58 @@ impl Disk {
         };
 
         let cap = ECoff::new(process.cluster.extents.seal_bytes);
-        let took = self.held.lock().expect("extents").take(
-            &self.daily_cache,
-            &self.extent_cache,
-            process,
-            &appending,
-            cap,
-        );
-        let took = match took {
+        let storage = self.storage.read().expect("disk storage").clone();
+        // Capture the journal event while the same lock still protects the state
+        // transition. A later append must not leak into this record's extent totals.
+        let captured = {
+            let mut held = self.held.lock().expect("extents");
+            match held.take(
+                &self.daily_cache,
+                &self.extent_cache,
+                process,
+                &appending,
+                cap,
+                storage.as_deref(),
+            ) {
+                Ok(took) => {
+                    let event = match (&took, storage.is_some()) {
+                        (Took::Landed(landed), true) => {
+                            match held.journal_append(
+                                &self.daily_cache,
+                                &self.extent_cache,
+                                process,
+                                appending.sn,
+                                appending.extent,
+                                *landed,
+                            ) {
+                                Ok(event) => Some(event),
+                                Err(error) => {
+                                    return {
+                                        reply.send(bad(error));
+                                        Ok(())
+                                    };
+                                }
+                            }
+                        }
+                        (Took::Sealed { .. }, true) => {
+                            match held.journal_state(appending.sn, appending.extent) {
+                                Ok(metadata) => Some((metadata, Vec::new())),
+                                Err(error) => {
+                                    return {
+                                        reply.send(bad(error));
+                                        Ok(())
+                                    };
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
+                    Ok((took, event))
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let (took, event) = match captured {
             Ok(value) => value,
             Err(error) => {
                 reply.send(bad(error));
@@ -1090,9 +2010,6 @@ impl Disk {
                 return Ok(());
             }
             Took::Sealed { came_to, closing } => {
-                if closing {
-                    self.sealed.fetch_add(1, Ordering::Relaxed);
-                }
                 reply.about(format_args!(
                     "extent {} of sn {},records {},logical {},bytes {}",
                     appending.extent,
@@ -1101,7 +2018,19 @@ impl Disk {
                     came_to.logical,
                     came_to.compressed
                 ));
-                reply.send(Resp::from_args(Status::Sealed, came_to.args()).id(0));
+                let disk = Arc::clone(self);
+                self.persist_record(Op::EnJSeal, event, move |result| match result {
+                    Ok(()) => {
+                        if closing {
+                            disk.sealed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        reply.send(Resp::from_args(Status::Sealed, came_to.args()).id(0));
+                    }
+                    Err(error) => {
+                        logw!("EN seal was not durable", "{}", error);
+                        reply.send(Resp::error(Status::Internal, error.to_string()));
+                    }
+                });
                 return Ok(());
             }
         };
@@ -1127,7 +2056,38 @@ impl Disk {
         ];
 
         let quorum_wants = process.cluster.extents.quorum;
-        let pending = Arc::new(Pending::new(receipt, quorum_wants, reply));
+        let sn = appending.sn;
+        let extent = appending.extent;
+        let created = appending.created;
+        let logical = landed.logical;
+        let first_record = landed.first_record;
+        let quorum_disk = Arc::clone(self);
+        let after_quorum: QuorumHook = Box::new(move || {
+            let result = quorum_disk.held.lock().expect("extents").mark_quorum(
+                sn,
+                extent,
+                created,
+                logical,
+                first_record,
+            );
+            match result {
+                Ok(mark) => mark,
+                Err(error) => {
+                    logw!("could not advance EN durable watermark", "{}", error);
+                    None
+                }
+            }
+        });
+        let marker_disk = Arc::clone(self);
+        let marker_process = Arc::clone(process);
+        let peers = others.clone();
+        let after_reply: ReplyHook = Box::new(move |mark| {
+            if let Some(mark) = mark {
+                marker_disk.persist_durable(&marker_process, peers, sn, extent, created, mark);
+            }
+        });
+        let pending =
+            Arc::new(Pending::new(receipt, quorum_wants, reply, after_quorum, after_reply));
         match landed.records == ERoff::ZERO {
             true => {
                 let mut waiting = self.waiting.lock().expect("waiting");
@@ -1148,6 +2108,31 @@ impl Disk {
             }
         }
         let quorum = Arc::new(Quorum::new(others.len(), quorum_wants, pending));
+        let local = Arc::clone(&quorum);
+        let local_disk = Arc::clone(self);
+        let local_key = (sn, extent, created, logical, first_record);
+        self.persist_record(Op::EnJAppend, event, move |result| {
+            let written = match result {
+                Ok(()) => match local_disk.held.lock().expect("extents").mark_written(
+                    local_key.0,
+                    local_key.1,
+                    local_key.2,
+                    local_key.3,
+                    local_key.4,
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        logw!("could not advance EN written watermark", "{}", error);
+                        false
+                    }
+                },
+                Err(error) => {
+                    logw!("local EN append was not durable", "{}", error);
+                    false
+                }
+            };
+            local.local_written(written);
+        });
 
         let mut onward = appending.clone();
         onward.instances = Vec::new();
@@ -1200,6 +2185,7 @@ impl Disk {
             process,
             appending,
             cap,
+            None,
         )?;
         if let Took::Landed(_) = &took {
             self.appends.fetch_add(1, Ordering::Relaxed);
@@ -1216,15 +2202,18 @@ impl Disk {
         }
     }
 
+    #[cfg(test)]
     fn write_append(&self, process: &Process, appending: AppendBlock) -> Resp {
         if let Err(error) = Self::check_size(&appending, process.cluster.extents.max_append_bytes) {
             return bad(error);
         }
+        let storage = self.storage.read().expect("disk storage").clone();
         match self.held.lock().expect("extents").write_append(
             &self.daily_cache,
             &self.extent_cache,
             process,
             &appending,
+            storage.as_deref(),
         ) {
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             Ok(Written::Already) => return Resp::ok(),
@@ -1236,6 +2225,116 @@ impl Disk {
             self.finish(appending.sn, appending.extent);
         }
         Resp::ok()
+    }
+
+    fn write_wait(self: &Arc<Self>, process: &Process, appending: AppendBlock, reply: Reply) {
+        if let Err(error) = Self::check_size(&appending, process.cluster.extents.max_append_bytes) {
+            reply.send(bad(error));
+            return;
+        }
+        let logical = match appending.logical_offset {
+            Some(value) => value,
+            None => {
+                reply.send(bad("write-append lacks logical offset"));
+                return;
+            }
+        };
+        let first_record = match appending.record_offset {
+            Some(value) => value,
+            None => {
+                reply.send(bad("write-append lacks record offset"));
+                return;
+            }
+        };
+        let sn = appending.sn;
+        let extent = appending.extent;
+        let created = appending.created;
+        let storage = self.storage.read().expect("disk storage").clone();
+        let captured = {
+            let mut held = self.held.lock().expect("extents");
+            match held.write_append(
+                &self.daily_cache,
+                &self.extent_cache,
+                process,
+                &appending,
+                storage.as_deref(),
+            ) {
+                Err(error) => Err(error),
+                Ok(written) => {
+                    let event = if storage.is_some() {
+                        let place = match held.at.get(&(appending.sn, appending.extent)) {
+                            Some(place) => *place,
+                            None => return reply.send(bad("written extent disappeared")),
+                        };
+                        let Some(append) = held.appends.iter().rev().find(|append| {
+                            append.extent == place
+                                && append.logical == logical
+                                && append.first_record == first_record
+                        }) else {
+                            return reply.send(bad("written append disappeared"));
+                        };
+                        let landed = Landed {
+                            offset: append.offset,
+                            logical: append.logical,
+                            first_record: append.first_record,
+                            records: append.holds.records,
+                        };
+                        match held.journal_append(
+                            &self.daily_cache,
+                            &self.extent_cache,
+                            process,
+                            appending.sn,
+                            appending.extent,
+                            landed,
+                        ) {
+                            Ok(event) => Some(event),
+                            Err(error) => return reply.send(bad(error)),
+                        }
+                    } else {
+                        None
+                    };
+                    Ok((written, event))
+                }
+            }
+        };
+        let (written, event) = match captured {
+            Ok(value) => value,
+            Err(error) => {
+                reply.send(bad(error));
+                return;
+            }
+        };
+        let disk = Arc::clone(self);
+        let bytes = appending.bytes.len() as u64;
+        let records = appending.holds.records;
+        self.persist_record(Op::EnJAppend, event, move |result| match result {
+            Ok(()) => {
+                let marked = disk.held.lock().expect("extents").mark_written(
+                    sn,
+                    extent,
+                    created,
+                    logical,
+                    first_record,
+                );
+                if let Err(error) = marked {
+                    logw!("could not advance replica EN written watermark", "{}", error);
+                    reply.send(Resp::error(Status::Internal, error.to_string()));
+                    return;
+                }
+                if matches!(written, Written::Stored) {
+                    disk.appends.fetch_add(1, Ordering::Relaxed);
+                    disk.bytes.fetch_add(bytes, Ordering::Relaxed);
+                }
+                if records > ERoff::ZERO {
+                    disk.finish(sn, extent);
+                }
+                reply.send(Resp::ok());
+            }
+            Err(error) => {
+                logw!("replica EN append was not durable", "{}", error);
+                reply.send(Resp::error(Status::Internal, error.to_string()));
+            }
+        });
     }
 
     #[cfg(test)]
@@ -1383,6 +2482,13 @@ impl EN {
 }
 
 impl Service for EN {
+    fn start_with_process(self: &Arc<Self>, process: &Arc<Process>) -> Result<()> {
+        for (index, disk) in self.disks.iter().enumerate() {
+            disk.recover(process, DiskId::new(index as u16))?;
+        }
+        Ok(())
+    }
+
     fn serves(&self) -> &'static [Op] {
         SERVES
     }
@@ -1392,7 +2498,15 @@ impl Service for EN {
     }
 
     fn defers(&self, op: Op) -> bool {
-        matches!(op, Op::AppendExtent)
+        matches!(
+            op,
+            Op::AppendExtent
+                | Op::WriteAppend
+                | Op::SoftDeleteExtentInstance
+                | Op::DeleteExtentInstance
+                | Op::ForceSealExtent
+                | Op::WriteDurable
+        )
     }
 
     fn inline(&self, op: Op) -> bool {
@@ -1405,12 +2519,13 @@ impl Service for EN {
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
         match request.op() {
             Op::SoftDeleteExtentInstance | Op::DeleteExtentInstance => {
-                reply.send(self.delete_instance(process, &request))
+                self.delete_wait(process, &request, reply)
             }
             Op::AppendExtent => self.append(process, request, reply),
-            Op::WriteAppend => reply.send(self.write_append(process, request)),
+            Op::WriteAppend => self.write_wait(process, request, reply),
+            Op::WriteDurable => self.write_durable(process, request, reply),
             Op::ReadExtent => reply.send(self.read(process, &request)),
-            Op::ForceSealExtent => reply.send(self.force_seal(process, &request)),
+            Op::ForceSealExtent => self.seal_wait(process, &request, reply),
             _ => reply.send(server::unbuilt(process, SERVES, &request)),
         }
     }
@@ -1428,6 +2543,119 @@ impl Service for EN {
 }
 
 impl EN {
+    fn write_durable(&self, process: &Process, request: Req, reply: Reply) {
+        let (mut payload, rest) =
+            match structure(&request.args(), Op::WriteDurable, "an EN durable marker") {
+                Ok(value) => value,
+                Err(error) => return reply.send(bad(error)),
+            };
+        let en = match payload.en_id() {
+            Ok(value) => value,
+            Err(error) => return reply.send(bad(error)),
+        };
+        let disk_id = match payload.disk_id() {
+            Ok(value) => value,
+            Err(error) => return reply.send(bad(error)),
+        };
+        let sn = match payload.sn_id() {
+            Ok(value) => value,
+            Err(error) => return reply.send(bad(error)),
+        };
+        let extent = match payload.extent_id() {
+            Ok(value) => value,
+            Err(error) => return reply.send(bad(error)),
+        };
+        let created = match payload.time_sec() {
+            Ok(value) => value,
+            Err(error) => return reply.send(bad(error)),
+        };
+        let mark = Mark {
+            logical: match payload.eloff() {
+                Ok(value) => value,
+                Err(error) => return reply.send(bad(error)),
+            },
+            records: match payload.eroff() {
+                Ok(value) => value,
+                Err(error) => return reply.send(bad(error)),
+            },
+        };
+        if !rest.is_empty() || payload.done().is_err() {
+            return reply.send(bad("EN durable marker has trailing fields"));
+        }
+        if en != EnId::new(process.entry.number()) {
+            return reply.send(bad("EN durable marker reached the wrong EN"));
+        }
+        match self.disk(disk_id) {
+            Ok(disk) => disk.durable_wait(sn, extent, created, mark, reply),
+            Err(error) => reply.send(bad(error)),
+        }
+    }
+
+    fn delete_wait(&self, process: &Process, request: &Req, reply: Reply) {
+        let deletion =
+            match Delete::of_with_limit(request, process.cluster.max_soft_delete_retention_secs) {
+                Ok(value) => value,
+                Err(error) => return reply.send(bad(error)),
+            };
+        let Target::Instance { en, disk, sn, extent, created } = deletion.target else {
+            return reply.send(bad("expected an extent instance"));
+        };
+        if en.number() != process.entry.number() {
+            return reply.send(bad("deletion addressed to a different EN"));
+        }
+        match self.disk(disk) {
+            Ok(disk) => disk.delete_wait(
+                sn,
+                extent,
+                created,
+                deletion.retention,
+                deletion.hard,
+                process.cluster.max_soft_delete_retention_secs,
+                reply,
+            ),
+            Err(error) => reply.send(bad(error)),
+        }
+    }
+
+    fn seal_wait(&self, process: &Process, request: &Req, reply: Reply) {
+        let (mut payload, rest) =
+            match structure(&request.args(), Op::ForceSealExtent, "a force-seal request") {
+                Ok(value) => value,
+                Err(error) => return reply.send(bad(error)),
+            };
+        let en = match payload.en_id() {
+            Ok(value) => value,
+            Err(error) => return reply.send(bad(error)),
+        };
+        let disk = match payload.disk_id() {
+            Ok(value) => value,
+            Err(error) => return reply.send(bad(error)),
+        };
+        let sn = match payload.sn_id() {
+            Ok(value) => value,
+            Err(error) => return reply.send(bad(error)),
+        };
+        let extent = match payload.extent_id() {
+            Ok(value) => value,
+            Err(error) => return reply.send(bad(error)),
+        };
+        let created = match payload.time_sec() {
+            Ok(value) => value,
+            Err(error) => return reply.send(bad(error)),
+        };
+        if !rest.is_empty() || payload.done().is_err() {
+            return reply.send(bad("force-seal request has trailing arguments"));
+        }
+        if en != EnId::new(process.entry.number()) {
+            return reply.send(bad("force-seal request reached the wrong EN"));
+        }
+        match self.disk(disk) {
+            Ok(disk) => disk.seal_wait(sn, extent, created, reply),
+            Err(error) => reply.send(bad(error)),
+        }
+    }
+
+    #[cfg(test)]
     fn delete_instance(&self, process: &Process, request: &Req) -> Resp {
         let deletion =
             match Delete::of_with_limit(request, process.cluster.max_soft_delete_retention_secs) {
@@ -1502,44 +2730,7 @@ impl EN {
         }
     }
 
-    fn force_seal(&self, process: &Process, request: &Req) -> Resp {
-        let (mut payload, rest) =
-            match structure(&request.args(), Op::ForceSealExtent, "a force-seal request") {
-                Ok(value) => value,
-                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-            };
-        let en = match payload.en_id() {
-            Ok(value) => value,
-            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-        };
-        let disk = match payload.disk_id() {
-            Ok(value) => value,
-            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-        };
-        let sn = match payload.sn_id() {
-            Ok(value) => value,
-            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-        };
-        let extent = match payload.extent_id() {
-            Ok(value) => value,
-            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-        };
-        let created = match payload.time_sec() {
-            Ok(value) => value,
-            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
-        };
-        if !rest.is_empty() || payload.done().is_err() {
-            return Resp::error(Status::BadRequest, "force-seal request has trailing arguments");
-        }
-        if en != EnId::new(process.entry.number()) {
-            return Resp::error(Status::BadRequest, "force-seal request reached the wrong EN");
-        }
-        match self.disk(disk).and_then(|disk| disk.force_seal(sn, extent, created)) {
-            Ok(filled) => Resp::from_args(Status::Ok, filled.args()).id(0),
-            Err(e) => Resp::error(Status::BadRequest, e.to_string()),
-        }
-    }
-
+    #[cfg(test)]
     fn write_append(&self, process: &Process, request: Req) -> Resp {
         let (en, disk_id, appending) = match AppendBlock::of(&request) {
             Ok(res) => res,
@@ -1555,6 +2746,24 @@ impl EN {
         match self.disk(disk_id) {
             Ok(disk) => disk.write_append(process, appending),
             Err(e) => Resp::error(Status::BadRequest, e.to_string()),
+        }
+    }
+
+    fn write_wait(&self, process: &Process, request: Req, reply: Reply) {
+        let (en, disk_id, appending) = match AppendBlock::of(&request) {
+            Ok(res) => res,
+            Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        let mine = EnId::new(process.entry.number());
+        if en != mine {
+            return reply.send(Resp::error(
+                Status::BadRequest,
+                format!("write-append aimed at EN{en} reached EN{mine}"),
+            ));
+        }
+        match self.disk(disk_id) {
+            Ok(disk) => disk.write_wait(process, appending, reply),
+            Err(e) => reply.send(Resp::error(Status::BadRequest, e.to_string())),
         }
     }
 
@@ -1607,10 +2816,10 @@ impl EN {
 }
 
 struct Counting {
-    others: usize,
+    unanswered: usize,
     wanted: usize,
     written: usize,
-    failed: usize,
+    local_pending: bool,
     settled: bool,
 }
 
@@ -1622,30 +2831,42 @@ enum Verdict {
 
 impl Counting {
     fn new(others: usize, quorum: usize) -> Counting {
-        Counting { others, wanted: quorum.saturating_sub(1), written: 0, failed: 0, settled: false }
+        Counting {
+            unanswered: others,
+            wanted: quorum,
+            written: 0,
+            local_pending: true,
+            settled: false,
+        }
     }
 
-    fn answer(&mut self, written: bool) -> Option<Verdict> {
+    fn answer(&mut self, written: bool, local: bool) -> Option<Verdict> {
         if self.settled {
+            return None;
+        }
+        if local {
+            if !self.local_pending {
+                return None;
+            }
+            self.local_pending = false;
+        } else if self.unanswered > 0 {
+            self.unanswered -= 1;
+        } else {
             return None;
         }
         match written {
             true => self.written += 1,
-            false => self.failed += 1,
+            false => {}
         }
         let verdict = if self.written >= self.wanted {
             Verdict::Durable
-        } else if !self.possible() {
+        } else if self.written + self.unanswered + usize::from(self.local_pending) < self.wanted {
             Verdict::Lost
         } else {
             return None;
         };
         self.settled = true;
         Some(verdict)
-    }
-
-    fn possible(&self) -> bool {
-        self.others - self.failed >= self.wanted
     }
 }
 
@@ -1657,20 +2878,34 @@ struct Quorum {
 impl Quorum {
     fn new(others: usize, quorum: usize, pending: Arc<Pending>) -> Quorum {
         let quorum = Quorum { counting: Mutex::new(Counting::new(others, quorum)), pending };
-        if !quorum.counting.lock().expect("quorum").possible() {
+        let counting = quorum.counting.lock().expect("quorum");
+        if counting.unanswered + usize::from(counting.local_pending) < counting.wanted {
             quorum.pending.lost();
         }
+        drop(counting);
         quorum
     }
 
     fn written(&self, written: bool) {
-        match self.counting.lock().expect("quorum").answer(written) {
+        self.answer(written, false);
+    }
+
+    fn local_written(&self, written: bool) {
+        self.answer(written, true);
+    }
+
+    fn answer(&self, written: bool, local: bool) {
+        match self.counting.lock().expect("quorum").answer(written, local) {
             Some(Verdict::Durable) => self.pending.quorum_is_in(),
             Some(Verdict::Lost) => self.pending.lost(),
             None => {}
         }
     }
 }
+
+type QuorumHook = Box<dyn FnOnce() -> Option<Mark> + Send + 'static>;
+type ReplyHook = Box<dyn FnOnce(Option<Mark>) + Send + 'static>;
+type PendingDone = (Reply, Option<Mark>, Option<ReplyHook>);
 
 struct Pending {
     gates: Mutex<Gates>,
@@ -1682,35 +2917,68 @@ struct Gates {
     quorum: bool,
     whole: bool,
     reply: Option<Reply>,
+    mark: Option<Mark>,
+    on_quorum: Option<QuorumHook>,
+    after_reply: Option<ReplyHook>,
 }
 
 impl Pending {
-    fn new(receipt: Vec<Arg>, quorum: usize, reply: Reply) -> Pending {
+    fn new(
+        receipt: Vec<Arg>,
+        quorum: usize,
+        reply: Reply,
+        on_quorum: QuorumHook,
+        after_reply: ReplyHook,
+    ) -> Pending {
         Pending {
-            gates: Mutex::new(Gates { quorum: false, whole: false, reply: Some(reply) }),
+            gates: Mutex::new(Gates {
+                quorum: false,
+                whole: false,
+                reply: Some(reply),
+                mark: None,
+                on_quorum: Some(on_quorum),
+                after_reply: Some(after_reply),
+            }),
             receipt,
             quorum,
         }
     }
 
     fn quorum_is_in(&self) {
-        let mut gates = self.gates.lock().expect("pending");
-        gates.quorum = true;
-        self.settle(&mut gates);
+        let done = {
+            let mut gates = self.gates.lock().expect("pending");
+            if gates.quorum {
+                return;
+            }
+            gates.mark = gates.on_quorum.take().and_then(|hook| hook());
+            gates.quorum = true;
+            self.settle(&mut gates)
+        };
+        self.complete(done);
     }
 
     fn records_are_whole(&self) {
-        let mut gates = self.gates.lock().expect("pending");
-        gates.whole = true;
-        self.settle(&mut gates);
+        let done = {
+            let mut gates = self.gates.lock().expect("pending");
+            gates.whole = true;
+            self.settle(&mut gates)
+        };
+        self.complete(done);
     }
 
-    fn settle(&self, gates: &mut Gates) {
+    fn settle(&self, gates: &mut Gates) -> Option<PendingDone> {
         if !(gates.quorum && gates.whole) {
-            return;
+            return None;
         }
-        if let Some(reply) = gates.reply.take() {
+        Some((gates.reply.take()?, gates.mark.take(), gates.after_reply.take()))
+    }
+
+    fn complete(&self, done: Option<PendingDone>) {
+        if let Some((reply, mark, after_reply)) = done {
             reply.send(Resp::from_args(Status::Ok, self.receipt.clone()).id(0));
+            if let Some(after_reply) = after_reply {
+                after_reply(mark);
+            }
         }
     }
 
@@ -1722,6 +2990,8 @@ impl Pending {
                 format!("could not reach a quorum of {} instances", self.quorum),
             ));
         }
+        gates.on_quorum = None;
+        gates.after_reply = None;
     }
 }
 

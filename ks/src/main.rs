@@ -11,7 +11,7 @@ use common::registry::{self, Peer};
 use common::server::{self, Process, Service};
 use common::time::TimeSec;
 use common::{Context, Result};
-use common::{Op, Req, Resp, SnKey, Status, structure};
+use common::{EnKey, Op, Req, Resp, SnKey, Status, structure};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
@@ -84,6 +84,7 @@ const SERVES: &[Op] = &[
     Op::AssignPeers,
     Op::Unlock,
     Op::SnMasterKey,
+    Op::EnMasterKey,
     Op::RotateMasterKey,
 ];
 
@@ -240,19 +241,23 @@ impl Ks {
     /// Direct requests and forwarded client requests share this admission boundary.
     fn client_request(&self, process: &Process, request: &Req, allow_forward: bool) -> Resp {
         if allow_forward
-            && matches!(request.op(), Op::SnMasterKey | Op::RotateMasterKey | Op::RaftMembers)
+            && matches!(
+                request.op(),
+                Op::SnMasterKey | Op::EnMasterKey | Op::RotateMasterKey | Op::RaftMembers
+            )
         {
             if let Some(answer) = self.forward(request) {
                 return answer;
             }
         }
         // Key generation is internal maintenance; proposals still require write authority.
-        if request.op() == Op::SnMasterKey && self.ready.load(Ordering::SeqCst) {
+        let key_read = matches!(request.op(), Op::SnMasterKey | Op::EnMasterKey);
+        if key_read && self.ready.load(Ordering::SeqCst) {
             if let Err(e) = self.prepare_key_read() {
                 return Resp::error(Status::Internal, e.to_string());
             }
         }
-        let admission = match self.admit_client(request.op() == Op::SnMasterKey) {
+        let admission = match self.admit_client(key_read) {
             Ok(admission) => admission,
             Err(e) => return Resp::error(Status::Internal, e.to_string()),
         };
@@ -265,6 +270,10 @@ impl Ks {
             }
             Op::SnMasterKey => match admission.history.as_deref() {
                 Some(history) => self.sn_key(request, &history.keys),
+                None => Resp::error(Status::Internal, "missing admitted key history"),
+            },
+            Op::EnMasterKey => match admission.history.as_deref() {
+                Some(history) => self.en_key(request, &history.keys),
                 None => Resp::error(Status::Internal, "missing admitted key history"),
             },
             Op::RotateMasterKey => {
@@ -512,6 +521,35 @@ impl Ks {
         }
     }
 
+    fn en_key(&self, request: &Req, history: &KeyHistory) -> Resp {
+        if !self.ready.load(Ordering::SeqCst) {
+            return Resp::error(Status::Locked, "KS is locked");
+        }
+        let (mut payload, rest) =
+            match structure(&request.args(), Op::EnMasterKey, "an EN master-key request") {
+                Ok(value) => value,
+                Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+            };
+        if !rest.is_empty() {
+            return Resp::error(
+                Status::BadRequest,
+                "an EN master-key request has trailing arguments",
+            );
+        }
+        let en = match payload.en_id() {
+            Ok(en) => en,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        let at = match payload.time_sec().and_then(|at| payload.done().map(|()| at)) {
+            Ok(at) => at,
+            Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
+        };
+        match Self::en_key_for(history, en, at) {
+            Ok(key) => Resp::new(Status::Ok, key.write()),
+            Err(e) => Resp::error(Status::Internal, e.to_string()),
+        }
+    }
+
     fn prepare_key_read(&self) -> Result<()> {
         let index = self.on_raft(|host, node| {
             host.initial_key(node)?;
@@ -534,6 +572,20 @@ impl Ks {
             .map(|epoch| (epoch.since, crypto::sn_key(&epoch.key, sn, epoch.since)));
         let result = SnKey { current: current_key, next };
         Ok(result)
+    }
+
+    fn en_key_for(history: &KeyHistory, en: common::ids::EnId, at: TimeSec) -> Result<EnKey> {
+        let epochs = &history.epochs;
+        let count = epochs.partition_point(|epoch| epoch.since <= at);
+        let current = count
+            .checked_sub(1)
+            .and_then(|i| epochs.get(i))
+            .ok_or_else(|| common::Error::new("no master key is active at the requested second"))?;
+        let current_key = crypto::en_key(&current.key, en, current.since);
+        let next = epochs
+            .get(count)
+            .map(|epoch| (epoch.since, crypto::en_key(&epoch.key, en, epoch.since)));
+        Ok(EnKey { current: current_key, next })
     }
 
     fn ensure_future_key(&self) -> Result<()> {
