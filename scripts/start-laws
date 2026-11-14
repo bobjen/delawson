@@ -279,13 +279,17 @@ for source in "${dn_ids[@]}"; do
 done
 for source in "${sn_ids[@]}"; do
     source_number=${source//[^0-9]/}
-    case "$source_number" in
-        0) destinations=("${en_ids[0]}" "${en_ids[2]}") ;;
-        1) destinations=("${en_ids[1]}" "${en_ids[3]}") ;;
-        2) destinations=("${en_ids[0]}" "${en_ids[3]}") ;;
-        3) destinations=("${en_ids[1]}" "${en_ids[2]}") ;;
-        *) echo "start-laws: no EN assignment for $source" >&2; exit 1 ;;
-    esac
+    if ((${#en_ids[@]} == 1)); then
+        destinations=("${en_ids[0]}")
+    else
+        case "$source_number" in
+            0) destinations=("${en_ids[0]}" "${en_ids[2]}") ;;
+            1) destinations=("${en_ids[1]}" "${en_ids[3]}") ;;
+            2) destinations=("${en_ids[0]}" "${en_ids[3]}") ;;
+            3) destinations=("${en_ids[1]}" "${en_ids[2]}") ;;
+            *) echo "start-laws: no EN assignment for $source" >&2; exit 1 ;;
+        esac
+    fi
     "$laws" --config "$cluster" --to "$ks_registrar" assign-peers "$source" "${destinations[@]}"
 done
 
