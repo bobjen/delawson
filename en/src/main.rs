@@ -37,9 +37,11 @@ use common::{
     structure,
 };
 use common::{Error, Result, logw};
-use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 const SERVES: &[Op] = &[
     Op::SoftDeleteExtentInstance,
@@ -628,6 +630,10 @@ impl Extents {
             stage: None,
             marks: HashMap::new(),
         }
+    }
+
+    fn sn_ids(&self) -> Vec<SnId> {
+        self.extents.iter().map(|extent| extent.sn_id).collect()
     }
 
     fn journal_append(
@@ -1676,6 +1682,10 @@ impl Disk {
         Ok(())
     }
 
+    fn sn_ids(&self) -> Vec<SnId> {
+        self.held.lock().expect("extents").sn_ids()
+    }
+
     fn persist_record(
         &self,
         op: Op,
@@ -2461,6 +2471,11 @@ struct EN {
     config: ENConfig,
     disks: Vec<Arc<Disk>>,
     _daily_cache: Arc<DailyKeyCache>,
+    accepting: AtomicBool,
+    startup_stop: AtomicBool,
+    startup_status: Mutex<String>,
+    startup_error: Mutex<Option<String>>,
+    startup_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl EN {
@@ -2470,6 +2485,11 @@ impl EN {
             config,
             disks: (0..5).map(|_| Arc::new(Disk::new(Arc::clone(&daily_cache)))).collect(),
             _daily_cache: daily_cache,
+            accepting: AtomicBool::new(false),
+            startup_stop: AtomicBool::new(false),
+            startup_status: Mutex::new("loading keys".to_owned()),
+            startup_error: Mutex::new(None),
+            startup_thread: Mutex::new(None),
         }
     }
 
@@ -2479,12 +2499,87 @@ impl EN {
             .cloned()
             .ok_or_else(|| Error::new(format!("no disk {id} here")))
     }
+
+    fn initialize(&self, process: &Arc<Process>) -> Result<()> {
+        let en_id = EnId::new(process.entry.number());
+        loop {
+            if self.startup_stop.load(Ordering::Acquire) {
+                return Err(Error::new("EN startup stopped"));
+            }
+            *self.startup_status.lock().expect("startup status") =
+                "loading current EN key".to_owned();
+            match self._daily_cache.get_en(process, en_id, TimeSec::now()) {
+                Ok(_) => break,
+                Err(error) => {
+                    *self.startup_status.lock().expect("startup status") =
+                        format!("waiting for current EN key: {error}");
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
+        }
+
+        *self.startup_status.lock().expect("startup status") = "replaying journals".to_owned();
+        for (index, disk) in self.disks.iter().enumerate() {
+            if self.startup_stop.load(Ordering::Acquire) {
+                return Err(Error::new("EN startup stopped"));
+            }
+            disk.recover(process, DiskId::new(index as u16))?;
+        }
+
+        let mut sn_ids = HashSet::new();
+        for disk in &self.disks {
+            sn_ids.extend(disk.sn_ids());
+        }
+        let current = TimeSec::now();
+        for sn_id in sn_ids {
+            loop {
+                if self.startup_stop.load(Ordering::Acquire) {
+                    return Err(Error::new("EN startup stopped"));
+                }
+                *self.startup_status.lock().expect("startup status") =
+                    format!("loading current SN key for {sn_id}");
+                match self._daily_cache.get(process, sn_id, current) {
+                    Ok(_) => break,
+                    Err(error) => {
+                        *self.startup_status.lock().expect("startup status") =
+                            format!("waiting for current SN key for {sn_id}: {error}");
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Service for EN {
     fn start_with_process(self: &Arc<Self>, process: &Arc<Process>) -> Result<()> {
-        for (index, disk) in self.disks.iter().enumerate() {
-            disk.recover(process, DiskId::new(index as u16))?;
+        let en = Arc::clone(self);
+        let process = Arc::clone(process);
+        let worker = thread::Builder::new()
+            .name("en-recovery".to_owned())
+            .spawn(move || match en.initialize(&process) {
+                Ok(()) if !en.startup_stop.load(Ordering::Acquire) => {
+                    *en.startup_status.lock().expect("startup status") = "ready".to_owned();
+                    en.accepting.store(true, Ordering::Release);
+                }
+                Ok(()) => {}
+                Err(_) if en.startup_stop.load(Ordering::Acquire) => {}
+                Err(error) => {
+                    let message = error.to_string();
+                    *en.startup_status.lock().expect("startup status") = "failed".to_owned();
+                    *en.startup_error.lock().expect("startup error") = Some(message.clone());
+                    logw!("EN startup failed", "{message}");
+                }
+            })?;
+        *self.startup_thread.lock().expect("startup thread") = Some(worker);
+        Ok(())
+    }
+
+    fn stop(&self, _process: &Process) -> Result<()> {
+        self.startup_stop.store(true, Ordering::Release);
+        if let Some(worker) = self.startup_thread.lock().expect("startup thread").take() {
+            worker.join().map_err(|_| Error::new("EN startup thread panicked"))?;
         }
         Ok(())
     }
@@ -2517,6 +2612,16 @@ impl Service for EN {
     }
 
     fn handle(self: &Arc<Self>, process: &Arc<Process>, request: Req, reply: Reply) {
+        if !self.accepting.load(Ordering::Acquire) {
+            let detail = self
+                .startup_error
+                .lock()
+                .expect("startup error")
+                .as_ref()
+                .map(|error| format!("EN is not accepting appends yet: {error}"))
+                .unwrap_or_else(|| "EN is not accepting appends yet".to_owned());
+            return reply.send(Resp::error(Status::Locked, detail));
+        }
         match request.op() {
             Op::SoftDeleteExtentInstance | Op::DeleteExtentInstance => {
                 self.delete_wait(process, &request, reply)
@@ -2531,7 +2636,10 @@ impl Service for EN {
     }
 
     fn status(&self, process: &Process) -> Vec<String> {
-        let mut lines = Vec::new();
+        let mut lines = vec![format!(
+            "startup {}",
+            self.startup_status.lock().expect("startup status")
+        )];
         for (i, disk) in self.disks.iter().enumerate() {
             lines.push(format!("disk {i}"));
             for line in disk.status(process, &self.config) {

@@ -2321,6 +2321,31 @@ impl SN {
         self.disks.lock().expect("disks")[id.get() as usize]
     }
 
+    fn learn_action_disks(&self, action: &raft::Action) -> Result<()> {
+        let mut names = Vec::new();
+        match action.op {
+            Op::SnOpen => {
+                let command: OpenCmd = raft::codec::decode(&action.fields)?;
+                names.extend(command.extent.disks);
+            }
+            Op::SnSeal => {
+                let command: SealCmd = raft::codec::decode(&action.fields)?;
+                if let Some(next) = command.next {
+                    names.extend(next.disks);
+                }
+            }
+            _ => return Ok(()),
+        }
+
+        let mut roster = self.disks.lock().map_err(|_| Error::new("SN disk lock poisoned"))?;
+        for name in names {
+            if !roster.contains(&name) {
+                roster.push(name);
+            }
+        }
+        Ok(())
+    }
+
     fn extent_ref(&self, extent: ExtentData) -> Result<ExtentRef> {
         let disks = self.disks.lock().map_err(|_| Error::new("SN disk lock poisoned"))?;
         ExtentRef::from_data(extent, &disks)
@@ -3700,6 +3725,7 @@ impl Host for SN {
         action: &raft::Action,
         done: &mut Vec<Self::Done>,
     ) -> Result<()> {
+        self.learn_action_disks(action)?;
         let local_id = if matches!(action.op, Op::SnOpen | Op::SnSeal) {
             self.pending_extents
                 .lock()

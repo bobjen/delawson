@@ -217,42 +217,71 @@ impl StageFiles {
         ))
     }
 
-    fn reserve(&mut self, len: usize) -> Result<(StageId, u32, TimeSec, Arc<File>)> {
+    fn reserve(
+        &mut self,
+        len: usize,
+        key_lookup: &KeyLookup,
+    ) -> Result<(StageId, u32, TimeSec, Arc<File>)> {
         let len = u64::try_from(len).map_err(|_| Error::new("EN stage write length overflow"))?;
         if len > FILE_LIMIT - HEADER {
             return Err(Error::new("one EN stage write exceeds the 4 GiB file limit"));
         }
         if self.current_len.checked_add(len).is_none_or(|end| end > FILE_LIMIT) {
-            let next = usize::from(self.current.get()) + 1;
-            if next == STAGE_SLOTS {
-                return Err(Error::new("all 16K EN stage file slots are occupied"));
-            }
-            let id = StageId::new(next as u16)?;
-            if self.files.read().expect("stage files")[next].is_some() {
-                return Err(Error::new("next EN stage file slot is already occupied"));
-            }
             let stage_time = TimeSec::now();
-            let (file, _) = create_file(
-                &self.dir,
-                "stage-",
-                ".bin",
-                STAGE_MAGIC,
-                self.en,
-                self.disk,
-                u32::from(id.get()),
-                true,
-                stage_time,
-            )?;
-            self.files.write().expect("stage files")[id.index()?] =
-                Some(StageFile { file: Arc::new(file), created: stage_time });
-            self.current = id;
-            self.current_len = HEADER;
+            key_lookup(stage_time)?;
+            self.new_file(stage_time)?;
         }
         let stage_file = self.get(self.current)?;
         let offset = u32::try_from(self.current_len)
             .map_err(|_| Error::new("EN stage offset exceeds u32"))?;
         self.current_len += len;
         Ok((self.current, offset, stage_file.created, stage_file.file))
+    }
+
+    fn ensure_current_key(&mut self, key_lookup: &KeyLookup) -> Result<bool> {
+        let current = self.get(self.current)?;
+        if key_lookup(current.created).is_ok() {
+            return Ok(false);
+        }
+        if current.file.metadata()?.len() != HEADER {
+            return Err(Error::new(format!(
+                "EN stage file {:?} has data but no key for its creation time {}",
+                self.current,
+                current.created.number()
+            )));
+        }
+
+        let stage_time = TimeSec::now();
+        key_lookup(stage_time)?;
+        self.new_file(stage_time)?;
+        Ok(true)
+    }
+
+    fn new_file(&mut self, stage_time: TimeSec) -> Result<()> {
+        let next = usize::from(self.current.get()) + 1;
+        if next == STAGE_SLOTS {
+            return Err(Error::new("all 16K EN stage file slots are occupied"));
+        }
+        let id = StageId::new(next as u16)?;
+        if self.files.read().expect("stage files")[next].is_some() {
+            return Err(Error::new("next EN stage file slot is already occupied"));
+        }
+        let (file, _) = create_file(
+            &self.dir,
+            "stage-",
+            ".bin",
+            STAGE_MAGIC,
+            self.en,
+            self.disk,
+            u32::from(id.get()),
+            true,
+            stage_time,
+        )?;
+        self.files.write().expect("stage files")[id.index()?] =
+            Some(StageFile { file: Arc::new(file), created: stage_time });
+        self.current = id;
+        self.current_len = HEADER;
+        Ok(())
     }
 
     fn get(&self, id: StageId) -> Result<StageFile> {
@@ -424,7 +453,8 @@ impl DiskFiles {
         let disk_number = disk.get();
         fs::create_dir_all(dir)?;
         let identity_record = read_identity(&dir.join("identity"), en_number, disk_number)?;
-        let (stage, stage_new) = StageFiles::open(dir, en_number, disk_number)?;
+        let (mut stage, mut stage_new) = StageFiles::open(dir, en_number, disk_number)?;
+        stage_new |= stage.ensure_current_key(&key_lookup)?;
         let (mut journal, journal_new) =
             FileSet::open(dir, "journal-", ".log", JOURNAL_MAGIC, en_number, disk_number, false)?;
         if stage_new || journal_new {
@@ -745,7 +775,7 @@ fn write_loop(
                         break;
                     }
                 };
-                match stage.reserve(stage_plain.len()) {
+                match stage.reserve(stage_plain.len(), &key_lookup) {
                     Ok((id, offset, stage_time, file)) => {
                         let daily = match key_lookup(stage_time) {
                             Ok(key) => key,
