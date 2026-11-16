@@ -5,7 +5,7 @@ Perhaps for shared AI memory. Billing will be by physical storage, proportional
 to costs. Automatic compression and encryption. Objects can contain up to 2^64 records.
 
 Unfinished. Do not depend on. Expect frequent backward-incompatible changes. Garbage 
-collection, data/metadata sync, replication, erasure coding, user accounts, caching, 
+collection, sync between layers, replication, erasure coding, user accounts, caching, 
 ring balancing, keyed objects, compute et cetera still unimplemented. No hardening 
 done. I'm currently working on EN persistence. You can see how I'm doing things, and 
 planning on doing things, but I will keep this single-person development until all the 
