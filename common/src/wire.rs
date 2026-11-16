@@ -376,6 +376,11 @@ ops! {
     WriteDurable = 201, "write-durable";
     EnMasterKey = 202, "en-master-key";
     EnKeyResp = 203, "en-key-response";
+    EnCkHeader = 204, "en-checkpoint-header";
+    EnCkState = 205, "en-checkpoint-state";
+    EnCkFooter = 206, "en-checkpoint-footer";
+    EnCkExtent = 207, "en-checkpoint-extent";
+    EnCkAppend = 208, "en-checkpoint-append";
 }
 
 impl std::fmt::Display for Op {

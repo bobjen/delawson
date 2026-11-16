@@ -20,6 +20,7 @@
 //! is not evidence about what a durable append costs. What replaces it is a
 //! journal of extent metadata per disk, snapshot and log.
 
+mod checkpoint;
 mod journal;
 
 use common::block::Holds;
@@ -35,7 +36,7 @@ use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::{
     AppendBlock, AppendPiece, Arg, EnKey, EnReceipt, Op, Req, Resp, SnKey, Status, StructWriter,
-    structure,
+    logi, structure,
 };
 use common::{Error, Result, logw};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1882,17 +1883,36 @@ impl Disk {
         }
     }
 
-    fn recover(&self, process: &Arc<Process>, disk: DiskId) -> Result<()> {
+    fn recover(
+        self: &Arc<Self>,
+        process: &Arc<Process>,
+        disk: DiskId,
+        max_journal_bytes: u64,
+        checkpoint_count: usize,
+    ) -> Result<()> {
         let en = EnId::new(process.entry.number());
         let directory = process.config.data_dir.join(format!("disk-{disk}"));
         let key_process = Arc::clone(process);
         let daily_cache = Arc::clone(&self.daily_cache);
         let key_lookup: journal::KeyLookup =
             Arc::new(move |ts| daily_cache.get_en(&key_process, en, ts));
-        let (storage, records) = journal::DiskFiles::open(&directory, en, disk, key_lookup)?;
+        let (storage, checkpoint, records) = journal::DiskFiles::open(
+            &directory,
+            en,
+            disk,
+            key_lookup,
+            max_journal_bytes,
+            checkpoint_count,
+        )?;
         {
             let mut held = self.held.lock().expect("extents");
             held.stage = Some(Arc::clone(&storage));
+            if let Some(checkpoint) = checkpoint {
+                if let Some(scn) = checkpoint.max_scn {
+                    common::scn::merge(scn)?;
+                }
+                *held = checkpoint::decode(&checkpoint.data, Some(Arc::clone(&storage)))?;
+            }
             for record in records {
                 match record.op {
                     Op::EnJAppend => held.restore_append(record)?,
@@ -1908,7 +1928,21 @@ impl Disk {
                 Ordering::Relaxed,
             );
         }
-        *self.storage.write().expect("disk storage") = Some(storage);
+        *self.storage.write().expect("disk storage") = Some(Arc::clone(&storage));
+        let checkpoint_rx = storage.take_checkpoint_receiver();
+        let storage_weak = Arc::downgrade(&storage);
+        thread::Builder::new().name(format!("en-checkpoint-{disk}")).spawn(move || {
+            while checkpoint_rx.recv().is_ok() {
+                let Some(storage) = storage_weak.upgrade() else {
+                    break;
+                };
+                if let Err(error) = checkpoint::write_next(&storage) {
+                    storage.checkpoint_failed();
+                    logw!("EN disk checkpoint failed", "disk {disk},{error}");
+                }
+            }
+        })?;
+        storage.request_checkpoint_if_due();
         Ok(())
     }
 
@@ -2790,6 +2824,7 @@ impl EN {
     }
 
     fn initialize(&self, process: &Arc<Process>) -> Result<()> {
+        self.config.validate()?;
         let en_id = EnId::new(process.entry.number());
         loop {
             if self.startup_stop.load(Ordering::Acquire) {
@@ -2812,7 +2847,12 @@ impl EN {
             if self.startup_stop.load(Ordering::Acquire) {
                 return Err(Error::new("EN startup stopped"));
             }
-            disk.recover(process, DiskId::new(index as u16))?;
+            disk.recover(
+                process,
+                DiskId::new(index as u16),
+                self.config.journal_file_bytes,
+                self.config.checkpoint_count,
+            )?;
         }
 
         let mut sn_ids = HashSet::new();

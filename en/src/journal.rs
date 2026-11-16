@@ -24,6 +24,9 @@ const HEADER: u64 = HEADER_LEN as u64;
 pub(crate) const STAGE_PREFIX: usize = 20;
 pub(crate) const STAGE_TAG: usize = 16;
 const FILE_LIMIT: u64 = 1u64 << 32;
+const CHECKPOINT_MIN_JOURNAL_BYTES: u64 = 1024 * 1024;
+const CHECKPOINT_MAGIC: &[u8; 8] = b"DLAWENK1";
+const CHECKPOINT_FIXED: u64 = 20;
 const STAGE_SLOTS: usize = 16 * 1024;
 const NO_STAGE_FILE: StageId = StageId(u16::MAX);
 
@@ -35,6 +38,10 @@ pub(crate) struct StageId(u16);
 
 impl StageId {
     const FIRST: Self = Self(0);
+
+    pub(crate) fn from_number(value: u16) -> Result<Self> {
+        Self::new(value)
+    }
 
     fn new(value: u16) -> Result<Self> {
         if usize::from(value) >= STAGE_SLOTS {
@@ -91,6 +98,44 @@ pub(crate) struct Record {
 
 type Done = Box<dyn FnOnce(Result<Option<StageRef>>) + Send + 'static>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JournalCursor {
+    pub file: u32,
+    pub end: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Checkpoint {
+    pub generation: u64,
+    pub cursor: JournalCursor,
+    pub max_scn: Option<Scn>,
+    pub data: Arc<[u8]>,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CheckpointMeta {
+    generation: u64,
+    cursor: JournalCursor,
+}
+
+impl From<&Checkpoint> for CheckpointMeta {
+    fn from(checkpoint: &Checkpoint) -> Self {
+        Self { generation: checkpoint.generation, cursor: checkpoint.cursor }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CheckpointBoundary {
+    pub cursor: JournalCursor,
+    bytes_since_previous: u64,
+}
+
+enum WriterMessage {
+    Job(Request),
+    Checkpoint(Sender<Result<CheckpointBoundary>>),
+}
+
 struct Request {
     scn: Scn,
     op: Op,
@@ -119,6 +164,7 @@ struct BatchDone {
     jobs: Vec<Request>,
     stage_files: BTreeMap<StageId, Arc<File>>,
     journal_files: BTreeMap<u32, Arc<File>>,
+    journal_bytes: u64,
     result: std::result::Result<(), String>,
 }
 
@@ -134,6 +180,7 @@ struct FileSet {
     disk: u16,
     files: Arc<RwLock<BTreeMap<u32, Arc<File>>>>,
     current_len: u64,
+    max_len: u64,
 }
 
 /// Per-disk stage files occupy a fixed, persistent 16K-slot namespace.
@@ -308,7 +355,11 @@ impl FileSet {
         en: u64,
         disk: u16,
         id_header: bool,
+        max_len: u64,
     ) -> Result<(FileSet, bool)> {
+        if max_len <= HEADER || max_len > FILE_LIMIT {
+            return Err(Error::new("invalid configured EN journal file size"));
+        }
         let mut names = Vec::new();
         for item in fs::read_dir(dir)? {
             let item = item?;
@@ -360,6 +411,7 @@ impl FileSet {
                 disk,
                 files: Arc::new(RwLock::new(files)),
                 current_len,
+                max_len,
             },
             created,
         ))
@@ -367,10 +419,10 @@ impl FileSet {
 
     fn reserve(&mut self, len: usize) -> Result<(u32, u32, Arc<File>)> {
         let len = u64::try_from(len).map_err(|_| Error::new("EN write length overflow"))?;
-        if len > FILE_LIMIT - HEADER {
-            return Err(Error::new("one EN write exceeds the 4 GiB file limit"));
+        if len > self.max_len.saturating_sub(HEADER) {
+            return Err(Error::new("one EN journal frame exceeds its configured file limit"));
         }
-        if self.current_len.checked_add(len).is_none_or(|end| end > FILE_LIMIT) {
+        if self.current_len.checked_add(len).is_none_or(|end| end > self.max_len) {
             let id = self
                 .files
                 .read()
@@ -402,6 +454,57 @@ impl FileSet {
         Ok((id, offset, file))
     }
 
+    fn rotate(&mut self) -> Result<JournalCursor> {
+        let files = self.files.read().expect("files");
+        let (&old_id, _) =
+            files.last_key_value().ok_or_else(|| Error::new("EN journal has no current file"))?;
+        let cursor = JournalCursor { file: old_id, end: self.current_len };
+        drop(files);
+        let id = old_id.checked_add(1).ok_or_else(|| Error::new("EN journal file id overflow"))?;
+        let (file, _) = create_file(
+            &self.dir,
+            self.stem,
+            self.suffix,
+            self.magic,
+            self.en,
+            self.disk,
+            id,
+            self.id_header,
+            TimeSec::now(),
+        )?;
+        self.files.write().expect("files").insert(id, Arc::new(file));
+        self.current_len = HEADER;
+        Ok(cursor)
+    }
+
+    fn ensure_file_after(&mut self, id: u32) -> Result<()> {
+        let last = self
+            .files
+            .read()
+            .expect("files")
+            .last_key_value()
+            .map(|(&last, _)| last)
+            .ok_or_else(|| Error::new("EN journal has no files"))?;
+        if last > id {
+            return Ok(());
+        }
+        let next = id.checked_add(1).ok_or_else(|| Error::new("EN journal file id overflow"))?;
+        let (file, _) = create_file(
+            &self.dir,
+            self.stem,
+            self.suffix,
+            self.magic,
+            self.en,
+            self.disk,
+            next,
+            self.id_header,
+            TimeSec::now(),
+        )?;
+        self.files.write().expect("files").insert(next, Arc::new(file));
+        self.current_len = HEADER;
+        Ok(())
+    }
+
     fn get(&self, id: u32) -> Result<Arc<File>> {
         self.files
             .read()
@@ -414,14 +517,175 @@ impl FileSet {
     fn len(&self) -> usize {
         self.files.read().expect("files").len()
     }
+
+    fn bytes_after(&self, after_file: Option<u32>) -> Result<u64> {
+        self.files
+            .read()
+            .expect("files")
+            .iter()
+            .filter(|(id, _)| after_file.is_none_or(|after| **id > after))
+            .try_fold(0u64, |sum, (_, file)| {
+                let payload = file.metadata()?.len().saturating_sub(HEADER);
+                sum.checked_add(payload).ok_or_else(|| Error::new("EN journal byte count overflow"))
+            })
+    }
+}
+
+fn checkpoint_path(dir: &Path, generation: u64) -> PathBuf {
+    dir.join(format!("checkpoint-{generation:08}.bin"))
+}
+
+fn read_checkpoint(path: &Path) -> Result<Checkpoint> {
+    let bytes = fs::read(path)?;
+    const PREFIX: usize = 12;
+    if bytes.len() < PREFIX + 2 + 39 + CHECKPOINT_FIXED as usize || &bytes[..8] != CHECKPOINT_MAGIC
+    {
+        return Err(Error::new("truncated EN checkpoint"));
+    }
+    let op = |at: usize| -> Result<Op> {
+        Op::from_code(u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()))
+    };
+    if op(8)? != Op::EnCkHeader || u16::from_le_bytes(bytes[10..12].try_into().unwrap()) != 1 {
+        return Err(Error::new("unsupported EN checkpoint header"));
+    }
+    let end_at = bytes.len() - CHECKPOINT_FIXED as usize;
+    if op(end_at)? != Op::CheckpointEnd
+        || u64::from_le_bytes(bytes[end_at + 2..end_at + 10].try_into().unwrap())
+            != bytes.len() as u64
+    {
+        return Err(Error::new("invalid EN checkpoint fixed footer"));
+    }
+    let footer_len =
+        usize::try_from(u64::from_le_bytes(bytes[end_at + 10..end_at + 18].try_into().unwrap()))
+            .map_err(|_| Error::new("EN checkpoint footer is too large"))?;
+    if op(end_at + 18)? != Op::EnCkFooter || footer_len != 39 || footer_len > end_at {
+        return Err(Error::new("invalid EN checkpoint footer length"));
+    }
+    let footer_at = end_at - footer_len;
+    if op(footer_at)? != Op::EnCkFooter {
+        return Err(Error::new("wrong EN checkpoint variable footer"));
+    }
+    let generation = u64::from_le_bytes(bytes[footer_at + 2..footer_at + 10].try_into().unwrap());
+    let cursor = JournalCursor {
+        file: u32::from_le_bytes(bytes[footer_at + 10..footer_at + 14].try_into().unwrap()),
+        end: u64::from_le_bytes(bytes[footer_at + 14..footer_at + 22].try_into().unwrap()),
+    };
+    if cursor.end < HEADER || cursor.end > FILE_LIMIT {
+        return Err(Error::new("invalid EN checkpoint journal position"));
+    }
+    let max_scn = match bytes[footer_at + 22] {
+        0 => None,
+        1 => Some(Scn::new(u64::from_le_bytes(
+            bytes[footer_at + 23..footer_at + 31].try_into().unwrap(),
+        ))),
+        _ => return Err(Error::new("invalid EN checkpoint SCN flag")),
+    };
+    let checksum = u64::from_le_bytes(bytes[footer_at + 31..footer_at + 39].try_into().unwrap());
+    if op(PREFIX)? != Op::EnCkState || common::crc::of(&bytes[..footer_at + 31]) != checksum {
+        return Err(Error::new("invalid EN checkpoint checksum or footer"));
+    }
+    Ok(Checkpoint {
+        generation,
+        cursor,
+        max_scn,
+        data: Arc::from(&bytes[PREFIX + 2..footer_at]),
+        size: bytes.len() as u64,
+    })
+}
+
+fn encode_checkpoint(
+    generation: u64,
+    cursor: JournalCursor,
+    max_scn: Option<Scn>,
+    data: &[u8],
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(data.len().saturating_add(64));
+    bytes.extend_from_slice(CHECKPOINT_MAGIC);
+    bytes.extend_from_slice(&Op::EnCkHeader.code().to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&Op::EnCkState.code().to_le_bytes());
+    bytes.extend_from_slice(data);
+    bytes.extend_from_slice(&Op::EnCkFooter.code().to_le_bytes());
+    bytes.extend_from_slice(&generation.to_le_bytes());
+    bytes.extend_from_slice(&cursor.file.to_le_bytes());
+    bytes.extend_from_slice(&cursor.end.to_le_bytes());
+    if let Some(scn) = max_scn {
+        bytes.push(1);
+        bytes.extend_from_slice(&scn.number().to_le_bytes());
+    } else {
+        bytes.push(0);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+    }
+    let checksum = common::crc::of(&bytes);
+    bytes.extend_from_slice(&checksum.to_le_bytes());
+    let total_len = u64::try_from(bytes.len())
+        .map_err(|_| Error::new("EN checkpoint length overflow"))?
+        .checked_add(CHECKPOINT_FIXED)
+        .ok_or_else(|| Error::new("EN checkpoint length overflow"))?;
+    bytes.extend_from_slice(&Op::CheckpointEnd.code().to_le_bytes());
+    bytes.extend_from_slice(&total_len.to_le_bytes());
+    bytes.extend_from_slice(&39u64.to_le_bytes());
+    bytes.extend_from_slice(&Op::EnCkFooter.code().to_le_bytes());
+    Ok(bytes)
+}
+
+fn load_checkpoints(dir: &Path) -> Result<(Option<Checkpoint>, Vec<CheckpointMeta>, u64)> {
+    let mut paths = Vec::new();
+    for item in fs::read_dir(dir)? {
+        let item = item?;
+        let name = item.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(generation) =
+            name.strip_prefix("checkpoint-").and_then(|value| value.strip_suffix(".bin"))
+        else {
+            continue;
+        };
+        let generation = generation
+            .parse::<u64>()
+            .map_err(|_| Error::new("invalid EN checkpoint generation"))?;
+        paths.push((generation, item.path()));
+    }
+    paths.sort_by_key(|(generation, _)| *generation);
+    let mut latest = None;
+    let mut valid = Vec::new();
+    let mut invalid = Vec::new();
+    let mut next_generation = 0;
+    for (generation, path) in paths {
+        next_generation = next_generation.max(generation.saturating_add(1));
+        match read_checkpoint(&path) {
+            Ok(checkpoint) if checkpoint.generation == generation => {
+                valid.push(CheckpointMeta::from(&checkpoint));
+                latest = Some(checkpoint);
+            }
+            Ok(_) => invalid.push(path),
+            Err(_) => invalid.push(path),
+        }
+    }
+    if latest.is_none() && !invalid.is_empty() {
+        return Err(Error::new("no valid EN checkpoint remains"));
+    }
+    Ok((latest, valid, next_generation))
 }
 
 /// Open the per-disk files and replay journal metadata. Stage payloads are not read.
 pub(crate) struct DiskFiles {
     stage: Arc<RwLock<StageTable>>,
+    journal: Arc<RwLock<BTreeMap<u32, Arc<File>>>>,
+    dir: PathBuf,
     en: EnId,
     disk: DiskId,
-    tx: Sender<Request>,
+    tx: Sender<WriterMessage>,
+    checkpoint_signal: Sender<()>,
+    progress: Arc<SyncProgress>,
+    checkpoint_rx: Mutex<Option<Receiver<()>>>,
+    checkpoint_data: Mutex<CheckpointData>,
+    retention: usize,
+}
+
+struct CheckpointData {
+    latest: Option<Checkpoint>,
+    next_generation: u64,
+    valid: Vec<CheckpointMeta>,
 }
 
 impl DiskFiles {
@@ -430,14 +694,25 @@ impl DiskFiles {
         en: EnId,
         disk: DiskId,
         key_lookup: KeyLookup,
-    ) -> Result<(Arc<DiskFiles>, Vec<Record>)> {
+        max_journal_bytes: u64,
+        retention: usize,
+    ) -> Result<(Arc<DiskFiles>, Option<Checkpoint>, Vec<Record>)> {
         let en_number = en.get();
         let disk_number = disk.get();
         fs::create_dir_all(dir)?;
         let (mut stage, mut stage_new) = StageFiles::open(dir, en_number, disk_number)?;
         stage_new |= stage.ensure_current_key(&key_lookup)?;
-        let (mut journal, journal_new) =
-            FileSet::open(dir, "journal-", ".log", JOURNAL_MAGIC, en_number, disk_number, false)?;
+        let (latest, valid_checkpoints, next_generation) = load_checkpoints(dir)?;
+        let (mut journal, journal_new) = FileSet::open(
+            dir,
+            "journal-",
+            ".log",
+            JOURNAL_MAGIC,
+            en_number,
+            disk_number,
+            false,
+            max_journal_bytes,
+        )?;
         if stage_new || journal_new {
             File::open(dir)?.sync_all()?;
         }
@@ -445,7 +720,15 @@ impl DiskFiles {
         let mut records = Vec::new();
         let journal_count = journal.len();
         let journal_ids = journal.files.read().expect("files").keys().copied().collect::<Vec<_>>();
+        if let Some(checkpoint) = &latest {
+            if !journal_ids.iter().any(|id| *id > checkpoint.cursor.file) {
+                journal.ensure_file_after(checkpoint.cursor.file)?;
+            }
+        }
         for (index, id) in journal_ids.iter().enumerate() {
+            if latest.as_ref().is_some_and(|checkpoint| *id <= checkpoint.cursor.file) {
+                continue;
+            }
             let file = journal.get(*id)?;
             let is_last = index + 1 == journal_count;
             let (mut found, end) = read_journal(&file, *id, is_last)?;
@@ -528,8 +811,33 @@ impl DiskFiles {
         }
 
         let stage_files = Arc::clone(&stage.files);
-        let tx = start_writer(stage, journal, Arc::clone(&key_lookup), en, disk)?;
-        Ok((Arc::new(DiskFiles { stage: stage_files, en, disk, tx }), records))
+        let bytes_since_checkpoint =
+            journal.bytes_after(latest.as_ref().map(|cp| cp.cursor.file))?;
+        let previous_checkpoint_size = latest.as_ref().map_or(0, |cp| cp.size);
+        let progress =
+            Arc::new(SyncProgress::new(bytes_since_checkpoint, previous_checkpoint_size));
+        let journal_files = Arc::clone(&journal.files);
+        let (tx, checkpoint_signal, checkpoint_rx) =
+            start_writer(stage, journal, Arc::clone(&key_lookup), en, disk, Arc::clone(&progress))?;
+        let storage = Arc::new(DiskFiles {
+            stage: stage_files,
+            journal: journal_files,
+            dir: dir.to_path_buf(),
+            en,
+            disk,
+            tx,
+            checkpoint_signal,
+            progress,
+            checkpoint_rx: Mutex::new(Some(checkpoint_rx)),
+            checkpoint_data: Mutex::new(CheckpointData {
+                latest: latest.clone(),
+                next_generation,
+                valid: valid_checkpoints,
+            }),
+            retention,
+        });
+        storage.enforce_retention()?;
+        Ok((storage, latest, records))
     }
 
     pub(crate) fn submit(
@@ -541,13 +849,167 @@ impl DiskFiles {
         done: impl FnOnce(Result<Option<StageRef>>) + Send + 'static,
     ) -> Result<()> {
         let request = Request { scn, op, metadata, stage, stage_ref: None, done: Box::new(done) };
-        match self.tx.send(request) {
+        match self.tx.send(WriterMessage::Job(request)) {
             Ok(()) => Ok(()),
             Err(error) => {
-                (error.0.done)(Err(Error::new("EN journal writer stopped")));
+                if let WriterMessage::Job(request) = error.0 {
+                    (request.done)(Err(Error::new("EN journal writer stopped")));
+                }
                 Err(Error::new("EN journal writer stopped"))
             }
         }
+    }
+
+    pub(crate) fn latest_checkpoint(&self) -> Option<Checkpoint> {
+        self.checkpoint_data.lock().expect("EN checkpoint data").latest.clone()
+    }
+
+    pub(crate) fn take_checkpoint_receiver(&self) -> Receiver<()> {
+        self.checkpoint_rx
+            .lock()
+            .expect("EN checkpoint receiver")
+            .take()
+            .expect("checkpoint receiver taken once")
+    }
+
+    pub(crate) fn request_checkpoint_if_due(&self) {
+        if self.progress.mark_checkpoint_due() {
+            let _ = self.checkpoint_signal.send(());
+        }
+    }
+
+    pub(crate) fn checkpoint_failed(&self) {
+        self.progress.checkpoint_failed();
+    }
+
+    pub(crate) fn rotate_for_checkpoint(&self) -> Result<CheckpointBoundary> {
+        let (reply, response) = mpsc::channel();
+        self.tx
+            .send(WriterMessage::Checkpoint(reply))
+            .map_err(|_| Error::new("EN journal writer stopped before checkpoint rotation"))?;
+        response
+            .recv()
+            .map_err(|_| Error::new("EN journal writer stopped during checkpoint rotation"))?
+    }
+
+    pub(crate) fn records_since_checkpoint(&self, through: JournalCursor) -> Result<Vec<Record>> {
+        let previous = self.latest_checkpoint();
+        let after = previous.map(|checkpoint| checkpoint.cursor.file);
+        let ids = self.journal.read().expect("journal files").keys().copied().collect::<Vec<_>>();
+        let mut records = Vec::new();
+        for id in ids {
+            if after.is_some_and(|after| id <= after) || id > through.file {
+                continue;
+            }
+            let file = self
+                .journal
+                .read()
+                .expect("journal files")
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| Error::new("EN journal disappeared during checkpoint"))?;
+            let (mut found, _) = read_journal(&file, id, false)?;
+            found.retain(|record| {
+                record.file < through.file
+                    || (record.file == through.file && record.end <= through.end)
+            });
+            for record in &mut found {
+                record.written = true;
+            }
+            records.append(&mut found);
+        }
+        Ok(records)
+    }
+
+    pub(crate) fn publish_checkpoint(
+        &self,
+        boundary: CheckpointBoundary,
+        max_scn: Option<Scn>,
+        data: Vec<u8>,
+    ) -> Result<Checkpoint> {
+        let mut checkpoints = self.checkpoint_data.lock().expect("EN checkpoint data");
+        let generation = checkpoints.next_generation;
+        let encoded = encode_checkpoint(generation, boundary.cursor, max_scn, &data)?;
+        let size = u64::try_from(encoded.len())
+            .map_err(|_| Error::new("EN checkpoint length overflow"))?;
+        let path = checkpoint_path(&self.dir, generation);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp =
+            self.dir.join(format!(".checkpoint-{}-{generation}-{stamp}.tmp", std::process::id()));
+        let result = (|| -> Result<()> {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file =
+                OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp)?;
+            use std::io::Write;
+            file.write_all(&encoded)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp, &path)?;
+            File::open(&self.dir)?.sync_all()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {}
+            Err(error) => {
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
+        }
+        let checkpoint = Checkpoint {
+            generation,
+            cursor: boundary.cursor,
+            max_scn,
+            data: Arc::from(data),
+            size,
+        };
+        checkpoints.next_generation = generation.saturating_add(1);
+        checkpoints.valid.push(CheckpointMeta::from(&checkpoint));
+        checkpoints.valid.sort_by_key(|item| item.generation);
+        while checkpoints.valid.len() > self.retention {
+            let old = checkpoints.valid.remove(0);
+            fs::remove_file(checkpoint_path(&self.dir, old.generation))?;
+        }
+        checkpoints.latest = Some(checkpoint.clone());
+        let oldest_journal = checkpoints
+            .valid
+            .first()
+            .map(|item| item.cursor.file)
+            .ok_or_else(|| Error::new("EN checkpoint retention removed every checkpoint"))?;
+        let mut journal_files = self.journal.write().expect("journal files");
+        let expired = journal_files.range(..=oldest_journal).map(|(&id, _)| id).collect::<Vec<_>>();
+        for id in expired {
+            journal_files.remove(&id);
+            fs::remove_file(self.dir.join(segment_name("journal-", id, ".log")))?;
+        }
+        drop(journal_files);
+        File::open(&self.dir)?.sync_all()?;
+        if self.progress.checkpoint_finished(boundary.bytes_since_previous, checkpoint.size) {
+            let _ = self.checkpoint_signal.send(());
+        }
+        Ok(checkpoint)
+    }
+
+    fn enforce_retention(&self) -> Result<()> {
+        let mut checkpoints = self.checkpoint_data.lock().expect("EN checkpoint data");
+        while checkpoints.valid.len() > self.retention {
+            let old = checkpoints.valid.remove(0);
+            fs::remove_file(checkpoint_path(&self.dir, old.generation))?;
+        }
+        if let Some(oldest) = checkpoints.valid.first() {
+            let mut journal_files = self.journal.write().expect("journal files");
+            let expired =
+                journal_files.range(..=oldest.cursor.file).map(|(&id, _)| id).collect::<Vec<_>>();
+            for id in expired {
+                journal_files.remove(&id);
+                fs::remove_file(self.dir.join(segment_name("journal-", id, ".log")))?;
+            }
+            drop(journal_files);
+            File::open(&self.dir)?.sync_all()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn read_stage(&self, loc: StageRef) -> Result<StageData> {
@@ -592,56 +1054,122 @@ fn start_writer(
     key_lookup: KeyLookup,
     en: EnId,
     disk: DiskId,
-) -> Result<Sender<Request>> {
-    let (tx, rx) = mpsc::channel::<Request>();
+    progress: Arc<SyncProgress>,
+) -> Result<(Sender<WriterMessage>, Sender<()>, Receiver<()>)> {
+    let (tx, rx) = mpsc::channel::<WriterMessage>();
     let (done_tx, done_rx) = mpsc::channel::<BatchDone>();
-    let progress =
-        Arc::new(SyncProgress { completed: Mutex::new((0, None)), changed: Condvar::new() });
+    let (checkpoint_signal, checkpoint_rx) = mpsc::channel();
     let stage_sync = Arc::clone(&stage.files);
     let journal_sync = Arc::clone(&journal.files);
     let sync_progress = Arc::clone(&progress);
+    let sync_checkpoint_signal = checkpoint_signal.clone();
     std::thread::Builder::new().name("en-journal-sync".into()).spawn(move || {
-        sync_loop(done_rx, stage_sync, journal_sync, sync_progress);
+        sync_loop(done_rx, stage_sync, journal_sync, sync_progress, sync_checkpoint_signal);
     })?;
     std::thread::Builder::new().name("en-journal-write".into()).spawn(move || {
         write_loop(rx, done_tx, stage, journal, key_lookup, en, disk, progress);
     })?;
-    Ok(tx)
+    Ok((tx, checkpoint_signal, checkpoint_rx))
 }
 
 /// Lets the write thread place EnJDurable frames after a known locally synced
 /// journal prefix. Recovery can then trust earlier frames without rereading all
 /// their staged append payloads.
 struct SyncProgress {
-    /// Next batch sequence known to have completed its sync, plus a terminal error.
-    completed: Mutex<(u64, Option<String>)>,
+    state: Mutex<ProgressState>,
     changed: Condvar,
 }
 
+struct ProgressState {
+    completed: u64,
+    error: Option<String>,
+    bytes_since_checkpoint: u64,
+    previous_checkpoint_size: u64,
+    checkpoint_active: bool,
+}
+
 impl SyncProgress {
-    fn wait_for(&self, sequence: u64) -> Result<()> {
-        let mut completed = self.completed.lock().expect("journal sync progress");
-        while completed.0 < sequence && completed.1.is_none() {
-            completed = self.changed.wait(completed).expect("journal sync progress");
+    fn new(bytes_since_checkpoint: u64, previous_checkpoint_size: u64) -> Self {
+        Self {
+            state: Mutex::new(ProgressState {
+                completed: 0,
+                error: None,
+                bytes_since_checkpoint,
+                previous_checkpoint_size,
+                checkpoint_active: false,
+            }),
+            changed: Condvar::new(),
         }
-        if let Some(error) = &completed.1 {
+    }
+
+    fn wait_for(&self, sequence: u64) -> Result<()> {
+        let mut state = self.state.lock().expect("journal sync progress");
+        while state.completed < sequence && state.error.is_none() {
+            state = self.changed.wait(state).expect("journal sync progress");
+        }
+        if let Some(error) = &state.error {
             return Err(Error::new(error.clone()));
         }
         Ok(())
     }
 
-    fn complete_through(&self, sequence: u64, error: Option<String>) {
-        let mut completed = self.completed.lock().expect("journal sync progress");
-        completed.0 = sequence;
-        if completed.1.is_none() {
-            completed.1 = error;
+    fn complete_through(&self, sequence: u64, error: Option<String>, journal_bytes: u64) -> bool {
+        let mut state = self.state.lock().expect("journal sync progress");
+        state.completed = sequence;
+        if let Some(error) = error {
+            if state.error.is_none() {
+                state.error = Some(error);
+            }
+        } else {
+            state.bytes_since_checkpoint =
+                state.bytes_since_checkpoint.saturating_add(journal_bytes);
+        }
+        let due = state.error.is_none()
+            && !state.checkpoint_active
+            && state.bytes_since_checkpoint
+                >= CHECKPOINT_MIN_JOURNAL_BYTES.max(state.previous_checkpoint_size);
+        if due {
+            state.checkpoint_active = true;
         }
         self.changed.notify_all();
+        due
+    }
+
+    fn mark_checkpoint_due(&self) -> bool {
+        let mut state = self.state.lock().expect("journal sync progress");
+        if state.error.is_some()
+            || state.checkpoint_active
+            || state.bytes_since_checkpoint
+                < CHECKPOINT_MIN_JOURNAL_BYTES.max(state.previous_checkpoint_size)
+        {
+            return false;
+        }
+        state.checkpoint_active = true;
+        true
+    }
+
+    fn checkpoint_cut_bytes(&self) -> u64 {
+        self.state.lock().expect("journal sync progress").bytes_since_checkpoint
+    }
+
+    fn checkpoint_finished(&self, cut_bytes: u64, checkpoint_size: u64) -> bool {
+        let mut state = self.state.lock().expect("journal sync progress");
+        state.bytes_since_checkpoint = state.bytes_since_checkpoint.saturating_sub(cut_bytes);
+        state.previous_checkpoint_size = checkpoint_size;
+        let due = state.bytes_since_checkpoint
+            >= CHECKPOINT_MIN_JOURNAL_BYTES.max(state.previous_checkpoint_size);
+        state.checkpoint_active = due;
+        self.changed.notify_all();
+        due
+    }
+
+    fn checkpoint_failed(&self) {
+        self.state.lock().expect("journal sync progress").checkpoint_active = false;
     }
 }
 
 fn write_loop(
-    rx: Receiver<Request>,
+    rx: Receiver<WriterMessage>,
     done: Sender<BatchDone>,
     mut stage: StageFiles,
     mut journal: FileSet,
@@ -651,15 +1179,44 @@ fn write_loop(
     progress: Arc<SyncProgress>,
 ) {
     let mut seq = 0u64;
-    while let Ok(first) = rx.recv() {
+    let mut pending = None;
+    loop {
+        let message = match pending.take() {
+            Some(message) => message,
+            None => match rx.recv() {
+                Ok(message) => message,
+                Err(_) => break,
+            },
+        };
+        let first = match message {
+            WriterMessage::Job(job) => job,
+            WriterMessage::Checkpoint(reply) => {
+                let result = progress.wait_for(seq).and_then(|_| {
+                    let cursor = journal.rotate()?;
+                    Ok(CheckpointBoundary {
+                        cursor,
+                        bytes_since_previous: progress.checkpoint_cut_bytes(),
+                    })
+                });
+                let _ = reply.send(result);
+                continue;
+            }
+        };
         let mut jobs = vec![first];
-        while let Ok(job) = rx.try_recv() {
-            jobs.push(job);
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                WriterMessage::Job(job) => jobs.push(job),
+                message @ WriterMessage::Checkpoint(_) => {
+                    pending = Some(message);
+                    break;
+                }
+            }
         }
         let mut stage_writes = BTreeMap::<StageId, WriteAt>::new();
         let mut journal_writes = BTreeMap::<u32, WriteAt>::new();
         let mut stage_files = BTreeMap::new();
         let mut journal_files = BTreeMap::new();
+        let mut journal_bytes = 0;
         let mut entries = Vec::with_capacity(jobs.len());
         let batch_seq = seq;
         seq = seq.wrapping_add(1);
@@ -750,6 +1307,7 @@ fn write_loop(
             match encode_frame(&entries) {
                 Ok(frame) => match journal.reserve(frame.len()) {
                     Ok((id, offset, file)) => {
+                        journal_bytes = frame.len() as u64;
                         if let Err(error) =
                             add_write(&mut journal_writes, id, offset, &file, &frame)
                         {
@@ -765,11 +1323,15 @@ fn write_loop(
         }
 
         if let Some(error) = build_error {
+            if let Some(WriterMessage::Checkpoint(reply)) = pending.take() {
+                let _ = reply.send(Err(Error::new(format!("EN journal writer stopped: {error}"))));
+            }
             let batch = BatchDone {
                 seq: batch_seq,
                 jobs,
                 stage_files,
                 journal_files,
+                journal_bytes,
                 result: Err(error.clone()),
             };
             if let Err(batch) = done.send(batch) {
@@ -777,8 +1339,16 @@ fn write_loop(
                     (job.done)(Err(Error::new("EN journal sync worker stopped")));
                 }
             }
-            while let Ok(job) = rx.recv() {
-                (job.done)(Err(Error::new(format!("EN journal writer stopped: {error}"))));
+            while let Ok(message) = rx.recv() {
+                match message {
+                    WriterMessage::Job(job) => {
+                        (job.done)(Err(Error::new(format!("EN journal writer stopped: {error}"))));
+                    }
+                    WriterMessage::Checkpoint(reply) => {
+                        let _ = reply
+                            .send(Err(Error::new(format!("EN journal writer stopped: {error}"))));
+                    }
+                }
             }
             break;
         }
@@ -814,6 +1384,7 @@ fn write_loop(
                 jobs,
                 stage_files,
                 journal_files,
+                journal_bytes,
                 result,
             });
         });
@@ -846,6 +1417,7 @@ fn sync_loop(
     stage: Arc<RwLock<StageTable>>,
     journal: Arc<RwLock<BTreeMap<u32, Arc<File>>>>,
     progress: Arc<SyncProgress>,
+    checkpoint_signal: Sender<()>,
 ) {
     let mut next = 0u64;
     let mut ready = BTreeMap::new();
@@ -866,6 +1438,7 @@ fn sync_loop(
 
         let mut stage_ids = BTreeSet::<StageId>::new();
         let mut journal_ids = BTreeSet::new();
+        let mut journal_bytes = 0u64;
         let mut jobs = Vec::new();
         let mut write_error = failed.clone();
         for batch in batches {
@@ -874,6 +1447,7 @@ fn sync_loop(
             }
             stage_ids.extend(batch.stage_files.keys().copied());
             journal_ids.extend(batch.journal_files.keys().copied());
+            journal_bytes = journal_bytes.saturating_add(batch.journal_bytes);
             jobs.extend(batch.jobs);
         }
         let result = if let Some(error) = write_error {
@@ -908,7 +1482,14 @@ fn sync_loop(
                 }
             }
         };
-        progress.complete_through(next, result.as_ref().err().map(|error| error.to_string()));
+        let checkpoint_due = progress.complete_through(
+            next,
+            result.as_ref().err().map(|error| error.to_string()),
+            journal_bytes,
+        );
+        if checkpoint_due {
+            let _ = checkpoint_signal.send(());
+        }
         for job in jobs {
             let response = result
                 .as_ref()

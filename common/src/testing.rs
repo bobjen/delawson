@@ -152,7 +152,12 @@ pub fn knobs() -> Knobs {
 }
 
 pub fn en_config() -> ENConfig {
-    ENConfig { knobs: knobs(), media_class: "hdd".to_string() }
+    ENConfig {
+        knobs: knobs(),
+        media_class: "hdd".to_string(),
+        journal_file_bytes: 100 * 1024 * 1024,
+        checkpoint_count: 2,
+    }
 }
 
 pub fn fe_config() -> FEConfig {

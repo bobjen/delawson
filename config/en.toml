@@ -4,6 +4,13 @@
 # Which row of the cluster's media-class table this node's disks follow.
 media_class = "hdd"
 
+# Maximum physical size of one per-disk EN journal file. Checkpointing rotates
+# to a fresh journal before writing its checkpoint.
+journal_file_bytes = 104857600
+
+# Keep this many recent per-disk checkpoints and the journals needed by them.
+checkpoint_count = 2
+
 # Threads answering requests off the read loop. Zero means one per core.
 [knobs]
 workers = 0

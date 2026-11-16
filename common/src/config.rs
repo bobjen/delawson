@@ -885,6 +885,35 @@ pub struct ENConfig {
     /// Which media-class row this node's disks follow. Must name a row in the
     /// cluster table.
     pub media_class: String,
+    /// Maximum physical size of one per-disk journal file. Checkpointing starts
+    /// a fresh journal file before it writes a checkpoint.
+    #[serde(default = "default_en_journal_file_bytes")]
+    pub journal_file_bytes: u64,
+    /// Number of recent per-disk checkpoints to retain.
+    #[serde(default = "default_en_checkpoint_count")]
+    pub checkpoint_count: usize,
+}
+
+fn default_en_journal_file_bytes() -> u64 {
+    100 * 1024 * 1024
+}
+
+fn default_en_checkpoint_count() -> usize {
+    2
+}
+
+impl ENConfig {
+    pub fn validate(&self) -> Result<()> {
+        const FILE_LIMIT: u64 = 1u64 << 32;
+        const HEADER: u64 = 40;
+        if self.journal_file_bytes <= HEADER || self.journal_file_bytes > FILE_LIMIT {
+            return Err(Error::new("EN journal_file_bytes must be between 41 bytes and 4 GiB"));
+        }
+        if self.checkpoint_count == 0 {
+            return Err(Error::new("EN checkpoint_count must be positive"));
+        }
+        Ok(())
+    }
 }
 
 /// FE's own configuration.
