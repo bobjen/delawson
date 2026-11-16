@@ -47,6 +47,7 @@ pub use buffer::{FrameBuffer, Message, MessageBuffer};
 use crate::config::Messaging;
 use crate::ids::{DiskId, DnId, EnId, ExtentId, ObjectId, RangeId, SnId, StreamId};
 use crate::offset::{ECoff, ELoff, ERoff, OCoff, OEoff, OLoff, ORoff, SCoff, SLoff, SRoff};
+use crate::scn::Scn;
 use crate::seal::{self, Seal};
 use crate::time::TimeSec;
 use crate::{Context, Error, Result};
@@ -1542,6 +1543,15 @@ impl Receipt {
 
 impl AppendBlock {
     pub fn request(&self, en: EnId, disk: DiskId, op: Op) -> Req {
+        self.request_with_optional_scn(en, disk, op, None)
+    }
+
+    /// Replicate an append with the SCN assigned by its primary EN.
+    pub fn request_with_scn(&self, en: EnId, disk: DiskId, scn: Scn) -> Req {
+        self.request_with_optional_scn(en, disk, Op::WriteAppend, Some(scn))
+    }
+
+    fn request_with_optional_scn(&self, en: EnId, disk: DiskId, op: Op, scn: Option<Scn>) -> Req {
         let request = Req::new(op);
         let mut payload = StructWriter::new();
         let (kind, width) = self.framing.wire();
@@ -1576,10 +1586,17 @@ impl AppendBlock {
             payload.number_u64(piece.crc);
             payload.bytes(&piece.bytes);
         }
+        payload.flag(scn.is_some());
+        payload.number_u64(scn.map_or(0, Scn::number));
         request.structure(payload)
     }
 
     pub fn of(request: &Req) -> Result<(EnId, DiskId, AppendBlock)> {
+        let (en, disk, _, append) = Self::of_with_scn(request)?;
+        Ok((en, disk, append))
+    }
+
+    pub fn of_with_scn(request: &Req) -> Result<(EnId, DiskId, Option<Scn>, AppendBlock)> {
         let (mut payload, rest) = structure(&request.args(), request.op(), "an append request")?;
         if !rest.is_empty() {
             return Err(Error::new("an append block has arguments after its payload"));
@@ -1618,6 +1635,8 @@ impl AppendBlock {
                 bytes: payload.bytes()?,
             });
         }
+        let has_scn = payload.flag()?;
+        let scn = Scn::new(payload.number_u64()?);
         payload.done()?;
         let mut pieces_iter = pieces.iter();
         let first = pieces_iter.next().expect("piece count checked").holds;
@@ -1631,6 +1650,7 @@ impl AppendBlock {
         Ok((
             en,
             disk,
+            has_scn.then_some(scn),
             AppendBlock {
                 sn,
                 extent,

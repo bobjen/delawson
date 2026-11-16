@@ -30,6 +30,7 @@ use common::framing::Framing;
 use common::ids::{DiskId, EnId, ExtentId, SnId};
 use common::offset::{ECoff, ELoff, ERoff};
 use common::range::{Budget, ExtentCovered, ExtentRange, ExtentStart, Filled, Piece};
+use common::scn::Scn;
 use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::{
@@ -284,6 +285,8 @@ struct Extent {
     records: ERoff,
     /// Whether a record has begun and not ended.
     open_record: bool,
+    /// First extent record introduced at each append SCN while this extent is staged.
+    scn_first: ScnIndex,
 }
 
 /// One append, as it arrived.
@@ -296,6 +299,10 @@ struct Append {
     logical: ELoff,
     /// The extent-local number of the first record this block completed.
     first_record: ERoff,
+    /// SCN assigned by the primary EN for this client append.
+    scn: Option<Scn>,
+    /// Its physical staging frame after the local stage write is durable.
+    stage: Option<journal::StageRef>,
     /// Metadata in the clear, to avoid expensive decryption during scans.
     holds: Holds,
     written: bool,
@@ -317,6 +324,7 @@ struct Encrypted {
     stage: Option<journal::StageRef>,
     stage_tag: [u8; 16],
     stage_ad: Option<Arc<[u8]>>,
+    stage_timestamp: Option<TimeSec>,
     stage_part: Option<(u32, u32)>,
 }
 
@@ -370,6 +378,7 @@ impl Encrypted {
             stage: None,
             stage_tag: [0; 16],
             stage_ad: None,
+            stage_timestamp: None,
             stage_part: None,
         })
     }
@@ -396,25 +405,29 @@ impl Encrypted {
                     loc.offset,
                 )
             };
-            let cipher = stage.read_stage(loc)?;
+            let stage_data = stage.read_stage(loc)?;
             let ad = self
                 .stage_ad
                 .as_deref()
                 .ok_or_else(|| Error::new("recovered EN append has no stage associated data"))?;
-            let plain = crypto::decrypt_block(&key, &nonce, ad, &cipher, &self.stage_tag)?;
-            if plain.len() < 4 {
-                return Err(Error::new("staged EN append has no body length"));
+            if stage_data.metadata != ad || stage_data.tag != self.stage_tag {
+                return Err(Error::new("staged EN header disagrees with its append record"));
             }
-            let body_len = u32::from_le_bytes(plain[..4].try_into().unwrap());
-            if usize::try_from(body_len).ok() != Some(plain.len() - 4) {
-                return Err(Error::new("staged EN append body length mismatch"));
+            if self.stage_timestamp.is_some_and(|timestamp| timestamp != stage_data.timestamp) {
+                return Err(Error::new("staged EN timestamp disagrees with its append SCN"));
             }
+            let stage_aad = journal::stage_aad(stage_data.timestamp, &stage_data.metadata);
+            let plain = crypto::decrypt_block(
+                &key,
+                &nonce,
+                &stage_aad,
+                &stage_data.cipher,
+                &stage_data.tag,
+            )?;
             let (rel, len) = self
                 .stage_part
                 .ok_or_else(|| Error::new("recovered EN block has no stage range"))?;
-            let start = 4usize
-                .checked_add(rel as usize)
-                .ok_or_else(|| Error::new("staged EN block offset overflow"))?;
+            let start = rel as usize;
             let end = start
                 .checked_add(len as usize)
                 .ok_or_else(|| Error::new("staged EN block length overflow"))?;
@@ -604,8 +617,107 @@ struct Extents {
     extents: Vec<Extent>,
     at: HashMap<(SnId, ExtentId), usize>,
     appends: Vec<Append>,
+    /// Physical stage location to the logical append identity stored there.
+    stage_index: BTreeMap<(journal::StageId, u32), StageAppend>,
     stage: Option<Arc<journal::DiskFiles>>,
     marks: HashMap<(SnId, ExtentId, TimeSec), Marks>,
+}
+
+type ExtentName = (SnId, ExtentId, TimeSec);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StageAppend {
+    extent: ExtentName,
+    logical: ELoff,
+    first_record: ERoff,
+}
+
+/// A per-extent ordered SCN index. The retained staged SCNs span far less than
+/// half the wrapping SCN range, so deltas from `base` sort in logical order.
+#[derive(Default)]
+struct ScnIndex {
+    base: Option<Scn>,
+    entries: BTreeMap<u64, (Scn, ERoff)>,
+}
+
+impl ScnIndex {
+    fn insert(&mut self, scn: Scn, first_record: ERoff) -> Result<()> {
+        let Some(base) = self.base else {
+            self.base = Some(scn);
+            self.entries.insert(0, (scn, first_record));
+            return Ok(());
+        };
+        let delta = scn.number().wrapping_sub(base.number());
+        if delta <= i64::MAX as u64 {
+            return self.insert_delta(delta, scn, first_record);
+        }
+        if scn.compare(base) != std::cmp::Ordering::Less {
+            return Err(Error::new("staged extent SCN span exceeds the comparison window"));
+        }
+
+        let mut rebased = BTreeMap::new();
+        rebased.insert(0, (scn, first_record));
+        for (_, (old_scn, old_record)) in &self.entries {
+            let delta = old_scn.number().wrapping_sub(scn.number());
+            if delta > i64::MAX as u64 {
+                return Err(Error::new("staged extent SCN span exceeds the comparison window"));
+            }
+            rebased.insert(delta, (*old_scn, *old_record));
+        }
+        self.base = Some(scn);
+        self.entries = rebased;
+        Ok(())
+    }
+
+    fn insert_delta(&mut self, delta: u64, scn: Scn, first_record: ERoff) -> Result<()> {
+        if let Some((old_scn, old_record)) = self.entries.get(&delta) {
+            if *old_scn != scn || *old_record != first_record {
+                return Err(Error::new("staged extent has conflicting entries for one SCN"));
+            }
+            return Ok(());
+        }
+        self.entries.insert(delta, (scn, first_record));
+        Ok(())
+    }
+
+    fn get(&self, scn: Scn) -> Option<ERoff> {
+        let base = self.base?;
+        let delta = scn.number().wrapping_sub(base.number());
+        if delta > i64::MAX as u64 {
+            return None;
+        }
+        self.entries.get(&delta).map(|(_, first_record)| *first_record)
+    }
+
+    fn at_or_before(&self, scn: Scn) -> Option<ERoff> {
+        let base = self.base?;
+        let delta = scn.number().wrapping_sub(base.number());
+        if delta > i64::MAX as u64 {
+            return None;
+        }
+        self.entries.range(..=delta).next_back().map(|(_, (_, first_record))| *first_record)
+    }
+
+    fn remove(&mut self, scn: Scn) -> Option<ERoff> {
+        let base = self.base?;
+        let delta = scn.number().wrapping_sub(base.number());
+        if delta > i64::MAX as u64 {
+            return None;
+        }
+        let removed = self.entries.remove(&delta).map(|(_, first_record)| first_record);
+        if self.entries.is_empty() {
+            self.base = None;
+        } else if delta == 0 {
+            let old = std::mem::take(&mut self.entries);
+            let new_base = old.first_key_value().expect("nonempty SCN index").1.0;
+            self.base = Some(new_base);
+            for (_, (scn, first_record)) in old {
+                let delta = scn.number().wrapping_sub(new_base.number());
+                self.entries.insert(delta, (scn, first_record));
+            }
+        }
+        removed
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -627,9 +739,100 @@ impl Extents {
             extents: Vec::new(),
             at: HashMap::new(),
             appends: Vec::new(),
+            stage_index: BTreeMap::new(),
             stage: None,
             marks: HashMap::new(),
         }
+    }
+
+    fn remove_appends(&mut self, mut remove: impl FnMut(&Append) -> bool) {
+        let appends = std::mem::take(&mut self.appends);
+        let mut kept = Vec::with_capacity(appends.len());
+        for append in appends {
+            if remove(&append) {
+                if let Some(stage) = append.stage {
+                    self.stage_index.remove(&(stage.file, stage.offset));
+                }
+                if let (Some(scn), Some(extent)) = (append.scn, self.extents.get_mut(append.extent))
+                {
+                    extent.scn_first.remove(scn);
+                }
+            } else {
+                kept.push(append);
+            }
+        }
+        self.appends = kept;
+    }
+
+    fn index_staged_append(
+        &mut self,
+        place: usize,
+        stage: journal::StageRef,
+        scn: Scn,
+        logical: ELoff,
+        first_record: ERoff,
+    ) -> Result<()> {
+        let extent = self
+            .extents
+            .get(place)
+            .ok_or_else(|| Error::new("staged append extent index is out of range"))?;
+        let value = StageAppend {
+            extent: (extent.sn_id, extent.id, extent.created),
+            logical,
+            first_record,
+        };
+        let key = (stage.file, stage.offset);
+        if self.stage_index.get(&key).is_some_and(|existing| *existing != value) {
+            return Err(Error::new("stage location is already indexed for a different append"));
+        }
+        self.extents[place].scn_first.insert(scn, first_record)?;
+        self.stage_index.insert(key, value);
+        Ok(())
+    }
+
+    fn unindex_staged_append(
+        &mut self,
+        place: usize,
+        stage: Option<journal::StageRef>,
+        scn: Option<Scn>,
+    ) {
+        if let Some(stage) = stage {
+            self.stage_index.remove(&(stage.file, stage.offset));
+        }
+        if let (Some(scn), Some(extent)) = (scn, self.extents.get_mut(place)) {
+            extent.scn_first.remove(scn);
+        }
+    }
+
+    #[allow(dead_code)]
+    fn staged_append_at(&self, file: journal::StageId, offset: u32) -> Option<StageAppend> {
+        self.stage_index.get(&(file, offset)).copied()
+    }
+
+    #[allow(dead_code)]
+    fn first_record_at_scn(
+        &self,
+        sn: SnId,
+        id: ExtentId,
+        created: TimeSec,
+        scn: Scn,
+    ) -> Option<ERoff> {
+        let place = *self.at.get(&(sn, id))?;
+        let extent = &self.extents[place];
+        (extent.created == created).then(|| extent.scn_first.get(scn)).flatten()
+    }
+
+    #[allow(dead_code)]
+    fn first_record_at_or_before_scn(
+        &self,
+        sn: SnId,
+        id: ExtentId,
+        created: TimeSec,
+        scn: Scn,
+    ) -> Option<ERoff> {
+        let place = *self.at.get(&(sn, id))?;
+        let extent = &self.extents[place];
+        (extent.created == created).then(|| extent.scn_first.at_or_before(scn)).flatten()
     }
 
     fn sn_ids(&self) -> Vec<SnId> {
@@ -750,6 +953,7 @@ impl Extents {
                 logical_end: state.logical_end,
                 records: state.records,
                 open_record: state.open_record,
+                scn_first: ScnIndex::default(),
             });
             self.at.insert((state.sn, state.id), place);
             place
@@ -808,6 +1012,7 @@ impl Extents {
         created: TimeSec,
         logical: ELoff,
         first_record: ERoff,
+        stage: Option<journal::StageRef>,
     ) -> Result<()> {
         let place = *self
             .at
@@ -816,16 +1021,25 @@ impl Extents {
         if self.extents[place].created != created {
             return Err(Error::new("written append has the wrong creation second"));
         }
-        let append = self
-            .appends
-            .iter_mut()
-            .find(|append| {
-                append.extent == place
-                    && append.logical == logical
-                    && append.first_record == first_record
-            })
-            .ok_or_else(|| Error::new("written append metadata disappeared"))?;
-        append.written = true;
+        let (old_stage, scn) = {
+            let append = self
+                .appends
+                .iter_mut()
+                .find(|append| {
+                    append.extent == place
+                        && append.logical == logical
+                        && append.first_record == first_record
+                })
+                .ok_or_else(|| Error::new("written append metadata disappeared"))?;
+            let old_stage = append.stage;
+            append.stage = stage;
+            append.written = true;
+            (old_stage, append.scn)
+        };
+        self.unindex_staged_append(place, old_stage, scn);
+        if let (Some(scn), Some(stage)) = (scn, stage) {
+            self.index_staged_append(place, stage, scn, logical, first_record)?;
+        }
         let next = self.advance(place, true)?;
         self.marks.entry((sn, id, created)).or_default().written = next;
         Ok(())
@@ -915,7 +1129,7 @@ impl Extents {
         common::scn::merge(record.scn)?;
         let place = self.apply_state(state)?;
         if record.op == Op::EnJDelete && state.deletion.retired() {
-            self.appends.retain(|append| append.extent != place);
+            self.remove_appends(|append| append.extent == place);
         }
         Ok(())
     }
@@ -928,11 +1142,13 @@ impl Extents {
         let first_record = ERoff::new(input.u32()?);
         let holds = input.holds()?;
         let count = input.u32()? as usize;
-        let stage_body_len = record
-            .stage
-            .len
-            .checked_sub(4)
-            .ok_or_else(|| Error::new("EN append stage range lacks its length prefix"))?;
+        let stage_overhead = journal::STAGE_PREFIX
+            .checked_add(record.metadata.len())
+            .and_then(|len| len.checked_add(journal::STAGE_TAG))
+            .ok_or_else(|| Error::new("EN stage append overhead overflow"))?;
+        let stage_body_len = (record.stage.len as usize)
+            .checked_sub(stage_overhead)
+            .ok_or_else(|| Error::new("EN append stage frame is shorter than its header"))?;
         let stage_ad: Arc<[u8]> = Arc::from(record.metadata.clone());
         let mut blocks = Vec::with_capacity(count);
         for _ in 0..count {
@@ -946,7 +1162,7 @@ impl Extents {
             let rel = input.u32()?;
             let len = input.u32()?;
             let end = u64::from(rel) + u64::from(len);
-            if end > u64::from(stage_body_len) {
+            if end > stage_body_len as u64 {
                 return Err(Error::new("append block extends past its stage range"));
             }
             blocks.push(Encrypted {
@@ -959,6 +1175,7 @@ impl Extents {
                 stage: Some(record.stage),
                 stage_tag: record.stage_tag,
                 stage_ad: Some(Arc::clone(&stage_ad)),
+                stage_timestamp: Some(record.scn.time_sec()),
                 stage_part: Some((rel, len)),
             });
         }
@@ -968,19 +1185,22 @@ impl Extents {
         if state.deletion.retired() {
             return Err(Error::new("journal appends to a retired EN extent"));
         }
-        self.appends.retain(|a| {
-            !(a.extent == place && a.logical == logical && a.first_record == first_record)
+        self.remove_appends(|a| {
+            a.extent == place && a.logical == logical && a.first_record == first_record
         });
         self.appends.push(Append {
             extent: place,
             offset,
             logical,
             first_record,
+            scn: Some(record.scn),
+            stage: Some(record.stage),
             holds,
             written: record.written,
             quorum: false,
             blocks,
         });
+        self.index_staged_append(place, record.stage, record.scn, logical, first_record)?;
         let append = self.appends.last().expect("recovered append");
         let end = Mark {
             logical: append.logical.plus(append.holds.logical)?,
@@ -1039,7 +1259,7 @@ impl Extents {
         self.extras.transition(key, &mut extent.deletion, now, retention, hard, maximum)?;
         if hard && !extent.deletion.retired() {
             assert!(self.extras.reclaim(&key, &mut extent.deletion, now));
-            self.appends.retain(|append| append.extent != place);
+            self.remove_appends(|append| append.extent == place);
         }
         Ok(())
     }
@@ -1067,6 +1287,7 @@ impl Extents {
             logical_end: ELoff::ZERO,
             records: ERoff::ZERO,
             open_record: false,
+            scn_first: ScnIndex::default(),
         });
         let place = self.extents.len() - 1;
         self.at.insert((sn, id), place);
@@ -1136,6 +1357,7 @@ impl Extents {
         appending: &AppendBlock,
         cap: ECoff,
         stage: Option<&journal::DiskFiles>,
+        scn: Scn,
     ) -> Result<Took> {
         let logical_size = appending.holds.logical;
         let place = self.place(appending.sn, appending.extent, appending.created)?;
@@ -1252,6 +1474,8 @@ impl Extents {
             offset,
             logical: logical_offset,
             first_record,
+            scn: Some(scn),
+            stage: None,
             holds: appending.holds,
             written: false,
             quorum: false,
@@ -1269,6 +1493,7 @@ impl Extents {
         process: &Process,
         appending: &AppendBlock,
         stage: Option<&journal::DiskFiles>,
+        scn: Scn,
     ) -> Result<Written> {
         let logical_size = appending.holds.logical;
         let place = self.place(appending.sn, appending.extent, appending.created)?;
@@ -1291,6 +1516,9 @@ impl Extents {
         if let Some(existing) = self.appends.iter().find(|a| {
             a.extent == place && a.logical == logical_offset && a.first_record == first_record
         }) {
+            if existing.scn != Some(scn) {
+                return Err(Error::new("replicated append retry has a different SCN"));
+            }
             Self::check_retry(
                 existing,
                 appending,
@@ -1364,6 +1592,8 @@ impl Extents {
             offset,
             logical: logical_offset,
             first_record,
+            scn: Some(scn),
+            stage: None,
             holds: appending.holds,
             written: false,
             quorum: false,
@@ -1436,7 +1666,7 @@ impl Extents {
             )));
         }
 
-        self.appends.retain(|append| append.extent != place || append.logical < above);
+        self.remove_appends(|append| append.extent == place && append.logical >= above);
         let extent = &mut self.extents[place];
         extent.sealed = true;
         extent.end = length;
@@ -1692,20 +1922,36 @@ impl Disk {
         event: Option<(Vec<u8>, Vec<u8>)>,
         done: impl FnOnce(Result<()>) + Send + 'static,
     ) {
-        let Some(storage) = self.storage.read().expect("disk storage").clone() else {
+        if self.storage.read().expect("disk storage").is_none() {
             done(Ok(()));
             return;
-        };
-        let Some((metadata, stage)) = event else {
-            done(Err(Error::new("missing EN journal event")));
-            return;
-        };
+        }
         let scn = match common::scn::next() {
             Ok(scn) => scn,
             Err(error) => {
                 done(Err(error));
                 return;
             }
+        };
+        self.persist_record_at(scn, op, event, move |result| {
+            done(result.map(|_| ()));
+        });
+    }
+
+    fn persist_record_at(
+        &self,
+        scn: Scn,
+        op: Op,
+        event: Option<(Vec<u8>, Vec<u8>)>,
+        done: impl FnOnce(Result<Option<journal::StageRef>>) + Send + 'static,
+    ) {
+        let Some(storage) = self.storage.read().expect("disk storage").clone() else {
+            done(Ok(None));
+            return;
+        };
+        let Some((metadata, stage)) = event else {
+            done(Err(Error::new("missing EN journal event")));
+            return;
         };
         if let Err(error) = storage.submit(scn, op, metadata, stage, done) {
             logw!("could not queue EN journal record", "{error}");
@@ -1948,6 +2194,17 @@ impl Disk {
         // transition. A later append must not leak into this record's extent totals.
         let captured = {
             let mut held = self.held.lock().expect("extents");
+            let scn = if storage.is_some() {
+                match common::scn::next() {
+                    Ok(scn) => scn,
+                    Err(error) => {
+                        reply.send(bad(error));
+                        return Ok(());
+                    }
+                }
+            } else {
+                Scn::new(0)
+            };
             match held.take(
                 &self.daily_cache,
                 &self.extent_cache,
@@ -1955,8 +2212,22 @@ impl Disk {
                 &appending,
                 cap,
                 storage.as_deref(),
+                scn,
             ) {
                 Ok(took) => {
+                    let append_scn = if let Took::Landed(landed) = &took {
+                        let place = held.at[&(appending.sn, appending.extent)];
+                        held.appends
+                            .iter()
+                            .find(|append| {
+                                append.extent == place
+                                    && append.logical == landed.logical
+                                    && append.first_record == landed.first_record
+                            })
+                            .and_then(|append| append.scn)
+                    } else {
+                        None
+                    };
                     let event = match (&took, storage.is_some()) {
                         (Took::Landed(landed), true) => {
                             match held.journal_append(
@@ -1989,12 +2260,12 @@ impl Disk {
                         }
                         _ => None,
                     };
-                    Ok((took, event))
+                    Ok((took, event, append_scn))
                 }
                 Err(error) => Err(error),
             }
         };
-        let (took, event) = match captured {
+        let (took, event, append_scn) = match captured {
             Ok(value) => value,
             Err(error) => {
                 reply.send(bad(error));
@@ -2044,6 +2315,7 @@ impl Disk {
                 return Ok(());
             }
         };
+        let scn = append_scn.ok_or_else(|| Error::new("landed EN append has no SCN"))?;
         reply.about(format_args!(
             "extent {} of sn {},offset {},bytes {length},records {}",
             appending.extent, appending.sn, landed.logical, landed.records
@@ -2121,14 +2393,15 @@ impl Disk {
         let local = Arc::clone(&quorum);
         let local_disk = Arc::clone(self);
         let local_key = (sn, extent, created, logical, first_record);
-        self.persist_record(Op::EnJAppend, event, move |result| {
+        self.persist_record_at(scn, Op::EnJAppend, event, move |result| {
             let written = match result {
-                Ok(()) => match local_disk.held.lock().expect("extents").mark_written(
+                Ok(stage_ref) => match local_disk.held.lock().expect("extents").mark_written(
                     local_key.0,
                     local_key.1,
                     local_key.2,
                     local_key.3,
                     local_key.4,
+                    stage_ref,
                 ) {
                     Ok(()) => true,
                     Err(error) => {
@@ -2150,7 +2423,7 @@ impl Disk {
         onward.record_offset = Some(landed.first_record);
 
         for (en, disk) in others {
-            let write_request = onward.request(en, disk, Op::WriteAppend);
+            let write_request = onward.request_with_scn(en, disk, scn);
             let identity = format!("EN{en}");
             let waiting = Arc::clone(&quorum);
             if let Err(e) = process.ask(&identity, &write_request, move |answer| {
@@ -2189,6 +2462,7 @@ impl Disk {
 
     #[cfg(test)]
     fn take(&self, process: &Process, appending: &AppendBlock, cap: ECoff) -> Result<Took> {
+        let scn = Scn::new(0);
         let took = self.held.lock().expect("extents").take(
             &self.daily_cache,
             &self.extent_cache,
@@ -2196,6 +2470,7 @@ impl Disk {
             appending,
             cap,
             None,
+            scn,
         )?;
         if let Took::Landed(_) = &took {
             self.appends.fetch_add(1, Ordering::Relaxed);
@@ -2218,12 +2493,14 @@ impl Disk {
             return bad(error);
         }
         let storage = self.storage.read().expect("disk storage").clone();
+        let scn = Scn::new(0);
         match self.held.lock().expect("extents").write_append(
             &self.daily_cache,
             &self.extent_cache,
             process,
             &appending,
             storage.as_deref(),
+            scn,
         ) {
             Err(e) => return Resp::error(Status::BadRequest, e.to_string()),
             Ok(Written::Already) => return Resp::ok(),
@@ -2237,7 +2514,13 @@ impl Disk {
         Resp::ok()
     }
 
-    fn write_wait(self: &Arc<Self>, process: &Process, appending: AppendBlock, reply: Reply) {
+    fn write_wait(
+        self: &Arc<Self>,
+        process: &Process,
+        appending: AppendBlock,
+        scn: Scn,
+        reply: Reply,
+    ) {
         if let Err(error) = Self::check_size(&appending, process.cluster.extents.max_append_bytes) {
             reply.send(bad(error));
             return;
@@ -2256,6 +2539,10 @@ impl Disk {
                 return;
             }
         };
+        if let Err(error) = common::scn::merge(scn) {
+            reply.send(bad(error));
+            return;
+        }
         let sn = appending.sn;
         let extent = appending.extent;
         let created = appending.created;
@@ -2268,6 +2555,7 @@ impl Disk {
                 process,
                 &appending,
                 storage.as_deref(),
+                scn,
             ) {
                 Err(error) => Err(error),
                 Ok(written) => {
@@ -2317,14 +2605,15 @@ impl Disk {
         let disk = Arc::clone(self);
         let bytes = appending.bytes.len() as u64;
         let records = appending.holds.records;
-        self.persist_record(Op::EnJAppend, event, move |result| match result {
-            Ok(()) => {
+        self.persist_record_at(scn, Op::EnJAppend, event, move |result| match result {
+            Ok(stage_ref) => {
                 let marked = disk.held.lock().expect("extents").mark_written(
                     sn,
                     extent,
                     created,
                     logical,
                     first_record,
+                    stage_ref,
                 );
                 if let Err(error) = marked {
                     logw!("could not advance replica EN written watermark", "{}", error);
@@ -2858,9 +3147,12 @@ impl EN {
     }
 
     fn write_wait(&self, process: &Process, request: Req, reply: Reply) {
-        let (en, disk_id, appending) = match AppendBlock::of(&request) {
+        let (en, disk_id, scn, appending) = match AppendBlock::of_with_scn(&request) {
             Ok(res) => res,
             Err(e) => return reply.send(Resp::error(Status::BadRequest, e.to_string())),
+        };
+        let Some(scn) = scn else {
+            return reply.send(Resp::error(Status::BadRequest, "write-append lacks primary SCN"));
         };
         let mine = EnId::new(process.entry.number());
         if en != mine {
@@ -2870,7 +3162,7 @@ impl EN {
             ));
         }
         match self.disk(disk_id) {
-            Ok(disk) => disk.write_wait(process, appending, reply),
+            Ok(disk) => disk.write_wait(process, appending, scn, reply),
             Err(e) => reply.send(Resp::error(Status::BadRequest, e.to_string())),
         }
     }
@@ -3355,7 +3647,8 @@ mod tests {
                     &replica._daily_cache,
                     &other.extent_cache,
                     &process,
-                    &replicated.extents[0]
+                    &replicated.extents[0],
+                    None,
                 )
                 .is_err()
         );
@@ -3786,11 +4079,23 @@ mod tests {
         let mut same = block(0, 1, b"once\n");
         same.logical_offset = Some(ELoff::ZERO);
         same.record_offset = Some(ERoff::ZERO);
-        let result =
-            held.write_append(&en._daily_cache, &disk.extent_cache, &testing::process(), &same);
+        let result = held.write_append(
+            &en._daily_cache,
+            &disk.extent_cache,
+            &testing::process(),
+            &same,
+            None,
+            Scn::new(0),
+        );
         assert!(matches!(result, Ok(Written::Stored)));
-        let result =
-            held.write_append(&en._daily_cache, &disk.extent_cache, &testing::process(), &same);
+        let result = held.write_append(
+            &en._daily_cache,
+            &disk.extent_cache,
+            &testing::process(),
+            &same,
+            None,
+            Scn::new(0),
+        );
         assert!(matches!(result, Ok(Written::Already)));
     }
 

@@ -3,11 +3,15 @@
 //! Allocation never reads a clock. Only the periodic synchronizer sets/clears
 //! the stall flag. Small merges may temporarily run beyond the UTC allowance;
 //! the next synchronization detects that. SCNs order changes, not commits.
+use crate::time::TimeSec;
 use crate::{Error, Result};
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// SCNs are measured in nanosecond ticks.
+pub const SCN_NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -18,6 +22,10 @@ impl Scn {
     }
     pub const fn number(self) -> u64 {
         self.0
+    }
+    /// The UTC second represented by this nanosecond-based system change number.
+    pub const fn time_sec(self) -> TimeSec {
+        TimeSec::new(self.0 / SCN_NANOS_PER_SECOND)
     }
     /// Compare by signed eight-byte wrapping subtraction. Callers must keep
     /// the whole range being compared within u64::MAX / 2 ticks. Older values

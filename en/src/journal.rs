@@ -22,6 +22,8 @@ const STAGE_MAGIC: &[u8; 8] = b"DLAWENS1";
 const ID_MAGIC: &[u8; 8] = b"DLAWENI1";
 const HEADER_LEN: usize = 40;
 const HEADER: u64 = HEADER_LEN as u64;
+pub(crate) const STAGE_PREFIX: usize = 20;
+pub(crate) const STAGE_TAG: usize = 16;
 const FILE_LIMIT: u64 = 1u64 << 32;
 const STAGE_SLOTS: usize = 16 * 1024;
 const NO_STAGE_FILE: StageId = StageId(u16::MAX);
@@ -63,11 +65,18 @@ struct StageFile {
 
 type StageTable = Box<[Option<StageFile>; STAGE_SLOTS]>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StageRef {
     pub file: StageId,
     pub offset: u32,
     pub len: u32,
+}
+
+pub(crate) struct StageData {
+    pub timestamp: TimeSec,
+    pub metadata: Vec<u8>,
+    pub cipher: Vec<u8>,
+    pub tag: [u8; STAGE_TAG],
 }
 
 #[derive(Debug, Clone)]
@@ -82,13 +91,14 @@ pub(crate) struct Record {
     pub end: u64,
 }
 
-type Done = Box<dyn FnOnce(Result<()>) + Send + 'static>;
+type Done = Box<dyn FnOnce(Result<Option<StageRef>>) + Send + 'static>;
 
 struct Request {
     scn: Scn,
     op: Op,
     metadata: Vec<u8>,
     stage: Vec<u8>,
+    stage_ref: Option<StageRef>,
     done: Done,
 }
 
@@ -574,8 +584,8 @@ impl DiskFiles {
                 }
                 continue;
             }
-            if record.op == Op::EnJAppend && record.stage.len < 4 {
-                return Err(Error::new("EN append stage range lacks its length prefix"));
+            if record.op == Op::EnJAppend && record.stage.len < (STAGE_PREFIX + STAGE_TAG) as u32 {
+                return Err(Error::new("EN append stage range lacks its header or tag"));
             }
             if record.stage.file == NO_STAGE_FILE {
                 return Err(Error::new("EN journal stage reference has no file"));
@@ -586,8 +596,13 @@ impl DiskFiles {
                 return Err(Error::new("EN journal refers past a stage file"));
             }
             if !record.written && record.op == Op::EnJAppend {
-                let mut stage_bytes = vec![0; record.stage.len as usize];
-                read_exact_at(&stage_file.file, &mut stage_bytes, u64::from(record.stage.offset))?;
+                let stage_data = read_stage_frame(&stage_file.file, record.stage)?;
+                if stage_data.metadata != record.metadata
+                    || stage_data.tag != record.stage_tag
+                    || stage_data.timestamp != record.scn.time_sec()
+                {
+                    return Err(Error::new("EN stage header disagrees with its journal record"));
+                }
                 let daily = key_lookup(stage_file.created)?;
                 let (key, nonce) = crypto::derive_stage_secrets(
                     &daily,
@@ -597,19 +612,8 @@ impl DiskFiles {
                     record.stage.file.get(),
                     record.stage.offset,
                 );
-                let plain = crypto::decrypt_block(
-                    &key,
-                    &nonce,
-                    &record.metadata,
-                    &stage_bytes,
-                    &record.stage_tag,
-                )?;
-                if plain.len() < 4
-                    || usize::try_from(u32::from_le_bytes(plain[..4].try_into().unwrap())).ok()
-                        != Some(plain.len() - 4)
-                {
-                    return Err(Error::new("invalid EN append stage length prefix"));
-                }
+                let aad = stage_aad(stage_data.timestamp, &stage_data.metadata);
+                crypto::decrypt_block(&key, &nonce, &aad, &stage_data.cipher, &stage_data.tag)?;
                 dirty_stage.insert(record.stage.file);
             }
         }
@@ -656,9 +660,9 @@ impl DiskFiles {
         op: Op,
         metadata: Vec<u8>,
         stage: Vec<u8>,
-        done: impl FnOnce(Result<()>) + Send + 'static,
+        done: impl FnOnce(Result<Option<StageRef>>) + Send + 'static,
     ) -> Result<()> {
-        let request = Request { scn, op, metadata, stage, done: Box::new(done) };
+        let request = Request { scn, op, metadata, stage, stage_ref: None, done: Box::new(done) };
         match self.tx.send(request) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -668,7 +672,7 @@ impl DiskFiles {
         }
     }
 
-    pub(crate) fn read_stage(&self, loc: StageRef) -> Result<Vec<u8>> {
+    pub(crate) fn read_stage(&self, loc: StageRef) -> Result<StageData> {
         if loc.file == NO_STAGE_FILE || loc.len == 0 {
             return Err(Error::new("invalid EN stage reference"));
         }
@@ -682,9 +686,7 @@ impl DiskFiles {
             .and_then(Option::as_ref)
             .map(|stage| Arc::clone(&stage.file))
             .ok_or_else(|| Error::new(format!("missing EN stage file {:?}", loc.file)))?;
-        let mut bytes = vec![0; loc.len as usize];
-        read_exact_at(&file, &mut bytes, u64::from(loc.offset))?;
-        Ok(bytes)
+        read_stage_frame(&file, loc)
     }
 
     pub(crate) fn stage_time(&self, id: StageId) -> Result<TimeSec> {
@@ -748,34 +750,29 @@ fn write_loop(
         let mut entries = Vec::with_capacity(jobs.len());
         let mut build_error = None;
 
-        for job in &jobs {
+        for job in &mut jobs {
             let mut stage_tag = [0; 16];
             let stage_loc = if job.stage.is_empty() && job.op != Op::EnJAppend {
                 // Empty metadata-only records do not pin an arbitrary stage file.
                 StageRef { file: NO_STAGE_FILE, offset: 0, len: 0 }
             } else {
-                let body_len = match u32::try_from(job.stage.len()) {
-                    Ok(len) => len,
-                    Err(_) => {
-                        build_error = Some("stage append body exceeds u32".into());
-                        break;
-                    }
-                };
-                let Some(plain_len) = job.stage.len().checked_add(4) else {
-                    build_error = Some("stage append length overflow".into());
+                let timestamp = job.scn.time_sec();
+                let Some(frame_len) = STAGE_PREFIX
+                    .checked_add(job.metadata.len())
+                    .and_then(|len| len.checked_add(job.stage.len()))
+                    .and_then(|len| len.checked_add(STAGE_TAG))
+                else {
+                    build_error = Some("stage append frame length overflow".into());
                     break;
                 };
-                let mut stage_plain = Vec::with_capacity(plain_len);
-                stage_plain.extend_from_slice(&body_len.to_le_bytes());
-                stage_plain.extend_from_slice(&job.stage);
-                let len = match u32::try_from(stage_plain.len()) {
+                let len = match u32::try_from(frame_len) {
                     Ok(len) => len,
                     Err(_) => {
                         build_error = Some("stage append exceeds u32".into());
                         break;
                     }
                 };
-                match stage.reserve(stage_plain.len(), &key_lookup) {
+                match stage.reserve(frame_len, &key_lookup) {
                     Ok((id, offset, stage_time, file)) => {
                         let daily = match key_lookup(stage_time) {
                             Ok(key) => key,
@@ -792,9 +789,17 @@ fn write_loop(
                             id.get(),
                             offset,
                         );
-                        let (cipher, tag) =
-                            crypto::encrypt_block(&key, &nonce, &job.metadata, &stage_plain);
-                        if let Err(error) = add_write(&mut stage_writes, id, offset, &file, &cipher)
+                        let aad = stage_aad(timestamp, &job.metadata);
+                        let (cipher, tag) = crypto::encrypt_block(&key, &nonce, &aad, &job.stage);
+                        let frame =
+                            match encode_stage_frame(timestamp, &job.metadata, &cipher, &tag) {
+                                Ok(frame) => frame,
+                                Err(error) => {
+                                    build_error = Some(error.to_string());
+                                    break;
+                                }
+                            };
+                        if let Err(error) = add_write(&mut stage_writes, id, offset, &file, &frame)
                         {
                             build_error = Some(error.to_string());
                             break;
@@ -809,6 +814,7 @@ fn write_loop(
                     }
                 }
             };
+            job.stage_ref = (stage_loc.file != NO_STAGE_FILE).then_some(stage_loc);
             entries.push(JournalEntry {
                 scn: job.scn,
                 op: job.op,
@@ -982,7 +988,11 @@ fn sync_loop(
             }
         };
         for job in jobs {
-            (job.done)(result.as_ref().map(|_| ()).map_err(|error| Error::new(error.to_string())));
+            let response = result
+                .as_ref()
+                .map(|_| job.stage_ref)
+                .map_err(|error| Error::new(error.to_string()));
+            (job.done)(response);
         }
     }
 }
@@ -1266,6 +1276,71 @@ fn read_journal(file: &File, id: u32, last_file: bool) -> Result<(Vec<Record>, u
         at = end;
     }
     Ok((records, at))
+}
+
+pub(crate) fn stage_aad(timestamp: TimeSec, metadata: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(8 + metadata.len());
+    aad.extend_from_slice(&timestamp.number().to_le_bytes());
+    aad.extend_from_slice(metadata);
+    aad
+}
+
+fn encode_stage_frame(
+    timestamp: TimeSec,
+    metadata: &[u8],
+    cipher: &[u8],
+    tag: &[u8; STAGE_TAG],
+) -> Result<Vec<u8>> {
+    let metadata_len =
+        u32::try_from(metadata.len()).map_err(|_| Error::new("EN stage metadata exceeds u32"))?;
+    let rest_len = 8usize
+        .checked_add(4)
+        .and_then(|len| len.checked_add(metadata.len()))
+        .and_then(|len| len.checked_add(cipher.len()))
+        .and_then(|len| len.checked_add(STAGE_TAG))
+        .ok_or_else(|| Error::new("EN stage frame length overflow"))?;
+    let frame_len =
+        u32::try_from(rest_len).map_err(|_| Error::new("EN stage frame exceeds u32"))?;
+    let mut frame = Vec::with_capacity(8 + rest_len);
+    frame.extend_from_slice(&frame_len.to_le_bytes());
+    frame.extend_from_slice(&(!frame_len).to_le_bytes());
+    frame.extend_from_slice(&timestamp.number().to_le_bytes());
+    frame.extend_from_slice(&metadata_len.to_le_bytes());
+    frame.extend_from_slice(metadata);
+    frame.extend_from_slice(cipher);
+    frame.extend_from_slice(tag);
+    Ok(frame)
+}
+
+fn read_stage_frame(file: &File, loc: StageRef) -> Result<StageData> {
+    if loc.len < (STAGE_PREFIX + STAGE_TAG) as u32 {
+        return Err(Error::new("truncated EN stage frame"));
+    }
+    let mut prefix = [0; STAGE_PREFIX];
+    read_exact_at(file, &mut prefix, u64::from(loc.offset))?;
+    let frame_len = u32::from_le_bytes(prefix[..4].try_into().unwrap());
+    let inverse = u32::from_le_bytes(prefix[4..8].try_into().unwrap());
+    if inverse != !frame_len || u64::from(frame_len) + 8 != u64::from(loc.len) {
+        return Err(Error::new("invalid EN stage frame length"));
+    }
+    let timestamp = TimeSec::new(u64::from_le_bytes(prefix[8..16].try_into().unwrap()));
+    let metadata_len = u32::from_le_bytes(prefix[16..20].try_into().unwrap()) as usize;
+    let metadata_end = STAGE_PREFIX
+        .checked_add(metadata_len)
+        .ok_or_else(|| Error::new("EN stage metadata length overflow"))?;
+    let tag_start = (loc.len as usize)
+        .checked_sub(STAGE_TAG)
+        .ok_or_else(|| Error::new("truncated EN stage tag"))?;
+    if metadata_end > tag_start {
+        return Err(Error::new("EN stage metadata extends past its frame"));
+    }
+    let mut metadata = vec![0; metadata_len];
+    read_exact_at(file, &mut metadata, u64::from(loc.offset) + STAGE_PREFIX as u64)?;
+    let mut cipher = vec![0; tag_start - metadata_end];
+    read_exact_at(file, &mut cipher, u64::from(loc.offset) + metadata_end as u64)?;
+    let mut tag = [0; STAGE_TAG];
+    read_exact_at(file, &mut tag, u64::from(loc.offset) + tag_start as u64)?;
+    Ok(StageData { timestamp, metadata, cipher, tag })
 }
 
 fn write_all_at(file: &File, mut bytes: &[u8], mut at: u64) -> io::Result<()> {
