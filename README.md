@@ -7,8 +7,9 @@ to costs. Automatic compression and encryption. Objects can contain up to 2^64 r
 Unfinished. Do not depend on. Expect frequent backward-incompatible changes. Garbage 
 collection, data/metadata sync, replication, erasure coding, user accounts, caching, 
 ring balancing, keyed objects, compute et cetera still unimplemented. No hardening 
-done. You can see how I'm doing things, and planning on doing things, but I will 
-keep this single-person development until all the major pieces are in and working.
+done. I'm currently working on EN persistence. You can see how I'm doing things, and 
+planning on doing things, but I will keep this single-person development until all the 
+major pieces are in and working.
 
 Named after George DeLawson Lowry (b. 17 January 1880, Hagersville, Ontario;
 d. 1919, Buffalo, New York) — a piano teacher who
