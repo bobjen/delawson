@@ -502,6 +502,24 @@ fn put_holds(bytes: &mut Vec<u8>, holds: Holds) {
     put_u32(bytes, holds.records.get());
 }
 
+fn put_mark(bytes: &mut Vec<u8>, mark: Mark) {
+    put_u32(bytes, mark.logical.get());
+    put_u32(bytes, mark.records.get());
+}
+
+fn read_mark(input: &mut JournalRead<'_>) -> Result<Mark> {
+    Ok(Mark { logical: ELoff::new(input.u32()?), records: ERoff::new(input.u32()?) })
+}
+
+fn put_marks(bytes: &mut Vec<u8>, marks: Marks) {
+    put_mark(bytes, marks.written);
+    put_mark(bytes, marks.durable);
+}
+
+fn read_marks(input: &mut JournalRead<'_>) -> Result<Marks> {
+    Ok(Marks { written: read_mark(input)?, durable: read_mark(input)? })
+}
+
 struct JournalRead<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -600,6 +618,41 @@ fn read_extent_state(input: &mut JournalRead<'_>) -> Result<ExtentState> {
         records: ERoff::new(input.u32()?),
         retain_until: TimeSec::new(input.u64()?),
     })
+}
+
+fn journal_recovery_mark(record: &journal::Record) -> Result<Option<journal::RecoveryMark>> {
+    if !matches!(record.op, Op::EnJAppend | Op::EnJSeal) {
+        return Ok(None);
+    }
+    let mut input = JournalRead::new(&record.metadata);
+    let state = read_extent_state(&mut input)?;
+    let state_end = input.at;
+    let marks = read_marks(&mut input)?;
+    let after_marks = input.at;
+    let append_end = if record.op == Op::EnJAppend {
+        let _offset = input.u32()?;
+        let logical = ELoff::new(input.u32()?);
+        let first_record = ERoff::new(input.u32()?);
+        let holds = input.holds()?;
+        Some((logical.plus(holds.logical)?.get(), first_record.plus(holds.records)?.get()))
+    } else {
+        input.done()?;
+        None
+    };
+    let stage_metadata = if record.op == Op::EnJAppend {
+        let mut metadata = Vec::with_capacity(record.metadata.len() - (after_marks - state_end));
+        metadata.extend_from_slice(&record.metadata[..state_end]);
+        metadata.extend_from_slice(&record.metadata[after_marks..]);
+        Some(metadata)
+    } else {
+        None
+    };
+    Ok(Some(journal::RecoveryMark {
+        extent: (state.sn.get(), state.id.get(), state.created.number()),
+        written: (marks.written.logical.get(), marks.written.records.get()),
+        append_end,
+        stage_metadata,
+    }))
 }
 
 /// Where an append landed and what it numbered.
@@ -727,10 +780,24 @@ struct Mark {
     records: ERoff,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct Marks {
     written: Mark,
     durable: Mark,
+}
+
+struct JournalEvent {
+    /// Journal state, including the advisory written and durable marks.
+    metadata: Vec<u8>,
+    /// Stage header and AAD; deliberately excludes those advisory marks.
+    stage_metadata: Vec<u8>,
+    stage: Vec<u8>,
+}
+
+impl JournalEvent {
+    fn state(metadata: Vec<u8>) -> Self {
+        Self { metadata, stage_metadata: Vec::new(), stage: Vec::new() }
+    }
 }
 
 impl Extents {
@@ -848,7 +915,7 @@ impl Extents {
         sn: SnId,
         id: ExtentId,
         landed: Landed,
-    ) -> Result<(Vec<u8>, Vec<u8>)> {
+    ) -> Result<JournalEvent> {
         let place =
             *self.at.get(&(sn, id)).ok_or_else(|| Error::new("append extent disappeared"))?;
         let extent = &self.extents[place];
@@ -865,9 +932,9 @@ impl Extents {
         let key = (extent.sn_id, extent.id, extent.created);
         let retain_until = self.extras.get(&key).map_or(TimeSec::EPOCH, |extra| extra.retain_until);
 
-        let mut metadata = Vec::new();
+        let mut stage_metadata = Vec::new();
         put_extent_state(
-            &mut metadata,
+            &mut stage_metadata,
             ExtentState {
                 sn: extent.sn_id,
                 id: extent.id,
@@ -881,12 +948,15 @@ impl Extents {
                 retain_until,
             },
         );
-        put_u32(&mut metadata, append.offset.get());
-        put_u32(&mut metadata, append.logical.get());
-        put_u32(&mut metadata, append.first_record.get());
-        put_holds(&mut metadata, append.holds);
+        let mut metadata = stage_metadata.clone();
+        put_marks(&mut metadata, self.marks.get(&key).copied().unwrap_or_default());
+        let mut append_metadata = Vec::new();
+        put_u32(&mut append_metadata, append.offset.get());
+        put_u32(&mut append_metadata, append.logical.get());
+        put_u32(&mut append_metadata, append.first_record.get());
+        put_holds(&mut append_metadata, append.holds);
         put_u32(
-            &mut metadata,
+            &mut append_metadata,
             u32::try_from(append.blocks.len()).map_err(|_| Error::new("too many append blocks"))?,
         );
 
@@ -898,21 +968,23 @@ impl Extents {
                 .map_err(|_| Error::new("append stage data exceeds 4 GiB"))?;
             let len =
                 u32::try_from(bytes.len()).map_err(|_| Error::new("append block exceeds 4 GiB"))?;
-            put_u32(&mut metadata, block.logical.get());
-            put_u32(&mut metadata, block.first_record.get());
-            put_holds(&mut metadata, block.holds);
-            put_u64(&mut metadata, crc);
+            put_u32(&mut append_metadata, block.logical.get());
+            put_u32(&mut append_metadata, block.first_record.get());
+            put_holds(&mut append_metadata, block.holds);
+            put_u64(&mut append_metadata, crc);
             let (kind, width) = framing.wire();
-            metadata.push(kind);
-            put_u32(&mut metadata, width);
-            put_u32(&mut metadata, rel);
-            put_u32(&mut metadata, len);
+            append_metadata.push(kind);
+            put_u32(&mut append_metadata, width);
+            put_u32(&mut append_metadata, rel);
+            put_u32(&mut append_metadata, len);
             stage.extend_from_slice(&bytes);
         }
-        Ok((metadata, stage))
+        metadata.extend_from_slice(&append_metadata);
+        stage_metadata.extend_from_slice(&append_metadata);
+        Ok(JournalEvent { metadata, stage_metadata, stage })
     }
 
-    fn journal_state(&self, sn: SnId, id: ExtentId) -> Result<Vec<u8>> {
+    fn journal_state(&self, sn: SnId, id: ExtentId, include_marks: bool) -> Result<Vec<u8>> {
         let place = *self.at.get(&(sn, id)).ok_or_else(|| Error::new("extent disappeared"))?;
         let extent = &self.extents[place];
         let key = (extent.sn_id, extent.id, extent.created);
@@ -930,6 +1002,9 @@ impl Extents {
         };
         let mut metadata = Vec::new();
         put_extent_state(&mut metadata, state);
+        if include_marks {
+            put_marks(&mut metadata, self.marks.get(&key).copied().unwrap_or_default());
+        }
         Ok(metadata)
     }
 
@@ -1101,34 +1176,16 @@ impl Extents {
         Ok(())
     }
 
-    fn encode_durable(sn: SnId, id: ExtentId, created: TimeSec, mark: Mark) -> Vec<u8> {
-        let mut metadata = Vec::new();
-        put_u64(&mut metadata, sn.get());
-        put_u32(&mut metadata, id.get());
-        put_u64(&mut metadata, created.number());
-        put_u32(&mut metadata, mark.logical.get());
-        put_u32(&mut metadata, mark.records.get());
-        metadata
-    }
-
-    fn restore_durable(&mut self, record: journal::Record) -> Result<()> {
-        let mut input = JournalRead::new(&record.metadata);
-        let sn = SnId::new(input.u64()?);
-        let id = ExtentId::new(input.u32()?);
-        let created = TimeSec::new(input.u64()?);
-        let mark = Mark { logical: ELoff::new(input.u32()?), records: ERoff::new(input.u32()?) };
-        input.done()?;
-        common::scn::merge(record.scn)?;
-        self.apply_durable(sn, id, created, mark)?;
-        Ok(())
-    }
-
     fn restore_state(&mut self, record: journal::Record) -> Result<()> {
         let mut input = JournalRead::new(&record.metadata);
         let state = read_extent_state(&mut input)?;
+        let marks = if record.op == Op::EnJSeal { Some(read_marks(&mut input)?) } else { None };
         input.done()?;
         common::scn::merge(record.scn)?;
         let place = self.apply_state(state)?;
+        if let Some(marks) = marks {
+            self.apply_journal_marks(state.sn, state.id, state.created, marks)?;
+        }
         if record.op == Op::EnJDelete && state.deletion.retired() {
             self.remove_appends(|append| append.extent == place);
         }
@@ -1136,21 +1193,25 @@ impl Extents {
     }
 
     fn restore_append(&mut self, record: journal::Record) -> Result<()> {
+        let stage_metadata = journal_recovery_mark(&record)?
+            .and_then(|mark| mark.stage_metadata)
+            .ok_or_else(|| Error::new("EN append has no stage metadata"))?;
         let mut input = JournalRead::new(&record.metadata);
         let state = read_extent_state(&mut input)?;
+        let marks = read_marks(&mut input)?;
         let offset = ECoff::new(input.u32()?);
         let logical = ELoff::new(input.u32()?);
         let first_record = ERoff::new(input.u32()?);
         let holds = input.holds()?;
         let count = input.u32()? as usize;
         let stage_overhead = journal::STAGE_PREFIX
-            .checked_add(record.metadata.len())
+            .checked_add(stage_metadata.len())
             .and_then(|len| len.checked_add(journal::STAGE_TAG))
             .ok_or_else(|| Error::new("EN stage append overhead overflow"))?;
         let stage_body_len = (record.stage.len as usize)
             .checked_sub(stage_overhead)
             .ok_or_else(|| Error::new("EN append stage frame is shorter than its header"))?;
-        let stage_ad: Arc<[u8]> = Arc::from(record.metadata.clone());
+        let stage_ad: Arc<[u8]> = Arc::from(stage_metadata);
         let mut blocks = Vec::with_capacity(count);
         for _ in 0..count {
             let logical = ELoff::new(input.u32()?);
@@ -1186,6 +1247,7 @@ impl Extents {
         if state.deletion.retired() {
             return Err(Error::new("journal appends to a retired EN extent"));
         }
+        self.apply_journal_marks(state.sn, state.id, state.created, marks)?;
         self.remove_appends(|a| {
             a.extent == place && a.logical == logical && a.first_record == first_record
         });
@@ -1218,6 +1280,18 @@ impl Extents {
         let durable = self.advance(place, false)?;
         self.marks.entry(key).or_default().durable = durable;
         Ok(())
+    }
+
+    fn apply_journal_marks(
+        &mut self,
+        sn: SnId,
+        id: ExtentId,
+        created: TimeSec,
+        marks: Marks,
+    ) -> Result<()> {
+        let current = self.marks.entry((sn, id, created)).or_default();
+        current.written = current.written.max(marks.written);
+        self.apply_durable(sn, id, created, marks.durable)
     }
 
     fn delete_instance(
@@ -1903,6 +1977,7 @@ impl Disk {
             key_lookup,
             max_journal_bytes,
             checkpoint_count,
+            journal_recovery_mark,
         )?;
         {
             let mut held = self.held.lock().expect("extents");
@@ -1917,7 +1992,6 @@ impl Disk {
                 match record.op {
                     Op::EnJAppend => held.restore_append(record)?,
                     Op::EnJExtent | Op::EnJDelete | Op::EnJSeal => held.restore_state(record)?,
-                    Op::EnJDurable => held.restore_durable(record)?,
                     op => return Err(Error::new(format!("unsupported EN journal operation {op}"))),
                 }
             }
@@ -1953,7 +2027,7 @@ impl Disk {
     fn persist_record(
         &self,
         op: Op,
-        event: Option<(Vec<u8>, Vec<u8>)>,
+        event: Option<JournalEvent>,
         done: impl FnOnce(Result<()>) + Send + 'static,
     ) {
         if self.storage.read().expect("disk storage").is_none() {
@@ -1976,23 +2050,25 @@ impl Disk {
         &self,
         scn: Scn,
         op: Op,
-        event: Option<(Vec<u8>, Vec<u8>)>,
+        event: Option<JournalEvent>,
         done: impl FnOnce(Result<Option<journal::StageRef>>) + Send + 'static,
     ) {
         let Some(storage) = self.storage.read().expect("disk storage").clone() else {
             done(Ok(None));
             return;
         };
-        let Some((metadata, stage)) = event else {
+        let Some(event) = event else {
             done(Err(Error::new("missing EN journal event")));
             return;
         };
-        if let Err(error) = storage.submit(scn, op, metadata, stage, done) {
+        if let Err(error) =
+            storage.submit(scn, op, event.metadata, event.stage_metadata, event.stage, done)
+        {
             logw!("could not queue EN journal record", "{error}");
         }
     }
 
-    fn persist_durable(
+    fn notify_durable(
         self: &Arc<Self>,
         process: &Arc<Process>,
         peers: Vec<(EnId, DiskId)>,
@@ -2001,41 +2077,26 @@ impl Disk {
         created: TimeSec,
         mark: Mark,
     ) {
-        let metadata = Extents::encode_durable(sn, id, created, mark);
-        let process = Arc::clone(process);
-        self.persist_record(Op::EnJDurable, Some((metadata, Vec::new())), move |result| {
-            if let Err(error) = result {
-                logw!("local EN durable marker was not persisted", "{}", error);
-                return;
-            }
-            for (en, disk) in peers {
-                let request = durable_request(en, disk, sn, id, created, mark);
-                let identity = format!("EN{en}");
-                let target = identity.clone();
-                if let Err(error) = process.ask(&identity, &request, move |answer| {
-                    if answer.status != Status::Ok {
-                        logw!("EN durable marker was rejected", "en {target},{}", answer.status);
-                    }
-                }) {
-                    logw!("could not send EN durable marker", "en {identity},{error}");
+        for (en, disk) in peers {
+            let request = durable_request(en, disk, sn, id, created, mark);
+            let identity = format!("EN{en}");
+            let target = identity.clone();
+            if let Err(error) = process.ask(&identity, &request, move |answer| {
+                if answer.status != Status::Ok {
+                    logw!("EN durable update was rejected", "en {target},{}", answer.status);
                 }
+            }) {
+                logw!("could not send EN durable update", "en {identity},{error}");
             }
-        });
+        }
     }
 
     fn durable_wait(&self, sn: SnId, id: ExtentId, created: TimeSec, mark: Mark, reply: Reply) {
-        let metadata = Extents::encode_durable(sn, id, created, mark);
-        self.persist_record(
-            Op::EnJDurable,
-            Some((metadata, Vec::new())),
-            move |result| match result {
-                Ok(()) => reply.send(Resp::ok()),
-                Err(error) => {
-                    logw!("remote EN durable marker was not persisted", "{}", error);
-                    reply.send(Resp::error(Status::Internal, error.to_string()));
-                }
-            },
-        );
+        let result = self.held.lock().expect("extents").apply_durable(sn, id, created, mark);
+        match result {
+            Ok(()) => reply.send(Resp::ok()),
+            Err(error) => reply.send(bad(error)),
+        }
     }
 
     fn delete_wait(
@@ -2056,8 +2117,8 @@ impl Disk {
                     reply.send(bad(error));
                     return;
                 }
-                Ok(()) if storage.is_some() => match held.journal_state(sn, extent) {
-                    Ok(metadata) => Some((metadata, Vec::new())),
+                Ok(()) if storage.is_some() => match held.journal_state(sn, extent, false) {
+                    Ok(metadata) => Some(JournalEvent::state(metadata)),
                     Err(error) => {
                         reply.send(bad(error));
                         return;
@@ -2098,7 +2159,7 @@ impl Disk {
 
     fn seal_wait(self: &Arc<Self>, sn: SnId, extent: ExtentId, created: TimeSec, reply: Reply) {
         let storage = self.storage.read().expect("disk storage").clone();
-        let sealed: Result<(Filled, bool, Option<(Vec<u8>, Vec<u8>)>)> = {
+        let sealed: Result<(Filled, bool, Option<JournalEvent>)> = {
             let mut held = self.held.lock().expect("extents");
             let Some(&place) = held.at.get(&(sn, extent)) else {
                 reply.send(bad(format!("no extent {extent} of sn {sn}")));
@@ -2121,8 +2182,8 @@ impl Disk {
                 compressed: current.end,
             };
             let event = if storage.is_some() {
-                match held.journal_state(sn, extent) {
-                    Ok(metadata) => Some((metadata, Vec::new())),
+                match held.journal_state(sn, extent, true) {
+                    Ok(metadata) => Some(JournalEvent::state(metadata)),
                     Err(error) => {
                         reply.send(bad(error));
                         return;
@@ -2282,8 +2343,8 @@ impl Disk {
                             }
                         }
                         (Took::Sealed { .. }, true) => {
-                            match held.journal_state(appending.sn, appending.extent) {
-                                Ok(metadata) => Some((metadata, Vec::new())),
+                            match held.journal_state(appending.sn, appending.extent, true) {
+                                Ok(metadata) => Some(JournalEvent::state(metadata)),
                                 Err(error) => {
                                     return {
                                         reply.send(bad(error));
@@ -2394,12 +2455,12 @@ impl Disk {
                 }
             }
         });
-        let marker_disk = Arc::clone(self);
-        let marker_process = Arc::clone(process);
+        let notifier_disk = Arc::clone(self);
+        let notifier_process = Arc::clone(process);
         let peers = others.clone();
         let after_reply: ReplyHook = Box::new(move |mark| {
             if let Some(mark) = mark {
-                marker_disk.persist_durable(&marker_process, peers, sn, extent, created, mark);
+                notifier_disk.notify_durable(&notifier_process, peers, sn, extent, created, mark);
             }
         });
         let pending =
@@ -2885,20 +2946,21 @@ impl Service for EN {
     fn start_with_process(self: &Arc<Self>, process: &Arc<Process>) -> Result<()> {
         let en = Arc::clone(self);
         let process = Arc::clone(process);
-        let worker = thread::Builder::new()
-            .name("en-recovery".to_owned())
-            .spawn(move || match en.initialize(&process) {
-                Ok(()) if !en.startup_stop.load(Ordering::Acquire) => {
-                    *en.startup_status.lock().expect("startup status") = "ready".to_owned();
-                    en.accepting.store(true, Ordering::Release);
-                }
-                Ok(()) => {}
-                Err(_) if en.startup_stop.load(Ordering::Acquire) => {}
-                Err(error) => {
-                    let message = error.to_string();
-                    *en.startup_status.lock().expect("startup status") = "failed".to_owned();
-                    *en.startup_error.lock().expect("startup error") = Some(message.clone());
-                    logw!("EN startup failed", "{message}");
+        let worker =
+            thread::Builder::new().name("en-recovery".to_owned()).spawn(move || {
+                match en.initialize(&process) {
+                    Ok(()) if !en.startup_stop.load(Ordering::Acquire) => {
+                        *en.startup_status.lock().expect("startup status") = "ready".to_owned();
+                        en.accepting.store(true, Ordering::Release);
+                    }
+                    Ok(()) => {}
+                    Err(_) if en.startup_stop.load(Ordering::Acquire) => {}
+                    Err(error) => {
+                        let message = error.to_string();
+                        *en.startup_status.lock().expect("startup status") = "failed".to_owned();
+                        *en.startup_error.lock().expect("startup error") = Some(message.clone());
+                        logw!("EN startup failed", "{message}");
+                    }
                 }
             })?;
         *self.startup_thread.lock().expect("startup thread") = Some(worker);
@@ -2965,10 +3027,8 @@ impl Service for EN {
     }
 
     fn status(&self, process: &Process) -> Vec<String> {
-        let mut lines = vec![format!(
-            "startup {}",
-            self.startup_status.lock().expect("startup status")
-        )];
+        let mut lines =
+            vec![format!("startup {}", self.startup_status.lock().expect("startup status"))];
         for (i, disk) in self.disks.iter().enumerate() {
             lines.push(format!("disk {i}"));
             for line in disk.status(process, &self.config) {
@@ -2982,7 +3042,7 @@ impl Service for EN {
 impl EN {
     fn write_durable(&self, process: &Process, request: Req, reply: Reply) {
         let (mut payload, rest) =
-            match structure(&request.args(), Op::WriteDurable, "an EN durable marker") {
+            match structure(&request.args(), Op::WriteDurable, "an EN durable update") {
                 Ok(value) => value,
                 Err(error) => return reply.send(bad(error)),
             };
@@ -3017,10 +3077,10 @@ impl EN {
             },
         };
         if !rest.is_empty() || payload.done().is_err() {
-            return reply.send(bad("EN durable marker has trailing fields"));
+            return reply.send(bad("EN durable update has trailing fields"));
         }
         if en != EnId::new(process.entry.number()) {
-            return reply.send(bad("EN durable marker reached the wrong EN"));
+            return reply.send(bad("EN durable update reached the wrong EN"));
         }
         match self.disk(disk_id) {
             Ok(disk) => disk.durable_wait(sn, extent, created, mark, reply),

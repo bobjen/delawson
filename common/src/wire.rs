@@ -372,7 +372,6 @@ ops! {
     EnJAppend = 197, "en-journal-append";
     EnJDelete = 198, "en-journal-delete";
     EnJSeal = 199, "en-journal-seal";
-    EnJDurable = 200, "en-journal-durable";
     WriteDurable = 201, "write-durable";
     EnMasterKey = 202, "en-master-key";
     EnKeyResp = 203, "en-key-response";

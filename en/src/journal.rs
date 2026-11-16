@@ -9,7 +9,7 @@ use common::ids::{DiskId, EnId};
 use common::scn::Scn;
 use common::time::TimeSec;
 use common::{Error, Op, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -96,6 +96,16 @@ pub(crate) struct Record {
     pub end: u64,
 }
 
+/// Advisory per-extent marks carried by a later append or seal record.
+/// `append_end` is present only for append records.
+#[derive(Debug, Clone)]
+pub(crate) struct RecoveryMark {
+    pub extent: (u64, u32, u64),
+    pub written: (u32, u32),
+    pub append_end: Option<(u32, u32)>,
+    pub stage_metadata: Option<Vec<u8>>,
+}
+
 type Done = Box<dyn FnOnce(Result<Option<StageRef>>) + Send + 'static>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +150,7 @@ struct Request {
     scn: Scn,
     op: Op,
     metadata: Vec<u8>,
+    stage_metadata: Vec<u8>,
     stage: Vec<u8>,
     stage_ref: Option<StageRef>,
     done: Done,
@@ -667,7 +678,8 @@ fn load_checkpoints(dir: &Path) -> Result<(Option<Checkpoint>, Vec<CheckpointMet
     Ok((latest, valid, next_generation))
 }
 
-/// Open the per-disk files and replay journal metadata. Stage payloads are not read.
+/// Open the per-disk files and replay journal metadata. Staged appends past the
+/// latest recorded local written mark are authenticated and synced on recovery.
 pub(crate) struct DiskFiles {
     stage: Arc<RwLock<StageTable>>,
     journal: Arc<RwLock<BTreeMap<u32, Arc<File>>>>,
@@ -696,6 +708,7 @@ impl DiskFiles {
         key_lookup: KeyLookup,
         max_journal_bytes: u64,
         retention: usize,
+        recovery_mark: impl Fn(&Record) -> Result<Option<RecoveryMark>>,
     ) -> Result<(Arc<DiskFiles>, Option<Checkpoint>, Vec<Record>)> {
         let en_number = en.get();
         let disk_number = disk.get();
@@ -741,20 +754,35 @@ impl DiskFiles {
         if let Some((_, last)) = journal.files.read().expect("files").last_key_value() {
             journal.current_len = last.metadata()?.len();
         }
-        let written_before = records
-            .iter()
-            .filter(|record| record.op == Op::EnJDurable)
-            .map(|record| (record.file, record.end))
-            .max();
+        let mut written_marks = HashMap::new();
+        for record in &records {
+            if let Some(mark) = recovery_mark(record)? {
+                written_marks
+                    .entry(mark.extent)
+                    .and_modify(|old: &mut (u32, u32)| *old = (*old).max(mark.written))
+                    .or_insert(mark.written);
+            }
+        }
         let mut stage_files_to_sync = BTreeSet::new();
         let mut journal_files_to_sync = BTreeSet::new();
         for record in &mut records {
-            // A durable marker is only written after earlier batches have synced.
-            // The marker's own frame and everything after it may be torn, so
-            // validate those append payloads and sync their files before applying.
-            if written_before.is_some_and(|at| (record.file, record.end) < at) {
-                record.written = true;
-                continue;
+            let recovery =
+                if record.op == Op::EnJAppend {
+                    Some(recovery_mark(record)?.ok_or_else(|| {
+                        Error::new("EN append journal record has no recovery mark")
+                    })?)
+                } else {
+                    None
+                };
+            // The last journaled written mark for this extent lets recovery
+            // trust its earlier staged appends. Anything beyond that prefix
+            // must be read and authenticated from the stage file.
+            if let Some(mark) = &recovery {
+                let written = written_marks.get(&mark.extent).copied().unwrap_or_default();
+                if mark.append_end.is_some_and(|end| end <= written) {
+                    record.written = true;
+                    continue;
+                }
             }
             journal_files_to_sync.insert(record.file);
             if record.stage.len == 0 {
@@ -777,7 +805,10 @@ impl DiskFiles {
             stage_files_to_sync.insert(record.stage.file);
             if record.op == Op::EnJAppend {
                 let stage_data = read_stage_frame(&stage_file.file, record.stage)?;
-                if stage_data.metadata != record.metadata
+                let stage_metadata = recovery
+                    .and_then(|mark| mark.stage_metadata)
+                    .ok_or_else(|| Error::new("EN append has no stage metadata"))?;
+                if stage_data.metadata != stage_metadata
                     || stage_data.tag != record.stage_tag
                     || stage_data.timestamp != record.scn.time_sec()
                 {
@@ -845,10 +876,19 @@ impl DiskFiles {
         scn: Scn,
         op: Op,
         metadata: Vec<u8>,
+        stage_metadata: Vec<u8>,
         stage: Vec<u8>,
         done: impl FnOnce(Result<Option<StageRef>>) + Send + 'static,
     ) -> Result<()> {
-        let request = Request { scn, op, metadata, stage, stage_ref: None, done: Box::new(done) };
+        let request = Request {
+            scn,
+            op,
+            metadata,
+            stage_metadata,
+            stage,
+            stage_ref: None,
+            done: Box::new(done),
+        };
         match self.tx.send(WriterMessage::Job(request)) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -1072,9 +1112,7 @@ fn start_writer(
     Ok((tx, checkpoint_signal, checkpoint_rx))
 }
 
-/// Lets the write thread place EnJDurable frames after a known locally synced
-/// journal prefix. Recovery can then trust earlier frames without rereading all
-/// their staged append payloads.
+/// Tracks the locally synced write prefix for checkpoint scheduling.
 struct SyncProgress {
     state: Mutex<ProgressState>,
     changed: Condvar,
@@ -1220,11 +1258,7 @@ fn write_loop(
         let mut entries = Vec::with_capacity(jobs.len());
         let batch_seq = seq;
         seq = seq.wrapping_add(1);
-        let mut build_error = if jobs.iter().any(|job| job.op == Op::EnJDurable) {
-            progress.wait_for(batch_seq).err().map(|error| error.to_string())
-        } else {
-            None
-        };
+        let mut build_error = None;
 
         for job in &mut jobs {
             if build_error.is_some() {
@@ -1237,7 +1271,7 @@ fn write_loop(
             } else {
                 let timestamp = job.scn.time_sec();
                 let Some(frame_len) = STAGE_PREFIX
-                    .checked_add(job.metadata.len())
+                    .checked_add(job.stage_metadata.len())
                     .and_then(|len| len.checked_add(job.stage.len()))
                     .and_then(|len| len.checked_add(STAGE_TAG))
                 else {
@@ -1268,10 +1302,11 @@ fn write_loop(
                             id.get(),
                             offset,
                         );
-                        let aad = stage_aad(timestamp, &job.metadata);
+                        let aad = stage_aad(timestamp, &job.stage_metadata);
                         let (cipher, tag) = crypto::encrypt_block(&key, &nonce, &aad, &job.stage);
                         let frame =
-                            match encode_stage_frame(timestamp, &job.metadata, &cipher, &tag) {
+                            match encode_stage_frame(timestamp, &job.stage_metadata, &cipher, &tag)
+                            {
                                 Ok(frame) => frame,
                                 Err(error) => {
                                     build_error = Some(error.to_string());

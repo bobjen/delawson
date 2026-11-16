@@ -202,7 +202,6 @@ pub(super) fn write_next(storage: &Arc<journal::DiskFiles>) -> Result<()> {
         match record.op {
             Op::EnJAppend => state.restore_append(record)?,
             Op::EnJExtent | Op::EnJDelete | Op::EnJSeal => state.restore_state(record)?,
-            Op::EnJDurable => state.restore_durable(record)?,
             op => return Err(Error::new(format!("unsupported EN journal operation {op}"))),
         }
     }
@@ -217,11 +216,6 @@ pub(super) fn write_next(storage: &Arc<journal::DiskFiles>) -> Result<()> {
         checkpoint.size
     );
     Ok(())
-}
-
-fn put_mark(bytes: &mut Vec<u8>, mark: Mark) {
-    put_u32(bytes, mark.logical.get());
-    put_u32(bytes, mark.records.get());
 }
 
 fn put_stage_ref(bytes: &mut Vec<u8>, stage: Option<journal::StageRef>) {
