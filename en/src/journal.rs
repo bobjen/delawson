@@ -15,11 +15,10 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 const JOURNAL_MAGIC: &[u8; 8] = b"DLAWENJ1";
 const STAGE_MAGIC: &[u8; 8] = b"DLAWENS1";
-const ID_MAGIC: &[u8; 8] = b"DLAWENI1";
 const HEADER_LEN: usize = 40;
 const HEADER: u64 = HEADER_LEN as u64;
 pub(crate) const STAGE_PREFIX: usize = 20;
@@ -27,8 +26,6 @@ pub(crate) const STAGE_TAG: usize = 16;
 const FILE_LIMIT: u64 = 1u64 << 32;
 const STAGE_SLOTS: usize = 16 * 1024;
 const NO_STAGE_FILE: StageId = StageId(u16::MAX);
-const ID_SLOT: usize = 56;
-const ID_LEN: u64 = (2 * ID_SLOT) as u64;
 
 pub(crate) type KeyLookup = Arc<dyn Fn(TimeSec) -> Result<[u8; 32]> + Send + Sync>;
 
@@ -88,6 +85,7 @@ pub(crate) struct Record {
     pub metadata: Vec<u8>,
     pub written: bool,
     pub file: u32,
+    /// End offset of the containing journal frame.
     pub end: u64,
 }
 
@@ -136,15 +134,6 @@ struct FileSet {
     disk: u16,
     files: Arc<RwLock<BTreeMap<u32, Arc<File>>>>,
     current_len: u64,
-    identity: Option<Arc<Mutex<Identity>>>,
-}
-
-struct Identity {
-    file: Arc<File>,
-    last_journal: u32,
-    written_file: u32,
-    written_end: u64,
-    generation: u64,
 }
 
 /// Per-disk stage files occupy a fixed, persistent 16K-slot namespace.
@@ -371,7 +360,6 @@ impl FileSet {
                 disk,
                 files: Arc::new(RwLock::new(files)),
                 current_len,
-                identity: None,
             },
             created,
         ))
@@ -401,22 +389,6 @@ impl FileSet {
                 self.id_header,
                 TimeSec::now(),
             )?;
-            if !self.id_header {
-                if let Some(identity) = &self.identity {
-                    let mut identity = identity.lock().expect("identity");
-                    identity.generation = write_identity(
-                        &identity.file,
-                        self.en,
-                        self.disk,
-                        id,
-                        identity.written_file,
-                        identity.written_end,
-                        identity.generation,
-                        true,
-                    )?;
-                    identity.last_journal = id;
-                }
-            }
             self.current_len = HEADER;
             self.files.write().expect("files").insert(id, Arc::new(file));
         }
@@ -462,7 +434,6 @@ impl DiskFiles {
         let en_number = en.get();
         let disk_number = disk.get();
         fs::create_dir_all(dir)?;
-        let identity_record = read_identity(&dir.join("identity"), en_number, disk_number)?;
         let (mut stage, mut stage_new) = StageFiles::open(dir, en_number, disk_number)?;
         stage_new |= stage.ensure_current_key(&key_lookup)?;
         let (mut journal, journal_new) =
@@ -470,82 +441,6 @@ impl DiskFiles {
         if stage_new || journal_new {
             File::open(dir)?.sync_all()?;
         }
-
-        let last_journal = *journal
-            .files
-            .read()
-            .expect("journal files")
-            .last_key_value()
-            .expect("at least one journal file")
-            .0;
-        let identity = match identity_record {
-            Some((file, expected, written_file, written_end, generation)) => {
-                if journal_new {
-                    return Err(Error::new("EN identity names a missing journal file"));
-                }
-                if last_journal != expected {
-                    // A crash after creating a new empty segment but before updating
-                    // identity is safe to repair; no data is written before the update.
-                    let latest = journal.get(last_journal)?;
-                    let persisted_file = journal.get(written_file)?;
-                    if expected.checked_add(1) != Some(last_journal)
-                        || written_file > expected
-                        || persisted_file.metadata()?.len() < written_end
-                        || latest.metadata()?.len() != HEADER
-                    {
-                        return Err(Error::new("EN identity does not match the last journal file"));
-                    }
-                    let generation = write_identity(
-                        &file,
-                        en_number,
-                        disk_number,
-                        last_journal,
-                        written_file,
-                        written_end,
-                        generation,
-                        true,
-                    )?;
-                    Identity {
-                        file: Arc::new(file),
-                        last_journal,
-                        written_file,
-                        written_end,
-                        generation,
-                    }
-                } else {
-                    Identity {
-                        file: Arc::new(file),
-                        last_journal: expected,
-                        written_file,
-                        written_end,
-                        generation,
-                    }
-                }
-            }
-            None => {
-                let files = journal.files.read().expect("files");
-                for file in files.values() {
-                    if file.metadata()?.len() != HEADER {
-                        return Err(Error::new("EN journal exists without its identity file"));
-                    }
-                }
-                drop(files);
-                let (file, generation) =
-                    create_identity(dir, en_number, disk_number, last_journal)?;
-                Identity {
-                    file: Arc::new(file),
-                    last_journal,
-                    written_file: last_journal,
-                    written_end: HEADER,
-                    generation,
-                }
-            }
-        };
-        let written_file = journal.get(identity.written_file)?;
-        if identity.written_end < HEADER || identity.written_end > written_file.metadata()?.len() {
-            return Err(Error::new("EN identity has an invalid written journal position"));
-        }
-        journal.identity = Some(Arc::new(Mutex::new(identity)));
 
         let mut records = Vec::new();
         let journal_count = journal.len();
@@ -563,21 +458,22 @@ impl DiskFiles {
         if let Some((_, last)) = journal.files.read().expect("files").last_key_value() {
             journal.current_len = last.metadata()?.len();
         }
-        let (written_file, written_end) = {
-            let identity = journal.identity.as_ref().expect("identity").lock().expect("identity");
-            (identity.written_file, identity.written_end)
-        };
-        let mut dirty_stage = BTreeSet::new();
-        let mut dirty_journal = BTreeSet::new();
+        let written_before = records
+            .iter()
+            .filter(|record| record.op == Op::EnJDurable)
+            .map(|record| (record.file, record.end))
+            .max();
+        let mut stage_files_to_sync = BTreeSet::new();
+        let mut journal_files_to_sync = BTreeSet::new();
         for record in &mut records {
-            record.written = record.file < written_file
-                || (record.file == written_file && record.end <= written_end);
-            // The disk-level watermark turns the recovered journal into a local
-            // written prefix. A surviving frame after it is checked against the
-            // bytes it names before it can be accepted as written.
-            if !record.written {
-                dirty_journal.insert(record.file);
+            // A durable marker is only written after earlier batches have synced.
+            // The marker's own frame and everything after it may be torn, so
+            // validate those append payloads and sync their files before applying.
+            if written_before.is_some_and(|at| (record.file, record.end) < at) {
+                record.written = true;
+                continue;
             }
+            journal_files_to_sync.insert(record.file);
             if record.stage.len == 0 {
                 if record.op == Op::EnJAppend {
                     return Err(Error::new("EN append journal record has no stage range"));
@@ -595,7 +491,8 @@ impl DiskFiles {
             if end > stage_file.file.metadata()?.len() {
                 return Err(Error::new("EN journal refers past a stage file"));
             }
-            if !record.written && record.op == Op::EnJAppend {
+            stage_files_to_sync.insert(record.stage.file);
+            if record.op == Op::EnJAppend {
                 let stage_data = read_stage_frame(&stage_file.file, record.stage)?;
                 if stage_data.metadata != record.metadata
                     || stage_data.tag != record.stage_tag
@@ -614,38 +511,19 @@ impl DiskFiles {
                 );
                 let aad = stage_aad(stage_data.timestamp, &stage_data.metadata);
                 crypto::decrypt_block(&key, &nonce, &aad, &stage_data.cipher, &stage_data.tag)?;
-                dirty_stage.insert(record.stage.file);
             }
         }
-        if !dirty_stage.is_empty() || !dirty_journal.is_empty() {
-            for id in dirty_stage {
+        if !stage_files_to_sync.is_empty() || !journal_files_to_sync.is_empty() {
+            for id in stage_files_to_sync {
                 stage.sync(id)?;
             }
             let journal_files = journal.files.read().expect("journal files");
-            for id in dirty_journal {
+            for id in journal_files_to_sync {
                 journal_files.get(&id).expect("journal record file exists").sync_all()?;
             }
             drop(journal_files);
             for record in &mut records {
                 record.written = true;
-            }
-            if let Some(last) = records.last() {
-                let mut identity =
-                    journal.identity.as_ref().expect("identity").lock().expect("identity");
-                if (last.file, last.end) > (identity.written_file, identity.written_end) {
-                    identity.generation = write_identity(
-                        &identity.file,
-                        en_number,
-                        disk_number,
-                        identity.last_journal,
-                        last.file,
-                        last.end,
-                        identity.generation,
-                        false,
-                    )?;
-                    identity.written_file = last.file;
-                    identity.written_end = last.end;
-                }
             }
         }
 
@@ -717,15 +595,49 @@ fn start_writer(
 ) -> Result<Sender<Request>> {
     let (tx, rx) = mpsc::channel::<Request>();
     let (done_tx, done_rx) = mpsc::channel::<BatchDone>();
+    let progress =
+        Arc::new(SyncProgress { completed: Mutex::new((0, None)), changed: Condvar::new() });
     let stage_sync = Arc::clone(&stage.files);
     let journal_sync = Arc::clone(&journal.files);
+    let sync_progress = Arc::clone(&progress);
     std::thread::Builder::new().name("en-journal-sync".into()).spawn(move || {
-        sync_loop(done_rx, stage_sync, journal_sync);
+        sync_loop(done_rx, stage_sync, journal_sync, sync_progress);
     })?;
     std::thread::Builder::new().name("en-journal-write".into()).spawn(move || {
-        write_loop(rx, done_tx, stage, journal, key_lookup, en, disk);
+        write_loop(rx, done_tx, stage, journal, key_lookup, en, disk, progress);
     })?;
     Ok(tx)
+}
+
+/// Lets the write thread place EnJDurable frames after a known locally synced
+/// journal prefix. Recovery can then trust earlier frames without rereading all
+/// their staged append payloads.
+struct SyncProgress {
+    /// Next batch sequence known to have completed its sync, plus a terminal error.
+    completed: Mutex<(u64, Option<String>)>,
+    changed: Condvar,
+}
+
+impl SyncProgress {
+    fn wait_for(&self, sequence: u64) -> Result<()> {
+        let mut completed = self.completed.lock().expect("journal sync progress");
+        while completed.0 < sequence && completed.1.is_none() {
+            completed = self.changed.wait(completed).expect("journal sync progress");
+        }
+        if let Some(error) = &completed.1 {
+            return Err(Error::new(error.clone()));
+        }
+        Ok(())
+    }
+
+    fn complete_through(&self, sequence: u64, error: Option<String>) {
+        let mut completed = self.completed.lock().expect("journal sync progress");
+        completed.0 = sequence;
+        if completed.1.is_none() {
+            completed.1 = error;
+        }
+        self.changed.notify_all();
+    }
 }
 
 fn write_loop(
@@ -736,6 +648,7 @@ fn write_loop(
     key_lookup: KeyLookup,
     en: EnId,
     disk: DiskId,
+    progress: Arc<SyncProgress>,
 ) {
     let mut seq = 0u64;
     while let Ok(first) = rx.recv() {
@@ -748,9 +661,18 @@ fn write_loop(
         let mut stage_files = BTreeMap::new();
         let mut journal_files = BTreeMap::new();
         let mut entries = Vec::with_capacity(jobs.len());
-        let mut build_error = None;
+        let batch_seq = seq;
+        seq = seq.wrapping_add(1);
+        let mut build_error = if jobs.iter().any(|job| job.op == Op::EnJDurable) {
+            progress.wait_for(batch_seq).err().map(|error| error.to_string())
+        } else {
+            None
+        };
 
         for job in &mut jobs {
+            if build_error.is_some() {
+                break;
+            }
             let mut stage_tag = [0; 16];
             let stage_loc = if job.stage.is_empty() && job.op != Op::EnJAppend {
                 // Empty metadata-only records do not pin an arbitrary stage file.
@@ -842,8 +764,6 @@ fn write_loop(
             }
         }
 
-        let batch_seq = seq;
-        seq = seq.wrapping_add(1);
         if let Some(error) = build_error {
             let batch = BatchDone {
                 seq: batch_seq,
@@ -925,6 +845,7 @@ fn sync_loop(
     rx: Receiver<BatchDone>,
     stage: Arc<RwLock<StageTable>>,
     journal: Arc<RwLock<BTreeMap<u32, Arc<File>>>>,
+    progress: Arc<SyncProgress>,
 ) {
     let mut next = 0u64;
     let mut ready = BTreeMap::new();
@@ -987,6 +908,7 @@ fn sync_loop(
                 }
             }
         };
+        progress.complete_through(next, result.as_ref().err().map(|error| error.to_string()));
         for job in jobs {
             let response = result
                 .as_ref()
@@ -999,108 +921,6 @@ fn sync_loop(
 
 fn segment_name(stem: &str, id: u32, suffix: &str) -> String {
     format!("{stem}{id:08}{suffix}")
-}
-
-fn identity_slot(
-    en: u64,
-    disk: u16,
-    last: u32,
-    written_file: u32,
-    written_end: u64,
-    generation: u64,
-) -> [u8; ID_SLOT] {
-    let mut bytes = [0; ID_SLOT];
-    bytes[..8].copy_from_slice(ID_MAGIC);
-    bytes[8..16].copy_from_slice(&en.to_le_bytes());
-    bytes[16..18].copy_from_slice(&disk.to_le_bytes());
-    bytes[18..20].copy_from_slice(&1u16.to_le_bytes());
-    bytes[20..24].copy_from_slice(&last.to_le_bytes());
-    bytes[24..28].copy_from_slice(&written_file.to_le_bytes());
-    bytes[32..40].copy_from_slice(&written_end.to_le_bytes());
-    bytes[40..48].copy_from_slice(&generation.to_le_bytes());
-    let crc = common::crc::of(&bytes[..48]);
-    bytes[48..56].copy_from_slice(&crc.to_le_bytes());
-    bytes
-}
-
-fn decode_identity(bytes: &[u8; ID_SLOT], en: u64, disk: u16) -> Option<(u32, u32, u64, u64)> {
-    if &bytes[..8] != ID_MAGIC
-        || u64::from_le_bytes(bytes[8..16].try_into().ok()?) != en
-        || u16::from_le_bytes(bytes[16..18].try_into().ok()?) != disk
-        || u16::from_le_bytes(bytes[18..20].try_into().ok()?) != 1
-        || common::crc::of(&bytes[..48]) != u64::from_le_bytes(bytes[48..56].try_into().ok()?)
-    {
-        return None;
-    }
-    let generation = u64::from_le_bytes(bytes[40..48].try_into().ok()?);
-    if generation == 0 {
-        return None;
-    }
-    Some((
-        u32::from_le_bytes(bytes[20..24].try_into().ok()?),
-        u32::from_le_bytes(bytes[24..28].try_into().ok()?),
-        u64::from_le_bytes(bytes[32..40].try_into().ok()?),
-        generation,
-    ))
-}
-
-fn read_identity(path: &Path, en: u64, disk: u16) -> Result<Option<(File, u32, u32, u64, u64)>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let file = OpenOptions::new().read(true).write(true).open(path)?;
-    if file.metadata()?.len() < ID_LEN {
-        return Err(Error::new("truncated EN identity file"));
-    }
-    let mut best: Option<(u32, u32, u64, u64)> = None;
-    for slot in 0..2 {
-        let mut bytes = [0; ID_SLOT];
-        if read_exact_at(&file, &mut bytes, (slot * ID_SLOT) as u64).is_ok()
-            && let Some((last, written_file, written_end, generation)) =
-                decode_identity(&bytes, en, disk)
-            && best.is_none_or(|(_, _, _, old_generation)| generation > old_generation)
-        {
-            best = Some((last, written_file, written_end, generation));
-        }
-    }
-    let (last, written_file, written_end, generation) =
-        best.ok_or_else(|| Error::new("invalid EN identity file"))?;
-    Ok(Some((file, last, written_file, written_end, generation)))
-}
-
-fn create_identity(dir: &Path, en: u64, disk: u16, last: u32) -> Result<(File, u64)> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = dir.join("identity");
-    let file = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(path)?;
-    file.set_len(ID_LEN)?;
-    write_all_at(&file, &identity_slot(en, disk, last, last, HEADER, 1), 0)?;
-    file.sync_all()?;
-    File::open(dir)?.sync_all()?;
-    Ok((file, 1))
-}
-
-fn write_identity(
-    file: &File,
-    en: u64,
-    disk: u16,
-    last: u32,
-    written_file: u32,
-    written_end: u64,
-    generation: u64,
-    sync: bool,
-) -> Result<u64> {
-    let generation =
-        generation.checked_add(1).ok_or_else(|| Error::new("EN identity generation overflow"))?;
-    let slot = ((generation - 1) % 2) as usize;
-    write_all_at(
-        file,
-        &identity_slot(en, disk, last, written_file, written_end, generation),
-        (slot * ID_SLOT) as u64,
-    )?;
-    if sync {
-        file.sync_all()?;
-    }
-    Ok(generation)
 }
 
 fn make_header(magic: &[u8; 8], en: u64, disk: u16, id: u32, created: TimeSec) -> [u8; HEADER_LEN] {
