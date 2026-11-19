@@ -107,16 +107,23 @@ struct ExtentRow {
     compressed: u64,
     records: u64,
     created: u64,
-    disks: Vec<DiskRef>,
+    disks: Vec<DiskIndex>,
     extra: Option<ExtExtra>,
 }
 raft::wire_struct!(ExtentRow, SnCkExtent, {id,flags,sealed,logical,compressed,records,created,disks,extra});
 
-struct DiskRef {
-    en: u64,
-    disk: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiskIndex(u32);
+
+impl codec::Wire for DiskIndex {
+    fn write(&self, writer: &mut common::StructWriter) {
+        writer.number_u32(self.0);
+    }
+
+    fn read(reader: &mut common::StructReader<'_>) -> Result<Self> {
+        Ok(Self(reader.number_u32()?))
+    }
 }
-raft::wire_struct!(DiskRef, SnCkDiskRef, {en,disk});
 
 struct StreamHead {
     range: u64,
@@ -156,7 +163,7 @@ raft::wire_struct!(PendingHead, SnCkPending, {name,hard,task_count});
 struct TaskRow {
     id: u64,
     created: u64,
-    disks: Vec<DiskRef>,
+    disks: Vec<DiskIndex>,
     interval: u64,
     hard: bool,
 }
@@ -333,44 +340,51 @@ fn write_ens(file: &mut (impl Write + Seek), disks: &[(EnId, DiskId)]) -> Result
     range(file, start)
 }
 
-fn disk_refs(ids: &[SnDiskId], roster: &[(EnId, DiskId)]) -> Result<Vec<DiskRef>> {
+fn disk_indices(ids: &[SnDiskId], roster: &[(EnId, DiskId)]) -> Result<Vec<DiskIndex>> {
     ids.iter()
         .map(|id| {
-            let (en, disk) = roster
-                .get(id.get() as usize)
-                .ok_or_else(|| Error::new("SN checkpoint disk index is outside its roster"))?;
-            Ok(DiskRef { en: en.get(), disk: u64::from(disk.get()) })
+            if roster.get(id.get() as usize).is_none() {
+                return Err(Error::new("SN checkpoint disk index is outside its roster"));
+            }
+            Ok(DiskIndex(id.get()))
         })
         .collect()
 }
 
-fn disk_map(
-    roster: &[(EnId, DiskId)],
-) -> Result<std::collections::HashMap<(EnId, DiskId), SnDiskId>> {
+fn reindex_disks(roster: Vec<(EnId, DiskId)>) -> Result<(Vec<(EnId, DiskId)>, Vec<SnDiskId>)> {
     if roster.len() > u32::MAX as usize {
         return Err(Error::new("SN checkpoint EN roster is too large"));
     }
-    let mut result = std::collections::HashMap::with_capacity(roster.len());
-    for (at, &(en, disk)) in roster.iter().enumerate() {
-        let id = SnDiskId::new(at as u32);
-        if result.insert((en, disk), id).is_some() {
+
+    let mut indexed: Vec<_> = roster.into_iter().enumerate().collect();
+    indexed.sort_unstable_by_key(|(_, (en, disk))| (en.get(), disk.get()));
+
+    let mut disks = Vec::with_capacity(indexed.len());
+    let mut old_to_new = vec![SnDiskId::NONE; indexed.len()];
+    let mut previous = None;
+    for (new_at, (old_at, name)) in indexed.into_iter().enumerate() {
+        if previous == Some(name) {
             return Err(Error::new("duplicate SN checkpoint EN disk"));
         }
+        previous = Some(name);
+        let new_id = SnDiskId::new(
+            u32::try_from(new_at)
+                .map_err(|_| Error::new("SN checkpoint EN roster is too large"))?,
+        );
+        old_to_new[old_at] = new_id;
+        disks.push(name);
     }
-    Ok(result)
+    Ok((disks, old_to_new))
 }
 
-fn sn_disks(
-    refs: Vec<DiskRef>,
-    roster: &std::collections::HashMap<(EnId, DiskId), SnDiskId>,
-) -> Result<Vec<SnDiskId>> {
-    refs.into_iter()
+fn remap_disks(ids: Vec<DiskIndex>, old_to_new: &[SnDiskId]) -> Result<Vec<SnDiskId>> {
+    ids.into_iter()
         .map(|disk| {
-            let key = (EnId::of_number(disk.en)?, DiskId::of_number(disk.disk)?);
-            roster
-                .get(&key)
+            old_to_new
+                .get(disk.0 as usize)
                 .copied()
-                .ok_or_else(|| Error::new("SN checkpoint extent names an unknown EN disk"))
+                .filter(|id| *id != SnDiskId::NONE)
+                .ok_or_else(|| Error::new("SN checkpoint disk index is outside its roster"))
         })
         .collect()
 }
@@ -442,7 +456,7 @@ fn write_extents(
                     compressed: extent.compressed.number(),
                     records: extent.records.number(),
                     created: extent.created.number(),
-                    disks: disk_refs(&extent.disks, disks)?,
+                    disks: disk_indices(&extent.disks, disks)?,
                     extra: ext_extra(extras, extent)?,
                 });
             }
@@ -591,7 +605,7 @@ fn write_pending(
                 &TaskRow {
                     id: u64::from(task.id.get()),
                     created: task.created.number(),
-                    disks: disk_refs(&task.disks, disks)?,
+                    disks: disk_indices(&task.disks, disks)?,
                     interval: task.interval.get() as u64,
                     hard: task.hard,
                 },
@@ -812,7 +826,7 @@ fn restore_extent(
     table: &ExtentTable,
     row: ExtentRow,
     table_len: usize,
-    disks: &std::collections::HashMap<(EnId, DiskId), SnDiskId>,
+    old_to_new: &[SnDiskId],
 ) -> Result<Option<((ExtentId, TimeSec), Extra<ReferenceCounts>)>> {
     if row.id >= table_len as u64 {
         return Err(Error::new("SN checkpoint extent is beyond the table length"));
@@ -822,7 +836,7 @@ fn restore_extent(
     if !flags.is_valid() || row.extra.is_some() != flags.extra() {
         return Err(Error::new("invalid SN checkpoint extent flags"));
     }
-    let disks = sn_disks(row.disks, disks)?;
+    let disks = remap_disks(row.disks, old_to_new)?;
     let created = TimeSec::new(row.created);
     let extent = ExtentData {
         deletion: flags,
@@ -867,7 +881,7 @@ fn read_extents(
     chunks: &[raft::checkpoint::ChunkPos],
     state: &mut SNState,
     table_len: usize,
-    disks: &std::collections::HashMap<(EnId, DiskId), SnDiskId>,
+    old_to_new: &[SnDiskId],
     expected: u64,
     workers: usize,
 ) -> Result<()> {
@@ -897,7 +911,7 @@ fn read_extents(
             if row.id < chunk.first || row.id >= chunk_end {
                 return Err(Error::new("SN checkpoint extent is outside its chunk range"));
             }
-            if let Some(extra) = restore_extent(table, row, table_len, disks)? {
+            if let Some(extra) = restore_extent(table, row, table_len, old_to_new)? {
                 found.push(extra);
             }
         }
@@ -1122,7 +1136,7 @@ fn read_pending(
     file: &mut File,
     range: Range,
     state: &mut SNState,
-    disks: &std::collections::HashMap<(EnId, DiskId), SnDiskId>,
+    old_to_new: &[SnDiskId],
 ) -> Result<()> {
     let mut section = read_section(file, range, Op::SnCkPending)?;
     for _ in 0..section.count {
@@ -1139,7 +1153,7 @@ fn read_pending(
             tasks.push(DeleteTask {
                 id: ExtentId::of_number(task.id)?,
                 created: TimeSec::new(task.created),
-                disks: sn_disks(task.disks, disks)?,
+                disks: remap_disks(task.disks, old_to_new)?,
                 interval: TimeIntSec64::new(task.interval as i64),
                 hard: task.hard,
             });
@@ -1177,8 +1191,7 @@ pub(super) fn read_state_with_workers(
         return Err(Error::new("SN checkpoint is missing its application footer"));
     }
     let (footer, _) = read_public(&mut file)?;
-    let disks = read_ens(&mut file, footer.ens)?;
-    let disk_map = disk_map(&disks)?;
+    let (disks, old_to_new) = reindex_disks(read_ens(&mut file, footer.ens)?)?;
     if footer.streams > u64::from(MAX_STREAMS) {
         return Err(Error::new("SN checkpoint stream table exceeds its limit"));
     }
@@ -1200,7 +1213,7 @@ pub(super) fn read_state_with_workers(
         &footer.extent_chunks,
         &mut state,
         extent_slots,
-        &disk_map,
+        &old_to_new,
         footer.extents,
         workers,
     )?;
@@ -1216,7 +1229,7 @@ pub(super) fn read_state_with_workers(
         return Err(Error::new("SN checkpoint stream table length mismatch"));
     }
     read_retired(&mut file, footer.retired, &mut state)?;
-    read_pending(&mut file, footer.pending, &mut state, &disk_map)?;
+    read_pending(&mut file, footer.pending, &mut state, &old_to_new)?;
     state.sealed = u64::try_from(
         state
             .extent_table
@@ -1255,16 +1268,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disk_ref_reindexes() {
-        let old = [(EnId::new(4), DiskId::new(7)), (EnId::new(9), DiskId::new(2))];
-        let refs = disk_refs(&[SnDiskId::new(0), SnDiskId::new(1)], &old).unwrap();
-        assert_eq!(refs[0].en, 4);
-        assert_eq!(refs[0].disk, 7);
-        assert_eq!(refs[1].en, 9);
-        assert_eq!(refs[1].disk, 2);
+    fn disk_index_reindexes() {
+        let old = [(EnId::new(9), DiskId::new(2)), (EnId::new(4), DiskId::new(7))];
+        let indexes = disk_indices(&[SnDiskId::new(0), SnDiskId::new(1)], &old).unwrap();
+        let encoded = codec::encode(&indexes).unwrap();
+        assert_eq!(codec::decode::<Vec<DiskIndex>>(&encoded).unwrap(), indexes);
 
-        let new = [old[1], old[0]];
-        let restored = sn_disks(refs, &disk_map(&new).unwrap()).unwrap();
+        let (new, old_to_new) = reindex_disks(old.to_vec()).unwrap();
+        assert_eq!(new, [old[1], old[0]]);
+        let restored = remap_disks(indexes, &old_to_new).unwrap();
         assert_eq!(restored, [SnDiskId::new(1), SnDiskId::new(0)]);
+        assert_eq!(new[restored[0].get() as usize], old[0]);
+        assert_eq!(new[restored[1].get() as usize], old[1]);
+
+        assert!(remap_disks(vec![DiskIndex(2)], &old_to_new).is_err());
     }
 }
