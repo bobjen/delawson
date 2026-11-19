@@ -12,8 +12,8 @@ use pool::{LockedItem, LockedPool, PoolItem};
 use std::mem::{align_of, offset_of, size_of};
 
 const NONE: u32 = u32::MAX;
-// The tuning knob: sixteen u32 slots initially make a 64-byte pooled node.
-const NODE_SLOTS: usize = 16;
+// The tuning knob: each u32 slot contributes four bytes to a pooled node.
+const NODE_SLOTS: usize = 32;
 const NODE_BYTES: usize = NODE_SLOTS * size_of::<u32>();
 const LEAF_LINK_SLOT: usize = NODE_SLOTS - 1;
 const NODE_LEAF_CAPACITY: usize = LEAF_LINK_SLOT;
@@ -386,7 +386,15 @@ impl EnExtentTree {
         } else {
             root_keys[child_at] = minimum;
             if self.height == 1 && root_count > 1 && merge_candidate {
-                merge_leaf_children(
+                let _ = merge_leaf_children(
+                    pool,
+                    &mut root_keys,
+                    &mut root_children,
+                    &mut root_count,
+                    child_at,
+                );
+            } else if self.height > 1 && root_count > 1 && merge_candidate {
+                let _ = merge_branch_children(
                     pool,
                     &mut root_keys,
                     &mut root_children,
@@ -721,18 +729,26 @@ fn delete_subtree(pool: &mut ExtentTreePool, index: u32, height: u8, key: u32) -
             };
         };
         let minimum = keys[first_child];
+        let merge_candidate = branch_slot_has_empty_neighbors(&children, child_at);
         pool.write(index, Node::branch(&keys[..BRANCH_SLOTS], &children[..BRANCH_SLOTS]));
-        return DeleteResult::Removed { minimum, empty_leaf_next, merge_candidate: false };
+        return DeleteResult::Removed { minimum, empty_leaf_next, merge_candidate };
     }
 
     keys[child_at] = child_minimum;
-    if height == 1 && count > 1 && merge_candidate {
-        merge_leaf_children(pool, &mut keys, &mut children, &mut count, child_at);
-    }
+    let branch_merge_candidate = if count > 1 && merge_candidate {
+        let removed_slot = if height == 1 {
+            merge_leaf_children(pool, &mut keys, &mut children, &mut count, child_at)
+        } else {
+            merge_branch_children(pool, &mut keys, &mut children, &mut count, child_at)
+        };
+        removed_slot.is_some_and(|slot| branch_slot_has_empty_neighbors(&children, slot))
+    } else {
+        false
+    };
     let first_child = first_branch_slot(&children).expect("nonempty branch after deletion");
     let minimum = keys[first_child];
     pool.write(index, Node::branch(&keys[..BRANCH_SLOTS], &children[..BRANCH_SLOTS]));
-    DeleteResult::Removed { minimum, empty_leaf_next, merge_candidate: false }
+    DeleteResult::Removed { minimum, empty_leaf_next, merge_candidate: branch_merge_candidate }
 }
 
 fn set_leaf_next(pool: &mut ExtentTreePool, index: u32, next: u32) {
@@ -750,14 +766,14 @@ fn merge_leaf_children(
     children: &mut BranchChildren,
     parent_count: &mut usize,
     child_at: usize,
-) {
+) -> Option<usize> {
     if let Some(left_at) = previous_branch_slot(children, child_at) {
         let left = children[left_at];
         let right = children[child_at];
         if merge_leaf_nodes(pool, left, right) {
             pool.retire(right);
             remove_branch_child(keys, children, parent_count, child_at);
-            return;
+            return Some(child_at);
         }
     }
     if let Some(right_at) = next_branch_slot(children, child_at + 1) {
@@ -766,9 +782,40 @@ fn merge_leaf_children(
         if merge_leaf_nodes(pool, left, right) {
             pool.retire(right);
             remove_branch_child(keys, children, parent_count, right_at);
-            return;
+            return Some(right_at);
         }
     }
+    None
+}
+
+/// Merge the selected branch with an adjacent branch when their child entries
+/// fit in one node. The right node is retired on success.
+fn merge_branch_children(
+    pool: &mut ExtentTreePool,
+    keys: &mut BranchKeys,
+    children: &mut BranchChildren,
+    parent_count: &mut usize,
+    child_at: usize,
+) -> Option<usize> {
+    if let Some(left_at) = previous_branch_slot(children, child_at) {
+        let left = children[left_at];
+        let right = children[child_at];
+        if merge_branch_nodes(pool, left, right) {
+            pool.retire(right);
+            remove_branch_child(keys, children, parent_count, child_at);
+            return Some(child_at);
+        }
+    }
+    if let Some(right_at) = next_branch_slot(children, child_at + 1) {
+        let left = children[child_at];
+        let right = children[right_at];
+        if merge_branch_nodes(pool, left, right) {
+            pool.retire(right);
+            remove_branch_child(keys, children, parent_count, right_at);
+            return Some(right_at);
+        }
+    }
+    None
 }
 
 fn merge_leaf_nodes(pool: &mut ExtentTreePool, left_index: u32, right_index: u32) -> bool {
@@ -790,6 +837,57 @@ fn merge_leaf_nodes(pool: &mut ExtentTreePool, left_index: u32, right_index: u32
     }
     pool.write(left_index, Node::leaf(&merged[..count], right_next));
     true
+}
+
+fn merge_branch_nodes(pool: &mut ExtentTreePool, left_index: u32, right_index: u32) -> bool {
+    let left = pool.read(left_index);
+    let right = pool.read(right_index);
+    let (left_keys, left_children, left_count) = left.branch_parts();
+    let (right_keys, right_children, right_count) = right.branch_parts();
+    debug_assert!(left_count > 0 && right_count > 0);
+    if left_count == 0 || right_count == 0 {
+        return false;
+    }
+    let count = left_count + right_count;
+    if count > BRANCH_CAPACITY {
+        return false;
+    }
+
+    let mut dense_keys = [NONE; BRANCH_KEYS_SCRATCH];
+    let mut dense_children = [NONE; BRANCH_CHILDREN_SCRATCH];
+    let mut out = 0;
+    for (keys, children) in [(&left_keys, &left_children), (&right_keys, &right_children)] {
+        for slot in 0..BRANCH_SLOTS {
+            if children[slot] != NONE {
+                dense_keys[out] = keys[slot];
+                dense_children[out] = children[slot];
+                out += 1;
+            }
+        }
+    }
+    debug_assert_eq!(out, count);
+    debug_assert!(dense_keys[..count].windows(2).all(|pair| pair[0] < pair[1]));
+
+    let mut merged_keys = [NONE; BRANCH_KEYS_SCRATCH];
+    let mut merged_children = [NONE; BRANCH_CHILDREN_SCRATCH];
+    for i in 0..count {
+        let slot = i * BRANCH_SLOTS / count;
+        merged_keys[slot] = dense_keys[i];
+        merged_children[slot] = dense_children[i];
+    }
+    pool.write(
+        left_index,
+        Node::branch(&merged_keys[..BRANCH_SLOTS], &merged_children[..BRANCH_SLOTS]),
+    );
+    true
+}
+
+fn branch_slot_has_empty_neighbors(children: &BranchChildren, slot: usize) -> bool {
+    slot > 0
+        && slot + 1 < BRANCH_SLOTS
+        && children[slot] == NONE
+        && children[slot - 1] == NONE
+        && children[slot + 1] == NONE
 }
 
 fn branch_parts(words: &[u32; NODE_SLOTS]) -> (BranchKeys, BranchChildren, usize) {
@@ -945,12 +1043,12 @@ fn dense_insert_branch(
 
 fn spread_split_branch(keys: &[u32], children: &[u32]) -> (BranchKeys, BranchChildren) {
     debug_assert_eq!(keys.len(), children.len());
-    debug_assert!(keys.len() == 4 || keys.len() == 5);
+    debug_assert!(keys.len() == BRANCH_SLOTS / 2 || keys.len() == BRANCH_SLOTS / 2 + 1);
     let mut sparse_keys = [NONE; BRANCH_KEYS_SCRATCH];
     let mut sparse_children = [NONE; BRANCH_CHILDREN_SCRATCH];
-    const FIVE_CHILD_SLOTS: [usize; 5] = [0, 2, 4, 6, 7];
+    let evenly_spaced_count = BRANCH_SLOTS / 2;
     for i in 0..keys.len() {
-        let slot = if keys.len() == 4 { 2 * i } else { FIVE_CHILD_SLOTS[i] };
+        let slot = if i < evenly_spaced_count { 2 * i } else { BRANCH_SLOTS - (keys.len() - i) };
         sparse_keys[slot] = keys[i];
         sparse_children[slot] = children[i];
     }
@@ -1064,7 +1162,6 @@ mod tests {
 
     const TUNE_DEFAULT_ENTRIES: u32 = 1 << 13;
     const TUNE_DEFAULT_CHURN_PAIRS: u64 = 1 << 20;
-    const TUNE_MIN_POOL_NODES: u32 = 1 << 16;
     const TUNE_SEED: u64 = 0x51a7_ee42_9330_600d;
     const TUNE_PERMUTE_RANGE: u64 = 1u64 << 32;
 
@@ -1182,7 +1279,8 @@ mod tests {
     fn tune_fill_churn_delete() {
         let entries = tuning_entries();
         let churn_pairs = tuning_churn_pairs().min(u32::MAX as u64 - entries as u64);
-        let max_nodes = ((entries as u64).div_ceil(4) as u32).max(TUNE_MIN_POOL_NODES);
+        // Allow two nodes per NODE_SLOTS entries for branch-node overhead.
+        let max_nodes = ((entries as u64) * 2).div_ceil(NODE_SLOTS as u64).max(1) as u32;
         let mut pool = ExtentTreePool::new(max_nodes).unwrap();
         let mut tree = EnExtentTree::new();
 
@@ -1275,33 +1373,33 @@ mod tests {
     }
 
     #[test]
-    fn inline_root_holds_sixteen_raw_ids_then_rebalances() {
+    fn inline_root_holds_root_capacity_raw_ids_then_rebalances() {
         let mut pool = ExtentTreePool::new(256).unwrap();
         let initial_nodes = pool.slots.issued_blocks();
         let mut tree = EnExtentTree::new();
-        for value in 0..16 {
+        for value in 0..ROOT_LEAF_CAPACITY as u32 {
             assert!(tree.insert(&mut pool, ExtentId::new(value)).unwrap());
         }
         assert_eq!(tree.height, 0);
         assert_eq!(pool.slots.issued_blocks(), initial_nodes);
-        assert_eq!(collect(&tree, &pool), (0..16).collect::<Vec<_>>());
+        assert_eq!(collect(&tree, &pool), (0..ROOT_LEAF_CAPACITY as u32).collect::<Vec<_>>());
 
         assert!(tree.insert(&mut pool, ExtentId::new(u32::MAX - 1)).unwrap());
         assert_eq!(tree.height, 1);
         assert_eq!(pool.slots.issued_blocks(), initial_nodes + 1);
-        let mut expected: Vec<u32> = (0..16).collect();
+        let mut expected: Vec<u32> = (0..ROOT_LEAF_CAPACITY as u32).collect();
         expected.push(u32::MAX - 1);
         assert_eq!(collect(&tree, &pool), expected);
 
         assert!(tree.remove(&mut pool, ExtentId::new(u32::MAX - 1)).unwrap());
         assert_eq!(tree.height, 1);
-        assert_eq!(collect(&tree, &pool), (0..16).collect::<Vec<_>>());
-        for value in 8..16 {
+        assert_eq!(collect(&tree, &pool), (0..ROOT_LEAF_CAPACITY as u32).collect::<Vec<_>>());
+        for value in ROOT_LEAF_CAPACITY as u32 / 2..ROOT_LEAF_CAPACITY as u32 {
             assert!(tree.remove(&mut pool, ExtentId::new(value)).unwrap());
         }
         assert_eq!(tree.height, 0);
-        assert_eq!(collect(&tree, &pool), (0..8).collect::<Vec<_>>());
-        for value in 1..8 {
+        assert_eq!(collect(&tree, &pool), (0..ROOT_LEAF_CAPACITY as u32 / 2).collect::<Vec<_>>());
+        for value in 1..ROOT_LEAF_CAPACITY as u32 / 2 {
             assert!(tree.remove(&mut pool, ExtentId::new(value)).unwrap());
         }
         assert_eq!(tree.height, 0);
@@ -1315,27 +1413,33 @@ mod tests {
     fn leaf_merge_obeys_raw_slot_capacity() {
         let mut pool = ExtentTreePool::new(64).unwrap();
         let mut tree = EnExtentTree::new();
-        let mut values: Vec<u32> = (0..17).map(|value| value * 0x0100_0000).collect();
-        values.push(0x1100_0000);
+        let mut values: Vec<u32> =
+            (0..NODE_LEAF_CAPACITY + 2).map(|value| value as u32 * 0x0100_0000).collect();
+        values.push((NODE_LEAF_CAPACITY as u32 + 2) * 0x0100_0000);
         for &value in values.iter().rev() {
             assert!(tree.insert(&mut pool, ExtentId::new(value)).unwrap());
         }
         assert_eq!(tree.height, 1);
 
-        // Deleting slot 3 triggers a merge only after slots 2 and 4 are empty.
-        assert!(tree.remove(&mut pool, ExtentId::new(values[2])).unwrap());
+        let trigger_slot = NODE_LEAF_CAPACITY / 2;
+        // A merge triggers only after the slots neighboring the deleted slot are empty.
+        assert!(tree.remove(&mut pool, ExtentId::new(values[trigger_slot - 1])).unwrap());
         assert_eq!(tree.height, 1);
-        assert!(tree.remove(&mut pool, ExtentId::new(values[4])).unwrap());
+        assert!(tree.remove(&mut pool, ExtentId::new(values[trigger_slot + 1])).unwrap());
         assert_eq!(tree.height, 1);
 
-        assert!(tree.remove(&mut pool, ExtentId::new(values[3])).unwrap());
+        assert!(tree.remove(&mut pool, ExtentId::new(values[trigger_slot])).unwrap());
         assert_eq!(tree.height, 0);
         let mut root_keys = [0; KEY_SCRATCH];
-        assert_eq!(tree.root_leaf_parts(&mut root_keys), 15);
+        assert_eq!(tree.root_leaf_parts(&mut root_keys), NODE_LEAF_CAPACITY);
         let expected: Vec<u32> = values
             .iter()
             .copied()
-            .filter(|&value| value != values[2] && value != values[3] && value != values[4])
+            .filter(|&value| {
+                value != values[trigger_slot - 1]
+                    && value != values[trigger_slot]
+                    && value != values[trigger_slot + 1]
+            })
             .collect();
         assert_eq!(collect(&tree, &pool), expected);
     }
@@ -1344,24 +1448,96 @@ mod tests {
     fn pooled_leaf_empty_marker_is_reached_by_descending_deletes() {
         let mut pool = ExtentTreePool::new(64).unwrap();
         let mut tree = EnExtentTree::new();
-        for value in 0..17 {
+        for value in 0..ROOT_LEAF_CAPACITY as u32 + 1 {
             assert!(tree.insert(&mut pool, ExtentId::new(value)).unwrap());
         }
         assert_eq!(tree.height, 1);
 
-        let right_leaf = tree.find_leaf(&pool, 16);
+        let right_leaf = tree.find_leaf(&pool, ROOT_LEAF_CAPACITY as u32);
         let mut leaf_keys = [0; KEY_SCRATCH];
         let (count, _) = pool.read(right_leaf).leaf_parts(&mut leaf_keys);
         assert!(count > 0);
-        assert_eq!(leaf_keys[count - 1], 16);
+        assert_eq!(leaf_keys[count - 1], ROOT_LEAF_CAPACITY as u32);
 
         // Removing the leaf from highest to lowest leaves its minimum until
         // the last removal, when the all-NONE slots mark the leaf empty.
         for &value in leaf_keys[..count].iter().rev() {
             assert!(tree.remove(&mut pool, ExtentId::new(value)).unwrap());
         }
-        assert_eq!(collect(&tree, &pool), (0..8).collect::<Vec<_>>());
+        assert_eq!(collect(&tree, &pool), (0..ROOT_LEAF_CAPACITY as u32 / 2).collect::<Vec<_>>());
         assert_eq!(tree.height, 0);
+        pool.reclaim();
+    }
+
+    fn tree_until_height_two(pool: &mut ExtentTreePool) -> EnExtentTree {
+        let mut tree = EnExtentTree::new();
+        let max_entries = NODE_SLOTS * BRANCH_CAPACITY * 8;
+        for value in 0..max_entries as u32 {
+            assert!(tree.insert(pool, ExtentId::new(value)).unwrap());
+            if tree.height == 2 {
+                return tree;
+            }
+        }
+        panic!("inserting ordered IDs did not grow the tree to height two");
+    }
+
+    fn delete_leaf_highest_to_lowest(
+        tree: &mut EnExtentTree,
+        pool: &mut ExtentTreePool,
+        leaf: u32,
+    ) -> Vec<u32> {
+        let mut keys = [0; KEY_SCRATCH];
+        let (count, _) = pool.read(leaf).leaf_parts(&mut keys);
+        let removed = keys[..count].to_vec();
+        for &key in removed.iter().rev() {
+            assert!(tree.remove(pool, ExtentId::new(key)).unwrap());
+        }
+        removed
+    }
+
+    #[test]
+    fn branch_merge_uses_empty_neighbor_rule_and_reduces_root_height() {
+        let mut pool = ExtentTreePool::new(4096).unwrap();
+        let mut tree = tree_until_height_two(&mut pool);
+        let before = collect(&tree, &pool);
+
+        let (_, root_children, root_count) = tree.root_branch_parts();
+        assert_eq!(root_count, 2);
+        let left_branch = root_children[first_branch_slot(&root_children).unwrap()];
+        let (_, children, child_count) = pool.read(left_branch).branch_parts();
+        assert_eq!(child_count, BRANCH_SLOTS / 2);
+        let trigger_slot = BRANCH_SLOTS / 2;
+        assert_eq!(children[trigger_slot - 1], NONE);
+        assert_ne!(children[trigger_slot], NONE);
+        assert_eq!(children[trigger_slot + 1], NONE);
+
+        let removed = delete_leaf_highest_to_lowest(&mut tree, &mut pool, children[trigger_slot]);
+        assert_eq!(tree.height, 1);
+        let removed: BTreeSet<u32> = removed.into_iter().collect();
+        let expected: Vec<u32> = before.into_iter().filter(|key| !removed.contains(key)).collect();
+        assert_eq!(collect(&tree, &pool), expected);
+        pool.reclaim();
+    }
+
+    #[test]
+    fn branch_merge_does_not_trigger_at_an_edge_slot() {
+        let mut pool = ExtentTreePool::new(4096).unwrap();
+        let mut tree = tree_until_height_two(&mut pool);
+        let before = collect(&tree, &pool);
+
+        let (_, root_children, root_count) = tree.root_branch_parts();
+        assert_eq!(root_count, 2);
+        let left_branch = root_children[first_branch_slot(&root_children).unwrap()];
+        let (_, children, child_count) = pool.read(left_branch).branch_parts();
+        assert_eq!(child_count, BRANCH_SLOTS / 2);
+        assert_ne!(children[0], NONE);
+        assert_eq!(children[1], NONE);
+
+        let removed = delete_leaf_highest_to_lowest(&mut tree, &mut pool, children[0]);
+        assert_eq!(tree.height, 2);
+        let removed: BTreeSet<u32> = removed.into_iter().collect();
+        let expected: Vec<u32> = before.into_iter().filter(|key| !removed.contains(key)).collect();
+        assert_eq!(collect(&tree, &pool), expected);
         pool.reclaim();
     }
 
