@@ -14,6 +14,8 @@
 //! Deleted extent slots remain tombstones; recycling them safely is a later step.
 
 mod checkpoint;
+#[allow(dead_code)]
+mod extent_tree;
 
 use common::config::{SNConfig, ServiceKind};
 use common::deletion::{
