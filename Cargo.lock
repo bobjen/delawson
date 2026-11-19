@@ -333,6 +333,7 @@ name = "delawson-sn"
 version = "0.0.1"
 dependencies = [
  "delawson-common",
+ "delawson-permute",
  "delawson-pool",
  "delawson-raft",
  "delawson-random",

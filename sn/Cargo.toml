@@ -21,4 +21,5 @@ spookyhash.workspace = true
 [dev-dependencies]
 delawson-common = { workspace = true, features = ["testing"] }
 delawson-raft = { workspace = true, features = ["testing"] }
+permute = { package = "delawson-permute", path = "../permute" }
 tempfile = "3"
