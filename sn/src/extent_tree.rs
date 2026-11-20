@@ -21,7 +21,9 @@ const NODE_LEAF_CAPACITY: usize = NODE_SLOTS;
 const ROOT_LEAF_CAPACITY: usize = NODE_SLOTS;
 const KEY_SCRATCH: usize = ROOT_LEAF_CAPACITY + 2;
 const MERGE_KEY_SCRATCH: usize = NODE_LEAF_CAPACITY * 2 + 2;
-// Branch nodes hold sorted (child minimum, child link) pairs in sparse slots.
+// Branch nodes hold sorted child minima and links in matching sparse slots.
+// Stored key-first: the separator keys occupy the first half of the node and
+// child indexes the second, so a search probes the keys contiguously.
 const BRANCH_SLOTS: usize = NODE_SLOTS / 2;
 const BRANCH_CAPACITY: usize = BRANCH_SLOTS;
 const BRANCH_KEYS_SCRATCH: usize = BRANCH_SLOTS + 1;
@@ -363,18 +365,16 @@ impl EnExtentTree {
             return;
         }
 
-        let (root_keys, root_children) = self.root_branch_values();
-        let mut slot = branch_child(&root_keys, &root_children, key);
+        let mut slot = branch_child(&self.root_words[..BRANCH_SLOTS], key);
         cursor.set_path(0, std::ptr::null_mut(), slot);
-        let mut index = root_children[slot];
+        let mut index = self.root_words[BRANCH_SLOTS + slot];
 
         for level in 1..self.height as usize {
             let node_ptr = pool.ptr(index);
             let node = pool.read_ptr(node_ptr);
-            let (keys, children) = node.branch_values();
-            slot = branch_child(&keys, &children, key);
+            slot = branch_child(&node.words[..BRANCH_SLOTS], key);
             cursor.set_path(level, node_ptr, slot);
-            index = children[slot];
+            index = node.words[BRANCH_SLOTS + slot];
         }
 
         cursor.leaf_ptr = pool.ptr(index);
@@ -529,7 +529,7 @@ impl EnExtentTree {
         // A standalone remove can search and mutate in one recursive descent.
         // Callers that already have a cursor can use remove_with_cursor().
         let (mut root_keys, mut root_children) = self.root_branch_values();
-        let child_at = branch_child(&root_keys, &root_children, key);
+        let child_at = branch_child(&root_keys[..BRANCH_SLOTS], key);
         let child = root_children[child_at];
         let (minimum, merge_candidate) =
             match delete_subtree_direct(pool, child, self.height - 1, key) {
@@ -835,7 +835,7 @@ fn delete_subtree_direct(
     }
 
     let (mut keys, mut children) = node.branch_values();
-    let child_at = branch_child(&keys, &children, key);
+    let child_at = branch_child(&keys[..BRANCH_SLOTS], key);
     let child_index = children[child_at];
     let (child_minimum, merge_candidate) =
         match delete_subtree_direct(pool, child_index, height - 1, key) {
@@ -1082,13 +1082,14 @@ fn branch_slot_has_empty_neighbors(children: &BranchChildren, slot: usize) -> bo
 fn branch_values(words: &[u32; NODE_SLOTS]) -> (BranchKeys, BranchChildren) {
     let mut keys = [NONE; BRANCH_KEYS_SCRATCH];
     let mut children = [NONE; BRANCH_CHILDREN_SCRATCH];
-    for slot in 0..BRANCH_SLOTS {
-        let key = words[2 * slot];
-        let child = words[2 * slot + 1];
-        debug_assert_eq!(key == NONE, child == NONE);
-        keys[slot] = key;
-        children[slot] = child;
-    }
+    keys[..BRANCH_SLOTS].copy_from_slice(&words[..BRANCH_SLOTS]);
+    children[..BRANCH_SLOTS].copy_from_slice(&words[BRANCH_SLOTS..]);
+    debug_assert!(
+        keys[..BRANCH_SLOTS]
+            .iter()
+            .zip(&children[..BRANCH_SLOTS])
+            .all(|(key, child)| (*key == NONE) == (*child == NONE))
+    );
     (keys, children)
 }
 
@@ -1097,7 +1098,7 @@ fn branch_count(children: &BranchChildren) -> usize {
 }
 
 fn branch_has_hole_words(words: &[u32; NODE_SLOTS]) -> bool {
-    (0..BRANCH_SLOTS).any(|slot| words[2 * slot + 1] == NONE)
+    words[BRANCH_SLOTS..].contains(&NONE)
 }
 
 fn branch_parts(words: &[u32; NODE_SLOTS]) -> (BranchKeys, BranchChildren, usize) {
@@ -1110,11 +1111,9 @@ fn write_branch(words: &mut [u32; NODE_SLOTS], keys: &[u32], children: &[u32]) {
     debug_assert_eq!(keys.len(), BRANCH_SLOTS);
     debug_assert_eq!(children.len(), BRANCH_SLOTS);
     *words = [NONE; NODE_SLOTS];
-    for slot in 0..BRANCH_SLOTS {
-        debug_assert_eq!(keys[slot] == NONE, children[slot] == NONE);
-        words[2 * slot] = keys[slot];
-        words[2 * slot + 1] = children[slot];
-    }
+    debug_assert!(keys.iter().zip(children).all(|(key, child)| (*key == NONE) == (*child == NONE)));
+    words[..BRANCH_SLOTS].copy_from_slice(keys);
+    words[BRANCH_SLOTS..].copy_from_slice(children);
 }
 
 fn root_branch_parts(tree: &EnExtentTree) -> (BranchKeys, BranchChildren, usize) {
@@ -1122,20 +1121,21 @@ fn root_branch_parts(tree: &EnExtentTree) -> (BranchKeys, BranchChildren, usize)
     branch_parts(&tree.root_words)
 }
 
-fn branch_child(keys: &BranchKeys, children: &BranchChildren, key: u32) -> usize {
-    let first = first_branch_slot(children).expect("nonempty branch");
+fn branch_child(keys: &[u32], key: u32) -> usize {
+    debug_assert_eq!(keys.len(), BRANCH_SLOTS);
+    let first = keys.iter().position(|&separator| separator != NONE).expect("nonempty branch");
     let mut low = first;
     let mut high = BRANCH_SLOTS;
     let mut previous = None;
 
     while low < high {
         let middle = low + (high - low) / 2;
-        let at = if children[middle] != NONE {
+        let at = if keys[middle] != NONE {
             middle
-        } else if let Some(next) = (middle + 1..high).find(|&slot| children[slot] != NONE) {
+        } else if let Some(next) = (middle + 1..high).find(|&slot| keys[slot] != NONE) {
             next
         } else {
-            let Some(previous) = (low..middle).rev().find(|&slot| children[slot] != NONE) else {
+            let Some(previous) = (low..middle).rev().find(|&slot| keys[slot] != NONE) else {
                 break;
             };
             previous
