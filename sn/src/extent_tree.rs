@@ -28,7 +28,7 @@ const BRANCH_SLOTS: usize = NODE_SLOTS / 2;
 const BRANCH_CAPACITY: usize = BRANCH_SLOTS;
 const BRANCH_KEYS_SCRATCH: usize = BRANCH_SLOTS + 1;
 const BRANCH_CHILDREN_SCRATCH: usize = BRANCH_SLOTS + 1;
-const CURSOR_PATH: usize = u8::MAX as usize + 1;
+const CURSOR_PATH: usize = 1 + (u32::BITS as usize - 1) / (NODE_SLOTS_LOG2 - 2);
 
 const fn node_alignment(bytes: usize) -> usize {
     let mut alignment = 64;
@@ -45,12 +45,16 @@ const _: () = assert!(NODE_BYTES % NODE_ALIGNMENT == 0);
 
 type BranchKeys = [u32; BRANCH_KEYS_SCRATCH];
 type BranchChildren = [u32; BRANCH_CHILDREN_SCRATCH];
+type LeafWords = [u32; NODE_LEAF_CAPACITY];
 type KeyScratch = [u32; KEY_SCRATCH];
-type Nodes = LockedPool<Node, NODE_ALIGNMENT, { offset_of!(Node, words) }>;
+type Nodes = LockedPool<Node, NODE_ALIGNMENT, { offset_of!(Node, link) }>;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Node {
+union Node {
+    // LockedPool uses this word while the node is on a free or deleted list.
+    link: u32,
+    // A live node uses the whole array; every word is written before it is read.
     words: [u32; NODE_SLOTS],
 }
 
@@ -58,29 +62,37 @@ const _: [(); NODE_BYTES] = [(); size_of::<Node>()];
 const _: () = assert!(align_of::<Node>() <= NODE_ALIGNMENT);
 
 impl Node {
-    fn blank() -> Self {
-        Self { words: [NONE; NODE_SLOTS] }
+    fn free_slot() -> Self {
+        Self { link: NONE }
     }
 
     fn branch(keys: &[u32], children: &[u32]) -> Self {
-        debug_assert_eq!(keys.len(), BRANCH_SLOTS);
-        debug_assert_eq!(children.len(), BRANCH_SLOTS);
-        let mut node = Self::blank();
-        write_branch(&mut node.words, keys, children);
-        node
+        assert_eq!(keys.len(), BRANCH_SLOTS);
+        assert_eq!(children.len(), BRANCH_SLOTS);
+        debug_assert!(
+            keys.iter().zip(children).all(|(key, child)| (*key == NONE) == (*child == NONE))
+        );
+
+        let mut words = MaybeUninit::<[u32; NODE_SLOTS]>::uninit();
+        let dst = words.as_mut_ptr().cast::<u32>();
+        // SAFETY: the length checks establish that both copies initialize the
+        // entire node, and neither source overlaps this fresh array.
+        unsafe {
+            std::ptr::copy_nonoverlapping(keys.as_ptr(), dst, BRANCH_SLOTS);
+            std::ptr::copy_nonoverlapping(children.as_ptr(), dst.add(BRANCH_SLOTS), BRANCH_SLOTS);
+            Self { words: words.assume_init() }
+        }
     }
 
-    fn leaf(keys: &[u32]) -> Self {
-        debug_assert!(!keys.is_empty());
-        debug_assert!(keys.len() <= NODE_LEAF_CAPACITY);
-        let mut node = Self::blank();
-        node.words[..keys.len()].copy_from_slice(keys);
-        node
+    fn leaf(words: &LeafWords) -> Self {
+        Self { words: *words }
     }
 
     fn leaf_parts(self, keys: &mut KeyScratch) -> usize {
         let mut count = 0;
-        for &key in &self.words {
+        // SAFETY: leaf_parts is called only for a live, fully initialized node.
+        let words = unsafe { self.words };
+        for &key in &words {
             if key != NONE {
                 keys[count] = key;
                 count += 1;
@@ -91,15 +103,18 @@ impl Node {
     }
 
     fn branch_parts(self) -> (BranchKeys, BranchChildren, usize) {
-        branch_parts(&self.words)
+        // SAFETY: branch_parts is called only for a live, fully initialized node.
+        let words = unsafe { self.words };
+        branch_parts(&words)
     }
 }
 
-// SAFETY: a fresh pool slot is initialized as a complete empty node.
+// SAFETY: a fresh pool slot is initialized with its free-list link. Live node
+// words are written in full by insertion before any word is read.
 unsafe impl PoolItem for Node {
     unsafe fn init(slot: *mut Self) {
         // SAFETY: LockedPool supplies aligned, fresh storage for Node.
-        unsafe { slot.write(Self::blank()) };
+        unsafe { slot.write(Self::free_slot()) };
     }
 }
 
@@ -138,20 +153,23 @@ impl ExtentTreePool {
 
     fn words_ptr(&self, ptr: *mut Node) -> &[u32; NODE_SLOTS] {
         // SAFETY: cursor pointers come from this pool's stable mapping and
-        // remain live while the caller holds the lock protecting the tree.
+        // remain live while the caller holds the lock protecting the tree;
+        // their complete words array was written before they entered the tree.
         unsafe { &(*ptr).words }
     }
 
     fn words_mut_ptr(&mut self, ptr: *mut Node) -> &mut [u32; NODE_SLOTS] {
         // SAFETY: cursor pointers come from this pool's stable mapping and
-        // remain live while the caller holds the tree's exclusive lock.
+        // remain live while the caller holds the tree's exclusive lock; the
+        // node was fully initialized before it entered the tree.
         unsafe { &mut (*ptr).words }
     }
 
     fn read_word(&self, ptr: *mut Node, slot: usize) -> u32 {
         debug_assert!(slot < NODE_SLOTS);
         // SAFETY: cursor pointers come from this pool's stable mapping and
-        // remain live while the caller holds the lock protecting the tree.
+        // remain live while the caller holds the lock protecting the tree;
+        // the selected live node's complete words array is initialized.
         unsafe { (*ptr).words[slot] }
     }
 
@@ -180,9 +198,8 @@ impl ExtentTreePool {
             .slots
             .alloc_many(count)
             .map_err(|error| Error::new(format!("allocate EN extent-tree nodes: {error}")))?;
-        for &index in &indexes {
-            self.write(index, Node::blank());
-        }
+        // The insertion path writes every reserved node in full before
+        // linking it into the live tree.
         Ok(indexes)
     }
 
@@ -427,8 +444,10 @@ impl EnExtentTree {
                 let split = choose_leaf_split(&keys[..count + 1], NODE_LEAF_CAPACITY);
                 let left_index = reserved.pop().expect("root leaf split was pre-reserved");
                 let right_index = reserved.pop().expect("root leaf split was pre-reserved");
-                pool.write(left_index, Node::leaf(&keys[..split]));
-                pool.write(right_index, Node::leaf(&keys[split..count + 1]));
+                let left_words = spread_leaf_words(&keys[..split]);
+                let right_words = spread_leaf_words(&keys[split..count + 1]);
+                pool.write(left_index, Node::leaf(&left_words));
+                pool.write(right_index, Node::leaf(&right_words));
                 let (root_keys, root_children) =
                     centered_two_branch_pairs(keys[0], left_index, keys[split], right_index);
                 self.write_root_branch(
@@ -693,13 +712,12 @@ impl EnExtentTree {
             let node = pool.read(child);
             if self.height == 1 {
                 self.height = 0;
-                self._reserved = [0; 8];
-                self.root_words = node.words;
             } else {
                 self.height -= 1;
-                self._reserved = [0; 8];
-                self.root_words = node.words;
             }
+            self._reserved = [0; 8];
+            // SAFETY: this child is a live tree node and all of its words are initialized.
+            self.root_words = unsafe { node.words };
             pool.retire(child);
         }
     }
@@ -731,8 +749,10 @@ fn insert_subtree(
         insert_key(&mut keys, count, leaf.slot as usize, key);
         let split = choose_leaf_split(&keys[..count + 1], NODE_LEAF_CAPACITY);
         let right_index = reserved.pop().expect("leaf split was pre-reserved");
-        pool.write(right_index, Node::leaf(&keys[split..count + 1]));
-        pool.write_ptr(leaf.node, Node::leaf(&keys[..split]));
+        let left_words = spread_leaf_words(&keys[..split]);
+        let right_words = spread_leaf_words(&keys[split..count + 1]);
+        pool.write(right_index, Node::leaf(&right_words));
+        pool.write_ptr(leaf.node, Node::leaf(&left_words));
         return Some((keys[split], right_index));
     }
 
@@ -923,7 +943,10 @@ fn merge_leaf_children(
     children: &mut BranchChildren,
     child_at: usize,
 ) -> Option<usize> {
-    let leaf_count = pool.read(children[child_at]).words.iter().filter(|&&key| key != NONE).count();
+    let child = pool.read(children[child_at]);
+    // SAFETY: merge candidates reference live leaf nodes whose words are initialized.
+    let child_words = unsafe { child.words };
+    let leaf_count = child_words.iter().filter(|&&key| key != NONE).count();
     if leaf_count > NODE_LEAF_CAPACITY / 2 {
         return None;
     }
@@ -1000,7 +1023,8 @@ fn merge_leaf_nodes(pool: &mut ExtentTreePool, left_index: u32, right_index: u32
     if !can_store_leaf(&merged[..count], NODE_LEAF_CAPACITY) {
         return false;
     }
-    pool.write(left_index, Node::leaf(&merged[..count]));
+    let merged_words = spread_leaf_words(&merged[..count]);
+    pool.write(left_index, Node::leaf(&merged_words));
     true
 }
 
@@ -1186,9 +1210,8 @@ fn branch_parts(words: &[u32; NODE_SLOTS]) -> (BranchKeys, BranchChildren, usize
 }
 
 fn write_branch(words: &mut [u32; NODE_SLOTS], keys: &[u32], children: &[u32]) {
-    debug_assert_eq!(keys.len(), BRANCH_SLOTS);
-    debug_assert_eq!(children.len(), BRANCH_SLOTS);
-    *words = [NONE; NODE_SLOTS];
+    assert_eq!(keys.len(), BRANCH_SLOTS);
+    assert_eq!(children.len(), BRANCH_SLOTS);
     debug_assert!(keys.iter().zip(children).all(|(key, child)| (*key == NONE) == (*child == NONE)));
     words[..BRANCH_SLOTS].copy_from_slice(keys);
     words[BRANCH_SLOTS..].copy_from_slice(children);
@@ -1279,6 +1302,36 @@ fn next_branch_slot(children: &BranchChildren, from: usize) -> Option<usize> {
     (from..BRANCH_SLOTS).find(|&slot| children[slot] != NONE)
 }
 
+fn spread_leaf_words(keys: &[u32]) -> LeafWords {
+    assert!(!keys.is_empty());
+    assert!(keys.len() <= NODE_LEAF_CAPACITY);
+    debug_assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+
+    let count = keys.len();
+    let slot_for = |i: usize| {
+        if count == 1 {
+            NODE_LEAF_CAPACITY / 2
+        } else {
+            let intervals = count - 1;
+            (i * (NODE_LEAF_CAPACITY - 1) + intervals / 2) / intervals
+        }
+    };
+    let mut key_at = 0;
+    let mut next_key_slot = slot_for(0);
+    std::array::from_fn(|slot| {
+        if slot == next_key_slot {
+            let key = keys[key_at];
+            key_at += 1;
+            if key_at < count {
+                next_key_slot = slot_for(key_at);
+            }
+            key
+        } else {
+            NONE
+        }
+    })
+}
+
 fn can_store_leaf(keys: &[u32], capacity: usize) -> bool {
     keys.len() <= capacity
 }
@@ -1312,17 +1365,9 @@ fn insert_key(keys: &mut KeyScratch, count: usize, at: usize, key: u32) {
 }
 
 fn leaf_bounds(words: &[u32; NODE_SLOTS]) -> Option<(usize, usize)> {
-    let mut first = NODE_SLOTS;
-    let mut last = 0;
-    for (slot, &key) in words.iter().enumerate() {
-        if key != NONE {
-            if first == NODE_SLOTS {
-                first = slot;
-            }
-            last = slot;
-        }
-    }
-    (first != NODE_SLOTS).then_some((first, last))
+    let first = (0..NODE_SLOTS).find(|&slot| words[slot] != NONE)?;
+    let last = (first..NODE_SLOTS).rev().find(|&slot| words[slot] != NONE)?;
+    Some((first, last))
 }
 
 fn remove_leaf_word(
