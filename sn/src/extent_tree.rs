@@ -142,9 +142,25 @@ impl ExtentTreePool {
         unsafe { self.ptr(index).read() }
     }
 
+    fn read_ptr(&self, ptr: *mut Node) -> Node {
+        // SAFETY: cursor pointers come from this pool's stable mapping and
+        // remain live while the caller holds the lock protecting the tree.
+        unsafe { ptr.read() }
+    }
+
     fn write(&mut self, index: u32, node: Node) {
         // SAFETY: the tree owns this live node exclusively during mutation.
         unsafe { self.ptr(index).write(node) };
+    }
+
+    fn write_ptr(&mut self, ptr: *mut Node, node: Node) {
+        // SAFETY: cursor pointers come from this pool's stable mapping and
+        // remain live while the caller holds the tree's exclusive lock.
+        unsafe { ptr.write(node) };
+    }
+
+    fn index_of(&self, ptr: *mut Node) -> u32 {
+        self.slots.index_of(ptr.cast()).expect("cursor node pointer must belong to this pool")
     }
 
     /// Reserve all nodes an insertion can need before it mutates the tree.
@@ -196,7 +212,7 @@ enum DeleteResult {
 
 #[derive(Clone, Copy)]
 struct CursorPath {
-    node: u32,
+    node: *mut Node,
     slot: u16,
 }
 
@@ -206,7 +222,7 @@ struct CursorPath {
 pub(super) struct Cursor {
     key: u32,
     height: u8,
-    leaf_index: u32,
+    leaf_ptr: *mut Node,
     leaf_slot: usize,
     path: [MaybeUninit<CursorPath>; CURSOR_PATH],
     leaf_words: [u32; NODE_SLOTS],
@@ -221,7 +237,7 @@ impl Cursor {
         Self {
             key,
             height: 0,
-            leaf_index: NONE,
+            leaf_ptr: std::ptr::null_mut(),
             leaf_slot: NODE_SLOTS,
             path: [MaybeUninit::uninit(); CURSOR_PATH],
             leaf_words: [NONE; NODE_SLOTS],
@@ -251,7 +267,7 @@ impl Cursor {
         debug_assert_eq!(self.found, self.leaf_slot < NODE_SLOTS);
     }
 
-    fn set_path(&mut self, level: usize, node: u32, slot: usize) {
+    fn set_path(&mut self, level: usize, node: *mut Node, slot: usize) {
         self.path[level].write(CursorPath { node, slot: slot as u16 });
     }
 
@@ -272,7 +288,7 @@ impl Cursor {
         let mut needed = 1; // one new right leaf
         let mut split_carries = true;
         for level in (1..self.height as usize).rev() {
-            if split_carries && !pool.read(self.path(level).node).has_branch_hole() {
+            if split_carries && !pool.read_ptr(self.path(level).node).has_branch_hole() {
                 needed += 1; // full pooled branch splits and carries upward
             } else {
                 split_carries = false;
@@ -299,7 +315,7 @@ impl Cursor {
             let (_, children) = if level == 0 {
                 tree.root_branch_values()
             } else {
-                pool.read(path.node).branch_values()
+                pool.read_ptr(path.node).branch_values()
             };
             let Some(slot) = next_branch_slot(&children, path.slot as usize + 1) else {
                 continue;
@@ -307,13 +323,14 @@ impl Cursor {
             self.set_path(level, path.node, slot);
             let mut next = children[slot];
             for child_level in level + 1..height {
-                let (_, children) = pool.read(next).branch_values();
+                let node_ptr = pool.ptr(next);
+                let (_, children) = pool.read_ptr(node_ptr).branch_values();
                 let child_slot = first_branch_slot(&children).expect("nonempty branch");
-                self.set_path(child_level, next, child_slot);
+                self.set_path(child_level, node_ptr, child_slot);
                 next = children[child_slot];
             }
-            self.leaf_index = next;
-            self.set_leaf_words(pool.read(next).words);
+            self.leaf_ptr = pool.ptr(next);
+            self.set_leaf_words(pool.read_ptr(self.leaf_ptr).words);
             self.position = 0;
             self.found = false;
             return true;
@@ -341,25 +358,27 @@ impl EnExtentTree {
         cursor.key = key;
         cursor.height = self.height;
         if self.height == 0 {
+            cursor.leaf_ptr = std::ptr::null_mut();
             cursor.set_leaf_words(self.root_words);
             return;
         }
 
         let (root_keys, root_children) = self.root_branch_values();
         let mut slot = branch_child(&root_keys, &root_children, key);
-        cursor.set_path(0, NONE, slot);
+        cursor.set_path(0, std::ptr::null_mut(), slot);
         let mut index = root_children[slot];
 
         for level in 1..self.height as usize {
-            let node = pool.read(index);
+            let node_ptr = pool.ptr(index);
+            let node = pool.read_ptr(node_ptr);
             let (keys, children) = node.branch_values();
             slot = branch_child(&keys, &children, key);
-            cursor.set_path(level, index, slot);
+            cursor.set_path(level, node_ptr, slot);
             index = children[slot];
         }
 
-        cursor.leaf_index = index;
-        cursor.set_leaf_words(pool.read(index).words);
+        cursor.leaf_ptr = pool.ptr(index);
+        cursor.set_leaf_words(pool.read_ptr(cursor.leaf_ptr).words);
     }
 
     pub(super) fn contains(&self, pool: &ExtentTreePool, id: ExtentId) -> bool {
@@ -436,15 +455,9 @@ impl EnExtentTree {
         if min_changed {
             root_keys[child_at] = key;
         }
-        if let Some((separator, right)) = insert_subtree(
-            pool,
-            root_children[child_at],
-            self.height - 1,
-            1,
-            key,
-            &cursor,
-            &mut reserved,
-        ) {
+        if let Some((separator, right)) =
+            insert_subtree(pool, self.height - 1, 1, key, &cursor, &mut reserved)
+        {
             if insert_branch_entry(&mut root_keys, &mut root_children, child_at, separator, right) {
                 self.write_root_branch(
                     self.height,
@@ -558,7 +571,7 @@ impl EnExtentTree {
         let child_at = root_path.slot as usize;
         let child = root_children[child_at];
         let (minimum, merge_candidate) =
-            match delete_subtree(pool, child, self.height - 1, 1, key, &cursor) {
+            match delete_subtree(pool, self.height - 1, 1, key, &cursor) {
                 DeleteResult::NotFound => return Ok(false),
                 DeleteResult::Removed { minimum, merge_candidate } => (minimum, merge_candidate),
             };
@@ -717,7 +730,6 @@ impl EnExtentTree {
 
 fn insert_subtree(
     pool: &mut ExtentTreePool,
-    index: u32,
     height: u8,
     path_level: usize,
     key: u32,
@@ -725,24 +737,24 @@ fn insert_subtree(
     reserved: &mut Vec<u32>,
 ) -> Option<(u32, u32)> {
     if height == 0 {
-        debug_assert_eq!(index, cursor.leaf_index);
+        debug_assert!(!cursor.leaf_ptr.is_null());
         let mut keys = cursor.keys;
         let count = cursor.count;
         insert_key(&mut keys, count, cursor.position, key);
         if can_store_leaf(&keys[..count + 1], NODE_LEAF_CAPACITY) {
-            pool.write(index, Node::leaf(&keys[..count + 1]));
+            pool.write_ptr(cursor.leaf_ptr, Node::leaf(&keys[..count + 1]));
             return None;
         }
         let split = choose_leaf_split(&keys[..count + 1], NODE_LEAF_CAPACITY);
         let right_index = reserved.pop().expect("leaf split was pre-reserved");
         pool.write(right_index, Node::leaf(&keys[split..count + 1]));
-        pool.write(index, Node::leaf(&keys[..split]));
+        pool.write_ptr(cursor.leaf_ptr, Node::leaf(&keys[..split]));
         return Some((keys[split], right_index));
     }
 
     let path = cursor.path(path_level);
-    debug_assert_eq!(index, path.node);
-    let (mut keys, mut children) = pool.read(index).branch_values();
+    debug_assert!(!path.node.is_null());
+    let (mut keys, mut children) = pool.read_ptr(path.node).branch_values();
     let child_at = path.slot as usize;
     let first_child = first_branch_slot(&children).expect("nonempty branch");
     let min_changed = child_at == first_child && key < keys[child_at];
@@ -750,10 +762,13 @@ fn insert_subtree(
         keys[child_at] = key;
     }
     if let Some((separator, right)) =
-        insert_subtree(pool, children[child_at], height - 1, path_level + 1, key, cursor, reserved)
+        insert_subtree(pool, height - 1, path_level + 1, key, cursor, reserved)
     {
         if insert_branch_entry(&mut keys, &mut children, child_at, separator, right) {
-            pool.write(index, Node::branch(&keys[..BRANCH_SLOTS], &children[..BRANCH_SLOTS]));
+            pool.write_ptr(
+                path.node,
+                Node::branch(&keys[..BRANCH_SLOTS], &children[..BRANCH_SLOTS]),
+            );
             return None;
         }
 
@@ -772,11 +787,14 @@ fn insert_subtree(
             right_index,
             Node::branch(&right_keys[..BRANCH_SLOTS], &right_children[..BRANCH_SLOTS]),
         );
-        pool.write(index, Node::branch(&left_keys[..BRANCH_SLOTS], &left_children[..BRANCH_SLOTS]));
+        pool.write_ptr(
+            path.node,
+            Node::branch(&left_keys[..BRANCH_SLOTS], &left_children[..BRANCH_SLOTS]),
+        );
         return Some((promoted, right_index));
     }
     if min_changed {
-        pool.write(index, Node::branch(&keys[..BRANCH_SLOTS], &children[..BRANCH_SLOTS]));
+        pool.write_ptr(path.node, Node::branch(&keys[..BRANCH_SLOTS], &children[..BRANCH_SLOTS]));
     }
     None
 }
@@ -856,14 +874,13 @@ fn delete_subtree_direct(
 
 fn delete_subtree(
     pool: &mut ExtentTreePool,
-    index: u32,
     height: u8,
     path_level: usize,
     key: u32,
     cursor: &Cursor,
 ) -> DeleteResult {
     if height == 0 {
-        debug_assert_eq!(index, cursor.leaf_index);
+        debug_assert!(!cursor.leaf_ptr.is_null());
         debug_assert!(cursor.found);
         let slot = cursor.leaf_slot;
         debug_assert!(slot < NODE_SLOTS);
@@ -878,30 +895,30 @@ fn delete_subtree(
             && slot + 1 < NODE_LEAF_CAPACITY
             && updated.words[slot - 1] == NONE
             && updated.words[slot + 1] == NONE;
-        pool.write(index, updated);
+        pool.write_ptr(cursor.leaf_ptr, updated);
         return DeleteResult::Removed { minimum, merge_candidate };
     }
 
     let path = cursor.path(path_level);
-    debug_assert_eq!(index, path.node);
-    let (mut keys, mut children) = pool.read(index).branch_values();
+    debug_assert!(!path.node.is_null());
+    let (mut keys, mut children) = pool.read_ptr(path.node).branch_values();
     let child_at = path.slot as usize;
-    let child_index = children[child_at];
+    let child_ptr = if height == 1 { cursor.leaf_ptr } else { cursor.path(path_level + 1).node };
     let (child_minimum, merge_candidate) =
-        match delete_subtree(pool, child_index, height - 1, path_level + 1, key, cursor) {
+        match delete_subtree(pool, height - 1, path_level + 1, key, cursor) {
             DeleteResult::NotFound => return DeleteResult::NotFound,
             DeleteResult::Removed { minimum, merge_candidate } => (minimum, merge_candidate),
         };
 
     if child_minimum == NONE {
         remove_branch_child(&mut keys, &mut children, child_at);
-        pool.retire(child_index);
+        pool.retire(pool.index_of(child_ptr));
         let Some(first_child) = first_branch_slot(&children) else {
             return DeleteResult::Removed { minimum: NONE, merge_candidate: false };
         };
         let minimum = keys[first_child];
         let merge_candidate = branch_slot_has_empty_neighbors(&children, child_at);
-        pool.write(index, Node::branch(&keys[..BRANCH_SLOTS], &children[..BRANCH_SLOTS]));
+        pool.write_ptr(path.node, Node::branch(&keys[..BRANCH_SLOTS], &children[..BRANCH_SLOTS]));
         return DeleteResult::Removed { minimum, merge_candidate };
     }
 
@@ -918,7 +935,7 @@ fn delete_subtree(
     };
     let first_child = first_branch_slot(&children).expect("nonempty branch after deletion");
     let minimum = keys[first_child];
-    pool.write(index, Node::branch(&keys[..BRANCH_SLOTS], &children[..BRANCH_SLOTS]));
+    pool.write_ptr(path.node, Node::branch(&keys[..BRANCH_SLOTS], &children[..BRANCH_SLOTS]));
     DeleteResult::Removed { minimum, merge_candidate: branch_merge_candidate }
 }
 
@@ -1606,7 +1623,7 @@ mod tests {
 
         let mut cursor = Cursor::new(ROOT_LEAF_CAPACITY as u32);
         tree.find(&pool, ROOT_LEAF_CAPACITY as u32, &mut cursor);
-        let right_leaf = cursor.leaf_index;
+        let right_leaf = pool.index_of(cursor.leaf_ptr);
         let mut leaf_keys = [0; KEY_SCRATCH];
         let count = pool.read(right_leaf).leaf_parts(&mut leaf_keys);
         assert!(count > 0);

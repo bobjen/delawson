@@ -164,6 +164,28 @@ impl<T: LockedItem, const A: usize, const L: usize> LockedPool<T, A, L> {
         NonNull::new(self.slot(0)).expect("pool mapping is non-null")
     }
 
+    /// Find the index of an issued slot from its starting address.
+    ///
+    /// The pointer must point to the first byte of a slot in this pool. This
+    /// checks the pool's mapping, slot alignment, and issued range; it does
+    /// not establish ownership or prove that the slot is currently allocated.
+    pub fn index_of(&self, ptr: *const u8) -> Result<u32> {
+        let base = self.mapping.base.as_ptr() as usize;
+        let address = ptr as usize;
+        let offset = address
+            .checked_sub(base)
+            .ok_or_else(|| Error::new("pointer is below the locked pool mapping"))?;
+        let block_bytes = size_of::<T>();
+        if offset % block_bytes != 0 {
+            return Err(Error::new("pointer is not at a locked-pool slot boundary"));
+        }
+        let index = offset / block_bytes;
+        if index >= self.max_blocks as usize || index >= self.issued_blocks() as usize {
+            return Err(Error::new("pointer is outside the issued locked-pool range"));
+        }
+        Ok(index as u32)
+    }
+
     /// Search all 128 free lists in a randomized stride, then issue one new
     /// index if none has a block. Does not reclaim deleted blocks.
     pub fn alloc(&mut self) -> Result<u32> {
@@ -505,6 +527,23 @@ mod tests {
         unsafe { pool.retire_index(first) };
         pool.reclaim();
         assert_eq!(pool.alloc().unwrap(), 0);
+    }
+
+    #[test]
+    fn index_of_checks_pool_and_slot_boundaries() {
+        let mut pool = TestPool::new(4, 0).unwrap();
+        let first = pool.alloc().unwrap();
+        let second = pool.alloc().unwrap();
+        let first_ptr = pool.slot(first);
+        let second_ptr = pool.slot(second);
+        assert_eq!(pool.index_of(first_ptr.cast()).unwrap(), first);
+        assert_eq!(pool.index_of(second_ptr.cast()).unwrap(), second);
+        assert!(pool.index_of(unsafe { first_ptr.cast::<u8>().add(1) }).is_err());
+
+        let mut other = TestPool::new(4, 0).unwrap();
+        let other_index = other.alloc().unwrap();
+        let other_ptr = other.slot(other_index);
+        assert!(pool.index_of(other_ptr.cast()).is_err());
     }
 
     #[test]
