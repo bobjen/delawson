@@ -1479,25 +1479,49 @@ fn sparse_leaf_find(
 }
 
 fn nearest_hole(words: &[u32], target: usize) -> Option<usize> {
-    if words.is_empty() {
+    let len = words.len();
+    if len == 0 {
         return None;
     }
-    debug_assert!(target <= words.len());
-    let target = target.min(words.len() - 1);
-    for distance in 0..words.len() {
-        let right = target + distance;
-        if right < words.len() && words[right] == NONE {
+    debug_assert!(target <= len);
+    let target = target.min(len - 1);
+    if words[target] == NONE {
+        return Some(target);
+    }
+
+    let mut right = target + 1;
+    // A valid slice's byte size fits in isize, so its indexes fit as well.
+    let mut left = target as isize - 1;
+    loop {
+        if right == len {
+            while left >= 0 {
+                let at = left as usize;
+                if words[at] == NONE {
+                    return Some(at);
+                }
+                left -= 1;
+            }
+            return None;
+        }
+        if words[right] == NONE {
             return Some(right);
         }
-        if distance != 0 {
-            if let Some(left) = target.checked_sub(distance) {
-                if words[left] == NONE {
-                    return Some(left);
+        right += 1;
+
+        if left < 0 {
+            for at in right..len {
+                if words[at] == NONE {
+                    return Some(at);
                 }
             }
+            return None;
         }
+        let at = left as usize;
+        if words[at] == NONE {
+            return Some(at);
+        }
+        left -= 1;
     }
-    None
 }
 
 fn insert_sparse_item(
