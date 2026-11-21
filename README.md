@@ -76,9 +76,9 @@ instance ─▶ contiguous block of data on disk
 Those levels are split across three node types:
 
 ```
-DN  Directory Node   directory hierarchy, object metadata, inline tiny objects
+DN  Directory Node   directory hierarchy, object metadata, stream definitions
 SN  Stream Node      extents per stream, instances per extent, erasure coding
-EN  Extent Node      the bytes on disk, four initial instances of each extent
+EN  Extent Node      stores instances: the encrypted compressed bytes on disk
 ```
 
 Around those sit `FE` (Front End: authorization and coordination), `KS` (Key
