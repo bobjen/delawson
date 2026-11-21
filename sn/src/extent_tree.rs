@@ -27,7 +27,9 @@ const BRANCH_SLOTS: usize = NODE_SLOTS / 2;
 const BRANCH_CAPACITY: usize = BRANCH_SLOTS;
 const BRANCH_KEYS_SCRATCH: usize = BRANCH_SLOTS + 1;
 const BRANCH_CHILDREN_SCRATCH: usize = BRANCH_SLOTS + 1;
-const CURSOR_PATH: usize = 1 + (u32::BITS as usize - 1) / (NODE_SLOTS_LOG2 - 2);
+// Height is stored as u8. The cursor path includes both the leaf at level 0
+// and the root branch at level `height`, so it needs 256 entries.
+const CURSOR_PATH: usize = u8::MAX as usize + 1;
 
 const fn node_alignment(bytes: usize) -> usize {
     let mut alignment = 64;
