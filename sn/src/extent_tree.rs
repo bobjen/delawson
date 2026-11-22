@@ -950,7 +950,7 @@ fn merge_leaf_nodes(
     let (left_words, right_words) = unsafe { (&mut (*left_ptr).words, &(*right_ptr).words) };
     debug_assert_eq!(leaf_count(left_words), left_count);
     debug_assert_eq!(leaf_count(right_words), right_count);
-    let _merged_count = merge_items_packed(left_words, right_words);
+    let _merged_count = merge_items_spread_b(left_words, right_words, left_count, right_count);
     debug_assert_eq!(_merged_count, count);
     true
 }
@@ -980,16 +980,17 @@ fn merge_branch_nodes(pool: &mut ExtentTreePool, left_index: u32, right_index: u
     let (left_keys, left_children) = left_words.split_at_mut(BRANCH_SLOTS);
     let (right_keys, right_children) = right_words.split_at(BRANCH_SLOTS);
 
-    let _merged_key_count = merge_items_packed(left_keys, right_keys);
-    let _merged_child_count = merge_items_packed(left_children, right_children);
+    let _merged_key_count = merge_items_spread_b(left_keys, right_keys, left_count, right_count);
+    let _merged_child_count =
+        merge_items_spread_b(left_children, right_children, left_count, right_count);
     debug_assert_eq!(_merged_key_count, count);
     debug_assert_eq!(_merged_child_count, count);
     true
 }
 
-/// Merge two ordered sparse arrays into A, leaving all merged items packed at
-/// its start. The same routine handles leaf keys, branch keys, and child links.
-fn merge_items_packed(a: &mut [u32], b: &[u32]) -> usize {
+/// Pack A at the start of its array, then spread B through the remaining slots.
+/// The same routine handles leaf keys, branch keys, and child links.
+fn merge_items_spread_b(a: &mut [u32], b: &[u32], a_count: usize, b_count: usize) -> usize {
     assert_eq!(a.len(), b.len());
     let mut out = 0;
     for source in 0..a.len() {
@@ -1003,15 +1004,23 @@ fn merge_items_packed(a: &mut [u32], b: &[u32]) -> usize {
         }
         out += 1;
     }
+    debug_assert_eq!(out, a_count);
+    let available = a.len() - a_count;
+    let holes = available - b_count;
+    let intervals = b_count + 1;
+    a[a_count..].fill(NONE);
+    let mut b_at = 0;
     for &item in b {
         if item != NONE {
-            assert!(out < a.len(), "merged items exceed node capacity");
-            a[out] = item;
-            out += 1;
+            let spaces_before = ((b_at + 1) * holes + intervals / 2) / intervals;
+            let target = a_count + b_at + spaces_before;
+            debug_assert_eq!(a[target], NONE);
+            a[target] = item;
+            b_at += 1;
         }
     }
-    a[out..].fill(NONE);
-    out
+    debug_assert_eq!(b_at, b_count);
+    a_count + b_count
 }
 
 fn branch_count(words: &[u32; NODE_SLOTS]) -> usize {
@@ -1743,11 +1752,11 @@ mod tests {
     }
 
     #[test]
-    fn merge_packs_a_then_appends_b() {
+    fn merge_packs_a_then_spreads_b() {
         let mut a = [10, NONE, NONE, 20];
         let b = [NONE, 30, NONE, NONE];
-        assert_eq!(merge_items_packed(&mut a, &b), 3);
-        assert_eq!(a, [10, 20, 30, NONE]);
+        assert_eq!(merge_items_spread_b(&mut a, &b, 2, 1), 3);
+        assert_eq!(a, [10, 20, NONE, 30]);
     }
 
     #[test]
