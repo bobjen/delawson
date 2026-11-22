@@ -854,41 +854,14 @@ fn merge_leaf_children(
     parent_ptr: *mut Node,
     child_at: usize,
 ) -> Option<usize> {
-    let current = unsafe { (*parent_ptr).words()[BRANCH_SLOTS + child_at] };
-    debug_assert_ne!(current, NONE);
-    let current_count = leaf_count(pool.words_ptr(pool.ptr(current)));
-    if current_count > NODE_LEAF_CAPACITY / 2 {
-        return None;
-    }
-
-    let next_at = unsafe { next_branch_slot_words((*parent_ptr).words(), child_at + 1) };
-    if let Some(next_at) = next_at {
-        let next = unsafe { (*parent_ptr).words()[BRANCH_SLOTS + next_at] };
-        let next_count = leaf_count(pool.words_ptr(pool.ptr(next)));
-        let combined_count = current_count + next_count;
-        if combined_count <= NODE_LEAF_CAPACITY
-            && merge_leaf_nodes(pool, current, next, current_count, combined_count)
-        {
-            pool.retire(next);
-            unsafe { remove_branch_child_words((*parent_ptr).words_mut(), next_at) };
-            return Some(next_at);
-        }
-    }
-
-    let previous_at = unsafe { previous_branch_slot_words((*parent_ptr).words(), child_at) };
-    if let Some(previous_at) = previous_at {
-        let previous = unsafe { (*parent_ptr).words()[BRANCH_SLOTS + previous_at] };
-        let previous_count = leaf_count(pool.words_ptr(pool.ptr(previous)));
-        let combined_count = previous_count + current_count;
-        if combined_count <= NODE_LEAF_CAPACITY
-            && merge_leaf_nodes(pool, previous, current, previous_count, combined_count)
-        {
-            pool.retire(current);
-            unsafe { remove_branch_child_words((*parent_ptr).words_mut(), child_at) };
-            return Some(child_at);
-        }
-    }
-    None
+    merge_children(
+        pool,
+        parent_ptr,
+        child_at,
+        NODE_LEAF_CAPACITY,
+        leaf_node_count,
+        merge_leaf_nodes,
+    )
 }
 
 /// Merge the selected branch with an adjacent branch when their child entries
@@ -899,31 +872,67 @@ fn merge_branch_children(
     parent_ptr: *mut Node,
     child_at: usize,
 ) -> Option<usize> {
+    merge_children(
+        pool,
+        parent_ptr,
+        child_at,
+        BRANCH_CAPACITY,
+        branch_node_count,
+        merge_branch_nodes,
+    )
+}
+
+fn leaf_node_count(pool: &ExtentTreePool, index: u32) -> usize {
+    count_non_none(pool.words_ptr(pool.ptr(index)))
+}
+
+fn branch_node_count(pool: &ExtentTreePool, index: u32) -> usize {
+    count_non_none(&pool.words_ptr(pool.ptr(index))[BRANCH_SLOTS..])
+}
+
+#[inline]
+fn merge_children<C, M>(
+    pool: &mut ExtentTreePool,
+    parent_ptr: *mut Node,
+    child_at: usize,
+    capacity: usize,
+    count_node: C,
+    merge_nodes: M,
+) -> Option<usize>
+where
+    C: Fn(&ExtentTreePool, u32) -> usize,
+    M: Fn(&mut ExtentTreePool, u32, u32, usize, usize) -> bool,
+{
     let current = unsafe { (*parent_ptr).words()[BRANCH_SLOTS + child_at] };
     debug_assert_ne!(current, NONE);
-    let branch_count = branch_count(pool.words_ptr(pool.ptr(current)));
-    if branch_count > BRANCH_CAPACITY / 2 {
+    let current_count = count_node(pool, current);
+    if current_count > capacity / 2 {
         return None;
     }
 
-    let left_at = unsafe { previous_branch_slot_words((*parent_ptr).words(), child_at) };
-    if let Some(left_at) = left_at {
-        let left = unsafe { (*parent_ptr).words()[BRANCH_SLOTS + left_at] };
-        let right = current;
-        if merge_branch_nodes(pool, left, right) {
-            pool.retire(right);
-            unsafe { remove_branch_child_words((*parent_ptr).words_mut(), child_at) };
-            return Some(child_at);
+    let next_at = unsafe { next_branch_slot_words((*parent_ptr).words(), child_at + 1) };
+    if let Some(next_at) = next_at {
+        let next = unsafe { (*parent_ptr).words()[BRANCH_SLOTS + next_at] };
+        let next_count = count_node(pool, next);
+        if current_count + next_count <= capacity
+            && merge_nodes(pool, current, next, current_count, next_count)
+        {
+            pool.retire(next);
+            unsafe { remove_branch_child_words((*parent_ptr).words_mut(), next_at) };
+            return Some(next_at);
         }
     }
-    let right_at = unsafe { next_branch_slot_words((*parent_ptr).words(), child_at + 1) };
-    if let Some(right_at) = right_at {
-        let left = current;
-        let right = unsafe { (*parent_ptr).words()[BRANCH_SLOTS + right_at] };
-        if merge_branch_nodes(pool, left, right) {
-            pool.retire(right);
-            unsafe { remove_branch_child_words((*parent_ptr).words_mut(), right_at) };
-            return Some(right_at);
+
+    let previous_at = unsafe { previous_branch_slot_words((*parent_ptr).words(), child_at) };
+    if let Some(previous_at) = previous_at {
+        let previous = unsafe { (*parent_ptr).words()[BRANCH_SLOTS + previous_at] };
+        let previous_count = count_node(pool, previous);
+        if previous_count + current_count <= capacity
+            && merge_nodes(pool, previous, current, previous_count, current_count)
+        {
+            pool.retire(current);
+            unsafe { remove_branch_child_words((*parent_ptr).words_mut(), child_at) };
+            return Some(child_at);
         }
     }
     None
@@ -934,52 +943,57 @@ fn merge_leaf_nodes(
     left_index: u32,
     right_index: u32,
     left_count: usize,
-    count: usize,
+    right_count: usize,
 ) -> bool {
-    if left_count == 0 || left_count >= count || count > NODE_LEAF_CAPACITY {
+    if left_count == 0 || right_count == 0 || left_count + right_count > NODE_LEAF_CAPACITY {
         return false;
     }
 
     debug_assert_ne!(left_index, right_index);
-    let right_count = count - left_count;
+    let count = left_count + right_count;
     let left_ptr = pool.ptr(left_index);
     let right_ptr = pool.ptr(right_index);
     // SAFETY: the indexes identify two distinct live nodes in the stable pool.
     // The caller holds the tree's exclusive lock, and the right node is only
     // read while the left node is rewritten in place.
     let (left_words, right_words) = unsafe { (&mut (*left_ptr).words, &(*right_ptr).words) };
-    debug_assert_eq!(leaf_count(left_words), left_count);
-    debug_assert_eq!(leaf_count(right_words), right_count);
+    debug_assert_eq!(count_non_none(left_words), left_count);
+    debug_assert_eq!(count_non_none(right_words), right_count);
     let _merged_count = merge_items_spread_b(left_words, right_words, left_count, right_count);
     debug_assert_eq!(_merged_count, count);
     true
 }
 
-fn leaf_count(words: &[u32; NODE_SLOTS]) -> usize {
+fn count_non_none(words: &[u32]) -> usize {
     words.iter().filter(|&&key| key != NONE).count()
 }
 
-fn merge_branch_nodes(pool: &mut ExtentTreePool, left_index: u32, right_index: u32) -> bool {
+fn merge_branch_nodes(
+    pool: &mut ExtentTreePool,
+    left_index: u32,
+    right_index: u32,
+    left_count: usize,
+    right_count: usize,
+) -> bool {
     debug_assert_ne!(left_index, right_index);
     let left_ptr = pool.ptr(left_index);
     let right_ptr = pool.ptr(right_index);
     // SAFETY: the indexes refer to distinct live nodes and the caller owns the
     // tree's exclusive lock while merging them.
     let (left_words, right_words) = unsafe { (&mut (*left_ptr).words, &(*right_ptr).words) };
-    let left_count = branch_count(left_words);
-    let right_count = branch_count(right_words);
     debug_assert!(left_count > 0 && right_count > 0);
-    if left_count == 0 || right_count == 0 {
-        return false;
-    }
-    let count = left_count + right_count;
-    if count > BRANCH_CAPACITY {
+    if left_count == 0 || right_count == 0 || left_count + right_count > BRANCH_CAPACITY {
         return false;
     }
 
     let (left_keys, left_children) = left_words.split_at_mut(BRANCH_SLOTS);
     let (right_keys, right_children) = right_words.split_at(BRANCH_SLOTS);
 
+    debug_assert_eq!(count_non_none(left_keys), left_count);
+    debug_assert_eq!(count_non_none(right_keys), right_count);
+    debug_assert_eq!(count_non_none(left_children), left_count);
+    debug_assert_eq!(count_non_none(right_children), right_count);
+    let count = left_count + right_count;
     let _merged_key_count = merge_items_spread_b(left_keys, right_keys, left_count, right_count);
     let _merged_child_count =
         merge_items_spread_b(left_children, right_children, left_count, right_count);
@@ -1021,10 +1035,6 @@ fn merge_items_spread_b(a: &mut [u32], b: &[u32], a_count: usize, b_count: usize
     }
     debug_assert_eq!(b_at, b_count);
     a_count + b_count
-}
-
-fn branch_count(words: &[u32; NODE_SLOTS]) -> usize {
-    words[BRANCH_SLOTS..].iter().filter(|&&child| child != NONE).count()
 }
 
 fn branch_values(words: &[u32; NODE_SLOTS]) -> (BranchKeys, BranchChildren) {
@@ -1228,7 +1238,7 @@ fn branch_split_slot_for(index: usize, count: usize) -> usize {
 
 fn branch_parts(words: &[u32; NODE_SLOTS]) -> (BranchKeys, BranchChildren, usize) {
     let (keys, children) = branch_values(words);
-    let count = branch_count(words);
+    let count = count_non_none(&words[BRANCH_SLOTS..]);
     (keys, children, count)
 }
 
@@ -1241,15 +1251,8 @@ fn branch_child(keys: &[u32], key: u32) -> usize {
 
     while low < high {
         let middle = low + (high - low) / 2;
-        let at = if keys[middle] != NONE {
-            middle
-        } else if let Some(next) = (middle + 1..high).find(|&slot| keys[slot] != NONE) {
-            next
-        } else {
-            let Some(previous) = (low..middle).rev().find(|&slot| keys[slot] != NONE) else {
-                break;
-            };
-            previous
+        let Some(at) = nearest_key(keys, low, high, middle) else {
+            break;
         };
 
         if key < keys[at] {
@@ -1341,12 +1344,7 @@ fn remove_leaf_word(
     DeleteResult::Removed { minimum, merge_candidate }
 }
 
-fn nearest_leaf_key(
-    words: &[u32; NODE_SLOTS],
-    low: usize,
-    high: usize,
-    middle: usize,
-) -> Option<usize> {
+fn nearest_key(words: &[u32], low: usize, high: usize, middle: usize) -> Option<usize> {
     debug_assert!(low <= middle && middle < high);
     for distance in 0..high - low {
         let right = middle + distance;
@@ -1375,7 +1373,7 @@ fn sparse_leaf_find(
     let mut next = None;
     while low < high {
         let middle = low + (high - low) / 2;
-        let Some(at) = nearest_leaf_key(words, low, high, middle) else {
+        let Some(at) = nearest_key(words, low, high, middle) else {
             break;
         };
         match words[at].cmp(&key) {
@@ -1496,14 +1494,14 @@ mod tests {
     fn usage_node(pool: &ExtentTreePool, index: u32, height: u8, usage: &mut TreeUsage) {
         let node = pool.read(index);
         if height == 0 {
-            let count = leaf_count(node.words());
+            let count = count_non_none(node.words());
             usage.leaves += 1;
             usage.leaf_id_bytes += count * size_of::<u32>();
             usage.occupied_slots += count;
             return;
         }
         let words = node.words();
-        let count = branch_count(words);
+        let count = count_non_none(&words[BRANCH_SLOTS..]);
         usage.branches += 1;
         usage.occupied_slots += count * 2;
         for &child in &words[BRANCH_SLOTS..] {
@@ -1516,7 +1514,7 @@ mod tests {
     fn tree_usage(tree: &EnExtentTree, pool: &ExtentTreePool) -> TreeUsage {
         let mut usage = TreeUsage::default();
         if tree.height == 0 {
-            let count = leaf_count(tree.root.words());
+            let count = count_non_none(tree.root.words());
             if count != 0 {
                 usage.leaves = 1;
                 usage.leaf_id_bytes = count * size_of::<u32>();
@@ -1524,7 +1522,7 @@ mod tests {
             }
         } else {
             let words = tree.root.words();
-            let count = branch_count(words);
+            let count = count_non_none(&words[BRANCH_SLOTS..]);
             usage.occupied_slots += count * 2;
             for &child in &words[BRANCH_SLOTS..] {
                 if child != NONE {
@@ -1738,7 +1736,7 @@ mod tests {
 
         assert!(tree.remove(&mut pool, ExtentId::new(values[trigger_slot])).unwrap());
         assert_eq!(tree.height, 0);
-        assert_eq!(leaf_count(tree.root.words()), NODE_LEAF_CAPACITY);
+        assert_eq!(count_non_none(tree.root.words()), NODE_LEAF_CAPACITY);
         let expected: Vec<u32> = values
             .iter()
             .copied()
@@ -1884,7 +1882,7 @@ mod tests {
             assert_eq!(key % 2, 0);
             assert!(tree.insert(&mut pool, ExtentId::new(key + 1)).unwrap());
         }
-        assert_eq!(leaf_count(pool.words_ptr(pool.ptr(next_leaf))), NODE_LEAF_CAPACITY);
+        assert_eq!(count_non_none(pool.words_ptr(pool.ptr(next_leaf))), NODE_LEAF_CAPACITY);
         let before = collect(&tree, &pool);
 
         let removed = delete_leaf_highest_to_lowest(&mut tree, &mut pool, children[0]);
