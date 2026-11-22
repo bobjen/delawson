@@ -67,24 +67,6 @@ impl Node {
         Self { link: NONE }
     }
 
-    fn branch(keys: &[u32], children: &[u32]) -> Self {
-        assert_eq!(keys.len(), BRANCH_SLOTS);
-        assert_eq!(children.len(), BRANCH_SLOTS);
-        debug_assert!(
-            keys.iter().zip(children).all(|(key, child)| (*key == NONE) == (*child == NONE))
-        );
-
-        let mut words = MaybeUninit::<[u32; NODE_SLOTS]>::uninit();
-        let dst = words.as_mut_ptr().cast::<u32>();
-        // SAFETY: the length checks establish that both copies initialize the
-        // entire node, and neither source overlaps this fresh array.
-        unsafe {
-            std::ptr::copy_nonoverlapping(keys.as_ptr(), dst, BRANCH_SLOTS);
-            std::ptr::copy_nonoverlapping(children.as_ptr(), dst.add(BRANCH_SLOTS), BRANCH_SLOTS);
-            Self { words: words.assume_init() }
-        }
-    }
-
     fn leaf(words: &LeafWords) -> Self {
         Self { words: *words }
     }
@@ -183,12 +165,6 @@ impl ExtentTreePool {
     fn write(&mut self, index: u32, node: Node) {
         // SAFETY: the tree owns this live node exclusively during mutation.
         unsafe { self.ptr(index).write(node) };
-    }
-
-    fn write_ptr(&mut self, ptr: *mut Node, node: Node) {
-        // SAFETY: cursor pointers come from this pool's stable mapping and
-        // remain live while the caller holds the tree's exclusive lock.
-        unsafe { ptr.write(node) };
     }
 
     fn index_of(&self, ptr: *mut Node) -> u32 {
@@ -414,14 +390,14 @@ impl EnExtentTree {
 
         let mut cursor = Cursor::new(key);
         self.find(pool, key, &mut cursor);
-        self.insert_with_cursor(pool, key, &cursor)
+        self.insert_with_cursor(pool, key, &mut cursor)
     }
 
     pub(super) fn insert_with_cursor(
         &mut self,
         pool: &mut ExtentTreePool,
         key: u32,
-        cursor: &Cursor,
+        cursor: &mut Cursor,
     ) -> Result<bool> {
         debug_assert_eq!(cursor.key, key);
         if cursor.found {
@@ -440,39 +416,30 @@ impl EnExtentTree {
 
         if self.height == 0 {
             if let Some(hole) = leaf_hole {
-                insert_sparse_item(
-                    self.root.words_mut(),
-                    None,
-                    key,
-                    None,
-                    leaf.slot as usize,
-                    hole,
-                );
-            } else {
-                // A leaf only needs a dense scratch array when it is full and
-                // must split. A full leaf has no holes, so its physical order
-                // is already the sorted key order.
-                let mut keys = [0; KEY_SCRATCH];
-                let count = self.root.leaf_parts(&mut keys);
-                insert_key(&mut keys, count, leaf.slot as usize, key);
-                let split = choose_leaf_split(&keys[..count + 1], NODE_LEAF_CAPACITY);
-                let left_index = reserved.pop().expect("root leaf split was pre-reserved");
-                let right_index = reserved.pop().expect("root leaf split was pre-reserved");
-                let left_words = spread_leaf_words(&keys[..split]);
-                let right_words = spread_leaf_words(&keys[split..count + 1]);
-                pool.write(left_index, Node::leaf(&left_words));
-                pool.write(right_index, Node::leaf(&right_words));
-                let (root_keys, root_children) =
-                    centered_two_branch_pairs(keys[0], left_index, keys[split], right_index);
-                self.write_root_branch(
-                    1,
-                    &root_keys[..BRANCH_SLOTS],
-                    &root_children[..BRANCH_SLOTS],
-                );
+                insert_sparse_item(self.root.words_mut(), key, leaf.slot as usize, hole);
+                debug_assert!(reserved.is_empty());
+                self.len += 1;
+                return Ok(true);
             }
-            debug_assert!(reserved.is_empty());
-            self.len += 1;
-            return Ok(true);
+
+            // Move a full inline root leaf into the pool and make it the sole
+            // child of a height-one root. The normal subtree split path will
+            // retain this node as the left leaf and allocate its right sibling.
+            let root_leaf_index = reserved.pop().expect("root leaf promotion was pre-reserved");
+            let root_minimum = self.root.words()[0];
+            pool.write(root_leaf_index, self.root);
+
+            let root_child_at = BRANCH_SLOTS / 2 - 1;
+            self.height = 1;
+            self._reserved = [0; 8];
+            let root_words = self.root.words_mut();
+            root_words.fill(NONE);
+            root_words[root_child_at] = root_minimum;
+            root_words[BRANCH_SLOTS + root_child_at] = root_leaf_index;
+
+            cursor.height = 1;
+            cursor.set_path(0, pool.ptr(root_leaf_index), leaf.slot as usize);
+            cursor.set_path(1, std::ptr::null_mut(), root_child_at);
         }
 
         let root_path = cursor.path(self.height as usize);
@@ -485,35 +452,27 @@ impl EnExtentTree {
             insert_subtree(pool, self.height - 1, 1, key, &cursor, leaf_hole, &mut reserved)
         {
             if !insert_branch_entry_words(self.root.words_mut(), child_at, separator, right) {
-                let (dense_keys, dense_children, dense_count) =
-                    dense_insert_branch_words(self.root.words(), child_at, separator, right);
-                let split_at = dense_count / 2;
                 let left_index = reserved.pop().expect("root branch split was pre-reserved");
                 let right_index = reserved.pop().expect("root branch split was pre-reserved");
-                let (left_keys, left_children) =
-                    spread_split_branch(&dense_keys[..split_at], &dense_children[..split_at]);
-                let (right_keys, right_children) = spread_split_branch(
-                    &dense_keys[split_at..dense_count],
-                    &dense_children[split_at..dense_count],
-                );
-                let left_min = dense_keys[0];
-                let right_min = dense_keys[split_at];
-                pool.write(
+                pool.write(left_index, self.root);
+                pool.write(right_index, Node::leaf(&[NONE; NODE_SLOTS]));
+                let (left_min, right_min) = split_branch_nodes(
+                    pool,
                     left_index,
-                    Node::branch(&left_keys[..BRANCH_SLOTS], &left_children[..BRANCH_SLOTS]),
-                );
-                pool.write(
                     right_index,
-                    Node::branch(&right_keys[..BRANCH_SLOTS], &right_children[..BRANCH_SLOTS]),
+                    child_at + 1,
+                    separator,
+                    right,
                 );
-                let new_height = self.height + 1;
-                let (new_keys, new_children) =
-                    centered_two_branch_pairs(left_min, left_index, right_min, right_index);
-                self.write_root_branch(
-                    new_height,
-                    &new_keys[..BRANCH_SLOTS],
-                    &new_children[..BRANCH_SLOTS],
-                );
+                let root_child_at = BRANCH_SLOTS / 2 - 1;
+                let root_words = self.root.words_mut();
+                root_words.fill(NONE);
+                root_words[root_child_at] = left_min;
+                root_words[BRANCH_SLOTS + root_child_at] = left_index;
+                root_words[root_child_at + 1] = right_min;
+                root_words[BRANCH_SLOTS + root_child_at + 1] = right_index;
+                self.height += 1;
+                self._reserved = [0; 8];
             }
         }
         debug_assert!(reserved.is_empty());
@@ -622,19 +581,12 @@ impl EnExtentTree {
         } else {
             self.root.words_mut()[child_at] = minimum;
             if merge_candidate {
-                let (mut root_keys, mut root_children) = branch_values(self.root.words());
-                let removed_slot = if self.height == 1 {
-                    merge_leaf_children(pool, &mut root_keys, &mut root_children, child_at)
+                let root_ptr = std::ptr::addr_of_mut!(self.root);
+                let _ = if self.height == 1 {
+                    merge_leaf_children(pool, root_ptr, child_at)
                 } else {
-                    merge_branch_children(pool, &mut root_keys, &mut root_children, child_at)
+                    merge_branch_children(pool, root_ptr, child_at)
                 };
-                if removed_slot.is_some() {
-                    write_branch(
-                        self.root.words_mut(),
-                        &root_keys[..BRANCH_SLOTS],
-                        &root_children[..BRANCH_SLOTS],
-                    );
-                }
             }
         }
 
@@ -676,16 +628,6 @@ impl EnExtentTree {
                 break;
             }
         }
-    }
-
-    fn write_root_branch(&mut self, height: u8, keys: &[u32], children: &[u32]) {
-        debug_assert!(height > 0);
-        debug_assert_eq!(keys.len(), BRANCH_SLOTS);
-        debug_assert_eq!(children.len(), BRANCH_SLOTS);
-        debug_assert!(children.iter().any(|&child| child != NONE));
-        self.height = height;
-        self._reserved = [0; 8];
-        self.root = Node::branch(keys, children);
     }
 
     fn reset_root(&mut self) {
@@ -731,31 +673,18 @@ fn insert_subtree(
         let leaf = cursor.leaf();
         debug_assert!(!leaf.node.is_null());
         if let Some(hole) = leaf_hole {
-            insert_sparse_item(
-                pool.words_mut_ptr(leaf.node),
-                None,
-                key,
-                None,
-                leaf.slot as usize,
-                hole,
-            );
+            insert_sparse_item(pool.words_mut_ptr(leaf.node), key, leaf.slot as usize, hole);
             return None;
         }
 
-        // With no holes, every physical slot is occupied and the leaf is
-        // already dense. Materialize keys only for the split itself.
-        let words = pool.words_ptr(leaf.node);
-        let mut keys = [0; KEY_SCRATCH];
-        keys[..NODE_SLOTS].copy_from_slice(words);
-        let count = NODE_SLOTS;
-        insert_key(&mut keys, count, leaf.slot as usize, key);
-        let split = choose_leaf_split(&keys[..count + 1], NODE_LEAF_CAPACITY);
+        // With no holes, the leaf is dense. Split it in place while moving
+        // the inserted key directly into its final sparse slot.
+        let split = choose_leaf_split(NODE_SLOTS + 1, NODE_LEAF_CAPACITY);
         let right_index = reserved.pop().expect("leaf split was pre-reserved");
-        let left_words = spread_leaf_words(&keys[..split]);
-        let right_words = spread_leaf_words(&keys[split..count + 1]);
-        pool.write(right_index, Node::leaf(&right_words));
-        pool.write_ptr(leaf.node, Node::leaf(&left_words));
-        return Some((keys[split], right_index));
+        pool.write(right_index, Node::leaf(&[NONE; NODE_SLOTS]));
+        let separator =
+            split_leaf_node(pool, leaf.node, right_index, leaf.slot as usize, key, split);
+        return Some((separator, right_index));
     }
 
     let path_index = cursor.height as usize - path_level;
@@ -775,26 +704,11 @@ fn insert_subtree(
             return None;
         }
 
-        let (dense_keys, dense_children, dense_count) =
-            dense_insert_branch_words(pool.words_ptr(path.node), child_at, separator, right);
-        let split_at = dense_count / 2;
         let right_index = reserved.pop().expect("branch split was pre-reserved");
-        let promoted = dense_keys[split_at];
-        let (left_keys, left_children) =
-            spread_split_branch(&dense_keys[..split_at], &dense_children[..split_at]);
-        let (right_keys, right_children) = spread_split_branch(
-            &dense_keys[split_at..dense_count],
-            &dense_children[split_at..dense_count],
-        );
-        pool.write(
-            right_index,
-            Node::branch(&right_keys[..BRANCH_SLOTS], &right_children[..BRANCH_SLOTS]),
-        );
-        write_branch(
-            pool.words_mut_ptr(path.node),
-            &left_keys[..BRANCH_SLOTS],
-            &left_children[..BRANCH_SLOTS],
-        );
+        pool.write(right_index, Node::leaf(&[NONE; NODE_SLOTS]));
+        let left_index = pool.index_of(path.node);
+        let (_, promoted) =
+            split_branch_nodes(pool, left_index, right_index, child_at + 1, separator, right);
         return Some((promoted, right_index));
     }
     if min_changed {
@@ -911,20 +825,13 @@ fn finish_branch_delete(
 
     pool.words_mut_ptr(node_ptr)[child_at] = child_minimum;
     let branch_merge_candidate = if merge_candidate {
-        let (mut keys, mut children) = branch_values(pool.words_ptr(node_ptr));
         let removed_slot = if height == 1 {
-            merge_leaf_children(pool, &mut keys, &mut children, child_at)
+            merge_leaf_children(pool, node_ptr, child_at)
         } else {
-            merge_branch_children(pool, &mut keys, &mut children, child_at)
+            merge_branch_children(pool, node_ptr, child_at)
         };
         if let Some(slot) = removed_slot {
-            let branch_merge_candidate = branch_slot_has_empty_neighbors(&children, slot);
-            write_branch(
-                pool.words_mut_ptr(node_ptr),
-                &keys[..BRANCH_SLOTS],
-                &children[..BRANCH_SLOTS],
-            );
-            branch_merge_candidate
+            branch_slot_has_empty_neighbors_words(pool.words_ptr(node_ptr), slot)
         } else {
             false
         }
@@ -938,41 +845,46 @@ fn finish_branch_delete(
 }
 
 /// Merge the selected leaf with an adjacent leaf when the combined IDs fit
-/// after recomputing their common prefix. The right node is retired on success.
+/// in one node. The right node is retired on success.
+///
+/// `parent_ptr` points to this tree's live parent branch. The caller holds the
+/// tree's exclusive lock; child nodes are distinct from that parent node.
 fn merge_leaf_children(
     pool: &mut ExtentTreePool,
-    keys: &mut BranchKeys,
-    children: &mut BranchChildren,
+    parent_ptr: *mut Node,
     child_at: usize,
 ) -> Option<usize> {
-    let current = children[child_at];
+    let current = unsafe { (*parent_ptr).words()[BRANCH_SLOTS + child_at] };
+    debug_assert_ne!(current, NONE);
     let current_count = leaf_count(pool.words_ptr(pool.ptr(current)));
     if current_count > NODE_LEAF_CAPACITY / 2 {
         return None;
     }
 
-    if let Some(next_at) = next_branch_slot(children, child_at + 1) {
-        let next = children[next_at];
+    let next_at = unsafe { next_branch_slot_words((*parent_ptr).words(), child_at + 1) };
+    if let Some(next_at) = next_at {
+        let next = unsafe { (*parent_ptr).words()[BRANCH_SLOTS + next_at] };
         let next_count = leaf_count(pool.words_ptr(pool.ptr(next)));
         let combined_count = current_count + next_count;
         if combined_count <= NODE_LEAF_CAPACITY
             && merge_leaf_nodes(pool, current, next, current_count, combined_count)
         {
             pool.retire(next);
-            remove_branch_child(keys, children, next_at);
+            unsafe { remove_branch_child_words((*parent_ptr).words_mut(), next_at) };
             return Some(next_at);
         }
     }
 
-    if let Some(previous_at) = previous_branch_slot(children, child_at) {
-        let previous = children[previous_at];
+    let previous_at = unsafe { previous_branch_slot_words((*parent_ptr).words(), child_at) };
+    if let Some(previous_at) = previous_at {
+        let previous = unsafe { (*parent_ptr).words()[BRANCH_SLOTS + previous_at] };
         let previous_count = leaf_count(pool.words_ptr(pool.ptr(previous)));
         let combined_count = previous_count + current_count;
         if combined_count <= NODE_LEAF_CAPACITY
             && merge_leaf_nodes(pool, previous, current, previous_count, combined_count)
         {
             pool.retire(current);
-            remove_branch_child(keys, children, child_at);
+            unsafe { remove_branch_child_words((*parent_ptr).words_mut(), child_at) };
             return Some(child_at);
         }
     }
@@ -980,33 +892,37 @@ fn merge_leaf_children(
 }
 
 /// Merge the selected branch with an adjacent branch when their child entries
-/// fit in one node. The right node is retired on success.
+/// fit in one node. The right node is retired on success. `parent_ptr` has the
+/// same ownership and locking requirements as in `merge_leaf_children`.
 fn merge_branch_children(
     pool: &mut ExtentTreePool,
-    keys: &mut BranchKeys,
-    children: &mut BranchChildren,
+    parent_ptr: *mut Node,
     child_at: usize,
 ) -> Option<usize> {
-    let branch_count = pool.read(children[child_at]).branch_parts().2;
+    let current = unsafe { (*parent_ptr).words()[BRANCH_SLOTS + child_at] };
+    debug_assert_ne!(current, NONE);
+    let branch_count = branch_count(pool.words_ptr(pool.ptr(current)));
     if branch_count > BRANCH_CAPACITY / 2 {
         return None;
     }
 
-    if let Some(left_at) = previous_branch_slot(children, child_at) {
-        let left = children[left_at];
-        let right = children[child_at];
+    let left_at = unsafe { previous_branch_slot_words((*parent_ptr).words(), child_at) };
+    if let Some(left_at) = left_at {
+        let left = unsafe { (*parent_ptr).words()[BRANCH_SLOTS + left_at] };
+        let right = current;
         if merge_branch_nodes(pool, left, right) {
             pool.retire(right);
-            remove_branch_child(keys, children, child_at);
+            unsafe { remove_branch_child_words((*parent_ptr).words_mut(), child_at) };
             return Some(child_at);
         }
     }
-    if let Some(right_at) = next_branch_slot(children, child_at + 1) {
-        let left = children[child_at];
-        let right = children[right_at];
+    let right_at = unsafe { next_branch_slot_words((*parent_ptr).words(), child_at + 1) };
+    if let Some(right_at) = right_at {
+        let left = current;
+        let right = unsafe { (*parent_ptr).words()[BRANCH_SLOTS + right_at] };
         if merge_branch_nodes(pool, left, right) {
             pool.retire(right);
-            remove_branch_child(keys, children, right_at);
+            unsafe { remove_branch_child_words((*parent_ptr).words_mut(), right_at) };
             return Some(right_at);
         }
     }
@@ -1034,43 +950,8 @@ fn merge_leaf_nodes(
     let (left_words, right_words) = unsafe { (&mut (*left_ptr).words, &(*right_ptr).words) };
     debug_assert_eq!(leaf_count(left_words), left_count);
     debug_assert_eq!(leaf_count(right_words), right_count);
-
-    // First compact the left leaf in place. Each packed destination is at or
-    // before its source, so this forward scan cannot overwrite an unread key.
-    let mut left_at = 0;
-    for packed_at in 0..left_count {
-        let (source_at, key) = next_leaf_key(left_words, &mut left_at)
-            .expect("left leaf count changed while merging under X lock");
-        debug_assert!(packed_at <= source_at);
-        left_words[packed_at] = key;
-        if source_at != packed_at {
-            left_words[source_at] = NONE;
-        }
-    }
-
-    // Adjacent leaves have ordered, nonoverlapping key ranges. Append the right
-    // keys to the packed prefix; their source is a separate node.
-    let mut right_at = 0;
-    for packed_at in left_count..count {
-        let (_, key) = next_leaf_key(right_words, &mut right_at)
-            .expect("right leaf count changed while merging under X lock");
-        left_words[packed_at] = key;
-    }
-
-    // Spread the packed keys into their final slots from right to left. Every
-    // destination is at or after its source, so unread packed keys stay intact;
-    // clearing moved sources leaves the interspersed holes as NONE.
-    for key_at in (0..count).rev() {
-        let source_at = key_at;
-        let target_at = leaf_slot_for(key_at, count);
-        let key = left_words[source_at];
-        debug_assert_ne!(key, NONE);
-        debug_assert!(target_at >= source_at);
-        left_words[target_at] = key;
-        if target_at != source_at {
-            left_words[source_at] = NONE;
-        }
-    }
+    let _merged_count = merge_items_packed(left_words, right_words);
+    debug_assert_eq!(_merged_count, count);
     true
 }
 
@@ -1078,23 +959,15 @@ fn leaf_count(words: &[u32; NODE_SLOTS]) -> usize {
     words.iter().filter(|&&key| key != NONE).count()
 }
 
-fn next_leaf_key(words: &[u32; NODE_SLOTS], slot: &mut usize) -> Option<(usize, u32)> {
-    while *slot < NODE_SLOTS {
-        let at = *slot;
-        let key = words[*slot];
-        *slot += 1;
-        if key != NONE {
-            return Some((at, key));
-        }
-    }
-    None
-}
-
 fn merge_branch_nodes(pool: &mut ExtentTreePool, left_index: u32, right_index: u32) -> bool {
-    let left = pool.read(left_index);
-    let right = pool.read(right_index);
-    let (left_keys, left_children, left_count) = left.branch_parts();
-    let (right_keys, right_children, right_count) = right.branch_parts();
+    debug_assert_ne!(left_index, right_index);
+    let left_ptr = pool.ptr(left_index);
+    let right_ptr = pool.ptr(right_index);
+    // SAFETY: the indexes refer to distinct live nodes and the caller owns the
+    // tree's exclusive lock while merging them.
+    let (left_words, right_words) = unsafe { (&mut (*left_ptr).words, &(*right_ptr).words) };
+    let left_count = branch_count(left_words);
+    let right_count = branch_count(right_words);
     debug_assert!(left_count > 0 && right_count > 0);
     if left_count == 0 || right_count == 0 {
         return false;
@@ -1104,41 +977,45 @@ fn merge_branch_nodes(pool: &mut ExtentTreePool, left_index: u32, right_index: u
         return false;
     }
 
-    let mut dense_keys = [NONE; BRANCH_KEYS_SCRATCH];
-    let mut dense_children = [NONE; BRANCH_CHILDREN_SCRATCH];
-    let mut out = 0;
-    for (keys, children) in [(&left_keys, &left_children), (&right_keys, &right_children)] {
-        for slot in 0..BRANCH_SLOTS {
-            if children[slot] != NONE {
-                dense_keys[out] = keys[slot];
-                dense_children[out] = children[slot];
-                out += 1;
-            }
-        }
-    }
-    debug_assert_eq!(out, count);
-    debug_assert!(dense_keys[..count].windows(2).all(|pair| pair[0] < pair[1]));
+    let (left_keys, left_children) = left_words.split_at_mut(BRANCH_SLOTS);
+    let (right_keys, right_children) = right_words.split_at(BRANCH_SLOTS);
 
-    let mut merged_keys = [NONE; BRANCH_KEYS_SCRATCH];
-    let mut merged_children = [NONE; BRANCH_CHILDREN_SCRATCH];
-    for i in 0..count {
-        let slot = i * BRANCH_SLOTS / count;
-        merged_keys[slot] = dense_keys[i];
-        merged_children[slot] = dense_children[i];
-    }
-    pool.write(
-        left_index,
-        Node::branch(&merged_keys[..BRANCH_SLOTS], &merged_children[..BRANCH_SLOTS]),
-    );
+    let _merged_key_count = merge_items_packed(left_keys, right_keys);
+    let _merged_child_count = merge_items_packed(left_children, right_children);
+    debug_assert_eq!(_merged_key_count, count);
+    debug_assert_eq!(_merged_child_count, count);
     true
 }
 
-fn branch_slot_has_empty_neighbors(children: &BranchChildren, slot: usize) -> bool {
-    slot > 0
-        && slot + 1 < BRANCH_SLOTS
-        && children[slot] == NONE
-        && children[slot - 1] == NONE
-        && children[slot + 1] == NONE
+/// Merge two ordered sparse arrays into A, leaving all merged items packed at
+/// its start. The same routine handles leaf keys, branch keys, and child links.
+fn merge_items_packed(a: &mut [u32], b: &[u32]) -> usize {
+    assert_eq!(a.len(), b.len());
+    let mut out = 0;
+    for source in 0..a.len() {
+        let item = a[source];
+        if item == NONE {
+            continue;
+        }
+        if source != out {
+            a[out] = item;
+            a[source] = NONE;
+        }
+        out += 1;
+    }
+    for &item in b {
+        if item != NONE {
+            assert!(out < a.len(), "merged items exceed node capacity");
+            a[out] = item;
+            out += 1;
+        }
+    }
+    a[out..].fill(NONE);
+    out
+}
+
+fn branch_count(words: &[u32; NODE_SLOTS]) -> usize {
+    words[BRANCH_SLOTS..].iter().filter(|&&child| child != NONE).count()
 }
 
 fn branch_values(words: &[u32; NODE_SLOTS]) -> (BranchKeys, BranchChildren) {
@@ -1155,10 +1032,6 @@ fn branch_values(words: &[u32; NODE_SLOTS]) -> (BranchKeys, BranchChildren) {
     (keys, children)
 }
 
-fn branch_count(children: &BranchChildren) -> usize {
-    children[..BRANCH_SLOTS].iter().filter(|&&child| child != NONE).count()
-}
-
 fn branch_has_hole_words(words: &[u32; NODE_SLOTS]) -> bool {
     words[BRANCH_SLOTS..].contains(&NONE)
 }
@@ -1169,6 +1042,10 @@ fn first_branch_slot_words(words: &[u32; NODE_SLOTS]) -> Option<usize> {
 
 fn next_branch_slot_words(words: &[u32; NODE_SLOTS], from: usize) -> Option<usize> {
     (from..BRANCH_SLOTS).find(|&slot| words[BRANCH_SLOTS + slot] != NONE)
+}
+
+fn previous_branch_slot_words(words: &[u32; NODE_SLOTS], before: usize) -> Option<usize> {
+    (0..before.min(BRANCH_SLOTS)).rev().find(|&slot| words[BRANCH_SLOTS + slot] != NONE)
 }
 
 fn remove_branch_child_words(words: &mut [u32; NODE_SLOTS], child_at: usize) {
@@ -1205,51 +1082,145 @@ fn insert_branch_entry_words(
     };
 
     // The caller updates the left subtree's separator first when its minimum
-    // changed. Inserting this right subtree is then the same sparse insertion
-    // used at a leaf, with the child link moved alongside its separator.
-    insert_sparse_item(keys, Some(children), separator, Some(right), anchor, hole);
+    // changed. Separators and child links have matching occupancy, so move
+    // them separately through the same hole to keep each pair aligned.
+    insert_sparse_item(keys, separator, anchor, hole);
+    insert_sparse_item(children, right, anchor, hole);
     true
 }
 
-fn dense_insert_branch_words(
-    words: &[u32; NODE_SLOTS],
-    after_slot: usize,
+/// Split a full leaf in place. The original array is dense because a split is
+/// only needed when it has no hole. `right_words` is fresh initialized storage.
+fn split_leaf_node(
+    pool: &mut ExtentTreePool,
+    left_ptr: *mut Node,
+    right_index: u32,
+    insert_at: usize,
+    key: u32,
+    left_count: usize,
+) -> u32 {
+    debug_assert_ne!(pool.index_of(left_ptr), right_index);
+    let right_ptr = pool.ptr(right_index);
+    // SAFETY: both pointers identify distinct live nodes, the right node was
+    // initialized to NONE, and the caller owns the tree's exclusive lock.
+    let (left_words, right_words) = unsafe { (&mut (*left_ptr).words, &mut (*right_ptr).words) };
+    debug_assert!(left_words.iter().all(|&word| word != NONE));
+    let separator = value_with_insert(left_words, insert_at, key, left_count).0;
+    split_sparse_items(left_words, right_words, insert_at, key, left_count, leaf_slot_for);
+    separator
+}
+
+/// Split a full branch in place, using the same layout routine for its keys
+/// and child indexes. Returns the minima of the left and right results.
+fn split_branch_nodes(
+    pool: &mut ExtentTreePool,
+    left_index: u32,
+    right_index: u32,
+    insert_at: usize,
     separator: u32,
-    right: u32,
-) -> (BranchKeys, BranchChildren, usize) {
-    let mut dense_keys = [NONE; BRANCH_KEYS_SCRATCH];
-    let mut dense_children = [NONE; BRANCH_CHILDREN_SCRATCH];
-    let mut out = 0;
-    for slot in 0..BRANCH_SLOTS {
-        let child = words[BRANCH_SLOTS + slot];
-        if child == NONE {
-            continue;
-        }
-        dense_keys[out] = words[slot];
-        dense_children[out] = child;
-        out += 1;
-        if slot == after_slot {
-            dense_keys[out] = separator;
-            dense_children[out] = right;
-            out += 1;
+    right_child: u32,
+) -> (u32, u32) {
+    debug_assert_ne!(left_index, right_index);
+    let total = BRANCH_SLOTS + 1;
+    let left_count = total / 2;
+    let left_ptr = pool.ptr(left_index);
+    let right_ptr = pool.ptr(right_index);
+    // SAFETY: both indexes name distinct live nodes, right was initialized to
+    // NONE, and this caller owns the tree's exclusive lock.
+    let (left_words, right_words) = unsafe { (&mut (*left_ptr).words, &mut (*right_ptr).words) };
+    let (left_keys, left_children) = left_words.split_at_mut(BRANCH_SLOTS);
+    let (right_keys, right_children) = right_words.split_at_mut(BRANCH_SLOTS);
+    debug_assert!(left_children.iter().all(|&word| word != NONE));
+    let left_min = value_with_insert(left_keys, insert_at, separator, 0).0;
+    let right_min = value_with_insert(left_keys, insert_at, separator, left_count).0;
+    split_sparse_items(
+        left_keys,
+        right_keys,
+        insert_at,
+        separator,
+        left_count,
+        branch_split_slot_for,
+    );
+    split_sparse_items(
+        left_children,
+        right_children,
+        insert_at,
+        right_child,
+        left_count,
+        branch_split_slot_for,
+    );
+    (left_min, right_min)
+}
+
+/// Split a dense input plus one virtual insertion into sparse left and right
+/// outputs without materializing an intermediate packed array. The right side
+/// is filled backwards first; then A is walked backwards into its final slots.
+#[inline]
+fn split_sparse_items<F>(
+    a: &mut [u32],
+    b: &mut [u32],
+    insert_at: usize,
+    item: u32,
+    left_count: usize,
+    slot_for: F,
+) where
+    F: Fn(usize, usize) -> usize + Copy,
+{
+    assert_eq!(a.len(), b.len());
+    let total = a.len() + 1;
+    let right_count = total - left_count;
+    debug_assert!(insert_at <= a.len());
+    debug_assert!(left_count > 0 && right_count > 0);
+    debug_assert!(a.iter().all(|&value| value != NONE));
+
+    b.fill(NONE);
+    for sequence_at in (left_count..total).rev() {
+        let (value, source) = value_with_insert(a, insert_at, item, sequence_at);
+        let target = slot_for(sequence_at - left_count, right_count);
+        b[target] = value;
+        if let Some(source) = source {
+            a[source] = NONE;
         }
     }
-    debug_assert_eq!(out, BRANCH_SLOTS + 1);
-    (dense_keys, dense_children, out)
+
+    for sequence_at in (0..left_count).rev() {
+        let (value, source) = value_with_insert(a, insert_at, item, sequence_at);
+        let target = slot_for(sequence_at, left_count);
+        debug_assert!(source.is_none_or(|source| target >= source));
+        a[target] = value;
+        if let Some(source) = source {
+            if source != target {
+                a[source] = NONE;
+            }
+        }
+    }
+}
+
+fn value_with_insert(
+    words: &[u32],
+    insert_at: usize,
+    item: u32,
+    sequence_at: usize,
+) -> (u32, Option<usize>) {
+    if sequence_at < insert_at {
+        (words[sequence_at], Some(sequence_at))
+    } else if sequence_at == insert_at {
+        (item, None)
+    } else {
+        (words[sequence_at - 1], Some(sequence_at - 1))
+    }
+}
+
+fn branch_split_slot_for(index: usize, count: usize) -> usize {
+    debug_assert!(count == BRANCH_SLOTS / 2 || count == BRANCH_SLOTS / 2 + 1);
+    let evenly_spaced_count = BRANCH_SLOTS / 2;
+    if index < evenly_spaced_count { 2 * index } else { BRANCH_SLOTS - (count - index) }
 }
 
 fn branch_parts(words: &[u32; NODE_SLOTS]) -> (BranchKeys, BranchChildren, usize) {
     let (keys, children) = branch_values(words);
-    let count = branch_count(&children);
+    let count = branch_count(words);
     (keys, children, count)
-}
-
-fn write_branch(words: &mut [u32; NODE_SLOTS], keys: &[u32], children: &[u32]) {
-    assert_eq!(keys.len(), BRANCH_SLOTS);
-    assert_eq!(children.len(), BRANCH_SLOTS);
-    debug_assert!(keys.iter().zip(children).all(|(key, child)| (*key == NONE) == (*child == NONE)));
-    words[..BRANCH_SLOTS].copy_from_slice(keys);
-    words[BRANCH_SLOTS..].copy_from_slice(children);
 }
 
 fn branch_child(keys: &[u32], key: u32) -> usize {
@@ -1283,43 +1254,6 @@ fn branch_child(keys: &[u32], key: u32) -> usize {
     previous.unwrap_or(first)
 }
 
-fn spread_split_branch(keys: &[u32], children: &[u32]) -> (BranchKeys, BranchChildren) {
-    debug_assert_eq!(keys.len(), children.len());
-    debug_assert!(keys.len() == BRANCH_SLOTS / 2 || keys.len() == BRANCH_SLOTS / 2 + 1);
-    let mut sparse_keys = [NONE; BRANCH_KEYS_SCRATCH];
-    let mut sparse_children = [NONE; BRANCH_CHILDREN_SCRATCH];
-    let evenly_spaced_count = BRANCH_SLOTS / 2;
-    for i in 0..keys.len() {
-        let slot = if i < evenly_spaced_count { 2 * i } else { BRANCH_SLOTS - (keys.len() - i) };
-        sparse_keys[slot] = keys[i];
-        sparse_children[slot] = children[i];
-    }
-    (sparse_keys, sparse_children)
-}
-
-fn centered_two_branch_pairs(
-    left_min: u32,
-    left: u32,
-    right_min: u32,
-    right: u32,
-) -> (BranchKeys, BranchChildren) {
-    let mut keys = [NONE; BRANCH_KEYS_SCRATCH];
-    let mut children = [NONE; BRANCH_CHILDREN_SCRATCH];
-    let first = BRANCH_SLOTS / 2 - 1;
-    keys[first] = left_min;
-    children[first] = left;
-    keys[first + 1] = right_min;
-    children[first + 1] = right;
-    (keys, children)
-}
-
-fn remove_branch_child(keys: &mut BranchKeys, children: &mut BranchChildren, child_at: usize) {
-    debug_assert!(child_at < BRANCH_SLOTS);
-    debug_assert_ne!(children[child_at], NONE);
-    keys[child_at] = NONE;
-    children[child_at] = NONE;
-}
-
 fn first_branch_slot(children: &BranchChildren) -> Option<usize> {
     (0..BRANCH_SLOTS).find(|&slot| children[slot] != NONE)
 }
@@ -1330,28 +1264,6 @@ fn previous_branch_slot(children: &BranchChildren, before: usize) -> Option<usiz
 
 fn next_branch_slot(children: &BranchChildren, from: usize) -> Option<usize> {
     (from..BRANCH_SLOTS).find(|&slot| children[slot] != NONE)
-}
-
-fn spread_leaf_words(keys: &[u32]) -> LeafWords {
-    assert!(!keys.is_empty());
-    assert!(keys.len() <= NODE_LEAF_CAPACITY);
-    debug_assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
-
-    let count = keys.len();
-    let mut key_at = 0;
-    let mut next_key_slot = leaf_slot_for(0, count);
-    std::array::from_fn(|slot| {
-        if slot == next_key_slot {
-            let key = keys[key_at];
-            key_at += 1;
-            if key_at < count {
-                next_key_slot = leaf_slot_for(key_at, count);
-            }
-            key
-        } else {
-            NONE
-        }
-    })
 }
 
 fn leaf_slot_for(key_at: usize, count: usize) -> usize {
@@ -1365,32 +1277,23 @@ fn leaf_slot_for(key_at: usize, count: usize) -> usize {
     }
 }
 
-fn choose_leaf_split(keys: &[u32], capacity: usize) -> usize {
-    debug_assert!(keys.len() >= 2);
+fn choose_leaf_split(total_count: usize, capacity: usize) -> usize {
+    debug_assert!(total_count >= 2);
     let mut best: Option<(usize, usize, usize)> = None;
-    for split in 1..keys.len() {
-        let left = &keys[..split];
-        let right = &keys[split..];
-        if left.len() > capacity || right.len() > capacity {
+    for split in 1..total_count {
+        let right_count = total_count - split;
+        if split > capacity || right_count > capacity {
             continue;
         }
-        let score = (left.len().max(right.len()), left.len().abs_diff(right.len()), split);
+        let score = (split.max(right_count), split.abs_diff(right_count), split);
         if best.is_none_or(|old| score < old) {
             best = Some(score);
         }
     }
     best.map(|(_, _, split)| split).unwrap_or_else(|| {
         debug_assert!(false, "no capacity-respecting split for raw leaf");
-        keys.len() / 2
+        total_count / 2
     })
-}
-
-fn insert_key(keys: &mut KeyScratch, count: usize, at: usize, key: u32) {
-    debug_assert!(count + 1 < KEY_SCRATCH);
-    for i in (at..count).rev() {
-        keys[i + 1] = keys[i];
-    }
-    keys[at] = key;
 }
 
 fn leaf_bounds(words: &[u32; NODE_SLOTS]) -> Option<(usize, usize)> {
@@ -1524,52 +1427,29 @@ fn nearest_hole(words: &[u32], target: usize) -> Option<usize> {
     }
 }
 
-fn insert_sparse_item(
-    keys: &mut [u32],
-    mut links: Option<&mut [u32]>,
-    key: u32,
-    link: Option<u32>,
-    anchor: usize,
-    mut hole: usize,
-) {
-    debug_assert_eq!(keys[hole], NONE);
-    debug_assert_eq!(links.is_some(), link.is_some());
-    debug_assert!(anchor <= keys.len());
-    if let Some(links) = links.as_deref() {
-        debug_assert_eq!(links.len(), keys.len());
-        debug_assert_eq!(links[hole], NONE);
-    }
+fn insert_sparse_item(words: &mut [u32], item: u32, anchor: usize, mut hole: usize) {
+    debug_assert_eq!(words[hole], NONE);
+    debug_assert!(anchor <= words.len());
 
     if hole < anchor {
         for from in hole + 1..anchor {
-            if keys[from] != NONE {
-                keys[hole] = keys[from];
-                keys[from] = NONE;
-                if let Some(links) = links.as_deref_mut() {
-                    links[hole] = links[from];
-                    links[from] = NONE;
-                }
+            if words[from] != NONE {
+                words[hole] = words[from];
+                words[from] = NONE;
                 hole = from;
             }
         }
     } else if hole > anchor {
         for from in (anchor..hole).rev() {
-            if keys[from] != NONE {
-                keys[hole] = keys[from];
-                keys[from] = NONE;
-                if let Some(links) = links.as_deref_mut() {
-                    links[hole] = links[from];
-                    links[from] = NONE;
-                }
+            if words[from] != NONE {
+                words[hole] = words[from];
+                words[from] = NONE;
                 hole = from;
             }
         }
     }
 
-    keys[hole] = key;
-    if let (Some(links), Some(link)) = (links, link) {
-        links[hole] = link;
-    }
+    words[hole] = item;
 }
 
 #[cfg(test)]
@@ -1607,17 +1487,17 @@ mod tests {
     fn usage_node(pool: &ExtentTreePool, index: u32, height: u8, usage: &mut TreeUsage) {
         let node = pool.read(index);
         if height == 0 {
-            let mut keys = [0; KEY_SCRATCH];
-            let count = node.leaf_parts(&mut keys);
+            let count = leaf_count(node.words());
             usage.leaves += 1;
             usage.leaf_id_bytes += count * size_of::<u32>();
             usage.occupied_slots += count;
             return;
         }
-        let (_, children, count) = node.branch_parts();
+        let words = node.words();
+        let count = branch_count(words);
         usage.branches += 1;
         usage.occupied_slots += count * 2;
-        for &child in &children[..BRANCH_SLOTS] {
+        for &child in &words[BRANCH_SLOTS..] {
             if child != NONE {
                 usage_node(pool, child, height - 1, usage);
             }
@@ -1627,17 +1507,17 @@ mod tests {
     fn tree_usage(tree: &EnExtentTree, pool: &ExtentTreePool) -> TreeUsage {
         let mut usage = TreeUsage::default();
         if tree.height == 0 {
-            let mut keys = [0; KEY_SCRATCH];
-            let count = tree.root.leaf_parts(&mut keys);
+            let count = leaf_count(tree.root.words());
             if count != 0 {
                 usage.leaves = 1;
                 usage.leaf_id_bytes = count * size_of::<u32>();
                 usage.occupied_slots = count;
             }
         } else {
-            let (_, children, count) = tree.root.branch_parts();
+            let words = tree.root.words();
+            let count = branch_count(words);
             usage.occupied_slots += count * 2;
-            for &child in &children[..BRANCH_SLOTS] {
+            for &child in &words[BRANCH_SLOTS..] {
                 if child != NONE {
                     usage_node(pool, child, tree.height - 1, &mut usage);
                 }
@@ -1849,8 +1729,7 @@ mod tests {
 
         assert!(tree.remove(&mut pool, ExtentId::new(values[trigger_slot])).unwrap());
         assert_eq!(tree.height, 0);
-        let mut root_keys = [0; KEY_SCRATCH];
-        assert_eq!(tree.root.leaf_parts(&mut root_keys), NODE_LEAF_CAPACITY);
+        assert_eq!(leaf_count(tree.root.words()), NODE_LEAF_CAPACITY);
         let expected: Vec<u32> = values
             .iter()
             .copied()
@@ -1861,6 +1740,36 @@ mod tests {
             })
             .collect();
         assert_eq!(collect(&tree, &pool), expected);
+    }
+
+    #[test]
+    fn merge_packs_a_then_appends_b() {
+        let mut a = [10, NONE, NONE, 20];
+        let b = [NONE, 30, NONE, NONE];
+        assert_eq!(merge_items_packed(&mut a, &b), 3);
+        assert_eq!(a, [10, 20, 30, NONE]);
+    }
+
+    #[test]
+    fn split_moves_inserted_items_in_place_at_every_position() {
+        let original = [10u32, 20, 30, 40];
+        let capacity = original.len();
+        for insert_at in 0..=original.len() {
+            let inserted = insert_at as u32 * 10 + 5;
+            let mut expected = original.to_vec();
+            expected.insert(insert_at, inserted);
+            let mut a = original;
+            let mut b = [NONE; 4];
+
+            split_sparse_items(&mut a, &mut b, insert_at, inserted, 2, |index, count| {
+                index * (capacity - 1) / (count - 1)
+            });
+
+            let left: Vec<_> = a.into_iter().filter(|&item| item != NONE).collect();
+            let right: Vec<_> = b.into_iter().filter(|&item| item != NONE).collect();
+            assert_eq!(left, expected[..2]);
+            assert_eq!(right, expected[2..]);
+        }
     }
 
     #[test]
@@ -1890,11 +1799,11 @@ mod tests {
         pool.reclaim();
     }
 
-    fn tree_until_height_two(pool: &mut ExtentTreePool) -> EnExtentTree {
+    fn tree_until_height_two(pool: &mut ExtentTreePool, stride: u32) -> EnExtentTree {
         let mut tree = EnExtentTree::new();
         let max_entries = NODE_SLOTS * BRANCH_CAPACITY * 8;
         for value in 0..max_entries as u32 {
-            assert!(tree.insert(pool, ExtentId::new(value)).unwrap());
+            assert!(tree.insert(pool, ExtentId::new(value * stride)).unwrap());
             if tree.height == 2 {
                 return tree;
             }
@@ -1919,7 +1828,7 @@ mod tests {
     #[test]
     fn branch_merge_uses_empty_neighbor_rule_and_reduces_root_height() {
         let mut pool = ExtentTreePool::new(4096).unwrap();
-        let mut tree = tree_until_height_two(&mut pool);
+        let mut tree = tree_until_height_two(&mut pool, 1);
         let before = collect(&tree, &pool);
 
         let (_, root_children, root_count) = tree.root.branch_parts();
@@ -1943,8 +1852,11 @@ mod tests {
     #[test]
     fn branch_merge_does_not_trigger_at_an_edge_slot() {
         let mut pool = ExtentTreePool::new(4096).unwrap();
-        let mut tree = tree_until_height_two(&mut pool);
-        let before = collect(&tree, &pool);
+        // Leave gaps between IDs so the next leaf can be filled without
+        // splitting. While this leaf still has an item, a full neighbor makes
+        // their combined count exceed capacity. Removing its final item yields
+        // NONE and removes its child slot directly, without a coalesce attempt.
+        let mut tree = tree_until_height_two(&mut pool, 2);
 
         let (_, root_children, root_count) = tree.root.branch_parts();
         assert_eq!(root_count, 2);
@@ -1954,8 +1866,27 @@ mod tests {
         assert_ne!(children[0], NONE);
         assert_eq!(children[1], NONE);
 
+        let next_at = next_branch_slot(&children, 1).expect("edge leaf has a right neighbor");
+        let next_leaf = children[next_at];
+        let mut next_keys = [0; KEY_SCRATCH];
+        let next_count = pool.read(next_leaf).leaf_parts(&mut next_keys);
+        assert_eq!(next_count, NODE_LEAF_CAPACITY / 2);
+        for &key in &next_keys[..next_count] {
+            assert_eq!(key % 2, 0);
+            assert!(tree.insert(&mut pool, ExtentId::new(key + 1)).unwrap());
+        }
+        assert_eq!(leaf_count(pool.words_ptr(pool.ptr(next_leaf))), NODE_LEAF_CAPACITY);
+        let before = collect(&tree, &pool);
+
         let removed = delete_leaf_highest_to_lowest(&mut tree, &mut pool, children[0]);
         assert_eq!(tree.height, 2);
+        let (_, root_children, root_count) = tree.root.branch_parts();
+        assert_eq!(root_count, 2);
+        let left_branch_after = root_children[first_branch_slot(&root_children).unwrap()];
+        assert_eq!(left_branch_after, left_branch);
+        let (_, children_after, child_count_after) = pool.read(left_branch_after).branch_parts();
+        assert_eq!(child_count_after, child_count - 1);
+        assert_eq!(children_after[0], NONE);
         let removed: BTreeSet<u32> = removed.into_iter().collect();
         let expected: Vec<u32> = before.into_iter().filter(|key| !removed.contains(key)).collect();
         assert_eq!(collect(&tree, &pool), expected);
