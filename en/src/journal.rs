@@ -105,6 +105,10 @@ impl DiskSpace {
         self.capacity_bytes
     }
 
+    pub(crate) fn used_bytes(&self) -> u64 {
+        self.used_bytes.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn staging_bytes(&self) -> u64 {
         self.staging_bytes.load(Ordering::Relaxed)
     }

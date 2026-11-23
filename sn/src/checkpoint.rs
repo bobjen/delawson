@@ -110,10 +110,9 @@ struct EnDiskRow {
     id: u64,
     total_bytes: u64,
     used_bytes: u64,
-    sync_time: u64,
     status: u8,
 }
-raft::wire_struct!(EnDiskRow, SnCkEnDisk, {id,total_bytes,used_bytes,sync_time,status});
+raft::wire_struct!(EnDiskRow, SnCkEnDisk, {id,total_bytes,used_bytes,status});
 
 struct EnStateRow {
     id: u64,
@@ -440,7 +439,6 @@ fn write_en_states(file: &mut (impl Write + Seek), state: &SNState) -> Result<Ra
                 id: u64::from(id.get()),
                 total_bytes: info.total_bytes,
                 used_bytes: info.used_bytes,
-                sync_time: info.sync_time.number(),
                 status: info.status as u8,
             })
             .collect();
@@ -1071,13 +1069,9 @@ fn read_en_states(
             if !known_disks.contains(&(id, disk_id)) {
                 return Err(Error::new("SN checkpoint EN disk state is outside the disk roster"));
             }
-            if disk.used_bytes > disk.total_bytes {
-                return Err(Error::new("SN checkpoint EN disk usage exceeds its capacity"));
-            }
             let info = EnDiskInfo {
                 total_bytes: disk.total_bytes,
                 used_bytes: disk.used_bytes,
-                sync_time: TimeSec::new(disk.sync_time),
                 status: EnDiskStatus::from_code(disk.status)?,
             };
             if en.disks.insert(disk_id, info).is_some() {

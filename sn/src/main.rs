@@ -412,7 +412,6 @@ impl EnDiskStatus {
 struct EnDiskInfo {
     total_bytes: u64,
     used_bytes: u64,
-    sync_time: TimeSec,
     status: EnDiskStatus,
 }
 
@@ -431,7 +430,6 @@ struct EnDiskSyncRow {
     disk: DiskId,
     total_bytes: u64,
     used_bytes: u64,
-    sync_time: TimeSec,
     status: EnDiskStatus,
 }
 
@@ -1096,7 +1094,6 @@ fn write_en_disk_sync_row(w: &mut StructWriter, row: &EnDiskSyncRow) {
     w.disk_id(row.disk);
     w.number_u64(row.total_bytes);
     w.number_u64(row.used_bytes);
-    w.time_sec(row.sync_time);
     w.number_u8(row.status as u8);
 }
 
@@ -1104,18 +1101,18 @@ fn read_en_disk_sync_row(r: &mut StructReader<'_>) -> Result<EnDiskSyncRow> {
     let disk = r.disk_id()?;
     let total_bytes = r.number_u64()?;
     let used_bytes = r.number_u64()?;
-    let sync_time = r.time_sec()?;
     let status = EnDiskStatus::from_code(r.number_u8()?)?;
-    if used_bytes > total_bytes {
-        return Err(Error::new("EN disk used bytes exceed its total length"));
-    }
     if status == EnDiskStatus::Deleted {
         return Err(Error::new("EN cannot report an SN-deleted disk as present"));
     }
-    Ok(EnDiskSyncRow { disk, total_bytes, used_bytes, sync_time, status })
+    Ok(EnDiskSyncRow { disk, total_bytes, used_bytes, status })
 }
 
-fn read_en_disk_sync_response(en: EnId, response: Resp) -> Result<EnDiskSyncCmd> {
+fn read_en_disk_sync_response(
+    en: EnId,
+    sync_time: TimeSec,
+    response: Resp,
+) -> Result<EnDiskSyncCmd> {
     if response.status != Status::Ok {
         return Err(Error::new(format!("EN returned {}", response.status)));
     }
@@ -1141,7 +1138,7 @@ fn read_en_disk_sync_response(en: EnId, response: Resp) -> Result<EnDiskSyncCmd>
         }
         disks.push(disk);
     }
-    Ok(EnDiskSyncCmd { en, sync_time: TimeSec::now(), disks })
+    Ok(EnDiskSyncCmd { en, sync_time, disks })
 }
 
 sn_wire!(
@@ -1160,8 +1157,8 @@ sn_wire!(
         let sync_time = r.time_sec()?;
         let count = usize::try_from(r.number_u64()?)
             .map_err(|_| Error::new("EN disk sync count overflow"))?;
-        // Each nested row is a 2-byte Op plus 2 + 8 + 8 + 8 + 1 bytes of fields.
-        if count > r.remaining() / 29 {
+        // Each nested row is a 2-byte Op plus 2 + 8 + 8 + 1 bytes of fields.
+        if count > r.remaining() / 21 {
             return Err(Error::new("EN disk sync count exceeds the action"));
         }
         let mut disks = Vec::with_capacity(count);
@@ -1674,9 +1671,6 @@ fn apply_en_disk_sync(
     }
     let mut reported = HashMap::with_capacity(command.disks.len());
     for disk in command.disks {
-        if disk.used_bytes > disk.total_bytes {
-            return Err(Error::new("EN disk used bytes exceed its total length"));
-        }
         if disk.status == EnDiskStatus::Deleted {
             return Err(Error::new("EN disk sync reports an SN-deleted disk"));
         }
@@ -1714,7 +1708,6 @@ fn apply_en_disk_sync(
             EnDiskInfo {
                 total_bytes: record.total_bytes,
                 used_bytes: record.used_bytes,
-                sync_time: record.sync_time,
                 status: record.status,
             },
         );
@@ -1724,7 +1717,6 @@ fn apply_en_disk_sync(
             let info = en.disks.entry(disk).or_insert(EnDiskInfo {
                 total_bytes: 0,
                 used_bytes: 0,
-                sync_time: command.sync_time,
                 status: EnDiskStatus::Deleted,
             });
             info.status = EnDiskStatus::Deleted;
@@ -2507,6 +2499,14 @@ impl SN {
         let worker = thread::Builder::new()
             .name("sn-sync".into())
             .spawn(move || {
+                if let Some(service) = sn.upgrade() {
+                    if service.sync_stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    service.sync_tick(&process);
+                } else {
+                    return;
+                }
                 'worker: loop {
                     let Some(service) = sn.upgrade() else { break };
                     if service.sync_stop.load(Ordering::Acquire) {
@@ -2595,6 +2595,7 @@ impl SN {
             EnSyncKind::Extents => Op::EnSyncExtents,
         };
         let request = Req::new(op).number(self.mine.number());
+        let sent_at = TimeSec::now();
         let sn = Arc::downgrade(self);
         let workers = process.worker_queue();
         if process
@@ -2602,7 +2603,7 @@ impl SN {
                 if let Some(sn) = sn.upgrade() {
                     match kind {
                         EnSyncKind::Disks => {
-                            sn.receive_en_disk_sync(en, _response, workers);
+                            sn.receive_en_disk_sync(en, sent_at, _response, workers);
                         }
                         EnSyncKind::Extents => sn.finish_en_sync(en, kind),
                     }
@@ -2617,10 +2618,11 @@ impl SN {
     fn receive_en_disk_sync(
         self: &Arc<Self>,
         en: EnId,
+        sent_at: TimeSec,
         response: Resp,
         workers: server::WorkerQueue,
     ) {
-        let command = match read_en_disk_sync_response(en, response) {
+        let command = match read_en_disk_sync_response(en, sent_at, response) {
             Ok(command) => command,
             Err(error) => {
                 self.finish_en_sync(en, EnSyncKind::Disks);
@@ -3231,7 +3233,6 @@ impl SN {
                     EnDiskInfo {
                         total_bytes: u64::MAX,
                         used_bytes: 0,
-                        sync_time: TimeSec::EPOCH,
                         status: EnDiskStatus::Ready,
                     },
                 );
@@ -3700,22 +3701,6 @@ impl SN {
             }
         };
 
-        // EN sync learns the actual disk inventory. Until that response has
-        // arrived, retain the existing bootstrap roster convention.
-        let assigned = process.assigned_of_kind(ServiceKind::En);
-        if !assigned.is_empty() {
-            let mut roster = self.disks.lock().expect("SN disk roster");
-            for identity in assigned {
-                let en = EnId::new(
-                    process.cluster.service(&identity).map(|entry| entry.number()).unwrap_or(0),
-                );
-                if !roster.iter().any(|(known, _)| *known == en) {
-                    for disk in 0..5 {
-                        roster.push((en, DiskId::new(disk)));
-                    }
-                }
-            }
-        }
         let disks = match self.pick_available_disks(process.cluster.extents.instances) {
             Ok(disks) => disks,
             Err(error) => {

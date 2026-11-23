@@ -37,7 +37,7 @@ use common::server::{self, Process, Reply, Service};
 use common::time::TimeSec;
 use common::{
     AppendBlock, AppendPiece, Arg, EnKey, EnReceipt, Op, Req, Resp, SnKey, Status, StructWriter,
-    logi, structure,
+    loge, logi, structure,
 };
 use common::{Error, Result, logw};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -55,6 +55,7 @@ const SERVES: &[Op] = &[
     Op::ReadExtent,
     Op::ForceSealExtent,
     Op::WriteDurable,
+    Op::EnSyncDisks,
 ];
 
 /// Cached SN keys, addressed by the exact extent creation second. The exact
@@ -2878,7 +2879,13 @@ impl EN {
         #[cfg(test)]
         let disks = (0..5)
             .map(|id| {
-                (DiskId::new(id), Arc::new(Disk::new(Arc::clone(&daily_cache), 1024 * 1024 * 1024)))
+                (
+                    DiskId::new(id),
+                    Arc::new(Disk::new(
+                        Arc::clone(&daily_cache),
+                        u64::from(id + 1) * 1024 * 1024 * 1024,
+                    )),
+                )
             })
             .collect();
         EN {
@@ -2904,14 +2911,6 @@ impl EN {
 
     fn initialize(&self, process: &Arc<Process>) -> Result<()> {
         self.config.validate()?;
-        let mut configured_ids =
-            process.config.disks.iter().map(|disk| disk.id).collect::<Vec<_>>();
-        configured_ids.sort_unstable();
-        if !(0..5).all(|id| configured_ids.binary_search(&id).is_ok()) {
-            return Err(Error::new(
-                "until SN/EN disk synchronization is implemented, process.toml must include EN disks 0 through 4",
-            ));
-        }
         let en_id = EnId::new(process.entry.number());
         loop {
             if self.startup_stop.load(Ordering::Acquire) {
@@ -3066,6 +3065,7 @@ impl Service for EN {
             Op::WriteDurable => self.write_durable(process, request, reply),
             Op::ReadExtent => reply.send(self.read(process, &request)),
             Op::ForceSealExtent => self.seal_wait(process, &request, reply),
+            Op::EnSyncDisks => self.sync_disks(process, &request, reply),
             _ => reply.send(server::unbuilt(process, SERVES, &request)),
         }
     }
@@ -3084,6 +3084,53 @@ impl Service for EN {
 }
 
 impl EN {
+    fn sync_disks(&self, process: &Process, request: &Req, reply: Reply) {
+        let (mut payload, rest) =
+            match structure(&request.args(), Op::EnSyncDisks, "an EN disk-sync request") {
+                Ok(value) => value,
+                Err(error) => return reply.send(bad(error)),
+            };
+        let sn = match payload.sn_id() {
+            Ok(sn) => sn,
+            Err(error) => return reply.send(bad(error)),
+        };
+        if !rest.is_empty() {
+            return reply
+                .send(Resp::error(Status::BadRequest, "disk-sync request has trailing fields"));
+        }
+        if let Err(error) = payload.done() {
+            return reply.send(bad(error));
+        }
+
+        let configured: HashSet<_> =
+            process.config.disks.iter().map(|disk| DiskId::new(disk.id)).collect();
+        let disks = self.disks.read().expect("EN disks");
+        let mut rows = Vec::with_capacity(disks.len());
+        for (&id, disk) in disks.iter() {
+            if !configured.contains(&id) {
+                loge!("EN disk sync found an unconfigured disk", "sn {sn}, disk {id}");
+            }
+            let status = if disk.storage.read().expect("disk storage").is_some() {
+                0 // Ready
+            } else {
+                1 // Unavailable
+            };
+            let mut row = StructWriter::new();
+            row.disk_id(id);
+            row.number_u64(disk.space.capacity_bytes());
+            row.number_u64(disk.space.used_bytes());
+            row.number_u8(status);
+            rows.push(row.finish(Op::EnSyncDisk));
+        }
+        for configured in &process.config.disks {
+            let id = DiskId::new(configured.id);
+            if !disks.contains_key(&id) {
+                loge!("EN disk sync cannot find a configured disk", "sn {sn}, disk {id}");
+            }
+        }
+        reply.send(Resp::from_args(Status::Ok, rows).to(request));
+    }
+
     fn write_durable(&self, process: &Process, request: Req, reply: Reply) {
         let (mut payload, rest) =
             match structure(&request.args(), Op::WriteDurable, "an EN durable update") {

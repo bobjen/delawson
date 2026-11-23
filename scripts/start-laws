@@ -225,7 +225,7 @@ PYIDENTITY
 id = $disk
 device_identity = "$identity-disk-$disk"
 path = "data/disk-$disk"
-capacity_bytes = 1073741824
+capacity_bytes = $(((disk + 1) * 1073741824))
 EOF
         done
     fi
