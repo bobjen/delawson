@@ -10,16 +10,23 @@ pub mod raft;
 pub mod runtime;
 use common::Op;
 use common::Result;
+use common::time::TimeSec;
 pub use raft::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Action {
     pub op: Op,
     pub fields: Vec<u8>,
+    now: TimeSec,
 }
 impl Action {
     pub fn new(op: Op, fields: Vec<u8>) -> Self {
-        Self { op, fields }
+        Self { op, fields, now: TimeSec::EPOCH }
+    }
+
+    /// The primary's timestamp from when this action was submitted to Raft.
+    pub const fn now(&self) -> TimeSec {
+        self.now
     }
 }
 pub fn random_bytes() -> Result<[u8; 32]> {

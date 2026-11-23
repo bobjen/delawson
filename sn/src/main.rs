@@ -23,7 +23,7 @@ use common::config::{SNConfig, ServiceKind};
 use common::deletion::{
     Delete, Extras, Flags, SharedExtras, Target, bad, forward, read_soft_deleted,
 };
-use common::ids::{DiskId, EnId, ExtentId, RangeId, SnDiskId, SnId, StreamId};
+use common::ids::{DiskId, EnId, ExtentId, RangeId, SnDiskId, SnEnDiskId, SnId, StreamId};
 use common::info::{ExtentRow, ExtentRun, Listing, StreamName, Totals};
 use common::offset::{ECoff, ELoff, ERoff, SCoff, SLoff, SRoff};
 use common::range::Filled;
@@ -415,6 +415,14 @@ struct EnDiskInfo {
     status: EnDiskStatus,
 }
 
+#[derive(Clone, Copy)]
+struct DiskUsage {
+    id: SnEnDiskId,
+    cumulative_usage: u64,
+    cumulative_total_space: u64,
+    cumulative_adjusted_free_space: u64,
+}
+
 #[derive(Default)]
 struct EnInfo {
     last_disk_sync: Option<TimeSec>,
@@ -438,6 +446,12 @@ struct EnDiskSyncCmd {
     sync_time: TimeSec,
     disks: Vec<EnDiskSyncRow>,
 }
+
+struct BuildDiskUsageCmd {
+    capped_free_space_bits: u64,
+    subtract_fraction_average_free_bits: u64,
+}
+raft::wire_struct!(BuildDiskUsageCmd, SnBuildDiskUsage, { capped_free_space_bits, subtract_fraction_average_free_bits });
 
 #[derive(Clone, Copy)]
 enum EnSyncKind {
@@ -1357,6 +1371,7 @@ thread_local! {
 }
 
 /// Instances for one extent, taken randomly from the available disks.
+#[cfg(test)]
 fn pick_disks(total_disks: usize, want: usize) -> Result<Vec<SnDiskId>> {
     if total_disks < want {
         return Err(Error::new(format!(
@@ -1376,6 +1391,20 @@ fn pick_disks(total_disks: usize, want: usize) -> Result<Vec<SnDiskId>> {
     Ok(picked)
 }
 
+fn random_below(upper: u64) -> u64 {
+    assert!(upper > 0);
+    let threshold = upper.wrapping_neg() % upper;
+    RNG.with(|rng| {
+        let mut rng = rng.borrow_mut();
+        loop {
+            let value = rng.next_u64();
+            if value >= threshold {
+                return value % upper;
+            }
+        }
+    })
+}
+
 struct SNState {
     /// Keyed by the whole name, `(RangeId, StreamId, CreateSec)`, not just the id (#109).
     /// A re-minted id in a later second is a different key, so stale references cannot
@@ -1388,6 +1417,10 @@ struct SNState {
     disk_extent_indexes: DiskExtentIndexes,
     /// EN disk inventory and the last complete disk/extent sync applied by Raft.
     ens: HashMap<EnId, EnInfo>,
+    /// Cumulative disk usage/space, ordered by stable `(EnId, DiskId)` identity.
+    disk_usage: Vec<DiskUsage>,
+    disk_usage_available_disks: usize,
+    disk_usage_built_at: Option<TimeSec>,
     /// Side metadata whose lifetime follows its owning stream or extent.
     retired_streams: std::collections::HashSet<StreamName>,
     stream_extras: Extras<StreamName>,
@@ -1422,6 +1455,9 @@ impl SNState {
             extent_table,
             disk_extent_indexes,
             ens: HashMap::new(),
+            disk_usage: Vec::new(),
+            disk_usage_available_disks: 0,
+            disk_usage_built_at: None,
             retired_streams: std::collections::HashSet::new(),
             stream_extras: Extras::default(),
             extent_extras: Extras::default(),
@@ -1655,7 +1691,7 @@ fn apply_sn_action_with_disks(
     disks: &[(EnId, DiskId)],
 ) -> Result<()> {
     let mut local_used = false;
-    apply_sn_slot(state, index, action, disks, None, &mut local_used)
+    apply_sn_slot(state, index, TimeSec::EPOCH, action, disks, None, &mut local_used)
 }
 
 fn apply_en_disk_sync(
@@ -1728,15 +1764,112 @@ fn apply_en_disk_sync(
     Ok(())
 }
 
+fn rebuild_disk_usage(
+    state: &mut SNState,
+    now: TimeSec,
+    capped_free_space: f64,
+    subtract_fraction_average_free: f64,
+) -> Result<()> {
+    if !capped_free_space.is_finite() || capped_free_space < 0.0 {
+        return Err(Error::new("SN capped free space must be finite and nonnegative"));
+    }
+    if !subtract_fraction_average_free.is_finite() || subtract_fraction_average_free < 0.0 {
+        return Err(Error::new("SN subtract fraction average free must be finite and nonnegative"));
+    }
+    let mut disks: Vec<_> = state
+        .ens
+        .iter()
+        .flat_map(|(&en_id, en)| {
+            en.disks.iter().map(move |(&disk_id, disk)| {
+                (SnEnDiskId::new(en_id, disk_id), disk.used_bytes, disk.total_bytes, disk.status)
+            })
+        })
+        .collect();
+    disks.sort_unstable_by_key(|(id, _, _, _)| *id);
+
+    let fraction_free_sum: f64 = disks
+        .iter()
+        .map(|(_, usage, total_space, _)| {
+            if *total_space == 0 {
+                0.0
+            } else {
+                total_space.saturating_sub(*usage) as f64 / *total_space as f64
+            }
+        })
+        .sum();
+    let average_fraction_free =
+        if disks.is_empty() { 0.0 } else { fraction_free_sum / disks.len() as f64 };
+
+    let mut cumulative_usage = 0u64;
+    let mut cumulative_total_space = 0u64;
+    let mut cumulative_adjusted_free_space = 0u64;
+    let mut available_disks = 0usize;
+    let mut table = Vec::with_capacity(disks.len());
+    for (id, usage, total_space, status) in disks {
+        let actual_free = total_space.saturating_sub(usage);
+        let average_free = average_fraction_free * total_space as f64;
+        let capped_free = capped_free_space * average_free;
+        let adjusted_free = if status == EnDiskStatus::Ready {
+            ((actual_free as f64).min(capped_free) - subtract_fraction_average_free * average_free)
+                .max(0.0) as u64
+        } else {
+            0
+        };
+        if adjusted_free > 0 {
+            available_disks += 1;
+        }
+        cumulative_usage = cumulative_usage
+            .checked_add(usage)
+            .ok_or_else(|| Error::new("SN cumulative disk usage overflow"))?;
+        cumulative_total_space = cumulative_total_space
+            .checked_add(total_space)
+            .ok_or_else(|| Error::new("SN cumulative disk space overflow"))?;
+        cumulative_adjusted_free_space = cumulative_adjusted_free_space
+            .checked_add(adjusted_free)
+            .ok_or_else(|| Error::new("SN cumulative adjusted free space overflow"))?;
+        table.push(DiskUsage {
+            id,
+            cumulative_usage,
+            cumulative_total_space,
+            cumulative_adjusted_free_space,
+        });
+    }
+    state.disk_usage = table;
+    state.disk_usage_available_disks = available_disks;
+    state.disk_usage_built_at = Some(now);
+    let (used, total_space, adjusted_free) = state.disk_usage.last().map_or((0, 0, 0), |last| {
+        (last.cumulative_usage, last.cumulative_total_space, last.cumulative_adjusted_free_space)
+    });
+    common::logn!(
+        "SN disk usage table built",
+        "available disks {}, used {}, total space {}, adjusted free space {}",
+        available_disks,
+        used,
+        total_space,
+        adjusted_free
+    );
+    Ok(())
+}
+
 fn apply_sn_slot(
     state: &mut SNState,
     _index: u64,
+    now: TimeSec,
     action: &raft::Action,
     disks: &[(EnId, DiskId)],
     local_id: Option<ExtentId>,
     local_used: &mut bool,
 ) -> Result<()> {
     match action.op {
+        Op::SnBuildDiskUsage => {
+            let command: BuildDiskUsageCmd = raft::codec::decode(&action.fields)?;
+            rebuild_disk_usage(
+                state,
+                now,
+                f64::from_bits(command.capped_free_space_bits),
+                f64::from_bits(command.subtract_fraction_average_free_bits),
+            )
+        }
         Op::SnEnDiskSync => {
             let command: EnDiskSyncCmd = raft::codec::decode(&action.fields)?;
             apply_en_disk_sync(state, command, disks)
@@ -2155,6 +2288,9 @@ impl raft::execution::Application for SNState {
         self.disk_extent_indexes.clear();
         self.extent_table.reset();
         self.ens.clear();
+        self.disk_usage.clear();
+        self.disk_usage_available_disks = 0;
+        self.disk_usage_built_at = None;
         self.retired_streams.clear();
         self.stream_extras = Extras::default();
         self.extent_extras = Extras::default();
@@ -2191,9 +2327,12 @@ struct SN {
     mine: SnId,
     /// All disks across all ENs that this SN can see.
     disks: Mutex<Vec<(EnId, DiskId)>>,
+    /// Member-local indexes for the stable disk names stored in the usage table.
+    disk_ids: Mutex<HashMap<SnEnDiskId, SnDiskId>>,
     /// Per-EN sync timestamps; these are process-local scheduling state, so a
     /// restarted SN immediately asks its ENs to reconcile again.
     en_sync: Mutex<HashMap<EnId, EnSyncState>>,
+    disk_usage_build_in_flight: AtomicBool,
     sync_stop: AtomicBool,
     sync_thread: Mutex<Option<JoinHandle<()>>>,
     gc_stop: AtomicBool,
@@ -2546,11 +2685,13 @@ impl SN {
         let disk_interval = Duration::from_secs(self.config.en_disk_sync_interval_sec);
         let extent_interval = Duration::from_secs(self.config.en_extent_sync_interval_sec);
 
+        let mut has_assigned_en = false;
         for identity in process.assigned_of_kind(ServiceKind::En) {
             let Some(entry) = process.cluster.service(&identity) else { continue };
             if entry.kind != ServiceKind::En {
                 continue;
             }
+            has_assigned_en = true;
             let en = EnId::new(entry.number());
             let (sync_disks, sync_extents) = {
                 let mut states = self.en_sync.lock().expect("SN EN sync state");
@@ -2580,6 +2721,50 @@ impl SN {
             if sync_extents {
                 self.send_en_sync(process, &identity, en, EnSyncKind::Extents);
             }
+        }
+
+        let now_sec = TimeSec::now();
+        let build_interval = u64::from(self.config.en_disk_sync_interval_sec);
+        let due = {
+            let state = self.global_lock.read();
+            let inventory_known = !has_assigned_en || !state.ens.is_empty();
+            inventory_known
+                && state.disk_usage_built_at.map_or(true, |last| {
+                    now_sec.number().saturating_sub(last.number()) >= build_interval
+                })
+        };
+        if due
+            && self
+                .disk_usage_build_in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let action = match sn_action(
+                Op::SnBuildDiskUsage,
+                &BuildDiskUsageCmd {
+                    capped_free_space_bits: self.config.capped_free_space.to_bits(),
+                    subtract_fraction_average_free_bits: self
+                        .config
+                        .subtract_fraction_average_free
+                        .to_bits(),
+                },
+            ) {
+                Ok(action) => action,
+                Err(error) => {
+                    common::logn!("SN disk usage build encoding failed", "{}", error);
+                    self.disk_usage_build_in_flight.store(false, Ordering::Release);
+                    return;
+                }
+            };
+            let sn = Arc::downgrade(self);
+            self.submit_action(process.worker_queue(), action, move |result| {
+                if let Err(error) = result {
+                    common::logn!("SN disk usage build failed", "{}", error);
+                }
+                if let Some(sn) = sn.upgrade() {
+                    sn.disk_usage_build_in_flight.store(false, Ordering::Release);
+                }
+            });
         }
     }
 
@@ -2663,32 +2848,56 @@ impl SN {
         }
     }
 
-    fn available_disks(&self) -> Vec<SnDiskId> {
-        let state = self.global_lock.read();
-        let roster = self.disks.lock().expect("SN disk roster");
-        roster
-            .iter()
-            .enumerate()
-            .filter_map(|(at, &(en, disk))| {
-                let status = state.ens.get(&en);
-                let eligible = match status {
-                    // Until the first successful sync, preserve the configured
-                    // roster as the placement source. This keeps startup usable
-                    // while EN sync is unavailable or has not completed yet.
-                    None | Some(EnInfo { last_disk_sync: None, .. }) => true,
-                    Some(info) => info.disks.get(&disk).is_some_and(|disk| {
-                        disk.status == EnDiskStatus::Ready && disk.used_bytes < disk.total_bytes
-                    }),
-                };
-                eligible.then(|| SnDiskId::new(u32::try_from(at).expect("SN disk roster fits u32")))
-            })
-            .collect()
-    }
-
     fn pick_available_disks(&self, want: usize) -> Result<Vec<SnDiskId>> {
-        let available = self.available_disks();
-        let indexes = pick_disks(available.len(), want)?;
-        Ok(indexes.into_iter().map(|index| available[index.get() as usize]).collect())
+        if want == 0 {
+            return Ok(Vec::new());
+        }
+        let state = self.global_lock.read();
+        let available = state.disk_usage_available_disks;
+        if available == 0 {
+            return Err(Error::new("SN has no disks with adjusted free space"));
+        }
+        let disk_ids =
+            self.disk_ids.lock().map_err(|_| Error::new("SN disk index lock poisoned"))?;
+        let mut picked = Vec::with_capacity(want.min(available));
+
+        // If every usable disk is needed, use each exactly once instead of
+        // doing weighted draws that would have to reject duplicates.
+        if available <= want {
+            let mut previous = 0;
+            for row in &state.disk_usage {
+                if row.cumulative_adjusted_free_space > previous {
+                    picked.push(
+                        *disk_ids
+                            .get(&row.id)
+                            .ok_or_else(|| Error::new("SN disk usage names an unknown disk"))?,
+                    );
+                }
+                previous = row.cumulative_adjusted_free_space;
+            }
+            return Ok(picked);
+        }
+
+        let total = state.disk_usage.last().map_or(0, |row| row.cumulative_adjusted_free_space);
+        if total == 0 {
+            return Err(Error::new("SN has no adjusted free space"));
+        }
+        while picked.len() < want {
+            let byte = random_below(total);
+            let at =
+                state.disk_usage.partition_point(|row| row.cumulative_adjusted_free_space <= byte);
+            let row = state
+                .disk_usage
+                .get(at)
+                .ok_or_else(|| Error::new("SN disk usage cumulative total is invalid"))?;
+            let disk = *disk_ids
+                .get(&row.id)
+                .ok_or_else(|| Error::new("SN disk usage names an unknown disk"))?;
+            if !picked.contains(&disk) {
+                picked.push(disk);
+            }
+        }
+        Ok(picked)
     }
 
     fn delete_stream_async(self: &Arc<Self>, process: &Arc<Process>, request: &Req, done: Respond) {
@@ -3023,10 +3232,25 @@ impl SN {
         }
 
         let mut roster = self.disks.lock().map_err(|_| Error::new("SN disk lock poisoned"))?;
+        let mut disk_ids =
+            self.disk_ids.lock().map_err(|_| Error::new("SN disk index lock poisoned"))?;
         for name in names {
-            if !roster.contains(&name) {
-                roster.push(name);
+            let id = SnEnDiskId::new(name.0, name.1);
+            if disk_ids.contains_key(&id) {
+                continue;
             }
+            let at = if let Some(at) = roster.iter().position(|&candidate| candidate == name) {
+                at
+            } else {
+                let at = roster.len();
+                roster.push(name);
+                at
+            };
+            let index = u32::try_from(at)
+                .ok()
+                .filter(|index| *index != u32::MAX)
+                .ok_or_else(|| Error::new("SN disk roster exceeds its index limit"))?;
+            disk_ids.insert(id, SnDiskId::new(index));
         }
         Ok(())
     }
@@ -3167,6 +3391,17 @@ impl SN {
             common.application_generation.store(generation, Ordering::SeqCst);
             common.publish_applied(snapshot_index);
         }
+        let disk_roster = saved_disks.unwrap_or(disks);
+        let mut disk_ids = HashMap::with_capacity(disk_roster.len());
+        for (at, &(en, disk)) in disk_roster.iter().enumerate() {
+            let index = u32::try_from(at)
+                .ok()
+                .filter(|index| *index != u32::MAX)
+                .ok_or_else(|| Error::new("SN disk roster exceeds its index limit"))?;
+            if disk_ids.insert(SnEnDiskId::new(en, disk), SnDiskId::new(index)).is_some() {
+                return Err(Error::new("SN disk roster contains a duplicate disk"));
+            }
+        }
         let sn = SN {
             common,
             config,
@@ -3175,8 +3410,10 @@ impl SN {
             pending_extents: Mutex::new(HashMap::new()),
             per_stream,
             mine,
-            disks: Mutex::new(saved_disks.unwrap_or(disks)),
+            disks: Mutex::new(disk_roster),
+            disk_ids: Mutex::new(disk_ids),
             en_sync: Mutex::new(HashMap::new()),
+            disk_usage_build_in_flight: AtomicBool::new(false),
             sync_stop: AtomicBool::new(true),
             sync_thread: Mutex::new(None),
             gc_stop: AtomicBool::new(true),
@@ -4437,7 +4674,15 @@ impl Host for SN {
             _ => Vec::new(),
         };
         let mut local_used = false;
-        let result = apply_sn_slot(state, context.index, action, &disks, local_id, &mut local_used);
+        let result = apply_sn_slot(
+            state,
+            context.index,
+            context.now,
+            action,
+            &disks,
+            local_id,
+            &mut local_used,
+        );
         if let Some(id) = local_id {
             if result.is_err() || !local_used {
                 release_extent_id(&mut state.extent_table, id);
@@ -4899,7 +5144,7 @@ mod tests {
         let action =
             sn_action(Op::SnCreate, &CreateCmd { names: names.to_vec(), creator: SnId::FIRST })?;
         let mut local_used = false;
-        apply_sn_slot(state, 0, &action, &[], None, &mut local_used)
+        apply_sn_slot(state, 0, TimeSec::EPOCH, &action, &[], None, &mut local_used)
     }
 
     #[test]
@@ -5138,7 +5383,7 @@ mod tests {
         .unwrap();
 
         let mut used = false;
-        apply_sn_slot(&mut primary, 1, &action, &[], Some(id), &mut used).unwrap();
+        apply_sn_slot(&mut primary, 1, TimeSec::EPOCH, &action, &[], Some(id), &mut used).unwrap();
         apply_sn_action(&mut secondary, 1, &action).unwrap();
 
         assert!(used);
@@ -5182,7 +5427,7 @@ mod tests {
         .unwrap();
 
         let mut used = false;
-        apply_sn_slot(&mut state, 1, &action, &new, None, &mut used).unwrap();
+        apply_sn_slot(&mut state, 1, TimeSec::EPOCH, &action, &new, None, &mut used).unwrap();
         assert_eq!(
             state.extent_table[ExtentId::FIRST.get() as usize].disks,
             [SnDiskId::new(1), SnDiskId::new(0)]

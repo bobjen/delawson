@@ -888,6 +888,14 @@ pub struct SNConfig {
     /// Minimum interval between successful extent syncs with one EN.
     #[serde(default = "default_en_extent_sync_interval_sec")]
     pub en_extent_sync_interval_sec: u64,
+    /// Multiplier for the average free-space fraction used to cap each disk's
+    /// adjusted free space. 1.0 caps each disk at the average fraction free.
+    #[serde(default = "default_capped_free_space")]
+    pub capped_free_space: f64,
+    /// Subtract this fraction of each disk's average free-space share after
+    /// applying the cap. This keeps heavily used disks from being filled first.
+    #[serde(default = "default_subtract_fraction_average_free")]
+    pub subtract_fraction_average_free: f64,
 }
 
 fn default_sync_loop_interval_sec() -> u64 {
@@ -902,6 +910,14 @@ fn default_en_extent_sync_interval_sec() -> u64 {
     120
 }
 
+fn default_capped_free_space() -> f64 {
+    1.0
+}
+
+fn default_subtract_fraction_average_free() -> f64 {
+    0.1
+}
+
 impl SNConfig {
     pub fn validate(&self) -> Result<()> {
         if self.sync_loop_interval_sec == 0 {
@@ -912,6 +928,16 @@ impl SNConfig {
         }
         if self.en_extent_sync_interval_sec == 0 {
             return Err(Error::new("SN en_extent_sync_interval_sec must be positive"));
+        }
+        if !self.capped_free_space.is_finite() || self.capped_free_space < 0.0 {
+            return Err(Error::new("SN capped_free_space must be finite and nonnegative"));
+        }
+        if !self.subtract_fraction_average_free.is_finite()
+            || self.subtract_fraction_average_free < 0.0
+        {
+            return Err(Error::new(
+                "SN subtract_fraction_average_free must be finite and nonnegative",
+            ));
         }
         Ok(())
     }

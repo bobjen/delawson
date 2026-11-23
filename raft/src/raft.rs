@@ -2216,7 +2216,8 @@ impl<S: Storage> Node<S> {
         }
         Ok(())
     }
-    pub fn propose(&mut self, command: Command) -> Result<u64> {
+    pub fn propose(&mut self, mut command: Command) -> Result<u64> {
+        let submitted_at = common::time::TimeSec::now();
         if self.role != Role::Leader {
             let membership = self.state().membership();
             let member = membership
@@ -2245,6 +2246,11 @@ impl<S: Storage> Node<S> {
         let scn = self.next_scn()?.ok_or_else(|| {
             Error::new("SCN allocation stalled; retry after clock synchronization")
         })?;
+        if let Command::Client(actions) = &mut command {
+            for action in actions {
+                action.now = submitted_at;
+            }
+        }
         let entry = Entry { scn, index, term: self.state().term, command, entry_buf: None };
         self.persist(vec![Record::Entries { from: index, entries: vec![entry] }])?;
         self.advance()?;

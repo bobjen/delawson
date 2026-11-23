@@ -113,6 +113,27 @@ id!(SnId, u64, "an SN");
 id!(EnId, u64, "an EN");
 // ⚠️ A **disk** within an EN, scoped by `(EnId, DiskId)`. 16 bits within its EN.
 id!(DiskId, u16, "a disk");
+/// A stable disk identity within an SN, independent of the SN's local roster index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SnEnDiskId {
+    en: EnId,
+    disk: DiskId,
+}
+
+impl SnEnDiskId {
+    pub const fn new(en: EnId, disk: DiskId) -> Self {
+        Self { en, disk }
+    }
+
+    pub const fn en(self) -> EnId {
+        self.en
+    }
+
+    pub const fn disk(self) -> DiskId {
+        self.disk
+    }
+}
+
 // ⚠️ An SN-only index into its array of all known disks across all ENs.
 id!(SnDiskId, "an SN disk index");
 // ⚠️ A **range**, not the DN serving it, for the same reason a disk is not an EN. But note what

@@ -297,6 +297,10 @@ for source in "${sn_ids[@]}"; do
     source_number=${source//[^0-9]/}
     if ((${#en_ids[@]} == 1)); then
         destinations=("${en_ids[0]}")
+    elif ((${#sn_ids[@]} == 1)); then
+        # A single SN uses every configured EN, including small test clusters
+        # with two ENs that do not match the production four-by-four layout.
+        destinations=("${en_ids[@]}")
     else
         case "$source_number" in
             0) destinations=("${en_ids[0]}" "${en_ids[2]}") ;;

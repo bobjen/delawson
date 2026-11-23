@@ -1,11 +1,11 @@
 //! SN application checkpoint codec.
 use super::extent_tree::DiskExtentTree;
 use super::{
-    DeleteTask, EnDiskInfo, EnDiskStatus, EnInfo, Extent, ExtentData, ExtentTable, MAX_STREAMS,
-    PendingDelete, SNState, Stream,
+    DeleteTask, DiskUsage, EnDiskInfo, EnDiskStatus, EnInfo, Extent, ExtentData, ExtentTable,
+    MAX_STREAMS, PendingDelete, SNState, Stream,
 };
 use common::deletion::{Extra, Flags, ReferenceCounts, SharedExtras};
-use common::ids::{DiskId, EnId, ExtentId, RangeId, SnDiskId, SnId, StreamId};
+use common::ids::{DiskId, EnId, ExtentId, RangeId, SnDiskId, SnEnDiskId, SnId, StreamId};
 use common::info::StreamName;
 use common::offset::{ECoff, ELoff, ERoff, SRoff};
 use common::time::{TimeIntSec32, TimeIntSec64, TimeSec};
@@ -40,6 +40,8 @@ struct Footer {
     extent_slots: ExtentId,
     ens: Range,
     en_states: Range,
+    disk_usage: Range,
+    disk_usage_built_at: Option<u64>,
     disk_extent_entries: u64,
     disk_extent_rows: Range,
     disk_extent_chunks: Vec<raft::checkpoint::ChunkPos>,
@@ -62,6 +64,8 @@ impl codec::Wire for Footer {
             writer.extent_id(self.extent_slots);
             self.ens.write(writer);
             self.en_states.write(writer);
+            self.disk_usage.write(writer);
+            self.disk_usage_built_at.write(writer);
             self.disk_extent_entries.write(writer);
             self.disk_extent_rows.write(writer);
             self.disk_extent_chunks.write(writer);
@@ -86,6 +90,8 @@ impl codec::Wire for Footer {
                 extent_slots: reader.extent_id()?,
                 ens: codec::Wire::read(reader)?,
                 en_states: codec::Wire::read(reader)?,
+                disk_usage: codec::Wire::read(reader)?,
+                disk_usage_built_at: codec::Wire::read(reader)?,
                 disk_extent_entries: codec::Wire::read(reader)?,
                 disk_extent_rows: codec::Wire::read(reader)?,
                 disk_extent_chunks: codec::Wire::read(reader)?,
@@ -113,6 +119,20 @@ struct EnDiskRow {
     status: u8,
 }
 raft::wire_struct!(EnDiskRow, SnCkEnDisk, {id,total_bytes,used_bytes,status});
+
+struct DiskUsageEnRow {
+    en: u64,
+    disks: Vec<DiskUsageDiskRow>,
+}
+raft::wire_struct!(DiskUsageEnRow, SnCkDiskUsageEn, {en,disks});
+
+struct DiskUsageDiskRow {
+    disk: u64,
+    cumulative_usage: u64,
+    cumulative_total_space: u64,
+    cumulative_adjusted_free_space: u64,
+}
+raft::wire_struct!(DiskUsageDiskRow, SnCkDiskUsageDisk, {disk,cumulative_usage,cumulative_total_space,cumulative_adjusted_free_space});
 
 struct EnStateRow {
     id: u64,
@@ -455,6 +475,33 @@ fn write_en_states(file: &mut (impl Write + Seek), state: &SNState) -> Result<Ra
                 retired_disks,
             },
         )?;
+    }
+    range(file, start)
+}
+
+fn write_disk_usage(file: &mut (impl Write + Seek), state: &SNState) -> Result<Range> {
+    let groups = state
+        .disk_usage
+        .iter()
+        .enumerate()
+        .filter(|(at, row)| *at == 0 || state.disk_usage[*at - 1].id.en() != row.id.en())
+        .count();
+    let start = section_start(file, Op::SnCkDiskUsage, groups as u64)?;
+    let mut at = 0;
+    while at < state.disk_usage.len() {
+        let en = state.disk_usage[at].id.en();
+        let mut disks = Vec::new();
+        while at < state.disk_usage.len() && state.disk_usage[at].id.en() == en {
+            let row: DiskUsage = state.disk_usage[at];
+            disks.push(DiskUsageDiskRow {
+                disk: u64::from(row.id.disk().get()),
+                cumulative_usage: row.cumulative_usage,
+                cumulative_total_space: row.cumulative_total_space,
+                cumulative_adjusted_free_space: row.cumulative_adjusted_free_space,
+            });
+            at += 1;
+        }
+        write_piece(file, &DiskUsageEnRow { en: en.get(), disks })?;
     }
     range(file, start)
 }
@@ -842,6 +889,7 @@ pub(super) fn write(
     }
     let ens = write_ens(file, disks)?;
     let en_states = write_en_states(file, state)?;
+    let disk_usage = write_disk_usage(file, state)?;
     let (disk_extent_rows, disk_extent_chunks, disk_extent_entries) =
         write_disk_extent_indexes(file, state, workers)?;
     let (extent_rows, extent_chunks) = write_extents(file, state, disks, workers)?;
@@ -859,6 +907,8 @@ pub(super) fn write(
         extent_slots: ExtentId::of_number(state.extent_table.len() as u64)?,
         ens,
         en_states,
+        disk_usage,
+        disk_usage_built_at: state.disk_usage_built_at.map(TimeSec::number),
         disk_extent_entries,
         disk_extent_rows,
         disk_extent_chunks,
@@ -922,6 +972,8 @@ fn read_public(file: &mut (impl Read + Seek)) -> Result<(Footer, u64)> {
     check_chunks(footer.stream_rows, &footer.stream_chunks)?;
     let ranges = [
         footer.ens,
+        footer.en_states,
+        footer.disk_usage,
         footer.disk_extent_rows,
         footer.extent_rows,
         footer.stream_rows,
@@ -1094,6 +1146,68 @@ fn read_en_states(
     if section.left != 0 {
         return Err(Error::new("trailing SN checkpoint EN state data"));
     }
+    Ok(())
+}
+
+fn read_disk_usage(
+    file: &mut File,
+    range: Range,
+    built_at: Option<u64>,
+    state: &mut SNState,
+    disk_roster: &[(EnId, DiskId)],
+) -> Result<()> {
+    let mut section = read_section(file, range, Op::SnCkDiskUsage)?;
+    if built_at.is_none() && section.count != 0 {
+        return Err(Error::new("SN checkpoint disk usage has no build timestamp"));
+    }
+    let known_disks: HashSet<_> = disk_roster.iter().copied().collect();
+    let mut previous_en = None;
+    let mut previous_id = None;
+    let mut cumulative_usage = 0;
+    let mut cumulative_total_space = 0;
+    let mut cumulative_adjusted_free_space = 0;
+    let mut available_disks = 0;
+    for _ in 0..section.count {
+        let row: DiskUsageEnRow = read_piece(file, &mut section.left)?;
+        let en = EnId::of_number(row.en)?;
+        if row.disks.is_empty() || previous_en.is_some_and(|previous| previous >= en) {
+            return Err(Error::new("invalid SN checkpoint disk usage EN ordering"));
+        }
+        previous_en = Some(en);
+        for disk_row in row.disks {
+            let disk = DiskId::of_number(disk_row.disk)?;
+            let id = SnEnDiskId::new(en, disk);
+            if !known_disks.contains(&(en, disk))
+                || previous_id.is_some_and(|previous| previous >= id)
+            {
+                return Err(Error::new("invalid SN checkpoint disk usage disk ordering"));
+            }
+            if disk_row.cumulative_usage < cumulative_usage
+                || disk_row.cumulative_total_space < cumulative_total_space
+                || disk_row.cumulative_adjusted_free_space < cumulative_adjusted_free_space
+            {
+                return Err(Error::new("SN checkpoint disk usage cumulatives decrease"));
+            }
+            if disk_row.cumulative_adjusted_free_space > cumulative_adjusted_free_space {
+                available_disks += 1;
+            }
+            cumulative_usage = disk_row.cumulative_usage;
+            cumulative_total_space = disk_row.cumulative_total_space;
+            cumulative_adjusted_free_space = disk_row.cumulative_adjusted_free_space;
+            previous_id = Some(id);
+            state.disk_usage.push(DiskUsage {
+                id,
+                cumulative_usage,
+                cumulative_total_space,
+                cumulative_adjusted_free_space,
+            });
+        }
+    }
+    if section.left != 0 {
+        return Err(Error::new("trailing SN checkpoint disk usage data"));
+    }
+    state.disk_usage_built_at = built_at.map(TimeSec::new);
+    state.disk_usage_available_disks = available_disks;
     Ok(())
 }
 
@@ -1762,6 +1876,7 @@ pub(super) fn read_state_with_workers(
     }
     let mut state = SNState::with_stream_buckets(max_extents, stream_buckets)?;
     read_en_states(&mut file, footer.en_states, &mut state, &disks)?;
+    read_disk_usage(&mut file, footer.disk_usage, footer.disk_usage_built_at, &mut state, &disks)?;
     let extent_slots = usize::try_from(footer.extent_slots.get())
         .map_err(|_| Error::new("SN checkpoint extent table is too large"))?;
     if extent_slots == 0 || extent_slots > max_extents as usize {

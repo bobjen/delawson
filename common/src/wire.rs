@@ -393,6 +393,10 @@ ops! {
     SnCkEnStates = 219, "sn-checkpoint-en-states";
     SnCkEnState = 220, "sn-checkpoint-en-state";
     SnCkEnDisk = 221, "sn-checkpoint-en-disk";
+    SnBuildDiskUsage = 222, "sn-build-disk-usage";
+    SnCkDiskUsage = 223, "sn-checkpoint-disk-usage";
+    SnCkDiskUsageEn = 224, "sn-checkpoint-disk-usage-en";
+    SnCkDiskUsageDisk = 225, "sn-checkpoint-disk-usage-disk";
 }
 
 impl std::fmt::Display for Op {

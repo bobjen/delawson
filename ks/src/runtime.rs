@@ -55,6 +55,7 @@ pub(super) fn restore_registrations(state: &State) -> Result<Registrations> {
                     ring: &state.ring,
                     index: entry.index,
                     term: entry.term,
+                    now: action.now(),
                 },
                 action,
             )?;

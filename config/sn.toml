@@ -18,6 +18,10 @@ repair_checkpoint_indexes = false
 sync_loop_interval_sec = 1
 en_disk_sync_interval_sec = 30
 en_extent_sync_interval_sec = 120
+# Cap each disk's adjusted free space at this multiple of the average free fraction.
+capped_free_space = 1.0
+# Subtract this fraction of the average free-space share from each disk after the cap.
+subtract_fraction_average_free = 0.1
 
 # Raft consensus for this SN. With no members listed, this process is a singleton.
 # To replicate the SN group, configure the same ring and member map on every member.

@@ -206,10 +206,13 @@ impl<K: Wire + Ord, V: Wire> Wire for BTreeMap<K, V> {
 }
 impl Wire for crate::Action {
     fn write(&self, w: &mut StructWriter) {
-        w.nested(self.op, |w| w.bytes(&self.fields));
+        w.nested(self.op, |w| {
+            w.time_sec(self.now);
+            w.bytes(&self.fields);
+        });
     }
     fn read(r: &mut StructReader<'_>) -> Result<Self> {
-        r.nested_any(|op, r| Ok(Self { op, fields: r.bytes()? }))
+        r.nested_any(|op, r| Ok(Self { op, now: r.time_sec()?, fields: r.bytes()? }))
     }
 }
 
@@ -260,7 +263,12 @@ fn read_entry_command(r: &mut StructReader<'_>) -> Result<crate::Command> {
                 return Err(Error::new("client action count exceeds entry"));
             }
             for _ in 0..count {
-                r.nested_any(|_, r| r.skip_bytes())?;
+                r.nested_any(|_, r| {
+                    // Actions carry their primary submission time before the
+                    // opaque application payload.
+                    r.time_sec()?;
+                    r.skip_bytes()
+                })?;
             }
             Ok(crate::Command::Client(Vec::new()))
         }),

@@ -87,6 +87,7 @@ pub struct Context<'a> {
     pub ring: &'a str,
     pub index: u64,
     pub term: u64,
+    pub now: common::time::TimeSec,
 }
 /// Execute only committed work. A budget expiry yields the global write lock and
 /// returns to the runtime, allowing journaling and checkpoint readers to proceed.
@@ -295,7 +296,12 @@ fn execute_with_lock<S: Application, T>(
                         let action = &cursor.decoded.as_ref().unwrap().1[cursor.action];
                         apply(
                             data,
-                            Context { ring: state.ring(), index: entry.index, term: entry.term },
+                            Context {
+                                ring: state.ring(),
+                                index: entry.index,
+                                term: entry.term,
+                                now: action.now,
+                            },
                             action,
                         )?;
                         cursor.action += 1;

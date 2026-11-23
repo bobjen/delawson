@@ -4294,7 +4294,12 @@ mod tests {
             let mut state = dn.state_write();
             dn.apply_client(
                 &mut state,
-                raft::execution::Context { ring: "DN", index: 7, term: 1 },
+                raft::execution::Context {
+                    ring: "DN",
+                    index: 7,
+                    term: 1,
+                    now: common::time::TimeSec::EPOCH,
+                },
                 &action,
                 &mut done,
             )
