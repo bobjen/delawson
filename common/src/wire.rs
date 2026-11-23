@@ -397,6 +397,9 @@ ops! {
     SnCkDiskUsage = 223, "sn-checkpoint-disk-usage";
     SnCkDiskUsageEn = 224, "sn-checkpoint-disk-usage-en";
     SnCkDiskUsageDisk = 225, "sn-checkpoint-disk-usage-disk";
+    SnCkDiskUsageDiskDouble = 226, "sn-checkpoint-disk-usage-disk-double";
+    EnSyncDiskDouble = 227, "en-sync-disk-double";
+    SnCkEnDiskDouble = 228, "sn-checkpoint-en-disk-double";
 }
 
 impl std::fmt::Display for Op {
@@ -541,6 +544,10 @@ impl StructWriter {
 
     pub fn number_u64(&mut self, value: u64) {
         self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    pub fn number_f64(&mut self, value: f64) {
+        self.number_u64(value.to_bits());
     }
 
     pub fn number_u8(&mut self, value: u8) {
@@ -843,6 +850,10 @@ impl<'a> StructReader<'a> {
 
     pub fn number_u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.read_array::<8>()?))
+    }
+
+    pub fn number_f64(&mut self) -> Result<f64> {
+        Ok(f64::from_bits(self.number_u64()?))
     }
 
     pub fn number_u8(&mut self) -> Result<u8> {

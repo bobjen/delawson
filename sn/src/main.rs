@@ -410,17 +410,17 @@ impl EnDiskStatus {
 
 #[derive(Clone)]
 struct EnDiskInfo {
-    total_bytes: u64,
-    used_bytes: u64,
+    total_bytes: f64,
+    used_bytes: f64,
     status: EnDiskStatus,
 }
 
 #[derive(Clone, Copy)]
 struct DiskUsage {
     id: SnEnDiskId,
-    cumulative_usage: u64,
-    cumulative_total_space: u64,
-    cumulative_adjusted_free_space: u64,
+    cumulative_usage: f64,
+    cumulative_total_space: f64,
+    cumulative_adjusted_free_space: f64,
 }
 
 #[derive(Default)]
@@ -436,8 +436,8 @@ struct EnInfo {
 #[derive(Clone)]
 struct EnDiskSyncRow {
     disk: DiskId,
-    total_bytes: u64,
-    used_bytes: u64,
+    total_bytes: f64,
+    used_bytes: f64,
     status: EnDiskStatus,
 }
 
@@ -1106,15 +1106,19 @@ macro_rules! sn_wire {
 
 fn write_en_disk_sync_row(w: &mut StructWriter, row: &EnDiskSyncRow) {
     w.disk_id(row.disk);
-    w.number_u64(row.total_bytes);
-    w.number_u64(row.used_bytes);
+    w.number_f64(row.total_bytes);
+    w.number_f64(row.used_bytes);
     w.number_u8(row.status as u8);
 }
 
-fn read_en_disk_sync_row(r: &mut StructReader<'_>) -> Result<EnDiskSyncRow> {
+fn read_en_disk_sync_row(r: &mut StructReader<'_>, double_fields: bool) -> Result<EnDiskSyncRow> {
     let disk = r.disk_id()?;
-    let total_bytes = r.number_u64()?;
-    let used_bytes = r.number_u64()?;
+    let total_bytes = if double_fields { r.number_f64()? } else { r.number_u64()? as f64 };
+    let used_bytes = if double_fields { r.number_f64()? } else { r.number_u64()? as f64 };
+    if !total_bytes.is_finite() || total_bytes < 0.0 || !used_bytes.is_finite() || used_bytes < 0.0
+    {
+        return Err(Error::new("EN disk sync has an invalid space value"));
+    }
     let status = EnDiskStatus::from_code(r.number_u8()?)?;
     if status == EnDiskStatus::Deleted {
         return Err(Error::new("EN cannot report an SN-deleted disk as present"));
@@ -1140,12 +1144,16 @@ fn read_en_disk_sync_response(
             }
             return Err(Error::new("EN disk sync has an empty row among disk records"));
         }
+        let row_op = match arg.op {
+            Op::EnSyncDisk | Op::EnSyncDiskDouble => arg.op,
+            _ => return Err(Error::new("invalid EN disk sync response row")),
+        };
         let (mut row, rest) =
-            structure(std::slice::from_ref(arg), Op::EnSyncDisk, "an EN disk sync response row")?;
+            structure(std::slice::from_ref(arg), row_op, "an EN disk sync response row")?;
         if !rest.is_empty() {
             return Err(Error::new("EN disk sync response row has trailing arguments"));
         }
-        let disk = read_en_disk_sync_row(&mut row)?;
+        let disk = read_en_disk_sync_row(&mut row, row_op == Op::EnSyncDiskDouble)?;
         row.done()?;
         if !seen.insert(disk.disk) {
             return Err(Error::new(format!("EN disk sync repeats disk {}", disk.disk)));
@@ -1163,7 +1171,7 @@ sn_wire!(
         w.time_sec(v.sync_time);
         w.number_u64(v.disks.len() as u64);
         for row in &v.disks {
-            w.nested(Op::EnSyncDisk, |w| write_en_disk_sync_row(w, row));
+            w.nested(Op::EnSyncDiskDouble, |w| write_en_disk_sync_row(w, row));
         }
     },
     |r: &mut StructReader<'_>| {
@@ -1177,7 +1185,14 @@ sn_wire!(
         }
         let mut disks = Vec::with_capacity(count);
         for _ in 0..count {
-            disks.push(r.nested(Op::EnSyncDisk, "EN disk sync row", read_en_disk_sync_row)?);
+            disks.push(r.nested_any(|op, r| {
+                let double_fields = match op {
+                    Op::EnSyncDisk => false,
+                    Op::EnSyncDiskDouble => true,
+                    _ => return Err(Error::new("invalid EN disk sync row")),
+                };
+                read_en_disk_sync_row(r, double_fields)
+            })?);
         }
         Ok(EnDiskSyncCmd { en, sync_time, disks })
     }
@@ -1391,18 +1406,76 @@ fn pick_disks(total_disks: usize, want: usize) -> Result<Vec<SnDiskId>> {
     Ok(picked)
 }
 
-fn random_below(upper: u64) -> u64 {
-    assert!(upper > 0);
-    let threshold = upper.wrapping_neg() % upper;
-    RNG.with(|rng| {
-        let mut rng = rng.borrow_mut();
-        loop {
-            let value = rng.next_u64();
-            if value >= threshold {
-                return value % upper;
-            }
+fn random_below(upper: f64) -> f64 {
+    assert!(upper > 0.0 && upper.is_finite());
+    RNG.with(|rng| rng.borrow_mut().next_double(upper))
+}
+
+fn pick_from_disk_usage(
+    disk_usage: &[DiskUsage],
+    available: usize,
+    disk_ids: &HashMap<SnEnDiskId, SnDiskId>,
+    want: usize,
+    retries_allowed: u32,
+    mut draw_below: impl FnMut(f64) -> f64,
+) -> Result<Vec<SnDiskId>> {
+    if available == 0 {
+        return Err(Error::new("SN has no disks with adjusted free space"));
+    }
+    if available < want {
+        return Err(Error::new(format!(
+            "SN has {available} available disks, but an extent needs {want} instances"
+        )));
+    }
+    if want == 0 {
+        return Ok(Vec::new());
+    }
+    let mut picked = Vec::with_capacity(want.min(available));
+
+    // If every usable disk is needed, use each exactly once instead of
+    // doing weighted draws that would have to reject duplicates.
+    if available == want {
+        for row in disk_usage {
+            picked.push(
+                *disk_ids
+                    .get(&row.id)
+                    .ok_or_else(|| Error::new("SN disk usage names an unknown disk"))?,
+            );
         }
-    })
+        if picked.len() != want {
+            return Err(Error::new("SN disk usage table size does not match available disks"));
+        }
+        return Ok(picked);
+    }
+
+    let total = disk_usage.last().map_or(0.0, |row| row.cumulative_adjusted_free_space);
+    if total <= 0.0 || !total.is_finite() {
+        return Err(Error::new("SN has no adjusted free space"));
+    }
+    while picked.len() < want {
+        let mut retries = 0;
+        loop {
+            let byte = draw_below(total);
+            let at = disk_usage.partition_point(|row| row.cumulative_adjusted_free_space <= byte);
+            let row = disk_usage
+                .get(at)
+                .ok_or_else(|| Error::new("SN disk usage cumulative total is invalid"))?;
+            let disk = *disk_ids
+                .get(&row.id)
+                .ok_or_else(|| Error::new("SN disk usage names an unknown disk"))?;
+            if !picked.contains(&disk) {
+                picked.push(disk);
+                break;
+            }
+            if retries >= retries_allowed {
+                return Err(Error::new(format!(
+                    "SN could not choose a distinct disk after {retries_allowed} retries"
+                )));
+            }
+            retries += 1;
+        }
+    }
+    Ok(picked)
 }
 
 struct SNState {
@@ -1751,8 +1824,8 @@ fn apply_en_disk_sync(
     for (disk, has_instances) in removed {
         if has_instances {
             let info = en.disks.entry(disk).or_insert(EnDiskInfo {
-                total_bytes: 0,
-                used_bytes: 0,
+                total_bytes: 0.0,
+                used_bytes: 0.0,
                 status: EnDiskStatus::Deleted,
             });
             info.status = EnDiskStatus::Deleted;
@@ -1780,53 +1853,41 @@ fn rebuild_disk_usage(
         .ens
         .iter()
         .flat_map(|(&en_id, en)| {
-            en.disks.iter().map(move |(&disk_id, disk)| {
-                (SnEnDiskId::new(en_id, disk_id), disk.used_bytes, disk.total_bytes, disk.status)
+            en.disks.iter().filter_map(move |(&disk_id, disk)| {
+                (disk.status == EnDiskStatus::Ready).then_some((
+                    SnEnDiskId::new(en_id, disk_id),
+                    disk.used_bytes,
+                    disk.total_bytes,
+                ))
             })
         })
         .collect();
-    disks.sort_unstable_by_key(|(id, _, _, _)| *id);
+    disks.sort_unstable_by_key(|(id, _, _)| *id);
 
     let fraction_free_sum: f64 = disks
         .iter()
-        .map(|(_, usage, total_space, _)| {
-            if *total_space == 0 {
-                0.0
-            } else {
-                total_space.saturating_sub(*usage) as f64 / *total_space as f64
-            }
+        .map(|(_, usage, total_space)| {
+            if *total_space == 0.0 { 0.0 } else { (*total_space - *usage).max(0.0) / *total_space }
         })
         .sum();
     let average_fraction_free =
         if disks.is_empty() { 0.0 } else { fraction_free_sum / disks.len() as f64 };
 
-    let mut cumulative_usage = 0u64;
-    let mut cumulative_total_space = 0u64;
-    let mut cumulative_adjusted_free_space = 0u64;
+    let mut cumulative_usage = 0.0;
+    let mut cumulative_total_space = 0.0;
+    let mut cumulative_adjusted_free_space = 0.0;
     let mut available_disks = 0usize;
     let mut table = Vec::with_capacity(disks.len());
-    for (id, usage, total_space, status) in disks {
-        let actual_free = total_space.saturating_sub(usage);
-        let average_free = average_fraction_free * total_space as f64;
+    for (id, usage, total_space) in disks {
+        let actual_free = (total_space - usage).max(0.0);
+        let average_free = average_fraction_free * total_space;
         let capped_free = capped_free_space * average_free;
-        let adjusted_free = if status == EnDiskStatus::Ready {
-            ((actual_free as f64).min(capped_free) - subtract_fraction_average_free * average_free)
-                .max(0.0) as u64
-        } else {
-            0
-        };
-        if adjusted_free > 0 {
-            available_disks += 1;
-        }
-        cumulative_usage = cumulative_usage
-            .checked_add(usage)
-            .ok_or_else(|| Error::new("SN cumulative disk usage overflow"))?;
-        cumulative_total_space = cumulative_total_space
-            .checked_add(total_space)
-            .ok_or_else(|| Error::new("SN cumulative disk space overflow"))?;
-        cumulative_adjusted_free_space = cumulative_adjusted_free_space
-            .checked_add(adjusted_free)
-            .ok_or_else(|| Error::new("SN cumulative adjusted free space overflow"))?;
+        let adjusted_free =
+            (actual_free.min(capped_free) - subtract_fraction_average_free * average_free).max(1.0);
+        available_disks += 1;
+        cumulative_usage += usage;
+        cumulative_total_space += total_space;
+        cumulative_adjusted_free_space += adjusted_free;
         table.push(DiskUsage {
             id,
             cumulative_usage,
@@ -1837,9 +1898,14 @@ fn rebuild_disk_usage(
     state.disk_usage = table;
     state.disk_usage_available_disks = available_disks;
     state.disk_usage_built_at = Some(now);
-    let (used, total_space, adjusted_free) = state.disk_usage.last().map_or((0, 0, 0), |last| {
-        (last.cumulative_usage, last.cumulative_total_space, last.cumulative_adjusted_free_space)
-    });
+    let (used, total_space, adjusted_free) =
+        state.disk_usage.last().map_or((0.0, 0.0, 0.0), |last| {
+            (
+                last.cumulative_usage,
+                last.cumulative_total_space,
+                last.cumulative_adjusted_free_space,
+            )
+        });
     common::logn!(
         "SN disk usage table built",
         "available disks {}, used {}, total space {}, adjusted free space {}",
@@ -2849,55 +2915,17 @@ impl SN {
     }
 
     fn pick_available_disks(&self, want: usize) -> Result<Vec<SnDiskId>> {
-        if want == 0 {
-            return Ok(Vec::new());
-        }
         let state = self.global_lock.read();
-        let available = state.disk_usage_available_disks;
-        if available == 0 {
-            return Err(Error::new("SN has no disks with adjusted free space"));
-        }
         let disk_ids =
             self.disk_ids.lock().map_err(|_| Error::new("SN disk index lock poisoned"))?;
-        let mut picked = Vec::with_capacity(want.min(available));
-
-        // If every usable disk is needed, use each exactly once instead of
-        // doing weighted draws that would have to reject duplicates.
-        if available <= want {
-            let mut previous = 0;
-            for row in &state.disk_usage {
-                if row.cumulative_adjusted_free_space > previous {
-                    picked.push(
-                        *disk_ids
-                            .get(&row.id)
-                            .ok_or_else(|| Error::new("SN disk usage names an unknown disk"))?,
-                    );
-                }
-                previous = row.cumulative_adjusted_free_space;
-            }
-            return Ok(picked);
-        }
-
-        let total = state.disk_usage.last().map_or(0, |row| row.cumulative_adjusted_free_space);
-        if total == 0 {
-            return Err(Error::new("SN has no adjusted free space"));
-        }
-        while picked.len() < want {
-            let byte = random_below(total);
-            let at =
-                state.disk_usage.partition_point(|row| row.cumulative_adjusted_free_space <= byte);
-            let row = state
-                .disk_usage
-                .get(at)
-                .ok_or_else(|| Error::new("SN disk usage cumulative total is invalid"))?;
-            let disk = *disk_ids
-                .get(&row.id)
-                .ok_or_else(|| Error::new("SN disk usage names an unknown disk"))?;
-            if !picked.contains(&disk) {
-                picked.push(disk);
-            }
-        }
-        Ok(picked)
+        pick_from_disk_usage(
+            &state.disk_usage,
+            state.disk_usage_available_disks,
+            &disk_ids,
+            want,
+            self.config.placement_retries,
+            random_below,
+        )
     }
 
     fn delete_stream_async(self: &Arc<Self>, process: &Arc<Process>, request: &Req, done: Respond) {
@@ -3462,18 +3490,26 @@ impl SN {
         let test_disks = disks.clone();
         let mut sn =
             Self::with_runtime(config, per_stream, mine, disks, directory.path(), settings)?;
+        let capped_free_space = sn.config.capped_free_space;
+        let subtract_fraction_average_free = sn.config.subtract_fraction_average_free;
         {
             let mut state = sn.global_lock.write();
             for &(en, disk) in &test_disks {
                 state.ens.entry(en).or_default().disks.insert(
                     disk,
                     EnDiskInfo {
-                        total_bytes: u64::MAX,
-                        used_bytes: 0,
+                        total_bytes: 1_000_000_000.0,
+                        used_bytes: 0.0,
                         status: EnDiskStatus::Ready,
                     },
                 );
             }
+            rebuild_disk_usage(
+                &mut state,
+                TimeSec::now(),
+                capped_free_space,
+                subtract_fraction_average_free,
+            )?;
         }
         sn._test_dir = Some(directory);
         Ok(sn)
@@ -5623,6 +5659,26 @@ mod tests {
         assert_eq!(initial.state.streams, 0);
         assert_eq!(initial.state.extents, 0);
         assert_eq!(initial.disks, disks);
+        {
+            let mut state = sn.global_lock.write();
+            for &(en, disk) in &disks {
+                state.ens.entry(en).or_default().disks.insert(
+                    disk,
+                    EnDiskInfo {
+                        total_bytes: 1_000_000_000.0,
+                        used_bytes: 0.0,
+                        status: EnDiskStatus::Ready,
+                    },
+                );
+            }
+            rebuild_disk_usage(
+                &mut state,
+                TimeSec::new(123),
+                config.capped_free_space,
+                config.subtract_fraction_average_free,
+            )
+            .unwrap();
+        }
         sn.common.options.snapshot_min_log_bytes = u64::MAX;
         sn.common.options.snapshot_interval_secs = u64::MAX;
         let sn = Arc::new(sn);
@@ -5856,7 +5912,9 @@ mod tests {
             records: ERoff::ZERO,
             logical: ELoff::ZERO,
             compressed: ECoff::ZERO,
-            disks: vec![SnDiskId::new(0); testing::extents().instances],
+            disks: (0..testing::extents().instances)
+                .map(|index| SnDiskId::new(index as u32))
+                .collect(),
         };
         let extent = sn.extent_ref(extent).unwrap();
         let action = sn_action(Op::SnOpen, &OpenCmd { name, extent }).unwrap();
@@ -6337,5 +6395,229 @@ mod tests {
         }
         assert!(disks.len() >= testing::extents().instances);
         assert!(pick_disks(disks.len(), testing::extents().instances).is_ok());
+    }
+
+    fn disk_usage_state(disks: &[(u64, u16, u64, u64, EnDiskStatus)]) -> SNState {
+        let mut state = SNState::new(1).unwrap();
+        for &(en, disk, total_bytes, used_bytes, status) in disks {
+            state.ens.entry(EnId::new(en)).or_default().disks.insert(
+                DiskId::new(disk),
+                EnDiskInfo {
+                    total_bytes: total_bytes as f64,
+                    used_bytes: used_bytes as f64,
+                    status,
+                },
+            );
+        }
+        rebuild_disk_usage(&mut state, TimeSec::new(123), 1.0, 0.05).unwrap();
+        state
+    }
+
+    fn disk_usage_indexes(state: &SNState) -> HashMap<SnEnDiskId, SnDiskId> {
+        state
+            .disk_usage
+            .iter()
+            .enumerate()
+            .map(|(at, row)| (row.id, SnDiskId::new(at as u32)))
+            .collect()
+    }
+
+    #[test]
+    fn disk_usage_table_omits_unavailable_disks_and_weights_ready_capacity() {
+        let state = disk_usage_state(&[
+            (0, 0, 100, 50, EnDiskStatus::Ready),
+            (0, 1, 200, 100, EnDiskStatus::Ready),
+            (1, 0, 100_000, 0, EnDiskStatus::Unavailable),
+            (1, 1, 200_000, 0, EnDiskStatus::Deleted),
+        ]);
+
+        assert_eq!(state.disk_usage.len(), 2);
+        assert_eq!(state.disk_usage_available_disks, 2);
+        assert_eq!(state.disk_usage[0].id, SnEnDiskId::new(EnId::new(0), DiskId::new(0)));
+        assert_eq!(state.disk_usage[0].cumulative_usage, 50.0);
+        assert_eq!(state.disk_usage[0].cumulative_total_space, 100.0);
+        assert_eq!(state.disk_usage[0].cumulative_adjusted_free_space, 47.5);
+        assert_eq!(state.disk_usage[1].id, SnEnDiskId::new(EnId::new(0), DiskId::new(1)));
+        assert_eq!(state.disk_usage[1].cumulative_usage, 150.0);
+        assert_eq!(state.disk_usage[1].cumulative_total_space, 300.0);
+        assert_eq!(state.disk_usage[1].cumulative_adjusted_free_space, 142.5);
+
+        let indexes = disk_usage_indexes(&state);
+        let first = pick_from_disk_usage(
+            &state.disk_usage,
+            state.disk_usage_available_disks,
+            &indexes,
+            1,
+            10,
+            |total| {
+                assert_eq!(total, 142.5);
+                0.0
+            },
+        )
+        .unwrap();
+        let second = pick_from_disk_usage(
+            &state.disk_usage,
+            state.disk_usage_available_disks,
+            &indexes,
+            1,
+            10,
+            |total| {
+                assert_eq!(total, 142.5);
+                47.5
+            },
+        )
+        .unwrap();
+        assert_eq!(first, [SnDiskId::new(0)]);
+        assert_eq!(second, [SnDiskId::new(1)]);
+    }
+
+    #[test]
+    fn cumulative_disk_capacity_can_exceed_u64() {
+        let state = disk_usage_state(&[
+            (0, 0, u64::MAX, 0, EnDiskStatus::Ready),
+            (0, 1, u64::MAX, 0, EnDiskStatus::Ready),
+        ]);
+        let last = state.disk_usage.last().unwrap();
+        assert!(last.cumulative_total_space > u64::MAX as f64);
+        assert!(last.cumulative_adjusted_free_space > u64::MAX as f64);
+
+        let indexes = disk_usage_indexes(&state);
+        let picked = pick_from_disk_usage(
+            &state.disk_usage,
+            state.disk_usage_available_disks,
+            &indexes,
+            1,
+            10,
+            |total| {
+                assert!(total > u64::MAX as f64);
+                0.0
+            },
+        )
+        .unwrap();
+        assert_eq!(picked, [SnDiskId::new(0)]);
+    }
+
+    #[test]
+    fn zero_reported_free_space_gives_ready_disks_equal_minimum_weight() {
+        let state = disk_usage_state(&[
+            (0, 0, 100, 100, EnDiskStatus::Ready),
+            (0, 1, 200, 200, EnDiskStatus::Ready),
+        ]);
+        assert_eq!(state.disk_usage.len(), 2);
+        assert_eq!(state.disk_usage[0].cumulative_adjusted_free_space, 1.0);
+        assert_eq!(state.disk_usage[1].cumulative_adjusted_free_space, 2.0);
+
+        let indexes = disk_usage_indexes(&state);
+        for (byte, expected) in [(0.0, SnDiskId::new(0)), (1.0, SnDiskId::new(1))] {
+            let picked = pick_from_disk_usage(
+                &state.disk_usage,
+                state.disk_usage_available_disks,
+                &indexes,
+                1,
+                10,
+                |total| {
+                    assert_eq!(total, 2.0);
+                    byte
+                },
+            )
+            .unwrap();
+            assert_eq!(picked, [expected]);
+        }
+
+        let all = pick_from_disk_usage(
+            &state.disk_usage,
+            state.disk_usage_available_disks,
+            &indexes,
+            2,
+            10,
+            |_| panic!("all available disks should be selected directly"),
+        )
+        .unwrap();
+        assert_eq!(all, [SnDiskId::new(0), SnDiskId::new(1)]);
+    }
+
+    #[test]
+    fn placement_uses_the_current_threads_seeded_rng() {
+        let state = disk_usage_state(&[
+            (0, 0, 100, 50, EnDiskStatus::Ready),
+            (0, 1, 200, 100, EnDiskStatus::Ready),
+            (0, 2, 300, 150, EnDiskStatus::Ready),
+        ]);
+        let indexes = disk_usage_indexes(&state);
+        let select = || {
+            pick_from_disk_usage(
+                &state.disk_usage,
+                state.disk_usage_available_disks,
+                &indexes,
+                2,
+                10,
+                random_below,
+            )
+            .unwrap()
+        };
+
+        RNG.with(|rng| *rng.borrow_mut() = random::Rng::from_seed(0x5eed));
+        let first = select();
+        RNG.with(|rng| *rng.borrow_mut() = random::Rng::from_seed(0x5eed));
+        let second = select();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn placement_rejects_zero_or_insufficient_ready_disks_before_drawing() {
+        let one_ready = disk_usage_state(&[
+            (0, 0, 100, 0, EnDiskStatus::Ready),
+            (0, 1, 100, 0, EnDiskStatus::Unavailable),
+        ]);
+        let indexes = disk_usage_indexes(&one_ready);
+        assert!(
+            pick_from_disk_usage(
+                &one_ready.disk_usage,
+                one_ready.disk_usage_available_disks,
+                &indexes,
+                2,
+                10,
+                |_| panic!("insufficient disks must fail before drawing"),
+            )
+            .is_err()
+        );
+
+        let none_ready = disk_usage_state(&[(0, 0, 100, 0, EnDiskStatus::Deleted)]);
+        let indexes = disk_usage_indexes(&none_ready);
+        assert!(
+            pick_from_disk_usage(
+                &none_ready.disk_usage,
+                none_ready.disk_usage_available_disks,
+                &indexes,
+                1,
+                10,
+                |_| panic!("no available disks must fail before drawing"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn placement_stops_after_the_configured_duplicate_retries() {
+        let state = disk_usage_state(&[
+            (0, 0, 100, 0, EnDiskStatus::Ready),
+            (0, 1, 100, 0, EnDiskStatus::Ready),
+            (0, 2, 100, 0, EnDiskStatus::Ready),
+        ]);
+        let indexes = disk_usage_indexes(&state);
+        let mut draws = 0;
+        let result = pick_from_disk_usage(
+            &state.disk_usage,
+            state.disk_usage_available_disks,
+            &indexes,
+            2,
+            2,
+            |_| {
+                draws += 1;
+                0.0
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(draws, 4, "one initial draw and three draws for the second instance");
     }
 }

@@ -896,6 +896,9 @@ pub struct SNConfig {
     /// applying the cap. This keeps heavily used disks from being filled first.
     #[serde(default = "default_subtract_fraction_average_free")]
     pub subtract_fraction_average_free: f64,
+    /// Maximum duplicate-disk draws to retry while placing one extent's instances.
+    #[serde(default = "default_placement_retries")]
+    pub placement_retries: u32,
 }
 
 fn default_sync_loop_interval_sec() -> u64 {
@@ -915,7 +918,11 @@ fn default_capped_free_space() -> f64 {
 }
 
 fn default_subtract_fraction_average_free() -> f64 {
-    0.1
+    0.05
+}
+
+fn default_placement_retries() -> u32 {
+    10
 }
 
 impl SNConfig {

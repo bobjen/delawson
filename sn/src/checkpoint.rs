@@ -114,11 +114,42 @@ raft::wire_struct!(EnRow, SnCkEn, {id,disks});
 
 struct EnDiskRow {
     id: u64,
-    total_bytes: u64,
-    used_bytes: u64,
+    total_bytes: f64,
+    used_bytes: f64,
     status: u8,
 }
-raft::wire_struct!(EnDiskRow, SnCkEnDisk, {id,total_bytes,used_bytes,status});
+impl codec::Wire for EnDiskRow {
+    fn write(&self, writer: &mut common::StructWriter) {
+        writer.nested(Op::SnCkEnDiskDouble, |writer| {
+            writer.number_u64(self.id);
+            writer.number_f64(self.total_bytes);
+            writer.number_f64(self.used_bytes);
+            writer.number_u8(self.status);
+        });
+    }
+
+    fn read(reader: &mut common::StructReader<'_>) -> Result<Self> {
+        reader.nested_any(|op, reader| {
+            let id = reader.number_u64()?;
+            let (total_bytes, used_bytes) = match op {
+                // Keep accepting checkpoints written before disk-space values
+                // moved to doubles.
+                Op::SnCkEnDisk => (reader.number_u64()? as f64, reader.number_u64()? as f64),
+                Op::SnCkEnDiskDouble => (reader.number_f64()?, reader.number_f64()?),
+                _ => return Err(Error::new("invalid SN checkpoint EN disk row")),
+            };
+            let status = reader.number_u8()?;
+            if !total_bytes.is_finite()
+                || total_bytes < 0.0
+                || !used_bytes.is_finite()
+                || used_bytes < 0.0
+            {
+                return Err(Error::new("invalid SN checkpoint EN disk space value"));
+            }
+            Ok(Self { id, total_bytes, used_bytes, status })
+        })
+    }
+}
 
 struct DiskUsageEnRow {
     en: u64,
@@ -128,11 +159,57 @@ raft::wire_struct!(DiskUsageEnRow, SnCkDiskUsageEn, {en,disks});
 
 struct DiskUsageDiskRow {
     disk: u64,
-    cumulative_usage: u64,
-    cumulative_total_space: u64,
-    cumulative_adjusted_free_space: u64,
+    cumulative_usage: f64,
+    cumulative_total_space: f64,
+    cumulative_adjusted_free_space: f64,
 }
-raft::wire_struct!(DiskUsageDiskRow, SnCkDiskUsageDisk, {disk,cumulative_usage,cumulative_total_space,cumulative_adjusted_free_space});
+impl codec::Wire for DiskUsageDiskRow {
+    fn write(&self, writer: &mut common::StructWriter) {
+        writer.nested(Op::SnCkDiskUsageDiskDouble, |writer| {
+            writer.number_u64(self.disk);
+            writer.number_u64(self.cumulative_usage.to_bits());
+            writer.number_u64(self.cumulative_total_space.to_bits());
+            writer.number_u64(self.cumulative_adjusted_free_space.to_bits());
+        });
+    }
+
+    fn read(reader: &mut common::StructReader<'_>) -> Result<Self> {
+        reader.nested_any(|op, reader| {
+            let disk = reader.number_u64()?;
+            let (cumulative_usage, cumulative_total_space, cumulative_adjusted_free_space) =
+                match op {
+                    // Retain the previous integer representation while existing
+                    // checkpoints written with it are still in use.
+                    Op::SnCkDiskUsageDisk => (
+                        reader.number_u64()? as f64,
+                        reader.number_u64()? as f64,
+                        reader.number_u64()? as f64,
+                    ),
+                    Op::SnCkDiskUsageDiskDouble => (
+                        f64::from_bits(reader.number_u64()?),
+                        f64::from_bits(reader.number_u64()?),
+                        f64::from_bits(reader.number_u64()?),
+                    ),
+                    _ => return Err(Error::new("invalid SN checkpoint disk usage row")),
+                };
+            if !cumulative_usage.is_finite()
+                || cumulative_usage < 0.0
+                || !cumulative_total_space.is_finite()
+                || cumulative_total_space < 0.0
+                || !cumulative_adjusted_free_space.is_finite()
+                || cumulative_adjusted_free_space < 0.0
+            {
+                return Err(Error::new("invalid SN checkpoint disk usage value"));
+            }
+            Ok(Self {
+                disk,
+                cumulative_usage,
+                cumulative_total_space,
+                cumulative_adjusted_free_space,
+            })
+        })
+    }
+}
 
 struct EnStateRow {
     id: u64,
@@ -1163,9 +1240,12 @@ fn read_disk_usage(
     let known_disks: HashSet<_> = disk_roster.iter().copied().collect();
     let mut previous_en = None;
     let mut previous_id = None;
-    let mut cumulative_usage = 0;
-    let mut cumulative_total_space = 0;
-    let mut cumulative_adjusted_free_space = 0;
+    let mut stored_cumulative_usage = 0.0;
+    let mut stored_cumulative_total_space = 0.0;
+    let mut stored_cumulative_adjusted_free_space = 0.0;
+    let mut cumulative_usage = 0.0;
+    let mut cumulative_total_space = 0.0;
+    let mut cumulative_adjusted_free_space = 0.0;
     let mut available_disks = 0;
     for _ in 0..section.count {
         let row: DiskUsageEnRow = read_piece(file, &mut section.left)?;
@@ -1182,25 +1262,45 @@ fn read_disk_usage(
             {
                 return Err(Error::new("invalid SN checkpoint disk usage disk ordering"));
             }
-            if disk_row.cumulative_usage < cumulative_usage
-                || disk_row.cumulative_total_space < cumulative_total_space
-                || disk_row.cumulative_adjusted_free_space < cumulative_adjusted_free_space
+            if disk_row.cumulative_usage < stored_cumulative_usage
+                || disk_row.cumulative_total_space < stored_cumulative_total_space
+                || disk_row.cumulative_adjusted_free_space < stored_cumulative_adjusted_free_space
             {
                 return Err(Error::new("SN checkpoint disk usage cumulatives decrease"));
             }
-            if disk_row.cumulative_adjusted_free_space > cumulative_adjusted_free_space {
+
+            // Older checkpoint tables may include unavailable disks. Filter
+            // them using the restored EN state and rebuild cumulatives over
+            // the remaining disks only.
+            let usage = disk_row.cumulative_usage - stored_cumulative_usage;
+            let total_space = disk_row.cumulative_total_space - stored_cumulative_total_space;
+            let adjusted_free =
+                disk_row.cumulative_adjusted_free_space - stored_cumulative_adjusted_free_space;
+            stored_cumulative_usage = disk_row.cumulative_usage;
+            stored_cumulative_total_space = disk_row.cumulative_total_space;
+            stored_cumulative_adjusted_free_space = disk_row.cumulative_adjusted_free_space;
+
+            let ready = state
+                .ens
+                .get(&en)
+                .and_then(|en| en.disks.get(&disk))
+                .is_some_and(|disk| disk.status == EnDiskStatus::Ready);
+            if ready {
+                // A ready disk keeps a one-byte minimum weight, even when the
+                // checkpoint predates that minimum or reports no free space.
+                let adjusted_free = adjusted_free.max(1.0);
                 available_disks += 1;
+                cumulative_usage += usage;
+                cumulative_total_space += total_space;
+                cumulative_adjusted_free_space += adjusted_free;
+                state.disk_usage.push(DiskUsage {
+                    id,
+                    cumulative_usage,
+                    cumulative_total_space,
+                    cumulative_adjusted_free_space,
+                });
             }
-            cumulative_usage = disk_row.cumulative_usage;
-            cumulative_total_space = disk_row.cumulative_total_space;
-            cumulative_adjusted_free_space = disk_row.cumulative_adjusted_free_space;
             previous_id = Some(id);
-            state.disk_usage.push(DiskUsage {
-                id,
-                cumulative_usage,
-                cumulative_total_space,
-                cumulative_adjusted_free_space,
-            });
         }
     }
     if section.left != 0 {

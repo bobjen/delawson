@@ -187,7 +187,8 @@ pub fn sn_config() -> SNConfig {
         en_disk_sync_interval_sec: 30,
         en_extent_sync_interval_sec: 120,
         capped_free_space: 1.0,
-        subtract_fraction_average_free: 0.1,
+        subtract_fraction_average_free: 0.05,
+        placement_retries: 10,
     }
 }
 

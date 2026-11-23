@@ -3117,10 +3117,10 @@ impl EN {
             };
             let mut row = StructWriter::new();
             row.disk_id(id);
-            row.number_u64(disk.space.capacity_bytes());
-            row.number_u64(disk.space.used_bytes());
+            row.number_f64(disk.space.capacity_bytes() as f64);
+            row.number_f64(disk.space.used_bytes() as f64);
             row.number_u8(status);
-            rows.push(row.finish(Op::EnSyncDisk));
+            rows.push(row.finish(Op::EnSyncDiskDouble));
         }
         for configured in &process.config.disks {
             let id = DiskId::new(configured.id);

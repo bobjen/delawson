@@ -41,6 +41,16 @@ impl Rng {
         self.next_u64() as u32
     }
 
+    /// Return a uniform value in `[0, limit)` using 32 bits of random precision.
+    pub fn next_double(&mut self, limit: f64) -> f64 {
+        assert!(limit.is_finite() && limit >= 0.0, "limit must be finite and nonnegative");
+        if limit == 0.0 {
+            return 0.0;
+        }
+        let value = self.next_u32() as f64 * (limit / 4_294_967_296.0);
+        if value >= limit { f64::from_bits(limit.to_bits() - 1) } else { value }
+    }
+
     pub fn fill_bytes(&mut self, buf: &mut [u8]) {
         let mut chunks = buf.chunks_exact_mut(8);
         for chunk in &mut chunks {
@@ -120,6 +130,18 @@ mod tests {
         let mut b = Rng::from_seed(42);
         assert_eq!(a.next_u64(), b.next_u64());
         assert_ne!(a.next_u64(), Rng::from_seed(43).next_u64());
+    }
+
+    #[test]
+    fn next_double_scales_a_random_u32_by_the_limit() {
+        let mut rng = Rng::from_seed(42);
+        let mut reference = Rng::from_seed(42);
+        for limit in [1.0, 17.5, 123_456.75] {
+            let expected = reference.next_u32() as f64 * (limit / 4_294_967_296.0);
+            let value = rng.next_double(limit);
+            assert_eq!(value, expected);
+            assert!((0.0..limit).contains(&value));
+        }
     }
 
     #[test]
