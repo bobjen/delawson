@@ -7696,6 +7696,16 @@ Raft state has, for the same reason:
 **A new snapshot is written when the log gets big.** Nothing more elaborate: the log bounds
 recovery time, and rewriting the snapshot is what shortens it again.
 
+**Disk inventory is EN-wide state, separate from these per-disk extent journals.** Each
+`process.toml` lists the host's disk IDs, device identities, mount paths, and capacities. An
+EN-wide roster journal and checkpoint records the disks the EN has admitted. On startup, an
+existing roster disk must still be configured with the same identity and path; removing or
+remapping one fails closed. A newly configured disk is durably recorded before EN uses it,
+and a capacity change is journaled before startup completes. Staging and final-extent usage
+is reconstructed from the data files, rather than persisted as inventory state. Until SN/EN
+disk synchronization exists, IDs 0 through 4 remain required because SN placement assumes
+five disks per EN.
+
 #### 8.1.5.1 Only coalesced extents are self-describing
 
 This is the part that decides how much the journal matters. **A coalesced extent should be

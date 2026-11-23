@@ -216,6 +216,12 @@ pub fn process() -> Arc<Process> {
             cluster_config: "cluster.toml".into(),
             service_config: "en.toml".into(),
             data_dir: "data".into(),
+            disks: vec![crate::config::ProcessDiskConfig {
+                id: 0,
+                device_identity: "test-en0-disk0".to_owned(),
+                path: "data/disk-0".into(),
+                capacity_bytes: 1024 * 1024 * 1024,
+            }],
         },
         cluster: cluster(),
         entry: entry("EN0", ServiceKind::En, Some("hdd")),

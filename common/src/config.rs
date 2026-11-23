@@ -4,7 +4,7 @@
 //! |---|---|---|---|
 //! | cluster | cluster | yes | everything every process must agree on |
 //! | service | machine type | yes | knobs one machine type owns |
-//! | process | process | no, written by `start-laws` | identity, and where the other two are |
+//! | process | process | no, written by `start-laws` | identity, shared paths, and EN disks |
 //!
 //! A process is told who it is, which port to listen on, and where to look;
 //! everything else comes from files that are identical fleet-wide.
@@ -950,10 +950,8 @@ macro_rules! loaders {
 
 loaders!(DNConfig, SNConfig, ENConfig, FEConfig);
 
-/// Written into each run directory by `start-laws`. Its whole job is to say who
-/// this process is and where the shared files are; identity comes from here
-/// rather than argv, so a process's identity is one file a harness or a
-/// deployment system writes.
+/// Written into each run directory by `start-laws`. It says who this process is,
+/// where the shared files are, and (for an EN) which local disks it owns.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
@@ -972,6 +970,20 @@ pub struct ProcessConfig {
     pub service_config: PathBuf,
     /// Persistent state. KS, DN, SN and EN have state; FE and the client do not.
     pub data_dir: PathBuf,
+    /// This process's local EN disk inventory. Other service kinds leave it empty.
+    #[serde(default)]
+    pub disks: Vec<ProcessDiskConfig>,
+}
+
+/// One physical or development EN disk. IDs and device identities are stable
+/// across restarts; paths locate the storage on this host.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessDiskConfig {
+    pub id: u16,
+    pub device_identity: String,
+    pub path: PathBuf,
+    pub capacity_bytes: u64,
 }
 
 impl ProcessConfig {
@@ -982,6 +994,9 @@ impl ProcessConfig {
         config.service_config = resolve(base, &config.service_config);
         config.data_dir = resolve(base, &config.data_dir);
         config.machine_identity = config.machine_identity.map(|p| resolve(base, &p));
+        for disk in &mut config.disks {
+            disk.path = resolve(base, &disk.path);
+        }
         Ok(config)
     }
 }

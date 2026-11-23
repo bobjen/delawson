@@ -22,6 +22,7 @@
 
 mod checkpoint;
 mod journal;
+mod roster;
 
 use common::block::Holds;
 use common::config::ENConfig;
@@ -40,6 +41,7 @@ use common::{
 };
 use common::{Error, Result, logw};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -1936,13 +1938,14 @@ struct Disk {
     bytes: AtomicU64,
     sealed: AtomicU64,
     checksummed: AtomicU64,
+    space: Arc<journal::DiskSpace>,
     daily_cache: Arc<DailyKeyCache>,
     extent_cache: Arc<ExtentKeyCache>,
     pending_fixed: Mutex<HashMap<(SnId, ExtentId, ELoff, Option<ERoff>), QueuedAppend>>,
 }
 
 impl Disk {
-    fn new(daily_cache: Arc<DailyKeyCache>) -> Disk {
+    fn new(daily_cache: Arc<DailyKeyCache>, disk_capacity_bytes: u64) -> Disk {
         Disk {
             held: Mutex::new(Extents::new()),
             storage: RwLock::new(None),
@@ -1951,6 +1954,7 @@ impl Disk {
             bytes: AtomicU64::new(0),
             sealed: AtomicU64::new(0),
             checksummed: AtomicU64::new(0),
+            space: journal::DiskSpace::new(disk_capacity_bytes),
             daily_cache,
             extent_cache: Arc::new(ExtentKeyCache::new()),
             pending_fixed: Mutex::new(HashMap::new()),
@@ -1961,19 +1965,20 @@ impl Disk {
         self: &Arc<Self>,
         process: &Arc<Process>,
         disk: DiskId,
+        directory: &Path,
         max_journal_bytes: u64,
         checkpoint_count: usize,
     ) -> Result<()> {
         let en = EnId::new(process.entry.number());
-        let directory = process.config.data_dir.join(format!("disk-{disk}"));
         let key_process = Arc::clone(process);
         let daily_cache = Arc::clone(&self.daily_cache);
         let key_lookup: journal::KeyLookup =
             Arc::new(move |ts| daily_cache.get_en(&key_process, en, ts));
         let (storage, checkpoint, records) = journal::DiskFiles::open(
-            &directory,
+            directory,
             en,
             disk,
+            Arc::clone(&self.space),
             key_lookup,
             max_journal_bytes,
             checkpoint_count,
@@ -2846,6 +2851,10 @@ impl Disk {
             format!("appended_bytes {}", self.bytes.load(Ordering::Relaxed)),
             format!("sealed_extents {}", self.sealed.load(Ordering::Relaxed)),
             format!("blocks_with_a_crc {}", self.checksummed.load(Ordering::Relaxed)),
+            format!("capacity_bytes {}", self.space.capacity_bytes()),
+            format!("staging_bytes {}", self.space.staging_bytes()),
+            format!("final_extent_bytes {}", self.space.final_extent_bytes()),
+            format!("available_bytes {}", self.space.available_bytes()),
             format!("media_class {}", config.media_class),
         ]
     }
@@ -2853,7 +2862,7 @@ impl Disk {
 
 struct EN {
     config: ENConfig,
-    disks: Vec<Arc<Disk>>,
+    disks: RwLock<BTreeMap<DiskId, Arc<Disk>>>,
     _daily_cache: Arc<DailyKeyCache>,
     accepting: AtomicBool,
     startup_stop: AtomicBool,
@@ -2865,9 +2874,16 @@ struct EN {
 impl EN {
     fn new(config: ENConfig) -> EN {
         let daily_cache = Arc::new(DailyKeyCache::new());
+        let disks = BTreeMap::new();
+        #[cfg(test)]
+        let disks = (0..5)
+            .map(|id| {
+                (DiskId::new(id), Arc::new(Disk::new(Arc::clone(&daily_cache), 1024 * 1024 * 1024)))
+            })
+            .collect();
         EN {
             config,
-            disks: (0..5).map(|_| Arc::new(Disk::new(Arc::clone(&daily_cache)))).collect(),
+            disks: RwLock::new(disks),
             _daily_cache: daily_cache,
             accepting: AtomicBool::new(false),
             startup_stop: AtomicBool::new(false),
@@ -2879,13 +2895,23 @@ impl EN {
 
     fn disk(&self, id: DiskId) -> Result<Arc<Disk>> {
         self.disks
-            .get(id.get() as usize)
+            .read()
+            .expect("EN disks")
+            .get(&id)
             .cloned()
             .ok_or_else(|| Error::new(format!("no disk {id} here")))
     }
 
     fn initialize(&self, process: &Arc<Process>) -> Result<()> {
         self.config.validate()?;
+        let mut configured_ids =
+            process.config.disks.iter().map(|disk| disk.id).collect::<Vec<_>>();
+        configured_ids.sort_unstable();
+        if !(0..5).all(|id| configured_ids.binary_search(&id).is_ok()) {
+            return Err(Error::new(
+                "until SN/EN disk synchronization is implemented, process.toml must include EN disks 0 through 4",
+            ));
+        }
         let en_id = EnId::new(process.entry.number());
         loop {
             if self.startup_stop.load(Ordering::Acquire) {
@@ -2903,21 +2929,39 @@ impl EN {
             }
         }
 
+        *self.startup_status.lock().expect("startup status") = "checking disk roster".to_owned();
+        let roster_dir = process.config.data_dir.join("en-roster");
+        let mut roster = roster::DiskRoster::open(&roster_dir)?;
+        roster.reconcile(&process.config.disks)?;
+
+        let mut disks = BTreeMap::new();
+        for configured in &process.config.disks {
+            let id = DiskId::new(configured.id);
+            disks.insert(
+                id,
+                Arc::new(Disk::new(Arc::clone(&self._daily_cache), configured.capacity_bytes)),
+            );
+        }
+        *self.disks.write().expect("EN disks") = disks;
+
         *self.startup_status.lock().expect("startup status") = "replaying journals".to_owned();
-        for (index, disk) in self.disks.iter().enumerate() {
+        for configured in &process.config.disks {
             if self.startup_stop.load(Ordering::Acquire) {
                 return Err(Error::new("EN startup stopped"));
             }
+            let id = DiskId::new(configured.id);
+            let disk = self.disk(id)?;
             disk.recover(
                 process,
-                DiskId::new(index as u16),
+                id,
+                &configured.path,
                 self.config.journal_file_bytes,
                 self.config.checkpoint_count,
             )?;
         }
 
         let mut sn_ids = HashSet::new();
-        for disk in &self.disks {
+        for disk in self.disks.read().expect("EN disks").values() {
             sn_ids.extend(disk.sn_ids());
         }
         let current = TimeSec::now();
@@ -3029,8 +3073,8 @@ impl Service for EN {
     fn status(&self, process: &Process) -> Vec<String> {
         let mut lines =
             vec![format!("startup {}", self.startup_status.lock().expect("startup status"))];
-        for (i, disk) in self.disks.iter().enumerate() {
-            lines.push(format!("disk {i}"));
+        for (id, disk) in self.disks.read().expect("EN disks").iter() {
+            lines.push(format!("disk {id}"));
             for line in disk.status(process, &self.config) {
                 lines.push(format!("  {line}"));
             }

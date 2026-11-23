@@ -14,6 +14,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
@@ -29,6 +30,93 @@ const CHECKPOINT_MAGIC: &[u8; 8] = b"DLAWENK1";
 const CHECKPOINT_FIXED: u64 = 20;
 const STAGE_SLOTS: usize = 16 * 1024;
 const NO_STAGE_FILE: StageId = StageId(u16::MAX);
+
+/// Per-disk capacity accounting. Staging and final extents share the configured
+/// budget; journal and checkpoint files are deliberately excluded.
+pub(crate) struct DiskSpace {
+    capacity_bytes: u64,
+    used_bytes: AtomicU64,
+    staging_bytes: AtomicU64,
+    final_extent_bytes: AtomicU64,
+}
+
+impl DiskSpace {
+    pub(crate) fn new(capacity_bytes: u64) -> Arc<Self> {
+        Arc::new(Self {
+            capacity_bytes,
+            used_bytes: AtomicU64::new(0),
+            staging_bytes: AtomicU64::new(0),
+            final_extent_bytes: AtomicU64::new(0),
+        })
+    }
+
+    fn restore(&self, staging_bytes: u64, final_extent_bytes: u64) -> Result<()> {
+        let used = staging_bytes
+            .checked_add(final_extent_bytes)
+            .ok_or_else(|| Error::new("EN disk usage overflow"))?;
+        self.staging_bytes.store(staging_bytes, Ordering::Relaxed);
+        self.final_extent_bytes.store(final_extent_bytes, Ordering::Relaxed);
+        self.used_bytes.store(used, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn reserve(&self, bytes: u64, category: &AtomicU64) -> Result<()> {
+        let mut used = self.used_bytes.load(Ordering::Relaxed);
+        loop {
+            let next =
+                used.checked_add(bytes).ok_or_else(|| Error::new("EN disk usage overflow"))?;
+            match self.used_bytes.compare_exchange_weak(
+                used,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    category.fetch_add(bytes, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(current) => used = current,
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn reserve_final_extent(&self, bytes: u64) -> Result<()> {
+        self.reserve(bytes, &self.final_extent_bytes)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn release_staging(&self, bytes: u64) {
+        let old = self.staging_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        assert!(old >= bytes, "released more EN staging bytes than were charged");
+        let old = self.used_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        assert!(old >= bytes, "released more EN disk bytes than were charged");
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn release_final_extent(&self, bytes: u64) {
+        let old = self.final_extent_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        assert!(old >= bytes, "released more EN final-extent bytes than were charged");
+        let old = self.used_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        assert!(old >= bytes, "released more EN disk bytes than were charged");
+    }
+
+    pub(crate) fn capacity_bytes(&self) -> u64 {
+        self.capacity_bytes
+    }
+
+    pub(crate) fn staging_bytes(&self) -> u64 {
+        self.staging_bytes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn final_extent_bytes(&self) -> u64 {
+        self.final_extent_bytes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn available_bytes(&self) -> u64 {
+        self.capacity_bytes.saturating_sub(self.used_bytes.load(Ordering::Relaxed))
+    }
+}
 
 pub(crate) type KeyLookup = Arc<dyn Fn(TimeSec) -> Result<[u8; 32]> + Send + Sync>;
 
@@ -201,15 +289,17 @@ struct StageFiles {
     en: u64,
     disk: u16,
     files: Arc<RwLock<StageTable>>,
+    space: Arc<DiskSpace>,
     current: StageId,
     current_len: u64,
 }
 
 impl StageFiles {
-    fn open(dir: &Path, en: u64, disk: u16) -> Result<(StageFiles, bool)> {
+    fn open(dir: &Path, en: u64, disk: u16, space: Arc<DiskSpace>) -> Result<(StageFiles, bool)> {
         let mut files: StageTable = Box::new(std::array::from_fn(|_| None));
         let mut current = None;
         let mut created = false;
+        let mut staging_bytes = 0u64;
         for item in fs::read_dir(dir)? {
             let item = item?;
             let name = item.file_name();
@@ -229,15 +319,23 @@ impl StageFiles {
                     item.path().display()
                 )));
             }
+            staging_bytes = staging_bytes
+                .checked_add(len)
+                .ok_or_else(|| Error::new("EN stage byte count overflow"))?;
             files[id.index()?] = Some(StageFile { file: Arc::new(file), created: stage_time });
             if current.is_none_or(|old: StageId| id > old) {
                 current = Some(id);
             }
         }
 
+        // Final extent files are not implemented yet, so recovery currently
+        // reconstructs their usage as zero and counts every stage file by size.
+        space.restore(staging_bytes, 0)?;
+
         if current.is_none() {
             let id = StageId::FIRST;
             let stage_time = TimeSec::now();
+            space.reserve(HEADER, &space.staging_bytes)?;
             let (file, new) = create_file(
                 dir,
                 "stage-",
@@ -267,6 +365,7 @@ impl StageFiles {
                 en,
                 disk,
                 files: Arc::new(RwLock::new(files)),
+                space,
                 current,
                 current_len,
             },
@@ -288,6 +387,7 @@ impl StageFiles {
             key_lookup(stage_time)?;
             self.new_file(stage_time)?;
         }
+        self.space.reserve(len, &self.space.staging_bytes)?;
         let stage_file = self.get(self.current)?;
         let offset = u32::try_from(self.current_len)
             .map_err(|_| Error::new("EN stage offset exceeds u32"))?;
@@ -323,6 +423,7 @@ impl StageFiles {
         if self.files.read().expect("stage files")[next].is_some() {
             return Err(Error::new("next EN stage file slot is already occupied"));
         }
+        self.space.reserve(HEADER, &self.space.staging_bytes)?;
         let (file, _) = create_file(
             &self.dir,
             "stage-",
@@ -705,6 +806,7 @@ impl DiskFiles {
         dir: &Path,
         en: EnId,
         disk: DiskId,
+        space: Arc<DiskSpace>,
         key_lookup: KeyLookup,
         max_journal_bytes: u64,
         retention: usize,
@@ -713,7 +815,7 @@ impl DiskFiles {
         let en_number = en.get();
         let disk_number = disk.get();
         fs::create_dir_all(dir)?;
-        let (mut stage, mut stage_new) = StageFiles::open(dir, en_number, disk_number)?;
+        let (mut stage, mut stage_new) = StageFiles::open(dir, en_number, disk_number, space)?;
         stage_new |= stage.ensure_current_key(&key_lookup)?;
         let (latest, valid_checkpoints, next_generation) = load_checkpoints(dir)?;
         let (mut journal, journal_new) = FileSet::open(

@@ -213,6 +213,22 @@ with pathlib.Path(sys.argv[1]).open('a') as file:
     file.write('machine_identity = ' + json.dumps(sys.argv[2]) + '\n')
 PYIDENTITY
     fi
+
+    if [[ $kind == en ]]; then
+        # The local launcher models each EN as five independent disks. Real
+        # deployments write these entries from the host's disk inventory.
+        for ((disk=0; disk<5; disk++)); do
+            mkdir -p "$dir/data/disk-$disk"
+            cat >> "$dir/process.toml" <<EOF
+
+[[disks]]
+id = $disk
+device_identity = "$identity-disk-$disk"
+path = "data/disk-$disk"
+capacity_bytes = 1073741824
+EOF
+        done
+    fi
     rm -f "$dir/ready"
     # Whatever the process says before its own logs are open, plus anything the
     # kernel says about it. Its real logs are in $dir/logs.

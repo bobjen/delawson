@@ -383,6 +383,9 @@ ops! {
     SnCkDiskExtents = 209, "sn-checkpoint-disk-extents";
     SnCkDiskExtentIndex = 210, "sn-checkpoint-disk-extent-index";
     SnCkDiskExtentChunk = 211, "sn-checkpoint-disk-extent-chunk";
+    EnJDiskState = 212, "en-journal-disk-state";
+    EnCkDiskRoster = 213, "en-checkpoint-disk-roster";
+    EnCkDiskRecord = 214, "en-checkpoint-disk-record";
 }
 
 impl std::fmt::Display for Op {
