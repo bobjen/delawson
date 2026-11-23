@@ -2875,7 +2875,8 @@ struct EN {
 impl EN {
     fn new(config: ENConfig) -> EN {
         let daily_cache = Arc::new(DailyKeyCache::new());
-        let disks = BTreeMap::new();
+        #[cfg(not(test))]
+        let disks: BTreeMap<DiskId, Arc<Disk>> = BTreeMap::new();
         #[cfg(test)]
         let disks = (0..5)
             .map(|id| {

@@ -377,6 +377,10 @@ fn encode_checkpoint(sequence: u64, records: &BTreeMap<DiskId, DiskRecord>) -> R
 
 fn read_checkpoint(path: &Path) -> Result<(u64, BTreeMap<DiskId, DiskRecord>)> {
     let bytes = fs::read(path)?;
+    read_checkpoint_bytes(&bytes)
+}
+
+fn read_checkpoint_bytes(bytes: &[u8]) -> Result<(u64, BTreeMap<DiskId, DiskRecord>)> {
     if bytes.len() < 8 + 2 + 2 + 8 + 4 + CHECKPOINT_FOOTER
         || &bytes[..8] != CHECKPOINT_MAGIC
         || u16::from_le_bytes(bytes[8..10].try_into().unwrap()) != Op::EnCkDiskRoster.code()
@@ -390,7 +394,7 @@ fn read_checkpoint(path: &Path) -> Result<(u64, BTreeMap<DiskId, DiskRecord>)> {
         || u64::from_le_bytes(bytes[footer_at + 2..footer_at + 10].try_into().unwrap())
             != bytes.len() as u64
         || u64::from_le_bytes(bytes[footer_at + 10..footer_at + 18].try_into().unwrap())
-            != common::crc::of(&bytes[..footer_at])
+            != common::crc::of(&bytes[..footer_at + 10])
     {
         return Err(Error::new("invalid EN disk roster checkpoint footer"));
     }
@@ -408,6 +412,33 @@ fn read_checkpoint(path: &Path) -> Result<(u64, BTreeMap<DiskId, DiskRecord>)> {
     }
     input.done()?;
     Ok((sequence, records))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_roster_checkpoint_round_trips_with_footer_crc() {
+        let record = DiskRecord {
+            id: DiskId::new(3),
+            device_identity: "test-device".to_owned(),
+            path: "/mnt/test".to_owned(),
+            capacity_bytes: 123_456,
+            state: DiskState::Active,
+        };
+        let records = BTreeMap::from([(record.id, record)]);
+        let bytes = encode_checkpoint(7, &records).unwrap();
+
+        let footer_at = bytes.len() - CHECKPOINT_FOOTER;
+        let stored_crc =
+            u64::from_le_bytes(bytes[footer_at + 10..footer_at + 18].try_into().unwrap());
+        assert_eq!(stored_crc, common::crc::of(&bytes[..footer_at + 10]));
+
+        let (sequence, decoded) = read_checkpoint_bytes(&bytes).unwrap();
+        assert_eq!(sequence, 7);
+        assert_eq!(decoded, records);
+    }
 }
 
 fn put_text(bytes: &mut Vec<u8>, value: &str) -> Result<()> {
