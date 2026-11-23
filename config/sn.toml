@@ -14,6 +14,11 @@ max_extents = 1073741824
 # extent rows. Set true to rebuild those derived indexes from extent rows.
 repair_checkpoint_indexes = false
 
+# Ask ENs for their disk inventory and extent placement at these intervals.
+sync_loop_interval_sec = 1
+en_disk_sync_interval_sec = 30
+en_extent_sync_interval_sec = 120
+
 # Raft consensus for this SN. With no members listed, this process is a singleton.
 # To replicate the SN group, configure the same ring and member map on every member.
 [raft]

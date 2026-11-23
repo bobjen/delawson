@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering}
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SERVES: &[Op] = &[
     Op::Raft,
@@ -376,6 +376,77 @@ struct DiskExtentIndexes {
     pool: ExtentTreePool,
 }
 
+/// Per-EN scheduling state for the two independent synchronization streams. The
+/// timestamps record when a request was issued, so a failed request is retried
+/// after its normal interval; in-flight bits prevent overlap while it is pending.
+#[derive(Default)]
+struct EnSyncState {
+    last_disk_sync: Option<Instant>,
+    disk_sync_in_flight: bool,
+    last_extent_sync: Option<Instant>,
+    extent_sync_in_flight: bool,
+}
+
+/// EN-reported availability, with deletion tracked by the SN when a full disk
+/// sync omits a disk that still has extent instances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum EnDiskStatus {
+    Ready = 0,
+    Unavailable = 1,
+    Deleted = 2,
+}
+
+impl EnDiskStatus {
+    fn from_code(code: u8) -> Result<Self> {
+        match code {
+            0 => Ok(Self::Ready),
+            1 => Ok(Self::Unavailable),
+            2 => Ok(Self::Deleted),
+            _ => Err(Error::new(format!("unknown EN disk status {code}"))),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct EnDiskInfo {
+    total_bytes: u64,
+    used_bytes: u64,
+    sync_time: TimeSec,
+    status: EnDiskStatus,
+}
+
+#[derive(Default)]
+struct EnInfo {
+    last_disk_sync: Option<TimeSec>,
+    last_extent_sync: Option<TimeSec>,
+    disks: HashMap<DiskId, EnDiskInfo>,
+    /// IDs removed after their last indexed extent instance was removed. Kept
+    /// so an EN cannot silently reuse a disk identity.
+    retired_disks: HashSet<DiskId>,
+}
+
+#[derive(Clone)]
+struct EnDiskSyncRow {
+    disk: DiskId,
+    total_bytes: u64,
+    used_bytes: u64,
+    sync_time: TimeSec,
+    status: EnDiskStatus,
+}
+
+struct EnDiskSyncCmd {
+    en: EnId,
+    sync_time: TimeSec,
+    disks: Vec<EnDiskSyncRow>,
+}
+
+#[derive(Clone, Copy)]
+enum EnSyncKind {
+    Disks,
+    Extents,
+}
+
 impl DiskExtentIndexes {
     fn new(max_nodes: u32) -> Result<Self> {
         Ok(Self { ens: HashMap::new(), pool: ExtentTreePool::new(max_nodes)? })
@@ -441,6 +512,10 @@ impl DiskExtentIndexes {
 
     fn tree(&self, disk: (EnId, DiskId)) -> Option<&DiskExtentTree> {
         self.ens.get(&disk.0).and_then(|en_indexes| en_indexes.disks.get(&disk.1))
+    }
+
+    fn has_instances(&self, disk: (EnId, DiskId)) -> bool {
+        self.tree(disk).is_some_and(|tree| !tree.is_empty())
     }
 
     fn insert_extent(
@@ -1017,6 +1092,86 @@ macro_rules! sn_wire {
     };
 }
 
+fn write_en_disk_sync_row(w: &mut StructWriter, row: &EnDiskSyncRow) {
+    w.disk_id(row.disk);
+    w.number_u64(row.total_bytes);
+    w.number_u64(row.used_bytes);
+    w.time_sec(row.sync_time);
+    w.number_u8(row.status as u8);
+}
+
+fn read_en_disk_sync_row(r: &mut StructReader<'_>) -> Result<EnDiskSyncRow> {
+    let disk = r.disk_id()?;
+    let total_bytes = r.number_u64()?;
+    let used_bytes = r.number_u64()?;
+    let sync_time = r.time_sec()?;
+    let status = EnDiskStatus::from_code(r.number_u8()?)?;
+    if used_bytes > total_bytes {
+        return Err(Error::new("EN disk used bytes exceed its total length"));
+    }
+    if status == EnDiskStatus::Deleted {
+        return Err(Error::new("EN cannot report an SN-deleted disk as present"));
+    }
+    Ok(EnDiskSyncRow { disk, total_bytes, used_bytes, sync_time, status })
+}
+
+fn read_en_disk_sync_response(en: EnId, response: Resp) -> Result<EnDiskSyncCmd> {
+    if response.status != Status::Ok {
+        return Err(Error::new(format!("EN returned {}", response.status)));
+    }
+    let args = response.args();
+    let mut disks = Vec::with_capacity(args.len());
+    let mut seen = HashSet::with_capacity(args.len());
+    for arg in args {
+        if arg.op == Op::EmptyResp {
+            if args.len() == 1 {
+                continue;
+            }
+            return Err(Error::new("EN disk sync has an empty row among disk records"));
+        }
+        let (mut row, rest) =
+            structure(std::slice::from_ref(arg), Op::EnSyncDisk, "an EN disk sync response row")?;
+        if !rest.is_empty() {
+            return Err(Error::new("EN disk sync response row has trailing arguments"));
+        }
+        let disk = read_en_disk_sync_row(&mut row)?;
+        row.done()?;
+        if !seen.insert(disk.disk) {
+            return Err(Error::new(format!("EN disk sync repeats disk {}", disk.disk)));
+        }
+        disks.push(disk);
+    }
+    Ok(EnDiskSyncCmd { en, sync_time: TimeSec::now(), disks })
+}
+
+sn_wire!(
+    EnDiskSyncCmd,
+    SnEnDiskSync,
+    |v: &EnDiskSyncCmd, w: &mut StructWriter| {
+        w.en_id(v.en);
+        w.time_sec(v.sync_time);
+        w.number_u64(v.disks.len() as u64);
+        for row in &v.disks {
+            w.nested(Op::EnSyncDisk, |w| write_en_disk_sync_row(w, row));
+        }
+    },
+    |r: &mut StructReader<'_>| {
+        let en = r.en_id()?;
+        let sync_time = r.time_sec()?;
+        let count = usize::try_from(r.number_u64()?)
+            .map_err(|_| Error::new("EN disk sync count overflow"))?;
+        // Each nested row is a 2-byte Op plus 2 + 8 + 8 + 8 + 1 bytes of fields.
+        if count > r.remaining() / 29 {
+            return Err(Error::new("EN disk sync count exceeds the action"));
+        }
+        let mut disks = Vec::with_capacity(count);
+        for _ in 0..count {
+            disks.push(r.nested(Op::EnSyncDisk, "EN disk sync row", read_en_disk_sync_row)?);
+        }
+        Ok(EnDiskSyncCmd { en, sync_time, disks })
+    }
+);
+
 sn_wire!(
     CreateCmd,
     SnCreate,
@@ -1234,6 +1389,8 @@ struct SNState {
     extent_table: ExtentTable,
     /// Per-disk indexes of ExtentIds represented in the extents' disk lists.
     disk_extent_indexes: DiskExtentIndexes,
+    /// EN disk inventory and the last complete disk/extent sync applied by Raft.
+    ens: HashMap<EnId, EnInfo>,
     /// Side metadata whose lifetime follows its owning stream or extent.
     retired_streams: std::collections::HashSet<StreamName>,
     stream_extras: Extras<StreamName>,
@@ -1267,6 +1424,7 @@ impl SNState {
             stream_map,
             extent_table,
             disk_extent_indexes,
+            ens: HashMap::new(),
             retired_streams: std::collections::HashSet::new(),
             stream_extras: Extras::default(),
             extent_extras: Extras::default(),
@@ -1503,6 +1661,81 @@ fn apply_sn_action_with_disks(
     apply_sn_slot(state, index, action, disks, None, &mut local_used)
 }
 
+fn apply_en_disk_sync(
+    state: &mut SNState,
+    command: EnDiskSyncCmd,
+    disk_roster: &[(EnId, DiskId)],
+) -> Result<()> {
+    let mut known = HashSet::new();
+    for &(en, disk) in disk_roster {
+        if en == command.en {
+            known.insert(disk);
+        }
+    }
+    let mut reported = HashMap::with_capacity(command.disks.len());
+    for disk in command.disks {
+        if disk.used_bytes > disk.total_bytes {
+            return Err(Error::new("EN disk used bytes exceed its total length"));
+        }
+        if disk.status == EnDiskStatus::Deleted {
+            return Err(Error::new("EN disk sync reports an SN-deleted disk"));
+        }
+        if reported.insert(disk.disk, disk).is_some() {
+            return Err(Error::new("EN disk sync contains a duplicate disk"));
+        }
+    }
+
+    if let Some(en) = state.ens.get(&command.en) {
+        if reported.keys().any(|disk| {
+            en.retired_disks.contains(disk)
+                || en.disks.get(disk).is_some_and(|d| d.status == EnDiskStatus::Deleted)
+        }) {
+            return Err(Error::new("EN disk sync attempts to reactivate a deleted disk"));
+        }
+    }
+
+    if let Some(en) = state.ens.get(&command.en) {
+        known.extend(en.disks.keys().copied());
+    }
+    let removed: Vec<_> = known
+        .into_iter()
+        .filter(|disk| {
+            !reported.contains_key(disk)
+                && !state.ens.get(&command.en).is_some_and(|en| en.retired_disks.contains(disk))
+        })
+        .map(|disk| (disk, state.disk_extent_indexes.has_instances((command.en, disk))))
+        .collect();
+
+    let en = state.ens.entry(command.en).or_default();
+    en.last_disk_sync = Some(command.sync_time);
+    for (disk, record) in reported {
+        en.disks.insert(
+            disk,
+            EnDiskInfo {
+                total_bytes: record.total_bytes,
+                used_bytes: record.used_bytes,
+                sync_time: record.sync_time,
+                status: record.status,
+            },
+        );
+    }
+    for (disk, has_instances) in removed {
+        if has_instances {
+            let info = en.disks.entry(disk).or_insert(EnDiskInfo {
+                total_bytes: 0,
+                used_bytes: 0,
+                sync_time: command.sync_time,
+                status: EnDiskStatus::Deleted,
+            });
+            info.status = EnDiskStatus::Deleted;
+        } else {
+            en.disks.remove(&disk);
+            en.retired_disks.insert(disk);
+        }
+    }
+    Ok(())
+}
+
 fn apply_sn_slot(
     state: &mut SNState,
     _index: u64,
@@ -1512,6 +1745,10 @@ fn apply_sn_slot(
     local_used: &mut bool,
 ) -> Result<()> {
     match action.op {
+        Op::SnEnDiskSync => {
+            let command: EnDiskSyncCmd = raft::codec::decode(&action.fields)?;
+            apply_en_disk_sync(state, command, disks)
+        }
         Op::SnCreate => {
             let cmd: CreateCmd = raft::codec::decode(&action.fields)?;
             let SNState { stream_map, retired_streams, streams, .. } = state;
@@ -1861,6 +2098,7 @@ fn apply_sn_slot(
                 stream_map,
                 extent_table,
                 disk_extent_indexes,
+                ens,
                 retired_streams,
                 stream_extras,
                 extent_extras,
@@ -1876,6 +2114,7 @@ fn apply_sn_slot(
             if pending.hard {
                 for task in pending.tasks.iter().filter(|task| task.hard) {
                     let extent = &mut extent_table[task.id.get() as usize];
+                    let disk_names = extent_disk_names(&extent.disks, disks)?;
                     assert!(extent_extras.reclaim(
                         &(task.id, task.created),
                         &mut extent.deletion,
@@ -1886,6 +2125,18 @@ fn apply_sn_slot(
                         .expect("remove the extent from each EN index before reclaim");
                     extent.disks.clear();
                     *extents -= 1;
+                    for (en_id, disk_id) in disk_names {
+                        if !disk_extent_indexes.has_instances((en_id, disk_id))
+                            && let Some(en) = ens.get_mut(&en_id)
+                            && en
+                                .disks
+                                .get(&disk_id)
+                                .is_some_and(|info| info.status == EnDiskStatus::Deleted)
+                        {
+                            en.disks.remove(&disk_id);
+                            en.retired_disks.insert(disk_id);
+                        }
+                    }
                 }
                 let map = stream_map;
                 let stream = map
@@ -1911,6 +2162,7 @@ impl raft::execution::Application for SNState {
         self.stream_map.clear();
         self.disk_extent_indexes.clear();
         self.extent_table.reset();
+        self.ens.clear();
         self.retired_streams.clear();
         self.stream_extras = Extras::default();
         self.extent_extras = Extras::default();
@@ -1947,6 +2199,11 @@ struct SN {
     mine: SnId,
     /// All disks across all ENs that this SN can see.
     disks: Mutex<Vec<(EnId, DiskId)>>,
+    /// Per-EN sync timestamps; these are process-local scheduling state, so a
+    /// restarted SN immediately asks its ENs to reconcile again.
+    en_sync: Mutex<HashMap<EnId, EnSyncState>>,
+    sync_stop: AtomicBool,
+    sync_thread: Mutex<Option<JoinHandle<()>>>,
     gc_stop: AtomicBool,
     gc_thread: Mutex<Option<JoinHandle<()>>>,
     streams: AtomicU64,
@@ -1975,7 +2232,18 @@ impl Service for SN {
         Ok(())
     }
 
+    fn start_with_process(self: &Arc<Self>, process: &Arc<Process>) -> Result<()> {
+        self.start()?;
+        if let Err(error) = self.start_sync(Arc::clone(process)) {
+            let _ = self.stop_gc();
+            let _ = self.stop_raft();
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn stop(&self, _process: &Process) -> Result<()> {
+        self.stop_sync()?;
         self.stop_gc()?;
         self.stop_raft()
     }
@@ -2226,6 +2494,199 @@ impl SN {
             worker.join().map_err(|_| Error::new("SN GC thread panicked"))?;
         }
         Ok(())
+    }
+
+    fn start_sync(self: &Arc<Self>, process: Arc<Process>) -> Result<()> {
+        let mut slot = self.sync_thread.lock().expect("SN sync thread");
+        if slot.is_some() {
+            return Err(Error::new("SN sync thread is already running"));
+        }
+        self.sync_stop.store(false, Ordering::Release);
+        let sn = Arc::downgrade(self);
+        let interval = Duration::from_secs(self.config.sync_loop_interval_sec);
+        let worker = thread::Builder::new()
+            .name("sn-sync".into())
+            .spawn(move || {
+                'worker: loop {
+                    let Some(service) = sn.upgrade() else { break };
+                    if service.sync_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let started = Instant::now();
+                    loop {
+                        if service.sync_stop.load(Ordering::Acquire) {
+                            break 'worker;
+                        }
+                        let remaining = interval.saturating_sub(started.elapsed());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        thread::park_timeout(remaining);
+                    }
+                    service.sync_tick(&process);
+                }
+            })
+            .map_err(|error| Error::new(format!("starting SN sync thread: {error}")))?;
+        *slot = Some(worker);
+        Ok(())
+    }
+
+    fn stop_sync(&self) -> Result<()> {
+        self.sync_stop.store(true, Ordering::Release);
+        let worker = self.sync_thread.lock().expect("SN sync thread").take();
+        if let Some(worker) = worker {
+            worker.thread().unpark();
+            worker.join().map_err(|_| Error::new("SN sync thread panicked"))?;
+        }
+        Ok(())
+    }
+
+    fn sync_tick(self: &Arc<Self>, process: &Process) {
+        let now = Instant::now();
+        let disk_interval = Duration::from_secs(self.config.en_disk_sync_interval_sec);
+        let extent_interval = Duration::from_secs(self.config.en_extent_sync_interval_sec);
+
+        for identity in process.assigned_of_kind(ServiceKind::En) {
+            let Some(entry) = process.cluster.service(&identity) else { continue };
+            if entry.kind != ServiceKind::En {
+                continue;
+            }
+            let en = EnId::new(entry.number());
+            let (sync_disks, sync_extents) = {
+                let mut states = self.en_sync.lock().expect("SN EN sync state");
+                let state = states.entry(en).or_default();
+                let sync_disks = !state.disk_sync_in_flight
+                    && state
+                        .last_disk_sync
+                        .map_or(true, |last| now.duration_since(last) >= disk_interval);
+                let sync_extents = !state.extent_sync_in_flight
+                    && state
+                        .last_extent_sync
+                        .map_or(true, |last| now.duration_since(last) >= extent_interval);
+                if sync_disks {
+                    state.disk_sync_in_flight = true;
+                    state.last_disk_sync = Some(now);
+                }
+                if sync_extents {
+                    state.extent_sync_in_flight = true;
+                    state.last_extent_sync = Some(now);
+                }
+                (sync_disks, sync_extents)
+            };
+
+            if sync_disks {
+                self.send_en_sync(process, &identity, en, EnSyncKind::Disks);
+            }
+            if sync_extents {
+                self.send_en_sync(process, &identity, en, EnSyncKind::Extents);
+            }
+        }
+    }
+
+    fn send_en_sync(
+        self: &Arc<Self>,
+        process: &Process,
+        identity: &str,
+        en: EnId,
+        kind: EnSyncKind,
+    ) {
+        let op = match kind {
+            EnSyncKind::Disks => Op::EnSyncDisks,
+            EnSyncKind::Extents => Op::EnSyncExtents,
+        };
+        let request = Req::new(op).number(self.mine.number());
+        let sn = Arc::downgrade(self);
+        let workers = process.worker_queue();
+        if process
+            .ask(identity, &request, move |_response| {
+                if let Some(sn) = sn.upgrade() {
+                    match kind {
+                        EnSyncKind::Disks => {
+                            sn.receive_en_disk_sync(en, _response, workers);
+                        }
+                        EnSyncKind::Extents => sn.finish_en_sync(en, kind),
+                    }
+                }
+            })
+            .is_err()
+        {
+            self.finish_en_sync(en, kind);
+        }
+    }
+
+    fn receive_en_disk_sync(
+        self: &Arc<Self>,
+        en: EnId,
+        response: Resp,
+        workers: server::WorkerQueue,
+    ) {
+        let command = match read_en_disk_sync_response(en, response) {
+            Ok(command) => command,
+            Err(error) => {
+                self.finish_en_sync(en, EnSyncKind::Disks);
+                common::logn!("SN EN disk sync response rejected", "EN {}, error {}", en, error);
+                return;
+            }
+        };
+        let action = match sn_action(Op::SnEnDiskSync, &command) {
+            Ok(action) => action,
+            Err(error) => {
+                self.finish_en_sync(en, EnSyncKind::Disks);
+                common::logn!(
+                    "SN EN disk sync action encoding failed",
+                    "EN {}, error {}",
+                    en,
+                    error
+                );
+                return;
+            }
+        };
+        let sn = Arc::downgrade(self);
+        self.submit_action(workers, action, move |result| {
+            if let Err(error) = result {
+                common::logn!("SN EN disk sync Raft update failed", "EN {}, error {}", en, error);
+            }
+            if let Some(sn) = sn.upgrade() {
+                sn.finish_en_sync(en, EnSyncKind::Disks);
+            }
+        });
+    }
+
+    fn finish_en_sync(&self, en: EnId, kind: EnSyncKind) {
+        let mut states = self.en_sync.lock().expect("SN EN sync state");
+        let state = states.entry(en).or_default();
+        match kind {
+            EnSyncKind::Disks => state.disk_sync_in_flight = false,
+            EnSyncKind::Extents => state.extent_sync_in_flight = false,
+        }
+    }
+
+    fn available_disks(&self) -> Vec<SnDiskId> {
+        let state = self.global_lock.read();
+        let roster = self.disks.lock().expect("SN disk roster");
+        roster
+            .iter()
+            .enumerate()
+            .filter_map(|(at, &(en, disk))| {
+                let status = state.ens.get(&en);
+                let eligible = match status {
+                    // Until the first successful sync, preserve the configured
+                    // roster as the placement source. This keeps startup usable
+                    // while EN sync is unavailable or has not completed yet.
+                    None | Some(EnInfo { last_disk_sync: None, .. }) => true,
+                    Some(info) => info.disks.get(&disk).is_some_and(|disk| {
+                        disk.status == EnDiskStatus::Ready && disk.used_bytes < disk.total_bytes
+                    }),
+                };
+                eligible.then(|| SnDiskId::new(u32::try_from(at).expect("SN disk roster fits u32")))
+            })
+            .collect()
+    }
+
+    fn pick_available_disks(&self, want: usize) -> Result<Vec<SnDiskId>> {
+        let available = self.available_disks();
+        let indexes = pick_disks(available.len(), want)?;
+        Ok(indexes.into_iter().map(|index| available[index.get() as usize]).collect())
     }
 
     fn delete_stream_async(self: &Arc<Self>, process: &Arc<Process>, request: &Req, done: Respond) {
@@ -2552,6 +3013,10 @@ impl SN {
                     names.extend(next.disks);
                 }
             }
+            Op::SnEnDiskSync => {
+                let command: EnDiskSyncCmd = raft::codec::decode(&action.fields)?;
+                names.extend(command.disks.into_iter().map(|disk| (command.en, disk.disk)));
+            }
             _ => return Ok(()),
         }
 
@@ -2608,6 +3073,7 @@ impl SN {
         path: &std::path::Path,
         runtime: RaftSettings,
     ) -> Result<SN> {
+        config.validate()?;
         runtime.validate(&config.raft)?;
         let mut initial = raft::State::initial(
             runtime.ring.clone(),
@@ -2708,6 +3174,9 @@ impl SN {
             per_stream,
             mine,
             disks: Mutex::new(saved_disks.unwrap_or(disks)),
+            en_sync: Mutex::new(HashMap::new()),
+            sync_stop: AtomicBool::new(true),
+            sync_thread: Mutex::new(None),
             gc_stop: AtomicBool::new(true),
             gc_thread: Mutex::new(None),
             streams: AtomicU64::new(0),
@@ -2751,8 +3220,23 @@ impl SN {
             &settings.name,
             settings.identities[&0].identity.clone(),
         )?;
+        let test_disks = disks.clone();
         let mut sn =
             Self::with_runtime(config, per_stream, mine, disks, directory.path(), settings)?;
+        {
+            let mut state = sn.global_lock.write();
+            for &(en, disk) in &test_disks {
+                state.ens.entry(en).or_default().disks.insert(
+                    disk,
+                    EnDiskInfo {
+                        total_bytes: u64::MAX,
+                        used_bytes: 0,
+                        sync_time: TimeSec::EPOCH,
+                        status: EnDiskStatus::Ready,
+                    },
+                );
+            }
+        }
         sn._test_dir = Some(directory);
         Ok(sn)
     }
@@ -3216,23 +3700,23 @@ impl SN {
             }
         };
 
+        // EN sync learns the actual disk inventory. Until that response has
+        // arrived, retain the existing bootstrap roster convention.
         let assigned = process.assigned_of_kind(ServiceKind::En);
         if !assigned.is_empty() {
-            let mut disks = self.disks.lock().expect("disks");
-            disks.clear();
+            let mut roster = self.disks.lock().expect("SN disk roster");
             for identity in assigned {
                 let en = EnId::new(
                     process.cluster.service(&identity).map(|entry| entry.number()).unwrap_or(0),
                 );
-                for disk in 0..5 {
-                    disks.push((en, DiskId::new(disk)));
+                if !roster.iter().any(|(known, _)| *known == en) {
+                    for disk in 0..5 {
+                        roster.push((en, DiskId::new(disk)));
+                    }
                 }
             }
         }
-        let disks = match pick_disks(
-            self.disks.lock().expect("disks").len(),
-            process.cluster.extents.instances,
-        ) {
+        let disks = match self.pick_available_disks(process.cluster.extents.instances) {
             Ok(disks) => disks,
             Err(error) => {
                 self.release_extent_id(id);
@@ -3629,10 +4113,7 @@ impl SN {
         let mut next_id = None;
         if let Some(allocated) = next_result {
             match allocated {
-                Ok(id) => match pick_disks(
-                    self.disks.lock().expect("disks").len(),
-                    process.cluster.extents.instances,
-                ) {
+                Ok(id) => match self.pick_available_disks(process.cluster.extents.instances) {
                     Ok(disks) => {
                         next_id = Some(id);
                         next = Some(ExtentData {
@@ -3954,10 +4435,21 @@ impl Host for SN {
         } else {
             None
         };
-        let disks = if matches!(action.op, Op::SnOpen | Op::SnSeal | Op::SnDeleteDone) {
-            self.disks.lock().map_err(|_| Error::new("SN disk lock poisoned"))?.clone()
-        } else {
-            Vec::new()
+        let disks = match action.op {
+            Op::SnEnDiskSync => {
+                let command: EnDiskSyncCmd = raft::codec::decode(&action.fields)?;
+                self.disks
+                    .lock()
+                    .map_err(|_| Error::new("SN disk lock poisoned"))?
+                    .iter()
+                    .filter(|(en, _)| *en == command.en)
+                    .copied()
+                    .collect()
+            }
+            Op::SnOpen | Op::SnSeal | Op::SnDeleteDone => {
+                self.disks.lock().map_err(|_| Error::new("SN disk lock poisoned"))?.clone()
+            }
+            _ => Vec::new(),
         };
         let mut local_used = false;
         let result = apply_sn_slot(state, context.index, action, &disks, local_id, &mut local_used);

@@ -1,7 +1,8 @@
 //! SN application checkpoint codec.
 use super::extent_tree::DiskExtentTree;
 use super::{
-    DeleteTask, Extent, ExtentData, ExtentTable, MAX_STREAMS, PendingDelete, SNState, Stream,
+    DeleteTask, EnDiskInfo, EnDiskStatus, EnInfo, Extent, ExtentData, ExtentTable, MAX_STREAMS,
+    PendingDelete, SNState, Stream,
 };
 use common::deletion::{Extra, Flags, ReferenceCounts, SharedExtras};
 use common::ids::{DiskId, EnId, ExtentId, RangeId, SnDiskId, SnId, StreamId};
@@ -38,6 +39,7 @@ struct Footer {
     extents: u64,
     extent_slots: ExtentId,
     ens: Range,
+    en_states: Range,
     disk_extent_entries: u64,
     disk_extent_rows: Range,
     disk_extent_chunks: Vec<raft::checkpoint::ChunkPos>,
@@ -59,6 +61,7 @@ impl codec::Wire for Footer {
             self.extents.write(writer);
             writer.extent_id(self.extent_slots);
             self.ens.write(writer);
+            self.en_states.write(writer);
             self.disk_extent_entries.write(writer);
             self.disk_extent_rows.write(writer);
             self.disk_extent_chunks.write(writer);
@@ -82,6 +85,7 @@ impl codec::Wire for Footer {
                 extents: codec::Wire::read(reader)?,
                 extent_slots: reader.extent_id()?,
                 ens: codec::Wire::read(reader)?,
+                en_states: codec::Wire::read(reader)?,
                 disk_extent_entries: codec::Wire::read(reader)?,
                 disk_extent_rows: codec::Wire::read(reader)?,
                 disk_extent_chunks: codec::Wire::read(reader)?,
@@ -101,6 +105,24 @@ struct EnRow {
     disks: Vec<u64>,
 }
 raft::wire_struct!(EnRow, SnCkEn, {id,disks});
+
+struct EnDiskRow {
+    id: u64,
+    total_bytes: u64,
+    used_bytes: u64,
+    sync_time: u64,
+    status: u8,
+}
+raft::wire_struct!(EnDiskRow, SnCkEnDisk, {id,total_bytes,used_bytes,sync_time,status});
+
+struct EnStateRow {
+    id: u64,
+    last_disk_sync: Option<u64>,
+    last_extent_sync: Option<u64>,
+    disks: Vec<EnDiskRow>,
+    retired_disks: Vec<u64>,
+}
+raft::wire_struct!(EnStateRow, SnCkEnState, {id,last_disk_sync,last_extent_sync,disks,retired_disks});
 
 struct ExtentIndex(u32);
 
@@ -401,6 +423,40 @@ fn write_ens(file: &mut (impl Write + Seek), disks: &[(EnId, DiskId)]) -> Result
             at += 1;
         }
         write_piece(file, &EnRow { id: en.get(), disks: values })?;
+    }
+    range(file, start)
+}
+
+fn write_en_states(file: &mut (impl Write + Seek), state: &SNState) -> Result<Range> {
+    let mut ens: Vec<_> = state.ens.iter().collect();
+    ens.sort_unstable_by_key(|(id, _)| **id);
+    let start = section_start(file, Op::SnCkEnStates, ens.len() as u64)?;
+    for (&id, en) in ens {
+        let mut disks: Vec<_> = en.disks.iter().collect();
+        disks.sort_unstable_by_key(|(disk, _)| **disk);
+        let disks = disks
+            .into_iter()
+            .map(|(&id, info)| EnDiskRow {
+                id: u64::from(id.get()),
+                total_bytes: info.total_bytes,
+                used_bytes: info.used_bytes,
+                sync_time: info.sync_time.number(),
+                status: info.status as u8,
+            })
+            .collect();
+        let mut retired_disks: Vec<_> =
+            en.retired_disks.iter().map(|id| u64::from(id.get())).collect();
+        retired_disks.sort_unstable();
+        write_piece(
+            file,
+            &EnStateRow {
+                id: id.get(),
+                last_disk_sync: en.last_disk_sync.map(TimeSec::number),
+                last_extent_sync: en.last_extent_sync.map(TimeSec::number),
+                disks,
+                retired_disks,
+            },
+        )?;
     }
     range(file, start)
 }
@@ -787,6 +843,7 @@ pub(super) fn write(
         return Err(Error::new("SN checkpoint target is not empty"));
     }
     let ens = write_ens(file, disks)?;
+    let en_states = write_en_states(file, state)?;
     let (disk_extent_rows, disk_extent_chunks, disk_extent_entries) =
         write_disk_extent_indexes(file, state, workers)?;
     let (extent_rows, extent_chunks) = write_extents(file, state, disks, workers)?;
@@ -803,6 +860,7 @@ pub(super) fn write(
         extents: state.extents,
         extent_slots: ExtentId::of_number(state.extent_table.len() as u64)?,
         ens,
+        en_states,
         disk_extent_entries,
         disk_extent_rows,
         disk_extent_chunks,
@@ -990,6 +1048,59 @@ fn read_ens(file: &mut File, range: Range) -> Result<Vec<(EnId, DiskId)>> {
         return Err(Error::new("invalid SN checkpoint EN roster"));
     }
     Ok(disks)
+}
+
+fn read_en_states(
+    file: &mut File,
+    range: Range,
+    state: &mut SNState,
+    disk_roster: &[(EnId, DiskId)],
+) -> Result<()> {
+    let mut section = read_section(file, range, Op::SnCkEnStates)?;
+    let known_disks: HashSet<_> = disk_roster.iter().copied().collect();
+    for _ in 0..section.count {
+        let row: EnStateRow = read_piece(file, &mut section.left)?;
+        let id = EnId::of_number(row.id)?;
+        let mut en = EnInfo {
+            last_disk_sync: row.last_disk_sync.map(TimeSec::new),
+            last_extent_sync: row.last_extent_sync.map(TimeSec::new),
+            ..EnInfo::default()
+        };
+        for disk in row.disks {
+            let disk_id = DiskId::of_number(disk.id)?;
+            if !known_disks.contains(&(id, disk_id)) {
+                return Err(Error::new("SN checkpoint EN disk state is outside the disk roster"));
+            }
+            if disk.used_bytes > disk.total_bytes {
+                return Err(Error::new("SN checkpoint EN disk usage exceeds its capacity"));
+            }
+            let info = EnDiskInfo {
+                total_bytes: disk.total_bytes,
+                used_bytes: disk.used_bytes,
+                sync_time: TimeSec::new(disk.sync_time),
+                status: EnDiskStatus::from_code(disk.status)?,
+            };
+            if en.disks.insert(disk_id, info).is_some() {
+                return Err(Error::new("duplicate SN checkpoint EN disk state"));
+            }
+        }
+        for disk in row.retired_disks {
+            let disk_id = DiskId::of_number(disk)?;
+            if !known_disks.contains(&(id, disk_id)) {
+                return Err(Error::new("SN checkpoint retired disk is outside the disk roster"));
+            }
+            if en.disks.contains_key(&disk_id) || !en.retired_disks.insert(disk_id) {
+                return Err(Error::new("duplicate or active SN checkpoint retired disk"));
+            }
+        }
+        if state.ens.insert(id, en).is_some() {
+            return Err(Error::new("duplicate SN checkpoint EN state"));
+        }
+    }
+    if section.left != 0 {
+        return Err(Error::new("trailing SN checkpoint EN state data"));
+    }
+    Ok(())
 }
 
 fn restore_extent(
@@ -1656,6 +1767,7 @@ pub(super) fn read_state_with_workers(
         return Err(Error::new("SN checkpoint stream bucket count is out of range"));
     }
     let mut state = SNState::with_stream_buckets(max_extents, stream_buckets)?;
+    read_en_states(&mut file, footer.en_states, &mut state, &disks)?;
     let extent_slots = usize::try_from(footer.extent_slots.get())
         .map_err(|_| Error::new("SN checkpoint extent table is too large"))?;
     if extent_slots == 0 || extent_slots > max_extents as usize {
@@ -1691,6 +1803,20 @@ pub(super) fn read_state_with_workers(
         repair_checkpoint_indexes,
         index_mismatches,
     )?;
+    for (&en_id, en) in &state.ens {
+        for (&disk_id, info) in &en.disks {
+            if info.status == EnDiskStatus::Deleted
+                && !state.disk_extent_indexes.has_instances((en_id, disk_id))
+            {
+                return Err(Error::new("SN checkpoint deleted disk has no indexed instances"));
+            }
+        }
+        for &disk_id in &en.retired_disks {
+            if state.disk_extent_indexes.has_instances((en_id, disk_id)) {
+                return Err(Error::new("SN checkpoint retired disk still has indexed instances"));
+            }
+        }
+    }
     read_streams(
         &mut file,
         footer.stream_rows,

@@ -879,6 +879,48 @@ pub struct SNConfig {
     /// checkpoint validation finds inconsistencies. False rejects the checkpoint.
     #[serde(default)]
     pub repair_checkpoint_indexes: bool,
+    /// How often the SN checks whether an EN disk or extent sync is due.
+    #[serde(default = "default_sync_loop_interval_sec")]
+    pub sync_loop_interval_sec: u64,
+    /// Minimum interval between successful disk syncs with one EN.
+    #[serde(default = "default_en_disk_sync_interval_sec")]
+    pub en_disk_sync_interval_sec: u64,
+    /// Minimum interval between successful extent syncs with one EN.
+    #[serde(default = "default_en_extent_sync_interval_sec")]
+    pub en_extent_sync_interval_sec: u64,
+}
+
+fn default_sync_loop_interval_sec() -> u64 {
+    1
+}
+
+fn default_en_disk_sync_interval_sec() -> u64 {
+    30
+}
+
+fn default_en_extent_sync_interval_sec() -> u64 {
+    120
+}
+
+impl SNConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.sync_loop_interval_sec == 0 {
+            return Err(Error::new("SN sync_loop_interval_sec must be positive"));
+        }
+        if self.en_disk_sync_interval_sec == 0 {
+            return Err(Error::new("SN en_disk_sync_interval_sec must be positive"));
+        }
+        if self.en_extent_sync_interval_sec == 0 {
+            return Err(Error::new("SN en_extent_sync_interval_sec must be positive"));
+        }
+        Ok(())
+    }
+
+    pub fn load(path: &Path) -> Result<SNConfig> {
+        let config: SNConfig = read_toml(path)?;
+        config.validate()?;
+        Ok(config)
+    }
 }
 
 /// EN's own configuration.
@@ -948,7 +990,7 @@ macro_rules! loaders {
     };
 }
 
-loaders!(DNConfig, SNConfig, ENConfig, FEConfig);
+loaders!(DNConfig, ENConfig, FEConfig);
 
 /// Written into each run directory by `start-laws`. It says who this process is,
 /// where the shared files are, and (for an EN) which local disks it owns.

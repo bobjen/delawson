@@ -183,6 +183,9 @@ pub fn sn_config() -> SNConfig {
         max_extents: 1024,
         stream_share: 0.333,
         repair_checkpoint_indexes: false,
+        sync_loop_interval_sec: 1,
+        en_disk_sync_interval_sec: 30,
+        en_extent_sync_interval_sec: 120,
     }
 }
 

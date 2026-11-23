@@ -386,6 +386,13 @@ ops! {
     EnJDiskState = 212, "en-journal-disk-state";
     EnCkDiskRoster = 213, "en-checkpoint-disk-roster";
     EnCkDiskRecord = 214, "en-checkpoint-disk-record";
+    EnSyncDisks = 215, "en-sync-disks";
+    EnSyncExtents = 216, "en-sync-extents";
+    EnSyncDisk = 217, "en-sync-disk";
+    SnEnDiskSync = 218, "sn-en-disk-sync-action";
+    SnCkEnStates = 219, "sn-checkpoint-en-states";
+    SnCkEnState = 220, "sn-checkpoint-en-state";
+    SnCkEnDisk = 221, "sn-checkpoint-en-disk";
 }
 
 impl std::fmt::Display for Op {
