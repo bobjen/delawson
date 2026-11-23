@@ -1,16 +1,17 @@
-//! Per-EN extent index used by SN for sync.
+//! Per-disk extent index used by SN for repair and sync.
 //!
-//! Each EN's root is inline in its SN-side row. The root starts as a leaf, so
-//! small trees need no node-pool allocation. At greater heights it is an inline
-//! branch. Height zero means leaf; branches and the root terminate their child
-//! arrays with `NONE` instead of storing child counts. Leaf items use raw u32
-//! slots. Scans retain their path through the branches instead of linking
-//! leaves.
+//! Each EN disk's root is inline in its SN-side index. The root starts as a
+//! leaf, so small trees need no node-pool allocation. At greater heights it is
+//! an inline branch. Height zero means leaf; branches and the root terminate
+//! their child arrays with `NONE` instead of storing child counts. Leaf items
+//! use raw u32 slots. Scans retain their path through the branches instead of
+//! linking leaves.
 
 use common::ids::ExtentId;
 use common::{Error, Result};
 use pool::{LockedItem, LockedPool, PoolItem};
 use std::mem::{MaybeUninit, align_of, offset_of, size_of};
+use std::sync::Mutex;
 
 const NONE: u32 = u32::MAX;
 // The tuning knob: each u32 slot contributes four bytes to a pooled node.
@@ -112,26 +113,36 @@ unsafe impl LockedItem for Node {
     const LINK_NONE: u32 = NONE;
 }
 
-/// Shared node storage for all per-EN extent trees in one SN.
+/// Shared node storage for all per-disk extent trees in one SN.
 pub(super) struct ExtentTreePool {
-    slots: Nodes,
+    // LockedPool itself is single-threaded. The mutex is the central
+    // allocator for checkpoint workers; normal SN operations are already
+    // serialized by the global X lock. Node contents live in the pool's
+    // stationary mapping and may be accessed concurrently only through
+    // disjoint tree ownership / pre-reserved indexes.
+    slots: Mutex<Nodes>,
+    base: usize,
+    max_nodes: u32,
 }
 
 impl ExtentTreePool {
     pub(super) fn new(max_nodes: u32) -> Result<Self> {
         let slots = Nodes::new(max_nodes, 0)
-            .map_err(|error| Error::new(format!("create EN extent-tree pool: {error}")))?;
-        Ok(Self { slots })
+            .map_err(|error| Error::new(format!("create SN extent-tree pool: {error}")))?;
+        let base = slots.base_ptr().as_ptr() as usize;
+        Ok(Self { slots: Mutex::new(slots), base, max_nodes })
     }
 
     /// Reclaim nodes retired by tree deletion. Call under the owning X lock.
     pub(super) fn reclaim(&mut self) {
-        self.slots.reclaim();
+        self.slots.get_mut().expect("SN extent-tree pool lock poisoned").reclaim();
     }
 
     fn ptr(&self, index: u32) -> *mut Node {
-        // SAFETY: callers pass an issued pool index; the mapping is stationary.
-        unsafe { self.slots.base_ptr().as_ptr().add(index as usize) }
+        assert!(index < self.max_nodes, "SN extent-tree index exceeds pool capacity");
+        // SAFETY: the virtual mapping is stationary and callers pass an index
+        // allocated by this pool. Its address does not depend on the pool value.
+        unsafe { (self.base as *mut Node).add(index as usize) }
     }
 
     fn read(&self, index: u32) -> Node {
@@ -147,10 +158,11 @@ impl ExtentTreePool {
         unsafe { (*ptr).words() }
     }
 
-    fn words_mut_ptr(&mut self, ptr: *mut Node) -> &mut [u32; NODE_SLOTS] {
-        // SAFETY: cursor pointers come from this pool's stable mapping and
-        // remain live while the caller holds the tree's exclusive lock; the
-        // node was fully initialized before it entered the tree.
+    fn words_mut_ptr(&self, ptr: *mut Node) -> &mut [u32; NODE_SLOTS] {
+        // SAFETY: cursor pointers come from this pool's stable mapping. Normal
+        // callers hold the SN global X lock; checkpoint workers hold exclusive
+        // ownership of one disk tree, and allocated node indexes are unique.
+        // Thus no other thread can access this node while it is mutably used.
         unsafe { (*ptr).words_mut() }
     }
 
@@ -162,46 +174,74 @@ impl ExtentTreePool {
         unsafe { (*ptr).words()[slot] }
     }
 
-    fn write(&mut self, index: u32, node: Node) {
+    fn write(&self, index: u32, node: Node) {
         // SAFETY: the tree owns this live node exclusively during mutation.
         unsafe { self.ptr(index).write(node) };
     }
 
     fn index_of(&self, ptr: *mut Node) -> u32 {
-        self.slots.index_of(ptr.cast()).expect("cursor node pointer must belong to this pool")
+        let address = ptr as usize;
+        let offset = address.checked_sub(self.base).expect("cursor pointer below pool mapping");
+        assert_eq!(offset % NODE_BYTES, 0, "cursor pointer is not a pool node");
+        let index = offset / NODE_BYTES;
+        assert!(index < self.max_nodes as usize, "cursor pointer outside pool mapping");
+        index as u32
     }
 
     /// Reserve all nodes an insertion can need before it mutates the tree.
     /// This keeps pool exhaustion from leaving a partially split path.
-    fn reserve_nodes(&mut self, count: usize) -> Result<Vec<u32>> {
+    pub(super) fn reserve_nodes(&self, count: usize) -> Result<Vec<u32>> {
         if count == 0 {
             return Ok(Vec::new());
         }
         let indexes = self
             .slots
+            .lock()
+            .map_err(|_| Error::new("SN extent-tree allocator lock poisoned"))?
             .alloc_many(count)
-            .map_err(|error| Error::new(format!("allocate EN extent-tree nodes: {error}")))?;
+            .map_err(|error| Error::new(format!("allocate SN extent-tree nodes: {error}")))?;
         // The insertion path writes every reserved node in full before
         // linking it into the live tree.
         Ok(indexes)
     }
 
-    fn retire(&mut self, index: u32) {
+    /// Return unused pre-reserved nodes to the central allocator.
+    pub(super) fn return_nodes(&self, indexes: &mut Vec<u32>) -> Result<()> {
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        let mut slots =
+            self.slots.lock().map_err(|_| Error::new("SN extent-tree allocator lock poisoned"))?;
+        for index in indexes.drain(..) {
+            // SAFETY: reservations are exclusively owned by the caller and
+            // unused indexes are not referenced by any tree.
+            unsafe { slots.retire_index(index) };
+        }
+        slots.reclaim();
+        Ok(())
+    }
+
+    fn issued_blocks(&self) -> u32 {
+        self.slots.lock().expect("SN extent-tree allocator lock poisoned").issued_blocks()
+    }
+
+    fn retire(&self, index: u32) {
+        let mut slots = self.slots.lock().expect("SN extent-tree allocator lock poisoned");
         // SAFETY: callers detach this node from its tree before retiring it.
-        unsafe { self.slots.retire_index(index) };
+        unsafe { slots.retire_index(index) };
     }
 }
 
-/// One EN's ordered ExtentId index, embedded in that EN's row in the SN table.
-/// The inline root is deliberately not allocated from the node pool.
-pub(super) struct EnExtentTree {
+/// One EN disk's ordered ExtentId index. Its inline root is deliberately not
+/// allocated from the shared node pool.
+pub(super) struct DiskExtentTree {
     height: u8,
     len: u32,
     _reserved: [u8; 8],
     root: Node,
 }
 
-impl Default for EnExtentTree {
+impl Default for DiskExtentTree {
     fn default() -> Self {
         Self::new()
     }
@@ -267,7 +307,7 @@ impl Cursor {
 
     fn insert_reserve_count(
         &self,
-        tree: &EnExtentTree,
+        tree: &DiskExtentTree,
         pool: &ExtentTreePool,
         leaf_full: bool,
     ) -> Result<usize> {
@@ -290,14 +330,14 @@ impl Cursor {
         }
         if split_carries && !branch_has_hole_words(tree.root.words()) {
             if self.height == u8::MAX {
-                return Err(Error::new("EN extent-tree height overflow"));
+                return Err(Error::new("SN extent-tree height overflow"));
             }
             needed += 2; // the inline root becomes two pooled branches
         }
         Ok(needed)
     }
 
-    fn next_leaf(&mut self, tree: &EnExtentTree, pool: &ExtentTreePool) -> bool {
+    fn next_leaf(&mut self, tree: &DiskExtentTree, pool: &ExtentTreePool) -> bool {
         let height = self.height as usize;
         if height == 0 {
             return false;
@@ -329,7 +369,7 @@ impl Cursor {
     }
 }
 
-impl EnExtentTree {
+impl DiskExtentTree {
     pub(super) fn new() -> Self {
         Self { height: 0, len: 0, _reserved: [0; 8], root: Node::leaf(&[NONE; NODE_SLOTS]) }
     }
@@ -340,6 +380,41 @@ impl EnExtentTree {
 
     pub(super) fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Initial checkpoint-load reservation estimate. Sorted extent IDs are
+    /// rebuilt from an empty tree, so pooled leaves average near half full and
+    /// pooled branches add roughly one node per several leaves. The restore
+    /// allocator tops this up exactly if this estimate is low and returns the
+    /// unused tail when the tree is complete.
+    pub(super) fn checkpoint_node_estimate(entries: u64) -> Result<usize> {
+        if entries <= NODE_LEAF_CAPACITY as u64 {
+            return Ok(0);
+        }
+        let entries = usize::try_from(entries)
+            .map_err(|_| Error::new("SN disk extent index is too large"))?;
+        Ok(entries.div_ceil(NODE_SLOTS * 3 / 8))
+    }
+
+    /// Retire all pooled nodes and return this tree to its empty inline root.
+    /// The caller holds the SN-wide exclusive lock; pooled nodes are reclaimed
+    /// after all per-disk trees have been cleared.
+    pub(super) fn clear(&mut self, pool: &mut ExtentTreePool) {
+        if self.height != 0 {
+            let mut children = [NONE; BRANCH_SLOTS];
+            let mut count = 0;
+            for &child in &self.root.words()[BRANCH_SLOTS..] {
+                if child != NONE {
+                    children[count] = child;
+                    count += 1;
+                }
+            }
+            for child in children[..count].iter().copied() {
+                retire_subtree(pool, child, self.height - 1);
+            }
+        }
+        self.reset_root();
+        self.len = 0;
     }
 
     /// Find a key and retain its path, indexed by subtree height, in `cursor`.
@@ -379,7 +454,32 @@ impl EnExtentTree {
     }
 
     /// Insert an ExtentId. Returns false if it was already present.
-    pub(super) fn insert(&mut self, pool: &mut ExtentTreePool, id: ExtentId) -> Result<bool> {
+    pub(super) fn insert(&mut self, pool: &ExtentTreePool, id: ExtentId) -> Result<bool> {
+        let mut reserved = Vec::new();
+        let result = self.insert_with_reservation(pool, id, &mut reserved);
+        let returned = pool.return_nodes(&mut reserved);
+        match result {
+            Ok(inserted) => {
+                returned?;
+                Ok(inserted)
+            }
+            Err(error) => {
+                returned?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Insert using a caller-owned list of nodes reserved for this tree.
+    /// Checkpoint workers use this to keep LockedPool allocation centralized
+    /// and amortize allocation locks; a short list is topped up before any
+    /// mutation so pool exhaustion cannot leave a partially split tree.
+    pub(super) fn insert_with_reservation(
+        &mut self,
+        pool: &ExtentTreePool,
+        id: ExtentId,
+        reserved: &mut Vec<u32>,
+    ) -> Result<bool> {
         let key = id.get();
         if key == NONE {
             return Err(Error::new("ExtentId::NONE cannot be indexed"));
@@ -390,14 +490,15 @@ impl EnExtentTree {
 
         let mut cursor = Cursor::new(key);
         self.find(pool, key, &mut cursor);
-        self.insert_with_cursor(pool, key, &mut cursor)
+        self.insert_with_cursor_and_reservation(pool, key, &mut cursor, reserved)
     }
 
-    pub(super) fn insert_with_cursor(
+    fn insert_with_cursor_and_reservation(
         &mut self,
-        pool: &mut ExtentTreePool,
+        pool: &ExtentTreePool,
         key: u32,
         cursor: &mut Cursor,
+        reserved: &mut Vec<u32>,
     ) -> Result<bool> {
         debug_assert_eq!(cursor.key, key);
         if cursor.found {
@@ -412,12 +513,14 @@ impl EnExtentTree {
         let leaf_hole = nearest_hole(leaf_words, leaf.slot as usize);
         let leaf_full = leaf_hole.is_none();
         let reserve_count = cursor.insert_reserve_count(self, pool, leaf_full)?;
-        let mut reserved = pool.reserve_nodes(reserve_count)?;
+        if reserved.len() < reserve_count {
+            let mut more = pool.reserve_nodes(reserve_count - reserved.len())?;
+            reserved.append(&mut more);
+        }
 
         if self.height == 0 {
             if let Some(hole) = leaf_hole {
                 insert_sparse_item(self.root.words_mut(), key, leaf.slot as usize, hole);
-                debug_assert!(reserved.is_empty());
                 self.len += 1;
                 return Ok(true);
             }
@@ -449,7 +552,7 @@ impl EnExtentTree {
             self.root.words_mut()[child_at] = key;
         }
         if let Some((separator, right)) =
-            insert_subtree(pool, self.height - 1, 1, key, &cursor, leaf_hole, &mut reserved)
+            insert_subtree(pool, self.height - 1, 1, key, &cursor, leaf_hole, reserved)
         {
             if !insert_branch_entry_words(self.root.words_mut(), child_at, separator, right) {
                 let left_index = reserved.pop().expect("root branch split was pre-reserved");
@@ -475,7 +578,6 @@ impl EnExtentTree {
                 self._reserved = [0; 8];
             }
         }
-        debug_assert!(reserved.is_empty());
         self.len += 1;
         Ok(true)
     }
@@ -599,13 +701,20 @@ impl EnExtentTree {
         Ok(true)
     }
 
-    /// Visit ExtentIds in increasing order. Return false from `visit` to stop.
-    pub(super) fn for_each(&self, pool: &ExtentTreePool, mut visit: impl FnMut(ExtentId) -> bool) {
-        if self.len == 0 {
+    /// Visit ExtentIds in `[first, last]` order. Return false from `visit` to
+    /// stop. Checkpoint chunks use this to serialize bounded key ranges.
+    pub(super) fn for_each_range(
+        &self,
+        pool: &ExtentTreePool,
+        first: ExtentId,
+        last: ExtentId,
+        mut visit: impl FnMut(ExtentId) -> bool,
+    ) {
+        if self.len == 0 || first > last {
             return;
         }
-        let mut cursor = Cursor::new(0);
-        self.find(pool, 0, &mut cursor);
+        let mut cursor = Cursor::new(first.get());
+        self.find(pool, first.get(), &mut cursor);
         loop {
             let mut leaf = cursor.leaf();
             while (leaf.slot as usize) < NODE_SLOTS {
@@ -620,6 +729,9 @@ impl EnExtentTree {
                 if key == NONE {
                     continue;
                 }
+                if key > last.get() {
+                    return;
+                }
                 if !visit(ExtentId::new(key)) {
                     return;
                 }
@@ -628,6 +740,12 @@ impl EnExtentTree {
                 break;
             }
         }
+    }
+
+    /// Visit every ExtentId in increasing order. Return false from `visit` to
+    /// stop.
+    pub(super) fn for_each(&self, pool: &ExtentTreePool, visit: impl FnMut(ExtentId) -> bool) {
+        self.for_each_range(pool, ExtentId::FIRST, ExtentId::new(NONE - 1), visit);
     }
 
     fn reset_root(&mut self) {
@@ -660,8 +778,27 @@ impl EnExtentTree {
     }
 }
 
+fn retire_subtree(pool: &mut ExtentTreePool, index: u32, height: u8) {
+    if height != 0 {
+        let node = pool.read(index);
+        let words = node.words();
+        let mut children = [NONE; BRANCH_SLOTS];
+        let mut count = 0;
+        for &child in &words[BRANCH_SLOTS..] {
+            if child != NONE {
+                children[count] = child;
+                count += 1;
+            }
+        }
+        for child in children[..count].iter().copied() {
+            retire_subtree(pool, child, height - 1);
+        }
+    }
+    pool.retire(index);
+}
+
 fn insert_subtree(
-    pool: &mut ExtentTreePool,
+    pool: &ExtentTreePool,
     height: u8,
     path_level: usize,
     key: u32,
@@ -1111,7 +1248,7 @@ fn insert_branch_entry_words(
 /// Split a full leaf in place. The original array is dense because a split is
 /// only needed when it has no hole. `right_words` is fresh initialized storage.
 fn split_leaf_node(
-    pool: &mut ExtentTreePool,
+    pool: &ExtentTreePool,
     left_ptr: *mut Node,
     right_index: u32,
     insert_at: usize,
@@ -1132,7 +1269,7 @@ fn split_leaf_node(
 /// Split a full branch in place, using the same layout routine for its keys
 /// and child indexes. Returns the minima of the left and right results.
 fn split_branch_nodes(
-    pool: &mut ExtentTreePool,
+    pool: &ExtentTreePool,
     left_index: u32,
     right_index: u32,
     insert_at: usize,
@@ -1511,7 +1648,7 @@ mod tests {
         }
     }
 
-    fn tree_usage(tree: &EnExtentTree, pool: &ExtentTreePool) -> TreeUsage {
+    fn tree_usage(tree: &DiskExtentTree, pool: &ExtentTreePool) -> TreeUsage {
         let mut usage = TreeUsage::default();
         if tree.height == 0 {
             let count = count_non_none(tree.root.words());
@@ -1545,7 +1682,7 @@ mod tests {
 
     fn report_timing(
         phase: &str,
-        tree: &EnExtentTree,
+        tree: &DiskExtentTree,
         pool: &ExtentTreePool,
         elapsed: Duration,
         operations: u64,
@@ -1553,12 +1690,12 @@ mod tests {
     ) {
         let usage = tree_usage(tree, pool);
         let live_nodes = if tree.height == 0 {
-            0 // The leaf root is inline in EnExtentTree, not a pooled node.
+            0 // The leaf root is inline in DiskExtentTree, not a pooled node.
         } else {
             usage.leaves + usage.branches
         };
         let live_node_bytes = live_nodes * NODE_BYTES;
-        let issued_bytes = pool.slots.issued_blocks() as usize * NODE_BYTES;
+        let issued_bytes = pool.issued_blocks() as usize * NODE_BYTES;
         let reserved_bytes = max_nodes as usize * NODE_BYTES;
         let seconds = elapsed.as_secs_f64();
         println!(
@@ -1569,10 +1706,10 @@ mod tests {
             usage.leaves,
             usage.branches,
             live_node_bytes,
-            size_of::<EnExtentTree>(),
+            size_of::<DiskExtentTree>(),
             usage.leaf_id_bytes,
             usage.occupied_slots,
-            pool.slots.issued_blocks(),
+            pool.issued_blocks(),
             issued_bytes,
             reserved_bytes,
         );
@@ -1588,7 +1725,7 @@ mod tests {
         // Allow two nodes per NODE_SLOTS entries for branch-node overhead.
         let max_nodes = ((entries as u64) * 4).div_ceil(NODE_SLOTS as u64).max(1) as u32;
         let mut pool = ExtentTreePool::new(max_nodes).unwrap();
-        let mut tree = EnExtentTree::new();
+        let mut tree = DiskExtentTree::new();
 
         // Both permutations are initialized before any timed phase. They use
         // the same cycle: one yields new IDs, the other yields active IDs to
@@ -1650,7 +1787,7 @@ mod tests {
         report_timing("delete_all", &tree, &pool, elapsed, entries as u64, max_nodes);
     }
 
-    fn collect(tree: &EnExtentTree, pool: &ExtentTreePool) -> Vec<u32> {
+    fn collect(tree: &DiskExtentTree, pool: &ExtentTreePool) -> Vec<u32> {
         let mut keys = Vec::with_capacity(tree.len() as usize);
         tree.for_each(pool, |id| {
             keys.push(id.get());
@@ -1681,18 +1818,18 @@ mod tests {
     #[test]
     fn inline_root_holds_root_capacity_raw_ids_then_rebalances() {
         let mut pool = ExtentTreePool::new(256).unwrap();
-        let initial_nodes = pool.slots.issued_blocks();
-        let mut tree = EnExtentTree::new();
+        let initial_nodes = pool.issued_blocks();
+        let mut tree = DiskExtentTree::new();
         for value in 0..ROOT_LEAF_CAPACITY as u32 {
             assert!(tree.insert(&mut pool, ExtentId::new(value)).unwrap());
         }
         assert_eq!(tree.height, 0);
-        assert_eq!(pool.slots.issued_blocks(), initial_nodes);
+        assert_eq!(pool.issued_blocks(), initial_nodes);
         assert_eq!(collect(&tree, &pool), (0..ROOT_LEAF_CAPACITY as u32).collect::<Vec<_>>());
 
         assert!(tree.insert(&mut pool, ExtentId::new(u32::MAX - 1)).unwrap());
         assert_eq!(tree.height, 1);
-        assert_eq!(pool.slots.issued_blocks(), initial_nodes + 1);
+        assert_eq!(pool.issued_blocks(), initial_nodes + 1);
         let mut expected: Vec<u32> = (0..ROOT_LEAF_CAPACITY as u32).collect();
         expected.push(u32::MAX - 1);
         assert_eq!(collect(&tree, &pool), expected);
@@ -1718,7 +1855,7 @@ mod tests {
     #[test]
     fn leaf_merge_obeys_raw_slot_capacity() {
         let mut pool = ExtentTreePool::new(64).unwrap();
-        let mut tree = EnExtentTree::new();
+        let mut tree = DiskExtentTree::new();
         let mut values: Vec<u32> =
             (0..NODE_LEAF_CAPACITY + 2).map(|value| value as u32 * 0x0100_0000).collect();
         values.push((NODE_LEAF_CAPACITY as u32 + 2) * 0x0100_0000);
@@ -1782,7 +1919,7 @@ mod tests {
     #[test]
     fn pooled_leaf_empty_marker_is_reached_by_descending_deletes() {
         let mut pool = ExtentTreePool::new(64).unwrap();
-        let mut tree = EnExtentTree::new();
+        let mut tree = DiskExtentTree::new();
         for value in 0..ROOT_LEAF_CAPACITY as u32 + 1 {
             assert!(tree.insert(&mut pool, ExtentId::new(value)).unwrap());
         }
@@ -1806,8 +1943,8 @@ mod tests {
         pool.reclaim();
     }
 
-    fn tree_until_height_two(pool: &mut ExtentTreePool, stride: u32) -> EnExtentTree {
-        let mut tree = EnExtentTree::new();
+    fn tree_until_height_two(pool: &mut ExtentTreePool, stride: u32) -> DiskExtentTree {
+        let mut tree = DiskExtentTree::new();
         let max_entries = NODE_SLOTS * BRANCH_CAPACITY * 8;
         for value in 0..max_entries as u32 {
             assert!(tree.insert(pool, ExtentId::new(value * stride)).unwrap());
@@ -1819,7 +1956,7 @@ mod tests {
     }
 
     fn delete_leaf_highest_to_lowest(
-        tree: &mut EnExtentTree,
+        tree: &mut DiskExtentTree,
         pool: &mut ExtentTreePool,
         leaf: u32,
     ) -> Vec<u32> {
@@ -1904,7 +2041,7 @@ mod tests {
     fn inserts_and_deletes_preserve_order_for_scrambled_and_wide_keys() {
         for values in [permutation(4000, 0x1234), pseudorandom_ids(2500)] {
             let mut pool = ExtentTreePool::new(4096).unwrap();
-            let mut tree = EnExtentTree::new();
+            let mut tree = DiskExtentTree::new();
             let mut expected = BTreeSet::new();
             for &value in &values {
                 assert!(tree.insert(&mut pool, ExtentId::new(value)).unwrap());
@@ -1936,7 +2073,7 @@ mod tests {
     #[test]
     fn rejects_reserved_extent_id() {
         let mut pool = ExtentTreePool::new(8).unwrap();
-        let mut tree = EnExtentTree::new();
+        let mut tree = DiskExtentTree::new();
         assert!(tree.insert(&mut pool, ExtentId::NONE).is_err());
         assert!(!tree.contains(&pool, ExtentId::NONE));
         assert!(!tree.remove(&mut pool, ExtentId::NONE).unwrap());

@@ -1,4 +1,5 @@
 //! SN application checkpoint codec.
+use super::extent_tree::DiskExtentTree;
 use super::{
     DeleteTask, Extent, ExtentData, ExtentTable, MAX_STREAMS, PendingDelete, SNState, Stream,
 };
@@ -9,11 +10,12 @@ use common::offset::{ECoff, ELoff, ERoff, SRoff};
 use common::time::{TimeIntSec32, TimeIntSec64, TimeSec};
 use common::{Error, Op, Result};
 use raft::codec;
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 const REF_CHUNK: usize = 16 * 1024;
 const CHUNK_BYTES: usize = 2 * 1024 * 1024;
@@ -36,6 +38,9 @@ struct Footer {
     extents: u64,
     extent_slots: ExtentId,
     ens: Range,
+    disk_extent_entries: u64,
+    disk_extent_rows: Range,
+    disk_extent_chunks: Vec<raft::checkpoint::ChunkPos>,
     extent_rows: Range,
     extent_chunks: Vec<raft::checkpoint::ChunkPos>,
     stream_rows: Range,
@@ -54,6 +59,9 @@ impl codec::Wire for Footer {
             self.extents.write(writer);
             writer.extent_id(self.extent_slots);
             self.ens.write(writer);
+            self.disk_extent_entries.write(writer);
+            self.disk_extent_rows.write(writer);
+            self.disk_extent_chunks.write(writer);
             self.extent_rows.write(writer);
             self.extent_chunks.write(writer);
             self.stream_rows.write(writer);
@@ -74,6 +82,9 @@ impl codec::Wire for Footer {
                 extents: codec::Wire::read(reader)?,
                 extent_slots: reader.extent_id()?,
                 ens: codec::Wire::read(reader)?,
+                disk_extent_entries: codec::Wire::read(reader)?,
+                disk_extent_rows: codec::Wire::read(reader)?,
+                disk_extent_chunks: codec::Wire::read(reader)?,
                 extent_rows: codec::Wire::read(reader)?,
                 extent_chunks: codec::Wire::read(reader)?,
                 stream_rows: codec::Wire::read(reader)?,
@@ -90,6 +101,60 @@ struct EnRow {
     disks: Vec<u64>,
 }
 raft::wire_struct!(EnRow, SnCkEn, {id,disks});
+
+struct ExtentIndex(u32);
+
+impl codec::Wire for ExtentIndex {
+    fn write(&self, writer: &mut common::StructWriter) {
+        writer.number_u32(self.0);
+    }
+
+    fn read(reader: &mut common::StructReader<'_>) -> Result<Self> {
+        Ok(Self(reader.number_u32()?))
+    }
+}
+
+struct DiskExtentIndexRow {
+    en: u64,
+    disk: u64,
+    ids: Vec<ExtentIndex>,
+}
+raft::wire_struct!(DiskExtentIndexRow, SnCkDiskExtentIndex, {en,disk,ids});
+
+#[derive(Clone, Copy, Debug)]
+enum DiskExtentMismatchKind {
+    FooterEntryCount,
+    EmptyTree,
+    UnsortedIds,
+    UnknownDisk,
+    NoneExtentId,
+    MissingExtent,
+    WrongDisk,
+    DuplicateExtentId,
+    DuplicateTree,
+    ExtentNotIndexed,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DiskExtentMismatch {
+    kind: DiskExtentMismatchKind,
+    disk: Option<(u64, u16)>,
+    extent: Option<u32>,
+}
+
+impl DiskExtentMismatch {
+    fn new(
+        kind: DiskExtentMismatchKind,
+        disk: Option<(EnId, DiskId)>,
+        extent: Option<u32>,
+    ) -> Self {
+        Self { kind, disk: disk.map(|(en, disk)| (en.get(), disk.get())), extent }
+    }
+}
+
+struct DiskExtentIndexRange {
+    disks: Vec<(EnId, DiskId)>,
+}
 
 struct ExtExtra {
     until: u64,
@@ -468,6 +533,99 @@ fn write_extents(
     Ok((range(file, start)?, chunks))
 }
 
+fn write_disk_extent_indexes(
+    file: &mut File,
+    state: &SNState,
+    workers: usize,
+) -> Result<(Range, Vec<raft::checkpoint::ChunkPos>, u64)> {
+    let indexes = &state.disk_extent_indexes;
+    let mut disks: Vec<_> = indexes
+        .ens
+        .iter()
+        .flat_map(|(&en, en_indexes)| en_indexes.disks.keys().map(move |&disk| (en, disk)))
+        .collect();
+    disks.sort_unstable();
+
+    let mut ranges = Vec::new();
+    let mut current = Vec::new();
+    let mut current_bytes = 0usize;
+    let mut entries = 0u64;
+    for disk in disks {
+        let tree = indexes.tree(disk).expect("disk index collected from tree map");
+        if tree.is_empty() {
+            return Err(Error::new("SN disk extent index contains an empty tree"));
+        }
+        let tree_bytes = usize::try_from(tree.len())
+            .ok()
+            .and_then(|count| count.checked_mul(5))
+            .and_then(|bytes| bytes.checked_add(64))
+            .ok_or_else(|| Error::new("SN disk extent tree chunk size overflow"))?;
+        if !current.is_empty() && current_bytes.saturating_add(tree_bytes) > CHUNK_BYTES {
+            ranges.push(DiskExtentIndexRange { disks: std::mem::take(&mut current) });
+            current_bytes = 0;
+        }
+        current.push(disk);
+        current_bytes = current_bytes.saturating_add(tree_bytes);
+        if current_bytes >= CHUNK_BYTES {
+            ranges.push(DiskExtentIndexRange { disks: std::mem::take(&mut current) });
+            current_bytes = 0;
+        }
+        entries = entries
+            .checked_add(u64::from(tree.len()))
+            .ok_or_else(|| Error::new("SN disk extent index count overflow"))?;
+    }
+    if !current.is_empty() {
+        ranges.push(DiskExtentIndexRange { disks: current });
+    }
+
+    let start = file.stream_position()?;
+    section(file, Op::SnCkDiskExtents, ranges.len() as u64)?;
+    let data_start = file.stream_position()?;
+    let chunk_ranges: Vec<_> = (0..ranges.len()).map(|part| (part as u64, 1)).collect();
+    let (chunks, end) = raft::checkpoint::write_chunks(
+        file,
+        data_start,
+        workers,
+        "SN disk extent indexes",
+        &chunk_ranges,
+        CHUNK_MAX,
+        CHUNK_ITEMS as u64,
+        |first, span| {
+            if span != 1 {
+                return Err(Error::new("SN disk extent index chunk was split"));
+            }
+            let at = usize::try_from(first)
+                .map_err(|_| Error::new("SN disk extent chunk index overflow"))?;
+            let chunk_range = ranges
+                .get(at)
+                .ok_or_else(|| Error::new("SN disk extent chunk is outside its table"))?;
+            let mut rows = Vec::with_capacity(chunk_range.disks.len());
+            for &disk in &chunk_range.disks {
+                let tree = indexes.tree(disk).ok_or_else(|| {
+                    Error::new("SN disk extent tree disappeared during checkpoint")
+                })?;
+                let mut ids = Vec::with_capacity(tree.len() as usize);
+                tree.for_each(&indexes.pool, |id| {
+                    ids.push(ExtentIndex(id.get()));
+                    true
+                });
+                if ids.len() != tree.len() as usize {
+                    return Err(Error::new("SN disk extent tree changed during checkpoint"));
+                }
+                rows.push(DiskExtentIndexRow {
+                    en: u64::from(disk.0.get()),
+                    disk: u64::from(disk.1.get()),
+                    ids,
+                });
+            }
+            let count = rows.len() as u64;
+            Ok((count, encode_chunk(Op::SnCkDiskExtentChunk, &rows)?))
+        },
+    )?;
+    file.seek(SeekFrom::Start(end))?;
+    Ok((range(file, start)?, chunks, entries))
+}
+
 fn stream_head(stream: &Stream, extra: Option<&Extra<()>>) -> Result<StreamHead> {
     if stream.deletion.extra() != extra.is_some() {
         return Err(Error::new("SN stream extra flag does not match its checkpoint data"));
@@ -629,6 +787,8 @@ pub(super) fn write(
         return Err(Error::new("SN checkpoint target is not empty"));
     }
     let ens = write_ens(file, disks)?;
+    let (disk_extent_rows, disk_extent_chunks, disk_extent_entries) =
+        write_disk_extent_indexes(file, state, workers)?;
     let (extent_rows, extent_chunks) = write_extents(file, state, disks, workers)?;
     let (stream_rows, stream_chunks) = write_streams(file, state, workers)?;
     let stream_buckets = state.stream_map.bucket_count();
@@ -643,6 +803,9 @@ pub(super) fn write(
         extents: state.extents,
         extent_slots: ExtentId::of_number(state.extent_table.len() as u64)?,
         ens,
+        disk_extent_entries,
+        disk_extent_rows,
+        disk_extent_chunks,
         extent_rows,
         extent_chunks,
         stream_rows,
@@ -698,10 +861,17 @@ fn read_public(file: &mut (impl Read + Seek)) -> Result<(Footer, u64)> {
     }
     let footer: Footer = decode_piece(&fixed.bytes)?;
     footer.raft.validate()?;
+    check_chunks(footer.disk_extent_rows, &footer.disk_extent_chunks)?;
     check_chunks(footer.extent_rows, &footer.extent_chunks)?;
     check_chunks(footer.stream_rows, &footer.stream_chunks)?;
-    let ranges =
-        [footer.ens, footer.extent_rows, footer.stream_rows, footer.retired, footer.pending];
+    let ranges = [
+        footer.ens,
+        footer.disk_extent_rows,
+        footer.extent_rows,
+        footer.stream_rows,
+        footer.retired,
+        footer.pending,
+    ];
     let mut end = 0;
     for part in ranges {
         if part.start != end || part.len < 10 {
@@ -923,6 +1093,290 @@ fn read_extents(
     for (key, value) in extras {
         if state.extent_extras.restore(key, value).is_some() {
             return Err(Error::new("duplicate SN checkpoint extent extra"));
+        }
+    }
+    Ok(())
+}
+
+fn read_disk_extent_indexes(
+    file: &mut File,
+    range: Range,
+    chunks: &[raft::checkpoint::ChunkPos],
+    state: &mut SNState,
+    disk_roster: &[(EnId, DiskId)],
+    expected_entries: u64,
+    workers: usize,
+) -> Result<Vec<DiskExtentMismatch>> {
+    let section = read_section(file, range, Op::SnCkDiskExtents)?;
+    check_chunks(range, chunks)?;
+    if section.count != chunks.len() as u64
+        || chunks.iter().any(|chunk| chunk.items == 0 || chunk.items > CHUNK_ITEMS as u64)
+    {
+        return Err(Error::new("SN disk extent index count does not match its chunks"));
+    }
+
+    let mut mismatches = Vec::new();
+    let known_disks: HashSet<_> = disk_roster.iter().copied().collect();
+
+    // A checkpoint chunk contains whole disk trees. Its worker owns each tree
+    // from creation through completion, so no tree mutex is needed. Workers
+    // share only the central allocator lock when they need an extra node batch.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    {
+        let tree_pool = &state.disk_extent_indexes.pool;
+        let extent_table = &state.extent_table;
+        raft::checkpoint::read_chunks(
+            &*file,
+            chunks,
+            workers,
+            "SN disk extent indexes",
+            |chunk, bytes| {
+                let rows: Vec<DiskExtentIndexRow> =
+                    decode_chunk(chunk, &bytes, Op::SnCkDiskExtentChunk)?;
+                if rows.is_empty() {
+                    return Err(Error::new("SN disk extent chunk contains no trees"));
+                }
+                for row in rows {
+                    let disk_name = (EnId::of_number(row.en)?, DiskId::of_number(row.disk)?);
+                    let mut row_mismatches = Vec::new();
+                    if row.ids.is_empty() {
+                        row_mismatches.push(DiskExtentMismatch::new(
+                            DiskExtentMismatchKind::EmptyTree,
+                            Some(disk_name),
+                            None,
+                        ));
+                    }
+                    if row.ids.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+                        row_mismatches.push(DiskExtentMismatch::new(
+                            DiskExtentMismatchKind::UnsortedIds,
+                            Some(disk_name),
+                            None,
+                        ));
+                    }
+                    if !known_disks.contains(&disk_name) {
+                        row_mismatches.push(DiskExtentMismatch::new(
+                            DiskExtentMismatchKind::UnknownDisk,
+                            Some(disk_name),
+                            None,
+                        ));
+                    }
+                    let mut tree = DiskExtentTree::new();
+                    let estimate = DiskExtentTree::checkpoint_node_estimate(row.ids.len() as u64)?;
+                    let mut nodes = tree_pool.reserve_nodes(estimate)?;
+                    for item in &row.ids {
+                        if item.0 == ExtentId::NONE.get() {
+                            row_mismatches.push(DiskExtentMismatch::new(
+                                DiskExtentMismatchKind::NoneExtentId,
+                                Some(disk_name),
+                                Some(item.0),
+                            ));
+                            continue;
+                        }
+                        match extent_table
+                            .get(item.0 as usize)
+                            .filter(|extent| extent.deletion.is_valid())
+                        {
+                            None => row_mismatches.push(DiskExtentMismatch::new(
+                                DiskExtentMismatchKind::MissingExtent,
+                                Some(disk_name),
+                                Some(item.0),
+                            )),
+                            Some(extent)
+                                if !extent.disks.iter().any(|sn_disk| {
+                                    disk_roster
+                                        .get(sn_disk.get() as usize)
+                                        .is_some_and(|name| *name == disk_name)
+                                }) =>
+                            {
+                                row_mismatches.push(DiskExtentMismatch::new(
+                                    DiskExtentMismatchKind::WrongDisk,
+                                    Some(disk_name),
+                                    Some(item.0),
+                                ));
+                            }
+                            Some(_) => {}
+                        }
+                        if !tree.insert_with_reservation(
+                            tree_pool,
+                            ExtentId::new(item.0),
+                            &mut nodes,
+                        )? {
+                            row_mismatches.push(DiskExtentMismatch::new(
+                                DiskExtentMismatchKind::DuplicateExtentId,
+                                Some(disk_name),
+                                Some(item.0),
+                            ));
+                        }
+                    }
+                    tree_pool.return_nodes(&mut nodes)?;
+                    let row_entries = u64::try_from(row.ids.len())
+                        .map_err(|_| Error::new("SN disk extent index row is too large"))?;
+                    sender
+                        .send((disk_name, tree, row_mismatches, row_entries))
+                        .map_err(|_| Error::new("SN disk extent index result receiver closed"))?;
+                }
+                Ok(())
+            },
+        )?;
+    }
+    drop(sender);
+
+    let mut disks_seen = HashSet::<(EnId, DiskId)>::with_capacity(disk_roster.len());
+    let mut actual_entries = 0u64;
+    for (disk, mut tree, mut row_mismatches, row_entries) in receiver {
+        actual_entries = actual_entries
+            .checked_add(row_entries)
+            .ok_or_else(|| Error::new("SN disk extent index entry count overflow"))?;
+        mismatches.append(&mut row_mismatches);
+        if !disks_seen.insert(disk) {
+            mismatches.push(DiskExtentMismatch::new(
+                DiskExtentMismatchKind::DuplicateTree,
+                Some(disk),
+                None,
+            ));
+            tree.clear(&mut state.disk_extent_indexes.pool);
+            continue;
+        }
+        state.disk_extent_indexes.insert_tree(disk, tree)?;
+    }
+    if actual_entries != expected_entries {
+        mismatches.push(DiskExtentMismatch::new(
+            DiskExtentMismatchKind::FooterEntryCount,
+            None,
+            None,
+        ));
+    }
+    Ok(mismatches)
+}
+
+/// Compare the extent rows back to their per-disk trees using the same
+/// ExtentId ranges as the checkpoint chunks. Each worker scans disjoint ranges
+/// and returns its own inconsistency list.
+fn check_extent_chunks_against_disk_indexes(
+    state: &SNState,
+    chunks: &[raft::checkpoint::ChunkPos],
+    disk_roster: &[(EnId, DiskId)],
+    workers: usize,
+) -> Result<Vec<DiskExtentMismatch>> {
+    if workers == 0 {
+        return Err(Error::new("SN checkpoint validation needs at least one worker"));
+    }
+    let table_len = state.extent_table.len();
+    for chunk in chunks {
+        let end = chunk
+            .first
+            .checked_add(chunk.span)
+            .filter(|end| *end <= table_len as u64)
+            .ok_or_else(|| Error::new("SN extent validation chunk exceeds its table"))?;
+        if chunk.span == 0 || end <= chunk.first {
+            return Err(Error::new("SN extent validation chunk is empty"));
+        }
+    }
+
+    let next = AtomicUsize::new(0);
+    let worker_count = workers.min(chunks.len());
+    if worker_count == 0 {
+        return Ok(Vec::new());
+    }
+    std::thread::scope(|scope| -> Result<Vec<DiskExtentMismatch>> {
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let next = &next;
+            let chunks = chunks;
+            let table = &state.extent_table;
+            let indexes = &state.disk_extent_indexes;
+            handles.push(scope.spawn(move || -> Result<Vec<DiskExtentMismatch>> {
+                let mut mismatches = Vec::new();
+                loop {
+                    let chunk_at = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(chunk) = chunks.get(chunk_at) else { break };
+                    let first = usize::try_from(chunk.first)
+                        .map_err(|_| Error::new("SN extent validation offset is too large"))?;
+                    let end = usize::try_from(chunk.first + chunk.span)
+                        .map_err(|_| Error::new("SN extent validation limit is too large"))?;
+                    for extent in &table[first..end] {
+                        if !extent.deletion.is_valid() {
+                            continue;
+                        }
+                        for &sn_disk in &extent.disks {
+                            let disk =
+                                *disk_roster.get(sn_disk.get() as usize).ok_or_else(|| {
+                                    Error::new("SN extent disk index is outside its roster")
+                                })?;
+                            if !indexes.contains(disk, extent.id) {
+                                mismatches.push(DiskExtentMismatch::new(
+                                    DiskExtentMismatchKind::ExtentNotIndexed,
+                                    Some(disk),
+                                    Some(extent.id.get()),
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(mismatches)
+            }));
+        }
+
+        let mut mismatches = Vec::new();
+        for handle in handles {
+            let mut worker_mismatches = handle
+                .join()
+                .map_err(|_| Error::new("SN checkpoint extent validation worker panicked"))??;
+            mismatches.append(&mut worker_mismatches);
+        }
+        Ok(mismatches)
+    })
+}
+
+fn verify_or_repair_disk_extent_indexes(
+    state: &mut SNState,
+    chunks: &[raft::checkpoint::ChunkPos],
+    disk_roster: &[(EnId, DiskId)],
+    workers: usize,
+    repair: bool,
+    mut mismatches: Vec<DiskExtentMismatch>,
+) -> Result<()> {
+    mismatches.extend(check_extent_chunks_against_disk_indexes(
+        state,
+        chunks,
+        disk_roster,
+        workers,
+    )?);
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+
+    common::logw!(
+        "SN checkpoint disk extent index inconsistent",
+        "count {}, first {:?}, disk {:?}, extent {:?}, repair {}",
+        mismatches.len(),
+        mismatches[0].kind,
+        mismatches[0].disk,
+        mismatches[0].extent,
+        repair
+    );
+    if !repair {
+        return Err(Error::new(format!(
+            "SN checkpoint EN disk extent indexes contain {} inconsistency(s); first {:?} disk {:?} extent {:?}",
+            mismatches.len(),
+            mismatches[0].kind,
+            mismatches[0].disk,
+            mismatches[0].extent
+        )));
+    }
+
+    // Extent rows are the source of truth for this derived reverse index.
+    // Complete both parallel scans before rebuilding it single-threadedly.
+    let SNState { extent_table, disk_extent_indexes, .. } = state;
+    disk_extent_indexes.clear();
+    for extent in extent_table.iter().filter(|extent| extent.deletion.is_valid()) {
+        for &sn_disk in &extent.disks {
+            let disk = *disk_roster
+                .get(sn_disk.get() as usize)
+                .ok_or_else(|| Error::new("SN extent disk index is outside its roster"))?;
+            if !disk_extent_indexes.insert_one(disk, extent.id)? {
+                return Err(Error::new("SN extent index repair found a duplicate instance"));
+            }
         }
     }
     Ok(())
@@ -1177,13 +1631,14 @@ pub(super) struct Restored {
 
 /// Read the application image after Raft has selected this checkpoint.
 pub(super) fn read_state(path: &Path, max_extents: u32) -> Result<Restored> {
-    read_state_with_workers(path, max_extents, 16)
+    read_state_with_workers(path, max_extents, 16, false)
 }
 
 pub(super) fn read_state_with_workers(
     path: &Path,
     max_extents: u32,
     workers: usize,
+    repair_checkpoint_indexes: bool,
 ) -> Result<Restored> {
     let mut file = File::open(path)?;
     let fixed = raft::checkpoint::read_footer(&mut file)?;
@@ -1216,6 +1671,25 @@ pub(super) fn read_state_with_workers(
         &old_to_new,
         footer.extents,
         workers,
+    )?;
+    // Each disk's extent list is stored independently so checkpoint workers can
+    // read the reverse indexes without deriving them from the parallel extents.
+    let index_mismatches = read_disk_extent_indexes(
+        &mut file,
+        footer.disk_extent_rows,
+        &footer.disk_extent_chunks,
+        &mut state,
+        &disks,
+        footer.disk_extent_entries,
+        workers,
+    )?;
+    verify_or_repair_disk_extent_indexes(
+        &mut state,
+        &footer.extent_chunks,
+        &disks,
+        workers,
+        repair_checkpoint_indexes,
+        index_mismatches,
     )?;
     read_streams(
         &mut file,

@@ -380,6 +380,9 @@ ops! {
     EnCkFooter = 206, "en-checkpoint-footer";
     EnCkExtent = 207, "en-checkpoint-extent";
     EnCkAppend = 208, "en-checkpoint-append";
+    SnCkDiskExtents = 209, "sn-checkpoint-disk-extents";
+    SnCkDiskExtentIndex = 210, "sn-checkpoint-disk-extent-index";
+    SnCkDiskExtentChunk = 211, "sn-checkpoint-disk-extent-chunk";
 }
 
 impl std::fmt::Display for Op {

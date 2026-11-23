@@ -177,7 +177,13 @@ pub fn dn_config() -> DNConfig {
 }
 
 pub fn sn_config() -> SNConfig {
-    SNConfig { raft: Default::default(), knobs: knobs(), max_extents: 1024, stream_share: 0.333 }
+    SNConfig {
+        raft: Default::default(),
+        knobs: knobs(),
+        max_extents: 1024,
+        stream_share: 0.333,
+        repair_checkpoint_indexes: false,
+    }
 }
 
 /// A connected pair of wires, for testing the wire protocol without a network.

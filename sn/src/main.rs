@@ -17,6 +17,8 @@ mod checkpoint;
 #[allow(dead_code)]
 mod extent_tree;
 
+use extent_tree::{DiskExtentTree, ExtentTreePool};
+
 use common::config::{SNConfig, ServiceKind};
 use common::deletion::{
     Delete, Extras, Flags, SharedExtras, Target, bad, forward, read_soft_deleted,
@@ -360,6 +362,181 @@ unsafe impl pool::PoolItem for Extent {
 }
 
 type ExtentPool = Pool<Extent, { align_of::<Extent>() }>;
+
+/// Per-EN grouping of the disk-specific extent indexes.
+#[derive(Default)]
+struct EnDiskExtentIndexes {
+    disks: HashMap<DiskId, DiskExtentTree>,
+}
+
+/// Reverse index from EN disks to their extent instances. Extent rows remain
+/// the source of truth; each instance contributes one ExtentId to its disk.
+struct DiskExtentIndexes {
+    ens: HashMap<EnId, EnDiskExtentIndexes>,
+    pool: ExtentTreePool,
+}
+
+impl DiskExtentIndexes {
+    fn new(max_nodes: u32) -> Result<Self> {
+        Ok(Self { ens: HashMap::new(), pool: ExtentTreePool::new(max_nodes)? })
+    }
+
+    fn insert_one(&mut self, disk: (EnId, DiskId), id: ExtentId) -> Result<bool> {
+        let result = {
+            let Self { ens, pool } = self;
+            ens.entry(disk.0).or_default().disks.entry(disk.1).or_default().insert(pool, id)
+        };
+        if result.is_err() {
+            let remove_en = if let Some(en_indexes) = self.ens.get_mut(&disk.0) {
+                if en_indexes.disks.get(&disk.1).is_some_and(DiskExtentTree::is_empty) {
+                    en_indexes.disks.remove(&disk.1);
+                }
+                en_indexes.disks.is_empty()
+            } else {
+                false
+            };
+            if remove_en {
+                self.ens.remove(&disk.0);
+            }
+        }
+        result
+    }
+
+    fn insert_tree(&mut self, disk: (EnId, DiskId), tree: DiskExtentTree) -> Result<()> {
+        let disks = &mut self.ens.entry(disk.0).or_default().disks;
+        if disks.contains_key(&disk.1) {
+            return Err(Error::new("duplicate SN disk extent index tree"));
+        }
+        disks.insert(disk.1, tree);
+        Ok(())
+    }
+
+    fn remove_one(&mut self, disk: (EnId, DiskId), id: ExtentId) -> Result<bool> {
+        let Self { ens, pool } = self;
+        let Some(en_indexes) = ens.get_mut(&disk.0) else {
+            return Ok(false);
+        };
+        let Some(tree) = en_indexes.disks.get_mut(&disk.1) else {
+            return Ok(false);
+        };
+        let (removed, empty) = {
+            let removed = tree.remove(pool, id)?;
+            (removed, tree.is_empty())
+        };
+        if empty {
+            en_indexes.disks.remove(&disk.1);
+        }
+        if en_indexes.disks.is_empty() {
+            ens.remove(&disk.0);
+        }
+        Ok(removed)
+    }
+
+    fn contains(&self, disk: (EnId, DiskId), id: ExtentId) -> bool {
+        self.ens
+            .get(&disk.0)
+            .and_then(|en_indexes| en_indexes.disks.get(&disk.1))
+            .is_some_and(|tree| tree.contains(&self.pool, id))
+    }
+
+    fn tree(&self, disk: (EnId, DiskId)) -> Option<&DiskExtentTree> {
+        self.ens.get(&disk.0).and_then(|en_indexes| en_indexes.disks.get(&disk.1))
+    }
+
+    fn insert_extent(
+        &mut self,
+        id: ExtentId,
+        extent_disks: &[SnDiskId],
+        disk_roster: &[(EnId, DiskId)],
+    ) -> Result<()> {
+        let disks = extent_disk_names(extent_disks, disk_roster)?;
+        let mut inserted = Vec::with_capacity(disks.len());
+        for disk in disks {
+            match self.insert_one(disk, id) {
+                Ok(true) => inserted.push(disk),
+                Ok(false) => {
+                    self.rollback_insert(id, &inserted);
+                    return Err(Error::new(format!(
+                        "extent {} is already indexed for EN {} disk {}",
+                        id.get(),
+                        disk.0.get(),
+                        disk.1.get()
+                    )));
+                }
+                Err(error) => {
+                    self.rollback_insert(id, &inserted);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback_insert(&mut self, id: ExtentId, inserted: &[(EnId, DiskId)]) {
+        for &disk in inserted.iter().rev() {
+            assert!(
+                self.remove_one(disk, id).expect("remove an extent-index rollback"),
+                "extent index rollback lost an inserted id"
+            );
+        }
+    }
+
+    fn remove_extent(
+        &mut self,
+        id: ExtentId,
+        extent_disks: &[SnDiskId],
+        disk_roster: &[(EnId, DiskId)],
+    ) -> Result<()> {
+        let disks = extent_disk_names(extent_disks, disk_roster)?;
+        if let Some(&disk) = disks.iter().find(|&&disk| !self.contains(disk, id)) {
+            return Err(Error::new(format!(
+                "extent {} is missing from EN {} disk {} extent index",
+                id.get(),
+                disk.0.get(),
+                disk.1.get()
+            )));
+        }
+        for disk in disks {
+            assert!(
+                self.remove_one(disk, id).expect("remove an indexed extent"),
+                "prechecked extent index entry disappeared"
+            );
+        }
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        let Self { ens, pool } = self;
+        for en_indexes in ens.values_mut() {
+            for tree in en_indexes.disks.values_mut() {
+                tree.clear(pool);
+            }
+        }
+        ens.clear();
+        pool.reclaim();
+    }
+
+    fn reclaim(&mut self) {
+        self.pool.reclaim();
+    }
+}
+
+fn extent_disk_names(
+    extent_disks: &[SnDiskId],
+    disk_roster: &[(EnId, DiskId)],
+) -> Result<Vec<(EnId, DiskId)>> {
+    let mut names = Vec::with_capacity(extent_disks.len());
+    for &sn_disk in extent_disks {
+        let &name = disk_roster
+            .get(sn_disk.get() as usize)
+            .ok_or_else(|| Error::new("SN extent disk index is outside its roster"))?;
+        if names.contains(&name) {
+            return Err(Error::new("SN extent names the same EN disk twice"));
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
 
 /// A stable-index table backed by typed pool slots.
 struct ExtentTable {
@@ -1055,6 +1232,8 @@ struct SNState {
     stream_map: StreamTable,
     /// Stable extent indexes, protected by the same lock as the stream table.
     extent_table: ExtentTable,
+    /// Per-disk indexes of ExtentIds represented in the extents' disk lists.
+    disk_extent_indexes: DiskExtentIndexes,
     /// Side metadata whose lifetime follows its owning stream or extent.
     retired_streams: std::collections::HashSet<StreamName>,
     stream_extras: Extras<StreamName>,
@@ -1082,9 +1261,12 @@ impl SNState {
             .map_err(|error| Error::new(format!("reserve SN stream table: {error}")))?;
         let extent_table = ExtentTable::new(max_extents)
             .map_err(|error| Error::new(format!("reserve SN extent table: {error}")))?;
+        let disk_extent_indexes = DiskExtentIndexes::new(max_extents)
+            .map_err(|error| Error::new(format!("reserve SN disk extent indexes: {error}")))?;
         Ok(Self {
             stream_map,
             extent_table,
+            disk_extent_indexes,
             retired_streams: std::collections::HashSet::new(),
             stream_extras: Extras::default(),
             extent_extras: Extras::default(),
@@ -1446,7 +1628,7 @@ fn apply_sn_slot(
                 return Err(Error::new("open action creates an already-sealed extent"));
             }
             let extent = cmd.extent.into_data(disks)?;
-            let SNState { stream_map, extent_table, extents, .. } = state;
+            let SNState { stream_map, extent_table, disk_extent_indexes, extents, .. } = state;
             let held = stream_map
                 .get_mut(&cmd.name)
                 .ok_or_else(|| Error::new("open action names no stream"))?;
@@ -1464,6 +1646,15 @@ fn apply_sn_slot(
                 }
                 return Err(Error::new(error.to_string()));
             }
+            if let Err(error) =
+                disk_extent_indexes.insert_extent(id, &extent_table[id.get() as usize].disks, disks)
+            {
+                extent_table[id.get() as usize] = Extent::blank();
+                if local_id.is_none() {
+                    release_extent_id(extent_table, id);
+                }
+                return Err(error);
+            }
             held.open = Some(id);
             *extents += 1;
             *local_used = true;
@@ -1472,7 +1663,15 @@ fn apply_sn_slot(
         Op::SnSeal => {
             let cmd: SealCmd = raft::codec::decode(&action.fields)?;
             let next = cmd.next.map(|extent| extent.into_data(disks)).transpose()?;
-            let SNState { stream_map, extent_table, extents, sealed, sealed_streams, .. } = state;
+            let SNState {
+                stream_map,
+                extent_table,
+                disk_extent_indexes,
+                extents,
+                sealed,
+                sealed_streams,
+                ..
+            } = state;
             let held = stream_map
                 .get_mut(&cmd.name)
                 .ok_or_else(|| Error::new("seal action names no stream"))?;
@@ -1502,6 +1701,17 @@ fn apply_sn_slot(
                         release_extent_id(extent_table, id);
                     }
                     return Err(Error::new(error.to_string()));
+                }
+                if let Err(error) = disk_extent_indexes.insert_extent(
+                    id,
+                    &extent_table[id.get() as usize].disks,
+                    disks,
+                ) {
+                    extent_table[id.get() as usize] = Extent::blank();
+                    if local_id.is_none() {
+                        release_extent_id(extent_table, id);
+                    }
+                    return Err(error);
                 }
                 *local_used = true;
                 Some(id)
@@ -1650,6 +1860,7 @@ fn apply_sn_slot(
             let SNState {
                 stream_map,
                 extent_table,
+                disk_extent_indexes,
                 retired_streams,
                 stream_extras,
                 extent_extras,
@@ -1670,6 +1881,9 @@ fn apply_sn_slot(
                         &mut extent.deletion,
                         cmd.now
                     ));
+                    disk_extent_indexes
+                        .remove_extent(task.id, &extent.disks, disks)
+                        .expect("remove the extent from each EN index before reclaim");
                     extent.disks.clear();
                     *extents -= 1;
                 }
@@ -1695,6 +1909,7 @@ impl raft::execution::Application for SNState {
     fn reset(&mut self) {
         // The committed action history is the source of truth during a Raft restore.
         self.stream_map.clear();
+        self.disk_extent_indexes.clear();
         self.extent_table.reset();
         self.retired_streams.clear();
         self.stream_extras = Extras::default();
@@ -1709,6 +1924,7 @@ impl raft::execution::Application for SNState {
 
     fn reclaim(&mut self) {
         self.stream_map.reclaim();
+        self.disk_extent_indexes.reclaim();
     }
 }
 
@@ -2419,6 +2635,7 @@ impl SN {
             &snapshot_path,
             config.max_extents,
             workers,
+            config.repair_checkpoint_indexes,
         ) {
             Ok(saved) => Some(saved),
             Err(_) if snapshot_index == 0 && snapshot_sequence == 0 && !has_sn_ckpt => {
@@ -2445,6 +2662,7 @@ impl SN {
                     &snapshot_path,
                     config.max_extents,
                     workers,
+                    config.repair_checkpoint_indexes,
                 )?)
             }
             Err(error) => return Err(error),
@@ -3736,7 +3954,7 @@ impl Host for SN {
         } else {
             None
         };
-        let disks = if matches!(action.op, Op::SnOpen | Op::SnSeal) {
+        let disks = if matches!(action.op, Op::SnOpen | Op::SnSeal | Op::SnDeleteDone) {
             self.disks.lock().map_err(|_| Error::new("SN disk lock poisoned"))?.clone()
         } else {
             Vec::new()

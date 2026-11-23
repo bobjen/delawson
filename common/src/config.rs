@@ -875,6 +875,10 @@ pub struct SNConfig {
     /// A machine's extent budget is split between streams and extents, and the
     /// split encodes an assumed workload mix.
     pub stream_share: f64,
+    /// Rebuild SN's redundant EN-disk extent indexes from extent rows when
+    /// checkpoint validation finds inconsistencies. False rejects the checkpoint.
+    #[serde(default)]
+    pub repair_checkpoint_indexes: bool,
 }
 
 /// EN's own configuration.

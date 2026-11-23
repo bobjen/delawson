@@ -10,6 +10,10 @@ stream_share = 0.333
 # The limit should be at least the machine RAM size divided by the SN Extent size.
 max_extents = 1073741824
 
+# Reject a checkpoint whose saved EN-disk extent indexes disagree with its
+# extent rows. Set true to rebuild those derived indexes from extent rows.
+repair_checkpoint_indexes = false
+
 # Raft consensus for this SN. With no members listed, this process is a singleton.
 # To replicate the SN group, configure the same ring and member map on every member.
 [raft]
