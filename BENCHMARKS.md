@@ -1797,13 +1797,3 @@ bytes); 12 SN snapshots (148,407,339 bytes) and 12 SN journal files
 files remaining after the run, not total bytes written if files were rotated or
 replaced. The detached runner exited 0 after cluster cleanup. Logs and run data:
 `/var/tmp/delawson-object-bench-lanukejp/`.
-
-Repeat, same release commit `3f07f06`, same standard workload, again under `/var/tmp` on `/dev/nvme0n1p2`. Raft journaling and checkpointing were enabled. The detached runner exited 0 after cleanup.
-
-| Workload | First run | Repeat |
-| --- | ---: | ---: |
-| BatchCreate, batch 1,000 | 28.17 s; 710,062 objects/s | 26.86 s; 744,703 objects/s |
-| ObjectInfo, batch 1 (three-trial mean) | 83,808 names/s | 86,651 names/s |
-| BatchObjectInfo, batch 1,000 (three-trial mean) | 525,641 names/s | 534,187 names/s |
-
-Repeat ObjectInfo trials: 86,551, 86,046, and 87,356 names/s (range 86,046–87,356; 1.5% spread). Repeat BatchObjectInfo trials: 536,959, 537,542, and 528,060 names/s (range 528,060–537,542; 1.8% spread). All 20M creates completed and every lookup was answered and found. Across both runs, the six-trial means were 85,230 ObjectInfo names/s and 529,914 BatchObjectInfo names/s. Logs and run data: `/var/tmp/delawson-object-bench-t60796cp/`.
