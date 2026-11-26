@@ -26,7 +26,9 @@ CRUD (well, append not update yet) and concatenate are implemented.
 
 See [DESIGN.md](DESIGN.md) for the architecture, its Open Questions section for
 what is still undecided, and section 17 for what has been built. Github issues are
-being used to track bugs I didn't want to address quite yet.
+being used to track bugs I didn't want to address quite yet. For the standard 
+20-million-object ObjectInfo/BatchObjectInfo benchmark and its
+required detached launcher, see [BENCHMARKS.md](BENCHMARKS.md).
 
 ```sh
 scripts/start-laws              # build debug, start every process in the roster
@@ -445,6 +447,3 @@ Machine-auth tests use software identities by default; `--tpm` remains opt-in.
 User authorization, unlock-key replacement, recovery cutoffs, selective execution,
 and chunked snapshot transfer are deferred. The registry remains ephemeral.
 See DESIGN.md §§17.48–17.51 for storage and consensus details.
-
-For the standard 20-million-object ObjectInfo/BatchObjectInfo benchmark and its
-required detached launcher, see [BENCHMARKS.md](BENCHMARKS.md).
