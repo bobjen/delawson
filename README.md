@@ -61,8 +61,8 @@ Stable indexes are possible, referencing
 Implementation in progress. See [DESIGN.md](DESIGN.md) for the architecture. Github issues are
 being used to track bugs I didn't want to address quite yet. For the standard 
 20-million-object ObjectInfo/BatchObjectInfo benchmark, see [BENCHMARKS.md](BENCHMARKS.md).
-On a single 16-core machine running all processes, batch object creation does 710K/sec, 
-object info does 83K/sec, and batch object info does 525K/sec. That's parallel throughput,
+On a single 16-core machine running all processes, batch object creation can do 710K/sec, 
+object info can do 83K/sec, and batch object info can do 525K/sec. That's parallel throughput,
 not serial.
 
 ```sh
